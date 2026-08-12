@@ -160,13 +160,76 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision="", o
     return cost_per_step
 
 
-def _fits(candidate: Candidate, need: int) -> bool:
+def _fits(candidate: Candidate, need: int, executed_gpu_count: int = 0) -> bool:
     """Whether this rentable shape can actually hold the run.
 
     ``combined_vram_gb`` is the shared fit model, so a shape accepted here is a shape parse-time
     sizing also accepted -- the two must not be able to disagree.
+
+    Credit only the cards that JOIN the run. Multi-card fit comes from sharding, so a card that
+    never enters the fsdp group contributes no memory: sft shards by data and bounds its width by
+    the batch and the row count, so an unpacked profile pins the batch to 1 and launches ONE rank
+    however many cards are rented. Crediting the billed count there admits a run on memory it will
+    not have -- a 4B at 32k needs 28 GB and is correctly REJECTED on one 24 GB card, but renting
+    two credits 35 GB, passes, and then OOMs on the single rank that starts. Renting more cards is
+    not a way to pass this gate. ``method_card_speedup`` already clamps throughput to the same
+    width; this is the other half of that.
     """
-    return combined_vram_gb(candidate.vram_gb, candidate.gpu_count) >= need
+    fit_count = executed_gpu_count or candidate.gpu_count
+    return combined_vram_gb(candidate.vram_gb, fit_count) >= need
+
+
+def _executed_gpu_count(algorithm: str, train, overrides, candidate: Candidate) -> int:
+    """Ranks this candidate would actually launch, which is its card count except for sft.
+
+    Reads the executed batch from the SAME substituted knobs sizing does (see ``_overridden_train``)
+    so the fit gate and the VRAM requirement describe one run rather than two. The retained row
+    count comes from ``overrides`` instead: it is a profile measurement, not a ``TrainSpec`` sizing
+    knob, so ``_TRAIN_KNOB_FOR_OVERRIDE`` does not carry it onto ``train`` and reading it from there
+    would silently find nothing and miss every rows-bound narrowing.
+
+    Every other algorithm launches the shape it rents, so this returns the card count unchanged.
+    """
+    if (algorithm or "").strip().lower() != "sft":
+        return candidate.gpu_count
+    batch = _sizing_int(train, "batch_size", 0)
+    if batch <= 0:
+        # an UNKNOWN batch is not a batch of 1. defaulting it would assert the most restrictive
+        # width on every caller that ranks without knobs and reject multi-card sft outright, which
+        # is a worse failure than the one this clamp prevents: the narrowing must only bite where
+        # the executed width is actually known to be smaller.
+        return candidate.gpu_count
+    from flash.engine.plan.steps import sft_data_parallel_cards
+
+    # 0 rows means UNMEASURED, and `sft_data_parallel_cards` reads it that way (it does not narrow),
+    # so an absent profile keeps the batch-bound width rather than inventing a row limit.
+    return sft_data_parallel_cards(
+        candidate.gpu_count, batch, _sizing_int(overrides, "sft_retained_examples", 0)
+    )
+
+
+def _fitting_candidates(candidates, need: int, algorithm: str, train, overrides) -> list:
+    """The shapes that hold the run on the ranks they will actually launch.
+
+    Providers report the shapes they can genuinely rent (RunPod takes a count, Lambda names it in the
+    instance type, Vast bakes it into the offer); the allocator owns only whether a shape fits. The
+    executed width is per-candidate because it is bounded by that candidate's own card count.
+    """
+    return [
+        c for c in candidates if _fits(c, need, _executed_gpu_count(algorithm, train, overrides, c))
+    ]
+
+
+def _sizing_int(train, name: str, default: int) -> int:
+    """A positive int knob off a dict-or-object ``train``, or ``default`` when absent/unusable."""
+    if train is None:
+        return default
+    value = train.get(name) if isinstance(train, dict) else getattr(train, name, None)
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
 
 
 def _structurally_fits(available, need: int, cap: int) -> bool:
@@ -509,6 +572,11 @@ def allocate(
     ``workload_profile=True`` allocates the cpu-only profile job instead of the run it measures: it
     needs no training VRAM and gains nothing from a faster card, so it ranks on rate alone.
     """
+    # the same profile knobs ranking prices on: VRAM must be sized for the work that will RUN, not
+    # the authored request. an exact-unpacked run executes batch 1 at the measured length, so sizing
+    # off the authored batch over-reserves (4 GB on a 4B at batch 8 / 4096) and can reject a card the
+    # run would have fit on. `_fits` reads it too, so the requirement and the fit cannot disagree.
+    sized_train = _overridden_train(train, overrides)
     if workload_profile:
         need = profile_required_vram_gb()
         max_gpu_count = 1
@@ -516,11 +584,7 @@ def allocate(
         need = required_vram_gb(
             model_id,
             algorithm,
-            # the same profile knobs ranking prices on: VRAM must be sized for the work that will
-            # RUN, not the authored request. an exact-unpacked run executes batch 1 at the measured
-            # length, so sizing off the authored batch over-reserves (4 GB on a 4B at batch 8 /
-            # 4096) and can reject a card the run would have fit on.
-            train=_overridden_train(train, overrides),
+            train=sized_train,
             thinking=thinking,
             model_revision=model_revision,
         )
@@ -593,9 +657,7 @@ def allocate(
         exact=exact,
         provider=provider,
     )
-    # providers report the shapes they can genuinely rent (RunPod takes a count, Lambda names it in
-    # the instance type, Vast bakes it into the offer); the allocator owns only whether a shape fits.
-    candidates = [c for c in candidates if _fits(c, need)]
+    candidates = _fitting_candidates(candidates, need, algorithm, sized_train, overrides)
     supported_available = tuple(name for name in available if name not in structurally_unsupported)
     if not candidates:
         _raise_no_candidate_error(

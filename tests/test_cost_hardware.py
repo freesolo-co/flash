@@ -397,3 +397,76 @@ def test_a_live_vast_allocation_is_requoted_without_nvlink_credit():
         "the wall the run is billed for"
     )
     assert quote("vast", gpu_count=1).train_seconds == quote("runpod", gpu_count=1).train_seconds
+
+
+def test_sft_fit_credits_only_the_ranks_that_will_launch():
+    """Regression: the fit gate credited cards the sft run never puts in the fsdp group.
+
+    Multi-card fit comes from SHARDING, so a card that does not join contributes no memory. sft
+    shards by data and bounds its width by the batch and the row count, and an unpacked profile pins
+    the batch to 1 -- so the run launches ONE rank no matter how many cards are rented.
+
+    The decisive shape is a run that one card correctly rejects: a 4B at 32k needs 28 GB and does not
+    fit a 24 GB card. Before this, renting two credited 35 GB and ADMITTED it, then launched a single
+    rank with 24 GB and OOM'd on paid hardware. Allocating more cards must not be a way to pass a
+    gate the executed run cannot pass.
+    """
+    from flash.providers.allocator import _executed_gpu_count, _fits
+    from flash.providers.base import Candidate
+
+    need = 28.0
+
+    def fits(cards, algorithm="sft", train=None, overrides=None):
+        candidate = Candidate(
+            provider="runpod", gpu="A10", hourly_usd=1.0, vram_gb=24, gpu_count=cards
+        )
+        width = _executed_gpu_count(algorithm, train, overrides, candidate)
+        return _fits(candidate, need, width)
+
+    unpacked = {"batch_size": 1}
+    # one card cannot hold it -- that is the baseline the wider shapes must not be able to dodge.
+    assert not fits(1, train=unpacked)
+    for cards in (2, 4, 8):
+        assert not fits(cards, train=unpacked), (
+            f"{cards} cards were credited as if all joined the run, but an unpacked sft run "
+            "launches one rank, so the run is admitted on memory it never has and OOMs when paid"
+        )
+
+    # a batch that DOES divide the allocation launches every card, so sharding is real and credited.
+    packed = {"batch_size": 8}
+    assert fits(2, train=packed, overrides={"sft_retained_examples": 64}), (
+        "a width the batch and rows both divide must keep its shard credit"
+    )
+
+    # ROWS bind too, and they arrive by a different route: `sft_retained_examples` is a profile
+    # measurement, not a TrainSpec knob, so `_overridden_train` never copies it onto `train`.
+    # reading it from there would find nothing and miss this narrowing entirely. sized against a
+    # need BETWEEN the 2- and 4-card credits, so narrowing 4 -> 2 actually crosses the gate rather
+    # than landing on the same side of it.
+    def fits_rows(cards, rows, need_gb):
+        candidate = Candidate(
+            provider="runpod", gpu="A10", hourly_usd=1.0, vram_gb=24, gpu_count=cards
+        )
+        width = _executed_gpu_count("sft", packed, {"sft_retained_examples": rows}, candidate)
+        return _fits(candidate, need_gb, width)
+
+    between = 50.0  # 2 cards credit 35.2, 4 credit 62.4
+    assert fits_rows(4, 64, between), (
+        "64 rows split 4 ways, so all four cards join and are credited"
+    )
+    assert not fits_rows(4, 10, between), (
+        "10 rows cannot be split 4 ways, so the run launches 2 ranks -- crediting 4 admits it on "
+        "memory only the wider world would have had"
+    )
+
+    # and no other algorithm is touched: they launch the shape they rent, so a batch of 1 that would
+    # collapse sft to one rank must leave THEM at full width.
+    assert fits(2, algorithm="grpo", train=unpacked)
+    assert fits(2, algorithm="opd", train=unpacked)
+
+    # an UNKNOWN batch must not be read as a batch of 1, and unmeasured rows must not invent a limit.
+    # callers that rank without knobs would otherwise have every multi-card sft shape rejected -- a
+    # worse failure than the over-credit this clamp exists to stop, and one no test above catches.
+    assert fits(2, train=None)
+    assert fits(2, train={})
+    assert fits(4, train=packed, overrides={})
