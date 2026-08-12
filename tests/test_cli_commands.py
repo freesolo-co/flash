@@ -337,7 +337,7 @@ def test_traces_export_reads_the_self_hosted_plane(monkeypatch, tmp_path) -> Non
     project_id = "11111111-1111-4111-8111-111111111111"
     calls: list[tuple[str, str, str | None]] = []
 
-    def _export(selected_project, api_key, base_url=None, export_format=None):
+    def _export(selected_project, api_key, base_url=None, export_format=None, limit=None):
         calls.append((selected_project, api_key, base_url))
         return {
             "records": [{"input": "hello", "output": "world"}],
