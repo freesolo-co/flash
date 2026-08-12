@@ -166,26 +166,46 @@ async def _run_lock(run_id: str):
     # An ownership token, not just an expiry. Two waiters can both observe the same stale lease,
     # and an unconditional delete would let the second one drop the FIRST one's freshly acquired
     # lease and then take its own -- putting both inside the critical section, which is exactly
-    # the lost update `alias_compare_and_swap` promises cannot happen. Every removal below is
-    # therefore conditional on the value still being the lease this caller is entitled to remove.
+    # the lost update `alias_compare_and_swap` promises cannot happen.
     token = uuid.uuid4().hex
 
     async def _drop_if(expected: Any) -> None:
-        """Delete the lock only while it still holds `expected`. Modal Dicts are single-key
-        atomic, so re-reading before the delete is the strongest guard available here; it closes
-        the window that matters (a slow waiter reclaiming a lease acquired after its own read)."""
-        current = await adapter_records.get.aio(key)
-        if current == expected:
-            await adapter_records.pop.aio(key, None)
+        """Remove the lock only if it still holds `expected`, restoring it otherwise.
+
+        Built on `pop`, not on read-then-delete: `pop` removes AND returns the value in one atomic
+        step, so what came back is proof of what was removed. Read-then-delete cannot make that
+        claim -- the value can change between the two calls, and the delete then destroys a lease
+        the caller never inspected. That is the difference that matters when two waiters judge the
+        same lease stale: the slower one's `pop` returns the winner's NEW lease, so it puts it back
+        instead of clearing the slot and taking it.
+
+        The restore is `skip_if_exists` so it can never overwrite a third holder that acquired in
+        between; if it fails, that holder owns the lock and we leave it alone.
+
+        What this does not close: `pop` is destructive, so between a misjudged removal and its
+        restore the slot is briefly empty and a third waiter could win it. Closing that needs a
+        compare-and-delete, which modal.Dict does not offer -- it is the usual result that a
+        crash-recoverable lock cannot be built from insert-if-absent alone. It is reachable only
+        when a holder has already died mid-update AND two more operations on the SAME run race
+        through that window, and the run lock is a guard against the crashed-container case rather
+        than the app's only defence. If you are running deploys concurrently enough to care, hold
+        this state in a store with a real compare-and-swap.
+        """
+        removed = await adapter_records.pop.aio(key, None)
+        if removed is not None and removed != expected:
+            await adapter_records.put.aio(key, removed, skip_if_exists=True)
 
     while True:
         lease = {{"token": token, "expires_at": time.time() + LOCK_TTL_SECONDS}}
+        # The ONLY way into the critical section: whoever wins this insert holds the lock. Never
+        # by deleting somebody else's lease and assuming the slot is now ours.
         if await adapter_records.put.aio(key, lease, skip_if_exists=True):
             break
         holder = await adapter_records.get.aio(key)
         expires_at = holder.get("expires_at") if isinstance(holder, dict) else None
-        # a stale lock (holder crashed) is reclaimed rather than waited on forever, but only if
-        # the exact lease we judged stale is still the one there.
+        # a stale lock (holder crashed) is reclaimed rather than waited on forever, but only the
+        # exact lease that was judged stale -- and after reclaiming we still have to win the
+        # insert above, so two waiters racing here cannot both end up inside.
         if not isinstance(expires_at, (int, float)) or expires_at < time.time():
             await _drop_if(holder)
             continue
@@ -521,13 +541,34 @@ def api():
                     raise HTTPException(
                         status.HTTP_409_CONFLICT, "immutable adapter revision already exists"
                     )
-                # Same id, same content: a no-op EXCEPT when the first attempt never reached a
-                # terminal state. Retrying after an ambiguous failure is exactly how the client
-                # recovers, so a record still sitting at `registered` gets another settle rather
-                # than being stranded there forever. `ready`/`failed`/`disabled` are terminal and
-                # left alone -- re-settling those would undo an undeploy or reload a live adapter.
-                if (existing.get("metadata") or {{}}).get("lifecycle_state") == "registered":
-                    settle_adapter.spawn(existing)
+                # Same id, same content. `ready` is a genuine no-op. The other two states are not:
+                #
+                # `registered` means the first settle never reached a terminal state. Retrying
+                # after an ambiguous failure is exactly how the client recovers, so re-drive it
+                # rather than stranding the revision there forever.
+                #
+                # `disabled`/`failed` means undeploy (or a failed load) already ran. A revision id
+                # is deterministic in (run_id, step, hf_revision), so redeploying an UNCHANGED
+                # checkpoint arrives here with the same id -- and returning the disabled record
+                # would make the client raise a readiness failure, permanently. An explicit
+                # registration is a deliberate request to serve this artifact again, so it resets
+                # the record to `registered` and loads it afresh.
+                #
+                # This is safe precisely because it requires a fresh POST: a late settle finishing
+                # after an undeploy carries no registration behind it, and still stands down.
+                state = (existing.get("metadata") or {{}}).get("lifecycle_state")
+                if state == "ready":
+                    return {{"ok": True, "adapter": existing}}
+                if state != "registered":
+                    existing["status"] = "registered"
+                    existing["metadata"] = {{
+                        **(existing.get("metadata") or {{}}),
+                        "lifecycle_state": "registered",
+                    }}
+                    # Drop a stale failure reason so a retried load does not report the old one.
+                    existing["metadata"].pop("failure", None)
+                    await _write(existing)
+                settle_adapter.spawn(existing)
                 return {{"ok": True, "adapter": existing}}
             await _write(record)
             # Create the run alias disabled, pointing at nothing yet. Activation is what makes it

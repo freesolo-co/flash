@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ast
 import re
+import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -104,6 +106,49 @@ def test_engine_values_come_from_the_catalog(model_id):
     assert values["MAX_LORAS"] == info.serving.max_loras
     assert values["MAX_LORA_RANK"] == info.serving.max_lora_rank
     assert values["VLLM_VERSION"] == VLLM_VERSION
+
+
+def test_the_serve_modal_extra_installs_what_the_generated_app_imports_locally():
+    """`modal deploy` imports the generated module in the LOCAL interpreter to discover the app.
+
+    So every module-scope import in the template has to be satisfied by `[serve-modal]` itself.
+    modal does not depend on fastapi, so a fresh `pip install 'freesolo-flash[serve-modal]'` that
+    omits it fails at the documented first deploy with ModuleNotFoundError -- before any remote
+    image is ever built, and with nothing in the error naming the missing extra.
+
+    vLLM is deliberately NOT here: it is imported inside the Engine methods, which only ever run
+    in the Modal image on the GPU.
+    """
+    root = Path(__file__).resolve().parents[1]
+    extra = tomllib.loads((root / "pyproject.toml").read_text())["project"]["optional-dependencies"]
+    packages = {
+        re.split(r"[<>=!\[ ]", spec, maxsplit=1)[0].lower() for spec in extra["serve-modal"]
+    }
+
+    source = render_app(MODELS["Qwen/Qwen3.5-4B"])
+    imported = set()
+    for node in ast.parse(source).body:  # module scope only: nested imports run on the GPU
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            imported.add(node.module.split(".")[0])
+
+    stdlib = {
+        "__future__",
+        "asyncio",
+        "contextlib",
+        "hashlib",
+        "hmac",
+        "os",
+        "time",
+        "uuid",
+        "typing",
+        "json",
+        "datetime",
+        "dataclasses",
+    }
+    missing = sorted(imported - stdlib - packages)
+    assert not missing, f"[serve-modal] does not install {missing}, imported at module scope"
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS)

@@ -73,12 +73,17 @@ server = [
     # multimodal opd run. the gpu extra gets Pillow transitively via vllm; server does not.
     "pillow>=11",
 ]
-# `flash serve setup`: generate and deploy a self-hosted Modal serving backend. Only the modal
-# client is needed here -- vLLM is installed INSIDE the generated app's Modal image, on the GPU
-# container, never in the user's local environment.
+# `flash serve setup`: generate and deploy a self-hosted Modal serving backend. vLLM is installed
+# INSIDE the generated app's Modal image, on the GPU container, never in the user's local
+# environment -- but fastapi IS needed locally: `modal deploy` imports the generated module in the
+# local interpreter to discover the app before any remote image exists, and that module imports
+# fastapi at module scope (it has to, so FastAPI can resolve the handlers' stringized annotations).
+# modal does not depend on fastapi itself, so without this a fresh `pip install
+# 'freesolo-flash[serve-modal]'` fails at `modal deploy` with ModuleNotFoundError: fastapi.
 serve-modal = [
     "modal>=1.0",
     "httpx>=0.27",
+    "fastapi",
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [

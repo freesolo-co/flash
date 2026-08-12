@@ -1090,6 +1090,7 @@ gpu = [
     { name = "vllm" },
 ]
 serve-modal = [
+    { name = "fastapi" },
     { name = "httpx" },
     { name = "modal" },
 ]
@@ -1130,6 +1131,7 @@ requires-dist = [
     { name = "datasets", marker = "extra == 'gpu'", specifier = ">=2.19" },
     { name = "datasets", marker = "extra == 'server'", specifier = ">=2.19" },
     { name = "fastapi", marker = "extra == 'dev'" },
+    { name = "fastapi", marker = "extra == 'serve-modal'" },
     { name = "fastapi", marker = "extra == 'server'" },
     { name = "freesolo", marker = "extra == 'dev'", specifier = ">=0.4.1" },
     { name = "freesolo", marker = "extra == 'gpu'", specifier = ">=0.4.1" },

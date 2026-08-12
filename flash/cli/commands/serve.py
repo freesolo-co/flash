@@ -258,7 +258,7 @@ def _deploy(app_file: Path) -> int:
         return 0
     print(f"\ndeployed at {url}")
     print(_control_plane_instructions(url))
-    _warn_if_unauthenticated(url)
+    _warn_if_unauthenticated(url, app_file)
     return 0
 
 
@@ -295,7 +295,7 @@ def _healthz(url: str) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _warn_if_unauthenticated(url: str) -> None:
+def _warn_if_unauthenticated(url: str, app_file: Path | None = None) -> None:
     """Say so if the deployed app accepts unauthenticated writes.
 
     The app only enforces a key when FLASH_SERVING_KEY is in its secret, and the URL is public.
@@ -303,6 +303,10 @@ def _warn_if_unauthenticated(url: str) -> None:
     deployed container is the only thing that knows whether a key is set. Silence on an
     unreadable or older /healthz is deliberate -- warning without evidence trains users to
     ignore the warning.
+
+    ``app_file`` is the file that was actually deployed. The redeploy step names it rather than
+    the default: under ``--output`` a hardcoded name would deploy an unrelated file or fail, and
+    the public keyless endpoint would stay up after the user did exactly what they were told.
     """
     payload = _healthz(url)
     if payload is None or payload.get("requires_key") is not False:
@@ -314,7 +318,7 @@ def _warn_if_unauthenticated(url: str) -> None:
         "'import secrets; print(secrets.token_urlsafe(32))')\n"
         f"  modal secret create {SECRET_NAME} HF_TOKEN=hf_... "
         'FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"\n'
-        f"  modal deploy {DEFAULT_APP_FILE}",
+        f"  modal deploy {app_file if app_file is not None else DEFAULT_APP_FILE}",
         file=sys.stderr,
     )
 
@@ -348,9 +352,18 @@ def cmd_serve_status(args) -> int:
     except Exception as exc:  # any transport or decode failure is the same answer to the user
         return _err(f"serving backend at {base} did not answer /healthz: {exc}")
 
+    # Diagnosing a malformed backend is exactly this command's job, so a payload that decodes but
+    # is the wrong shape has to become the compatibility error rather than a traceback.
+    if not isinstance(payload, dict):
+        return _err(f"serving backend at {base} returned a non-object /healthz payload")
     capabilities = payload.get("capabilities") or []
+    if not isinstance(capabilities, list) or any(not isinstance(c, str) for c in capabilities):
+        return _err(f"serving backend at {base} did not return capabilities as a list of strings")
+    models = payload.get("base_models") or []
+    if not isinstance(models, list):
+        models = []
     print(f"serving:      {base}")
-    print(f"base models:  {', '.join(payload.get('base_models') or []) or '-'}")
+    print(f"base models:  {', '.join(str(m) for m in models) or '-'}")
     print(f"capabilities: {', '.join(capabilities) or '-'}")
     required = {"immutable_adapter_revisions", "alias_compare_and_swap"}
     missing = sorted(required - set(capabilities))

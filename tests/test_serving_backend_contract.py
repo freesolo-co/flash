@@ -512,6 +512,34 @@ def test_a_registration_stuck_at_registered_is_retried_not_stranded(client):
     assert module.spawned, "a stuck registration was not re-settled on retry"
 
 
+def test_redeploying_the_same_checkpoint_after_undeploy_works(client):
+    """Undeploy then deploy the same checkpoint again must succeed.
+
+    A revision id is deterministic in (run_id, step, hf_revision), so redeploying an unchanged
+    checkpoint reuses the exact id, and its record is `disabled` from the undeploy. Returning that
+    record unchanged is a permanent dead end: the client reads `status: "disabled"` and raises a
+    readiness failure (deploy.py:622), so the run can never be redeployed unless the artifact
+    gains a new commit.
+
+    This is distinct from a late settle racing an undeploy: that arrives with no fresh
+    registration behind it, and must still stand down.
+    """
+    _register_and_ready(client)
+    assert client.delete(f"/adapters/{REVISION}").status_code == 200
+    assert client.get(f"/adapters/{REVISION}").json()["adapter"]["status"] == "disabled"
+
+    assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
+    assert _lifecycle(client, REVISION) == "ready", (
+        "an explicit redeploy of the same checkpoint stayed disabled forever"
+    )
+    assert (
+        client.post(
+            f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None}
+        ).status_code
+        == 200
+    )
+
+
 def test_a_terminal_record_is_not_resettled_on_reregistration(client):
     """The retry above must not reload a revision that already settled.
 
@@ -685,6 +713,91 @@ def test_a_run_lock_is_released_by_its_owner(client):
 
     _run_awaitable(_acquire_and_release())
     assert module.adapter_records.get(key) is None, "the lock outlived its holder"
+
+
+class _StaleReadBarrier(_FakeDict):
+    """The app's Dict, with a two-party rendezvous on every read that returns an expired lease.
+
+    A lock race is not reachable by calling the lock twice in a row -- it needs two waiters pinned
+    in the same window, and which window matters is exactly what a fix changes. Pairing on the
+    OBSERVATION (a read that saw a stale lease) rather than on a call count keeps the barrier
+    meaningful across implementations: it pins both waiters wherever they judge the same dead
+    holder reclaimable, which is the only place a compare-less delete can lose an update.
+
+    A waiter that never finds a partner fails the test on a timeout instead of hanging it.
+    """
+
+    @staticmethod
+    def _is_stale(value) -> bool:
+        expires_at = value.get("expires_at") if isinstance(value, dict) else None
+        return isinstance(expires_at, (int, float)) and expires_at < time.time()
+
+    @property
+    def get(self):
+        parked = self.__dict__.setdefault("_parked", [])
+
+        async def _read(*args, **kwargs):
+            value = dict.get(self, *args, **kwargs)
+            if self._is_stale(value):
+                if parked:
+                    parked.pop().set_result(None)
+                else:
+                    waiter = asyncio.get_running_loop().create_future()
+                    parked.append(waiter)
+                    await asyncio.wait_for(waiter, timeout=5)
+            return value
+
+        # Only `.aio` is gated. The blocking form stays a plain read so a test can inspect the
+        # lock without parking itself on the barrier it is trying to observe.
+        gated = _Aio(lambda *args, **kwargs: dict.get(self, *args, **kwargs))
+        gated.aio = _read
+        return gated
+
+
+def test_two_waiters_reclaiming_one_dead_lease_do_not_both_enter(client):
+    """Reclaiming a crashed holder's lease must not let both reclaimers into the run.
+
+    The lock is built on `put(skip_if_exists=True)` because modal.Dict has no compare-and-swap, so
+    the release has to be conditional some other way. Read-then-delete is not: the value can change
+    between the two calls, and the delete then destroys a lease the caller never inspected. `pop`
+    removes and returns in one step, so a wrongly-taken lease is identifiable and gets put back.
+
+    Both waiters are pinned on the same dead lease, so both judge it reclaimable. Whichever wins,
+    the other must find the slot taken and wait rather than clear it -- otherwise two deploys of
+    one run both commit, which is the lost update `alias_compare_and_swap` promises cannot happen.
+    """
+    module = client.app.state.generated_module
+    key = module._lock_key(RUN_ID)
+    records = _StaleReadBarrier()
+    records.update(module.adapter_records)
+    # A container that died mid-update: the lease is real, and long expired.
+    records[key] = {"token": "dead-holder", "expires_at": time.time() - 60}
+    module.adapter_records = records
+
+    holders: list[str] = []
+    concurrent: list[int] = []
+
+    async def _waiter(name: str):
+        async with module._run_lock(RUN_ID):
+            holders.append(name)
+            concurrent.append(len(holders))
+            # Long enough for the other waiter to run its reclaim and a wait loop against a lock
+            # this one demonstrably still holds.
+            await asyncio.sleep(0.25)
+            assert (records.get(key) or {}).get("token") not in (
+                None,
+                "dead-holder",
+            ), "the holder's own lease was cleared while it was inside"
+            holders.remove(name)
+
+    async def _both():
+        # Gathered inside the coroutine: `gather` binds its future to the loop running at CALL
+        # time, which out here is the test's loop rather than the one `_run_awaitable` drives.
+        await asyncio.gather(_waiter("a"), _waiter("b"))
+
+    _run_awaitable(_both())
+    assert concurrent == [1, 1], f"both reclaimers entered the run lock together: {concurrent}"
+    assert records.get(key) is None, "the lock outlived both holders"
 
 
 def test_chat_resolves_the_run_alias_to_its_immutable_revision(client):
