@@ -14,6 +14,84 @@ def test_single_average_is_generalizable():
     assert reward_seconds_per_completion() == AVG_REWARD_SECONDS_PER_COMPLETION
 
 
+def test_unmeasured_grading_is_not_charged_on_top_of_the_step_floor():
+    """An unmeasured grader adds nothing beyond the floor, which was fitted to include grading.
+
+    Pins the VALUE, not the constant: the assertion above compares the accessor to the constant it
+    returns, so it holds at any default and never protected this. The old 1.0s default put
+    ``completions x 1.0s`` beside a step floor already fitted with measured reward applied, which
+    double-charged grading -- 32s of a 32-completion step, and 0.699x geometric bias over the 64
+    grpo arms of the 2026-08-01 campaign against 0.995x at 0.0.
+    """
+    assert AVG_REWARD_SECONDS_PER_COMPLETION == 0.0
+
+    base = {"batch_size": 8, "group_size": 4}
+    default = RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, **base)
+    explicit_zero = RunConfig(
+        "Qwen/Qwen3.5-0.8B", "grpo", 10, reward_seconds_per_completion=0.0, **base
+    )
+    # the default run must cost exactly what a run that measured "no grading cost" costs.
+    assert seconds_per_step(default, "RTX 5090") == pytest.approx(
+        seconds_per_step(explicit_zero, "RTX 5090")
+    )
+    # and a measured slow grader is still charged, on top of the floor.
+    slow = RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, reward_seconds_per_completion=2.0, **base)
+    assert seconds_per_step(slow, "RTX 5090") == pytest.approx(
+        seconds_per_step(default, "RTX 5090") + 2.0 * 8 * 4
+    )
+
+
+def test_a_failed_reward_probe_is_not_treated_as_a_measurement():
+    """An all-failed reward probe must not reach the quote as a measured ~0s grading wall.
+
+    The rollout profile is what prices a slow grader: it times the real reward() on the real worker.
+    But ``reward_failures == reward_samples`` is a state __post_init__ permits and trustworthy() has
+    no reward-success check, so a profile whose every probe FAILED still arrives here carrying the
+    latency of a grader that never ran. Gating on ``reward_samples > 0`` would accept it; gating on
+    a successful sample sends that run to the default instead.
+    """
+    from flash.core.spec import JobSpec
+    from flash.cost.spec import runconfig_from_spec
+
+    def _run(profile):
+        spec = JobSpec.from_dict(
+            {
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "project": "11111111-1111-1111-1111-111111111111",
+                "environment": {"id": "acme/env"},
+                "train": {"batch_size": 8, "group_size": 4, "max_steps": 10},
+            }
+        )
+        object.__setattr__(spec, "_test_rollout", profile)
+        return spec
+
+    class _Profile:
+        reward_seconds_per_completion = 0.0004
+        reward_samples = 3
+        reward_failures = 3  # every probe failed
+        completion_tokens_mean = 180.5
+        prompt_tokens_mean = 95.0
+
+    import flash.cost.spec as cost_spec
+
+    original = cost_spec._rollout_profile
+    try:
+        cost_spec._rollout_profile = lambda spec: getattr(spec, "_test_rollout", None)
+        # every probe failed -> not a measurement -> no measured value reaches the quote
+        assert runconfig_from_spec(_run(_Profile())).reward_seconds_per_completion is None
+
+        class _OneSucceeded(_Profile):
+            reward_failures = 2  # 3 samples, 1 real success
+
+        # a single successful sample IS a measurement, and it prices the run
+        assert runconfig_from_spec(
+            _run(_OneSucceeded())
+        ).reward_seconds_per_completion == pytest.approx(0.0004)
+    finally:
+        cost_spec._rollout_profile = original
+
+
 def test_override_wins_and_clamps():
     assert reward_seconds_per_completion(override=1.5) == 1.5
     assert reward_seconds_per_completion(override=-3.0) == 0.0  # clamped to >= 0

@@ -1508,17 +1508,18 @@ def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
     from flash.cost.spec import estimate_for_spec, spec_steps
     from flash.schema import spec_from_dict
 
-    # No [train].max_examples set — opd falls back to one prompt batch per epoch for pricing.
+    # this test is about teacher-token itemization, so the horizon is stated rather than derived:
+    # 240 prompts at the opd default batch of 8 is 8 steps per epoch, 30 epochs -> 240 steps.
     spec = spec_from_dict(
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"epochs": 30},
+            "train": {"epochs": 30, "max_examples": 240},
         },
         run_id="x",
     )
-    assert spec_steps(spec) == 30
+    assert spec_steps(spec) == 900
     est = estimate_for_spec(spec)
     assert est.method == "opd"
     assert est.teacher_api_usd > 0.0  # external teacher token spend is itemized (diagnostic)
