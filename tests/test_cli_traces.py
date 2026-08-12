@@ -17,10 +17,10 @@ from flash.cli.commands import traces
 from flash.cli.commands.env import setup as env_setup
 from flash.client import ApiError, ClientError
 
-# Trace export and the hosted project directory exist only on Freesolo's own deployment, so these
-# tests must present a Freesolo-hosted control-plane url. Any other hostname is how the CLI infers
-# a self-hosted plane (`client.http.has_freesolo_backend`), where these commands refuse by design.
+# most cases exercise the hosted backend. dedicated tests below pin that a self-hosted plane uses
+# its own url for both trace reads without weakening the one-snapshot credential property.
 _HOSTED_URL = "https://flash.freesolo.co"
+_SELF_HOSTED_URL = "http://127.0.0.1:8080"
 
 _PROJECTS = [
     {
@@ -69,9 +69,6 @@ def fake_traces(monkeypatch):
 
     monkeypatch.setattr(traces, "list_trace_projects", list_projects)
     monkeypatch.setattr(traces, "export_trace_records", export_records)
-    # A Freesolo-HOSTED url: trace export only exists on that deployment (traces are recorded by
-    # the freesolo SDK into its backend), so every behaviour below is the hosted path. A
-    # placeholder hostname reads as self-hosted and would short-circuit all of it at the guard.
     monkeypatch.setattr(traces, "load_credentials", lambda: (_HOSTED_URL, "fs-key"))
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: (_HOSTED_URL, "fs-key"))
     monkeypatch.setattr("flash.client.list_projects", lambda api_key: _PROJECTS)
@@ -208,9 +205,7 @@ def test_traces_export_under_ci_never_prompts(fake_traces, monkeypatch, tmp_path
 
 
 def test_traces_export_requires_login(monkeypatch, tmp_path, capsys) -> None:
-    """Logged out against the HOSTED plane, where a login is what's missing. On a self-hosted
-    plane the command is unavailable outright, so pointing this at one would assert the wrong
-    refusal (see test_traces_export_refuses_on_a_self_hosted_plane)."""
+    """Every trace store requires the key from the command's credential snapshot."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(traces, "load_credentials", lambda: (_HOSTED_URL, None))
 
@@ -219,11 +214,7 @@ def test_traces_export_requires_login(monkeypatch, tmp_path, capsys) -> None:
 
 
 def test_traces_export_sends_the_key_from_the_url_it_decided_on(monkeypatch, tmp_path) -> None:
-    """The self-hosted guard reads the url, and the key travels to the backend. Both must come
-    from ONE credential read: if the key is re-read afterwards, a `flash login` landing in that
-    window pairs a hosted-url decision with a newly stored self-hosted plane credential, sending
-    that credential to the hosted backend -- the exact leak the guard exists to prevent.
-    """
+    """The url decision and sent key must come from one credential read."""
     monkeypatch.chdir(tmp_path)
     reads = iter(
         [
@@ -235,8 +226,9 @@ def test_traces_export_sends_the_key_from_the_url_it_decided_on(monkeypatch, tmp
 
     sent: list[str] = []
 
-    def _record(project_id, api_key, export_format=None):
+    def _record(project_id, api_key, base_url=None, export_format=None):
         sent.append(api_key)
+        assert base_url is None
         return {"format": "records", "records": [{"input": "a", "output": "b"}]}
 
     monkeypatch.setattr(traces, "export_trace_records", _record)
@@ -244,6 +236,52 @@ def test_traces_export_sends_the_key_from_the_url_it_decided_on(monkeypatch, tmp
     assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
     # the plane credential from the second read must never reach the hosted backend
     assert sent == ["hosted-key"]
+
+
+def test_traces_export_reads_from_the_self_hosted_plane(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(traces, "load_credentials", lambda: (_SELF_HOSTED_URL, "operator-key"))
+    calls: list[tuple[str, str | None]] = []
+
+    def _record(project_id, api_key, base_url=None, export_format=None):
+        assert api_key == "operator-key"
+        calls.append((project_id, base_url))
+        return {"format": "records", "records": [{"input": "a", "output": "b"}]}
+
+    monkeypatch.setattr(traces, "export_trace_records", _record)
+
+    assert cli.main(["traces", "export", "--project", _PROJECTS[0]["id"]]) == 0
+    assert calls == [(_PROJECTS[0]["id"], _SELF_HOSTED_URL)]
+
+
+def test_fetch_records_without_explicit_key_snapshots_self_hosted_credentials(monkeypatch) -> None:
+    monkeypatch.setattr(traces, "load_credentials", lambda: (_SELF_HOSTED_URL, "operator-key"))
+    calls: list[tuple[str, str, str | None]] = []
+
+    def _record(project_id, api_key, base_url=None, export_format=None):
+        calls.append((project_id, api_key, base_url))
+        return {"format": "records", "records": []}
+
+    monkeypatch.setattr(traces, "export_trace_records", _record)
+
+    traces.fetch_records(_PROJECTS[0]["id"])
+    assert calls == [(_PROJECTS[0]["id"], "operator-key", _SELF_HOSTED_URL)]
+
+
+def test_self_hosted_project_discovery_uses_the_plane_url(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    _no_terminal(monkeypatch)
+    monkeypatch.setattr(traces, "load_credentials", lambda: (_SELF_HOSTED_URL, "operator-key"))
+    calls: list[tuple[str, str | None]] = []
+
+    def _projects(api_key, base_url=None):
+        calls.append((api_key, base_url))
+        return [_PROJECTS[0]]
+
+    monkeypatch.setattr(traces, "list_trace_projects", _projects)
+
+    assert cli.main(["traces", "export"]) == 1
+    assert calls == [("operator-key", _SELF_HOSTED_URL)]
 
 
 def test_a_logged_out_snapshot_does_not_reread_the_config(monkeypatch, tmp_path, capsys) -> None:

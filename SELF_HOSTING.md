@@ -124,10 +124,56 @@ string also refuses, since that is what a `${VAR}` with nothing behind it produc
 a deliberate request for the plain-environment path. See `deploy/infisical/README.md` for the
 full variable list, and copy its entrypoint if you use a different secret manager.
 
+### Recording chat traces
+
+The plane exposes an OpenAI-compatible recording proxy at `/v1/chat/completions`. Point an
+OpenAI client at the plane's `/v1` base, authenticate to the plane with
+`FREESOLO_INTERNAL_KEY`, and send the upstream provider, your provider credential, and the
+project uuid as headers:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://your-plane.example/v1",
+    api_key="your-freesolo-internal-key",
+    default_headers={
+        "X-Freesolo-Provider": "openai",
+        "X-Freesolo-Provider-Key": "your-openai-key",
+        "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
+    },
+)
+response = client.chat.completions.create(
+    model="gpt-4.1-mini",
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+`freesolo.OpenAI` and `freesolo.AsyncOpenAI` use the same OpenAI-compatible `/v1` contract,
+so they can be configured with the same base URL and headers. Supported upstream provider
+names are `openai`, `anthropic`, `openrouter`, and `google`; the provider key is used only for
+that upstream request and is not stored. Set `X-Freesolo-Record: false` to proxy a request
+without recording it. Otherwise `X-Freesolo-Project-Id` is required and must be a uuid.
+
+Each request records one `chat.completions` span after a normal response, a streamed response,
+a client disconnect, or an upstream failure. The request and response payloads land in the
+plane's own SQLite database under the authenticated single-tenant owner. Export them with:
+
+```bash
+flash traces export --project 11111111-1111-4111-8111-111111111111
+flash traces export --project 11111111-1111-4111-8111-111111111111 --format prompts
+flash traces export --project 11111111-1111-4111-8111-111111111111 --format raw
+```
+
+A standalone plane is single-tenant and applies no rate limit or spend limit to this proxy.
+Every forwarded call uses the caller-supplied paid provider key. Do not expose the endpoint to
+untrusted networks; use a private network, VPN, or an authenticating reverse proxy and apply
+any request or spend controls there.
+
 ### The state directory
 
-Everything the plane persists locally - the SQLite database of keys and run ownership, run
-records, results, and the CLI's saved login - lives under one root, `~/.flash` by default
+Everything the plane persists locally - the SQLite database of keys, run ownership, and recorded
+chat traces, run records, results, and the CLI's saved login - lives under one root, `~/.flash` by default
 (`/root/.flash` in the container). Set `FLASH_DATA_DIR` to move it somewhere a rootless
 container, a mounted PVC, or a `ProtectHome` systemd unit can actually write:
 
@@ -228,12 +274,11 @@ With it set:
 - **Backend reporting is off** - billing precheck and charge, realized-cost
   reconciliation, checkpoint registration, and the hosted artifact GC sweep. Otherwise these would send your operator key to `api.freesolo.co`
   (and, for the GC, `serve.freesolo.co`) and log a warning per run or per startup.
-- **Hosted-only CLI commands say so.** `flash projects create` mints a uuid locally instead
-  of calling the org directory; `flash projects list` and `flash traces export` have no local
-  store to read and refuse with the reason. Traces are recorded by the freesolo SDK into the
-  hosted backend, so write the same `{"input", "output"}` JSONL rows yourself and train on
-  them directly. Setting `FREESOLO_BASE_URL` to a Freesolo-compatible backend you run keeps
-  all three on the normal hosted path, since they then have a directory to call.
+- **Project commands stay local where possible.** `flash projects create` mints a uuid locally
+  instead of calling the org directory, and `flash projects list` has no directory to enumerate.
+  Recorded chat completions live in this plane's SQLite database, so `flash traces export` reads
+  them from the same self-hosted plane. Setting `FREESOLO_BASE_URL` to a Freesolo-compatible
+  backend you run keeps project-directory calls on that backend.
 
 Self-hosting relaxes the billing boundaries, not the catalog. Trainable models are the
 curated ones on both deployments; see [adding a model](#adding-a-model).

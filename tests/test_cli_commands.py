@@ -330,19 +330,26 @@ def test_projects_list_refuses_on_a_self_hosted_plane(monkeypatch, capsys) -> No
     assert "projects create" in err
 
 
-def test_traces_export_refuses_on_a_self_hosted_plane(monkeypatch, capsys) -> None:
-    """Unlike `projects create` there is nothing local to substitute: traces are written by the
-    freesolo SDK into the hosted backend, so a self-hosted plane has no trace store to read."""
+def test_traces_export_reads_the_self_hosted_plane(monkeypatch, tmp_path) -> None:
+    """The standalone plane now owns the trace store, so the CLI reads that same URL."""
     _self_hosted(monkeypatch)
-    # stubbed on `traces`, the binding the command actually calls: patching `flash.client` would
-    # leave the real functions in place there, so these fail-fast guards would never fire.
-    monkeypatch.setattr(cli_traces, "export_trace_records", lambda *a, **k: pytest.fail("hosted"))
-    monkeypatch.setattr(cli_traces, "list_trace_projects", lambda *a, **k: pytest.fail("hosted"))
+    monkeypatch.chdir(tmp_path)
+    project_id = "11111111-1111-4111-8111-111111111111"
+    calls: list[tuple[str, str, str | None]] = []
 
-    assert _run(["traces", "export"]) == 1
-    err = capsys.readouterr().err.lower()
-    assert "not available on a self-hosted plane" in err
-    assert "freesolo sdk" in err
+    def _export(selected_project, api_key, base_url=None, export_format=None):
+        calls.append((selected_project, api_key, base_url))
+        return {
+            "records": [{"input": "hello", "output": "world"}],
+            "traces": 1,
+            "skipped": 0,
+            "format": export_format,
+        }
+
+    monkeypatch.setattr(cli_traces, "export_trace_records", _export)
+
+    assert _run(["traces", "export", "--project", project_id]) == 0
+    assert calls == [(project_id, _SELF_HOSTED[1], _SELF_HOSTED[0])]
 
 
 def test_hosted_plane_still_reaches_the_backend(monkeypatch, capsys) -> None:

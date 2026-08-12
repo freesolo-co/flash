@@ -23,15 +23,15 @@ This repository contains:
 
 - the `flash` CLI (`flash/cli/`) — no declared runtime dependencies (commands that run
   an environment locally, such as `flash env test`, need the `freesolo` SDK),
-- the FastAPI control plane (`flash/server/`) — run submission, auth, project scoping,
+- the FastAPI control plane (`flash/server/`) — run submission, auth, project scoping, trace recording,
 - the GPU worker and training recipes (`flash/engine/`) — verl plus colocated vLLM
   rollouts,
 - the GPU provider substrate (`flash/providers/`) — pricing, allocation, submit/poll,
 - the environment loading machinery (`flash/envs/`).
 
-The training path is self-hostable end to end: with `FLASH_STANDALONE=1`, one GPU provider
-key, and a HuggingFace token, you can run SFT, GRPO, and on-policy distillation on your own
-hardware budget with no Freesolo backend involved. See
+The training path and proxy-style chat trace recording are self-hostable: with
+`FLASH_STANDALONE=1`, one GPU provider key, and a HuggingFace token, you can run SFT, GRPO,
+and on-policy distillation on your own hardware budget with no Freesolo backend involved. See
 **[SELF_HOSTING.md](SELF_HOSTING.md)**.
 
 Two components stay Freesolo-operated and are not in this repository:

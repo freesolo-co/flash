@@ -1,4 +1,4 @@
-"""SQLite store for control-plane keys, run ownership, and teacher capabilities."""
+"""SQLite store for control-plane keys, run ownership, traces, and teacher capabilities."""
 
 from __future__ import annotations
 
@@ -79,6 +79,35 @@ CREATE TABLE IF NOT EXISTS teacher_score_requests (
 );
 CREATE INDEX IF NOT EXISTS teacher_score_requests_state_idx
   ON teacher_score_requests(state, updated_at);
+CREATE TABLE IF NOT EXISTS llm_traces (
+  id          TEXT PRIMARY KEY,
+  created_at  REAL NOT NULL,
+  key_id      INTEGER NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+  project_id  TEXT NOT NULL,
+  model       TEXT,
+  trace_title TEXT,
+  metadata    TEXT
+);
+CREATE INDEX IF NOT EXISTS llm_traces_key_project_created_idx
+  ON llm_traces(key_id, project_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS llm_trace_spans (
+  id             TEXT PRIMARY KEY,
+  created_at     REAL NOT NULL,
+  llm_trace_id   TEXT NOT NULL REFERENCES llm_traces(id) ON DELETE CASCADE,
+  name           TEXT,
+  provider       TEXT,
+  model          TEXT,
+  duration_ms    INTEGER,
+  input_tokens   INTEGER,
+  output_tokens  INTEGER,
+  input_payload  TEXT,
+  output_payload TEXT,
+  attributes     TEXT,
+  status_code    TEXT,
+  error          TEXT
+);
+CREATE INDEX IF NOT EXISTS llm_trace_spans_trace_idx
+  ON llm_trace_spans(llm_trace_id, created_at);
 """
 
 

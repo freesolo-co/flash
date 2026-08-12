@@ -74,27 +74,34 @@ def fetch_records(
     project_id: str,
     api_key: str | None = None,
     export_format: str = RECORDS_FORMAT,
+    base_url: str | None = None,
 ) -> dict:
     """A project's traces in the requested shape, converted server-side.
 
     Omitting `api_key` reads the stored credential, which is right for `env_setup`'s call: it holds
     no snapshot this key has to agree with.
     """
-    key = _require_api_key(api_key or load_credentials()[1])
-    return export_trace_records(project_id, key, export_format=export_format)
+    if api_key is None:
+        api_url, snapshot_key = load_credentials()
+        key = _require_api_key(snapshot_key)
+        if base_url is None and not has_freesolo_backend(api_url):
+            base_url = api_url
+    else:
+        key = _require_api_key(api_key)
+    return export_trace_records(project_id, key, base_url, export_format=export_format)
 
 
-def fetch_projects(api_key: str) -> list[dict]:
-    """Projects in the caller's org that traces can be exported from."""
-    return list_trace_projects(api_key)
+def fetch_projects(api_key: str, base_url: str | None = None) -> list[dict]:
+    """Projects in the caller's trace store that can be exported from."""
+    return list_trace_projects(api_key, base_url)
 
 
-def _resolve_project_id(args, api_key: str) -> str:
+def _resolve_project_id(args, api_key: str, base_url: str | None = None) -> str:
     project_id = getattr(args, "project", None)
     if project_id:
         return str(project_id)
 
-    projects = fetch_projects(api_key)
+    projects = fetch_projects(api_key, base_url)
     if not projects:
         raise ClientError(
             "no projects with traces found for this account. Record traces with the freesolo "
@@ -143,35 +150,20 @@ def _empty_export_error(project_id: str, export_format: str) -> ClientError:
 
 
 def cmd_traces_export(args) -> int:
-    from flash.cli.commands import unavailable_without_a_freesolo_backend
-
-    # one snapshot for both: the url decides whether to refuse, and the key from that same read is
-    # what gets sent, so a concurrent `flash login` cannot pair this url with a later credential.
+    # one snapshot for both: the url decides which trace store to call, and the key from that same
+    # read is what gets sent, so a concurrent `flash login` cannot pair this url with a later
+    # credential and disclose either credential to the wrong service.
     api_url, snapshot_key = load_credentials()
-    if not has_freesolo_backend(api_url):
-        # unlike `projects create`, there is nothing local to substitute: traces are written by the
-        # freesolo SDK into the hosted backend, and flash itself never records one. so a
-        # self-hosted plane has no trace store to read, not merely no route to it.
-        raise unavailable_without_a_freesolo_backend(
-            "exporting traces",
-            because=(
-                "traces are recorded by the freesolo SDK into the hosted backend, which a "
-                "self-hosted plane does not have"
-            ),
-            instead=(
-                'write the same {"input", "output"} JSONL rows yourself and train on them '
-                f"directly (`{CLI_NAME} env setup` scaffolds the format)"
-            ),
-        )
     api_key = _require_api_key(snapshot_key)
-    project_id = _resolve_project_id(args, api_key)
+    trace_base_url = None if has_freesolo_backend(api_url) else api_url
+    project_id = _resolve_project_id(args, api_key, trace_base_url)
     export_format = getattr(args, "format", None) or RECORDS_FORMAT
 
     output = Path(getattr(args, "output", None) or default_output_path(export_format))
     if output.exists() and not getattr(args, "force", False):
         raise ClientError(f"{output} already exists; pass --force to overwrite it")
 
-    exported = fetch_records(project_id, api_key, export_format)
+    exported = fetch_records(project_id, api_key, export_format, trace_base_url)
 
     # old backends omit the format label and can only mean records. when a label is present it must
     # match the request, or rows could be mislabeled and later fed to an incompatible env/train path.
