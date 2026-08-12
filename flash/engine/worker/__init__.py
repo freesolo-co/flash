@@ -80,6 +80,7 @@ from flash.engine.worker.perf import (
     grad_checkpointing_on,
     grpo_use_reentrant,
     is_cuda_oom,
+    preflight_free_vram,
     wait_for_gpu,
 )
 from flash.engine.worker.runtime.kernel_warmup import _current_cuda_sm, load_mega_cache
@@ -220,6 +221,40 @@ def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
     return {"retriable": retriable, "oom": (not retriable and is_cuda_oom(exc))}
 
 
+def _preflight_free_vram_for_spec() -> None:
+    """Reject a card that arrived without the free VRAM this run was sized for.
+
+    Single-GPU only, deliberately. ``combined_vram_gb`` makes multi-card fit non-linear (a
+    replicated per-card floor plus a sharding efficiency term), so there is no honest per-device
+    requirement to compare ``mem_get_info`` against without reimplementing that model here -- and a
+    second sizing model that disagrees with the allocator's would reject shapes the allocator
+    correctly placed. Single-GPU is where the co-tenancy was observed and where the arithmetic is
+    exact: one device, one requirement.
+    """
+    if JOB_SPEC is None:
+        return
+    from flash.core.spec import gpu_count_of
+
+    if gpu_count_of(JOB_SPEC) > 1:
+        return
+    try:
+        from flash.providers.allocator import required_vram_gb
+
+        required = required_vram_gb(
+            JOB_SPEC.model,
+            JOB_SPEC.algorithm,
+            train=JOB_SPEC.train,
+            thinking=bool(JOB_SPEC.thinking),
+            model_revision=JOB_SPEC.model_revision or "",
+        )
+    except Exception as exc:
+        # sizing is the allocator's job and it already ran at submit; a failure to REPRODUCE it here
+        # is not grounds to fail a run that the control plane sized successfully.
+        print("free-vram preflight: could not size run:", sanitize_diagnostic(exc, limit=200))
+        return
+    preflight_free_vram(float(required))
+
+
 THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
@@ -332,6 +367,11 @@ def _run_worker_mode() -> None:
     # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
     _restrict_fla_gdn_autotune_on_blackwell()
     heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
+    # the boot heartbeat above already carries free VRAM; act on it here rather than only recording
+    # it. a card handed over with a co-tenant's ~18GB still resident fails the run either way, and
+    # the only question is whether that happens now or after the model download and FSDP init have
+    # spent ~80s of paid GPU reaching the same conclusion.
+    _preflight_free_vram_for_spec()
     load_mega_cache()
     handler()
     # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.

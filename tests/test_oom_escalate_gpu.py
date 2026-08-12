@@ -377,3 +377,78 @@ def test_worker_failure_flags_prioritize_retriable_over_oom(monkeypatch):
         "retriable": True,
         "oom": False,
     }
+
+
+def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
+    """A co-tenanted card must retry on a FRESH instance, not escalate to a bigger one.
+
+    The observed failure: Flash sized the run at >=19 GB, RunPod handed over a 4090 reporting
+    total=22.5 used=18.6 free=3.4, with only 0.486 GB owned by any process in our container. The
+    sizing was right and the card was dirty, but the run trained anyway and died on an OOM ~80s of
+    paid GPU later -- classified `oom`, which escalates to a larger card and spends the small OOM
+    retry budget. Both are the wrong recovery for a card that was merely occupied.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "free_vram_gb", lambda: 3.4)
+    with pytest.raises(lc.DirtyGpuError) as excinfo:
+        lc.preflight_free_vram(19.0)
+
+    assert "3.4 GB free" in str(excinfo.value)
+    # the whole point: infra retry (same shape, fresh instance), NOT an oom escalation.
+    monkeypatch.setattr(worker, "is_cuda_oom", lambda _exc: False)
+    assert worker._worker_failure_flags(excinfo.value) == {"retriable": True, "oom": False}
+
+
+@pytest.mark.parametrize(
+    ("free_gb", "required_gb"),
+    [
+        (22.1, 19.0),  # a clean card
+        (18.6, 19.0),  # misses by less than the headroom shave -- would have fitted
+        (19.0, 19.0),  # exactly the requirement
+    ],
+)
+def test_preflight_accepts_a_card_that_can_run_the_job(monkeypatch, free_gb, required_gb):
+    """The gate catches a grossly occupied card; it is not a second sizing model.
+
+    Rejecting a card that misses the estimate by a rounding error throws away a good instance and
+    bills for another, so the check deliberately shaves headroom off the requirement.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "free_vram_gb", lambda: free_gb)
+    lc.preflight_free_vram(required_gb)
+
+
+def test_preflight_is_inert_when_free_vram_cannot_be_read(monkeypatch):
+    """No CUDA, or a driver that will not answer, is not evidence of a dirty card."""
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "free_vram_gb", lambda: None)
+    lc.preflight_free_vram(19.0)
+    lc.preflight_free_vram(0)  # unsized run: nothing to compare against
+
+
+def test_free_vram_reads_the_driver_not_the_torch_allocator(monkeypatch):
+    """The co-tenant's memory is invisible to the torch allocator, so it must not be the source.
+
+    `memory_allocated`/`memory_reserved` only count what THIS process reserved. A card holding 18 GB
+    of another container's work reports 0 reserved here, which would read as entirely free.
+    """
+    import sys
+    import types
+
+    from flash.engine.worker.perf import lifecycle as lc
+
+    torch = types.ModuleType("torch")
+    torch.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        # driver: 3.4 GB free of 22.5 GB. allocator: this process has reserved nothing.
+        mem_get_info=lambda: (int(3.4 * 1024**3), int(22.5 * 1024**3)),
+        memory_allocated=lambda: 0,
+        memory_reserved=lambda: 0,
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+    assert lc.free_vram_gb() == pytest.approx(3.4, abs=0.05)
