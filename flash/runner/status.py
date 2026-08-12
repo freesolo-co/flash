@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 import os
 import time
 
@@ -84,9 +83,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     stored_rollout_batch = runner._stored_rollout_batch_spelling(raw_worker)
     stored_public_rollout_batch = runner._stored_rollout_batch_spelling(raw_public)
     has_workload_profile = bool(
-        worker_spec.workload_profile_kind
-        or worker_spec.workload_profile_input_digest
-        or worker_spec.workload_profile
+        worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
     # the auto-pin marker is excluded from the structural compare (the public half always reads
     # False by construction), so nothing else here would catch a forged worker-half marker. deploy
@@ -279,33 +276,6 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             status = runner.get_status(run_id)
         except FileNotFoundError:
             return
-        # atomically store a profile's first current-attempt heartbeat arm and deadline; readers reject
-        # a partial pair as tampering. reused run ids can retain an earlier lifecycle's heartbeat, so
-        # provenance must pass before the work budget starts.
-        arm_kwargs: dict[str, float] = {}
-        raw = runner._load_status_json(run_id)
-        armed_spec = runner._internal_spec_from_status(status)
-        if armed_spec.workload_profile_kind and runner._profile_wall_armed_at(raw) is None:
-            hb_ts = hb.get("ts") if isinstance(hb, dict) else None
-            fresh = (
-                not isinstance(hb_ts, bool)
-                and isinstance(hb_ts, (int, float))
-                and math.isfinite(float(hb_ts))
-                and float(hb_ts) >= runner._require_valid_deadline(status.created_at)
-                # ...and it must be THIS attempt. a timestamp test alone admits a still-live worker
-                # from a cancelled earlier lifecycle: it writes to the same workload-derived prefix
-                # and its heartbeats are genuinely recent, so they pass `>= created_at` and arm the
-                # replacement's work budget while it is still queuing for capacity.
-                and runner._heartbeat_attempt_is_current(hb, raw)
-            )
-            if fresh:
-                armed_at = time.time()
-                arm_kwargs = {
-                    "_profile_wall_armed_at": armed_at,
-                    "_run_deadline_at": runner._require_valid_deadline(
-                        armed_at + runner._require_valid_deadline(armed_spec.gpu.max_wall_seconds)
-                    ),
-                }
         # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
         # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
         # metrics-bearing heartbeat lands.
@@ -320,7 +290,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
         status.updated_at = time.time()
-        runner._save_status_unlocked(status, **arm_kwargs)
+        runner._save_status_unlocked(status)
     runner._report_status(status)
 
 
@@ -333,24 +303,6 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     from flash.engine.result.accounting import sanitize_worker_metrics
 
     metrics = sanitize_worker_metrics(metrics)
-    if spec.workload_profile_kind:
-        from flash.engine.profiling.workload_profile import require_matching_sft_profile
-
-        profile = require_matching_sft_profile(
-            metrics.get("workload_profile"),
-            input_digest=spec.workload_profile_input_digest,
-            producer_version=spec.workload_profile_producer_version,
-            tokenizer_revision=spec.model_revision,
-        )
-        metrics = {**metrics, "workload_profile": profile.to_dict()}
-        current = runner.get_status(spec.run_id)
-        if current.state in runner.TERMINAL_STATES:
-            raise ValueError("workload profile metrics arrived after the run became terminal")
-        runner._update(
-            spec.run_id,
-            current.state,
-            workload_profile=profile.to_dict(),
-        )
     dest = runner.artifacts_dir(spec)
     os.makedirs(dest, exist_ok=True)
     # Use allocated_gpu (worker-stamped) not spec.gpu.type; policy GPUs can be reallocated.

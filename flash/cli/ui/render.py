@@ -7,6 +7,16 @@ import sys
 
 from flash._internal.channel import BRAND_NAME, CLI_NAME
 
+# Cost selection lives in `flash.cli.ui.cost` (split out to keep this module under the file-size
+# limit). Imported at the TOP rather than the bottom like `tables` below, because that module
+# depends on nothing here -- it decides a number, it renders nothing -- so there is no cycle to
+# order around. Re-exported so `render.run_cost` / `render.SETTLED_COST_STATES` keep resolving.
+from flash.cli.ui.cost import (  # noqa: F401
+    SETTLED_COST_STATES,
+    cost_estimate_reason,
+    run_cost,
+)
+
 _ROWS = (
     ("email", "account"),
     ("org_id", "org"),
@@ -351,33 +361,6 @@ def money(value: float, decimals: int = 4) -> str:
     return _paint(f"${value:.{decimals}f}", _TEAL)
 
 
-# the states after which `cost_usd` is the settled charge. before one of these the field is still
-# 0.0, because the server only writes it on the terminal transition. kept here rather than imported
-# from flash.runner so this module stays stdlib-only; the set is asserted against the runner's
-# TERMINAL_STATES in the test suite so the two cannot drift.
-SETTLED_COST_STATES = frozenset({"done", "failed", "cancelled", "dry_run", "deployed"})
-
-
-def run_cost(obj: dict) -> tuple[float, bool]:
-    """The cost to show for a run, and whether it is a pre-settlement estimate.
-
-    ``cost_usd`` is only written when a run reaches a terminal state, so a run that is queued or
-    training reports 0.0 -- which reads as "this has cost nothing", exactly when the GPU is billing.
-    The submit-time quote is already on the record as ``estimated_cost_usd``; prefer it while the
-    run is live so current spend is never understated as free.
-    """
-    settled = float(obj.get("cost_usd") or 0.0)
-    if str(obj.get("state") or "") in SETTLED_COST_STATES:
-        return settled, False
-    if settled:
-        # a live run that has already accrued a measured cost: that number beats the submit quote.
-        return settled, True
-    quote = obj.get("estimated_cost_usd")
-    if isinstance(quote, (int, float)):
-        return float(quote), True
-    return settled, False
-
-
 def _kv(pairs: list[tuple[str, str | None]], indent: int = 2) -> str:
     """Aligned ``key · value`` panel; keys dimmed and padded to a common width."""
     rows = [(k, v) for k, v in pairs if v is not None]
@@ -515,7 +498,9 @@ def run_status(obj: dict) -> str:
     where = gpu_label(spec, obj.get("remote") or {}) or None
     amount, is_estimate = run_cost(obj)
     cost = (
-        f"{money(amount)} {_dim('(estimate, run in progress)')}" if is_estimate else money(amount)
+        f"{money(amount)} {_dim(f'({cost_estimate_reason(obj)})')}"
+        if is_estimate
+        else money(amount)
     )
     pairs = [
         ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
@@ -676,7 +661,7 @@ def cost_panel(est) -> str:
     return _safe(out)
 
 
-def exact_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
+def sft_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
     """Profile-backed cost estimate (sft), whose inputs are measured rather than modelled.
 
     Deliberately not cost_panel(): that panel's gpu/per-step/wall rows come from a local
@@ -688,7 +673,7 @@ def exact_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> st
         f"  {_paint('TOTAL'.ljust(8), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} "
         f"{_paint(f'${total_usd:.2f}', _TEAL, '1')}"
     )
-    head = header("train", "exact cost estimate (measured workload)")
+    head = header("train", "cost estimate (packaged dataset rows)")
     return _safe(f"{head}\n{panel}\n{_rule()}\n{total}")
 
 

@@ -138,6 +138,32 @@ def test_arch_dims_revision_nonzero_mismatch_still_fails_closed(monkeypatch):
         sft._model_arch_dims("Qwen/Qwen3.6-35B-A3B", revision="refs/pr/123")
 
 
+def test_control_plane_tokenizer_disables_remote_repository_code_without_changing_workers(
+    monkeypatch,
+):
+    calls = []
+
+    class _AutoTokenizer:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            calls.append((model_id, kwargs))
+            return object()
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoTokenizer = _AutoTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    from flash.engine.profiling.tokenizer import load_control_plane_tokenizer, load_tokenizer
+
+    load_control_plane_tokenizer("org/model", revision="refs/pr/123")
+    load_tokenizer("org/model", revision="refs/pr/123")
+
+    assert calls == [
+        ("org/model", {"trust_remote_code": False, "revision": "refs/pr/123"}),
+        ("org/model", {"trust_remote_code": True, "revision": "refs/pr/123"}),
+    ]
+
+
 def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
     calls = []
 
@@ -1798,9 +1824,9 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
         )
 
     # sft is conditional where grpo/opd are unconditional, and the condition is the whole point: a
-    # PACKED gdn profile has packed neighbours to contaminate, so it must take the raising gate. the
-    # quote-side gate cannot answer this -- it is device-independent by construction (the profile job
-    # is cpu-only), so it proves the kernels are installed, never that the conv kernel runs on this
+    # packed gdn profile has packed neighbours to contaminate, so it must take the raising gate. the
+    # control-plane gate cannot answer this because it is device-independent by construction, so it
+    # proves the kernels are installed, never that the conv kernel runs on this
     # card. only the child probe knows. an exact-unpacked run keeps the soft form because
     # examples_per_update is 1.
     sft_src = _inspect.getsource(sft_train.run_sft_train)

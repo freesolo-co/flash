@@ -124,15 +124,15 @@ def select_sft_examples(train, max_examples, seed):
     return selected
 
 
-def sft_under_ran(final_step: int, update_horizon: int, max_steps: int) -> bool:
-    """True when a max_steps-authoritative run completed fewer updates than requested.
+def sft_under_ran(final_step: int, update_horizon: int) -> bool:
+    """True when the run completed fewer updates than the horizon it was quoted and billed for.
 
-    with max_steps authoritative, the trainer's max_steps override lands a fresh run exactly on
-    the horizon, and a resume from a checkpoint past a lowered horizon does zero new steps yet
-    holds a fully-trained adapter (final_step >= horizon). fail loudly only on a genuine
-    under-run, mirroring grpo (steps_run < steps) and opd (opt_steps < steps).
+    the horizon caps every run (trainer.total_training_steps in _prepare_sft_child), so a fresh run
+    lands exactly on it. a resume from a checkpoint past a lowered horizon does zero new steps yet
+    holds a fully-trained adapter (final_step >= horizon). fail loudly only on a genuine under-run,
+    mirroring grpo (steps_run < steps) and opd (opt_steps < steps).
     """
-    return int(max_steps) > 0 and int(final_step) < int(update_horizon)
+    return int(final_step) < int(update_horizon)
 
 
 def _reject_image_completion(completion) -> None:

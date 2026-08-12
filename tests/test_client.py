@@ -72,15 +72,14 @@ def stub():
             if self.path == "/v1/runs/json-chat/chat":
                 self._send(200, {"choices": [{"message": {"content": "json reply"}}]})
                 return
-            if self.path == "/v1/runs" and seen["body"].get("spec", {}).get("model") == "pending":
+            if self.path == "/v1/runs" and seen["body"].get("spec", {}).get("model") == "rejected":
                 self._send(
-                    409,
+                    400,
                     {
                         "detail": {
-                            "code": "workload_profile_pending",
-                            "profile_run_id": "profile-sft-abc",
-                            "state": "queued",
-                            "owned": False,
+                            "code": "packaged_dataset_unavailable",
+                            "path": "dataset/train.jsonl",
+                            "retryable": False,
                         }
                     },
                 )
@@ -248,33 +247,23 @@ def test_api_error_carries_server_detail(stub):
 
 
 def test_api_error_preserves_a_structured_detail_over_the_wire(stub):
-    """The pending payload has to arrive as a dict, not as the repr of one.
-
-    Every caller-visible behaviour on a profile miss -- naming the run, quoting its separate
-    charge, deciding whether to tell the user to poll it -- is a branch on a key of this dict. If
-    the transport flattened it to a string the code lookup would return "" and the miss would
-    surface as a bare 409 traceback, which is the same failure whether the server is right or not.
-    """
+    """structured server detail arrives as a dict rather than its repr."""
     url, _ = stub
     client = ApiClient(url, "fslo-user-test")
 
     with pytest.raises(ApiError) as excinfo:
-        client.create_run({"model": "pending", "project": _PROJECT_ID})
+        client.create_run({"model": "rejected", "project": _PROJECT_ID})
 
     exc = excinfo.value
-    assert exc.status == 409
+    assert exc.status == 400
     assert exc.detail == {
-        "code": "workload_profile_pending",
-        "profile_run_id": "profile-sft-abc",
-        "state": "queued",
-        "owned": False,
+        "code": "packaged_dataset_unavailable",
+        "path": "dataset/train.jsonl",
+        "retryable": False,
     }
-    # `code` reads through to the dict, and False survives as False rather than as the string
-    # "False" -- which is truthy, and would flip the ownership branch to the wrong wording.
-    assert exc.code == "workload_profile_pending"
-    assert exc.detail["owned"] is False
-    # the message still stringifies for callers that only print it.
-    assert "workload_profile_pending" in str(exc)
+    assert exc.code == "packaged_dataset_unavailable"
+    assert exc.detail["retryable"] is False
+    assert "packaged_dataset_unavailable" in str(exc)
 
 
 def test_api_error_mentions_env_override(stub):

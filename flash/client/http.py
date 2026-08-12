@@ -546,11 +546,9 @@ class ApiClient:
         if runtime_secrets:
             body["runtime_secrets"] = runtime_secrets
         if dry_run:
-            # server-side preview: runs the same validation/preflights as a real submit and records
-            # a state=dry_run run, but allocates no training gpu and charges nothing for training.
-            # returns that status. an sft preview additionally requires an exact workload profile;
-            # on a miss the server starts that separate, separately billed profile run and answers
-            # 409 workload_profile_pending, so a preview is free of training spend, not all spend.
+            # server-side preview: runs the same validation and preflights as a real submit, records
+            # a state=dry_run run, allocates no training gpu, and charges nothing. sft also reads the
+            # pinned package's dataset file and rejects a missing or unreadable file before allocation.
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema

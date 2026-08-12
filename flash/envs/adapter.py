@@ -16,6 +16,7 @@ from flash.envs.base import (
     BaseEnvironment,
     RolloutReward,
     map_bounded,
+    with_system_prompt,
 )
 from flash.envs.loader import (
     GitHubEnvironmentRef,
@@ -169,25 +170,7 @@ class FreesoloEnvironment(BaseEnvironment):
         return self._task_example_from_record(self._canonical_record(example))
 
     def _with_system_prompt(self, messages: list[dict]) -> list[dict]:
-        """Ensure the training contract rides as the system prompt (fill blank / prepend)."""
-        system_text = str(self._contract_text or "").strip()
-        out = [dict(message) for message in messages]
-        if not system_text:
-            return out
-        first_blank_system_index: int | None = None
-        for index, message in enumerate(out):
-            if str(message.get("role") or "").strip().lower() != "system":
-                continue
-            content = message.get("content")
-            has_content = bool(content.strip()) if isinstance(content, str) else bool(content)
-            if has_content:
-                return out
-            if first_blank_system_index is None:
-                first_blank_system_index = index
-        if first_blank_system_index is not None:
-            out[first_blank_system_index]["content"] = system_text
-            return out
-        return [{"role": "system", "content": system_text}, *out]
+        return with_system_prompt(messages, self._contract_text)
 
     def _canonical_record(self, record: dict) -> dict:
         raw = dict(record)

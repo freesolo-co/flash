@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import threading
+from dataclasses import replace
 
 import pytest
 
@@ -113,6 +114,21 @@ def _seed_status(orch, spec):
     st = orch.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
     orch._save_status(st)
     return st
+
+
+def test_control_plane_rejects_a_profiler_result_with_the_wrong_identity(orch, monkeypatch):
+    import flash.engine.profiling.dataset_profile as dataset_profile
+
+    spec = satisfy_sft_profile(orch, monkeypatch, _spec(type="H200"))
+    honest = dataset_profile.profile_packaged_sft_dataset(spec, producer_version="ignored")
+    monkeypatch.setattr(
+        dataset_profile,
+        "profile_packaged_sft_dataset",
+        lambda *_args, **_kwargs: replace(honest, input_digest="f" * 64),
+    )
+
+    with pytest.raises(ValueError, match="input digest"):
+        orch._require_sft_workload_profile(spec)
 
 
 def test_exact_only_preflight_rejects_unconfigured_provider_set_before_persistence(
@@ -544,9 +560,8 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
 
     public = _public_spec()
-    # the profile job for this workload already ran, so preparation reads its record instead of
-    # queueing another one. it is keyed on the two shas submission itself resolves above, so it has
-    # to be recorded against those -- not against the helper's stand-ins.
+    # stub the static dataset estimate against the two revisions submission resolves above, not
+    # against the helper's stand-ins.
     record_sft_profile(
         orch,
         replace(
@@ -554,6 +569,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
             model_revision=resolved_model_sha,
             environment=replace(public.environment, resolved_sha=resolved_sha),
         ),
+        monkeypatch,
     )
 
     status = orch.submit_job(public)
@@ -607,7 +623,9 @@ def test_sft_submission_fails_closed_when_the_environment_cannot_be_pinned(orch,
         allocator, "allocate", lambda *a, **k: pytest.fail("allocated without a profile")
     )
 
-    with pytest.raises(orch.WorkloadProfileUnavailable, match="immutable resolved environment"):
+    with pytest.raises(
+        orch.WorkloadProfileUnavailable, match="pinned environment package revision"
+    ):
         orch.submit_job(_public_spec())
 
     assert persisted == []
@@ -1545,6 +1563,138 @@ def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monk
     assert "the class may change" in action, action
 
 
+def test_retry_message_admits_when_the_projected_provider_already_failed(orch, monkeypatch):
+    """A retry that clamps back onto a provider this run already lost on is not a failover.
+
+    ``_select_candidate`` escapes a failed provider only while some candidate has an unfailed one:
+    the key is ``provider in failed_providers``, so once every candidate's provider has failed it is
+    True for all of them and the escape degrades to plain cheapest-first. The line then reads as
+    recovery while the run loops on the substrate that is failing -- the shape of a 46-attempt
+    profile loop that printed a failover target it never acted on. The operator's fix is another
+    provider, not more waiting, so the message has to say the pool is exhausted.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    # one provider, two fitting classes: every candidate's provider fails together.
+    candidates = (
+        Candidate("runpod", "A100 PCIe", 1.2, 40),
+        Candidate("runpod", "A100 SXM", 1.8, 80),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        on_handle(_runpod_handle("ep1", "j1", attempt))
+        if attempt < 2:
+            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=2)
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, spec.seed, log)
+
+    # attempt 0 fails runpod, and the only other candidate is also runpod, so the "failover" is
+    # back onto the provider that just failed.
+    action = _retry_action_line(log.getvalue(), 0)
+    assert "already lost an attempt on" in action, action
+    # every fitting candidate really is runpod here, so denying another provider is true.
+    assert "no other provider offers a fitting class" in action, action
+
+
+def test_retry_message_does_not_deny_a_provider_that_is_in_the_candidate_list(orch, monkeypatch):
+    """Landing on a failed provider proves no UNFAILED one is left, not that none exists.
+
+    With fitting candidates on two providers that have both failed, ``_select_candidate``'s first
+    key is True for either, so the projection lands on a failed provider while another provider sits
+    in the very list the message is derived from. Claiming none offers a fitting class would deny
+    that provider and push the operator toward the wrong remedy -- the answer there is to unpin or
+    wait for one of them to recover, not to go find a provider that is already on the list.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    # two providers, both of which this run burns through.
+    candidates = (
+        Candidate("runpod", "A100 PCIe", 1.2, 40),
+        Candidate("vast", "A100 SXM", 1.8, 80),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        on_handle(_runpod_handle("ep1", "j1", attempt))
+        if attempt < 2:
+            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=2)
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, spec.seed, log)
+
+    # attempt 1 projects back onto a failed provider while the other one is still in the list.
+    action = _retry_action_line(log.getvalue(), 1)
+    assert "already lost an attempt on" in action, action
+    assert "no other provider offers a fitting class" not in action, action
+    assert "has now failed" in action, action
+    # and it names them rather than implying the list is empty.
+    assert "runpod" in action, action
+    assert "vast" in action, action
+
+
+def test_a_genuine_cross_provider_failover_is_not_labelled_exhausted(orch, monkeypatch):
+    """The admission must not fire when the retry really does escape to a different provider."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("runpod", "A100 PCIe", 1.2, 40),
+        Candidate("lambda", "A100 PCIe", 1.5, 40),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        on_handle(_runpod_handle("ep1", "j1", attempt))
+        return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=1)
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, log)
+
+    action = _retry_action_line(log.getvalue(), 0)
+    assert "@ lambda" in action, action
+    assert "already lost an attempt on" not in action, action
+
+
 def test_last_gpu_retry_message_names_the_clamped_back_class_not_the_current_one(orch, monkeypatch):
     """on_last_gpu means no UNTRIED class is left -- NOT that the current class is reused. With two
     fitting classes the walk is PCIe, SXM, then back to the cheaper PCIe, so the message printed on
@@ -1964,3 +2114,120 @@ def test_worker_pip_with_extras_dedupes_and_ignores_blanks() -> None:
     ]
     assert worker_pip_with_extras("e", ["  pymongo  ", ""]) == ["freesolo>=0.4.1", "pymongo"]
     assert worker_pip_with_extras("e", None) == ["freesolo>=0.4.1"]
+
+
+def _submit_failure(provider_obj):
+    """Drive the real ``_submit_provider`` against a provider whose submit raises.
+
+    Stubs only what stands between the call and the ``except`` clause under test: provider lookup,
+    the teacher-secret transport, and the persisted run deadline. The handler itself is untouched.
+    """
+    import contextlib as _contextlib
+
+    import flash.providers as _providers
+    import flash.runner as _runner
+    import flash.server.domain.teacher_broker as _broker
+    from flash.runner.supervise import seed_submission as _ss
+
+    @_contextlib.contextmanager
+    def _no_secrets(*_a, **_kw):
+        yield {}
+
+    saved = (
+        _providers.get_provider,
+        _broker.teacher_attempt_transport,
+        _runner._load_run_deadline_at,
+        _runner._worker_deadline_at,
+    )
+    _providers.get_provider = lambda _name: provider_obj
+    _broker.teacher_attempt_transport = _no_secrets
+    _runner._load_run_deadline_at = lambda _run_id: 1.0e12
+    _runner._worker_deadline_at = lambda _run_id, _spec: 1.0e12
+    try:
+        spec = _spec()
+        ctx = _ss._SubmitContext(
+            spec=spec,
+            seed=spec.seed,
+            log=io.StringIO(),
+            runtime_secrets={},
+            code_prefix="p",
+            attempt_start=0,
+            infra_budget=1,
+            retry_budget=None,
+            started_with_shared_cache=False,
+        )
+        prepared = _ss._PreparedAttempt(
+            local_attempt=0, attempt=0, attempt_spec=spec, runtime_secrets={}
+        )
+        plan = _ss._CandidatePlan(
+            allocation=None,
+            candidates=(),
+            chosen=_Chosen("vast", "RTX 4090"),
+            on_last_gpu=False,
+            effective_spec=spec,
+            run_spec=spec,
+        )
+        return _ss._submit_provider(ctx, prepared, plan)
+    finally:
+        (
+            _providers.get_provider,
+            _broker.teacher_attempt_transport,
+            _runner._load_run_deadline_at,
+            _runner._worker_deadline_at,
+        ) = saved
+
+
+class _Chosen:
+    def __init__(self, provider, gpu):
+        self.provider = provider
+        self.gpu = gpu
+        self.gpu_count = 1
+
+
+def _submit_failure_with_secret(exc):
+    class _Boom:
+        def submit_run(self, *_a, **_kw):
+            raise exc
+
+    return _submit_failure(_Boom())
+
+
+def test_the_pool_exhaustion_message_survives_supervision():
+    """The one submit-side message worth reading has to reach the operator, not just its class.
+
+    Supervision replaced every submit exception with `provider submit failed (<ClassName>)`, which
+    is the same line whether the market is dry or this run has burned every host in the class
+    itself. Those have different operator fixes -- wait, versus another class or provider -- so an
+    error that draws the distinction is worthless if it is discarded one frame later.
+    """
+    from flash.providers.base import RunExhaustedProviderPoolError
+
+    class _Boom:
+        def submit_run(self, *_a, **_kw):
+            raise RunExhaustedProviderPoolError(
+                "no usable vast offers for RTX 4090 outside the 3 machine(s) this run "
+                "already rented and lost"
+            )
+
+    result, retriable = _submit_failure(_Boom())
+
+    assert retriable
+    assert result.failure == "no_capacity"
+    assert "already rented and lost" in result.detail, result.detail
+
+
+def test_generic_provider_exception_text_still_never_reaches_the_run_record():
+    """Only the AUTHORED message is surfaced; provider text keeps its class-name-only treatment.
+
+    A provider exception can quote a request body, and this detail is persisted. `sanitize_diagnostic`
+    would not save it: that redacts CONFIGURED secrets, so arbitrary provider text passes straight
+    through. Surfacing the authored error is safe precisely because Flash writes that string.
+    """
+    from flash.providers.vast.api import VastApiError
+
+    result, _ = _submit_failure_with_secret(
+        VastApiError("create rejected: body echoed a token nobody registered")
+    )
+
+    assert "body echoed a token nobody registered" not in result.detail, result.detail
+    assert result.detail == "provider submit failed (VastApiError)", result.detail

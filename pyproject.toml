@@ -52,8 +52,8 @@ gpu = [
 # operations (create_commit / create_repo / update_repo_settings) and the wrappers also bound an
 # overall deadline. (>=0.34 was already required for upload_code()'s update_repo_settings(private=True);
 # 0.25.x only accepts `gated` and raises TypeError on `private`.)
-# SFT `flash train --cost` no longer imports Freesolo environments to count data. It requires
-# [train].max_examples to be set explicitly, so the estimate never guesses a hidden dataset size.
+# sft cost, dry-run, and submit statically read packaged rows plus the defined training contract.
+# environment.py is not imported; other environment prompt transformations remain estimate gaps.
 server = [
     "fastapi",
     "uvicorn",

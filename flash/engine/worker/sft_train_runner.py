@@ -236,19 +236,31 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
         producer_version=producer_version,
         tokenizer_revision=options.model_revision,
     )
-    if prepared_workload.profile != expected_profile:
-        raise ValueError("sft workload changed after the quote was frozen")
-
     rows = prepared_workload.rows
-    profile = prepared_workload.profile
-    # the context window comes from the profile, not a second reading of the train fields. the
-    # rows were truncated at the profile's max_length and the quote was priced at it, so a
-    # locally re-derived value could disagree with both while the parity check above still
-    # passed: that check compares two values the workload module produced, so it cannot see a
-    # third derivation living here.
-    max_length = _sft_train._sft_profile_max_length(profile)
-    dropped = profile.dropped_examples
-    selected_count = profile.selected_examples
+    realized_profile = prepared_workload.profile
+    # the control-plane profile uses raw packaged record fields and deliberately does not execute
+    # environment.py. training does execute the environment, so filtering and prompt construction may
+    # change token totals. keep the quote profile as the packing and step contract while using the
+    # recomputed measurements and rows for the environment-produced training data.
+    if expected_profile.packing_mode == "packed" and realized_profile.packing_mode != "packed":
+        raise RuntimeError(
+            "the accepted sft quote requires packed execution, but this worker cannot reproduce its "
+            "boundary-safe packing contract"
+        )
+    if expected_profile.examples_per_update > len(rows):
+        raise RuntimeError(
+            "the accepted sft quote requires more examples per update than the environment retained; "
+            "refusing to change the accepted training and billing contract"
+        )
+    if realized_profile != expected_profile:
+        print(
+            "[sft][warn] environment processing changed the packaged-dataset token estimate; "
+            "training continues on the environment-produced rows, and the accepted quote is unchanged"
+        )
+    profile = expected_profile
+    max_length = _sft_train._sft_profile_max_length(realized_profile)
+    dropped = realized_profile.dropped_examples
+    selected_count = realized_profile.selected_examples
     sampled_texts = prepared_workload.sampled_texts
     multiturn_targets = prepared_workload.multiturn_targets
     coerced_singleturn_targets = prepared_workload.coerced_singleturn_targets
@@ -279,9 +291,9 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
             "training on non-reasoning targets teaches the model to skip thinking"
         )
 
-    total_tokens_per_epoch = profile.real_tokens_per_epoch
-    realized_max_length = profile.realized_max_length
-    masked_tokens = total_tokens_per_epoch - profile.supervised_tokens_per_epoch
+    total_tokens_per_epoch = realized_profile.real_tokens_per_epoch
+    realized_max_length = realized_profile.realized_max_length
+    masked_tokens = total_tokens_per_epoch - realized_profile.supervised_tokens_per_epoch
     print(
         f"[sft] completion-only loss: masking {masked_tokens}/{total_tokens_per_epoch} "
         f"({masked_tokens / total_tokens_per_epoch:.0%}) prompt tokens"
@@ -505,6 +517,51 @@ def _resolve_sft_run_identity(
     return loggers, project_name, _w.wandb_run_name()
 
 
+def _write_sft_child_shims(
+    options: _SftOptions,
+    model: _SftModelSetup,
+    *,
+    shim_dir: str,
+    custom_dataset_path: str,
+    seed: int,
+    loggers: list[str],
+    gdn_reset_arch: str | None,
+) -> tuple[str, tuple[str, ...]]:
+    """Write the child's sitecustomize and dataset module; return its marker file and shim names."""
+    core_source = _render_sft_sitecustomize(
+        seed=seed,
+        loraplus_ratio=_SFT_LORAPLUS_RATIO,
+        save_at_steps=options.save_at_steps,
+        total_steps=model.update_horizon,
+        reentrant_gradient_checkpointing=model.reentrant_gradient_checkpointing,
+    )
+    # both shims, not either: this one patches DistributedSampler/StatefulDataLoader so the child's
+    # row order matches the profile's byte for byte, and the gdn one patches the model's text
+    # forward to reset linear-attention state at packed example boundaries. different objects,
+    # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
+    core_source = _sft_train._append_exact_sft_dataloader_shim(core_source)
+    # every required fragment is wrapped fail-closed (see wrap_shim_fragment): execsitecustomize
+    # would otherwise swallow a fragment's exception and the child would train unpatched (no
+    # seeding, no exact dataloader order, no lora+, no boundary resets) while looking healthy.
+    # the wandb link shim stays unwrapped: it swallows its own failures by design and a logging
+    # link must not be able to abort paid training.
+    required_fragments = [("sft-core", core_source)]
+    if gdn_reset_arch is not None:
+        required_fragments.append(("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
+    shim_markers = shim_marker_file(shim_dir)
+    # the workdir is wiped per attempt (_resolve_sft_options), so no stale marker can survive here.
+    shim_source = render_shim_marker_prologue(shim_markers) + "".join(
+        wrap_shim_fragment(name, source) for name, source in required_fragments
+    )
+    if "wandb" in loggers:
+        shim_source += render_wandb_link_shim()
+    with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
+        file.write(shim_source)
+    with open(custom_dataset_path, "w", encoding="utf-8") as file:
+        file.write(_render_sft_dataset_module())
+    return shim_markers, tuple(name for name, source in required_fragments if source)
+
+
 def _prepare_sft_child(
     options: _SftOptions,
     data: _SftData,
@@ -559,44 +616,28 @@ def _prepare_sft_child(
         **_sft_train._sft_liger_config(),
         "gradient_checkpointing": model.gradient_checkpointing
         and not model.reentrant_gradient_checkpointing,
-        "total_training_steps": model.update_horizon if options.max_steps > 0 else None,
-        "total_epochs": options.epochs if options.max_steps <= 0 else None,
+        # the accepted quote's step count binds whether or not the user authored max_steps. the
+        # plane profiles raw records without running environment.py, so an environment that expands
+        # or replaces rows makes steps_per_epoch larger than the quote assumed; without an explicit
+        # cap the loop would run a full realized epoch past the horizon the run was priced and
+        # wall-budgeted for. build_sft_overrides rejects setting both, so the horizon replaces the
+        # epoch count rather than joining it -- loop_epochs already covers the authored epochs.
+        "total_training_steps": model.update_horizon,
+        "total_epochs": None,
         "use_remove_padding": use_remove_padding,
         # resolved from the out-of-process capability probe, never by opening cuda in this parent.
         "fused_ce_backend": _sft_train._resolve_sft_fused_ce_backend(capabilities.caps),
     }
     overrides = build_sft_overrides(config)
-    core_source = _render_sft_sitecustomize(
+    shim_markers, expected_shims = _write_sft_child_shims(
+        options,
+        model,
+        shim_dir=shim_dir,
+        custom_dataset_path=custom_dataset_path,
         seed=config["seed"],
-        loraplus_ratio=_SFT_LORAPLUS_RATIO,
-        save_at_steps=options.save_at_steps,
-        total_steps=model.update_horizon,
-        reentrant_gradient_checkpointing=model.reentrant_gradient_checkpointing,
+        loggers=loggers,
+        gdn_reset_arch=gdn_reset_arch,
     )
-    # both shims, not either: this one patches DistributedSampler/StatefulDataLoader so the child's
-    # row order matches the profile's byte for byte, and the gdn one patches the model's text
-    # forward to reset linear-attention state at packed example boundaries. different objects,
-    # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
-    core_source = _sft_train._append_exact_sft_dataloader_shim(core_source)
-    # every required fragment is wrapped fail-closed (see wrap_shim_fragment): execsitecustomize
-    # would otherwise swallow a fragment's exception and the child would train unpatched (no
-    # seeding, no exact dataloader order, no lora+, no boundary resets) while looking healthy.
-    # the wandb link shim stays unwrapped: it swallows its own failures by design and a logging
-    # link must not be able to abort paid training.
-    required_fragments = [("sft-core", core_source)]
-    if gdn_reset_arch is not None:
-        required_fragments.append(("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
-    shim_markers = shim_marker_file(shim_dir)
-    # the workdir is wiped per attempt (_resolve_sft_options), so no stale marker can survive here.
-    shim_source = render_shim_marker_prologue(shim_markers) + "".join(
-        wrap_shim_fragment(name, source) for name, source in required_fragments
-    )
-    if "wandb" in loggers:
-        shim_source += render_wandb_link_shim()
-    with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(shim_source)
-    with open(custom_dataset_path, "w", encoding="utf-8") as file:
-        file.write(_render_sft_dataset_module())
 
     # the RESOLVED width, not the allocated card count: it is what becomes --nproc-per-node below,
     # so the guard compares the checkpoint against the topology this attempt really launches. sft
@@ -653,7 +694,7 @@ def _prepare_sft_child(
         world_size=world_size,
         micro_batch=micro_batch,
         shim_markers=shim_markers,
-        expected_shims=tuple(name for name, source in required_fragments if source),
+        expected_shims=expected_shims,
     )
 
 
@@ -824,7 +865,7 @@ def _verify_sft_run(
     resume_step: int,
 ) -> _SftVerified:
     actor_dir, final_step = _sft_train.latest_global_step_dir(options.paths.local_dir)
-    if sft_under_ran(final_step, model.update_horizon, options.max_steps):
+    if sft_under_ran(final_step, model.update_horizon):
         raise RuntimeError(
             f"sft completed {final_step}/{model.update_horizon} requested optimizer updates"
         )

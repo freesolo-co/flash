@@ -829,9 +829,9 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     installation, LoRA+ B-matrix ratio plumbing, and the chunked_nll loss_type -- because they were
     properties of trl's SFTTrainer call, and verl owns its own loss and kernel path.
 
-    The optimizations now live in two modules rather than one. Dataset preprocessing moved to
-    flash.engine.profiling.sft_workload so the profile run and the training run share one implementation, and
-    the sizing/memory choices stayed with the trainer that makes them. Each assertion reads the
+    the optimizations now live in two modules rather than one. dataset preprocessing moved to
+    flash.engine.profiling.sft_workload so estimate construction and training share one implementation,
+    and the sizing/memory choices stayed with the trainer that makes them. each assertion reads the
     module that actually owns its behaviour: pointing them all at one module would let a symbol
     disappear from the other and still pass.
     """
