@@ -832,6 +832,52 @@ def test_an_invalid_max_tokens_is_rejected_rather_than_defaulted(client, limit):
     assert "max_tokens" in response.json()["detail"]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", -0.5),
+        ("temperature", "hot"),
+        ("top_p", 0),
+        ("top_p", 1.5),
+        ("top_p", -1),
+    ],
+)
+def test_invalid_sampling_values_are_rejected_at_the_boundary(client, field, value):
+    """Sampling ranges must be checked before the engine round trip.
+
+    `SamplingParams` raises inside the remote GPU method, so a bad value came back as an opaque 500
+    after paying for the call. `top_p: 0` is worse than opaque: it is falsy, so `or 1.0` silently
+    rewrote it to 1.0 and the request was served with sampling the caller never asked for.
+    """
+    _register_and_ready(client)
+    client.post(f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None})
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": RUN_ID, "messages": [{"role": "user", "content": "hi"}], field: value},
+    )
+    assert response.status_code == 400, (
+        f"{field}={value!r} was accepted with {response.status_code}, so it either reached the "
+        "engine as a 500 or was silently rewritten to a different sampling behavior"
+    )
+    assert field in response.json()["detail"]
+
+
+@pytest.mark.parametrize(("field", "value"), [("temperature", 0), ("top_p", 1), ("top_p", 0.1)])
+def test_valid_sampling_values_are_accepted(client, field, value):
+    """The guard must reject bad ranges, not narrow the supported ones.
+
+    `temperature: 0` is greedy decoding and the ordinary case for evaluation, so a guard keyed on
+    truthiness rather than on range would reject the most common request there is.
+    """
+    _register_and_ready(client)
+    client.post(f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None})
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": RUN_ID, "messages": [{"role": "user", "content": "hi"}], field: value},
+    )
+    assert response.status_code == 200, f"{field}={value!r} is valid but was rejected"
+
+
 def test_an_omitted_max_tokens_still_gets_the_default(client):
     """The validation above must reject explicit bad values, not require the field.
 
@@ -1566,6 +1612,101 @@ def test_two_adapters_sharing_one_lora_int_id_are_refused_not_aliased(client, mo
     result = _run_awaitable_result(engine_class.register(instance, second))
     assert result["ok"] is False
     assert "collision" in result["failure"]
+
+
+def test_a_failed_load_releases_its_lora_id_claim(client, monkeypatch):
+    """A claim taken before the download must not survive a download that fails.
+
+    Claiming early is what makes the download window safe, and it is also what makes a leak
+    permanent: settle records the revision `failed`, undeploy skips already-disabled records, so
+    nothing later clears the claim. The id is then refused forever for an adapter that was never
+    resident -- and because the id is a hash of the adapter id, the run cannot get a different one
+    by retrying.
+    """
+    lora = types.ModuleType("vllm.lora.request")
+    lora.LoRARequest = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora)
+
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._int_ids = {}
+    instance._loaded = {}
+
+    async def _boom(record):
+        raise RuntimeError("hf download failed")
+
+    instance._adapter_path = _boom
+    instance.engine = types.SimpleNamespace(add_lora=lambda request: None)
+
+    doomed = {"adapter_id": "run-doomed@final." + "d" * 40}
+    with pytest.raises(RuntimeError, match="download failed"):
+        _run_awaitable(engine_class._lora_request(instance, doomed))
+
+    key = module._lora_id_key(module._lora_int_id(doomed["adapter_id"]))
+    assert dict.get(module.adapter_records, key) is None, (
+        "a failed load kept its lora id claim, so that id is refused forever for an adapter that "
+        "never became resident"
+    )
+
+
+def test_unregister_evicts_before_releasing_its_claim(client, monkeypatch):
+    """The claim must be held across the eviction, not dropped before it.
+
+    The claim is what keeps a colliding newcomer out, and the two adapters hold DIFFERENT
+    per-adapter locks -- so releasing first lets the newcomer claim the id and load into it, and
+    this adapter's own `remove_lora(int_id)` then evicts the newcomer, whose record still reads
+    `ready` while nothing is resident.
+
+    Driven by having a newcomer claim the id at the moment the outgoing adapter releases it, which
+    is only reachable when the release happens first.
+    """
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    adapter = "run-out@final." + "e" * 40
+    int_id = module._lora_int_id(adapter)
+    key = module._lora_id_key(int_id)
+    dict.__setitem__(module.adapter_records, key, adapter)
+    order: list[str] = []
+
+    records = module.adapter_records
+
+    class _NewcomerRaces(type(records)):
+        @property
+        def pop(self):
+            async def _pop(k, default=None):
+                if k == key:
+                    order.append("release")
+                return dict.pop(self, k, default)
+
+            gated = _Aio(lambda k, default=None: dict.pop(self, k, default))
+            gated.aio = _pop
+            return gated
+
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._int_ids = {int_id: adapter}
+    instance._loaded = {adapter: object()}
+
+    async def _remove(lora_id):
+        order.append("evict")
+
+    instance.engine = types.SimpleNamespace(remove_lora=_remove)
+    hooked = _NewcomerRaces()
+    hooked.update(records)
+    module.adapter_records = hooked
+    try:
+        _run_awaitable(engine_class.unregister(instance, adapter))
+    finally:
+        module.adapter_records = records
+
+    assert order == ["evict", "release"], (
+        f"the claim was released before the eviction (order: {order}), so a colliding newcomer "
+        "can claim and load the id in between and then be evicted by this call"
+    )
 
 
 def test_a_lora_claim_whose_owner_vanishes_is_recontested(client):

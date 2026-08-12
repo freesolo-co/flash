@@ -207,6 +207,20 @@ async def _claim_lora_int_id(int_id: int, adapter_id: str) -> str:
     return adapter_id
 
 
+async def _owns_lora_int_id(int_id: int, adapter_id: str) -> bool:
+    """Whether ``adapter_id`` may evict ``int_id`` from the engine.
+
+    Split from the release so eviction can happen while the claim is still HELD: the claim is what
+    keeps a colliding newcomer out, and dropping it first lets that newcomer load into the id and
+    then be evicted by this adapter's own `remove_lora`.
+
+    An absent claim answers True for the same reason it does in `_release_lora_int_id`: the question
+    is "would evicting kick a peer off the GPU", and with nothing recorded there is no peer.
+    """
+    owner = await adapter_records.get.aio(_lora_id_key(int_id))
+    return owner is None or owner == adapter_id
+
+
 async def _release_lora_int_id(int_id: int, adapter_id: str) -> bool:
     """Drop ``adapter_id``'s claim on ``int_id``. False only when somebody ELSE holds it.
 
@@ -494,12 +508,21 @@ class Engine:
                     f"lora id collision: {{adapter_id}} and {{owner}} both hash to {{int_id}}, and "
                     f"vllm cannot tell them apart. redeploy under a different run id."
                 )
-            path = await self._adapter_path(record)
-            request = LoRARequest(adapter_id, int_id, path)
-            # Load it NOW rather than lazily on first generate: a bad adapter (wrong rank, missing
-            # tensors) must fail here so registration reports `failed` with a real reason, instead
-            # of reporting ready and then 500ing on the user's first chat.
-            await self.engine.add_lora(request)
+            # Released on ANY post-claim failure, because claiming early is what makes the download
+            # window safe and also what makes a leak permanent: settle records the revision
+            # `failed`, undeploy skips already-disabled records, so nothing later would ever clear
+            # it -- and the id is then refused forever for an adapter that was never resident.
+            try:
+                path = await self._adapter_path(record)
+                request = LoRARequest(adapter_id, int_id, path)
+                # Load it NOW rather than lazily on first generate: a bad adapter (wrong rank,
+                # missing tensors) must fail here so registration reports `failed` with a real
+                # reason, instead of reporting ready and then 500ing on the user's first chat.
+                await self.engine.add_lora(request)
+            except Exception:
+                # Conditional release, so a retry that already re-claimed keeps its own claim.
+                await _release_lora_int_id(int_id, adapter_id)
+                raise
             self._loaded[adapter_id] = request
             self._int_ids[int_id] = adapter_id
             return request
@@ -526,13 +549,20 @@ class Engine:
             # the resident peer off the GPU while `_loaded` still reports the peer as present, so
             # it silently stops answering. Leaving the map entry alone matters for the same reason
             # in reverse: releasing it would hand the slot to the adapter the guard just refused.
-            if await _release_lora_int_id(int_id, adapter_id):
+            #
+            # EVICT FIRST, RELEASE AFTER. The claim is what keeps a colliding newcomer out, and
+            # the two adapters hold different per-adapter locks, so releasing first opens a window
+            # in which the newcomer claims the id and loads -- and this `remove_lora(int_id)` then
+            # evicts the NEWCOMER, whose record still says `ready` while nothing is resident.
+            # Holding the claim across the eviction closes that window entirely.
+            if await _owns_lora_int_id(int_id, adapter_id):
                 self._int_ids.pop(int_id, None)
                 # Drop it from vLLM too, not just from this dict. The LoRA cache is bounded by
                 # max_loras, so repeated deploy/undeploy cycles would otherwise keep disabled
                 # adapters resident until the container restarts and start evicting live ones.
                 with contextlib.suppress(Exception):  # best effort, never fails an undeploy
                     await self.engine.remove_lora(int_id)
+                await _release_lora_int_id(int_id, adapter_id)
         return {{"ok": True}}
 
     async def _prepare(self, payload: dict[str, Any], record: dict[str, Any]):
@@ -576,6 +606,8 @@ class Engine:
                 **{{k: v for k, v in structured.items() if v is not None}}
             )
         sampling = SamplingParams(
+            # `or` fallbacks only reach an ABSENT field: an explicit value was range-checked at the
+            # HTTP boundary, and both fallbacks equal the falsy value they would replace anyway.
             temperature=float(payload.get("temperature") or 0.0),
             # `or 512` only for an ABSENT field; an explicit value was validated at the boundary.
             max_tokens=int(payload.get("max_tokens") or 512),
@@ -1121,6 +1153,23 @@ def api():
                 status.HTTP_400_BAD_REQUEST,
                 f"max_tokens must be a positive integer, got {{limit!r}}",
             )
+        # Same reasoning for the sampling knobs, which share the same `or` fallback and the same
+        # engine-side failure mode. `top_p: 0` is the one that is not merely an opaque 500: it is
+        # falsy, so it silently became 1.0 and the request was served with sampling the caller did
+        # not ask for. Ranges are vLLM's own: temperature >= 0, 0 < top_p <= 1.
+        for field, low, high, low_ok in (("temperature", 0.0, None, True), ("top_p", 0.0, 1.0, False)):
+            value = payload.get(field)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST, f"{{field}} must be a number, got {{value!r}}"
+                )
+            if (value < low if low_ok else value <= low) or (high is not None and value > high):
+                bound = f"in ({{low}}, {{high}}]" if high is not None else f">= {{low}}"
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST, f"{{field}} must be {{bound}}, got {{value!r}}"
+                )
         record = await _read(requested)
         if record is None or record.get("status") == "disabled":
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown model {{requested}}")
