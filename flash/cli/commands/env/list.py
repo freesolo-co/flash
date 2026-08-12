@@ -78,7 +78,7 @@ def cmd_env_list(args) -> int:
         print(f"published environments unavailable: {unavailable}")
     if paths:
         print(
-            "local env sources (publish with `flash env push --project <project-uuid> "
+            f"local env sources (publish with `{CLI_NAME} env push --project <project-uuid> "
             "--name <name> <path>`):"
         )
         for path in paths:
@@ -87,5 +87,5 @@ def cmd_env_list(args) -> int:
         # still worth printing next to an `unavailable` line: that line already says the published
         # list was not checked, so this reads as "and you have nothing local yet" rather than as a
         # claim about the hub.
-        print("no environments yet - scaffold one with `flash env setup`")
+        print(f"no environments yet - scaffold one with `{CLI_NAME} env setup`")
     return 0

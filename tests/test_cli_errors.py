@@ -11,6 +11,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# `_run` launches the child with sys.executable, an absolute path, so the CLI names that
+# interpreter back rather than a bare `python` -- which is absent entirely on a python3-only host.
+# Derived from the same value the subprocess uses, so the two cannot drift apart.
+INVOKED_CLI_NAME = f"{sys.executable} -m flash.cli"
 
 
 def _run(args, env=None):
@@ -39,7 +43,7 @@ def test_logged_out_status_is_friendly():
         proc = _run(["runs", "status", "does-not-exist"], env=_logged_out_env(tmp))
     assert proc.returncode == 1
     assert proc.stderr.startswith("error:")
-    assert "flash login" in proc.stderr
+    assert f"{INVOKED_CLI_NAME} login" in proc.stderr
     # No raw traceback on stderr.
     assert "Traceback (most recent call last)" not in proc.stderr
 
@@ -67,6 +71,7 @@ def test_missing_config_is_friendly():
     assert proc.returncode == 1
     assert proc.stderr.startswith("error:")
     assert "config file not found" in proc.stderr
+    assert f"{INVOKED_CLI_NAME} env setup" in proc.stderr
     # a bare [Errno 2] string and a traceback are both the wrong UX for a mistyped path.
     assert "Errno" not in proc.stderr
     assert "Traceback (most recent call last)" not in proc.stderr
@@ -102,7 +107,7 @@ def test_train_without_login_fails_fast():
     assert proc.returncode == 1, proc.stdout + proc.stderr
     # It must fail *before* contacting anything, with the fix spelled out.
     assert "not logged in" in proc.stderr
-    assert "flash login" in proc.stderr
+    assert f"{INVOKED_CLI_NAME} login" in proc.stderr
 
 
 def test_missing_env_id_rejected_client_side():
@@ -117,6 +122,7 @@ def test_missing_env_id_rejected_client_side():
         submit = _run(["train", cfg], env=_logged_out_env(tmp))
         assert submit.returncode == 1
         assert "[environment] id" in submit.stderr
+        assert f"{INVOKED_CLI_NAME} env push" in submit.stderr
 
 
 def test_dry_run_without_login_fails_fast():
@@ -133,7 +139,7 @@ def test_dry_run_without_login_fails_fast():
         proc = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "not logged in" in proc.stderr
-    assert "flash login" in proc.stderr
+    assert f"{INVOKED_CLI_NAME} login" in proc.stderr
     assert "Traceback (most recent call last)" not in proc.stderr
 
 

@@ -110,6 +110,12 @@ Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
 flash = "flash.cli:main"
+# Same entry point as `flash`, under a name nothing else claims. The `server` and `dev` extras
+# pull in runpod-flash, which declares its own `flash` console script; whichever distribution is
+# installed last wins, so on a plane host `flash` can silently belong to runpod-flash. `flash-cli`
+# always reaches Flash. Keep both: on a base install `flash` is unambiguous and is what every
+# existing user has.
+flash-cli = "flash.cli:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
 flash-server = "flash.server.__main__:main"
