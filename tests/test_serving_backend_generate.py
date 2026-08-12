@@ -235,3 +235,43 @@ def test_generated_app_names_itself_in_its_deploy_instructions(tmp_path):
     destination = tmp_path / "my_serving_app.py"
     write_app(MODELS["Qwen/Qwen3.5-4B"], destination)
     assert "modal deploy my_serving_app.py" in destination.read_text()
+
+
+@pytest.mark.parametrize("model_id", _MODEL_IDS)
+def test_registration_settles_through_a_spawned_function(model_id):
+    """Registration must not settle in a background task on the web container's event loop.
+
+    Caught on a real Modal deploy: `asyncio.create_task(_load())` returns 202, then the task dies
+    with the container when the web function scales down -- silently, and because the next poll is
+    load balanced to a different replica, nothing anywhere notices. Every adapter stays
+    `registered` until the deploy times out, with the GPU healthy and idle the whole time.
+
+    Asserted on the AST, not the text, so the comment explaining why `create_task` is wrong does
+    not read as the defect itself.
+    """
+    source = render_app(MODELS[model_id])
+    created = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "create_task"
+    ]
+    assert not created, "registration must outlive the request that scheduled it"
+    assert "settle_adapter.spawn(record)" in source
+
+
+@pytest.mark.parametrize("model_id", _MODEL_IDS)
+def test_durable_state_is_read_and_written_without_blocking_the_event_loop(model_id):
+    """Modal Dict calls in an async handler must use `.aio`.
+
+    The blocking form stalls every other request the container is serving -- up to 100 of them --
+    while one round trip completes. Modal logs a warning per call; the deployed app logged 49.
+    """
+    source = render_app(MODELS[model_id])
+    blocking = [
+        line.strip()
+        for line in source.splitlines()
+        if "adapter_records." in line and not line.lstrip().startswith("#") and ".aio" not in line
+    ]
+    assert not blocking, f"blocking Dict calls: {blocking}"
