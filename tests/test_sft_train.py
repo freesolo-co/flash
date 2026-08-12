@@ -3433,3 +3433,32 @@ def test_sft_micro_batch_never_exceeds_a_ranks_share_of_the_batch():
     assert capped(8, 4, 1, 64) == 4
     # never zero -- a DataLoader with batch_size=0 raises
     assert capped(1, 4, 8, 64) >= 1
+
+
+def test_sft_result_records_the_micro_batch_that_ran_not_the_one_requested():
+    """The result file must report the EXECUTED per-rank micro-batch.
+
+    Data parallelism caps the micro-batch to one rank's share of the batch (batch 8 over 4 ranks
+    leaves 2), and verl rejects anything larger. Recording `model.micro_batch` instead reports the
+    REQUEST: a completed run claimed 4 while every rank ran 2, so a reader reconstructing the token
+    budget or reproducing the run doubles the rows each rank actually held. `gradient_accumulation_
+    steps` is derived from the same number, so it inherits the error.
+
+    Asserted against the source because the writer's inputs are a live verl child; the point is
+    which object the value is read FROM, and that is what the fix changes.
+    """
+    import inspect
+
+    from flash.engine.worker import sft_train
+
+    src = inspect.getsource(sft_train._write_sft_result)
+    assert '"per_device_train_batch_size": child.micro_batch,' in src
+    assert "child.micro_batch)" in src, "gradient accumulation must derive from the executed value"
+    # the uncapped request must not reach the result under either key.
+    assert '"per_device_train_batch_size": model.micro_batch,' not in src
+    assert "math.ceil(model.train_batch_size / model.micro_batch)" not in src
+
+    # and the child must actually carry it, or the writer above cannot read it.
+    from flash.engine.worker import sft_train_runner
+
+    assert "micro_batch" in sft_train_runner._SftChild.__dataclass_fields__

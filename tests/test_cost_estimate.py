@@ -106,6 +106,21 @@ def test_runconfig_preserves_old_positional_constructor():
     assert config.opd_multi_turn is False
     assert config.opd_max_turns is None
 
+    # the 16 args above stop short of the opd fields, so they cannot catch a field INSERTED among
+    # the later ones -- the shift only rebinds from that position on. pin the order itself, which is
+    # what the positional contract actually is.
+    import dataclasses
+
+    order = [f.name for f in dataclasses.fields(RunConfig)]
+    assert order.index("opd_multi_turn") < order.index("opd_max_turns")
+    assert order.index("opd_max_turns") < order.index("measured_completion_tokens")
+    # anything added later must be APPENDED, never slotted beside a related field: an old positional
+    # caller would silently bind its opd flag to the newcomer rather than fail.
+    assert order[-1] == "sft_retained_examples", (
+        "a new RunConfig field must be appended; inserting one shifts every later parameter and "
+        "silently reinterprets old positional calls as different quantities"
+    )
+
 
 def test_provisional_estimate_preserves_auto_provider():
     # Preparation stays offline: it cannot truthfully name a live substrate before allocation. The

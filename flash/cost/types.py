@@ -52,10 +52,6 @@ class RunConfig:
     supervised_train_tokens: int | None = None
     sft_packing_mode: str = ""
     sft_packed_blocks: int | None = None
-    # rows the trainer iterates (profile `retained_examples`), which is what verl's sampler shards.
-    # NOT derivable from sft_packed_blocks: that is ceil(rows / examples_per_update), so a packed
-    # profile with 10 rows and a batch of 8 reports 2 blocks and reconstructs as 16.
-    sft_retained_examples: int | None = None
     opd_multi_turn: bool = False
     opd_max_turns: int | None = None
     # use measured mean rollout tokens for pricing but retain completion_len/seq_len caps for gpu
@@ -63,6 +59,13 @@ class RunConfig:
     # on the tail; sft uses the same split through train_tokens.
     measured_completion_tokens: float | None = None
     measured_prompt_tokens: float | None = None
+    # rows the trainer iterates (profile `retained_examples`), which is what verl's sampler shards.
+    # NOT derivable from sft_packed_blocks: that is ceil(rows / examples_per_update), so a packed
+    # profile with 10 rows and a batch of 8 reports 2 blocks and reconstructs as 16.
+    # APPENDED, not slotted beside the other sft fields: this class keeps a positional constructor
+    # (see `test_runconfig_preserves_old_positional_constructor`), so inserting here would shift
+    # every later field and silently rebind an old caller's opd flag to this one.
+    sft_retained_examples: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))

@@ -443,8 +443,11 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "configured_max_length": data.max_length,
             "realized_max_length": data.realized_max_length,
             "runtime_max_length": data.realized_max_length,
-            "per_device_train_batch_size": model.micro_batch,
-            "gradient_accumulation_steps": math.ceil(model.train_batch_size / model.micro_batch),
+            # the EXECUTED micro-batch, not the requested one: data parallelism caps it to a rank's
+            # share of the batch, so a reader reconstructing the token budget off the request would
+            # believe each rank held rows it never received.
+            "per_device_train_batch_size": child.micro_batch,
+            "gradient_accumulation_steps": math.ceil(model.train_batch_size / child.micro_batch),
             # verl concatenates either way; the profile's mode records whether more than one
             # example was allowed to share a concatenated batch, which is what a reader of these
             # metrics needs in order to compare a run's step count against its row count.

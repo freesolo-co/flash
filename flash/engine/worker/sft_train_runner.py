@@ -120,6 +120,10 @@ class _SftChild:
     # ranks actually launched, which is the allocated card count only when the batch divides by it.
     # reported so a reader comparing realized step time against the quote sees the executed width.
     world_size: int
+    # the micro-batch verl RAN, which is `model.micro_batch` capped to one rank's share of the batch.
+    # carried because the result file reports it: recording the uncapped request would tell a reader
+    # reconstructing the token budget that each rank held twice the rows it did.
+    micro_batch: int
     shim_markers: str
     expected_shims: tuple[str, ...]
 
@@ -647,6 +651,7 @@ def _prepare_sft_child(
         child_env=child_env,
         command=command,
         world_size=world_size,
+        micro_batch=micro_batch,
         shim_markers=shim_markers,
         expected_shims=tuple(name for name, source in required_fragments if source),
     )
