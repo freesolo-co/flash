@@ -7,8 +7,24 @@ is not stubbed globally because client tests use a real loopback server.
 from __future__ import annotations
 
 import contextlib
+import os
 
 import pytest
+
+
+def _temp_root_lever(config) -> str:
+    """How to move pytest's temp root, in the same precedence pytest itself resolves it.
+
+    ``TempPathFactory.getbasetemp`` takes ``--basetemp`` first, then ``PYTEST_DEBUG_TEMPROOT``, and
+    only then falls through to ``tempfile.gettempdir()`` (which is what reads ``TMPDIR``). Telling a
+    developer running with ``--basetemp`` to change ``TMPDIR`` sends them to a knob that has no
+    effect on the path in front of them -- exactly the misdirection this hook exists to end.
+    """
+    if getattr(config.option, "basetemp", None):
+        return "pass a private directory to `--basetemp`"
+    if os.environ.get("PYTEST_DEBUG_TEMPROOT"):
+        return "point `PYTEST_DEBUG_TEMPROOT` at a private directory"
+    return "point `TMPDIR` at a private directory"
 
 
 def _untrusted_tmpdir_ancestor(base):
@@ -32,15 +48,16 @@ def _untrusted_tmpdir_ancestor(base):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
-    """Name TMPDIR on env-cache trust failures, instead of only the code under test.
+    """Name the temp root on env-cache trust failures, instead of only the code under test.
 
     ``validate_cache_root_ancestors`` refuses a cache root with a group/other-writable ancestor
     that has no sticky bit. That check is right, and the tests that trip it are not: they point
-    ``_CACHE_ROOT`` at ``tmp_path``, whose ancestors belong to whatever ``TMPDIR`` names. Set
-    ``TMPDIR`` to a shared 0775 directory and 13 tests across ``test_env_pull.py`` and
+    ``_CACHE_ROOT`` at ``tmp_path``, whose ancestors belong to whatever chose pytest's temp root.
+    Set ``TMPDIR`` to a shared 0775 directory and 13 tests across ``test_env_pull.py`` and
     ``test_verifiers.py`` go red naming ``cache_security.py`` and a generated cache root -- the
-    code under test and a path the developer never chose -- while never naming ``TMPDIR``, which
-    is the thing that is actually wrong. Default ``/tmp`` is 1777 and sticky, so CI never sees it.
+    code under test and a path the developer never chose -- while never naming the temp root,
+    which is the thing that is actually wrong. Default ``/tmp`` is 1777 and sticky, so CI never
+    sees it.
 
     Attached to the failing report rather than printed: ``addopts = -q`` suppresses
     ``pytest_report_header`` and capture swallows a fixture's ``print``, so both go missing in
@@ -65,11 +82,11 @@ def pytest_runtest_makereport(item, call):
     if ancestor is None:
         return
     detail = (
-        f"temp dir ancestor {ancestor} is group/other-writable without the sticky bit "
-        f"(mode {mode:04o}), which the env cache trust checks refuse. "
-        f"fix with `chmod +t {ancestor}`, or point TMPDIR at a private directory."
+        f"pytest's temp root is {base}, and its ancestor {ancestor} is group/other-writable "
+        f"without the sticky bit (mode {mode:04o}), which the env cache trust checks refuse. "
+        f"fix with `chmod +t {ancestor}`, or {_temp_root_lever(item.config)}."
     )
-    report.sections.append(("TMPDIR, not the code under test, caused this", detail))
+    report.sections.append(("the temp dir, not the code under test, caused this", detail))
 
 
 @pytest.fixture(scope="session", autouse=True)
