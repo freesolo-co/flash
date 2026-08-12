@@ -222,37 +222,20 @@ def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
 
 
 def _preflight_free_vram_for_spec() -> None:
-    """Reject a card that arrived without the free VRAM this run was sized for.
+    """Reject a card that arrived already occupied by another tenant.
 
-    Single-GPU only, deliberately. ``combined_vram_gb`` makes multi-card fit non-linear (a
-    replicated per-card floor plus a sharding efficiency term), so there is no honest per-device
-    requirement to compare ``mem_get_info`` against without reimplementing that model here -- and a
-    second sizing model that disagrees with the allocator's would reject shapes the allocator
-    correctly placed. Single-GPU is where the co-tenancy was observed and where the arithmetic is
-    exact: one device, one requirement.
+    Nothing about the spec is read. An earlier draft re-derived the run's requirement here and
+    compared free bytes against it, which is a second sizing model competing with the allocator's
+    and wrong in both directions -- see ``preflight_free_vram``. Occupancy needs no requirement, so
+    it runs on any shape without reimplementing ``combined_vram_gb``'s non-linear multi-card fit.
+
+    It samples the current device only. On a multi-card node that leaves a tenant sitting on device
+    3 alone undetected, which is a gap and not a false alarm -- device 0 occupancy is still evidence
+    of a shared host. Probing every device would mean creating a CUDA context on each one at boot,
+    in a process that is not the one that trains, and the cost of that on the training path is not
+    something this can measure from here.
     """
-    if JOB_SPEC is None:
-        return
-    from flash.core.spec import gpu_count_of
-
-    if gpu_count_of(JOB_SPEC) > 1:
-        return
-    try:
-        from flash.providers.allocator import required_vram_gb
-
-        required = required_vram_gb(
-            JOB_SPEC.model,
-            JOB_SPEC.algorithm,
-            train=JOB_SPEC.train,
-            thinking=bool(JOB_SPEC.thinking),
-            model_revision=JOB_SPEC.model_revision or "",
-        )
-    except Exception as exc:
-        # sizing is the allocator's job and it already ran at submit; a failure to REPRODUCE it here
-        # is not grounds to fail a run that the control plane sized successfully.
-        print("free-vram preflight: could not size run:", sanitize_diagnostic(exc, limit=200))
-        return
-    preflight_free_vram(float(required))
+    preflight_free_vram()
 
 
 THINKING = JOB_SPEC.thinking if JOB_SPEC else False

@@ -392,42 +392,73 @@ def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
     from flash.engine.worker.perf import lifecycle as lc
 
     monkeypatch.setattr(lc, "free_vram_gb", lambda: 3.4)
+    monkeypatch.setattr(lc, "total_vram_gb", lambda: 22.5)
     with pytest.raises(lc.DirtyGpuError) as excinfo:
-        lc.preflight_free_vram(19.0)
+        lc.preflight_free_vram()
 
-    assert "3.4 GB free" in str(excinfo.value)
-    # the whole point: infra retry (same shape, fresh instance), NOT an oom escalation.
+    assert "19.1 GB used of 22.5 GB (85%)" in str(excinfo.value)
+    # the whole point: infra retry, NOT an oom escalation onto a bigger (equally dirty) card.
     monkeypatch.setattr(worker, "is_cuda_oom", lambda _exc: False)
     assert worker._worker_failure_flags(excinfo.value) == {"retriable": True, "oom": False}
 
 
 @pytest.mark.parametrize(
-    ("free_gb", "required_gb"),
+    ("free_gb", "total_gb"),
     [
-        (22.1, 19.0),  # a clean card
-        (18.6, 19.0),  # misses by less than the headroom shave -- would have fitted
-        (19.0, 19.0),  # exactly the requirement
+        (22.1, 22.5),  # a clean card: only the driver's own reserve is gone
+        (19.0, 22.5),  # 16% gone at boot -- context, cudnn workspace, slack. not a tenant
+        (140.0, 180.0),  # 22% gone on a big card: still under the threshold, still accepted
     ],
 )
-def test_preflight_accepts_a_card_that_can_run_the_job(monkeypatch, free_gb, required_gb):
-    """The gate catches a grossly occupied card; it is not a second sizing model.
+def test_preflight_accepts_a_card_nobody_else_is_using(monkeypatch, free_gb, total_gb):
+    """The gate catches a grossly occupied card and nothing else.
 
-    Rejecting a card that misses the estimate by a rounding error throws away a good instance and
-    bills for another, so the check deliberately shaves headroom off the requirement.
+    It measures occupancy, so it has no opinion about whether the run FITS -- that is the
+    allocator's call and it already made it at submit. Re-litigating fit here would reject clean
+    cards two ways: a run sized from profile-measured knobs needs far less than its authored spec
+    implies, and a run sized exactly at a catalog tier (24 GB) can never fit a real 4090's usable
+    22.5 GB no matter how empty it is.
     """
     from flash.engine.worker.perf import lifecycle as lc
 
     monkeypatch.setattr(lc, "free_vram_gb", lambda: free_gb)
-    lc.preflight_free_vram(required_gb)
+    monkeypatch.setattr(lc, "total_vram_gb", lambda: total_gb)
+    lc.preflight_free_vram()
 
 
-def test_preflight_is_inert_when_free_vram_cannot_be_read(monkeypatch):
+def test_preflight_is_inert_when_the_driver_will_not_answer(monkeypatch):
     """No CUDA, or a driver that will not answer, is not evidence of a dirty card."""
     from flash.engine.worker.perf import lifecycle as lc
 
     monkeypatch.setattr(lc, "free_vram_gb", lambda: None)
-    lc.preflight_free_vram(19.0)
-    lc.preflight_free_vram(0)  # unsized run: nothing to compare against
+    monkeypatch.setattr(lc, "total_vram_gb", lambda: None)
+    lc.preflight_free_vram()
+
+    # a total of 0 is a nonsense reading, not a 100%-occupied card. dividing by it would raise.
+    monkeypatch.setattr(lc, "free_vram_gb", lambda: 0.0)
+    monkeypatch.setattr(lc, "total_vram_gb", lambda: 0.0)
+    lc.preflight_free_vram()
+
+
+def test_preflight_never_re_derives_what_the_run_needs(monkeypatch):
+    """The worker-side gate must not reach for the allocator's sizing model.
+
+    Two sizing models that disagree is the failure this guards. ``allocate()`` sizes SFT from
+    profile-measured overrides (``_overridden_train`` turns an authored batch 8 into the executed
+    batch 1), so recomputing from ``JOB_SPEC.train`` here demands more VRAM than the card was
+    rented for and rejects the instance the allocator correctly picked.
+    """
+    import flash.providers.allocator as allocator
+    from flash.engine.worker import _preflight_free_vram_for_spec
+    from flash.engine.worker.perf import lifecycle as lc
+
+    def _fail(*_a, **_k):
+        raise AssertionError("the free-vram preflight must not re-size the run")
+
+    monkeypatch.setattr(allocator, "required_vram_gb", _fail)
+    monkeypatch.setattr(lc, "free_vram_gb", lambda: 22.1)
+    monkeypatch.setattr(lc, "total_vram_gb", lambda: 22.5)
+    _preflight_free_vram_for_spec()
 
 
 def test_free_vram_reads_the_driver_not_the_torch_allocator(monkeypatch):

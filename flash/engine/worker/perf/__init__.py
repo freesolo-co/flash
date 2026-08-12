@@ -29,6 +29,7 @@ from flash.engine.worker.perf.lifecycle import (
     free_vram_gb,
     is_cuda_oom,
     preflight_free_vram,
+    total_vram_gb,
     wait_for_gpu,
 )
 from flash.engine.worker.perf.liger import (
@@ -403,5 +404,6 @@ __all__ = [
     "grpo_use_reentrant",
     "is_cuda_oom",
     "preflight_free_vram",
+    "total_vram_gb",
     "wait_for_gpu",
 ]

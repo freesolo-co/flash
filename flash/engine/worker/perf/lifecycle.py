@@ -29,8 +29,13 @@ class DirtyGpuError(RetriableInfraError):
     is right here: an OOM means the run does not fit the card and retries on a BIGGER one, spending
     from a small dedicated OOM budget. A dirty card means the run fits fine and the card was already
     occupied -- a co-tenant in another container, or a previous tenant's leak. Escalating size for
-    that pays more for a card that can be just as dirty, and burns an OOM retry proving it. Infra
-    retry is the correct recovery: same shape, fresh instance.
+    that pays more for a card that can be just as dirty, and burns an OOM retry proving it.
+
+    Infra retry reallocates instead: ``_handle_failure`` records the provider in ``failed_providers``
+    and the shape in ``tried_classes``, so the next attempt prefers a DIFFERENT provider, then an
+    untried shape, before clamping back. That is the right preference order for this failure --
+    co-tenancy is a property of the host pool that handed the instance out, not of the run -- but it
+    is a preference, not a guarantee, so nothing here promises which card comes back.
     """
 
 
@@ -53,35 +58,60 @@ def free_vram_gb() -> float | None:
         return None
 
 
-def preflight_free_vram(required_gb: float, *, headroom: float = 0.95) -> None:
-    """Fail fast when the allocated card does not actually have the VRAM the run was sized for.
+def total_vram_gb() -> float | None:
+    """Total VRAM on device 0 in GB as the DRIVER reports it, or None if unavailable.
+
+    The driver's usable total, not the catalog's nominal tier: a "24 GB" RTX 4090 reports ~22.5 GB.
+    Comparing against the nominal number is what makes an exact-fit run unschedulable.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        _free, total = torch.cuda.mem_get_info()
+        return float(total) / (1024**3)
+    except Exception:
+        return None
+
+
+def preflight_free_vram(*, max_occupied_fraction: float = 0.25) -> None:
+    """Fail fast when the allocated card arrives already occupied by somebody else.
 
     Flash sizes the run, asks the provider for a card that fits, and then trains on whatever comes
     back without ever checking that the memory is FREE. A real RTX 4090 arrived with
-    ``total=22.5 used=18.6 free=3.4`` against a >=19 GB requirement, only 0.486 GB of it owned by any
-    process in this container: ~18 GB was a co-tenant in another container. The number was already
-    in the first heartbeat, before any work -- recorded and not acted on -- so the run downloaded the
-    model and built FSDP for ~80s of paid GPU before dying on an OOM that was knowable at boot.
+    ``total=22.5 used=18.6 free=3.4``, only 0.486 GB of it owned by any process in this container:
+    ~18 GB was a co-tenant in another container. The number was already in the first heartbeat,
+    before any work -- recorded and not acted on -- so the run downloaded the model and built FSDP
+    for ~80s of paid GPU before dying on an OOM that was knowable at boot.
 
-    ``headroom`` shaves 5% off the requirement rather than demanding it exactly: the sizing estimate
-    and the driver's accounting are close but not identical, and a card that misses by a rounding
-    error is one the run would have fitted on. This is a check for a card that is grossly occupied,
-    not a second sizing model -- being wrong in the strict direction throws away a good instance.
+    Measured as OCCUPANCY (``used/total`` as the driver reports it), not against a requirement.
+    Re-deriving "what this run needs" here would be a second sizing model competing with the
+    allocator's, and it loses both ways: the allocator sizes SFT from profile-measured knobs
+    (``_overridden_train``) that reduce an authored batch 8 to the executed batch 1, so recomputing
+    from the authored spec demands more than the card was rented for; and a run sized exactly at a
+    catalog tier (24 GB) can exceed a real card's usable total (22.5 GB on a 4090), which no amount
+    of free memory can ever satisfy. Both reject a perfectly clean card and retry until the infra
+    budget is gone -- strictly worse than the OOM this exists to prevent.
+
+    Occupancy has neither failure mode: it needs no requirement, no profile, and no catalog number.
+    An empty card reads ~0 whatever is scheduled on it. The threshold is deliberately loose -- a
+    quarter of the card gone before any of our work starts is not a rounding error or a driver
+    reserve, it is another tenant.
     """
-    if required_gb <= 0:
-        return
     free = free_vram_gb()
-    if free is None:
+    total = total_vram_gb()
+    if free is None or total is None or total <= 0:
         # no CUDA, or the driver would not answer. both are somebody else's failure to report, and
         # neither is evidence of a dirty card -- training fails soon enough with a better message.
         return
-    threshold = required_gb * headroom
-    if free >= threshold:
+    occupied = max(0.0, total - free)
+    if occupied <= total * max_occupied_fraction:
         return
     raise DirtyGpuError(
-        f"allocated GPU has {free:.1f} GB free VRAM but this run needs ~{required_gb:.1f} GB "
-        f"(>= {threshold:.1f} GB after headroom); the card is occupied by another tenant or a "
-        "previous tenant's leak, so retrying on a fresh instance of the same shape"
+        f"allocated GPU is already {occupied:.1f} GB used of {total:.1f} GB "
+        f"({occupied / total:.0%}) before this run has done anything; the card is occupied by "
+        "another tenant or a previous tenant's leak, so retrying on a freshly allocated instance"
     )
 
 
