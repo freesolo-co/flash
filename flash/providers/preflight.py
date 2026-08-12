@@ -18,6 +18,7 @@ from flash.providers.runpod.preflight import PreflightError
 __all__ = [
     "PreflightError",
     "check_run_preflight",
+    "require_operator_config",
 ]
 
 logger = get_logger(__name__)
@@ -109,10 +110,16 @@ def _normalize_operator_credentials() -> None:
             logger.warning("%s had surrounding whitespace; using the stripped value.", var)
 
 
-def check_run_preflight() -> None:
-    """Raise PreflightError if the plane cannot run a job; warn on degraded-but-workable config."""
+def require_operator_config() -> None:
+    """Raise PreflightError if the plane is missing configuration it needs to run a job.
+
+    The refusing half of the preflight, on its own because it runs twice: ``run_server`` calls it
+    before uvicorn so a misconfigured operator gets a clean message instead of an ASGI startup
+    traceback, and the lifespan calls the full ``check_run_preflight`` for the plane that another
+    ASGI server built through ``create_app()``. Pure reads, apart from re-stripping already-stripped
+    env vars, so running it twice changes nothing.
+    """
     from flash.providers import available_providers
-    from flash.providers.runpod import auth as runpod_keys
     from flash.server.platform.auth import standalone
 
     _normalize_operator_credentials()
@@ -173,7 +180,14 @@ def check_run_preflight() -> None:
             + "\n\nSet these on the control-plane host. See SELF_HOSTING.md."
         )
 
-    _warn_degraded(configured, runpod_keys)
+
+def check_run_preflight() -> None:
+    """Raise PreflightError if the plane cannot run a job; warn on degraded-but-workable config."""
+    from flash.providers import available_providers
+    from flash.providers.runpod import auth as runpod_keys
+
+    require_operator_config()
+    _warn_degraded(available_providers(), runpod_keys)
 
 
 def _warn_degraded(configured: tuple[str, ...], runpod_keys) -> None:

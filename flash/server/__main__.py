@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 
 from flash._internal.logging import configure_logging
+from flash.providers.preflight import PreflightError
 from flash.server.app import run_server
 
 HOST_ENV = "FLASH_SERVER_HOST"
@@ -56,7 +58,14 @@ def main(argv: list[str] | None = None) -> int:
     # observable here, and without this call the `flash` logger keeps the NullHandler it gets at
     # import and emits none of them.
     configure_logging(default_level=logging.INFO)
-    run_server(host=args.host, port=args.port)
+    try:
+        run_server(host=args.host, port=args.port)
+    except PreflightError as exc:
+        # The operator is missing configuration, not looking at a bug: print what to set and stop.
+        # 3 is what this path already exited with when the error surfaced from inside the ASGI
+        # lifespan (uvicorn's STARTUP_FAILURE), so supervision that keys on it keeps working.
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
     return 0
 
 
