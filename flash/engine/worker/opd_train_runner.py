@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
@@ -428,7 +429,14 @@ def _materialize_child_files(
 ) -> _RuntimeState:
     knobs = request.knobs
     model_path = _opd_train._cached_model_path(request.model_id, request.model_revision)
-    gpu_count = int(getattr(request.spec.gpu, "count", 1) or 1)
+    # the ranks verl will RUN, not the cards rented: with ulysses pinned off every rank is a dp rank,
+    # and verl chunks the step's sequences across them with an exact-divisibility assert. bound here
+    # at the single source so the launch width, the resume world_size and the run metadata cannot
+    # disagree about how wide the attempt actually was.
+    gpu_count = rl_data_parallel_cards(
+        int(getattr(request.spec.gpu, "count", 1) or 1),
+        workload.prompts_per_step * knobs.group_size,
+    )
     save_freq = math.gcd(*knobs.save_at_steps) if knobs.save_at_steps else knobs.save_every
     # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
     loggers = _opd_train.resolve_verl_loggers(caps)

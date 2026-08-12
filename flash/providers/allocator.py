@@ -179,15 +179,22 @@ def _fits(candidate: Candidate, need: int, executed_gpu_count: int = 0) -> bool:
 
 
 def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int:
-    """Ranks a run of this shape would actually launch, which is the card count except for sft.
+    """Ranks a run of this shape would actually launch, which is the card count unless a batch bounds it.
 
     Reads the executed batch from the SAME substituted knobs sizing does (``_overridden_train``) so
     the fit gate and the VRAM requirement describe one run. The retained row count comes from
     ``overrides`` instead: it is a profile measurement rather than a ``TrainSpec`` sizing knob, so
     ``_TRAIN_KNOB_FOR_OVERRIDE`` never carries it onto ``train`` and reading it there would miss
     every rows-bound narrowing.
+
+    Both branches are the same rule -- verl divides the batch across dp ranks, so a rank with no
+    share cannot launch -- over each algorithm's own unit of work: sft counts rows, grpo/opd count
+    the sequences one step holds after the group repeat.
     """
-    if (algorithm or "").strip().lower() != "sft":
+    algo = (algorithm or "").strip().lower()
+    if algo in ("grpo", "rl", "opd"):
+        return _executed_rl_gpu_count(algo, train, gpu_count)
+    if algo != "sft":
         return gpu_count
     batch = _sizing_int(train, "batch_size", 0)
     if batch <= 0:
@@ -203,6 +210,28 @@ def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int
     return sft_data_parallel_cards(
         gpu_count, batch, _sizing_int(overrides, "sft_retained_examples", 0)
     )
+
+
+def _executed_rl_gpu_count(algorithm: str, train, gpu_count: int) -> int:
+    """Ranks grpo/opd would launch: bounded by the SEQUENCES one step holds, not the prompt count.
+
+    Both algorithms hand verl ``data.train_batch_size = prompts_per_step`` (grpo
+    ``train/rl/verl_config.py``, opd ``opd_train_runner`` via ``train/opd/overrides.py``) and then
+    ``batch.repeat(rollout.n)``, so a step carries ``prompts_per_step * group_size`` sequences. That
+    product is the quantity verl chunks across dp ranks -- verl derives its own agent-loop worker
+    count from the same product -- and it must divide the width exactly or the run aborts at step 0.
+
+    An unknown prompt count does not narrow, matching the sft branch: defaulting it would assert the
+    most restrictive width on every caller that ranks without knobs and reject multi-card rl
+    outright. ``group_size`` defaults to 1 because a missing group is one generation per prompt,
+    which is the value that leaves the product equal to the prompt count.
+    """
+    prompts = _sizing_int(train, "prompts_per_step", 0)
+    if prompts <= 0:
+        return gpu_count
+    from flash.engine.plan.steps import rl_data_parallel_cards
+
+    return rl_data_parallel_cards(gpu_count, prompts * _sizing_int(train, "group_size", 1))
 
 
 def _executed_width(algorithm: str, train, overrides):

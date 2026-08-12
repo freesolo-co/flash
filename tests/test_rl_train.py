@@ -748,6 +748,29 @@ def test_build_verl_overrides_shards_every_card_by_data(n_gpus):
     assert "actor_rollout_ref.model.use_remove_padding=True" in o
 
 
+def test_grpo_launches_the_width_the_step_can_fill():
+    """`n_gpus` handed to verl is the executed dp width, never the rented card count.
+
+    Pinning ulysses off makes every rank a dp rank, so verl now chunks the step's sequences across
+    them and asserts exact divisibility (`DataProto.chunk`, and `_balance_batch` with
+    `equal_size=True`). At sp = card count the dp width was 1 and this could not fire; that is why
+    this guard arrives with the pin rather than before it. Launching wider than the sequences divide
+    aborts at step 0 on a box already rented.
+
+    Asserted on the source: the clamp sits in `_configure_rl_child`, which writes the child shims
+    and reward file, so it is not drivable offline. The rule itself is covered by
+    `test_rl_width_never_exceeds_the_sequences_one_step_holds` in the opd suite, and the allocator
+    and quote agree through `executed_gpu_count`.
+    """
+    import inspect
+
+    src = inspect.getsource(rl_train._configure_rl_child)
+    line = next(ln.strip() for ln in src.splitlines() if ln.strip().startswith("n_gpus="))
+
+    assert line == "n_gpus=rl_data_parallel_cards(", line
+    assert 'int(inp["prompts_per_step"]) * int(inp["group_size"])' in src
+
+
 def test_build_verl_overrides_batch_shape_is_identical_across_gpu_counts():
     # the guard that matters: adding cards must not change what the optimizer sees. anything that
     # would alter the effective batch (or the per-gpu micro batch) is a silent recipe change.

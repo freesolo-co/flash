@@ -5531,6 +5531,55 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
     assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == str(gpu_count)
 
 
+def test_rl_width_never_exceeds_the_sequences_one_step_holds():
+    """The launched width must divide prompts * group, or verl aborts at step 0 on a paid box.
+
+    This is the regression that pinning ulysses off created rather than found. At sp = card count
+    verl's dp width was 1, and `n % 1 == 0` holds for every n, so nothing checked the batch. With
+    sequence parallelism off every rank is a dp rank, and TWO verl sites then require exact
+    divisibility and RAISE rather than degrade: `DataProto.chunk` asserts `len(self) % chunks == 0`
+    on each dp dispatch, and `_balance_batch` partitions with `equal_size=True`, which asserts the
+    same. verl auto-pads only when `VERL_AUTO_PADDING` is set, which flash does not set -- and that
+    path pads by DUPLICATING rows, which would change the gradient.
+
+    Asserted on the shared rule (both the allocator's fit gate and the quote call it, and the two
+    must not answer this separately) plus the real launch value, since a helper alone would stay
+    green against an unwired call site.
+    """
+    from flash.engine.plan.steps import rl_data_parallel_cards
+
+    # a step holding fewer sequences than the cards rented cannot fill them.
+    assert rl_data_parallel_cards(4, 2) == 2
+    assert rl_data_parallel_cards(8, 1) == 1
+    # nor can one whose count does not divide the width: 6 sequences on 4 cards runs 2.
+    assert rl_data_parallel_cards(4, 6) == 2
+    # and the width stays a POWER OF TWO, unlike sft's: this count is also the rollout engine's
+    # tensor-parallel size, and vllm needs the attention heads to divide it. 3 would chunk 6
+    # sequences evenly and then fail head divisibility at engine init on 5 of the 6 catalog rows.
+    for cards, sequences in ((4, 6), (8, 12), (2, 3), (8, 6)):
+        assert rl_data_parallel_cards(cards, sequences) in (1, 2, 4, 8)
+    # real knobs are unaffected, which is why this costs no capacity: 8 prompts x 4 group = 32.
+    for cards in (1, 2, 4, 8):
+        assert rl_data_parallel_cards(cards, 32) == cards
+    # a nonsense count floors to one card, matching `sft_data_parallel_cards`: narrowing is the
+    # fail-safe direction, since a launch narrower than the step can fill always runs. "unknown does
+    # not narrow" is the CALLERS' policy, guarded before they call this (see `_executed_rl_gpu_count`
+    # and `executed_gpu_count`), so that a quote taken before the knobs are resolved keeps the rented
+    # width rather than quoting one card (asserted there, in `test_cost_hardware.py`).
+    assert rl_data_parallel_cards(8, 0) == 1
+
+    # the opd runner binds it at ONE site (`_materialize_child_files`) so the launch width, the
+    # resume world_size and the run metadata cannot disagree; that function downloads weights, so
+    # the wiring is asserted on the source rather than by driving it offline.
+    import inspect
+
+    from flash.engine.worker import opd_train_runner
+
+    src = inspect.getsource(opd_train_runner._materialize_child_files)
+    assert "gpu_count = rl_data_parallel_cards(" in src
+    assert "workload.prompts_per_step * knobs.group_size" in src
+
+
 def test_overrides_carry_fused_expert_target_parameters():
     overrides = dict(
         value.split("=", 1)

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
-from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_sft_width
+from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
 from flash.engine.worker import sft_train as _sft_train
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 from flash.providers.base import rentable_gpu_counts
@@ -396,7 +396,7 @@ def _widest_rentable_width(max_cards: int, train_batch_size: int, row_count: int
     than clamping a resolved width -- `sft_data_parallel_cards` walks downward to find a divisor and
     happily returns 3 or 5, which are not shapes anyone can allocate. 1 always qualifies.
     """
-    return widest_usable_sft_width(rentable_gpu_counts(max_cards), train_batch_size, row_count)
+    return widest_usable_dp_width(rentable_gpu_counts(max_cards), train_batch_size, row_count)
 
 
 def _idle_card_warning(

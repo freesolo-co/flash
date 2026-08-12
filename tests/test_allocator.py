@@ -1090,9 +1090,13 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             "max_completion_tokens": 512,
             "lora_rank": 16,
         },
+        # this case varies the COMPLETION length, so its batch only has to be wide enough not to
+        # bound the rank count: one prompt in a group of one is a single sequence, which launches one
+        # rank however many cards are rented (see `rl_data_parallel_cards`) and would make this a test
+        # of the width clamp rather than of long completions.
         "longer_completion": {
             "epochs": 1,
-            "prompts_per_step": 1,
+            "prompts_per_step": 8,
             "group_size": 1,
             "max_context_tokens": 4096,
             "max_completion_tokens": 2048,

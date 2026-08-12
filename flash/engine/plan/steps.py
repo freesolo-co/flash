@@ -53,10 +53,10 @@ def sft_data_parallel_cards(gpu_count: int, train_batch_size: int, row_count: in
     """
     cards = max(1, int(gpu_count))
     batch = max(1, int(train_batch_size))
-    return widest_usable_sft_width(range(min(cards, batch), 0, -1), batch, row_count)
+    return widest_usable_dp_width(range(min(cards, batch), 0, -1), batch, row_count)
 
 
-def widest_usable_sft_width(candidates, train_batch_size: int, row_count: int) -> int:
+def widest_usable_dp_width(candidates, train_batch_size: int, row_count: int) -> int:
     """First candidate that divides the batch and the rows, or 1 when none does.
 
     ``candidates`` must be ordered widest-first; the caller owns which shapes are eligible.
@@ -71,6 +71,44 @@ def widest_usable_sft_width(candidates, train_batch_size: int, row_count: int) -
         if batch % count == 0 and (rows == 0 or rows % count == 0):
             return int(count)
     return 1
+
+
+def rl_data_parallel_cards(gpu_count: int, sequences_per_step: int) -> int:
+    """Cards grpo/opd can actually train on, because verl splits the batch evenly across dp ranks.
+
+    With ulysses pinned off (see ``verl.parallelism.ULYSSES_SEQUENCE_PARALLEL_SIZE``) every rank is a
+    DATA-parallel rank, so verl's dp width is the card count rather than 1. Two places then require
+    the sequence count to divide that width exactly, and both RAISE rather than degrade:
+    ``DataProto.chunk`` asserts ``len(self) % chunks == 0`` on every dp dispatch (``protocol.py``),
+    and ``_balance_batch`` partitions with ``equal_size=True``, which asserts the same
+    (``seqlen_balancing.py``). Neither is reachable at width 1, which is why sequence parallelism hid
+    this: ``n % 1 == 0`` always holds.
+
+    ``sequences_per_step`` is what verl holds after ``batch.repeat(rollout.n)`` -- prompts times
+    group size -- not the prompt count. verl pads to a divisor only for VALIDATION generation, and
+    its ``VERL_AUTO_PADDING`` path is off by default and unset here; enabling it would pad by
+    DUPLICATING rows, which changes the gradient, so narrowing the width is the correct trade (the
+    same one ``sft_data_parallel_cards`` makes for its own loader).
+
+    This costs no capacity at real knobs: batch times group is 16/32/64/128 in practice, and every
+    one of those divides 1/2/4/8. It bites only on tiny batches, which is exactly where verl would
+    otherwise abort at step 0 on a box already paid for.
+
+    Only POWERS OF TWO are candidates, which is where this parts company with
+    ``sft_data_parallel_cards``: the same count becomes vLLM's ``tensor_model_parallel_size`` for the
+    rollout engine (sft has no rollout engine), and vLLM requires the attention heads to divide it.
+    Searching every count would return 3 for 6 sequences on 4 cards -- correct for the dp chunk, and
+    a head-divisibility failure at engine init on five of the six catalog rows. Trading verl's abort
+    for vLLM's is not a fix.
+    """
+    # local import: `providers.base` reaches back into `engine.plan` (recipe, vram), so binding it at
+    # module level here would close that cycle.
+    from flash.providers.base import rentable_gpu_counts
+
+    cards = max(1, int(gpu_count))
+    sequences = max(1, int(sequences_per_step))
+    widths = [n for n in rentable_gpu_counts(cards) if n <= sequences]
+    return widest_usable_dp_width(widths, sequences, 0)
 
 
 def final_save_due(step: int, save_at_steps: tuple[int, ...] | list[int]) -> bool:

@@ -41,19 +41,29 @@ def _join_note(count: int, executed_width=None) -> str:
     return f", {launched} of which {'joins' if launched == 1 else 'join'} this run"
 
 
-def _batch_bound_width_note(*counts: str, parenthetical: bool = False) -> str:
+def _batch_bound_width_note(*counts: str, algorithm: str = "", parenthetical: bool = False) -> str:
     """Explain a launched-vs-rented gap ONCE, after the shapes that showed it.
 
     Only appended when some shape actually printed a join count, so a run that launches every card
     it rents never sees it. Worded as ``_resolve_exact_gpu`` words it: the operator has to learn
     that the card ceiling is not the limiter, or they raise `--gpus` and hit the same failure.
 
+    The reason is per-algorithm because the bounding quantity is: sft counts rows, grpo and opd count
+    the sequences one step holds. Naming sft's rows to an opd user would point them at a knob opd
+    rejects at parse time.
+
     ``parenthetical`` when a remedy clause follows -- a trailing dash clause would swallow it, so
     "..., or lower batch_size" would read as part of the explanation rather than as the fix.
     """
     if not any(counts):
         return ""
-    reason = "sft shards by data, so the batch and retained rows bound the rank count"
+    if (algorithm or "").lower() in ("grpo", "rl", "opd"):
+        reason = (
+            "every rank needs its own share of the step, so prompts_per_step x group_size bounds "
+            "the rank count"
+        )
+    else:
+        reason = "sft shards by data, so the batch and retained rows bound the rank count"
     return f" ({reason})" if parenthetical else f" -- {reason}"
 
 
@@ -339,7 +349,8 @@ def vram_fit_error_message(
                 f"Raise the card ceiling with `--gpus {fitting_count}` "
                 f"({_shape_label(fitting_gpu, fitting_count)} = {fitting_vram:g} GB"
                 f"{fitting_join})"
-                f"{_batch_bound_width_note(provided_join, fitting_join, parenthetical=True)}, or "
+                f"{_batch_bound_width_note(provided_join, fitting_join, algorithm=algorithm, parenthetical=True)}"
+                f", or "
                 f"{vram_knob_advice(algorithm)}."
             )
 
@@ -372,7 +383,9 @@ def vram_fit_error_message(
         if widest_count > 1
         else "any single validated GPU"
     )
-    ceiling = f"{shape} ({biggest:g} GB max){_batch_bound_width_note(widest_join)}"
+    ceiling = (
+        f"{shape} ({biggest:g} GB max){_batch_bound_width_note(widest_join, algorithm=algorithm)}"
+    )
     if algorithm == "opd":
         return (
             f"opd needs >= {need:g} GB VRAM, more than {ceiling}. "

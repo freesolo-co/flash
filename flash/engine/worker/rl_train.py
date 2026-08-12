@@ -21,6 +21,7 @@ from flash.engine.plan.steps import (
     final_save_due,
     on_policy_steps,  # noqa: F401
     resolve_update_horizon,  # noqa: F401
+    rl_data_parallel_cards,
 )
 from flash.engine.worker.backend_common import (  # noqa: F401
     _ORPHANED_PIPE_GRACE_S,
@@ -302,7 +303,13 @@ def _configure_rl_child(
         project_name=project_name,
         experiment_name=experiment_name,
         gpu_type=(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else ""),
-        n_gpus=gpu_count_of(_w.JOB_SPEC),
+        # the ranks verl will actually run, not the cards rented: with ulysses pinned off every rank
+        # is a dp rank, and verl chunks the step's sequences across them with an exact-divisibility
+        # assert. a wider launch than the sequences divide aborts at step 0 on a paid box.
+        n_gpus=rl_data_parallel_cards(
+            gpu_count_of(_w.JOB_SPEC),
+            int(inp["prompts_per_step"]) * int(inp["group_size"]),
+        ),
         # resolved from the out-of-process capability probe, never by opening cuda in this
         # parent -- see fused_ce_backend.
         ce_backend=fused_ce_backend(caps),
