@@ -879,6 +879,12 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
             # size, so the run is pinned to two below; otherwise the valid-context case would fail
             # allocation instead of exercising the ordering this test is about.
             "prompts_per_step": 4,
+            # both cards only JOIN a step wide enough to give each one a share, and the RETAINED pool
+            # bounds that width, not the requested batch: `SPEC["train"]` retains one row, which caps
+            # the priced step at one prompt however many this asks for, so the second rank holds no
+            # share, contributes no memory, and the 213 GB need is refused on one 180 GB card. two
+            # retained rows are what make the pin above real.
+            "max_examples": 2,
             "max_completion_tokens": max_completion_tokens,
             "structured_outputs": {"choice": ["4"]},
         },
