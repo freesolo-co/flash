@@ -64,12 +64,15 @@ def pytest_runtest_makereport(item, call):
     exactly the default run that needs them. A section on the failure is the one place pytest
     always shows it, and unlike raising in teardown it does not add a second error per test.
 
-    Fires only when the trust check is what rejected the path, so it explains that failure and
-    never editorializes over an unrelated one.
+    Fires only when the trust check is what rejected the path AND the ancestor it named is the
+    temp root's own, so it explains that failure and never editorializes over an unrelated one.
     """
     outcome = yield
     report = outcome.get_result()
-    if report.when != "call" or not report.failed:
+    # setup and teardown too: an environment resolved in a fixture raises the same exception and
+    # pytest reports it as an ERROR in that phase. those need the explanation exactly as much, and
+    # gating on the call phase silently dropped it for every one of them.
+    if not report.failed:
         return
     excinfo = getattr(call, "excinfo", None)
     if excinfo is None:
@@ -80,6 +83,13 @@ def pytest_runtest_makereport(item, call):
     base = item.config._tmp_path_factory.getbasetemp()
     ancestor, mode = _untrusted_tmpdir_ancestor(base)
     if ancestor is None:
+        return
+    # the temp root having an unsafe ancestor does not make it the CAUSE. two tests here chmod a
+    # directory under `tmp_path` on purpose to exercise the refusal, and a cache root under HOME
+    # can fail while the temp tree is spotless -- in both cases blaming the temp dir sends the
+    # reader to a knob that changes nothing, which is the same misdirection as saying nothing.
+    # only claim it when the ancestor the exception named is the one found above.
+    if f"ancestor {ancestor} " not in text:
         return
     detail = (
         f"pytest's temp root is {base}, and its ancestor {ancestor} is group/other-writable "
