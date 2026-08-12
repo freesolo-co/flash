@@ -1,6 +1,7 @@
 """Single switch between prod and dev channels; ``scripts/build_dev_dist.py`` rewrites CHANNEL to "dev"."""
 
 import os
+import shlex
 import sys
 
 CHANNEL = "prod"
@@ -67,13 +68,18 @@ def _module_launch_interpreter() -> str:
     operator moments ago, and it keeps the hint short and copy-pasteable. A path (`./venv/bin/python`,
     an absolute interpreter) is echoed as `sys.executable` instead, because a relative one is only
     valid from the directory they happened to be in.
+
+    The result is shell-quoted, because it is pasted into a shell. `C:\\Program Files\\...` and a
+    virtualenv under a spaced directory otherwise split into several argv words, so the printed
+    cancel command reaches a path that does not exist -- the same silent non-cancel this whole
+    module exists to prevent. Quoting is a no-op for the ordinary unspaced path.
     """
     orig = getattr(sys, "orig_argv", None) or []
     typed = orig[0] if orig else ""
     # a bare word is a PATH lookup that just succeeded; anything with a separator is location-bound
     if typed and os.sep not in typed and (os.altsep is None or os.altsep not in typed):
-        return typed
-    return sys.executable or "python3"
+        return shlex.quote(typed)
+    return shlex.quote(sys.executable) if sys.executable else "python3"
 
 
 def _invoked_cli_name() -> str:

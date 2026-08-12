@@ -335,6 +335,50 @@ def test_module_invocation_names_a_runnable_interpreter_not_bare_python():
     importlib.reload(channel)  # restore the pytest-invoked value for later tests
 
 
+def test_module_launch_interpreter_survives_a_path_with_spaces():
+    """An interpreter path is pasted into a shell, so it has to be one shell token.
+
+    `C:\\Program Files\\Python\\python.exe` and a virtualenv under a spaced directory otherwise
+    split into several argv words: the printed `runs cancel` resolves `/opt/My` and dies with "No
+    such file or directory" while the run keeps billing -- the same silent non-cancel the invoked-
+    name fix exists to close, reintroduced one layer down.
+
+    Quoting must stay conditional. An ordinary unspaced path gains no quotes, because a hint the
+    operator reads is worth keeping clean when there is nothing to escape.
+    """
+    import importlib
+    import shlex
+    import sys
+    from unittest import mock
+
+    from flash._internal import channel
+
+    spaced = "/opt/My Python/bin/python"
+    with (
+        mock.patch.object(sys, "executable", spaced),
+        mock.patch.object(sys, "orig_argv", [spaced, "-m", "flash.cli"]),
+        mock.patch.object(sys, "argv", ["-m"]),
+    ):
+        resolved = importlib.reload(channel).CLI_NAME
+
+    interpreter = resolved[: -len(" -m flash.cli")]
+    # the whole point: split the printed command the way a shell would, and the path must survive
+    assert shlex.split(resolved) == [spaced, "-m", "flash.cli"], resolved
+    assert interpreter != spaced, "an unquoted spaced path splits into three shell words"
+
+    # ...while an ordinary path is left alone rather than gratuitously quoted
+    plain = "/usr/bin/python3"
+    with (
+        mock.patch.object(sys, "executable", plain),
+        mock.patch.object(sys, "orig_argv", [plain, "-m", "flash.cli"]),
+        mock.patch.object(sys, "argv", ["-m"]),
+    ):
+        unquoted = importlib.reload(channel).CLI_NAME
+    assert unquoted == f"{plain} -m flash.cli"
+
+    importlib.reload(channel)  # restore the pytest-invoked value for later tests
+
+
 def test_the_wordmark_does_not_follow_the_invoked_entry_point():
     """BRAND_NAME identifies the product; CLI_NAME says what to type. Only the latter varies.
 
