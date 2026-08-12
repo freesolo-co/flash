@@ -555,9 +555,7 @@ def _quote_gpu_ceiling(
     )
 
 
-def _offline_gpu_shape(
-    config: RunConfig, *, max_wall_seconds: float = 0.0
-) -> tuple[str, int, int, str, float]:
+def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
     """Return an offline structural GPU quote.
 
     Preparation must not consume live-capacity failures before run creation. Rank rentable shapes
@@ -725,14 +723,12 @@ def _offline_profile_shape(config: RunConfig) -> tuple[str, int, int, str, float
     return gpu, need, 1, provider, hourly
 
 
-def _profile_quote_shape(config: RunConfig, allocation) -> tuple[str, int, int, str, float]:
-    """The (gpu, need, count, provider, per-card rate) a profile quote bills against.
+def _allocation_quote_shape(config: RunConfig, allocation) -> tuple[str, int, int, str, float]:
+    """The (gpu, need, count, provider, per-card rate) billed against a SELECTED live candidate.
 
-    ``allocation`` is the exact live candidate the lifecycle selected; without one the shape is the
-    offline structural pick, which must never touch a live market (see ``_offline_profile_shape``).
+    Both quote paths bill an allocation the same way; they differ only in the offline shape they
+    fall back to when the lifecycle has not selected one yet, so that choice stays with the caller.
     """
-    if allocation is None:
-        return _offline_profile_shape(config)
     need = int(
         getattr(allocation, "min_vram_gb", 0)
         or required_vram_gb(
@@ -759,7 +755,13 @@ def estimate_profile_cost(config: RunConfig, *, allocation=None) -> CostEstimate
     charge only the rented shape held up to the cap.
     """
     wall_s = max(60.0, float(config.max_wall_seconds or 0.0))
-    gpu, need, billed_gpu_count, quote_provider, hourly = _profile_quote_shape(config, allocation)
+    # without a selected candidate the shape is the offline structural pick, which must never touch
+    # a live market (see ``_offline_profile_shape``).
+    gpu, need, billed_gpu_count, quote_provider, hourly = (
+        _allocation_quote_shape(config, allocation)
+        if allocation is not None
+        else _offline_profile_shape(config)
+    )
     return CostEstimate(
         model_id=config.model_id,
         method=config.method,
@@ -860,40 +862,16 @@ def estimate_cost(
         if config.max_wall_seconds is not None
         else wall_cap_s
     )
-    # Vast market duration filter: price against offers that outlast the run, using the SAME semantics
-    # ``usable_offers`` applies at LAUNCH (not the 60s-floored billing cap_s) — a non-positive wall means
-    # NO filter, a positive one is floored at 60s by usable_offers itself:
-    #   None -> the 24h spec default the run runs under (== DEFAULT_WALL_CAP_S);
-    #   > 0  -> that wall;   <= 0 -> 0.0 (no filter, exactly like launch).
-    if config.max_wall_seconds is None:
-        market_wall_s = wall_cap_s
-    elif config.max_wall_seconds > 0:
-        market_wall_s = float(config.max_wall_seconds)
-    else:
-        market_wall_s = 0.0
     if allocation is not None:
-        gpu = allocation.gpu
-        quote_provider = allocation.provider
-        hourly = float(allocation.hourly_usd)
-        need = int(
-            getattr(allocation, "min_vram_gb", 0)
-            or required_vram_gb(
-                config.model_id,
-                config.method,
-                train=config.train_knobs(),
-                thinking=config.thinking,
-                model_revision=config.model_revision,
-            )
+        gpu, need, billed_gpu_count, quote_provider, hourly = _allocation_quote_shape(
+            config, allocation
         )
-        billed_gpu_count = int(getattr(allocation, "gpu_count", 1) or 1)
     else:
         # Preparation and `flash train --cost` must stay independent of live capacity. A provider
         # lookup blip here would consume the first allocation failure before a run/status exists, so
         # the lifecycle could never retry it. This provisional structural quote is replaced from the
         # exact selected candidate immediately before provisioning.
-        gpu, need, billed_gpu_count, quote_provider, hourly = _offline_gpu_shape(
-            config, max_wall_seconds=market_wall_s
-        )
+        gpu, need, billed_gpu_count, quote_provider, hourly = _offline_gpu_shape(config)
 
     setup = setup_seconds(config)
     # sft shards by sequence and grpo/opd by data, so the multiplier is method-specific. the quote
