@@ -2586,27 +2586,68 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
     assert response["terminal"] is False
 
 
-def test_multimodal_bridge_rejects_managed_teacher_scoring():
+def test_multimodal_bridge_scores_frozen_images_through_structured_teacher_messages(
+    monkeypatch,
+):
+    from flash.content import multimodal
+
+    captured = {}
+
+    class Teacher:
+        def score_many_multimodal(self, items):
+            captured["items"] = items
+            return [
+                _teacher_score(
+                    [TeacherToken(text="A", logprob=-0.4, start=0, end=1)],
+                    input_tokens=91,
+                )
+            ]
+
+    monkeypatch.setattr(
+        multimodal,
+        "image_descriptors_to_data_uris",
+        lambda descriptors, package_root: [
+            f"data:image/png;base64,{descriptors[0]}:{package_root}"
+        ],
+    )
     bridge = _TeacherAlignmentBridge(
         prompts=[
             _BridgePrompt(
                 student_messages=[{"role": "user", "content": [{"type": "image"}]}],
-                teacher_messages=[{"role": "user", "content": "<|media_pad|>"}],
+                teacher_messages=[{"role": "user", "content": "<|media_pad|>question"}],
                 prompt_ids=(10, 11),
                 image_descriptors=("frozen-descriptor",),
-                package_root=None,
+                package_root="/package",
             )
         ],
         tokenizer=_BridgeTokenizer(),
-        teacher=object(),
-        thinking_prefill="",
+        teacher=Teacher(),
+        thinking_prefill="<think>\n",
         eos_token_ids=frozenset({99}),
         stop_sequences=(),
         mutation_callback=lambda: None,
     )
 
-    with pytest.raises(ValueError, match="not supported by managed Parasail teachers"):
-        bridge.score(0, 2, [10, 11, 65, 99], image_count=1)
+    encoded = bridge.score(0, 2, [10, 11, 65, 99], image_count=1)
+
+    assert captured["items"] == [
+        (
+            [
+                {"role": "user", "content": "<|media_pad|>question"},
+                {"role": "assistant", "content": "<think>\n"},
+            ],
+            "A",
+            ["data:image/png;base64,frozen-descriptor:/package"],
+            # a thinking prefill IS the trailing assistant turn the student sampled after, so the
+            # teacher continues it. without a prefill this is False and the completion opens its
+            # own turn, so an environment's historical assistant message cannot absorb it.
+            True,
+        )
+    ]
+    assert encoded["teacher_ids"] == [-1, 0, -1, -1]
+    assert encoded["teacher_logprobs"] == [0.0, -0.4, 0.0, 0.0]
+    assert bridge.teacher_input_tokens == 91
+    assert bridge.teacher_output_tokens == 1
 
 
 def test_bridge_rejects_parent_child_image_count_mismatch_before_scoring():
@@ -3092,6 +3133,98 @@ def test_all_transient_teacher_samples_exhaust_replacements_as_retriable():
     assert bridge.no_signal_resamples == 2
     assert bridge.no_signal_skipped_steps == 1
     assert mutations == []
+
+
+def test_no_signal_failure_names_the_gate_that_dropped_the_rollouts():
+    """The fatal no-signal error must say WHICH pre-teacher gate dropped everything.
+
+    Three very different conditions land on the same "no aligned teacher signal" message: a
+    completion that reached the token cap without EOS, an empty response, and one that decodes to
+    replacement characters. The bridge's stats snapshot carries the tally, but it is only built
+    AFTER the child raises, so a run that loses every rollout leaves artifacts that cannot say
+    which gate fired. That ambiguity cost a paid GPU run, so pin the reason into the message.
+    """
+    import flash.engine.worker.train.opd.child.plugin as plugin
+
+    bridge = _text_bridge(_BridgeTeacher())
+
+    def run_attempt(attempt_ordinal):
+        # the completion carries no eos id and the bridge has no stop sequences, so this lands on
+        # the not-terminated gate and never reaches the teacher.
+        _post_json(
+            bridge.url,
+            bridge.token,
+            "/score",
+            _bridge_score_payload(0, [10, 11], [65, 66]),
+        )
+        raise _AllNoSignalBatch(attempt_ordinal)
+
+    bridge.start()
+    try:
+        with pytest.raises(RuntimeError) as failure:
+            _run_with_no_signal_replacements(
+                run_attempt,
+                lambda _batch: None,
+                lambda: None,
+                lambda: _post_json(bridge.url, bridge.token, "/no-signal/resample", {}),
+                lambda: plugin._post_no_signal_abandoned(bridge.url, bridge.token),
+            )
+    finally:
+        bridge.close()
+
+    message = str(failure.value)
+    # the existing contract still holds...
+    assert "after 3 rollout attempts" in message
+    # ...and the reason now rides along. assert on the COUNT too: a tally that reaches the message
+    # but reads zero would satisfy a substring check while telling the reader nothing.
+    assert "not_terminated=3" in message, message
+
+
+def test_no_signal_failure_counts_only_the_step_that_failed():
+    """The named tally must cover the failing step alone, not the run's lifetime.
+
+    ``skip_counts`` is a lifetime accumulator: it is never zeroed, and a resumed bridge rehydrates
+    it from prior state. Reporting it raw would let a gate that fired during an EARLIER, successful
+    step be named as the cause of this failure, which is worse than a bare message because it reads
+    as evidence. A step that commits closes the window, so only the drops after it may be counted.
+    """
+    import flash.engine.worker.train.opd.child.plugin as plugin
+
+    bridge = _text_bridge(_BridgeTeacher())
+    bridge.start()
+    try:
+        # step one: a rollout is dropped at the not-terminated gate, then the step COMMITS. this
+        # skip belongs to a step that already finished and must not appear in a later message.
+        _post_json(bridge.url, bridge.token, "/score", _bridge_score_payload(0, [10, 11], [65, 66]))
+        _post_json(bridge.url, bridge.token, "/teacher-cycle/committed", {})
+
+        # step two loses one rollout to the same gate and then abandons.
+        def run_attempt(attempt_ordinal):
+            if attempt_ordinal == 0:
+                _post_json(
+                    bridge.url,
+                    bridge.token,
+                    "/score",
+                    _bridge_score_payload(0, [10, 11], [65, 66]),
+                )
+            raise _AllNoSignalBatch(attempt_ordinal)
+
+        with pytest.raises(RuntimeError) as failure:
+            _run_with_no_signal_replacements(
+                run_attempt,
+                lambda _batch: None,
+                lambda: None,
+                lambda: _post_json(bridge.url, bridge.token, "/no-signal/resample", {}),
+                lambda: plugin._post_no_signal_abandoned(bridge.url, bridge.token),
+            )
+    finally:
+        bridge.close()
+
+    message = str(failure.value)
+    # one drop in this step, not the two the lifetime counter holds. `=2` is exactly what the
+    # unfixed code reports, so this assertion is what separates the two behaviors.
+    assert "not_terminated=1" in message, message
+    assert "not_terminated=2" not in message, message
 
 
 def test_mixed_transient_and_truncated_exhaustion_remains_retriable():
@@ -5411,6 +5544,29 @@ def test_opd_pins_the_blackwell_attention_backends_like_grpo_does():
     assert (
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_encoder_attn_backend=TORCH_SDPA" in on
     ), on
+
+
+def test_opd_disables_the_vllm_multimodal_processor_cache():
+    """Image OPD does not run without this, and the failure it produces names neither images nor
+    the cache.
+
+    vLLM splits the mm processor cache across two processes: the frontend SENDER replaces an image
+    it has seen before with just its hash, and the engine-core RECEIVER is supposed to still hold
+    the item. OPD's rollout lifecycle clears the receiver on every sleep/pause without clearing the
+    sender, so the sender keeps sending hashes for items the receiver dropped and each request dies
+    on `assert mm_item is not None`. That kills requests, not the run, so what surfaces is empty
+    rollouts and then an IndexError on a zero-length reward tensor.
+
+    Asserted on the parsed VALUE rather than substring presence, because the two ways this
+    regresses are both silent: a nonzero size re-enables the cache, and the pre-0.13 flag name is
+    rejected by vLLM's arg parser at startup, long after the GPU is paid for.
+    """
+    emitted = build_opd_overrides(_config())
+    overrides = dict(value.split("=", 1) for value in emitted)
+    assert overrides["+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb"] == "0"
+    # `disable_mm_preprocessor_cache` was REMOVED in vllm 0.13.0. it reads like the right knob and
+    # still appears in older verl examples, so pin it out rather than trusting review to catch it.
+    assert not any("disable_mm_preprocessor_cache" in override for override in emitted)
 
 
 def test_both_ray_rollouts_pin_blackwell_attention_from_the_same_resolver():

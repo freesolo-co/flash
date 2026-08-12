@@ -18,6 +18,7 @@ from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
     render_tf32_shim,
+    render_tilelang_cudart_shim,
     rollout_resident_overrides,
     trainer_dtype_overrides,
 )
@@ -170,6 +171,32 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
             if config.get("mm_encoder_attn_backend")
             else []
         ),
+        # turn OFF vllm's multimodal processor cache. this is what makes image opd run at all.
+        #
+        # the cache is split across two processes. a SENDER half in the frontend replaces an image
+        # it has already seen with just its hash; a RECEIVER half in the engine core is supposed to
+        # still hold the item that hash names. correctness depends on the two halves staying
+        # mirrored, and opd's rollout lifecycle breaks that: every sleep/pause reaches
+        # `EngineCore._reset_caches()`, which clears the RECEIVER only. vllm says so in its own
+        # source -- "we don't attempt to re-sync the internal caches (P0 sender, P1 receiver)".
+        # the sender then keeps sending hash-only requests for images the receiver has dropped, and
+        # each one dies on `assert mm_item is not None, f"Expected a cached item for {mm_hash=}"`.
+        #
+        # that assertion kills the request rather than the run, so the failure surfaces nowhere near
+        # the cause: the rollouts come back EMPTY, and verl indexes [-1] into a zero-length reward
+        # tensor, so the visible error is an IndexError with no mention of images.
+        #
+        # 0 is vllm's own disable value -- it assigns exactly this internally -- and it gates BOTH
+        # halves, so no hash-only request can be constructed and there is nothing left to desync.
+        # the cost is re-preprocessing a repeated image, which is the right trade: an opd rollout
+        # batch is small and this is the difference between working and not.
+        #
+        # it stays unconditional, like `data.image_key` and `limit_images` above, because it is
+        # inert on a text job -- with no mm items there is no cache to disable.
+        #
+        # `mm_processor_cache_gb`, NOT the older `disable_mm_preprocessor_cache`: that argument was
+        # removed in vllm 0.13.0, and passing it now aborts server startup as an unknown cli flag.
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0",
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
         # sleep_unsupported), exactly as the grpo path does. opd is NOT exempt: main_ppo_sync calls
         # checkpoint_manager.sleep_replicas() during init_workers and again around validation, which
@@ -331,8 +358,11 @@ def _render_opd_sitecustomize(*, save_at_steps: tuple[int, ...], total_steps: in
     required_steps = tuple(int(step) for step in save_at_steps)
     # the tf32 fragment goes first, and above the verl import: it is the child's only opt-in to
     # tensor-core fp32 matmul, and an import that raises here must not cost the run its throughput.
+    # the cudart fragment follows it and still precedes the verl import: it repoints tilelang's
+    # libcudart stub on disk, which only works while nothing has imported vllm and bound the stub.
     return f"""# generated flash opd runtime patches for verl 0.8
 {render_tf32_shim()}
+{render_tilelang_cudart_shim()}
 from verl.utils.checkpoint.checkpoint_handler import CheckpointHandler as _FlashCheckpointHandler
 
 _flash_required_save_steps = frozenset({required_steps!r})
