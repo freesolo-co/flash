@@ -198,27 +198,46 @@ def test_persisted_rollout_batch_survives_the_prompts_per_step_rename() -> None:
         # `vram.py::_optimizer_batch_value` (which takes the larger of the two) size a card off the
         # stale value that ranking ignores.
         assert legacy.batch_size is None, algorithm
-        # so the migrated spec must survive a full re-serialize -> reparse round trip.
-        roundtrip = spec_from_dict(
-            _job_from_dict(
-                {
-                    "model": "Qwen/Qwen3.5-4B",
-                    "algorithm": algorithm,
-                    "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                    "train": {"epochs": 1, "group_size": 4, "batch_size": 32},
-                }
-            ).to_dict()
-        )
-        assert (roundtrip.train.prompts_per_step, roundtrip.train.batch_size) == (32, None), (
-            algorithm
-        )
-        # the current spelling is untouched, and wins when a spec somehow carries both.
-        assert _train(algorithm, {"prompts_per_step": 16}).prompts_per_step == 16
-        assert _train(algorithm, {"batch_size": 32, "prompts_per_step": 16}).prompts_per_step == 16
-        # a non-positive legacy value is dropped rather than migrated: `minimum=1` would have
-        # rejected it at submission, so carrying it forward only fails later on a rented GPU.
-        for bad in (0, -5):
-            assert _train(algorithm, {"batch_size": bad}).prompts_per_step is None, (algorithm, bad)
+
+        # every persisted shape, asserted the same way: the migrated value, AND that the old key is
+        # gone. checking only prompts_per_step would miss a retained batch_size, which is what
+        # breaks the round trip below.
+        for stored, expected in (
+            # the pre-1.1.43 spelling, migrated.
+            ({"batch_size": 32}, 32),
+            # the current spelling, untouched.
+            ({"prompts_per_step": 16}, 16),
+            # a payload written mid-upgrade carrying BOTH: prompts_per_step wins, and the
+            # superseded key goes with it rather than being left to re-emit.
+            ({"batch_size": 32, "prompts_per_step": 16}, 16),
+            ({"batch_size": 0, "prompts_per_step": 16}, 16),
+            # a non-positive legacy value is discarded rather than migrated: `minimum=1` would have
+            # rejected it at submission, so carrying it forward only fails later on a rented GPU.
+            # discarded from BOTH names -- retaining it under the old one re-emits a rejected key.
+            ({"batch_size": 0}, None),
+            ({"batch_size": -5}, None),
+        ):
+            train = _train(algorithm, dict(stored))
+            assert (train.prompts_per_step, train.batch_size) == (expected, None), (
+                algorithm,
+                stored,
+            )
+            # and the result must survive a full re-serialize -> reparse, which is what recovery
+            # and `flash runs get` perform. a spec carrying both names raises ConfigError here.
+            roundtrip = spec_from_dict(
+                _job_from_dict(
+                    {
+                        "model": "Qwen/Qwen3.5-4B",
+                        "algorithm": algorithm,
+                        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                        "train": {"epochs": 1, "group_size": 4, **stored},
+                    }
+                ).to_dict()
+            )
+            assert (roundtrip.train.prompts_per_step, roundtrip.train.batch_size) == (
+                expected,
+                None,
+            ), (algorithm, stored)
 
     # sft is NOT migrated: there `batch_size` is a different quantity (examples per update, resolved
     # against a measured workload profile), so copying it into prompts_per_step would be wrong.

@@ -146,21 +146,25 @@ def _migrated_optimizer_batch(train: dict, algorithm: str) -> tuple[int | None, 
     ``prompts_per_step`` alone, so without this a recovered run silently resumes on the recipe
     default: 64 instead of an authored 32 on grpo, which OOMs a card rented for 32, and 8 on opd.
 
-    The old key is MOVED, not copied. Leaving it populated would re-emit both names from
-    ``to_dict()``, and a spec carrying both is rejected by the schema -- breaking the resubmit that
-    recovery and ``flash runs get`` perform, and leaving `vram.py::_optimizer_batch_value` (which
-    takes the larger of the two) free to size a card off the stale value that ranking ignores.
+    The old key is MOVED, not copied, and is dropped whenever the new one is present. Leaving it
+    populated would re-emit both names from ``to_dict()``, and a spec carrying both is rejected by
+    the schema -- breaking the resubmit that recovery and ``flash runs get`` perform, and leaving
+    `vram.py::_optimizer_batch_value` (which takes the larger of the two) free to size a card off
+    the stale value that ranking ignores. That applies to a payload written mid-upgrade carrying
+    BOTH spellings too: ``prompts_per_step`` wins, so the superseded key has to go with it.
 
-    A non-positive legacy value is dropped rather than migrated: ``minimum=1`` would have rejected
-    it at submission, and carrying it forward only fails later on a rented GPU.
+    A non-positive legacy value is discarded rather than migrated: ``minimum=1`` would have
+    rejected it at submission, and carrying it forward only fails later on a rented GPU. It is
+    discarded from BOTH names for the same round-trip reason -- retaining it under the old one
+    would re-emit a key the schema rejects for this algorithm.
     """
     batch_size = _opt_int(train.get("batch_size"))
     prompts_per_step = _opt_int(train.get("prompts_per_step"))
-    if not samples_on_policy(algorithm) or prompts_per_step is not None:
+    if not samples_on_policy(algorithm):
         return batch_size, prompts_per_step
-    if batch_size is None or batch_size < 1:
-        return batch_size, None
-    return None, batch_size
+    if prompts_per_step is not None:
+        return None, prompts_per_step
+    return None, batch_size if batch_size is not None and batch_size >= 1 else None
 
 
 _MAX_GPU_COUNT = 8
