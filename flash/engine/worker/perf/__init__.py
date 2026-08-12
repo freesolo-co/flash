@@ -334,7 +334,7 @@ def _ensure_fla_fastpath_on_hopper() -> None:
             fla_ok = _pip(
                 "--no-deps",
                 "git+https://github.com/fla-org/flash-linear-attention.git"
-                "@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
+                "@9c8e42e762fce087c27b673af4922795d9edb85e",
             )
         importlib.invalidate_caches()
         tvm_ffi_ver = _ver("apache-tvm-ffi")

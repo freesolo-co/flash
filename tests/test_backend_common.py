@@ -970,6 +970,356 @@ def test_the_armed_finder_patches_the_module_on_a_real_import(tmp_path, monkeypa
         sys.modules.update(saved_modules)
 
 
+def _run_flash_qla_shim(tmp_path, *, capability, backends, extra="", env=None):
+    """Execute the rendered flashqla fragment in a child against stub torch/fla, return the run.
+
+    A stub interpreter rather than mocks: the fragment is source text that runs at sitecustomize
+    time, and the thing under test is what it does to a real import system with a real sys.exit.
+    """
+    root = tmp_path / "site"
+    package = root / "transformers" / "models" / "qwen3_5"
+    package.mkdir(parents=True)
+    for parent in (root / "transformers", root / "transformers" / "models", package):
+        (parent / "__init__.py").write_text("")
+    (package / "modeling_qwen3_5.py").write_text(
+        "def chunk_gated_delta_rule(*args, **kwargs):\n    return 'original'\n"
+    )
+    (root / "torch.py").write_text(
+        "class _Cuda:\n"
+        "    @staticmethod\n"
+        f"    def is_available():\n        return {capability is not None!r}\n"
+        "    @staticmethod\n"
+        f"    def get_device_capability():\n        return {capability or (0, 0)!r}\n"
+        "cuda = _Cuda()\n"
+    )
+    fla = root / "fla" / "ops" / "gated_delta_rule" / "backends"
+    fla.mkdir(parents=True)
+    for parent in (root / "fla", root / "fla" / "ops", root / "fla" / "ops" / "gated_delta_rule"):
+        (parent / "__init__.py").write_text("")
+    (fla / "__init__.py").write_text(
+        "class _Backend:\n"
+        "    def __init__(self, backend_type, available, fn):\n"
+        "        self.backend_type = backend_type\n"
+        "        self._available = available\n"
+        "        self.chunk_gated_delta_rule = fn\n"
+        "    def is_available(self):\n        return self._available\n"
+        "\n"
+        "def _flashqla(*args, **kwargs):\n"
+        "    return ('flashqla', args, sorted(kwargs))\n"
+        "\n"
+        "class _Registry:\n"
+        "    def _get_sorted_backends(self):\n"
+        f"        return {backends}\n"
+        "\n"
+        "gdr_registry = _Registry()\n"
+    )
+    site = pathlib.Path(tmp_path, "shimdir")
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(vc.render_flash_qla_shim("qwen3_5") + extra)
+    return subprocess.run(
+        [sys.executable, "-c", ""],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, **(env or {}), "PYTHONPATH": f"{site}{os.pathsep}{root}"},
+    )
+
+
+_FLASH_QLA_AVAILABLE = "[_Backend('flash_qla', True, _flashqla)]"
+
+
+def test_the_flash_qla_shim_binds_the_backend_on_a_real_import(tmp_path):
+    # the whole point of the fragment: the env var alone provably does nothing, because transformers
+    # captures chunk_gated_delta_rule into a module global at import and each GDN layer copies that
+    # object onto self in __init__ -- so fla's @dispatch wrapper, the only reader of FLA_FLASH_QLA,
+    # is never on the call path. assert the module global the layers copy actually changed, driven
+    # through a genuine `import` so the finder and loader are exercised too.
+    probe = textwrap.dedent(
+        """
+        import importlib, sys
+        assert type(sys.meta_path[0]).__name__ == "_FlashQlaFinder", "finder not armed"
+        mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        assert getattr(mod.chunk_gated_delta_rule, "_flash_qla_patched", False) is True, "unpatched"
+        # the shim must step back off meta_path once it fired, or it re-wraps every later import.
+        assert not [f for f in sys.meta_path if type(f).__name__ == "_FlashQlaFinder"]
+        # and the bound call must reach the flashqla backend, not the module's own function.
+        assert mod.chunk_gated_delta_rule(1)[0] == "flashqla"
+        print("BOUND")
+        """
+    )
+    out = _run_flash_qla_shim(
+        tmp_path, capability=(9, 0), backends=_FLASH_QLA_AVAILABLE, extra=probe
+    )
+    assert out.returncode == 0, out.stderr
+    assert "BOUND" in out.stdout
+    assert vc.FLASH_FLASH_QLA_MARKER in out.stdout
+
+
+def test_the_flash_qla_shim_drops_the_kwarg_the_backend_cannot_take(tmp_path):
+    # fla's dispatcher passes cu_seqlens_cpu to backends that accept it; flashqla does not, and a
+    # TypeError here would surface as a dead training run rather than a slower one.
+    probe = textwrap.dedent(
+        """
+        import importlib
+        mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        got = mod.chunk_gated_delta_rule(1, cu_seqlens_cpu=object(), scale=2)
+        assert got[0] == "flashqla"
+        assert "cu_seqlens_cpu" not in got[2], got[2]
+        assert "scale" in got[2], "the shim dropped a kwarg the backend needs"
+        print("DROPPED")
+        """
+    )
+    out = _run_flash_qla_shim(
+        tmp_path, capability=(9, 0), backends=_FLASH_QLA_AVAILABLE, extra=probe
+    )
+    assert out.returncode == 0, out.stderr
+    assert "DROPPED" in out.stdout
+
+
+@pytest.mark.parametrize("capability", [(10, 0), (8, 0), None])
+def test_the_flash_qla_shim_binds_nothing_off_sm90(tmp_path, capability):
+    # sm90 is a CORRECTNESS floor, not a preference. on sm100 the tilelang-based flashqla backward
+    # computes wrong gradients at production shapes (measured dq 1.006 rel err on a B200, training
+    # loss diverging to 14.91 against the control's 13.96 from identical weights) while REPORTING a
+    # 1.047x speedup with a clean A/A null -- fast and wrong, the same failure class as the tilelang
+    # backward this worker already opts out of in perf._force_fla_triton_gdn_on_sm100. note the
+    # existing FLA_TILELANG=0 guard does NOT cover this: flashqla is a separate registry backend
+    # keyed on FLA_FLASH_QLA. a no-op here must also be a CLEAN no-op: the run continues on fla's
+    # own kernel rather than failing, so the fragment still records itself as applied.
+    probe = textwrap.dedent(
+        """
+        import importlib
+        mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        assert getattr(mod.chunk_gated_delta_rule, "_flash_qla_patched", False) is False
+        assert mod.chunk_gated_delta_rule() == "original"
+        print("UNPATCHED")
+        """
+    )
+    out = _run_flash_qla_shim(
+        tmp_path, capability=capability, backends=_FLASH_QLA_AVAILABLE, extra=probe
+    )
+    assert out.returncode == 0, out.stderr
+    assert "UNPATCHED" in out.stdout
+    assert vc.FLASH_FLASH_QLA_MARKER not in out.stdout
+
+
+@pytest.mark.parametrize(
+    "backends",
+    [
+        "[]",  # fla too old to carry the backend at all
+        "[_Backend('flash_qla', False, _flashqla)]",  # present but the wheel is missing
+        "[_Backend('chunk', True, _flashqla)]",  # a different backend must not be mistaken for it
+    ],
+)
+def test_an_unavailable_flash_qla_backend_keeps_training_on_flas_own_kernel(tmp_path, backends):
+    # this fragment must NOT fail closed, unlike every other required fragment. skipping the
+    # boundary-reset shims corrupts training, so those must kill the child; skipping this one only
+    # costs ~5% and leaves the child on exactly the kernel every run before it used.
+    #
+    # it is also the difference between a working deploy and an outage. the worker image is a
+    # MUTABLE tag that presets FLASH_VERL_PYTHON, so resolve_verl_python returns that interpreter
+    # and never runs the provisioning that installs the wheel -- between merge and the image build,
+    # every GDN child reaches this path. a hard exit here would take down all GDN SFT until the
+    # image caught up. assert the child survives AND still records the fragment as applied.
+    probe = textwrap.dedent(
+        """
+        import importlib
+        mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        assert getattr(mod.chunk_gated_delta_rule, "_flash_qla_patched", False) is False
+        assert mod.chunk_gated_delta_rule() == "original", "must stay on fla's own kernel"
+        print("SURVIVED")
+        """
+    )
+    out = _run_flash_qla_shim(tmp_path, capability=(9, 0), backends=backends, extra=probe)
+    assert out.returncode == 0, (out.returncode, out.stderr)
+    assert "SURVIVED" in out.stdout
+    assert "continuing on fla's own kernel" in out.stderr
+    assert vc.FLASH_FLASH_QLA_MARKER not in out.stdout
+
+
+def test_an_fla_without_the_backends_module_does_not_kill_the_child(tmp_path):
+    # THE deploy failure, caught by a live H200 run rather than by any of the tests above. an fla
+    # older than 0.5.2 has no `fla.ops.gated_delta_rule.backends` subpackage AT ALL, so resolving
+    # the backend raises ModuleNotFoundError -- and this resolution happens inside an import loader,
+    # so the exception propagates out of the child's `import transformers...` and kills the run.
+    # that is the state of every worker whose image has not been rebuilt with the new pin yet.
+    # the stubs in the other tests all define the module, so none of them can see this.
+    root = tmp_path / "site"
+    package = root / "transformers" / "models" / "qwen3_5"
+    package.mkdir(parents=True)
+    for parent in (root / "transformers", root / "transformers" / "models", package):
+        (parent / "__init__.py").write_text("")
+    (package / "modeling_qwen3_5.py").write_text(
+        "def chunk_gated_delta_rule(*args, **kwargs):\n    return 'original'\n"
+    )
+    (root / "torch.py").write_text(
+        "class _Cuda:\n"
+        "    @staticmethod\n"
+        "    def is_available():\n        return True\n"
+        "    @staticmethod\n"
+        "    def get_device_capability():\n        return (9, 0)\n"
+        "cuda = _Cuda()\n"
+    )
+    # an OLD fla: importable, but with no backends subpackage under gated_delta_rule.
+    old = root / "fla" / "ops" / "gated_delta_rule"
+    old.mkdir(parents=True)
+    for parent in (root / "fla", root / "fla" / "ops", old):
+        (parent / "__init__.py").write_text("")
+    site = tmp_path / "shimdir"
+    site.mkdir()
+    probe = textwrap.dedent(
+        """
+        import importlib
+        mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        assert mod.chunk_gated_delta_rule() == "original"
+        print("SURVIVED")
+        """
+    )
+    (site / "sitecustomize.py").write_text(vc.render_flash_qla_shim("qwen3_5") + probe)
+    out = subprocess.run(
+        [sys.executable, "-c", ""],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONPATH": f"{site}{os.pathsep}{root}"},
+    )
+    assert out.returncode == 0, (out.returncode, out.stderr)
+    assert "SURVIVED" in out.stdout
+    assert "ModuleNotFoundError" not in out.stderr
+
+
+def test_the_flash_qla_shim_imports_nothing_heavy_at_interpreter_startup(tmp_path):
+    # same multi-card trap as the varlen shim: sitecustomize runs at interpreter startup, and ray
+    # starts each actor's interpreter BEFORE narrowing that actor's CUDA_VISIBLE_DEVICES to its own
+    # card. touching torch here initializes cuda against every gpu, no later env change can rebuild
+    # that device map, and nccl aborts with "Duplicate GPU detected". this fragment probes
+    # torch.cuda.get_device_capability, which makes the deferral load-bearing rather than stylistic.
+    # record import ATTEMPTS, not sys.modules: python swallows a sitecustomize traceback, so a shim
+    # that died early leaves sys.modules as empty as a correct lazy one would.
+    shim = vc.render_flash_qla_shim("qwen3_5")
+    with tempfile.TemporaryDirectory() as shim_dir:
+        recorder = textwrap.dedent(
+            """
+            import sys
+            _flash_seen = []
+
+            class _Recorder:
+                def find_spec(self, fullname, path=None, target=None):
+                    _flash_seen.append(fullname)
+                    return None
+
+            sys.meta_path.insert(0, _Recorder())
+            """
+        )
+        tail = textwrap.dedent(
+            """
+
+            import atexit as _flash_atexit
+            import json as _flash_json
+
+            def _flash_dump(_path=__file__ + ".seen"):
+                with open(_path, "w") as _fh:
+                    _fh.write(_flash_json.dumps(_flash_seen))
+
+            _flash_atexit.register(_flash_dump)
+            """
+        )
+        site = pathlib.Path(shim_dir, "sitecustomize.py")
+        site.write_text(recorder + tail + shim)
+        out = subprocess.run(
+            [sys.executable, "-c", ""],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "PYTHONPATH": shim_dir},
+        )
+        assert out.returncode == 0, out.stderr
+        attempted = json.loads(pathlib.Path(str(site) + ".seen").read_text())
+    assert not [n for n in attempted if n.split(".")[0] in {"torch", "transformers", "fla"}], (
+        f"flashqla shim imported the cuda stack at interpreter startup: {attempted}"
+    )
+
+
+def test_the_flash_qla_shim_patches_a_module_already_imported(tmp_path):
+    # a parent process may have loaded the modeling module before sitecustomize ran, leaving no
+    # import for the finder to intercept. the eager branch is what covers that, and nothing else
+    # exercises it: without it the fragment records itself as applied and patches nothing.
+    probe = textwrap.dedent(
+        """
+        import sys
+        mod = sys.modules["transformers.models.qwen3_5.modeling_qwen3_5"]
+        assert getattr(mod.chunk_gated_delta_rule, "_flash_qla_patched", False) is True
+        assert not [f for f in sys.meta_path if type(f).__name__ == "_FlashQlaFinder"], (
+            "the eager path must not also arm the finder"
+        )
+        print("EAGER")
+        """
+    )
+    pre = "import transformers.models.qwen3_5.modeling_qwen3_5\n"
+    root = tmp_path / "site"
+    out = _run_flash_qla_shim(
+        tmp_path, capability=(9, 0), backends=_FLASH_QLA_AVAILABLE, extra=probe
+    )
+    assert out.returncode == 0, out.stderr
+    # re-run with the module already in sys.modules ahead of the fragment
+    (pathlib.Path(tmp_path, "shimdir") / "sitecustomize.py").write_text(
+        pre + vc.render_flash_qla_shim("qwen3_5") + probe
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", ""],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{pathlib.Path(tmp_path, 'shimdir')}{os.pathsep}{root}",
+        },
+    )
+    assert out.returncode == 0, out.stderr
+    assert "EAGER" in out.stdout
+
+
+def test_the_flash_qla_shim_targets_the_arch_the_gate_verified():
+    # `qwen3_5` and `qwen3_5_moe` are separate modules, so a hardcoded target leaves the MoE
+    # unpatched (the same trap render_gdn_varlen_shim documents). taking the arch also keeps the
+    # finder's lifecycle honest: one target means "patch it, then step off meta_path" is
+    # unambiguous, where a two-target watcher would have to decide when it is done.
+    dense = vc.render_flash_qla_shim("qwen3_5")
+    moe = vc.render_flash_qla_shim("qwen3_5_moe")
+    ast.parse(dense)
+    ast.parse(moe)
+    assert "transformers.models.qwen3_5.modeling_qwen3_5" in dense
+    assert "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe" in moe
+    assert dense != moe
+    # the dense render must not also name the moe module: that is what a two-target shim did.
+    assert "qwen3_5_moe" not in dense
+    # and the gate hands it the SAME arch it hands the boundary shim, so the two cannot disagree
+    source = inspect.getsource(
+        __import__("flash.engine.worker.sft_train_runner", fromlist=["x"])._write_sft_child_shims
+    )
+    assert "render_flash_qla_shim(gdn_reset_arch)" in source
+    assert "render_gdn_varlen_shim(gdn_reset_arch)" in source
+
+
+def test_the_flash_qla_fragment_is_wrapped_fail_closed_for_a_gdn_run():
+    # the fragment must ride the same required-fragment machinery as the boundary resets: rendered
+    # only for a gdn hybrid, wrapped so a failure exits rather than trains unpatched, and named in
+    # expected_shims so verify_applied_shim_markers can catch a sitecustomize that never ran.
+    from flash.engine.worker import sft_train_runner as _sft_runner
+
+    source = inspect.getsource(_sft_runner._write_sft_child_shims)
+    assert '("flashqla-gdn", render_flash_qla_shim(gdn_reset_arch))' in source
+    gdn_at = source.index('("gdn-varlen"')
+    qla_at = source.index('("flashqla-gdn"')
+    gate_at = source.index("if gdn_reset_arch is not None:")
+    assert gate_at < gdn_at < qla_at, (
+        "the flashqla fragment must sit inside the same gdn gate as the boundary resets"
+    )
+    wrapped = vc.wrap_shim_fragment("flashqla-gdn", vc.render_flash_qla_shim("qwen3_5"))
+    ast.parse(wrapped)
+    assert str(vc.SHIM_FRAGMENT_FAILED_EXIT_CODE) in wrapped
+
+
 def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
     # derive model_type from the child module so the gate and shim cannot disagree. patch the module
     # object because test cleanup may replace the parent package and break dotted monkeypatch
