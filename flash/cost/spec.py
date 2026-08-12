@@ -157,6 +157,18 @@ def _rollout_batch_for_quote(spec) -> int:
     the horizon outright, so ``spec_steps`` returns before ever asking for a row count; asking for
     one anyway would reject a fully specified run. There is nothing to cap against in that case, so
     the requested batch stands -- the same number this priced before the cap existed.
+
+    That stated horizon is also where the unenforced key stops mattering. ``max_steps`` fixes the
+    step COUNT but not how wide a step is, so a config that names the env-params cap and no enforced
+    one leaves the batch unknowable in the same both-ways sense: an environment that honours it
+    trains ``len(prompts)`` per step, so the requested batch overcharges 64x, and one that ignores
+    it trains the full batch, so the env value undercharges 64x. Refusing looks right and is not:
+    ``charge_usd_for_spec`` prices a CANCELLED run through here by pinning ``max_steps`` onto the
+    spec, and its outer ``except Exception`` turns any refusal into the $0 fallback -- billing
+    nothing for a run that really executed. A quote that is too high can at least be seen and
+    disputed; a silent zero cannot. So the requested batch stands, and the guard against pricing an
+    unenforced number lives where it costs nothing: ``_on_policy_example_count`` refuses to derive a
+    HORIZON from it, which is the path a submit-time quote takes.
     """
     try:
         return _on_policy_prompts_per_step(spec, _on_policy_example_count(spec))
