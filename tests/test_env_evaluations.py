@@ -3689,13 +3689,122 @@ def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes() -> None:
     assert results[0].score == 1.0
 
 
-def test_accepts_state_detects_the_scorer_shape() -> None:
-    # the signature check is what keeps a two-argument suite from getting a third argument, so
-    # its edge cases are worth pinning: **kwargs and *args can both read state.
-    from flash.cli.commands.env.episode import _accepts_state
+def test_state_argument_detects_how_the_scorer_takes_state() -> None:
+    # detecting only WHETHER state is accepted is not enough: **kwargs and keyword-only scorers
+    # reject a third positional, and *args scorers reject the keyword. the two groups are disjoint,
+    # so the call style has to come from the signature.
+    from flash.cli.commands.env.episode import _state_argument
 
-    assert _accepts_state(lambda case, response: None) is False
-    assert _accepts_state(lambda case, response, state=None: None) is True
-    assert _accepts_state(lambda case, response, **kwargs: None) is True
-    assert _accepts_state(lambda case, response, *args: None) is True
-    assert _accepts_state(None) is False
+    assert _state_argument(lambda case, response: None) is None
+    assert _state_argument(None) is None
+    assert _state_argument(lambda case, response, state=None: None) == "keyword"
+    assert _state_argument(lambda case, response, *, state=None: None) == "keyword"
+    assert _state_argument(lambda case, response, **kwargs: None) == "keyword"
+    assert _state_argument(lambda case, response, *args, **kwargs: None) == "keyword"
+    assert _state_argument(lambda case, response, *args: None) == "positional"
+    assert _state_argument(lambda case, response, episode=None: None) == "positional"
+
+
+@pytest.mark.parametrize(
+    "scorer_source",
+    [
+        "def score(self, case, response, state=None): return _graded(case, state)",
+        "def score(self, case, response, *, state=None): return _graded(case, state)",
+        "def score(self, case, response, **kwargs): return _graded(case, kwargs.get('state'))",
+        "def score(self, case, response, *args): return _graded(case, args[0] if args else None)",
+    ],
+    ids=["positional", "keyword_only", "kwargs", "varargs"],
+)
+def test_every_state_accepting_scorer_shape_actually_receives_the_episode(
+    scorer_source: str,
+) -> None:
+    """Each signature that opts in must be CALLED in the way it can accept.
+
+    Detection alone shipped a scorer that was marked supported and then called with a third
+    positional argument it could not take, so every case came back `scoring failed` -- a hard zero
+    that looks like the model failed. Asserting the score, not the detection, is what catches that.
+    """
+    from flash.cli.commands.env.episode import _state_argument
+    from flash.cli.commands.env.eval import _score_case
+
+    namespace: dict = {
+        "_graded": lambda case, state: (
+            1.0 if ",".join((state or {}).get("turns", [])) == case.expected else 0.0
+        )
+    }
+    exec(
+        f"class Suite:\n    name = 'suite'\n    grades_episodes = True\n    {scorer_source}",
+        namespace,
+    )
+    suite = namespace["Suite"]()
+
+    case = EvalCase(input="count up", expected="1,3,6", id="c1")
+    state = {"turns": ["1", "3", "6"], "response_text": "6"}
+
+    style = _state_argument(suite.score)
+    assert style is not None
+    result = _score_case(suite, case, "c1", "6", state=state, state_keyword=style == "keyword")
+
+    # the whole transcript reached the scorer, and no TypeError was reported as a scoring failure
+    assert result.error is None
+    assert result.score == 1.0
+
+
+def test_env_eval_does_not_step_the_environment_past_the_turn_cap() -> None:
+    """At the turn cap the episode must stop without one more env step.
+
+    Both trainers check termination BEFORE requesting a reply and skip it at the cap
+    (`flash/engine/worker/train/opd/bridge.py`, `.../rl/multi_turn.py`). Stepping once more scores
+    a state the trained rollout never produced: an env whose step mutates game state, metadata, or
+    `final_response_text` would be graded on a move training never made.
+
+    `rollout_done` cannot catch this alone -- it counts `state["turn"]`, which only `env_reply`
+    increments, so after the last model turn it is still one short of the cap.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 2
+        package_root = None
+
+        def __init__(self):
+            self.env_replies = 0
+
+        def new_rollout_state(self, example):
+            return {"messages": [{"role": "user", "content": "go"}], "turns": [], "turn": 0}
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["messages"].append({"role": "assistant", "content": content})
+            state["response_text"] = content
+
+        def rollout_done(self, state, max_turns=None):
+            # mirrors the adapter: the counter only advances on env_reply
+            if state.get("done"):
+                return True
+            return max_turns is not None and int(state.get("turn", 0)) >= int(max_turns)
+
+        def env_reply(self, messages, state):
+            self.env_replies += 1
+            state["turn"] = int(state.get("turn", 0)) + 1
+            state["messages"] = [*messages, {"role": "user", "content": "next"}]
+            return [{"role": "user", "content": "next"}]
+
+    replies = iter(["a", "b"])
+    environment = Environment()
+    original = env_eval._generate_case
+    env_eval._generate_case = lambda client, target, messages, args: next(replies)
+    try:
+        state = episode_module._drive_episode(
+            object(), "t", environment, EvalCase(id="c", input="x"), argparse.Namespace()
+        )
+    finally:
+        env_eval._generate_case = original
+
+    assert state["turns"] == ["a", "b"]
+    # exactly one inter-turn reply; the cap must not buy a second one after the final turn
+    assert environment.env_replies == 1

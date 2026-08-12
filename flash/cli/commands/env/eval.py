@@ -175,7 +175,14 @@ def _scored_response(response: str, *, thinking: bool) -> str:
 
 
 def _score_case(
-    suite, case: EvalCase, case_id: str, response: str, *, thinking: bool = False, state=None
+    suite,
+    case: EvalCase,
+    case_id: str,
+    response: str,
+    *,
+    thinking: bool = False,
+    state=None,
+    state_keyword: bool = False,
 ) -> EvalResult:
     """Grade one response on the caller's thread.
 
@@ -184,14 +191,18 @@ def _score_case(
 
     `state` is the finished episode, passed only for a multi-turn suite that accepts it (see
     `episode._score_episode_case`); single-turn scoring keeps the two-argument contract.
+    `state_keyword` says which way that suite's signature can take it -- `**kwargs` and
+    keyword-only scorers reject a third positional, `*args` scorers reject the keyword -- so the
+    caller decides, having read the signature.
     """
     try:
         scored_text = _scored_response(response, thinking=thinking)
-        scored = (
-            suite.score(case, scored_text)
-            if state is None
-            else suite.score(case, scored_text, state)
-        )
+        if state is None:
+            scored = suite.score(case, scored_text)
+        elif state_keyword:
+            scored = suite.score(case, scored_text, state=state)
+        else:
+            scored = suite.score(case, scored_text, state)
         return normalize_eval_result(case, response, scored, case_id=case_id)
     except (Exception, SystemExit) as exc:
         return EvalResult(

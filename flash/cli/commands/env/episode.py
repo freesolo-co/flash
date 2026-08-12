@@ -79,8 +79,17 @@ def _drive_episode(client, target: str, environment, case: EvalCase, args) -> di
     # The loop exits before the inter-turn env_reply, leaving the last model turn unapplied. A
     # stateful env would then score a transcript missing the last thing the model did, so give it
     # that turn before scoring; only the inter-turn glue is skipped, since no further model turn
-    # is conditioned on the reply. This matches `env test` and the worker loops.
-    if env_step_pending and not environment.rollout_done(state, hard_cap):
+    # is conditioned on the reply.
+    #
+    # But NOT at the turn cap. Both trainers check termination before requesting a reply and skip
+    # it there (opd/bridge.py and rl/multi_turn.py), so stepping once more would score a state the
+    # trained rollout never produced -- an env whose step mutates game state, metadata, or
+    # final_response_text would be graded on a move training never made. `rollout_done` cannot
+    # answer this on its own: it counts `state["turn"]`, which only `env_reply` increments, so
+    # after the final model turn it is still one short of the cap. The local turn count is the
+    # only thing that knows the cap was reached.
+    at_turn_cap = turns >= hard_cap
+    if env_step_pending and not at_turn_cap and not environment.rollout_done(state, hard_cap):
         environment.env_reply(state["messages"], state)
     return state
 
@@ -106,38 +115,57 @@ def _score_episode_case(
         turns = state.get("turns") or []
         response = str(turns[-1]) if turns else ""
     eval_module = _eval_module()
-    if _accepts_state(getattr(suite, "score", None)):
-        return eval_module._score_case(
-            suite, case, case_id, response, thinking=thinking, state=state
-        )
-    return eval_module._score_case(suite, case, case_id, response, thinking=thinking)
+    style = _state_argument(getattr(suite, "score", None))
+    if style is None:
+        return eval_module._score_case(suite, case, case_id, response, thinking=thinking)
+    return eval_module._score_case(
+        suite,
+        case,
+        case_id,
+        response,
+        thinking=thinking,
+        state=state,
+        state_keyword=style == "keyword",
+    )
 
 
-def _accepts_state(score) -> bool:
-    """Whether this scorer takes the episode state as a third argument.
+def _state_argument(score) -> str | None:
+    """How this scorer takes the episode state: `"keyword"`, `"positional"`, or None for neither.
 
-    A `**kwargs` scorer counts: it can read `state` even though it names no such parameter.
+    Detecting only WHETHER state is accepted is not enough, because the two groups are disjoint:
+    a `**kwargs` or keyword-only scorer rejects a third positional argument, and a `*args` scorer
+    rejects the `state=` keyword. Passing state the one way the signature cannot take turns a
+    suite that opted in to episode grading into `scoring failed` on every case -- a hard zero that
+    reads like the model failed rather than like the harness called the scorer wrong.
     """
     if not callable(score):
-        return False
+        return None
     try:
         parameters = list(inspect.signature(score).parameters.values())
     except (TypeError, ValueError):
         # builtins and C callables expose no signature; treat them as the published contract.
-        return False
+        return None
+    named_state = next((p for p in parameters if p.name == "state"), None)
+    if named_state is not None and named_state.kind in (
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    ):
+        # By keyword even where positional would also bind: it cannot land on the wrong parameter.
+        return "keyword"
+    # Checked before `*args`, since a scorer with both can take `state=` but one with only
+    # `*args` cannot.
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters):
-        return True
+        return "keyword"
+    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters):
+        return "positional"
     positional = [
         p
         for p in parameters
         if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
     ]
-    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters):
-        return True
-    if any(p.name == "state" for p in parameters):
-        return True
-    # (case, response) is the published contract; a third positional is the episode state.
-    return len(positional) >= 3
+    # (case, response) is the published contract; a third positional is the episode state. This
+    # also catches a positional-only `state`, which the named check above deliberately skips.
+    return "positional" if len(positional) >= 3 else None
 
 
 def _run_episode_cases(
