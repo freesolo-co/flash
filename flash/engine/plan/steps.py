@@ -25,6 +25,54 @@ def sft_update_steps(
     return max(1, math.ceil(training_rows / max(1, int(examples_per_update))) * int(epochs))
 
 
+def sft_data_parallel_cards(gpu_count: int, train_batch_size: int, row_count: int = 0) -> int:
+    """Cards SFT can actually train on, given verl splits the batch AND the dataset across them.
+
+    SFT runs data-parallel (see ``sft_train_runner._prepare_sft_child``), so verl derives
+    ``train_batch_size_per_dp = train_batch_size // dp_size`` and hands that straight to a
+    DataLoader. A count ABOVE the batch floors the per-rank batch to 0, and
+    ``DataLoader(batch_size=0)`` raises ``ValueError`` -- measured, not inferred.
+
+    The width must divide ``row_count`` too, and that one silently corrupts the run rather than
+    raising: verl builds ``DistributedSampler(..., drop_last=True)`` (``sft_trainer.py:237``) and
+    Flash's exact-dataloader shim overrides ``drop_last`` on the LOADER only, so a remainder is
+    dropped from every epoch -- MEASURED at 11 rows, 2 ranks trains 10 and 4 ranks trains 8, while
+    the frozen quote still bills all 11. ``drop_last=False`` is not the fix: it pads by DUPLICATING
+    rows, trading silent row loss for silent row repetition.
+
+    So take the largest count <= the allocated cards that divides both, keeping the realized global
+    batch exactly ``train_batch_size`` and every profiled row trained exactly once. That is what
+    makes the card count a pure throughput choice rather than a hyperparameter change. Returns 1 for
+    an unpacked run, which is correct: one example cannot be split.
+
+    ``row_count`` defaults to 0, meaning "unknown, do not constrain" -- the cost path quotes before
+    the dataset is materialized. Quote-side only; the worker always passes the real count.
+
+    Lives here rather than beside its caller because the cost path must quote the width that will
+    execute, and ``sft_train_runner`` is not importable from it (it cycles through ``sft_train``).
+    """
+    cards = max(1, int(gpu_count))
+    batch = max(1, int(train_batch_size))
+    return widest_usable_sft_width(range(min(cards, batch), 0, -1), batch, row_count)
+
+
+def widest_usable_sft_width(candidates, train_batch_size: int, row_count: int) -> int:
+    """First candidate that divides the batch and the rows, or 1 when none does.
+
+    ``candidates`` must be ordered widest-first; the caller owns which shapes are eligible.
+    ``sft_data_parallel_cards`` searches every count up to the allocation because it answers "what
+    will verl actually run", while the worker's idle-card warning searches only the power-of-two
+    shapes providers rent because it answers "what should you allocate instead". Same predicate,
+    different candidate sets -- the divisibility rule itself lives here once.
+    """
+    batch = max(1, int(train_batch_size))
+    rows = max(0, int(row_count))
+    for count in candidates:
+        if batch % count == 0 and (rows == 0 or rows % count == 0):
+            return int(count)
+    return 1
+
+
 def final_save_due(step: int, save_at_steps: tuple[int, ...] | list[int]) -> bool:
     """Preserve the final checkpoint unless exact save steps exclude it."""
     step = int(step)

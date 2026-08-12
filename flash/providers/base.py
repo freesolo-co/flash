@@ -323,11 +323,17 @@ def run_config_for_ranking(
     train=None,
     thinking: bool = False,
     model_revision: str = "",
+    overrides: dict | None = None,
 ):
     """Build the one-step RunConfig shared by every hardware-ranking path.
 
     Ranking is per step, so run length is irrelevant. Import lazily because the cost model imports
     this module.
+
+    ``overrides`` carries knobs that come from the frozen workload profile rather than the authored
+    ``train`` table -- see ``flash.cost.spec.sft_ranking_overrides``, which is the single place they
+    are derived. They are applied last because the profile measured what will actually execute and
+    the authored value is only the request.
     """
     from flash.core.catalog import samples_on_policy
     from flash.cost.types import RunConfig
@@ -374,25 +380,28 @@ def run_config_for_ranking(
         recipe = RECIPE.opd if algorithm == "opd" else RECIPE.rl
         return min(authored if authored is not None else int(recipe.prompts_per_step), retained)
 
-    return RunConfig(
-        model_id=model_id,
-        method=algorithm,
-        steps=1,
-        seq_len=knob("max_context_tokens"),
-        completion_len=knob("max_completion_tokens"),
+    fields = {
+        "model_id": model_id,
+        "method": algorithm,
+        "steps": 1,
+        "seq_len": knob("max_context_tokens"),
+        "completion_len": knob("max_completion_tokens"),
         # RunConfig.batch_size is "examples per optimizer update", which each algorithm authors
         # under a different key: sft as `batch_size`, grpo/opd as `prompts_per_step` (the schema
         # rejects `batch_size` outright for them). Reading only the sft name left every authored
         # rollout batch as None here, so ranking priced the recipe default -- 64 against an
         # authored 32 -- and could select a costlier shape than the run actually needs.
         # `flash.cost.spec.estimate_for_spec` splits the same way, with a third branch this has no
-        # input for: it prefers a measured sft workload profile, which ranking runs before.
-        batch_size=(rollout_batch() if samples_on_policy(algorithm) else knob("batch_size")),
-        group_size=knob("group_size"),
-        lora_rank=knob("lora_rank"),
-        thinking=thinking,
-        model_revision=model_revision,
-    )
+        # input for: it prefers a measured sft workload profile, which ranking runs before --
+        # `overrides` below is how that measurement reaches this function.
+        "batch_size": (rollout_batch() if samples_on_policy(algorithm) else knob("batch_size")),
+        "group_size": knob("group_size"),
+        "lora_rank": knob("lora_rank"),
+        "thinking": thinking,
+        "model_revision": model_revision,
+    }
+    fields.update(overrides or {})
+    return RunConfig(**fields)
 
 
 def _run_cost_key(
@@ -402,6 +411,7 @@ def _run_cost_key(
     train=None,
     thinking: bool = False,
     model_revision: str = "",
+    overrides: dict | None = None,
 ):
     """``(gpu, hourly_rate) -> dollars per step`` for this run, or None if it can't be priced."""
     try:
@@ -414,6 +424,7 @@ def _run_cost_key(
                 train=train,
                 thinking=thinking,
                 model_revision=model_revision,
+                overrides=overrides,
             )
         )
     except Exception:  # unpriceable run -- rank on $/hr, never fail selection
@@ -483,11 +494,21 @@ def gpu_capacity_shape(
     *,
     min_vram_gb: float | None = None,
     gpu_names: tuple[str, ...] | None = None,
+    executed_width=None,
 ) -> tuple[GpuClass, int, float] | None:
-    """Return the largest shape, or the smallest shape clearing ``min_vram_gb``."""
+    """Return the largest shape, or the smallest shape clearing ``min_vram_gb``.
+
+    The count in the returned shape is the RENTED count -- it labels what the user buys and what
+    `--gpus N` asks for. The capacity is valued at ``executed_width(count)``, the ranks that join.
+    For sft those differ, and a message that mixes them contradicts itself: a 2-card ceiling that
+    launches one rank was reported as providing 234.1 GB against a 230 GB need (so the rejection
+    read as a fit), then pointed at a 4-card shape credited 252.8 GB that really delivers 191.6.
+    """
     count = largest_rentable_count(gpu_count)
+    launched = executed_width(count) if executed_width else count
     shapes = [
-        (gpu, count, combined_vram_gb(gpu.vram_gb, count)) for gpu in _eligible_gpu_infos(gpu_names)
+        (gpu, count, combined_vram_gb(gpu.vram_gb, launched))
+        for gpu in _eligible_gpu_infos(gpu_names)
     ]
     if min_vram_gb is not None:
         shapes = [shape for shape in shapes if shape[2] >= min_vram_gb]
@@ -508,12 +529,30 @@ def smallest_fitting_gpu_count(
     *,
     max_gpu_count: int,
     gpu_names: tuple[str, ...] | None = None,
+    executed_width=None,
 ) -> int | None:
-    """Return the smallest rentable count whose structural pool can hold the run."""
-    for count in reversed(rentable_gpu_counts(max_gpu_count)):
-        if gpu_capacity_shape(count, min_vram_gb=min_vram_gb, gpu_names=gpu_names) is not None:
-            return count
-    return None
+    """Return the smallest rentable count whose structural pool can hold the run.
+
+    ``executed_width`` maps a rented count to the ranks that actually JOIN the run, defaulting to
+    "all of them"; only sft narrows it (``allocator._executed_width``). Two consequences shape this
+    search. The rank count is valued directly rather than through ``gpu_capacity_shape``, which
+    snaps its argument to a RENTABLE count -- right for cards you buy, wrong for ranks that launch,
+    since sft widths are not powers of two (batch 3 over 3 rows launches 3, and snapping to 2
+    under-credits a shape that fits). And every rentable count is visited rather than stopping at
+    the first miss, because the executed width is not monotonic in the rented count: that same run
+    launches 1 rank on 2 cards but 3 on 4. Returning the SMALLEST fitting count keeps the cheapest
+    shape winning.
+    """
+    launched = executed_width or (lambda count: count)
+    fitting = [
+        count
+        for count in rentable_gpu_counts(max_gpu_count)
+        if any(
+            combined_vram_gb(gpu.vram_gb, launched(count)) >= min_vram_gb
+            for gpu in _eligible_gpu_infos(gpu_names)
+        )
+    ]
+    return min(fitting) if fitting else None
 
 
 def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
@@ -681,7 +720,9 @@ def rentable_gpu_counts(max_gpu_count: int) -> tuple[int, ...]:
     """Return rentable card counts, largest first, up to ``max_gpu_count``.
 
     Use powers of two: providers sell those shapes, and verl requires ``num_attention_heads %
-    sp_size == 0``. Every current catalog head count (8, 8, 16, 16, 24, 16) divides 1, 2, 4, and 8,
+    sp_size == 0`` wherever ulysses runs (grpo and opd; sft pins it off and shards by data, so its
+    width is bounded by the batch instead -- see ``sft_data_parallel_cards``). Every current catalog
+    head count (8, 8, 16, 16, 24, 16) divides 1, 2, 4, and 8,
     so today every rentable shape is legal for every row. That is a property of today's catalog, not
     an invariant: ``allocator.geometry_safe_gpu_cap`` checks each row's own recorded head count so a
     future row with, say, 20 heads is capped rather than rented and failed at Ulysses init. This
@@ -704,7 +745,7 @@ def largest_rentable_count(max_gpu_count: int) -> int:
 
 
 def wider_shape_remedy(
-    vram_options: Iterable[int], need: float, *, ceiling: int, above: int = 0
+    vram_options: Iterable[int], need: float, *, ceiling: int, above: int = 0, executed_width=None
 ) -> str:
     """The ``--gpus N`` clause a fit failure carries, or ``""`` when no wider shape would fit.
 
@@ -723,13 +764,18 @@ def wider_shape_remedy(
     (see ``rents_arbitrary_card_counts``); passing none leaves the failure a bare dead end, which
     is the honest answer when no offline check can confirm the wider SKU exists.
 
+    ``executed_width`` (``allocator._executed_width``) has to bound the suggestion too: `--gpus 2`
+    on a run whose batch launches one rank buys a second card that contributes no memory, so the
+    user pays twice to fail identically. Advice is searched with the rule that will judge the retry.
+
     Every fit-rejection message routes through here so the remedy cannot drift in wording or in
     the rule that produces it.
     """
+    launched = executed_width or (lambda count: count)
     best = 0
     for vram_gb in vram_options:
         for count in sorted(rentable_gpu_counts(max(1, int(ceiling)))):
-            if count > above and combined_vram_gb(vram_gb, count) >= need:
+            if count > above and combined_vram_gb(vram_gb, launched(count)) >= need:
                 best = count if best == 0 else min(best, count)
                 break
     if best == 0:

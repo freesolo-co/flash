@@ -1393,8 +1393,30 @@ not a reliable place to look either: the mid-run heartbeats
 `gpu_status` wholesale, so the field is usually absent while a run is live and reappears only on the
 terminal heartbeat.
 
-GRPO, SFT and OPD all shard across the selected count with no backend key to set: the worker
-launches one rank per card with Ulysses sequence parallelism.
+GRPO, SFT and OPD all shard across the selected count with no backend key to set. GRPO and OPD
+launch one rank per card with Ulysses sequence parallelism, which keeps the global batch whole. SFT
+shards by data instead — sequence parallelism is wrong for the catalog's GatedDeltaNet models, whose
+linear attention and causal conv carry state along the sequence — so its batch is split across ranks.
+
+That gives SFT two things to watch, and the card count has to divide **both** or some cards go
+unused: `[train] batch_size`, because a batch verl cannot split evenly would starve a rank, and the
+number of rows the profile retains, because verl's sampler drops the remainder from every epoch
+rather than padding it. The worker trains on the largest number of cards that divides both and
+prints `[sft][warn] training on N of M allocated cards` when that is fewer than you allocated.
+
+The unused cards are still billed, so if you see that line, act on whichever input the warning
+names. Raising `batch_size` only helps when the rows already divide the card count — batch 8 on 4
+cards uses all four at 12 retained rows, but only two at 10, and no batch value fixes that. When
+the rows are the limit, allocate the card count the warning suggests instead; it is always a
+power of two, since those are the shapes providers rent. Batch 2 on 4 cards uses two either way.
+An unpacked run trains one example per update, so it always resolves to a single card whatever
+`batch_size` says — there, allocate one card rather than raising the batch.
+
+One caveat on shrinking the allocation: the cards that joined the run are the ones holding the
+model, so fewer cards can mean less memory, not just a smaller bill. When the suggested count is
+below the ranks you are training on, the warning says "if the run still fits" — check it before
+acting, because a large model can run on the ranks it launched and be rejected on the narrower
+shape. Raising `batch_size` never has this problem: it uses cards you are already paying for.
 
 OPD has one unsupported combination, and because there is no other backend to fall back to it
 raises at startup: a multi-turn env together with `[train] structured_outputs`. Multi-turn OPD

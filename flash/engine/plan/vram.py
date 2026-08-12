@@ -15,9 +15,6 @@ _BASE_OVERHEAD_GB = 4.0
 _ACT_COEF = 0.12
 _SFT_PER_DEVICE_BS_DEFAULT = 4
 _VOCAB_DEFAULT = 248_320
-# algorithms that author the optimizer batch as `prompts_per_step`. "rl" is the legacy spelling of
-# grpo this module already accepts everywhere else it branches on the algorithm.
-_ROLLOUT_ALGOS = frozenset({"grpo", "rl", "opd"})
 # must track verl's `FusedLinearForPPO(chunk_size=...)` default
 # (verl/utils/experimental/torch_functional.py). the child projects the vocab in chunks of this
 # many token rows, so a smaller value here under-reserves and admits a job that then OOMs.
@@ -578,7 +575,12 @@ def _optimizer_batch_value(train, algorithm: str):
     rejected yet; take the larger rather than trusting one, since under-sizing is the failure that
     OOMs a paid run and over-sizing only costs a bigger card.
     """
-    names = ("prompts_per_step", "batch_size") if algorithm in _ROLLOUT_ALGOS else ("batch_size",)
+    from flash.core.catalog import optimizer_batch_key
+
+    # the algorithm's OWN key comes from the one helper the writers use too (`RunConfig.train_knobs`
+    # emits under it, ranking reads under it), so the read and write sides cannot drift apart.
+    own = optimizer_batch_key(algorithm)
+    names = (own, "batch_size") if own != "batch_size" else ("batch_size",)
     values = [
         v for v in (_positive_int_or_default(_sizing_value(train, n), None) for n in names) if v
     ]
