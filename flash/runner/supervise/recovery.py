@@ -390,11 +390,15 @@ def _candidate_usable_vram_gb(candidate) -> float:
     """Run-usable VRAM under the allocator's fit model.
 
     Use ``combined_vram_gb`` on both sides of OOM escalation. Raw card-count multiplication ignores
-    replicated floors and shard efficiency, so it can move a retry to a smaller effective shape.
+    replicated floors and shard efficiency, so it can move a retry to a smaller effective shape. SFT
+    can launch fewer ranks than it rents; the allocator stamps that run-specific width, while an
+    unstamped candidate preserves the historical all-rented-cards behavior.
     """
     from flash.providers.base import combined_vram_gb
 
-    return combined_vram_gb(candidate.vram_gb, int(getattr(candidate, "gpu_count", 1) or 1))
+    rented = int(getattr(candidate, "gpu_count", 1) or 1)
+    executed = getattr(candidate, "executed_gpu_count", None)
+    return combined_vram_gb(candidate.vram_gb, int(executed) if executed is not None else rented)
 
 
 def _oom_escalated(candidates, oom_vram_floor: float):
