@@ -700,7 +700,7 @@ def project_created(project_id: str, name: str) -> str:
     )
 
 
-def env_setup(paths: list[str], project_id: str) -> str:
+def env_setup(paths: list[str], project_id: str, *, can_publish: bool = True) -> str:
     """Confirmation + file tree for `flash env setup`."""
     labels = {
         "environment.py": "env entrypoint — edit the reward + prompt",
@@ -715,7 +715,16 @@ def env_setup(paths: list[str], project_id: str) -> str:
         f"  {_paint(p.ljust(keyw), _ACCENT2)}  {_dim(labels.get(p, ''))}" for p in paths
     )
     head = f"{header('env setup', 'starter Freesolo environment')}\n{ok('scaffold ready')}\n"
-    next_step = arrow(f"publish it: flash env push --project {project_id} --name my-env .")
+    if can_publish:
+        next_step = arrow(f"publish it: flash env push --project {project_id} --name my-env .")
+    else:
+        # `env push` targets the managed hub, which a self-hosted plane cannot write to. The
+        # standalone caveat is part of the wording: a github: id is accepted only by a plane
+        # running FLASH_STANDALONE=1, and setup classifies on the API URL, which cannot see it.
+        next_step = arrow(
+            "publish it: push to a git repo, then set [environment] id = "
+            "github:OWNER/REPO@main:environment.py (needs FLASH_STANDALONE=1 on the plane)"
+        )
     return _safe(f"{head}\n{tree}\n\n{next_step}")
 
 
