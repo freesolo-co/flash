@@ -3815,3 +3815,131 @@ def test_env_eval_applies_the_last_model_turn_before_scoring_at_the_turn_cap() -
     assert state["applied"] == ["a", "b"]
     # one inter-turn reply plus the final apply; no third that would glue on an unanswerable prompt
     assert environment.env_replies == 2
+
+
+def test_env_eval_does_not_step_an_environment_that_already_reported_done() -> None:
+    """An env that ended the episode itself must not be stepped again before scoring.
+
+    `env_reply` runs `step_episode`. Once the env reports done there is nothing left to apply, and
+    both `env test` and the RL worker stop there. Stepping anyway scores a state past the end of
+    the episode -- and for an env that validates each action, can raise on a turn that never was.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 5
+        package_root = None
+
+        def __init__(self):
+            self.env_replies = 0
+
+        def new_rollout_state(self, example):
+            return {"messages": [{"role": "user", "content": "go"}], "turns": [], "turn": 0}
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["messages"].append({"role": "assistant", "content": content})
+            state["response_text"] = content
+            # the env decides the episode is over the moment it sees this action
+            if content == "stop":
+                state["done"] = True
+
+        def rollout_done(self, state, max_turns=None):
+            if state.get("done"):
+                return True
+            return max_turns is not None and int(state.get("turn", 0)) >= int(max_turns)
+
+        def env_reply(self, messages, state):
+            self.env_replies += 1
+            state["turn"] = int(state.get("turn", 0)) + 1
+            state["messages"] = [*messages, {"role": "user", "content": "next"}]
+            return [{"role": "user", "content": "next"}]
+
+    replies = iter(["stop"])
+    environment = Environment()
+    original = env_eval._generate_case
+    env_eval._generate_case = lambda client, target, messages, args: next(replies)
+    try:
+        state = episode_module._drive_episode(
+            object(), "t", environment, EvalCase(id="c", input="x"), argparse.Namespace()
+        )
+    finally:
+        env_eval._generate_case = original
+
+    assert state["turns"] == ["stop"]
+    # the env ended it; no step may follow
+    assert environment.env_replies == 0
+
+
+def test_env_eval_honours_a_per_example_turn_budget_below_the_env_ceiling() -> None:
+    """A case whose `max_episode_turns` is lower than `max_turns` must stop at its own budget.
+
+    `rollout_done` gives the per-example budget precedence (`flash/envs/adapter.py`), and both
+    training bridges derive the same effective limit (`opd/bridge.py:512`, `rl/multi_turn.py:174`).
+    Counting only the dataset-wide ceiling generates turns training would never have run.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 6
+        package_root = None
+
+        def __init__(self):
+            self.env_replies = 0
+
+        def new_rollout_state(self, example):
+            return {
+                "messages": [{"role": "user", "content": "go"}],
+                "turns": [],
+                "turn": 0,
+                # this case gets a shorter budget than the dataset-wide ceiling
+                "max_episode_turns": 2,
+            }
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["messages"].append({"role": "assistant", "content": content})
+            state["response_text"] = content
+
+        def rollout_done(self, state, max_turns=None):
+            # deliberately honours ONLY the cap it is handed, so this test measures the cap the
+            # driver computes rather than the env re-deriving the budget for it. the real adapter
+            # applies the same precedence internally (flash/envs/adapter.py:670), which would mask
+            # a driver that passed the wrong ceiling.
+            if state.get("done"):
+                return True
+            return max_turns is not None and int(state.get("turn", 0)) >= int(max_turns)
+
+        def env_reply(self, messages, state):
+            self.env_replies += 1
+            state["turn"] = int(state.get("turn", 0)) + 1
+            state["messages"] = [*messages, {"role": "user", "content": "next"}]
+            return [{"role": "user", "content": "next"}]
+
+    generated = []
+
+    def _fake_generate(client, target, messages, args):
+        generated.append(messages)
+        return f"turn{len(generated)}"
+
+    environment = Environment()
+    original = env_eval._generate_case
+    env_eval._generate_case = _fake_generate
+    try:
+        state = episode_module._drive_episode(
+            object(), "t", environment, EvalCase(id="c", input="x"), argparse.Namespace()
+        )
+    finally:
+        env_eval._generate_case = original
+
+    # two turns, not the six the dataset-wide ceiling would have allowed
+    assert state["turns"] == ["turn1", "turn2"]
+    assert len(generated) == 2

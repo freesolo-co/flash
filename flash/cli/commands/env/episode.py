@@ -47,7 +47,11 @@ def _drive_episode(client, target: str, environment, case: EvalCase, args) -> di
     eval_module = _eval_module()
     example = _evaluation_example(case)
     state = environment.new_rollout_state(example)
-    hard_cap = int(environment.max_turns)
+    # The per-example budget wins over the dataset-wide ceiling, the same precedence
+    # `rollout_done` applies (flash/envs/adapter.py) and both training bridges compute
+    # (opd/bridge.py, rl/multi_turn.py). Using only `environment.max_turns` would run a case whose
+    # `max_episode_turns` is lower past its own budget.
+    hard_cap = _effective_turn_cap(environment, state)
     turns = 0
     # True while the newest turn has not been through env_reply, mirroring the worker's own flag.
     env_step_pending = False
@@ -92,9 +96,29 @@ def _drive_episode(client, target: str, environment, case: EvalCase, args) -> di
     # last action's side effects from the scored state, and it made the branch unreachable outright
     # -- `env_step_pending` survives only the line-70 break, whose condition is exactly what the
     # extra guard then excluded.
-    if env_step_pending:
+    #
+    # An env that already reports done is the one case still skipped: it has ended the episode
+    # itself, so `step_episode` has nothing left to apply and both `env test` and the RL worker
+    # stop there. Only the CAP half of the old guard was wrong.
+    if env_step_pending and not environment.rollout_done(state, hard_cap):
         environment.env_reply(state["messages"], state)
     return state
+
+
+def _effective_turn_cap(environment, state: dict) -> int:
+    """The turn ceiling for THIS episode: the per-example budget if it set one, else the env's.
+
+    `rollout_done` gives `state["max_episode_turns"]` precedence over the dataset-wide cap, and
+    both training bridges derive the same effective limit. A driver that counted only
+    `environment.max_turns` would keep generating past a shorter per-example budget, grading turns
+    training would never have run.
+    """
+    cap = state.get("max_episode_turns")
+    ceiling = int(environment.max_turns)
+    if cap is None:
+        return ceiling
+    # Never above the dataset-wide ceiling, and never below one turn, matching rl/multi_turn.py.
+    return max(1, min(ceiling, int(cap)))
 
 
 def _score_episode_case(
