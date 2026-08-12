@@ -53,7 +53,13 @@ def _drive_episode(client, target: str, environment, case: EvalCase, args) -> di
         messages = state.get("messages")
         if not messages:
             return "rollout produced no messages to generate from"
-        response = eval_module._generate_case(client, target, [dict(m) for m in messages], args)
+        # Normalize on every turn, exactly as the single-turn path and the training workers do.
+        # Sending state["messages"] raw would ship package-relative image paths the chat API
+        # cannot load, so a multimodal case would silently grade a model that never saw the image.
+        prompt = eval_module._remote_prompt_messages(
+            environment, example, [dict(m) for m in messages]
+        )
+        response = eval_module._generate_case(client, target, prompt, args)
         if isinstance(response, eval_module._GenerationFailure):
             return response.error
         environment.record_model_turn(state, response)

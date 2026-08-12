@@ -3487,3 +3487,79 @@ def test_env_eval_refuses_an_episode_suite_on_a_single_turn_environment(
     # an error, not a 0.0: a mismatched pairing is unmeasurable, not a bad model.
     assert "single-turn" in captured.out + captured.err
     assert "errors=1" in captured.out
+
+
+def test_env_eval_normalizes_images_on_every_episode_turn() -> None:
+    """Each turn's prompt must go through the same image normalization as a single-turn case.
+
+    `_drive_episode` builds its prompt from rollout state rather than `_case_messages`, so it does
+    not inherit that normalization for free. Sending the state messages raw ships a data-URI-less
+    `image` block the chat API cannot read, and the case would still be graded -- scoring a model
+    that never saw the image.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 1
+        package_root = None
+
+        def new_rollout_state(self, example):
+            return {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+                            },
+                            {"type": "text", "text": "describe it"},
+                        ],
+                    }
+                ],
+                "turns": [],
+            }
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["response_text"] = content
+
+        def rollout_done(self, state, max_turns=None):
+            return True
+
+        def env_reply(self, messages, state):
+            return []
+
+    sent: list[list[dict]] = []
+
+    def capture(client, target, messages, args):
+        sent.append(messages)
+        return "a cat"
+
+    original = env_eval._generate_case
+    env_eval._generate_case = capture
+    try:
+        episode_module._drive_episode(
+            object(),
+            "t",
+            Environment(),
+            EvalCase(id="row", input="describe it"),
+            argparse.Namespace(),
+        )
+    finally:
+        env_eval._generate_case = original
+
+    assert len(sent) == 1
+    content = sent[0][0]["content"]
+    # the raw `image` block must be gone, rewritten into the image_url shape the backend reads.
+    assert not any(block.get("type") == "image" for block in content)
+    assert {
+        "type": "image_url",
+        "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        },
+    } in content
