@@ -475,14 +475,24 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
                 {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 2},
             ),
             ("unauthored, small pool", {"epochs": 1, "group_size": 4, "max_examples": 2}),
-            ("authored, no pool", {"epochs": 1, "group_size": 4, "prompts_per_step": 32}),
             (
                 "authored below the pool",
                 {"epochs": 1, "group_size": 4, "prompts_per_step": 2, "max_examples": 128},
             ),
+            # no pool size, horizon stated instead -- quotable, and nothing to cap against.
             (
-                "uncapped pool",
-                {"epochs": 1, "group_size": 4, "prompts_per_step": 8, "max_examples": 0},
+                "authored, max_steps horizon",
+                {"epochs": 1, "group_size": 4, "prompts_per_step": 32, "max_steps": 10},
+            ),
+            (
+                "uncapped pool, max_steps horizon",
+                {
+                    "epochs": 1,
+                    "group_size": 4,
+                    "prompts_per_step": 8,
+                    "max_examples": 0,
+                    "max_steps": 10,
+                },
             ),
         ):
             spec = JobSpec.from_dict(
@@ -508,6 +518,33 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
         }
     )
     assert runconfig_from_spec(capped).normalized().batch_size == 2
+
+    # a stated horizon needs no pool size, so capping must not turn `max_steps` into a refusal.
+    # `spec_steps` returns before asking for a row count; asking anyway here would reject a fully
+    # specified run at submit time.
+    stated = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 32, "max_steps": 10},
+        }
+    )
+    assert runconfig_from_spec(stated).normalized().batch_size == 32
+
+    # and a pool that genuinely cannot be known is still dev's explicit refusal, not a cheap quote.
+    from flash.cost.spec import UnknownPromptPoolSize
+
+    unbounded = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 32},
+        }
+    )
+    with pytest.raises(UnknownPromptPoolSize):
+        runconfig_from_spec(unbounded)
 
 
 def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():

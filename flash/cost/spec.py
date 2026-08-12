@@ -159,6 +159,26 @@ def _on_policy_prompts_per_step(spec, examples: int) -> int:
     return min(_on_policy_requested_prompts_per_step(spec), max(1, int(examples)))
 
 
+def _rollout_batch_for_quote(spec) -> int:
+    """Prompts one priced rollout step trains on: the requested batch, capped by the retained pool.
+
+    The workers retain at most ``max_examples`` rows and then clamp the batch to what is left, so
+    `prompts_per_step = 128` against `max_examples = 2` trains on 2. Pricing the raw 128 charges a
+    completed or cancelled run for the work it did not do, and ``spec_steps`` already counts steps
+    against the capped batch -- so without this one quote mixes a capped step COUNT with an uncapped
+    per-step PRICE.
+
+    A pool size is not always knowable, and that is not a pricing failure here. ``max_steps`` states
+    the horizon outright, so ``spec_steps`` returns before ever asking for a row count; asking for
+    one anyway would reject a fully specified run. There is nothing to cap against in that case, so
+    the requested batch stands -- the same number this priced before the cap existed.
+    """
+    try:
+        return _on_policy_prompts_per_step(spec, _on_policy_example_count(spec))
+    except UnknownPromptPoolSize:
+        return _on_policy_requested_prompts_per_step(spec)
+
+
 def spec_steps(spec) -> int:
     """Per-seed optimizer steps implied by a train spec (mirrors the worker).
 
@@ -258,11 +278,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         batch_size=(
             profile.examples_per_update
             if profile is not None
-            else (
-                _on_policy_prompts_per_step(spec, _on_policy_example_count(spec))
-                if has_rollout
-                else t.batch_size
-            )
+            else (_rollout_batch_for_quote(spec) if has_rollout else t.batch_size)
         ),
         group_size=t.group_size if has_rollout else None,
         lora_rank=t.lora_rank,
