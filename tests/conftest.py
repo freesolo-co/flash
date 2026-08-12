@@ -11,6 +11,67 @@ import contextlib
 import pytest
 
 
+def _untrusted_tmpdir_ancestor(base):
+    """The first ancestor of ``base`` that the env cache's trust checks will refuse, if any.
+
+    Mirrors the group/other-writable-without-sticky-bit rule in
+    ``flash.envs.cache_security.validate_cache_root_ancestors``. Kept as a plain predicate so the
+    diagnostic below can name the offending path rather than restating the rule.
+    """
+    import stat
+
+    for ancestor in (base, *base.parents):
+        try:
+            info = ancestor.stat()
+        except OSError:
+            continue
+        if (info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and not (info.st_mode & stat.S_ISVTX):
+            return ancestor, info.st_mode & 0o777
+    return None, None
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Name TMPDIR on env-cache trust failures, instead of only the code under test.
+
+    ``validate_cache_root_ancestors`` refuses a cache root with a group/other-writable ancestor
+    that has no sticky bit. That check is right, and the tests that trip it are not: they point
+    ``_CACHE_ROOT`` at ``tmp_path``, whose ancestors belong to whatever ``TMPDIR`` names. Set
+    ``TMPDIR`` to a shared 0775 directory and 13 tests across ``test_env_pull.py`` and
+    ``test_verifiers.py`` go red naming ``cache_security.py`` and a generated cache root -- the
+    code under test and a path the developer never chose -- while never naming ``TMPDIR``, which
+    is the thing that is actually wrong. Default ``/tmp`` is 1777 and sticky, so CI never sees it.
+
+    Attached to the failing report rather than printed: ``addopts = -q`` suppresses
+    ``pytest_report_header`` and capture swallows a fixture's ``print``, so both go missing in
+    exactly the default run that needs them. A section on the failure is the one place pytest
+    always shows it, and unlike raising in teardown it does not add a second error per test.
+
+    Fires only when the trust check is what rejected the path, so it explains that failure and
+    never editorializes over an unrelated one.
+    """
+    outcome = yield
+    report = outcome.get_result()
+    if report.when != "call" or not report.failed:
+        return
+    excinfo = getattr(call, "excinfo", None)
+    if excinfo is None:
+        return
+    text = str(excinfo.value)
+    if "env cache root ancestor" not in text or "sticky bit" not in text:
+        return
+    base = item.config._tmp_path_factory.getbasetemp()
+    ancestor, mode = _untrusted_tmpdir_ancestor(base)
+    if ancestor is None:
+        return
+    detail = (
+        f"temp dir ancestor {ancestor} is group/other-writable without the sticky bit "
+        f"(mode {mode:04o}), which the env cache trust checks refuse. "
+        f"fix with `chmod +t {ancestor}`, or point TMPDIR at a private directory."
+    )
+    report.sections.append(("TMPDIR, not the code under test, caused this", detail))
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _close_status_reporter_after_suite():
     yield
