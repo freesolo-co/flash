@@ -1481,6 +1481,29 @@ def test_opd_spec_json_round_trip():
     assert "PARASAIL_API_KEY" not in restored.environment.secrets
 
 
+def test_opd_worker_resolves_the_authored_prompt_batch(monkeypatch):
+    """The paid worker must train on the authored batch, not silently on the recipe default."""
+    from flash.engine.plan.recipe import RECIPE
+    from flash.engine.worker.entry import opd as opd_entry
+    from flash.engine.worker.runtime.pkg_proxy import W
+    from flash.schema import spec_from_dict
+
+    authored = int(RECIPE.opd.prompts_per_step) * 4
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "opd",
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+            "gpu": {},
+            "train": {"epochs": 1, "prompts_per_step": authored},
+        },
+        run_id="x",
+    )
+    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
+    monkeypatch.setattr(W, "THINKING", False, raising=False)
+    assert opd_entry._resolve_opd_knobs().prompts_per_step == authored
+
+
 def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
     from flash.cost.spec import estimate_for_spec, spec_steps
     from flash.schema import spec_from_dict

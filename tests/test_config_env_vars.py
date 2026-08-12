@@ -302,6 +302,65 @@ class TestServerBind:
         assert seen == {"default_level": logging.INFO}
 
 
+class TestServerPreflightFailure:
+    """A plane missing operator configuration must say so, not raise through the ASGI stack.
+
+    check_run_preflight also runs inside the lifespan, where uvicorn renders a PreflightError as
+    an unhandled startup exception: the actionable text arrives after ~20 frames of
+    starlette/fastapi/contextlib, which is where a self-hoster's first error used to land.
+    """
+
+    @staticmethod
+    def _main():
+        return importlib.import_module("flash.server.__main__")
+
+    def _run(self, monkeypatch, capsys, exc):
+        main = self._main()
+        monkeypatch.setattr(main, "configure_logging", lambda **_: None)
+
+        def _boom(host, port):
+            raise exc
+
+        monkeypatch.setattr(main, "run_server", _boom)
+        code = main.main([])
+        return code, capsys.readouterr()
+
+    def test_missing_operator_config_exits_3_with_the_message_on_stderr(self, monkeypatch, capsys):
+        from flash.providers.preflight import PreflightError
+
+        message = (
+            "the Flash control plane is missing required operator configuration:\n"
+            "  - HF_TOKEN: a token with write access\n\nSee SELF_HOSTING.md."
+        )
+        code, captured = self._run(monkeypatch, capsys, PreflightError(message))
+
+        # 3 is uvicorn's STARTUP_FAILURE, which is what this path exited with when the error came
+        # out of the lifespan. Supervision keying on it must not see a different code now.
+        assert code == 3
+        assert "HF_TOKEN" in captured.err
+        assert "SELF_HOSTING.md" in captured.err
+        assert captured.err.startswith("error: ")
+
+    def test_the_failure_is_not_reported_as_a_traceback(self, monkeypatch, capsys):
+        from flash.providers.preflight import PreflightError
+
+        _, captured = self._run(
+            monkeypatch, capsys, PreflightError("missing FREESOLO_INTERNAL_KEY")
+        )
+
+        combined = captured.out + captured.err
+        assert "Traceback" not in combined
+        for frame in ("starlette", "contextlib", "asgi"):
+            assert frame not in combined.lower(), (
+                f"{frame!r} in the output means the operator is reading an ASGI stack again"
+            )
+
+    def test_an_unexpected_error_still_propagates(self, monkeypatch, capsys):
+        """Only PreflightError is a configuration problem. A bug must not be swallowed as exit 3."""
+        with pytest.raises(RuntimeError):
+            self._run(monkeypatch, capsys, RuntimeError("something actually broke"))
+
+
 class TestSqliteBusyTimeout:
     def test_default_is_the_previous_thirty_seconds(self, monkeypatch):
         from flash.server.platform import db
