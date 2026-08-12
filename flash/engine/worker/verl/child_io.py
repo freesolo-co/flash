@@ -79,9 +79,10 @@ FLASH_CUDART_STUB_MARKER = "[flash-verl] tilelang libcudart stub repointed"
 def render_tilelang_cudart_shim() -> str:
     """child-side sitecustomize fragment that repoints tilelang's libcudart stub at the real runtime.
 
-    mirrors ``perf._neutralize_tilelang_cudart_stub`` inside the verl interpreter, and keeps its two
-    load-bearing rules: never ``dlopen`` the stub to test it (that maps the stub into this process,
-    which is the crash being avoided), and leave the stub alone when no real libcudart is found.
+    this is the only place the repoint happens: the stub only matters to the interpreter that builds
+    a sleeping vLLM engine, and that is the verl child. two load-bearing rules: never ``dlopen`` the
+    stub to test it (that maps the stub into this process, which is the crash being avoided), and
+    leave the stub alone when no real libcudart is found.
 
     never raises. an unrepointed stub only crashes the runs that build a sleeping vLLM engine, so a
     fragment that cannot find a runtime must leave the child to start rather than abort it here.
