@@ -175,15 +175,23 @@ def _scored_response(response: str, *, thinking: bool) -> str:
 
 
 def _score_case(
-    suite, case: EvalCase, case_id: str, response: str, *, thinking: bool = False
+    suite, case: EvalCase, case_id: str, response: str, *, thinking: bool = False, state=None
 ) -> EvalResult:
     """Grade one response on the caller's thread.
 
     Scorers may require main-thread resources such as signal-based timeouts; a lock prevents
     overlap but does not provide thread affinity.
+
+    `state` is the finished episode, passed only for a multi-turn suite that accepts it (see
+    `episode._score_episode_case`); single-turn scoring keeps the two-argument contract.
     """
     try:
-        scored = suite.score(case, _scored_response(response, thinking=thinking))
+        scored_text = _scored_response(response, thinking=thinking)
+        scored = (
+            suite.score(case, scored_text)
+            if state is None
+            else suite.score(case, scored_text, state)
+        )
         return normalize_eval_result(case, response, scored, case_id=case_id)
     except (Exception, SystemExit) as exc:
         return EvalResult(

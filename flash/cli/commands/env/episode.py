@@ -11,6 +11,8 @@ would no longer reach the episode path.
 
 from __future__ import annotations
 
+import inspect
+
 from flash.cli.commands.env.test import _evaluation_example
 from flash.envs.evaluations import EvalCase, EvalResult
 
@@ -88,17 +90,54 @@ def _score_episode_case(
 ) -> EvalResult:
     """Grade a finished episode through the suite's own scorer.
 
-    `EvalSuite.score` takes text, so the episode is represented by the text the environment itself
-    considers scored (`state["response_text"]`, which `env_reply` replaces outright when
-    `step_episode` returns a `final_response_text` override). A suite that grades the transcript
-    reads it from the environment it was built with; this keeps the published suite contract
-    unchanged rather than adding a second scoring entry point.
+    `state["response_text"]` is only the LAST model turn: `record_model_turn` overwrites it every
+    turn (flash/envs/adapter.py). Handing a transcript-grading suite that scalar would score one
+    turn of an episode it just paid to play out -- the same defect as generating once, moved one
+    step later. So the finished state is offered to the suite, exactly as `env test` passes it to
+    `reward(completion, example, state)`, which is what reaches the SDK's `score_episodes`.
+
+    `EvalSuite.score(case, response)` is the published two-argument contract, so state is offered
+    only to a suite that accepts it, detected by signature rather than by try/except: a TypeError
+    raised INSIDE a scorer that does accept state would otherwise be silently retried as a
+    two-argument call and graded on the wrong text.
     """
     response = state.get("response_text")
     if not isinstance(response, str):
         turns = state.get("turns") or []
         response = str(turns[-1]) if turns else ""
-    return _eval_module()._score_case(suite, case, case_id, response, thinking=thinking)
+    eval_module = _eval_module()
+    if _accepts_state(getattr(suite, "score", None)):
+        return eval_module._score_case(
+            suite, case, case_id, response, thinking=thinking, state=state
+        )
+    return eval_module._score_case(suite, case, case_id, response, thinking=thinking)
+
+
+def _accepts_state(score) -> bool:
+    """Whether this scorer takes the episode state as a third argument.
+
+    A `**kwargs` scorer counts: it can read `state` even though it names no such parameter.
+    """
+    if not callable(score):
+        return False
+    try:
+        parameters = list(inspect.signature(score).parameters.values())
+    except (TypeError, ValueError):
+        # builtins and C callables expose no signature; treat them as the published contract.
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters):
+        return True
+    positional = [
+        p
+        for p in parameters
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters):
+        return True
+    if any(p.name == "state" for p in parameters):
+        return True
+    # (case, response) is the published contract; a third positional is the episode state.
+    return len(positional) >= 3
 
 
 def _run_episode_cases(

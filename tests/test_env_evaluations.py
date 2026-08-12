@@ -3563,3 +3563,139 @@ def test_env_eval_normalizes_images_on_every_episode_turn() -> None:
             "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
         },
     } in content
+
+
+def test_env_eval_hands_the_finished_episode_to_a_suite_that_accepts_it() -> None:
+    """A transcript-grading suite must receive the episode, not just the last turn.
+
+    `record_model_turn` overwrites `state["response_text"]` on every turn, so the scalar is the
+    LAST reply. Scoring a running-total task on that grades one turn of an episode the run just
+    paid to play out -- the same defect as generating once, moved one step later.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 3
+        package_root = None
+
+        def new_rollout_state(self, example):
+            return {"messages": [{"role": "user", "content": "go"}], "turns": []}
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["messages"] = [*state["messages"], {"role": "assistant", "content": content}]
+            state["response_text"] = content
+
+        def rollout_done(self, state, max_turns=None):
+            return len(state["turns"]) >= 3
+
+        def env_reply(self, messages, state):
+            reply = [{"role": "user", "content": "next"}]
+            state["messages"] = [*messages, *reply]
+            return reply
+
+    class TranscriptSuite:
+        name = "running-total"
+        grades_episodes = True
+
+        def cases(self):
+            return [EvalCase(id="c", input="x", expected="1,3,6")]
+
+        def score(self, case, response, state=None):
+            turns = (state or {}).get("turns") or []
+            seen = ",".join(turns)
+            return EvalResult(
+                case_id=case.id,
+                passed=seen == case.expected,
+                score=1.0 if seen == case.expected else 0.0,
+                response=response,
+                reason=f"saw {seen}",
+            )
+
+    replies = iter(["1", "3", "6"])
+    original = env_eval._generate_case
+    env_eval._generate_case = lambda client, target, messages, args: next(replies)
+    try:
+        suite = TranscriptSuite()
+        results = episode_module._run_episode_cases(
+            object(), "t", suite, suite.cases(), argparse.Namespace(concurrency=1), Environment()
+        )
+    finally:
+        env_eval._generate_case = original
+
+    assert results[0].error is None
+    assert results[0].score == 1.0, results[0].reason
+    assert results[0].reason == "saw 1,3,6"
+
+
+def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes() -> None:
+    """A suite that takes only (case, response) must not be handed a third argument."""
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 2
+        package_root = None
+
+        def new_rollout_state(self, example):
+            return {"messages": [{"role": "user", "content": "go"}], "turns": []}
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["messages"] = [*state["messages"], {"role": "assistant", "content": content}]
+            state["response_text"] = content
+
+        def rollout_done(self, state, max_turns=None):
+            return len(state["turns"]) >= 2
+
+        def env_reply(self, messages, state):
+            return [{"role": "user", "content": "next"}]
+
+    class TextOnlySuite:
+        name = "last-turn"
+        grades_episodes = True
+
+        def cases(self):
+            return [EvalCase(id="c", input="x", expected="b")]
+
+        def score(self, case, response):
+            return EvalResult(
+                case_id=case.id,
+                passed=response == case.expected,
+                score=1.0 if response == case.expected else 0.0,
+                response=response,
+            )
+
+    replies = iter(["a", "b"])
+    original = env_eval._generate_case
+    env_eval._generate_case = lambda client, target, messages, args: next(replies)
+    try:
+        suite = TextOnlySuite()
+        results = episode_module._run_episode_cases(
+            object(), "t", suite, suite.cases(), argparse.Namespace(concurrency=1), Environment()
+        )
+    finally:
+        env_eval._generate_case = original
+
+    # scored on the last turn, with no TypeError from an unexpected third argument
+    assert results[0].error is None
+    assert results[0].score == 1.0
+
+
+def test_accepts_state_detects_the_scorer_shape() -> None:
+    # the signature check is what keeps a two-argument suite from getting a third argument, so
+    # its edge cases are worth pinning: **kwargs and *args can both read state.
+    from flash.cli.commands.env.episode import _accepts_state
+
+    assert _accepts_state(lambda case, response: None) is False
+    assert _accepts_state(lambda case, response, state=None: None) is True
+    assert _accepts_state(lambda case, response, **kwargs: None) is True
+    assert _accepts_state(lambda case, response, *args: None) is True
+    assert _accepts_state(None) is False
