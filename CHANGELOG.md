@@ -11,6 +11,15 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ## Unreleased
 
+### Fixed
+
+- `flash env setup` scaffolded hosted-only environment instructions on every plane. A
+  self-hosted plane cannot publish to Freesolo's managed environment hub, so the generated
+  configs left `[environment] id` empty (which fails validation) beside a `flash env push`
+  command that could not work. Against a self-hosted plane the scaffold now emits the
+  `github:owner/repo@ref:path` id form, which such a plane resolves directly. Output against
+  the managed plane is unchanged.
+
 ### Changed
 
 - CI runs the offline test suite on both supported interpreters (3.11 and 3.12) rather than
@@ -21,6 +30,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- `flash-server` reported missing operator configuration as an unhandled ASGI startup
+  exception, so the actionable message arrived under ~20 frames of starlette/contextlib. The
+  refusing half of the preflight now runs before uvicorn starts, and `flash-server` prints
+  `error: ...` and exits 3 (uvicorn's `STARTUP_FAILURE`, which this path already used, so
+  supervision keying on it is unaffected). The advisory warnings still come from the lifespan
+  alone, so a booted plane logs them once.
 - `flash env test` blamed the reward function for a gold answer that scored zero, when the
   gold completion is equally likely to be at fault: with no `sft_completion` hook the replayed
   answer is the dataset row's raw `output`, so a dataset whose `output` is a bare value fails a

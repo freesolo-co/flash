@@ -25,8 +25,12 @@ from flash.providers.base import (
     rentable_gpu_counts,
     run_config_for_ranking,
     smallest_fitting_gpu_count,
-    vram_fit_error_message,
     wider_shape_remedy,
+)
+from flash.providers.fit_errors import (
+    rents_arbitrary_card_counts,
+    vram_fit_error_message,
+    widenable_gpu_names,
 )
 
 logger = get_logger(__name__)
@@ -269,21 +273,99 @@ def _resolve_exact_gpu(
     provider: str,
     available: tuple[str, ...],
     widest_cap: int = 1,
+    unpinned: tuple[str, ...] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
-    """Validate an explicitly pinned GPU class and narrow ``available`` to providers that offer it."""
+    """Validate an explicitly pinned GPU class and narrow ``available`` to providers that offer it.
+
+    ``unpinned`` is the configured fleet before a provider pin narrowed ``available``, or ``None``
+    when nothing was pinned. A pin can hide the only provider that rents this class at a wider
+    count, and suppressing the remedy entirely would hide a fix the user can actually apply.
+    """
     exact = canonical_gpu(gpu_type)
     exact_info = GPU_INFO.get(exact)
     if exact_info is None or not exact_info.validated:
         raise UnsupportedGpuError(f"exact GPU {exact!r} is not an active validated GPU class")
+    # provider compatibility decides FIRST: a class the requested provider does not carry cannot be
+    # rented at any width, so reporting a fit failure (and a `--gpus N` remedy) for it would send
+    # the user to widen a shape that will never exist. the real defect is the pin/provider pair.
+    exact_providers = providers_for(exact)
+    if provider and provider not in exact_providers:
+        raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
+    reachable = tuple(name for name in available if name in exact_providers)
     # a card ceiling is the user's own `[gpu] count`, so a pin that fits at a wider rentable shape
     # is one flag from working; `above` is the width already tried, so the remedy only ever names
     # a wider one. bounded by the model's geometry cap so the suggestion is a width verl accepts
-    # rather than one it rejects after the box is rented.
+    # rather than one it rejects after the box is rented. only offered when a provider still in
+    # play rents counts freely -- a Lambda/Vast-only pin has no offline proof the wider SKU exists.
+    widths = (exact_info.vram_gb,) if rents_arbitrary_card_counts(reachable) else ()
+    # the pin may be the only reason no width is offerable: this class can be carried by a provider
+    # the pin excluded that DOES rent counts freely. saying so beats a bare shortfall the user
+    # cannot act on. computed from the pre-pin fleet, so it stays silent when there is no pin.
+    unpinned_reachable = (
+        tuple(name for name in unpinned if name in exact_providers) if unpinned else ()
+    )
+    unpinned_widths = (
+        (exact_info.vram_gb,)
+        if not widths and unpinned_reachable and rents_arbitrary_card_counts(unpinned_reachable)
+        else ()
+    )
+    # a class nobody configured can provision is blocked by the CONFIGURATION, not by its VRAM, and
+    # no width or knob change can move that. reporting the shortfall first would answer a question
+    # the user never reached: the same fleet with a smaller need already fails on reachability in
+    # `allocate()`, so deciding it here keeps one root cause from producing two different errors
+    # depending on how large the run happens to be.
+    if not (reachable or unpinned_reachable):
+        raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
+
+    def _drop_pin_hint(above: int) -> str:
+        """Name dropping the pin AND the width it unlocks, or nothing if no width fits.
+
+        Routed through ``wider_shape_remedy`` so this shares the sibling path's two rules: a width
+        is only named once PROVED to fit (an oversized pin gets no hint at all, since dropping the
+        pin cannot help), and the ceiling is named alongside the pin -- reaching here means the
+        authored count already failed, so advice omitting it just buys a second rejection.
+        """
+        remedy = wider_shape_remedy(unpinned_widths, need, ceiling=widest_cap, above=above)
+        if not remedy:
+            return ""
+        # the shared helper opens with "; it fits on N cards -- ...", so splice the pin clause in
+        # front of its body rather than concatenating two separately punctuated sentences.
+        return f". Drop the provider pin to rent {exact!r}:{remedy.removeprefix(';')}"
+
+    def _catalog_check_hint(above: int) -> str:
+        """Name the width to ASK a fixed-count provider for, when no offline width can be proved.
+
+        `live_capacity` means the count must be confirmed dynamically -- not that the wider SKU is
+        absent. Lambda really does resolve `gpu_4x_h100_pcie` against its catalog and rejects a
+        shape it does not sell with its own precise error, so naming the width to try beats a bare
+        shortfall the user cannot act on. Withheld once the class is oversized at every rentable
+        width, where no count would help and the honest answer is the shortfall alone.
+
+        Also withheld when NO configured provider carries this class at all: the obstacle is then
+        the class, not the width, and `--gpus N` cannot succeed at any N. That run belongs to the
+        `no configured active provider` rejection below, which names the real problem.
+        """
+        if widths or unpinned_widths or not (reachable or unpinned_reachable):
+            return ""
+        width = smallest_fitting_gpu_count(
+            need, max_gpu_count=widest_cap, gpu_names=(exact,) if exact_info.validated else ()
+        )
+        if width is None or width <= above:
+            return ""
+        return (
+            f". Their catalog may list a {width}-card {exact} instance -- raise the card ceiling "
+            f"with `--gpus {width}` to check it against their catalog"
+        )
+
     if exact_info.vram_gb < need and max_gpu_count <= 1:
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
             f"but this run requires at least {need} GB"
-            + wider_shape_remedy((exact_info.vram_gb,), need, ceiling=widest_cap, above=1)
+            + (
+                wider_shape_remedy(widths, need, ceiling=widest_cap, above=1)
+                or _drop_pin_hint(1)
+                or _catalog_check_hint(1)
+            )
         )
     # the widest shape providers actually rent for this ceiling, not the ceiling itself: a pin
     # that only fits at a non-rentable count (3) must be rejected here with a precise reason
@@ -295,12 +377,13 @@ def _resolve_exact_gpu(
     ):
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
-            + wider_shape_remedy((exact_info.vram_gb,), need, ceiling=widest_cap, above=cap)
+            + (
+                wider_shape_remedy(widths, need, ceiling=widest_cap, above=cap)
+                or _drop_pin_hint(cap)
+                or _catalog_check_hint(cap)
+            )
         )
-    exact_providers = providers_for(exact)
-    if provider and provider not in exact_providers:
-        raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
-    return exact, tuple(name for name in available if name in exact_providers)
+    return exact, reachable
 
 
 def _structural_gpu_names(available: tuple[str, ...], exact: str) -> tuple[str, ...]:
@@ -323,8 +406,14 @@ def _resolved_gpu_count(
     model_revision: str,
     available: tuple[str, ...],
     exact: str,
+    unpinned: tuple[str, ...] | None = None,
 ) -> int:
     """Resolve auto-size or validate that an authored ceiling can structurally fit.
+
+    ``unpinned`` is the configured fleet before a provider pin narrowed ``available``, or ``None``
+    when nothing was pinned. A rejection needs it to decide whether dropping the pin is a remedy:
+    ``available`` alone cannot tell a pin from a plane that only ever configured one provider, and
+    a pin on such a plane drops to the same pool and the same failure.
 
     Certifies the pin (``certify=True``): this runs inside ``allocate()``, which already does
     network i/o and can retry, and the width decided here is the one the run is really rented at. A
@@ -360,6 +449,14 @@ def _resolved_gpu_count(
             effective_gpu_count=effective_count,
             max_gpu_count=auto_cap,
             gpu_names=gpu_names,
+            providers=available,
+            # the pin is worth dropping only if the fleet behind it still buys a wider shape, so
+            # ask the same question of the unpinned pool that the pinned one just failed.
+            widenable_without_pin=(
+                None
+                if unpinned is None
+                else widenable_gpu_names(_structural_gpu_names(unpinned, exact), unpinned)
+            ),
         )
     )
 
@@ -504,9 +601,12 @@ def allocate(
             f"unknown provider {provider!r}; known providers: {', '.join(PROVIDER_NAMES)}"
         )
     available = available_providers()
+    # kept across the narrowing below so a rejection can ask what dropping the pin would restore.
+    unpinned = None
     if provider:
         if provider not in available:
             raise UnsupportedGpuError(f"requested provider {provider!r} is not configured")
+        unpinned = available
         available = (provider,)
 
     # allocate() is reachable directly, bypassing the parse gate entirely, so it resolves the
@@ -534,6 +634,7 @@ def allocate(
             widest_cap=geometry_safe_gpu_cap(
                 model_id, MAX_COMBINATION_CARDS, model_revision=model_revision, certify=True
             ),
+            unpinned=unpinned,
         )
         if not available:
             raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
@@ -545,6 +646,7 @@ def allocate(
         model_revision=model_revision,
         available=available,
         exact=exact,
+        unpinned=unpinned,
     )
 
     constraints = AllocationConstraints(

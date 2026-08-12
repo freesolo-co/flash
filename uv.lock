@@ -1052,7 +1052,7 @@ wheels = [
 
 [[package]]
 name = "freesolo-flash"
-version = "1.1.48"
+version = "1.1.53"
 source = { editable = "." }
 
 [package.optional-dependencies]

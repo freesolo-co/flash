@@ -158,8 +158,54 @@ def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch
     monkeypatch.setenv("HF_TOKEN", "hf")
     script = builders.build_onstart(_build_payload(builders, _spec(), seed=0, attempt=1))
     # Each closing terminator is preceded by a newline (own line), regardless of payload/src content.
-    for term in ("FLASH_PAYLOAD_EOF", "FLASH_BOOTSTRAP_EOF", "FLASH_BOOTSTRAP_SECRETS_EOF"):
+    for term in (
+        "FLASH_PAYLOAD_EOF",
+        "FLASH_BOOTSTRAP_EOF",
+        "FLASH_BOOTSTRAP_SECRETS_EOF",
+        "FLASH_BOOTSTRAP_PIP_EOF",
+    ):
         assert f"\n{term}\n" in script, f"{term} terminator must be on its own line"
+
+
+def test_onstart_ships_every_bare_sibling_the_bootstrap_imports(monkeypatch):
+    """Vast must write EVERY sibling module bootstrap.py imports when run as a bare script.
+
+    The bare-script imports are unconditional (``__package__`` is empty off-package), so a sibling
+    the onstart forgets is not a degraded install: the bootstrap dies with ModuleNotFoundError
+    before any work starts, on a box already rented and billing, on every run.
+
+    Derived from the bootstrap's own ``else:`` branch rather than a hardcoded list, so adding a
+    fourth shipped module fails here instead of in production.
+    """
+    import ast
+    from pathlib import Path
+
+    from flash.providers.vast.jobs import builders
+
+    lifecycle = Path(builders.__file__).parent.parent.parent / "_lifecycle"
+    tree = ast.parse((lifecycle / "bootstrap.py").read_text())
+    required: set[str] = set()
+    for node in ast.walk(tree):
+        # the bare-script branch of `if __package__:` -- plain `import x` and `from x import ...`
+        # whose module is a file sitting next to bootstrap.py.
+        if isinstance(node, ast.Import):
+            required |= {a.name for a in node.names if (lifecycle / f"{a.name}.py").exists()}
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module
+            and (lifecycle / f"{node.module}.py").exists()
+        ):
+            required.add(node.module)
+    assert required, "expected bootstrap.py to import at least one bare sibling"
+
+    monkeypatch.setenv("VAST_API_KEY", "vk")
+    monkeypatch.setenv("HF_TOKEN", "hf")
+    script = builders.build_onstart(_build_payload(builders, _spec(), seed=0, attempt=1))
+    for module in sorted(required):
+        assert f"/root/flash/{module}.py" in script, (
+            f"bootstrap.py imports {module} as a bare sibling but the vast onstart never writes it"
+        )
     # PYBIN never silently empty: python fallback + a diagnostic when nothing resolves.
     assert "command -v python3 || command -v python" in script
     assert "no python interpreter" in script

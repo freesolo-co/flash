@@ -21,10 +21,15 @@ def _teacher_prompt_text(prompt_messages: list[dict], thinking_prefill: str = ""
     scored against a prompt that never opened the reasoning block, and the gkd logprobs are
     conditioned on a different prefix than the sampled tokens.
     """
+    from flash.content.multimodal import message_content_text
+
     parts = []
     for m in prompt_messages:
         role = str(m.get("role", "user")).capitalize()
-        parts.append(f"{role}: {m.get('content', '')!s}")
+        # `!s` on a content-block list renders a python repr ("[{'type': 'text', ...}]") and the
+        # teacher scores that literal without failing. a mixed image/text opd job carries block
+        # content on its text-only rows too, so go through the one definition of message text.
+        parts.append(f"{role}: {message_content_text(m.get('content', ''))}")
     parts.append("Assistant: " + thinking_prefill)
     return "\n".join(parts)
 
