@@ -29,6 +29,7 @@ from flash.providers.base import (
     wider_shape_remedy,
 )
 from flash.providers.fit_errors import (
+    batch_bound_width_note,
     catalog_check_hint,
     drop_pin_hint,
     rents_arbitrary_card_counts,
@@ -223,15 +224,25 @@ def _executed_rl_gpu_count(algorithm: str, train, gpu_count: int) -> int:
 
     An unknown prompt count does not narrow, matching the sft branch: defaulting it would assert the
     most restrictive width on every caller that ranks without knobs and reject multi-card rl
-    outright. ``group_size`` defaults to 1 because a missing group is one generation per prompt,
-    which is the value that leaves the product equal to the prompt count.
+    outright.
+
+    An unknown ``group_size`` takes the RECIPE default for this algorithm, which is the value the
+    worker resolves it to (``train/rl/inputs.py``: ``gcfg.get("group_size") or rl.group_size``) and
+    the one the cost path fills in (``RunConfig.normalized``). Hardcoding 1 here would under-credit a
+    grpo step eightfold -- `RECIPE.rl.group_size` is 8 -- so one prompt on eight cards would be
+    sized as a single rank and a model that fits across the fsdp group would be REJECTED before it
+    could launch. The two defaults differ by algorithm (grpo groups, opd distills one completion per
+    prompt), which is exactly why this reads the recipe rather than a literal.
     """
     prompts = _sizing_int(train, "prompts_per_step", 0)
     if prompts <= 0:
         return gpu_count
+    from flash.engine.plan.recipe import RECIPE
     from flash.engine.plan.steps import rl_data_parallel_cards
 
-    return rl_data_parallel_cards(gpu_count, prompts * _sizing_int(train, "group_size", 1))
+    recipe = RECIPE.opd if algorithm == "opd" else RECIPE.rl
+    group = _sizing_int(train, "group_size", recipe.group_size)
+    return rl_data_parallel_cards(gpu_count, prompts * group)
 
 
 def _executed_width(algorithm: str, train, overrides):
@@ -431,6 +442,7 @@ def _resolve_exact_gpu(
     widest_cap: int = 1,
     unpinned: tuple[str, ...] | None = None,
     executed_width=None,
+    algorithm: str = "",
 ) -> tuple[str, tuple[str, ...]]:
     """Validate an explicitly pinned GPU class and narrow ``available`` to providers that offer it.
 
@@ -440,7 +452,8 @@ def _resolve_exact_gpu(
 
     ``executed_width`` is ``_executed_width``'s rule. Both the combination precheck below and every
     ``--gpus N`` remedy have to apply it, or a pinned sft run whose batch caps it at one rank is told
-    to buy cards that cannot hold it.
+    to buy cards that cannot hold it. ``algorithm`` only words the reason for that narrowing, so it
+    defaults to sft's phrasing rather than being required of every caller.
     """
     launched = executed_width or (lambda count: count)
     exact = canonical_gpu(gpu_type)
@@ -530,8 +543,12 @@ def _resolve_exact_gpu(
             f"exact GPU {exact!r} cannot fit this run even as a {tried}-card combination"
             + (
                 f" (of the {cap} cards allowed, only {tried} "
-                f"{'joins' if tried == 1 else 'join'} this run -- sft shards by data, so the "
-                f"batch and retained rows bound the rank count)"
+                f"{'joins' if tried == 1 else 'join'} this run"
+                # the reason comes from the shared formatter rather than being spelled again here:
+                # this copy said "sft" unconditionally, so a pinned small-batch grpo/opd run was sent
+                # to a batch knob opd rejects at parse time and rows rl does not have. the dash form,
+                # not the parenthetical: this clause is already inside parens.
+                f"{batch_bound_width_note(algorithm=algorithm)})"
                 if tried != cap
                 else ""
             )
@@ -829,6 +846,7 @@ def allocate(
             ),
             unpinned=unpinned,
             executed_width=executed_width,
+            algorithm=algorithm,
         )
         if not available:
             raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")

@@ -41,16 +41,16 @@ def _join_note(count: int, executed_width=None) -> str:
     return f", {launched} of which {'joins' if launched == 1 else 'join'} this run"
 
 
-def _batch_bound_width_note(*counts: str, algorithm: str = "", parenthetical: bool = False) -> str:
-    """Explain a launched-vs-rented gap ONCE, after the shapes that showed it.
+def batch_bound_width_note(*, algorithm: str = "", parenthetical: bool = False) -> str:
+    """Why this run launches on fewer ranks than it rents, worded for ``algorithm``.
 
-    Only appended when some shape actually printed a join count, so a run that launches every card
-    it rents never sees it. Worded as ``_resolve_exact_gpu`` words it: the operator has to learn
-    that the card ceiling is not the limiter, or they raise `--gpus` and hit the same failure.
+    THE wording for that gap, shared by every message that shows one. The operator has to learn that
+    the card ceiling is not the limiter, or they raise `--gpus` and hit the identical failure.
 
     The reason is per-algorithm because the bounding quantity is: sft counts rows, grpo and opd count
     the sequences one step holds. Naming sft's rows to an opd user would point them at a knob opd
-    rejects at parse time.
+    rejects at parse time -- which is exactly what the pinned-class path in ``allocator`` did while it
+    spelled this sentence itself.
 
     For grpo and opd it also states the DIRECTION, because the general knob advice appended after it
     says to lower those same knobs and here that is a dead end: a step bound by its sequence count
@@ -61,8 +61,6 @@ def _batch_bound_width_note(*counts: str, algorithm: str = "", parenthetical: bo
     ``parenthetical`` when a remedy clause follows -- a trailing dash clause would swallow it, so
     "..., or lower batch_size" would read as part of the explanation rather than as the fix.
     """
-    if not any(counts):
-        return ""
     if (algorithm or "").lower() in ("grpo", "rl", "opd"):
         reason = (
             "every rank needs its own share of the step, so prompts_per_step x group_size bounds "
@@ -71,6 +69,17 @@ def _batch_bound_width_note(*counts: str, algorithm: str = "", parenthetical: bo
     else:
         reason = "sft shards by data, so the batch and retained rows bound the rank count"
     return f" ({reason})" if parenthetical else f" -- {reason}"
+
+
+def _batch_bound_width_note(*counts: str, algorithm: str = "", parenthetical: bool = False) -> str:
+    """``batch_bound_width_note`` gated on some shape having actually printed a join count.
+
+    A run that launches every card it rents never sees the note, so the messages below can append it
+    unconditionally and let the join notes they already built decide.
+    """
+    if not any(counts):
+        return ""
+    return batch_bound_width_note(algorithm=algorithm, parenthetical=parenthetical)
 
 
 def vram_knob_advice(algorithm: str) -> str:

@@ -757,18 +757,37 @@ def test_grpo_launches_the_width_the_step_can_fill():
     this guard arrives with the pin rather than before it. Launching wider than the sequences divide
     aborts at step 0 on a box already rented.
 
-    Asserted on the source: the clamp sits in `_configure_rl_child`, which writes the child shims
-    and reward file, so it is not drivable offline. The rule itself is covered by
+    The width is resolved ONCE, in `_assemble_grpo_inputs`, because two phases consume it: the child
+    config here and the resume probe in `_prepare_rl_files`, which discards a checkpoint whose shard
+    count disagrees with the width it is handed. Deriving it separately let them drift -- resume
+    compared the RENTED count while the child launched the clamped one, so a checkpoint written at the
+    executed width read as the wrong topology and every retry restarted from step 0.
+
+    Asserted on the source: both call sites write child files or download weights, so neither is
+    drivable offline. The rule itself is covered by
     `test_rl_width_never_exceeds_the_sequences_one_step_holds` in the opd suite, and the allocator
     and quote agree through `executed_gpu_count`.
     """
     import inspect
 
-    src = inspect.getsource(rl_train._configure_rl_child)
-    line = next(ln.strip() for ln in src.splitlines() if ln.strip().startswith("n_gpus="))
+    from flash.engine.worker import rl_train_runner
+    from flash.engine.worker.train.rl import inputs as rl_inputs
 
-    assert line == "n_gpus=rl_data_parallel_cards(", line
-    assert 'int(inp["prompts_per_step"]) * int(inp["group_size"])' in src
+    # one derivation, in the builder that assembles every other resolved grpo knob.
+    resolver = inspect.getsource(rl_inputs._assemble_grpo_inputs)
+    assert '"dp_cards": rl_data_parallel_cards(' in resolver
+    assert 'int(schedule["prompts_per_step"]) * int(options["group_size"])' in resolver
+
+    # and both consumers read that one value rather than recomputing it.
+    child = inspect.getsource(rl_train._configure_rl_child)
+    line = next(ln.strip() for ln in child.splitlines() if ln.strip().startswith("n_gpus="))
+    assert line == 'n_gpus=int(inp["dp_cards"]),', line
+
+    resume = inspect.getsource(rl_train_runner._prepare_rl_files)
+    assert 'world_size=int(inp["dp_cards"])' in resume
+    # the rented count must not reach either phase, or the drift returns.
+    assert "gpu_count_of" not in child
+    assert "gpu_count_of" not in resume
 
 
 def test_build_verl_overrides_batch_shape_is_identical_across_gpu_counts():

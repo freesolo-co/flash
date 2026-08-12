@@ -2613,6 +2613,42 @@ def test_a_shape_label_reconciles_with_the_capacity_printed_beside_it():
         assert reason not in control
 
 
+def test_pinned_class_names_the_bounding_knob_of_the_algorithm_it_rejected():
+    """A pinned small-batch grpo/opd run must not be told that sft's rows bound its ranks.
+
+    `_resolve_exact_gpu` spelled this reason itself and hardcoded "sft", so once the width clamp let
+    an rl run narrow below its ceiling, a pinned rl rejection pointed at `batch_size` -- which opd
+    rejects at parse time -- and at retained rows, which rl has no concept of. The reason now comes
+    from the one shared formatter, so the two cannot drift apart again.
+    """
+    from flash.providers.allocator import _executed_width, _resolve_exact_gpu
+    from flash.providers.base import UnsupportedGpuError
+
+    def reject(algorithm, train):
+        with pytest.raises(UnsupportedGpuError) as exc:
+            _resolve_exact_gpu(
+                "H100",
+                need=400.0,
+                cap=8,
+                max_gpu_count=8,
+                provider="",
+                available=("runpod",),
+                widest_cap=8,
+                executed_width=_executed_width(algorithm, train, None),
+                algorithm=algorithm,
+            )
+        return str(exc.value)
+
+    rl = reject("opd", {"prompts_per_step": 1, "group_size": 1})
+    assert "only 1 joins this run" in rl
+    assert "prompts_per_step x group_size bounds the rank count" in rl
+    assert "batch and retained rows" not in rl
+
+    sft = reject("sft", {"batch_size": 1})
+    assert "sft shards by data, so the batch and retained rows bound the rank count" in sft
+    assert "prompts_per_step" not in sft
+
+
 def test_unreachable_class_reports_the_configuration_not_the_vram_shortfall():
     """One root cause must not produce two different errors depending on the run's size.
 
