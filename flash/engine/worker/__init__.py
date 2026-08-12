@@ -74,7 +74,6 @@ from flash.engine.worker.perf import (
     _force_fla_triton_gdn_on_sm100,
     _liger_default_for_model,
     _memory_mode,
-    _neutralize_tilelang_cudart_stub,
     _remove_fla_from_disk,
     _restrict_fla_gdn_autotune_on_blackwell,
     gpu_diagnostics,
@@ -333,14 +332,13 @@ def _run_worker_mode() -> None:
         sys.stderr.flush()
         os._exit(0)
     # these setups run in the parent; verl trains in FLASH_VERL_PYTHON.
-    # only _force_fla_triton_gdn_on_sm100 propagates through FLA_* env vars. the install,
-    # symlink,
-    # and monkeypatch are interpreter-local and must not be treated as child configuration.
+    # only _force_fla_triton_gdn_on_sm100 propagates through FLA_* env vars. the install and the
+    # monkeypatch are interpreter-local and must not be treated as child configuration. the tilelang
+    # libcudart repoint is NOT here: it is interpreter-local too, and the interpreter that needs it is
+    # the verl child, so it ships as a sitecustomize fragment (verl.child_io).
     # run before model imports: sm100 tilelang GDN computes wrong gradients, so use Triton.
     _force_fla_triton_gdn_on_sm100()
     _ensure_fla_fastpath_on_hopper()
-    # Must run AFTER fla fast path (may reinstall tilelang) and BEFORE model/vLLM import.
-    _neutralize_tilelang_cudart_stub()
     # AFTER the fla fast path (which may (re)install fla), BEFORE any model import / GDN
     # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
     _restrict_fla_gdn_autotune_on_blackwell()
@@ -447,7 +445,6 @@ __all__ = [
     "_liger_default_for_model",
     "_load_active_env",
     "_memory_mode",
-    "_neutralize_tilelang_cudart_stub",
     "_remove_fla_from_disk",
     "_restrict_fla_gdn_autotune_on_blackwell",
     "backend_seed",
