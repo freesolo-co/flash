@@ -415,4 +415,14 @@ def run_server(host: str = "127.0.0.1", port: int = 8080) -> None:
         import uvicorn
     except ImportError as exc:
         raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
+    from flash.providers.preflight import require_operator_config
+
+    # Before uvicorn, not just in the lifespan. The lifespan copy stays -- it is what covers a plane
+    # built through create_app() by another ASGI server -- but a PreflightError raised there is an
+    # unhandled ASGI startup exception, so the operator's actual problem arrives under ~20 lines of
+    # starlette/contextlib frames. Running it here lets __main__ print the message on its own.
+    #
+    # The refusing half only: this is the call that repeats, and the lifespan is where the advisory
+    # summary belongs, so a booted plane logs it once.
+    require_operator_config()
     uvicorn.run(create_app(), host=host, port=port)
