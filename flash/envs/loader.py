@@ -312,12 +312,18 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
 
 
 def _managed_hub_package_root(ref: GitHubEnvironmentRef) -> str:
+    """The directory holding ONE environment's package: ``<org>/<project>/<name>``.
+
+    All three segments, not two: the package root is what gets downloaded and copied into the
+    cache entry, and ``<org>/<project>`` is the project directory holding every environment
+    the project has published. Stopping at two would fetch all of them to import one.
+    """
     if ref.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
         return ""
     parts = [part for part in ref.path.split("/") if part]
-    if len(parts) < 2 or not _is_safe_github_path_parts(tuple(parts[:2])):
+    if len(parts) < 3 or not _is_safe_github_path_parts(tuple(parts[:3])):
         return ""
-    return "/".join(parts[:2])
+    return "/".join(parts[:3])
 
 
 def _github_contents_url(ref: GitHubEnvironmentRef, path: str) -> str:
