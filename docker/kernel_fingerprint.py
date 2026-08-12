@@ -14,7 +14,7 @@ Two fingerprints, because "out of date" has two flavors with very different cost
     FROM image (torch+triton), the fla git pin, tilelang, apache-tvm-ffi, and the warmup script
     itself (it decides which kernels get compiled).
 
-  * fp_base = hash of everything else baked into :cu128 that is NOT in the cache (FA2/FA3 wheel specs
+  * fp_base = hash of everything else baked into :cu128 that is NOT in the cache (FA2 wheel spec
     AND their sha256 digests, causal-conv1d, the non-kernel pip stack, and the baked rp_handler =
     endpoints.py + make_rp_handler.py). Changing one of these leaves the cache valid but means the
     per-arch tag is sitting on an old base, so it just needs a cheap re-layer (no GPU). fp_base folds
@@ -160,17 +160,14 @@ def collect_inputs(
     root: Path,
     *,
     fa2_spec: str | None = None,
-    fa3_spec: str | None = None,
     fa2_sha256: str | None = None,
-    fa3_sha256: str | None = None,
 ) -> tuple[dict, dict]:
     """Parse the authoritative sources into (cache_inputs, base_inputs_partial).
 
     Each value comes from where the IMAGE actually gets it:
       * pins / FROM / causal-conv1d from Dockerfile.worker (what the image is built from),
-      * FA2/FA3 from worker-image.yml's build-args (overridable via fa2_spec/fa3_spec and
-        fa2_sha256/fa3_sha256 for the resolved-build-arg case), and file hashes for the
-        warmup/handler sources.
+      * FA2 from worker-image.yml's build-args (overridable via fa2_spec/fa2_sha256 for the
+        resolved-build-arg case), and file hashes for the warmup/handler sources.
     base_inputs_partial does NOT yet include fp_cache; compute_fingerprints folds it in.
     """
     dockerfile = (root / "Dockerfile.worker").read_text()
@@ -202,17 +199,12 @@ def collect_inputs(
         ),
     }
 
-    # worker-image.yml holds the FA wheels in a job-level env block (single source for the build-args
-    # and these fingerprint inputs). CI passes the resolved values via --fa{2,3}-spec; for a manual
+    # worker-image.yml holds the FA2 wheel in a job-level env block (single source for the build-arg
+    # and these fingerprint inputs). CI passes the resolved value via --fa2-spec; for a manual
     # bake / the tests we read those env defaults here.
     if fa2_spec is None:
         fa2_spec = _search(
             r"(?m)^\s*FA2_SPEC:\s*(\S+)", worker_image_yml, "worker-image.yml FA2_SPEC"
-        )
-    if fa3_spec is None:
-        # FA3_SPEC: ${{ github.event.inputs.flash_attn_3_spec || '<default wheel>' }} -> the default.
-        fa3_spec = _search(
-            r"FA3_SPEC:.*?\|\|\s*'([^']+)'", worker_image_yml, "worker-image.yml FA3_SPEC default"
         )
     # the wheel digests are fp_base inputs too: a wheel replaced at the SAME url only shows up as a
     # sha256 rotation, and if fp_base did not hash it, a maintainer who bumps the checksum after a
@@ -220,13 +212,6 @@ def collect_inputs(
     if fa2_sha256 is None:
         fa2_sha256 = _search(
             r"(?m)^\s*FA2_SHA256:\s*(\S+)", worker_image_yml, "worker-image.yml FA2_SHA256"
-        )
-    if fa3_sha256 is None:
-        # FA3_SHA256: ${{ github.event.inputs.flash_attn_3_sha256 || '<default digest>' }} -> the default.
-        fa3_sha256 = _search(
-            r"FA3_SHA256:.*?\|\|\s*'([^']+)'",
-            worker_image_yml,
-            "worker-image.yml FA3_SHA256 default",
         )
 
     causal_conv1d = _search(
@@ -238,12 +223,10 @@ def collect_inputs(
 
     base_inputs_partial = {
         "fa2": fa2_spec,
-        "fa3": fa3_spec,
         # NOT cache_inputs: a wheel digest change leaves the Triton/Inductor mega-cache valid (the
         # wheel plays no part in what it caches), so it only needs the free re-layer, never a paid
         # GPU re-warm.
         "fa2_sha256": fa2_sha256,
-        "fa3_sha256": fa3_sha256,
         "causal_conv1d": causal_conv1d,
         "pip_base": pip_base,
         # whole-Dockerfile hash catches ANY base change the parsed fields miss (apt/ENV/CMD/cache-dir);
@@ -277,16 +260,12 @@ def fingerprints(
     root: Path,
     *,
     fa2_spec: str | None = None,
-    fa3_spec: str | None = None,
     fa2_sha256: str | None = None,
-    fa3_sha256: str | None = None,
 ) -> tuple[str, str, dict, dict]:
     cache_inputs, base_partial = collect_inputs(
         root,
         fa2_spec=fa2_spec,
-        fa3_spec=fa3_spec,
         fa2_sha256=fa2_sha256,
-        fa3_sha256=fa3_sha256,
     )
     fp_cache, fp_base, base_inputs = compute_fingerprints(cache_inputs, base_partial)
     return fp_cache, fp_base, cache_inputs, base_inputs
@@ -299,13 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         "--fa2-spec", default=None, help="resolved FLASH_ATTN_SPEC (else read from yml)"
     )
     ap.add_argument(
-        "--fa3-spec", default=None, help="resolved FLASH_ATTN_3_SPEC (else read from yml)"
-    )
-    ap.add_argument(
         "--fa2-sha256", default=None, help="resolved FLASH_ATTN_SHA256 (else read from yml)"
-    )
-    ap.add_argument(
-        "--fa3-sha256", default=None, help="resolved FLASH_ATTN_3_SHA256 (else read from yml)"
     )
     ap.add_argument("--format", choices=("github", "json"), default="json")
     ap.add_argument("--explain", action="store_true", help="dump the component inputs to stderr")
@@ -340,9 +313,7 @@ def main(argv: list[str] | None = None) -> int:
     fp_cache, fp_base, cache_inputs, base_inputs = fingerprints(
         root,
         fa2_spec=args.fa2_spec,
-        fa3_spec=args.fa3_spec,
         fa2_sha256=args.fa2_sha256,
-        fa3_sha256=args.fa3_sha256,
     )
     if args.explain:
         print(
