@@ -23,6 +23,7 @@ from flash.engine.worker.model.packing import worker_image_packing_support
 from flash.envs.dataset_selection import (
     _packaged_dataset_file,
     _validate_packaged_dataset_split,
+    select_dataset_source,
 )
 from flash.envs.loader import _load_contract_text, _resolve_environment_reference, _resolve_path_arg
 
@@ -180,6 +181,28 @@ def _read_jsonl_rows(path: Path, *, max_examples: int) -> tuple[int, list[dict[s
     return source_examples, values
 
 
+def _validate_dataset_rows(
+    values: object,
+    *,
+    invalid_message: str,
+    empty_message: str,
+    max_examples: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    if not isinstance(values, list) or not all(isinstance(row, dict) for row in values):
+        raise PackagedDatasetUnavailable(invalid_message)
+    source_examples = len(values)
+    missing = [index for index, row in enumerate(values) if _CANONICAL_INPUT_KEY not in row]
+    if missing:
+        raise ValueError(
+            "Freesolo dataset records must contain an input field; missing at row indexes "
+            f"{missing[:10]}"
+        )
+    selected = values[:max_examples] if max_examples > 0 else values
+    if not selected:
+        raise PackagedDatasetUnavailable(empty_message)
+    return source_examples, [dict(row) for row in selected]
+
+
 def _read_dataset_rows(path: Path, *, max_examples: int) -> tuple[int, list[dict[str, Any]]]:
     try:
         if path.stat().st_size > _MAX_PROFILE_DATASET_BYTES:
@@ -192,17 +215,18 @@ def _read_dataset_rows(path: Path, *, max_examples: int) -> tuple[int, list[dict
         elif path.suffix.lower() == ".json":
             loaded = json.loads(path.read_text(encoding="utf-8"))
             values = loaded.get("records") if isinstance(loaded, dict) else loaded
-            if not isinstance(values, list) or not all(isinstance(row, dict) for row in values):
-                raise TypeError("dataset rows are not objects")
-            source_examples = len(values)
-            missing = [index for index, row in enumerate(values) if _CANONICAL_INPUT_KEY not in row]
-            if missing:
-                raise ValueError(
-                    "Freesolo dataset records must contain an input field; missing at row indexes "
-                    f"{missing[:10]}"
-                )
-            if max_examples > 0:
-                values = values[:max_examples]
+            source_examples, values = _validate_dataset_rows(
+                values,
+                invalid_message=(
+                    f"environment dataset file {path.name!r} must contain JSON object rows. Add a "
+                    "valid dataset/train.jsonl to the environment package."
+                ),
+                empty_message=(
+                    f"environment dataset file {path.name!r} contains no rows. Add training rows to "
+                    "dataset/train.jsonl in the environment package."
+                ),
+                max_examples=max_examples,
+            )
         else:
             raise ValueError("dataset file must end in .jsonl or .json")
     except PackagedDatasetUnavailable:
@@ -253,9 +277,24 @@ def profile_packaged_sft_dataset(
         )
     base_dir = reference.parent
     params = dict(spec.environment.params or {})
-    dataset_path = _selected_dataset_path(base_dir, params)
+    records = params.pop("records", None)
     max_examples = int(spec.train.max_examples or 0)
-    source_examples, rows = _read_dataset_rows(dataset_path, max_examples=max_examples)
+    if records is not None:
+        selection = select_dataset_source(params, base_dir, records, _resolve_path_arg)
+        source_examples, rows = _validate_dataset_rows(
+            selection.source,
+            invalid_message=(
+                "[environment.params] records must contain JSON object rows. Add valid training "
+                "records."
+            ),
+            empty_message=(
+                "[environment.params] records contain no rows. Add training rows to records."
+            ),
+            max_examples=max_examples,
+        )
+    else:
+        dataset_path = _selected_dataset_path(base_dir, params)
+        source_examples, rows = _read_dataset_rows(dataset_path, max_examples=max_examples)
     rows = select_sft_examples(rows, 0, spec.seed)
     raw_environment = _RawRecordEnvironment(
         rows=rows,

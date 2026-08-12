@@ -166,6 +166,69 @@ def test_profile_honors_split_and_dataset_path(tmp_path) -> None:
     assert path_profile.source_examples == 2
 
 
+def test_profile_uses_explicit_records_instead_of_a_packaged_dataset_file(
+    tmp_path, monkeypatch
+) -> None:
+    from flash.engine.profiling import dataset_profile
+
+    entrypoint = _package(
+        tmp_path,
+        {
+            "dataset/train.jsonl": (
+                '{"input":"packaged-one","output":"no"}\n{"input":"packaged-two","output":"no"}\n'
+            )
+        },
+    )
+    seen = {}
+    real_prepare = dataset_profile.prepare_sft_workload
+
+    def capture_rows(spec, env, **kwargs):
+        seen["rows"] = list(env.rows)
+        return real_prepare(spec, env, **kwargs)
+
+    monkeypatch.setattr(dataset_profile, "prepare_sft_workload", capture_rows)
+
+    _spec_value, profile = _profile(
+        entrypoint,
+        params={"records": [{"input": "explicit", "output": "yes"}]},
+    )
+
+    assert profile.source_examples == 1
+    assert seen["rows"] == [{"input": "explicit", "output": "yes"}]
+
+
+def test_profile_uses_explicit_records_when_the_package_has_no_dataset_file(tmp_path) -> None:
+    entrypoint = _package(tmp_path, {})
+
+    _spec_value, profile = _profile(
+        entrypoint,
+        params={"records": [{"input": "explicit", "output": "yes"}]},
+    )
+
+    assert profile.source_examples == 1
+    assert profile.selected_examples == 1
+    assert profile.retained_examples == 1
+
+
+@pytest.mark.parametrize(
+    ("records", "message"),
+    [
+        ([], "records contain no rows"),
+        (["not-an-object"], "records must contain JSON object rows"),
+    ],
+)
+def test_profile_refuses_invalid_explicit_records_instead_of_falling_back_to_a_packaged_file(
+    tmp_path, records, message
+) -> None:
+    entrypoint = _package(
+        tmp_path,
+        {"dataset/train.jsonl": '{"input":"packaged","output":"must not be used"}\n'},
+    )
+
+    with pytest.raises(PackagedDatasetUnavailable, match=message):
+        _profile(entrypoint, params={"records": records})
+
+
 def test_profile_refuses_missing_or_unreadable_dataset(tmp_path) -> None:
     entrypoint = _package(tmp_path, {})
     with pytest.raises(PackagedDatasetUnavailable, match=r"dataset/train\.jsonl"):
