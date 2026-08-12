@@ -14,7 +14,6 @@ from flash.core.spec import require_project_id
 from flash.server.platform.auth import standalone
 from flash.server.platform.internal_client import (
     DEFAULT_TIMEOUT_S,
-    InternalRequestError,
     build_internal_request,
     delete_internal_json,
     error_detail,
@@ -32,16 +31,6 @@ _DEFAULT_HUB_REF = "main"
 _REPAIR_FAILURE_DETAIL = (
     "environment package exists, but its project association could not be repaired"
 )
-
-
-class EnvironmentProjectConflict(Exception):
-    """An environment name is already owned by a different project in the same org.
-
-    Names are unique per ORG, not per project: the hub slug is ``<org-slug>/<name>`` with no
-    project component. So this is a permanent verdict, and it is the one failure on the publish
-    path that a retry can never clear -- which is exactly why it needs its own type rather than
-    joining the transient failures behind a bool.
-    """
 
 
 def _post(
@@ -64,11 +53,7 @@ def _post(
 
 
 def record_published_environment(*, slug: str, name: str, key: dict, project_id: str) -> bool:
-    """Persist the published environment under its validated project.
-
-    Raises :class:`EnvironmentProjectConflict` when the name already belongs to another project
-    in this org; returns the usual best-effort bool for every other outcome.
-    """
+    """Persist the published environment under its validated project."""
     try:
         resolved_project_id = require_project_id(project_id)
     except (TypeError, ValueError) as exc:
@@ -89,46 +74,7 @@ def record_published_environment(*, slug: str, name: str, key: dict, project_id:
         "projectId": resolved_project_id,
         "metadata": {"source": "flash.env.push"},
     }
-    try:
-        return _post(
-            _PATH,
-            body,
-            subject=f"record published environment {slug}",
-            raise_for=frozenset({409}),
-        )
-    except InternalRequestError as exc:
-        raise EnvironmentProjectConflict(exc.detail) from exc
-
-
-def raise_if_owned_by_another_project(*, slug: str, project_id: str, org_id: str) -> None:
-    """Raise :class:`EnvironmentProjectConflict` if ``slug`` already belongs to another project.
-
-    Called BEFORE the hub upload. Publishing writes ``<org-slug>/<name>`` by deleting that
-    directory and re-copying it, so without this check a colliding name overwrites the other
-    project's environment package and only then fails to record the association -- destroying
-    the other project's environment as a side effect of an error.
-
-    Every non-conflict outcome returns normally and lets the publish proceed: a 404 is the
-    ordinary first publish of a new name, and a backend that is unreachable or unconfigured must
-    not block publishing (the association step afterwards still reports that failure). This is a
-    guard against a specific destructive case, not a new availability dependency.
-    """
-    if standalone():
-        # No Freesolo mirror here, so there are no cross-project rows to collide with.
-        return
-    try:
-        _post(
-            _VALIDATE_PATH,
-            {"orgId": org_id, "projectId": project_id, "slug": slug},
-            subject=f"check environment ownership for {slug}",
-            raise_for=frozenset({409}),
-            # 404 IS the ordinary answer here: this probe asks whether the name is already taken,
-            # and "no" is what every first publish of a new name gets. Logging it as a failure
-            # would put a warning in the logs for the most common successful path.
-            expected=frozenset({404}),
-        )
-    except InternalRequestError as exc:
-        raise EnvironmentProjectConflict(exc.detail) from exc
+    return _post(_PATH, body, subject=f"record published environment {slug}")
 
 
 def require_environment_project(

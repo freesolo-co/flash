@@ -25,7 +25,7 @@ def _prepared_spec(*, revision: str = "main", resolves_to: str = "a" * 40):
         model="Qwen/Qwen3.5-0.8B",
         model_revision=resolves_to,
         algorithm="sft",
-        environment=EnvironmentSpec(id="freesolo/gsm8k", resolved_sha="e" * 40),
+        environment=EnvironmentSpec(id="freesolo/example-project/gsm8k", resolved_sha="e" * 40),
         train=TrainSpec(epochs=1, max_examples=1),
         run_id="revision-preflight",
     )
@@ -49,7 +49,7 @@ def _minimal_spec_dict() -> dict:
     return {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
-        "environment": {"id": "freesolo/gsm8k"},
+        "environment": {"id": "freesolo/example-project/gsm8k"},
         "train": {"epochs": 1, "max_examples": 1},
     }
 
@@ -420,7 +420,7 @@ def _structured_opd_spec(structured_outputs: str):
         model="Qwen/Qwen3.5-0.8B",
         model_revision="a" * 40,
         algorithm="opd",
-        environment=EnvironmentSpec(id="freesolo/gsm8k", resolved_sha="e" * 40),
+        environment=EnvironmentSpec(id="freesolo/example-project/gsm8k", resolved_sha="e" * 40),
         train=TrainSpec(
             epochs=1,
             max_examples=1,

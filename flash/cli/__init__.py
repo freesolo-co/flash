@@ -551,7 +551,7 @@ def _add_env_publish_commands(env_sub: argparse._SubParsersAction) -> None:
     )
     env_pull.add_argument(
         "env_id",
-        help='the managed Freesolo environment slug "your-name/your-env"',
+        help='the managed Freesolo environment slug "your-org/your-project/your-env"',
     )
     env_pull.add_argument(
         "path",
@@ -568,7 +568,7 @@ def _add_env_publish_commands(env_sub: argparse._SubParsersAction) -> None:
 
     env_delete = env_sub.add_parser("delete", help="delete a published Freesolo environment")
     env_delete.add_argument(
-        "env_id", help="the Freesolo environment id to delete, e.g. you/your-env"
+        "env_id", help="the Freesolo environment id to delete, e.g. your-org/your-project/your-env"
     )
     env_delete.add_argument(
         "--project",

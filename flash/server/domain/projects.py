@@ -57,6 +57,26 @@ def _project_payload_id(payload: Any) -> str:
         return ""
 
 
+def _payload_project_slug(payload: Any) -> str:
+    """The project slug carried by a validation response, or ``""``.
+
+    Accepted at the top level or nested under ``project``, and under either spelling, because the
+    internal and user-key validation endpoints return differently shaped bodies.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    candidates: list[Any] = [payload]
+    nested = payload.get("project")
+    if isinstance(nested, dict):
+        candidates.append(nested)
+    for source in candidates:
+        for field in ("projectSlug", "slug"):
+            value = source.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
 def _internal_http_error(*, status: int, raw: bytes, project_id: str) -> HTTPException:
     detail = _raw_error_detail(raw)
     if status == 404:
@@ -70,7 +90,7 @@ def _internal_http_error(*, status: int, raw: bytes, project_id: str) -> HTTPExc
     )
 
 
-def _require_internal_project_access(*, project_id: str, org_id: str) -> str:
+def _require_internal_project_access(*, project_id: str, org_id: str) -> tuple[str, str]:
     token = internal_key()
     if not token:
         raise HTTPException(
@@ -119,7 +139,7 @@ def _require_internal_project_access(*, project_id: str, org_id: str) -> str:
             status_code=502,
             detail="Freesolo internal project validation returned a mismatched project association",
         )
-    return project_id
+    return project_id, _payload_project_slug(payload)
 
 
 def require_project_access(
@@ -130,6 +150,28 @@ def require_project_access(
     org_id: str | None = None,
 ) -> str:
     """Require the explicit project to resolve under the authenticated Freesolo organization."""
+    return require_project_access_slug(
+        project_id=project_id,
+        key=key,
+        authorization=authorization,
+        org_id=org_id,
+    )[0]
+
+
+def require_project_access_slug(
+    *,
+    project_id: str,
+    key: dict[str, Any],
+    authorization: str | None,
+    org_id: str | None = None,
+) -> tuple[str, str]:
+    """As :func:`require_project_access`, but also returns the project's slug.
+
+    The slug is the second segment of every environment slug this project publishes, so the env
+    routes need it; runs do not, which is why the id-only wrapper above stays the common entry
+    point. The slug is ``""`` in standalone mode, where there is no Freesolo project directory
+    to resolve it from.
+    """
     try:
         project_id = require_project_id(project_id)
     except (TypeError, ValueError) as exc:
@@ -140,7 +182,7 @@ def require_project_access(
         # with, so ownership is already established by the operator key that got the caller here.
         # The id is still REQUIRED and still validated for shape above -- runs stay grouped, and a
         # malformed id fails the same way it would against the backend.
-        return project_id
+        return project_id, ""
 
     if key.get("auth_kind") == "internal":
         expected_org = str(org_id or "").strip()
@@ -213,4 +255,4 @@ def require_project_access(
             status_code=403,
             detail=f"project {project_id!r} does not belong to the authenticated organization",
         )
-    return project_id
+    return project_id, _payload_project_slug(payload)

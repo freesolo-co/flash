@@ -32,7 +32,12 @@ def _package_tarball(entries: dict[str, bytes] | None = None) -> bytes:
 
 
 def _args(**kw) -> Namespace:
-    base = {"env_id": "david-freesolo-co/stuff", "path": None, "output": None, "force": False}
+    base = {
+        "env_id": "david-freesolo-co/my-project/stuff",
+        "path": None,
+        "output": None,
+        "force": False,
+    }
     base.update(kw)
     return Namespace(**base)
 
@@ -87,7 +92,7 @@ def test_cmd_env_pull_managed_whole_env_uses_authenticated_package(monkeypatch, 
     rc = cmd_env_pull(_args(output=str(dest)))
 
     assert rc == 0
-    assert seen == {"env_id": "david-freesolo-co/stuff"}
+    assert seen == {"env_id": "david-freesolo-co/my-project/stuff"}
     assert (dest / "environment.py").is_file()
     assert (dest / "datasets" / "train.jsonl").is_file()
 
@@ -98,10 +103,12 @@ def test_cmd_env_pull_managed_whole_env_strips_slug_before_request(monkeypatch, 
         "flash.client.client_from_config", _client_factory(_package_tarball(), seen)
     )
 
-    rc = cmd_env_pull(_args(env_id="  david-freesolo-co/stuff  ", output=str(tmp_path / "stuff")))
+    rc = cmd_env_pull(
+        _args(env_id="  david-freesolo-co/my-project/stuff  ", output=str(tmp_path / "stuff"))
+    )
 
     assert rc == 0
-    assert seen == {"env_id": "david-freesolo-co/stuff"}
+    assert seen == {"env_id": "david-freesolo-co/my-project/stuff"}
 
 
 def test_cmd_env_pull_managed_rejects_mixed_case_before_request(monkeypatch, tmp_path):
@@ -114,7 +121,9 @@ def test_cmd_env_pull_managed_rejects_mixed_case_before_request(monkeypatch, tmp
 
     monkeypatch.setattr("flash.client.client_from_config", lambda: _Client())
 
-    rc = cmd_env_pull(_args(env_id="David-Freesolo-Co/stuff", output=str(tmp_path / "stuff")))
+    rc = cmd_env_pull(
+        _args(env_id="David-Freesolo-Co/My-Project/stuff", output=str(tmp_path / "stuff"))
+    )
 
     assert rc == 1
     assert calls["n"] == 0
@@ -147,7 +156,7 @@ def test_cmd_env_pull_managed_single_file_uses_authenticated_package(monkeypatch
     rc = cmd_env_pull(_args(path="datasets/train.jsonl", output=str(out)))
 
     assert rc == 0
-    assert seen == {"env_id": "david-freesolo-co/stuff"}
+    assert seen == {"env_id": "david-freesolo-co/my-project/stuff"}
     assert out.read_bytes() == b'{"a":1}\n'
 
 

@@ -56,36 +56,19 @@ def _env_package_b64() -> str:
 ENV_PACKAGE_B64 = _env_package_b64()
 
 
-def stub_publish_package_failing_on_write(message: str, slug: str = "acme/env"):
-    """A `publish_package` stub that runs the pre-write hook and fails only if the write happens.
-
-    Asserting "the guard blocked this" needs the guard to actually run. A stub that raises
-    immediately would pass whether or not the route ever consulted the guard, since it never
-    reaches the hook the guard now lives in.
-    """
-
-    def _publish(*, package_b64, name, key, before_write=None):
-        if before_write is not None:
-            before_write(slug)
-        pytest.fail(message)
-
-    return _publish
-
-
 def stub_publish_package(slug: str, *, record: list | None = None):
-    """A `publish_package` replacement that still honours the pre-write hook.
+    """Return a publish stub that records the route contract when requested."""
 
-    The route gates the destination through `before_write`, which the real implementation fires
-    after validating the package and immediately before writing. A stub that ignores the hook
-    silently disables that gate, so a test asserting "the guard blocked this" would pass no
-    matter what the guard did.
-    """
-
-    def _publish(*, package_b64, name, key, before_write=None):
-        if before_write is not None:
-            before_write(slug)
+    def _publish(*, package_b64, name, key, project_slug):
         if record is not None:
-            record.append({"package_b64": package_b64, "name": name, "key": key})
+            record.append(
+                {
+                    "package_b64": package_b64,
+                    "name": name,
+                    "key": key,
+                    "project_slug": project_slug,
+                }
+            )
         return slug
 
     return _publish
@@ -96,8 +79,8 @@ SPEC = {
     "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
     # A hub slug, because this fixture drives the HOSTED api: the managed plane accepts
-    # `namespace/name` only, and a `github:` ref is refused at submit (see test_server_standalone).
-    "environment": {"id": "acme/gsm8k"},
+    # `namespace/project/name` only, and a `github:` ref is refused at submit.
+    "environment": {"id": "acme/checkout-bot/gsm8k"},
     "train": {"epochs": 1, "max_examples": 1},
     "gpu": {},
 }
@@ -198,6 +181,11 @@ def api(tmp_path, monkeypatch):
 
     monkeypatch.setattr(projects_mod, "require_project_access", validate_project)
     monkeypatch.setattr(
+        projects_mod,
+        "require_project_access_slug",
+        lambda **kwargs: (validate_project(**kwargs), "checkout-bot"),
+    )
+    monkeypatch.setattr(
         environment_registry_mod,
         "require_environment_project",
         lambda **_kwargs: None,
@@ -207,16 +195,6 @@ def api(tmp_path, monkeypatch):
         environment_registry_mod,
         "record_published_environment",
         lambda **_kwargs: True,
-    )
-    # The publish path's pre-upload ownership check is a second network choke-point: it urllib-POSTs
-    # the backend's validate endpoint, and FREESOLO_BASE_URL defaults to the production host. It
-    # swallows OSError by design (an unreachable backend must not block publishing), so a live call
-    # from this suite would pass silently instead of failing -- stub it like the reporters above.
-    monkeypatch.setattr(
-        environment_registry_mod,
-        "raise_if_owned_by_another_project",
-        lambda **_kwargs: None,
-        raising=False,
     )
     with TestClient(app_mod.create_app()) as client:
         yield client
@@ -276,7 +254,7 @@ def test_environment_project_validation_blocks_before_run_preparation(api, monke
     import flash.server.routes.runs as runs_route
 
     def reject_environment(**kwargs):
-        assert kwargs["slug"] == "acme/my-env"
+        assert kwargs["slug"] == "acme/checkout-bot/my-env"
         assert kwargs["repair_missing"] is True
         raise HTTPException(status_code=409, detail="flash environment belongs to another project")
 
@@ -291,7 +269,7 @@ def test_environment_project_validation_blocks_before_run_preparation(api, monke
     response = api.post(
         "/v1/runs",
         headers=_bearer(_login()),
-        json={"spec": {**SPEC, "environment": {"id": "acme/my-env"}}},
+        json={"spec": {**SPEC, "environment": {"id": "acme/checkout-bot/my-env"}}},
     )
     assert response.status_code == 409
     assert response.json()["detail"] == "flash environment belongs to another project"
@@ -305,12 +283,12 @@ def test_environment_project_validation_blocks_before_run_preparation(api, monke
         "https://github.com/acme/envs/tree/main/gsm8k",
         # the hub's OWN repo, spelled the long way: still refused, so there is exactly one
         # accepted spelling of a hub environment rather than two that must agree.
-        "github:freesolo-co/environment-hub@main:acme/my-env/environment.py",
-        "github:FREESOLO-CO/ENVIRONMENT-HUB@main:acme/my-env/environment.py",
+        "github:freesolo-co/environment-hub@main:acme/checkout-bot/my-env/environment.py",
+        "github:FREESOLO-CO/ENVIRONMENT-HUB@main:acme/checkout-bot/my-env/environment.py",
         # references that used to fail closed further downstream as "malformed hub reference";
         # they are now refused earlier, by form, which subsumes that check.
-        "github:freesolo-co/environment-hub@dev:acme/my-env/environment.py",
-        "github:freesolo-co/environment-hub@main:acme/my-env/other.py",
+        "github:freesolo-co/environment-hub@dev:acme/checkout-bot/my-env/environment.py",
+        "github:freesolo-co/environment-hub@main:acme/checkout-bot/my-env/other.py",
     ],
 )
 def test_a_github_environment_is_refused_before_validation_or_preparation(
@@ -364,10 +342,12 @@ def test_a_hub_environment_still_reaches_preparation(api, monkeypatch) -> None:
     )
 
     assert response.status_code == 200, response.text
-    assert seen == ["acme/gsm8k"]
+    assert seen == ["acme/checkout-bot/gsm8k"]
 
 
-@pytest.mark.parametrize("environment_id", ["Acme/My-Env", " acme/my-env "])
+@pytest.mark.parametrize(
+    "environment_id", ["Acme/Checkout-Bot/My-Env", " acme/checkout-bot/my-env "]
+)
 def test_run_rejects_noncanonical_managed_environment_before_registry(
     api, monkeypatch, environment_id
 ) -> None:
@@ -405,7 +385,7 @@ def test_project_validation_blocks_before_environment_publication(api, monkeypat
 
     monkeypatch.setattr(
         projects_mod,
-        "require_project_access",
+        "require_project_access_slug",
         lambda **_kwargs: (_ for _ in ()).throw(
             HTTPException(status_code=403, detail="project denied")
         ),
@@ -460,7 +440,7 @@ def _install_real_internal_project_validation(monkeypatch):
                 "body": body,
             }
         )
-        return _Response({"ok": True, **body})
+        return _Response({"ok": True, "projectSlug": "checkout-bot", **body})
 
     monkeypatch.setattr(projects_mod.urllib.request, "urlopen", urlopen)
     return requests
@@ -506,7 +486,9 @@ def test_internal_publish_uses_internal_project_validation_endpoint(api, monkeyp
     import flash.server.domain.envs as envs_mod
 
     requests = _install_real_internal_project_validation(monkeypatch)
-    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("org-test/env"))
+    monkeypatch.setattr(
+        envs_mod, "publish_package", stub_publish_package("org-test/checkout-bot/env")
+    )
     monkeypatch.setattr(registry, "record_published_environment", lambda **_kwargs: True)
 
     response = api.post(
@@ -528,7 +510,7 @@ def test_internal_delete_uses_internal_project_validation_endpoint(api, monkeypa
     monkeypatch.setattr(registry, "record_deleted_environment", lambda **_kwargs: True)
 
     response = api.delete(
-        "/v1/envs/org-test/env",
+        "/v1/envs/org-test/checkout-bot/env",
         headers={
             **_bearer("fslo-internal-test"),
             "X-Freesolo-Project-Id": SPEC["project"],
@@ -1934,7 +1916,7 @@ def test_create_run_retained_run_records_managed_environment_use(api, monkeypatc
     )
     submitted: list[str] = []
     _persist_queued_then_raise(app_mod, runner, monkeypatch, submitted)
-    spec = {**SPEC, "environment": {"id": "acme/my-env"}}
+    spec = {**SPEC, "environment": {"id": "acme/checkout-bot/my-env"}}
 
     key = _login()
     resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": spec})
@@ -1943,7 +1925,7 @@ def test_create_run_retained_run_records_managed_environment_use(api, monkeypatc
     run_id = submitted[0]
     assert db.run_owner(run_id) is not None
     assert calls
-    assert calls[0]["slug"] == "acme/my-env"
+    assert calls[0]["slug"] == "acme/checkout-bot/my-env"
     assert calls[0]["run_id"] == run_id
 
 
@@ -8723,7 +8705,7 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     pkg = base64.b64encode(buf.getvalue()).decode()
 
     key = _login()
-    expected_root = f"org-{key.removeprefix(_USER_PREFIX)}/myenv"
+    expected_root = f"org-{key.removeprefix(_USER_PREFIX)}/checkout-bot/myenv"
     resp = api.post(
         "/v1/envs",
         headers=_bearer(key),
@@ -8752,7 +8734,7 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
 
     captured: list = []
     monkeypatch.setattr(
-        envs_mod, "publish_package", stub_publish_package("key-1/e", record=captured)
+        envs_mod, "publish_package", stub_publish_package("key-1/checkout-bot/e", record=captured)
     )
 
     buf = io.BytesIO()
@@ -8794,7 +8776,7 @@ def test_publish_env_forwards_project_id_to_registry(api, monkeypatch):
     import flash.server.domain.environment_registry as registry_mod
     import flash.server.domain.envs as envs_mod
 
-    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("key-1/e"))
+    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("key-1/checkout-bot/e"))
 
     recorded: list[dict] = []
     monkeypatch.setattr(
@@ -8846,7 +8828,7 @@ def test_publish_env_returns_502_when_association_record_returns_false(api, monk
     monkeypatch.setattr(
         envs_mod,
         "publish_package",
-        lambda **_kwargs: events.append("uploaded") or "acme/env",
+        lambda **_kwargs: events.append("uploaded") or "acme/checkout-bot/env",
     )
     monkeypatch.setattr(
         registry,
@@ -8879,7 +8861,7 @@ def test_publish_env_returns_502_when_association_record_raises(api, monkeypatch
     monkeypatch.setattr(
         envs_mod,
         "publish_package",
-        lambda **_kwargs: events.append("uploaded") or "acme/env",
+        lambda **_kwargs: events.append("uploaded") or "acme/checkout-bot/env",
     )
 
     def fail_association(**_kwargs):
@@ -8914,7 +8896,7 @@ def test_publish_env_retry_repairs_association_after_false_ack(api, monkeypatch)
     monkeypatch.setattr(
         envs_mod,
         "publish_package",
-        lambda **_kwargs: uploads.append("acme/env") or "acme/env",
+        lambda **_kwargs: uploads.append("acme/checkout-bot/env") or "acme/checkout-bot/env",
     )
     monkeypatch.setattr(
         registry,
@@ -8936,183 +8918,8 @@ def test_publish_env_retry_repairs_association_after_false_ack(api, monkeypatch)
 
     assert first.status_code == 502
     assert second.status_code == 200, second.text
-    assert second.json() == {"id": "acme/env"}
-    assert uploads == ["acme/env", "acme/env"]
-
-
-def test_publish_env_reports_a_cross_project_name_conflict_without_uploading(api, monkeypatch):
-    """A name owned by another project must fail BEFORE the hub write, with the real cause.
-
-    Two defects in one: publishing replaces the whole `<org-slug>/<name>` hub directory, so
-    uploading first would destroy the other project's package on the way to failing; and the
-    old message blamed association *recording* and told the user to retry, which reproduces
-    the failure identically because names are unique per org.
-    """
-    import flash.server.domain.environment_registry as registry
-    import flash.server.domain.envs as envs_mod
-
-    monkeypatch.setattr(
-        registry,
-        "raise_if_owned_by_another_project",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            registry.EnvironmentProjectConflict("flash environment belongs to another project")
-        ),
-    )
-    monkeypatch.setattr(
-        envs_mod,
-        "publish_package",
-        stub_publish_package_failing_on_write(
-            "a name conflict must not upload over the other project"
-        ),
-    )
-
-    response = api.post(
-        "/v1/envs",
-        headers=_bearer(_login()),
-        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
-    )
-
-    assert response.status_code == 409, response.text
-    detail = response.json()["detail"]
-    assert "already belongs to a different project" in detail
-    assert "unique per organization" in detail
-    # the two ways the old message misled: it must not blame recording, nor advise a retry.
-    assert "could not be recorded" not in detail
-    assert "retry" not in detail.lower().replace("retrying will not change this", "")
-
-
-def test_publish_env_refuses_to_upload_when_the_org_cannot_be_resolved(api, monkeypatch):
-    """An org-id-less key must not bypass the guard and overwrite the hub anyway.
-
-    Auth requires only `org_slug`, so a key can authenticate with no `org_id`. The hub path is
-    namespaced by the SLUG, so such a publish still replaces `<org-slug>/<name>` -- while having
-    no org id to check ownership with. Gating the guard on the org id alone would skip it and
-    clobber the other project, then answer with the old misleading 502.
-    """
-    import flash.server.domain.envs as envs_mod
-    import flash.server.platform.deps as deps
-
-    monkeypatch.setitem(
-        api.app.dependency_overrides,
-        deps.require_key,
-        lambda: {"org_slug": "acme", "user_id": "u1", "api_key_id": "k1", "auth_kind": "user"},
-    )
-    monkeypatch.setattr(
-        envs_mod,
-        "publish_package",
-        stub_publish_package_failing_on_write("an unverifiable org must not reach the hub write"),
-    )
-
-    response = api.post(
-        "/v1/envs",
-        headers=_bearer(_login()),
-        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
-    )
-
-    assert response.status_code == 400, response.text
-    detail = response.json()["detail"]
-    assert "organization could not be resolved" in detail
-    # The remedy named must be one that works. The guard reads the KEY's org id and ignores the
-    # header, so advising the caller to "pass the organization" would be another unactionable
-    # instruction -- the same defect (advice that cannot clear the error) this PR exists to remove.
-    assert "flash login" in detail
-    assert "pass the organization" not in detail
-
-
-def test_publish_env_ignores_the_org_header_for_the_ownership_guard(api, monkeypatch):
-    """`X-Freesolo-Org-Id` must not decide WHERE ownership is checked.
-
-    For a user key `require_project_access` validates the project against `key["org_id"]` and
-    ignores this header, so it is caller-asserted. Trusting it in the guard would look the slug
-    up in an org the caller named while the hub path stays namespaced by the key's own slug: a
-    non-matching id finds nothing, the backend answers 404 rather than 409, and the colliding
-    write proceeds -- exactly the clobber this guard exists to stop.
-    """
-    import flash.server.domain.envs as envs_mod
-    import flash.server.platform.deps as deps
-    from flash.server.domain import environment_registry as registry_mod
-
-    monkeypatch.setitem(
-        api.app.dependency_overrides,
-        deps.require_key,
-        lambda: {"org_slug": "acme", "user_id": "u1", "api_key_id": "k1", "auth_kind": "user"},
-    )
-    checked_orgs: list = []
-
-    def _guard(**kwargs):
-        checked_orgs.append(kwargs.get("org_id"))
-
-    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _guard)
-    monkeypatch.setattr(
-        envs_mod,
-        "publish_package",
-        stub_publish_package_failing_on_write(
-            "a caller-asserted org must not authorize the hub write"
-        ),
-    )
-
-    response = api.post(
-        "/v1/envs",
-        headers={**_bearer(_login()), "X-Freesolo-Org-Id": "org-caller-supplied"},
-        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
-    )
-
-    assert response.status_code == 400, response.text
-    assert "organization could not be resolved" in response.json()["detail"]
-    assert checked_orgs == [], f"guard consulted a caller-supplied org: {checked_orgs}"
-
-
-def test_publish_env_checks_ownership_for_an_internal_key_using_the_validated_header(
-    api, monkeypatch
-):
-    """The internal key must reach the guard too, using the org header auth already validated.
-
-    The header is caller-asserted for a USER key and deliberately ignored there, but for the
-    internal key `require_project_access` REQUIRES it (400 without) and validates the project
-    against it -- so by the time the guard runs it is established fact, and it is the only org
-    this key has. Skipping the guard for internal keys left the platform's own publish path with
-    the exact destructive behaviour this PR exists to remove: it overwrote the other project's
-    hub directory and only then returned a conflict.
-    """
-    import flash.server.domain.envs as envs_mod
-    import flash.server.platform.deps as deps
-    from flash.server.domain import environment_registry as registry_mod
-    from flash.server.domain import projects as projects_mod
-
-    monkeypatch.setitem(
-        api.app.dependency_overrides,
-        deps.require_key,
-        # No `org_id`: the internal key is org-agnostic, which is why it must use the header.
-        lambda: {"org_slug": "acme", "auth_kind": "internal"},
-    )
-    monkeypatch.setattr(projects_mod, "require_project_access", lambda **_kwargs: SPEC["project"])
-
-    checked_orgs: list = []
-
-    def _guard(**kwargs):
-        checked_orgs.append(kwargs.get("org_id"))
-        raise registry_mod.EnvironmentProjectConflict("owned by another project")
-
-    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _guard)
-    monkeypatch.setattr(
-        envs_mod,
-        "publish_package",
-        stub_publish_package_failing_on_write(
-            "an internal-key name conflict must not upload over the other project"
-        ),
-    )
-
-    response = api.post(
-        "/v1/envs",
-        headers={**_bearer(_login()), "X-Freesolo-Org-Id": "org-validated"},
-        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
-    )
-
-    assert response.status_code == 409, response.text
-    assert "already belongs to a different project" in response.json()["detail"]
-    assert checked_orgs == ["org-validated"], (
-        f"internal key skipped the guard or used the wrong org: {checked_orgs}"
-    )
+    assert second.json() == {"id": "acme/checkout-bot/env"}
+    assert uploads == ["acme/checkout-bot/env", "acme/checkout-bot/env"]
 
 
 def _b64_targz(members: dict[str, bytes]) -> str:
@@ -9154,22 +8961,8 @@ def _b64_targz(members: dict[str, bytes]) -> str:
         ),
     ],
 )
-def test_publish_env_validates_the_archive_before_checking_ownership(
-    api, monkeypatch, package, message
-):
-    """Base64-valid but structurally invalid packages keep their own 400.
-
-    `validate_publish_inputs` only decodes; a payload can survive that and still be a corrupt
-    archive or lack `environment.py`. Those errors live deeper in the publish, so the ownership
-    guard has to run after them -- otherwise a colliding destination answers a package that could
-    never be published with a conflict, and consults the backend to do it.
-    """
-    from flash.server.domain import environment_registry as registry_mod
-
-    def _conflict(**_kwargs):
-        pytest.fail("ownership must not be consulted for a package that cannot be published")
-
-    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _conflict)
+def test_publish_env_validates_the_archive_before_publication(api, monkeypatch, package, message):
+    """Base64-valid but structurally invalid packages keep their own 400."""
     monkeypatch.setenv("GITHUB_TOKEN", "token-for-publish-path")
 
     response = api.post(
@@ -9191,22 +8984,10 @@ def test_publish_env_validates_the_archive_before_checking_ownership(
         ("package_b64", "", 400, "empty env package"),
     ],
 )
-def test_publish_env_validates_inputs_before_checking_ownership(
+def test_publish_env_validates_inputs_before_publication(
     api, monkeypatch, field, value, status, message
 ):
-    """An unpublishable request keeps its own deterministic error.
-
-    The ownership pre-check runs early enough to preempt the payload checks, so a colliding
-    destination would answer a malformed request with 409 -- replacing the 400/413 the inputs
-    earn -- and would contact the backend for a publish that could never happen.
-    """
-    from flash.server.domain import environment_registry as registry_mod
-
-    def _conflict(**_kwargs):
-        pytest.fail("ownership must not be consulted for a request that cannot be published")
-
-    monkeypatch.setattr(registry_mod, "raise_if_owned_by_another_project", _conflict)
-
+    """An unpublishable request keeps its own deterministic error."""
     body = {"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]}
     body[field] = value
     response = api.post("/v1/envs", headers=_bearer(_login()), json=body)
@@ -9215,25 +8996,8 @@ def test_publish_env_validates_inputs_before_checking_ownership(
     assert message in response.json()["detail"].lower()
 
 
-def test_publish_env_reports_an_invalid_name_as_a_type_error_not_a_conflict(api, monkeypatch):
-    """A malformed name must not be answered with a conflict about an unrelated environment.
-
-    A non-string name sanitizes to the generic "env", so checking ownership of that slug before
-    validating the type would answer `name=0` with a 409 naming `<org>/env` -- a different
-    environment the caller never asked for -- instead of the deterministic 400.
-    """
-    import flash.server.domain.environment_registry as registry
-
-    # The org owns the sanitized "<ns>/env" slug under a different project. The real
-    # publish_package runs: its type check is what must answer, not this conflict.
-    monkeypatch.setattr(
-        registry,
-        "raise_if_owned_by_another_project",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            registry.EnvironmentProjectConflict("flash environment belongs to another project")
-        ),
-    )
-
+def test_publish_env_reports_an_invalid_name_as_a_type_error(api, monkeypatch):
+    """A malformed name receives the deterministic type error."""
     response = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
@@ -9242,35 +9006,6 @@ def test_publish_env_reports_an_invalid_name_as_a_type_error_not_a_conflict(api,
 
     assert response.status_code == 400, response.text
     assert "name must be a string" in response.json()["detail"].lower()
-
-
-def test_publish_env_maps_a_late_ownership_conflict_to_409(api, monkeypatch):
-    """Losing the race to a concurrent publish is still an ownership conflict, not a 502.
-
-    The pre-check can pass and the association still be refused (another publish landed in
-    between, or the pre-check could not reach the backend). The cause is unchanged, so the
-    answer must be too -- otherwise the same conflict yields retry advice by timing alone.
-    """
-    import flash.server.domain.environment_registry as registry
-    import flash.server.domain.envs as envs_mod
-
-    monkeypatch.setattr(registry, "raise_if_owned_by_another_project", lambda **_kwargs: None)
-    monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("acme/env"))
-
-    def conflict(**_kwargs):
-        raise registry.EnvironmentProjectConflict("flash environment belongs to another project")
-
-    monkeypatch.setattr(registry, "record_published_environment", conflict)
-
-    response = api.post(
-        "/v1/envs",
-        headers=_bearer(_login()),
-        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
-    )
-
-    assert response.status_code == 409, response.text
-    assert "already belongs to a different project" in response.json()["detail"]
-    assert "could not be recorded" not in response.json()["detail"]
 
 
 def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
@@ -9321,7 +9056,7 @@ def test_delete_env_endpoint_removes_package(api, monkeypatch):
     )
 
     resp = api.delete(
-        "/v1/envs/acme/my-env",
+        "/v1/envs/acme/checkout-bot/my-env",
         headers={
             **_bearer(_login()),
             "X-Freesolo-Org-Id": "org-acme",
@@ -9329,15 +9064,15 @@ def test_delete_env_endpoint_removes_package(api, monkeypatch):
         },
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"id": "acme/my-env", "deleted": True}
-    assert seen["slug"] == "acme/my-env"
-    assert recorded["slug"] == "acme/my-env"
+    assert resp.json() == {"id": "acme/checkout-bot/my-env", "deleted": True}
+    assert seen["slug"] == "acme/checkout-bot/my-env"
+    assert recorded["slug"] == "acme/checkout-bot/my-env"
     assert recorded["project_id"] == "11111111-1111-4111-8111-111111111111"
     # the caller-supplied org (web ui delete) reaches the metadata-mirror drop.
     assert recorded["org_id"] == "org-acme"
 
     # unauthenticated requests are rejected.
-    assert api.delete("/v1/envs/acme/my-env").status_code in (401, 403)
+    assert api.delete("/v1/envs/acme/checkout-bot/my-env").status_code in (401, 403)
 
 
 def test_delete_env_missing_mirror_and_package_is_idempotent(api, monkeypatch):
@@ -9373,7 +9108,7 @@ def test_delete_env_missing_mirror_and_package_is_idempotent(api, monkeypatch):
     )
 
     response = api.delete(
-        f"/v1/envs/{namespace}/my-env",
+        f"/v1/envs/{namespace}/checkout-bot/my-env",
         headers={
             **_bearer(key),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
@@ -9381,7 +9116,7 @@ def test_delete_env_missing_mirror_and_package_is_idempotent(api, monkeypatch):
     )
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"id": f"{namespace}/my-env", "deleted": False}
+    assert response.json() == {"id": f"{namespace}/checkout-bot/my-env", "deleted": False}
 
 
 def test_delete_env_internal_key_missing_mirror_and_package_is_idempotent(api, monkeypatch):
@@ -9416,7 +9151,7 @@ def test_delete_env_internal_key_missing_mirror_and_package_is_idempotent(api, m
     )
 
     response = api.delete(
-        "/v1/envs/acme/my-env",
+        "/v1/envs/acme/checkout-bot/my-env",
         headers={
             **_bearer("fslo-internal-test"),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
@@ -9424,7 +9159,7 @@ def test_delete_env_internal_key_missing_mirror_and_package_is_idempotent(api, m
     )
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"id": "acme/my-env", "deleted": False}
+    assert response.json() == {"id": "acme/checkout-bot/my-env", "deleted": False}
 
 
 def test_delete_env_internal_key_missing_mirror_does_not_delete_existing_package(api, monkeypatch):
@@ -9452,7 +9187,7 @@ def test_delete_env_internal_key_missing_mirror_does_not_delete_existing_package
     )
 
     response = api.delete(
-        "/v1/envs/acme/my-env",
+        "/v1/envs/acme/checkout-bot/my-env",
         headers={
             **_bearer("fslo-internal-test"),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
@@ -9494,7 +9229,7 @@ def test_delete_env_user_key_missing_mirror_requires_matching_namespace(api, mon
     )
 
     response = api.delete(
-        "/v1/envs/someone-else/my-env",
+        "/v1/envs/someone-else/checkout-bot/my-env",
         headers={
             **_bearer(key),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
@@ -9541,7 +9276,7 @@ def test_delete_env_missing_mirror_surfaces_hub_outage_status(api, monkeypatch):
     )
 
     response = api.delete(
-        f"/v1/envs/{namespace}/my-env",
+        f"/v1/envs/{namespace}/checkout-bot/my-env",
         headers={
             **_bearer(key),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
@@ -9581,7 +9316,7 @@ def test_delete_env_missing_mirror_does_not_delete_existing_package(api, monkeyp
     )
 
     response = api.delete(
-        f"/v1/envs/{namespace}/my-env",
+        f"/v1/envs/{namespace}/checkout-bot/my-env",
         headers={
             **_bearer(key),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
@@ -9598,7 +9333,7 @@ def test_delete_env_endpoint_requires_project_header_before_storage(api, monkeyp
     monkeypatch.setattr(
         envs_mod, "delete_package", lambda **_k: pytest.fail("storage must not be touched")
     )
-    response = api.delete("/v1/envs/acme/my-env", headers=_bearer(_login()))
+    response = api.delete("/v1/envs/acme/checkout-bot/my-env", headers=_bearer(_login()))
     assert response.status_code == 400
     assert "X-Freesolo-Project-Id is required" in response.text
 
@@ -9627,7 +9362,7 @@ def test_delete_env_validates_project_and_environment_before_storage(api, monkey
     monkeypatch.setattr(environment_registry, "record_deleted_environment", lambda **_kwargs: True)
 
     response = api.delete(
-        "/v1/envs/acme/my-env",
+        "/v1/envs/acme/checkout-bot/my-env",
         headers={
             **_bearer(_login()),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
@@ -9638,7 +9373,7 @@ def test_delete_env_validates_project_and_environment_before_storage(api, monkey
     assert [name for name, _kwargs in events] == ["project", "environment", "storage"]
     assert events[0][1]["authorization"].startswith("Bearer ")
     environment_call = events[1][1]
-    assert environment_call["slug"] == "acme/my-env"
+    assert environment_call["slug"] == "acme/checkout-bot/my-env"
     assert environment_call["project_id"] == "11111111-1111-4111-8111-111111111111"
     assert environment_call["key"]["org_id"].startswith("org-")
     assert environment_call["org_id"] is None
@@ -9662,7 +9397,7 @@ def test_delete_env_project_mismatch_blocks_storage(api, monkeypatch):
     )
 
     response = api.delete(
-        "/v1/envs/acme/my-env",
+        "/v1/envs/acme/checkout-bot/my-env",
         headers={
             **_bearer(_login()),
             "X-Freesolo-Project-Id": "22222222-2222-4222-8222-222222222222",
@@ -9682,7 +9417,7 @@ def test_delete_env_endpoint_maps_publish_error_status(api, monkeypatch):
 
     monkeypatch.setattr(envs_mod, "delete_package", fake_delete_package)
     resp = api.delete(
-        "/v1/envs/someone-else/env",
+        "/v1/envs/someone-else/checkout-bot/env",
         headers={
             **_bearer(_login()),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
@@ -9703,7 +9438,7 @@ def test_delete_env_endpoint_mirror_failure_is_non_fatal(api, monkeypatch):
 
     monkeypatch.setattr(environment_registry, "record_deleted_environment", boom)
     resp = api.delete(
-        "/v1/envs/acme/my-env",
+        "/v1/envs/acme/checkout-bot/my-env",
         headers={
             **_bearer(_login()),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
@@ -9726,7 +9461,7 @@ def test_delete_env_endpoint_rejects_non_canonical_id(api, monkeypatch):
         "record_deleted_environment",
         lambda **_k: pytest.fail("mirror must not be touched"),
     )
-    for bad in ("Acme/My-Env", "acme/my-env/"):
+    for bad in ("Acme/Checkout-Bot/My-Env", "acme/checkout-bot/my-env/"):
         resp = api.delete(
             f"/v1/envs/{bad}",
             headers={
@@ -10084,7 +9819,7 @@ def test_create_run_records_managed_environment_use(api, monkeypatch):
         "record_environment_use",
         lambda **kwargs: calls.append(kwargs) or True,
     )
-    spec = {**SPEC, "environment": {"id": "acme/my-env"}}
+    spec = {**SPEC, "environment": {"id": "acme/checkout-bot/my-env"}}
     key = _login()
 
     resp = api.post(
@@ -10095,7 +9830,7 @@ def test_create_run_records_managed_environment_use(api, monkeypatch):
 
     assert resp.status_code == 200, resp.text
     assert calls
-    assert calls[0]["slug"] == "acme/my-env"
+    assert calls[0]["slug"] == "acme/checkout-bot/my-env"
     assert calls[0]["project_id"] == "11111111-1111-4111-8111-111111111111"
     assert calls[0]["run_id"] == resp.json()["run_id"]
     assert calls[0]["key"]["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
@@ -10110,7 +9845,7 @@ def test_internal_run_environment_use_merges_header_org(api, monkeypatch):
         "record_environment_use",
         lambda **kwargs: calls.append(kwargs) or True,
     )
-    spec = {**SPEC, "environment": {"id": "acme/my-env"}}
+    spec = {**SPEC, "environment": {"id": "acme/checkout-bot/my-env"}}
 
     response = api.post(
         "/v1/runs",
