@@ -704,14 +704,3 @@ def cmd_env_push(args) -> int:
             bar.clear()
 
 
-# The import-closure walk lives in `.imports`, which imports helpers from this module.
-# Re-exported at the bottom (after those helpers are defined) so the import resolves;
-# `_iter_env_sidecar_files` is deliberately NOT re-exported -- it has a wrapper above that keeps
-# `monkeypatch.setattr(push, ...)` effective for this module's own call sites.
-from flash.cli.commands.env.imports import (  # noqa: E402,F401
-    _dynamic_import_callees,
-    _dynamic_import_name,
-    _helper_imports,
-    _imported_module_names,
-    _iter_import_closure,
-)
