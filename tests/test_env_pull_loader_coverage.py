@@ -163,17 +163,18 @@ def test_normalize_env_path_variants():
 
 
 def test_slug_and_github_predicates_and_conversion():
-    assert loader.is_managed_environment_slug("david-freesolo-co/stuff") is True
+    assert loader.is_managed_environment_slug("david-freesolo-co/my-project/stuff") is True
     assert loader.is_managed_environment_slug("has:colon") is False
     assert loader.is_managed_environment_slug("only-one-part") is False
-    assert loader.is_managed_environment_slug("too/many/parts") is False
+    assert loader.is_managed_environment_slug("too/many/parts") is True
+    assert loader.is_managed_environment_slug("too/many/parts/extra") is False
 
     assert loader.is_github_environment_ref("github:owner/repo@main:env/environment.py") is True
-    assert loader.is_freesolo_environment_id("david-freesolo-co/stuff") is True
+    assert loader.is_freesolo_environment_id("david-freesolo-co/my-project/stuff") is True
     assert loader.is_freesolo_environment_id("nonsense value") is False
 
-    assert loader.managed_slug_to_github_ref("david-freesolo-co/stuff") == (
-        "github:freesolo-co/environment-hub@main:david-freesolo-co/stuff/environment.py"
+    assert loader.managed_slug_to_github_ref("david-freesolo-co/my-project/stuff") == (
+        "github:freesolo-co/environment-hub@main:david-freesolo-co/my-project/stuff/environment.py"
     )
     with pytest.raises(ValueError, match="not a Freesolo environment slug"):
         loader.managed_slug_to_github_ref("github:owner/repo@main:environment.py")

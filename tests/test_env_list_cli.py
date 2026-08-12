@@ -29,12 +29,12 @@ def _logged_in(monkeypatch, published, *, error: Exception | None = None):
 
 
 def test_published_environment_is_not_reported_as_empty(monkeypatch, capsys):
-    _logged_in(monkeypatch, ["acme/my-env"])
+    _logged_in(monkeypatch, ["acme/project/my-env"])
 
     assert commands.cmd_env_list(argparse.Namespace()) == 0
 
     output = capsys.readouterr().out
-    assert "acme/my-env" in output
+    assert "acme/project/my-env" in output
     assert "no environments yet" not in output
 
 
@@ -42,7 +42,7 @@ def test_published_environment_flows_from_endpoint_to_cli(monkeypatch, capsys):
     import flash.server.domain.envs as domain
     from flash.server.routes import envs as routes
 
-    monkeypatch.setattr(domain, "list_namespace_slugs", lambda **_kwargs: ["acme/my-env"])
+    monkeypatch.setattr(domain, "list_namespace_slugs", lambda **_kwargs: ["acme/project/my-env"])
     monkeypatch.setattr(commands, "load_credentials", lambda: ("https://plane.example", "key"))
     client = ApiClient(api_url="https://plane.example", api_key="key")
 
@@ -55,7 +55,7 @@ def test_published_environment_flows_from_endpoint_to_cli(monkeypatch, capsys):
     assert commands.cmd_env_list(argparse.Namespace()) == 0
 
     output = capsys.readouterr().out
-    assert "acme/my-env" in output
+    assert "acme/project/my-env" in output
     assert "no environments yet" not in output
 
 
@@ -79,12 +79,12 @@ def test_empty_hub_and_no_local_sources_shows_empty_hint(monkeypatch, capsys):
 
 def test_local_and_published_sources_are_both_reported(monkeypatch, capsys, tmp_path):
     (tmp_path / "environment.py").write_text("# env\n")
-    _logged_in(monkeypatch, ["acme/my-env"])
+    _logged_in(monkeypatch, ["acme/project/my-env"])
 
     assert commands.cmd_env_list(argparse.Namespace()) == 0
 
     output = capsys.readouterr().out
-    assert "acme/my-env" in output
+    assert "acme/project/my-env" in output
     assert "local env sources" in output
 
 
@@ -93,10 +93,10 @@ def test_custom_plane_is_asked_instead_of_rejected_client_side(monkeypatch, caps
 
     class Client:
         def list_envs(self):
-            return ["acme/my-env"]
+            return ["acme/project/my-env"]
 
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     commands.cmd_env_list(argparse.Namespace())
 
-    assert "acme/my-env" in capsys.readouterr().out
+    assert "acme/project/my-env" in capsys.readouterr().out

@@ -20,7 +20,7 @@ def _fake_client(capture: dict, *, deleted: bool = True):
 
 
 def _args(
-    env_id: str = "acme/env",
+    env_id: str = "acme/checkout-bot/env",
     *,
     project: str = "11111111-1111-4111-8111-111111111111",
     yes: bool = True,
@@ -31,17 +31,17 @@ def _args(
 def test_delete_calls_client_and_returns_zero(monkeypatch, capsys):
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
-    rc = cmd_env_delete(_args("acme/my-env"))
+    rc = cmd_env_delete(_args("acme/checkout-bot/my-env"))
     assert rc == 0
-    assert cap["env_id"] == "acme/my-env"
+    assert cap["env_id"] == "acme/checkout-bot/my-env"
     assert cap["project_id"] == "11111111-1111-4111-8111-111111111111"
-    assert "deleted acme/my-env" in capsys.readouterr().out
+    assert "deleted acme/checkout-bot/my-env" in capsys.readouterr().out
 
 
 def test_delete_reports_absent_env_as_success(monkeypatch, capsys):
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap, deleted=False))
-    rc = cmd_env_delete(_args("acme/gone"))
+    rc = cmd_env_delete(_args("acme/checkout-bot/gone"))
     assert rc == 0
     assert "not found" in capsys.readouterr().out
 
@@ -63,7 +63,7 @@ def test_delete_rejects_non_env_id(monkeypatch):
         "MyNs/MyEnv",
         "acme/My-Env",
         "ns/bad name",
-        "acme/env/extra",
+        "acme/checkout-bot/env/extra",
     ):
         assert cmd_env_delete(_args(bad)) == 1, bad
     assert called["n"] == 0
@@ -73,9 +73,9 @@ def test_delete_strips_and_sends_canonical_id(monkeypatch, capsys):
     # surrounding whitespace is stripped so the id sent to the server is canonical.
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
-    rc = cmd_env_delete(_args("  acme/my-env  "))
+    rc = cmd_env_delete(_args("  acme/checkout-bot/my-env  "))
     assert rc == 0
-    assert cap["env_id"] == "acme/my-env"
+    assert cap["env_id"] == "acme/checkout-bot/my-env"
 
 
 def test_delete_requires_project_before_network(monkeypatch, capsys):
@@ -96,7 +96,7 @@ def test_delete_aborts_on_declined_confirmation(monkeypatch):
 
     monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
     monkeypatch.setattr("builtins.input", lambda *_a: "n")
-    assert cmd_env_delete(_args("acme/env", yes=False)) == 1
+    assert cmd_env_delete(_args("acme/checkout-bot/env", yes=False)) == 1
     assert called["n"] == 0
 
 
@@ -104,8 +104,8 @@ def test_delete_proceeds_on_confirmation(monkeypatch):
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
     monkeypatch.setattr("builtins.input", lambda *_a: "y")
-    assert cmd_env_delete(_args("acme/env", yes=False)) == 0
-    assert cap["env_id"] == "acme/env"
+    assert cmd_env_delete(_args("acme/checkout-bot/env", yes=False)) == 0
+    assert cap["env_id"] == "acme/checkout-bot/env"
 
 
 def test_delete_surfaces_api_error(monkeypatch, capsys):
@@ -116,7 +116,7 @@ def test_delete_surfaces_api_error(monkeypatch, capsys):
             raise ApiError(403, "you can only delete environments in your own namespace")
 
     monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
-    assert cmd_env_delete(_args("someone-else/env")) == 1
+    assert cmd_env_delete(_args("someone-else/project/env")) == 1
     assert "your own namespace" in capsys.readouterr().err
 
 
@@ -128,11 +128,11 @@ def test_delete_subcommand_dispatches_to_handler():
             "delete",
             "--project",
             "11111111-1111-4111-8111-111111111111",
-            "acme/my-env",
+            "acme/checkout-bot/my-env",
         ]
     )
     assert args.func is cmd_env_delete
-    assert args.env_id == "acme/my-env"
+    assert args.env_id == "acme/checkout-bot/my-env"
     assert args.project == "11111111-1111-4111-8111-111111111111"
     assert args.yes is False
     args_yes = parser.parse_args(
@@ -142,7 +142,7 @@ def test_delete_subcommand_dispatches_to_handler():
             "--project",
             "11111111-1111-4111-8111-111111111111",
             "-y",
-            "acme/my-env",
+            "acme/checkout-bot/my-env",
         ]
     )
     assert args_yes.yes is True

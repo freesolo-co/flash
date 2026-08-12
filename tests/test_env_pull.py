@@ -70,7 +70,7 @@ def _patch_client(monkeypatch, package: bytes) -> None:
 
 def _margs(**kw) -> Namespace:
     base = {
-        "env_id": "david-freesolo-co/stuff",
+        "env_id": "david-freesolo-co/my-project/stuff",
         "path": None,
         "output": None,
         "force": False,
@@ -103,7 +103,7 @@ def test_cmd_env_pull_rejects_non_managed_ref(capsys):
 
 
 def test_cmd_env_pull_rejects_noncanonical_slug(capsys):
-    rc = cmd_env_pull(_margs(env_id="David-Freesolo-Co/Stuff"))
+    rc = cmd_env_pull(_margs(env_id="David-Freesolo-Co/My-Project/Stuff"))
 
     assert rc == 1
     assert "lowercase" in capsys.readouterr().err
@@ -169,7 +169,7 @@ def test_cmd_env_pull_positional_dir_names_the_destination_form(monkeypatch, tmp
     assert rc == 1
     err = capsys.readouterr().err
     assert "--output=into-here" in err
-    assert "david-freesolo-co/stuff" in err
+    assert "david-freesolo-co/my-project/stuff" in err
 
 
 def test_cmd_env_pull_explicit_output_dir_keeps_the_single_file_diagnostic(
@@ -527,7 +527,7 @@ def test_cmd_env_pull_whole_env_refuses_nonempty_dest_without_force(monkeypatch,
 
 
 def test_environment_local_dirname():
-    assert environment_local_dirname("david-freesolo-co/stuff") == "stuff"
+    assert environment_local_dirname("david-freesolo-co/my-project/stuff") == "stuff"
     with pytest.raises(ValueError, match="managed Freesolo environment slug"):
         environment_local_dirname("github:freesolo-co/environment-hub@main:a/b/environment.py")
 
@@ -560,7 +560,7 @@ def test_download_github_tarball_uses_whole_repo_ceiling(monkeypatch):
     monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
     monkeypatch.setattr(adapter, "_github_token", lambda: None)
     ref = adapter._parse_github_environment_ref(
-        adapter.managed_slug_to_github_ref("david-freesolo-co/stuff")
+        adapter.managed_slug_to_github_ref("david-freesolo-co/my-project/stuff")
     )
 
     tarball = adapter._download_github_tarball(ref)
@@ -586,28 +586,28 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
         },
         ("namespace-sha", False): {
             "truncated": False,
-            "tree": [{"type": "tree", "path": "stuff", "sha": "package-sha"}],
+            "tree": [{"type": "tree", "path": "my-project", "sha": "project-sha"}],
         },
-        ("package-sha", True): {
+        ("project-sha", True): {
             "truncated": False,
             "tree": [
                 {
                     "type": "blob",
-                    "path": "environment.py",
+                    "path": "stuff/environment.py",
                     "mode": "100644",
                     "size": len(b"# env\n"),
                 },
-                {"type": "tree", "path": "datasets", "sha": "datasets-sha"},
+                {"type": "tree", "path": "stuff/datasets", "sha": "datasets-sha"},
                 {
                     "type": "blob",
-                    "path": "datasets/train.jsonl",
+                    "path": "stuff/datasets/train.jsonl",
                     "mode": "100644",
                     "size": len(b'{"a":1}\n'),
                 },
-                {"type": "tree", "path": "bin", "sha": "bin-sha"},
+                {"type": "tree", "path": "stuff/bin", "sha": "bin-sha"},
                 {
                     "type": "blob",
-                    "path": "bin/run-helper",
+                    "path": "stuff/bin/run-helper",
                     "mode": "100755",
                     "size": len(b"#!/bin/sh\n"),
                 },
@@ -615,9 +615,9 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
         },
     }
     files = {
-        "david-freesolo-co/stuff/environment.py": b"# env\n",
-        "david-freesolo-co/stuff/datasets/train.jsonl": b'{"a":1}\n',
-        "david-freesolo-co/stuff/bin/run-helper": b"#!/bin/sh\n",
+        "david-freesolo-co/my-project/stuff/environment.py": b"# env\n",
+        "david-freesolo-co/my-project/stuff/datasets/train.jsonl": b'{"a":1}\n',
+        "david-freesolo-co/my-project/stuff/bin/run-helper": b"#!/bin/sh\n",
     }
     seen_urls: list[str] = []
 
@@ -641,7 +641,7 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
 
     monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
 
-    env_file = Path(adapter._resolve_environment_reference("david-freesolo-co/stuff"))
+    env_file = Path(adapter._resolve_environment_reference("david-freesolo-co/my-project/stuff"))
 
     assert env_file.read_bytes() == b"# env\n"
     assert (env_file.parent / "datasets" / "train.jsonl").read_bytes() == b'{"a":1}\n'
@@ -667,20 +667,20 @@ def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
         },
         ("namespace-sha", False): {
             "truncated": False,
-            "tree": [{"type": "tree", "path": "stuff", "sha": "package-sha"}],
+            "tree": [{"type": "tree", "path": "my-project", "sha": "project-sha"}],
         },
-        ("package-sha", True): {
+        ("project-sha", True): {
             "truncated": False,
             "tree": [
                 {
                     "type": "blob",
-                    "path": "environment.py",
+                    "path": "stuff/environment.py",
                     "mode": "100644",
                     "size": len(b"# env\n"),
                 },
                 {
                     "type": "blob",
-                    "path": "datasets/train.jsonl",
+                    "path": "stuff/datasets/train.jsonl",
                     "mode": "100644",
                     "size": len(b'{"a":1}\n'),
                 },
@@ -688,8 +688,8 @@ def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
         },
     }
     files = {
-        "david-freesolo-co/stuff/environment.py": b"# env\n",
-        "david-freesolo-co/stuff/datasets/train.jsonl": b'{"a":1}\n',
+        "david-freesolo-co/my-project/stuff/environment.py": b"# env\n",
+        "david-freesolo-co/my-project/stuff/datasets/train.jsonl": b'{"a":1}\n',
     }
 
     def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
@@ -710,7 +710,7 @@ def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
 
     env_file = Path(
         adapter._resolve_environment_reference(
-            "github:freesolo-co/environment-hub@main:david-freesolo-co/stuff/environment.py"
+            "github:freesolo-co/environment-hub@main:david-freesolo-co/my-project/stuff/environment.py"
         )
     )
 
@@ -722,7 +722,7 @@ def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
 def test_environment_hub_github_ref_requires_package_path(monkeypatch):
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
 
-    with pytest.raises(ValueError, match="namespace/name"):
+    with pytest.raises(ValueError, match="namespace/project/name"):
         adapter._resolve_environment_reference("github:freesolo-co/environment-hub@main")
 
 
@@ -731,12 +731,14 @@ def test_github_tree_url_encodes_treeish_path_segment():
         "freesolo-co",
         "environment-hub",
         "a" * 40,
-        "david-freesolo-co/stuff/environment.py",
+        "david-freesolo-co/my-project/stuff/environment.py",
     )
 
-    url = adapter._github_tree_url(ref, "a" * 40 + ":david-freesolo-co/stuff", recursive=True)
+    url = adapter._github_tree_url(
+        ref, "a" * 40 + ":david-freesolo-co/my-project/stuff", recursive=True
+    )
 
-    assert url.endswith("a" * 40 + "%3Adavid-freesolo-co%2Fstuff?recursive=1")
+    assert url.endswith("a" * 40 + "%3Adavid-freesolo-co%2Fmy-project%2Fstuff?recursive=1")
     assert "/stuff" not in url.split("/git/trees/", 1)[1]
 
 
@@ -745,7 +747,7 @@ def test_download_github_directory_handles_large_tree_listing(monkeypatch, tmp_p
         "freesolo-co",
         "environment-hub",
         "b" * 40,
-        "david-freesolo-co/big/environment.py",
+        "david-freesolo-co/my-project/big/environment.py",
     )
     shard_count = 1001
     trees = {
@@ -754,6 +756,10 @@ def test_download_github_directory_handles_large_tree_listing(monkeypatch, tmp_p
             "tree": [{"type": "tree", "path": "david-freesolo-co", "sha": "namespace-sha"}],
         },
         ("namespace-sha", False): {
+            "truncated": False,
+            "tree": [{"type": "tree", "path": "my-project", "sha": "project-sha"}],
+        },
+        ("project-sha", False): {
             "truncated": False,
             "tree": [{"type": "tree", "path": "big", "sha": "package-sha"}],
         },
@@ -795,10 +801,14 @@ def test_download_github_directory_handles_large_tree_listing(monkeypatch, tmp_p
 
     monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
 
-    repo_root = adapter._download_github_directory(ref, "david-freesolo-co/big", tmp_path)
+    repo_root = adapter._download_github_directory(
+        ref, "david-freesolo-co/my-project/big", tmp_path
+    )
 
-    assert (repo_root / "david-freesolo-co/big/environment.py").read_bytes() == b"# env\n"
-    assert (repo_root / "david-freesolo-co/big/shard-1000.jsonl").read_bytes() == b"x"
+    assert (
+        repo_root / "david-freesolo-co/my-project/big/environment.py"
+    ).read_bytes() == b"# env\n"
+    assert (repo_root / "david-freesolo-co/my-project/big/shard-1000.jsonl").read_bytes() == b"x"
 
 
 def test_download_github_directory_surfaces_tree_error_message(monkeypatch, tmp_path):
@@ -806,7 +816,7 @@ def test_download_github_directory_surfaces_tree_error_message(monkeypatch, tmp_
         "freesolo-co",
         "environment-hub",
         "c" * 40,
-        "david-freesolo-co/missing/environment.py",
+        "david-freesolo-co/my-project/missing/environment.py",
     )
 
     def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
@@ -815,7 +825,7 @@ def test_download_github_directory_surfaces_tree_error_message(monkeypatch, tmp_
     monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
 
     with pytest.raises(RuntimeError, match="Not Found"):
-        adapter._download_github_directory(ref, "david-freesolo-co/missing", tmp_path)
+        adapter._download_github_directory(ref, "david-freesolo-co/my-project/missing", tmp_path)
 
 
 def test_urlopen_streams_and_aborts_over_max_bytes(monkeypatch):

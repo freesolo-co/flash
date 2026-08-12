@@ -1513,12 +1513,12 @@ def test_github_environment_ref_parsing():
     assert not is_github_environment_ref(
         "https://github.com/owner/repo/blob/bad ref/envs/e/environment.py"
     )
-    assert is_managed_environment_slug("owner/env")
-    assert is_freesolo_environment_id("owner/env")
-    assert managed_slug_to_github_ref("owner/env") == (
-        "github:freesolo-co/environment-hub@main:owner/env/environment.py"
+    assert is_managed_environment_slug("owner/project/env")
+    assert is_freesolo_environment_id("owner/project/env")
+    assert managed_slug_to_github_ref("owner/project/env") == (
+        "github:freesolo-co/environment-hub@main:owner/project/env/environment.py"
     )
-    assert not is_managed_environment_slug("owner/env/extra")
+    assert not is_managed_environment_slug("owner/project/env/extra")
     assert not is_freesolo_environment_id("gsm8k")
 
 
@@ -1716,7 +1716,7 @@ def test_worker_deps():
     import flash.envs.base as registry
 
     env_id = "github:owner/repo@main:env/environment.py"
-    assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.4.0"]
+    assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.4.1"]
 
 
 # ============================================================================================

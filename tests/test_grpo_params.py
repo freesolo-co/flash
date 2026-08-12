@@ -226,7 +226,7 @@ def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypa
                 'algorithm = "grpo"',
                 "",
                 "[environment]",
-                'id = "owner/env"',
+                'id = "owner/project/env"',
                 "",
                 "[train]",
                 "entropy_quantile = 0.2",
@@ -613,7 +613,7 @@ def test_grpo_masks_truncated_completions_by_default() -> None:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "environment": {"id": "owner/env"},
+            "environment": {"id": "owner/project/env"},
             "train": {},
         }
     )
@@ -632,7 +632,7 @@ def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "environment": {"id": "owner/env"},
+            "environment": {"id": "owner/project/env"},
             "train": {"stop_sequences": ["</answer>"]},
         }
     )

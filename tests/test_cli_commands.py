@@ -471,7 +471,7 @@ def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:
         'model = "Qwen/Qwen3.5-4B"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
-        'id = "acme/example"\n'
+        'id = "acme/example-project/example"\n'
         "[train]\n"
         "epochs = 1\n"
         "max_examples = 1\n",
@@ -1100,7 +1100,7 @@ def _train_config(tmp_path, *, extra_train: str = ""):
         'model = "Qwen/Qwen3.5-4B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
-        '[environment]\nid = "owner/env"\n'
+        '[environment]\nid = "owner/project/env"\n'
         f"[train]\nepochs = 1\nmax_examples = 2\n{extra_train}"
     )
     return path
@@ -1175,7 +1175,7 @@ def test_train_dry_run_sends_declared_runtime_secrets(
         'model = "Qwen/Qwen3.5-4B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
-        '[environment]\nid = "owner/env"\nsecrets = ["SERPAPI_API_KEY"]\n'
+        '[environment]\nid = "owner/project/env"\nsecrets = ["SERPAPI_API_KEY"]\n'
         "[train]\nepochs = 1\nmax_examples = 2\n"
     )
     monkeypatch.setenv("SERPAPI_API_KEY", "serp-secret")
@@ -1886,7 +1886,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "response_text.thinking" in training_text
     assert "Qwen3.5 thinking multi-turn SFT" in training_text
     assert "longest shared token prefix" in training_text
-    assert "flash env pull your-org/my-env" in training_text
+    assert "flash env pull your-org/your-project/my-env" in training_text
     assert "private environment-scoped repo" in training_text
     assert 'project = "11111111-1111-4111-8111-111111111111"' in training_text
     assert "flash runs checkpoint <run-id>" in training_text
@@ -2427,14 +2427,14 @@ def test_submit_payload_carries_authored_pip_and_the_worker_appends_it(
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
         project="11111111-1111-4111-8111-111111111111",
-        environment=EnvironmentSpec(id="owner/env", pip=("pymongo>=4.6",)),
+        environment=EnvironmentSpec(id="owner/project/env", pip=("pymongo>=4.6",)),
     )
 
     # the author's scorer dependency reaches the server rather than being stripped on the client.
     assert tuple(spec_payload(spec)["environment"]["pip"]) == ("pymongo>=4.6",)
     # and the submit paths install it after the worker requirement, not instead of it.
     assert worker_pip_with_extras(spec.environment.id, spec.environment.pip) == [
-        "freesolo>=0.4.0",
+        "freesolo>=0.4.1",
         "pymongo>=4.6",
     ]
 

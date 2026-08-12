@@ -6,7 +6,6 @@ import base64
 import gzip
 import io
 import json
-import logging
 import subprocess
 import tarfile
 import tracemalloc
@@ -130,15 +129,44 @@ def test_publish_uploads_to_github_and_returns_slug(monkeypatch):
         package_b64=_pkg_b64(_MINIMAL),
         name="My Env!",
         key={"email": "dev@clado.ai", "org_slug": "acme"},
+        project_slug="checkout-bot",
     )
 
-    root = "acme/my-env"
+    root = "acme/checkout-bot/my-env"
     assert ref == root
     assert captured["repo"] == "freesolo-co/environment-hub"
     assert captured["token"] == "ghp-test"
     assert captured["publish_root"] == root
-    assert captured["message"] == "Upload Flash environment acme/my-env"
+    assert captured["message"] == "Upload Flash environment acme/checkout-bot/my-env"
     assert captured["files"] == ["environment.py", "pyproject.toml"]
+
+
+def test_same_name_in_two_projects_publishes_to_separate_roots(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    published_roots: list[str] = []
+    monkeypatch.setattr(
+        envs,
+        "_github_publish_once",
+        lambda *, publish_root, **_kwargs: published_roots.append(publish_root),
+    )
+    key = {"org_slug": "acme"}
+
+    checkout_ref = envs.publish_package(
+        package_b64=_pkg_b64(_MINIMAL),
+        name="shared-name",
+        key=key,
+        project_slug="checkout-bot",
+    )
+    support_ref = envs.publish_package(
+        package_b64=_pkg_b64(_MINIMAL),
+        name="shared-name",
+        key=key,
+        project_slug="support-bot",
+    )
+
+    assert checkout_ref == "acme/checkout-bot/shared-name"
+    assert support_ref == "acme/support-bot/shared-name"
+    assert published_roots == [checkout_ref, support_ref]
 
 
 def test_publish_accepts_matching_explicit_namespace(monkeypatch):
@@ -152,13 +180,14 @@ def test_publish_accepts_matching_explicit_namespace(monkeypatch):
 
     ref = envs.publish_package(
         package_b64=_pkg_b64(_MINIMAL),
-        name="benchmark/Math Python",
+        name="benchmark/checkout-bot/Math Python",
         key={"org_slug": "benchmark"},
+        project_slug="checkout-bot",
     )
 
-    assert ref == "benchmark/math-python"
-    assert captured["publish_root"] == "benchmark/math-python"
-    assert captured["message"] == "Upload Flash environment benchmark/math-python"
+    assert ref == "benchmark/checkout-bot/math-python"
+    assert captured["publish_root"] == "benchmark/checkout-bot/math-python"
+    assert captured["message"] == "Upload Flash environment benchmark/checkout-bot/math-python"
 
 
 def test_publish_rejects_mismatched_explicit_namespace(monkeypatch):
@@ -168,8 +197,9 @@ def test_publish_rejects_mismatched_explicit_namespace(monkeypatch):
     with pytest.raises(envs.EnvPublishError) as excinfo:
         envs.publish_package(
             package_b64=_pkg_b64(_MINIMAL),
-            name="benchmark/math-python",
+            name="benchmark/checkout-bot/math-python",
             key={"org_slug": "acme"},
+            project_slug="checkout-bot",
         )
 
     assert excinfo.value.status == 403
@@ -183,8 +213,9 @@ def test_publish_rejects_invalid_explicit_namespace(monkeypatch):
     with pytest.raises(envs.EnvPublishError) as excinfo:
         envs.publish_package(
             package_b64=_pkg_b64(_MINIMAL),
-            name="!!!/math-python",
+            name="!!!/checkout-bot/math-python",
             key={"org_slug": "env"},
+            project_slug="checkout-bot",
         )
 
     assert excinfo.value.status == 400
@@ -195,23 +226,30 @@ def test_publish_rejects_bad_input(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setattr(envs, "_github_publish_once", lambda **_kwargs: None)
     with pytest.raises(envs.EnvPublishError, match="base64"):
-        envs.publish_package(package_b64="not base64!!!", name="e", key={})
+        envs.publish_package(
+            package_b64="not base64!!!", name="e", key={}, project_slug="checkout-bot"
+        )
     with pytest.raises(envs.EnvPublishError, match="empty"):
-        envs.publish_package(package_b64="", name="e", key={})
+        envs.publish_package(package_b64="", name="e", key={}, project_slug="checkout-bot")
     with pytest.raises(envs.EnvPublishError, match="name"):
-        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="", key={})
+        envs.publish_package(
+            package_b64=_pkg_b64(_MINIMAL), name="", key={}, project_slug="checkout-bot"
+        )
     with pytest.raises(envs.EnvPublishError, match=r"environment\.py"):
         envs.publish_package(
             package_b64=_pkg_b64({"pyproject.toml": "[project]\nname='e'\n"}),
             name="e",
             key={"org_slug": "acme"},
+            project_slug="checkout-bot",
         )
 
 
 def test_publish_requires_github_token(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", key={})
+        envs.publish_package(
+            package_b64=_pkg_b64(_MINIMAL), name="e", key={}, project_slug="checkout-bot"
+        )
     assert excinfo.value.status == 503
     assert "GITHUB_TOKEN" in str(excinfo.value)
 
@@ -220,7 +258,9 @@ def test_publish_does_not_accept_github_pat_alias(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("GITHUB_PAT", "github_pat_test")
     with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", key={})
+        envs.publish_package(
+            package_b64=_pkg_b64(_MINIMAL), name="e", key={}, project_slug="checkout-bot"
+        )
     assert excinfo.value.status == 503
     assert "GITHUB_TOKEN" in str(excinfo.value)
 
@@ -250,7 +290,7 @@ def test_record_published_environment_posts_to_backend(monkeypatch):
     monkeypatch.setattr(environment_registry.urllib.request, "urlopen", fake_urlopen)
 
     ok = environment_registry.record_published_environment(
-        slug="acme/my-env",
+        slug="acme/checkout-bot/my-env",
         name="My Env",
         key={"org_id": "org-1", "user_id": "user-1", "api_key_id": "key-1"},
         project_id="11111111-1111-4111-8111-111111111111",
@@ -262,11 +302,11 @@ def test_record_published_environment_posts_to_backend(monkeypatch):
     body = json.loads(seen["body"])
     assert body == {
         "orgId": "org-1",
-        "slug": "acme/my-env",
+        "slug": "acme/checkout-bot/my-env",
         "name": "My Env",
         "hubRepo": "freesolo-co/environment-hub",
         "hubRef": "main",
-        "hubPath": "acme/my-env/environment.py",
+        "hubPath": "acme/checkout-bot/my-env/environment.py",
         "publishedByUserId": "user-1",
         "apiKeyId": "key-1",
         "projectId": "11111111-1111-4111-8111-111111111111",
@@ -298,7 +338,7 @@ def test_record_published_environment_sends_project_id(monkeypatch):
     monkeypatch.setattr(environment_registry.urllib.request, "urlopen", fake_urlopen)
 
     ok = environment_registry.record_published_environment(
-        slug="acme/my-env",
+        slug="acme/checkout-bot/my-env",
         name="My Env",
         key={"org_id": "org-1", "user_id": "user-1", "api_key_id": "key-1"},
         project_id="  11111111-1111-4111-8111-111111111111  ",
@@ -333,7 +373,7 @@ def test_record_published_environment_rejects_blank_project_id(monkeypatch):
 
     with pytest.raises(ValueError, match="project_id is required"):
         environment_registry.record_published_environment(
-            slug="acme/my-env",
+            slug="acme/checkout-bot/my-env",
             name="My Env",
             key={"org_id": "org-1"},
             project_id="   ",
@@ -348,7 +388,7 @@ def test_record_published_environment_returns_false_without_internal_key(monkeyp
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     assert (
         environment_registry.record_published_environment(
-            slug="acme/my-env",
+            slug="acme/checkout-bot/my-env",
             name="My Env",
             key={"org_id": "org-1"},
             project_id="11111111-1111-4111-8111-111111111111",
@@ -390,7 +430,7 @@ def test_record_deleted_environment_uses_caller_org_for_internal_key(monkeypatch
     seen = _capture_delete_request(monkeypatch)
     ok = environment_registry.record_deleted_environment(
         project_id="11111111-1111-4111-8111-111111111111",
-        slug="acme/my-env",
+        slug="acme/checkout-bot/my-env",
         key={"auth_kind": "internal"},
         org_id="org-acme",
     )
@@ -399,7 +439,7 @@ def test_record_deleted_environment_uses_caller_org_for_internal_key(monkeypatch
     assert json.loads(seen["body"]) == {
         "orgId": "org-acme",
         "projectId": "11111111-1111-4111-8111-111111111111",
-        "slug": "acme/my-env",
+        "slug": "acme/checkout-bot/my-env",
     }
 
 
@@ -411,7 +451,7 @@ def test_record_deleted_environment_prefers_key_org_over_supplied(monkeypatch):
     seen = _capture_delete_request(monkeypatch)
     ok = environment_registry.record_deleted_environment(
         project_id="11111111-1111-4111-8111-111111111111",
-        slug="acme/my-env",
+        slug="acme/checkout-bot/my-env",
         key={"org_id": "org-key"},
         org_id="org-other",
     )
@@ -432,7 +472,7 @@ def test_record_deleted_environment_without_any_org_is_noop(monkeypatch):
     assert (
         environment_registry.record_deleted_environment(
             project_id="11111111-1111-4111-8111-111111111111",
-            slug="acme/my-env",
+            slug="acme/checkout-bot/my-env",
             key={"auth_kind": "internal"},
         )
         is False
@@ -471,7 +511,7 @@ def test_require_environment_project_posts_strict_validation(monkeypatch):
     monkeypatch.setattr(environment_registry.urllib.request, "urlopen", urlopen)
 
     environment_registry.require_environment_project(
-        slug="acme/example",
+        slug="acme/checkout-bot/example",
         project_id="11111111-1111-4111-8111-111111111111",
         key={"org_id": "org-A"},
     )
@@ -486,7 +526,7 @@ def test_require_environment_project_posts_strict_validation(monkeypatch):
         "body": {
             "orgId": "org-A",
             "projectId": "11111111-1111-4111-8111-111111111111",
-            "slug": "acme/example",
+            "slug": "acme/checkout-bot/example",
         },
         "timeout": 10.0,
     }
@@ -533,24 +573,24 @@ def test_require_environment_project_repairs_missing_legacy_environment(monkeypa
     )
 
     environment_registry.require_environment_project(
-        slug="acme/example",
+        slug="acme/checkout-bot/example",
         project_id="11111111-1111-4111-8111-111111111111",
         key=key,
         repair_missing=True,
     )
 
-    assert downloads == [("acme/example", key)]
+    assert downloads == [("acme/checkout-bot/example", key)]
     assert [request["url"] for request in requests] == [
         "https://backend.test/api/flash/environments/validate/internal",
         "https://backend.test/api/flash/environments/internal",
     ]
     assert requests[1]["body"] == {
         "orgId": "org-A",
-        "slug": "acme/example",
+        "slug": "acme/checkout-bot/example",
         "name": "example",
         "hubRepo": "freesolo-co/environment-hub",
         "hubRef": "main",
-        "hubPath": "acme/example/environment.py",
+        "hubPath": "acme/checkout-bot/example/environment.py",
         "publishedByUserId": "user-A",
         "apiKeyId": None,
         "projectId": "11111111-1111-4111-8111-111111111111",
@@ -590,13 +630,13 @@ def test_require_environment_project_repairs_missing_row_without_error_detail(mo
     )
 
     environment_registry.require_environment_project(
-        slug="acme/example",
+        slug="acme/checkout-bot/example",
         project_id="11111111-1111-4111-8111-111111111111",
         key={"org_id": "org-A", "org_slug": "acme"},
         repair_missing=True,
     )
 
-    assert downloads == ["acme/example"]
+    assert downloads == ["acme/checkout-bot/example"]
     assert records[0]["project_id"] == "11111111-1111-4111-8111-111111111111"
 
 
@@ -635,7 +675,7 @@ def test_require_environment_project_missing_package_does_not_backfill(monkeypat
 
     with pytest.raises(HTTPException) as excinfo:
         environment_registry.require_environment_project(
-            slug="acme/example",
+            slug="acme/checkout-bot/example",
             project_id="11111111-1111-4111-8111-111111111111",
             key={"org_id": "org-A", "org_slug": "acme"},
             repair_missing=True,
@@ -683,7 +723,7 @@ def test_require_environment_project_cross_namespace_repair_preserves_404(monkey
 
     with pytest.raises(HTTPException) as excinfo:
         environment_registry.require_environment_project(
-            slug="other-org/example",
+            slug="other-org/checkout-bot/example",
             project_id="11111111-1111-4111-8111-111111111111",
             key={"org_id": "org-A", "org_slug": "acme"},
             repair_missing=True,
@@ -734,7 +774,7 @@ def test_internal_repair_without_org_namespace_preserves_404(monkeypatch, packag
 
     with pytest.raises(HTTPException) as excinfo:
         environment_registry.require_environment_project(
-            slug="foreign-org/example",
+            slug="foreign-org/checkout-bot/example",
             project_id="11111111-1111-4111-8111-111111111111",
             key={"auth_kind": "internal", "org_id": "org-caller"},
             repair_missing=True,
@@ -775,7 +815,7 @@ def test_require_environment_project_backfill_failure_is_502(monkeypatch):
 
     with pytest.raises(HTTPException) as excinfo:
         environment_registry.require_environment_project(
-            slug="acme/example",
+            slug="acme/checkout-bot/example",
             project_id="11111111-1111-4111-8111-111111111111",
             key={"org_id": "org-A", "org_slug": "acme"},
             repair_missing=True,
@@ -799,37 +839,8 @@ def _validate_http_error(code: int, body: bytes):
     )
 
 
-def test_record_published_environment_raises_on_a_cross_project_name_conflict(monkeypatch):
-    """A 409 must reach the caller as a conflict, not collapse into the best-effort ``False``.
-
-    ``False`` is indistinguishable from a transient write failure, which is what made the publish
-    route advise a retry for a conflict no retry can clear.
-    """
-    from flash.server.domain import environment_registry
-    from flash.server.platform import internal_client
-
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
-    monkeypatch.setattr(
-        internal_client.urllib.request,
-        "urlopen",
-        lambda *_a, **_k: (_ for _ in ()).throw(
-            _validate_http_error(409, b'{"detail":"flash environment belongs to another project"}')
-        ),
-    )
-
-    with pytest.raises(environment_registry.EnvironmentProjectConflict) as excinfo:
-        environment_registry.record_published_environment(
-            slug="acme/example",
-            name="example",
-            key={"org_id": "org-A"},
-            project_id="22222222-2222-4222-8222-222222222222",
-        )
-
-    assert "belongs to another project" in str(excinfo.value)
-
-
-def test_record_published_environment_keeps_other_failures_best_effort(monkeypatch):
-    """Only the conflict is promoted; a 500 stays a ``False`` so the retry advice still applies."""
+def test_record_published_environment_keeps_failures_best_effort(monkeypatch):
+    """A backend 500 stays a ``False`` so the retry advice still applies."""
     from flash.server.domain import environment_registry
     from flash.server.platform import internal_client
 
@@ -844,110 +855,12 @@ def test_record_published_environment_keeps_other_failures_best_effort(monkeypat
 
     assert (
         environment_registry.record_published_environment(
-            slug="acme/example",
+            slug="acme/checkout-bot/example",
             name="example",
             key={"org_id": "org-A"},
             project_id="22222222-2222-4222-8222-222222222222",
         )
         is False
-    )
-
-
-def test_raise_if_owned_by_another_project_blocks_only_a_real_conflict(monkeypatch):
-    """409 blocks the publish; 404 (first publish of a new name) does not."""
-    from flash.server.domain import environment_registry
-
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
-    monkeypatch.setattr(
-        environment_registry.urllib.request,
-        "urlopen",
-        lambda *_a, **_k: (_ for _ in ()).throw(
-            _validate_http_error(409, b'{"detail":"flash environment belongs to another project"}')
-        ),
-    )
-    with pytest.raises(environment_registry.EnvironmentProjectConflict):
-        environment_registry.raise_if_owned_by_another_project(
-            slug="acme/example",
-            project_id="22222222-2222-4222-8222-222222222222",
-            org_id="org-A",
-        )
-
-    monkeypatch.setattr(
-        environment_registry.urllib.request,
-        "urlopen",
-        lambda *_a, **_k: (_ for _ in ()).throw(
-            _validate_http_error(404, b'{"detail":"flash environment not found"}')
-        ),
-    )
-    environment_registry.raise_if_owned_by_another_project(
-        slug="acme/brand-new",
-        project_id="22222222-2222-4222-8222-222222222222",
-        org_id="org-A",
-    )
-
-
-def test_raise_if_owned_by_another_project_does_not_block_when_the_backend_is_down(monkeypatch):
-    """The guard prevents a destructive overwrite; it must not become a new uptime dependency.
-
-    An unreachable backend leaves publishing exactly as available as it was before the guard --
-    the association step afterwards still reports that failure.
-    """
-    from flash.server.domain import environment_registry
-
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
-    monkeypatch.setattr(
-        environment_registry.urllib.request,
-        "urlopen",
-        lambda *_a, **_k: (_ for _ in ()).throw(OSError("connection refused")),
-    )
-
-    environment_registry.raise_if_owned_by_another_project(
-        slug="acme/example",
-        project_id="22222222-2222-4222-8222-222222222222",
-        org_id="org-A",
-    )
-
-
-def test_ownership_probe_does_not_log_an_ordinary_first_publish_as_a_failure(monkeypatch, caplog):
-    """A 404 here means "that name is free" -- the answer every first publish gets.
-
-    The probe shares the best-effort transport, whose default is to log any HTTP error as
-    "failed to <subject>". For this one caller that would put a warning in the logs on the most
-    common SUCCESSFUL path, which is how operators learn to ignore the warning that matters. A
-    genuine fault must still warn, so both directions are asserted here.
-    """
-    from flash.server.domain import environment_registry
-
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
-
-    def _respond(status: int, payload: bytes):
-        monkeypatch.setattr(
-            environment_registry.urllib.request,
-            "urlopen",
-            lambda *_a, **_k: (_ for _ in ()).throw(_validate_http_error(status, payload)),
-        )
-
-    _respond(404, b'{"detail":"flash environment not found"}')
-    with caplog.at_level(logging.DEBUG, logger="flash.server.environments"):
-        environment_registry.raise_if_owned_by_another_project(
-            slug="acme/brand-new",
-            project_id="22222222-2222-4222-8222-222222222222",
-            org_id="org-A",
-        )
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
-        "an ordinary first publish must not warn"
-    )
-
-    caplog.clear()
-    _respond(500, b'{"detail":"backend exploded"}')
-    with caplog.at_level(logging.DEBUG, logger="flash.server.environments"):
-        environment_registry.raise_if_owned_by_another_project(
-            slug="acme/brand-new",
-            project_id="22222222-2222-4222-8222-222222222222",
-            org_id="org-A",
-        )
-    assert [r for r in caplog.records if r.levelno >= logging.WARNING], (
-        "a real backend fault must still warn"
     )
 
 
@@ -979,7 +892,7 @@ def test_require_environment_project_maps_project_mismatch(monkeypatch):
 
     with pytest.raises(HTTPException) as excinfo:
         environment_registry.require_environment_project(
-            slug="acme/example",
+            slug="acme/checkout-bot/example",
             project_id="22222222-2222-4222-8222-222222222222",
             key={"org_id": "org-A"},
             repair_missing=True,
@@ -998,7 +911,7 @@ def test_require_environment_project_fails_closed_without_internal_key(monkeypat
 
     with pytest.raises(HTTPException) as excinfo:
         environment_registry.require_environment_project(
-            slug="acme/example",
+            slug="acme/checkout-bot/example",
             project_id="11111111-1111-4111-8111-111111111111",
             key={"org_id": "org-A"},
         )
@@ -1033,7 +946,7 @@ def test_record_environment_use_posts_to_backend(monkeypatch):
 
     ok = environment_registry.record_environment_use(
         project_id="11111111-1111-4111-8111-111111111111",
-        slug="acme/my-env",
+        slug="acme/checkout-bot/my-env",
         run_id="flash-1",
         key={"org_id": "org-1"},
     )
@@ -1044,7 +957,7 @@ def test_record_environment_use_posts_to_backend(monkeypatch):
     assert json.loads(seen["body"]) == {
         "orgId": "org-1",
         "projectId": "11111111-1111-4111-8111-111111111111",
-        "slug": "acme/my-env",
+        "slug": "acme/checkout-bot/my-env",
         "runId": "flash-1",
     }
 
@@ -1082,7 +995,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
                 "model": "Qwen/Qwen3.5-4B",
                 "algorithm": "grpo",
                 "phase": "rl",
-                "environment": {"id": "acme/my-env"},
+                "environment": {"id": "acme/checkout-bot/my-env"},
                 "project": "11111111-1111-4111-8111-111111111111",
                 "gpu": {"type": "RTX 5090"},
             },
@@ -1101,7 +1014,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     assert body["orgId"] == "org-1"
     assert body["runId"] == "flash-1"
     assert body["status"] == "running"
-    assert body["environmentSlug"] == "acme/my-env"
+    assert body["environmentSlug"] == "acme/checkout-bot/my-env"
     # the exact canonical project uuid is persisted with every managed training run.
     assert body["projectId"] == "11111111-1111-4111-8111-111111111111"
     assert body["model"] == "Qwen/Qwen3.5-4B"
@@ -1402,10 +1315,12 @@ def test_github_publish_retries_concurrent_push(monkeypatch, tmp_path):
     monkeypatch.setattr(envs, "_github_publish_once", fake_publish_once)
     monkeypatch.setattr(envs.time, "sleep", lambda _seconds: None)
 
-    ref = envs._github_publish(tmp_path, name="e", key={"org_slug": "acme"})
+    ref = envs._github_publish(
+        tmp_path, name="e", key={"org_slug": "acme"}, project_slug="checkout-bot"
+    )
 
     assert calls["count"] == 2
-    assert ref == "acme/e"
+    assert ref == "acme/checkout-bot/e"
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -1501,8 +1416,8 @@ def test_delete_package_user_can_delete_own_namespace(monkeypatch):
         return True
 
     monkeypatch.setattr(envs, "_github_delete", fake_github_delete)
-    assert envs.delete_package(slug="acme/my-env", key={"org_slug": "acme"}) is True
-    assert seen == {"slug": "acme/my-env", "token": "ghp-test"}
+    assert envs.delete_package(slug="acme/checkout-bot/my-env", key={"org_slug": "acme"}) is True
+    assert seen == {"slug": "acme/checkout-bot/my-env", "token": "ghp-test"}
 
 
 def test_delete_package_rejects_other_users_namespace(monkeypatch):
@@ -1511,7 +1426,7 @@ def test_delete_package_rejects_other_users_namespace(monkeypatch):
         envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
     )
     with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.delete_package(slug="someone-else/env", key={"org_slug": "acme"})
+        envs.delete_package(slug="someone-else/checkout-bot/env", key={"org_slug": "acme"})
     assert excinfo.value.status == 403
 
 
@@ -1521,13 +1436,16 @@ def test_delete_package_internal_key_can_delete_any_namespace(monkeypatch):
     monkeypatch.setattr(
         envs, "_github_delete", lambda slug, *, token: seen.update(slug=slug) or True
     )
-    assert envs.delete_package(slug="acme/paper-foo", key={"auth_kind": "internal"}) is True
-    assert seen["slug"] == "acme/paper-foo"
+    assert (
+        envs.delete_package(slug="acme/checkout-bot/paper-foo", key={"auth_kind": "internal"})
+        is True
+    )
+    assert seen["slug"] == "acme/checkout-bot/paper-foo"
 
 
 def test_delete_package_internal_key_rejects_repo_control_namespace(monkeypatch):
     # The internal key bypasses the namespace-ownership check, so _validate_slug is the ONLY barrier
-    # before `git rm -r -- <namespace>/<name>`. A GENUINE repo-control top-level path (a dir at the
+    # before `git rm -r -- <namespace>/<project>/<name>`. A GENUINE repo-control top-level path (a dir at the
     # root of the hub checkout) must be rejected so e.g. DELETE /v1/envs/.github/workflows can't
     # remove tracked repo infrastructure. Only `.git`/`.github` qualify because org slugs can never
     # be dot-prefixed, so these are never publishable.
@@ -1539,13 +1457,13 @@ def test_delete_package_internal_key_rejects_repo_control_namespace(monkeypatch)
     assert "source" not in envs._REPO_CONTROL_TOP_LEVEL_PATHS
     for blocked in envs._REPO_CONTROL_TOP_LEVEL_PATHS:
         with pytest.raises(envs.EnvPublishError, match="invalid env id segment"):
-            envs.delete_package(slug=f"{blocked}/workflows", key={"auth_kind": "internal"})
+            envs.delete_package(slug=f"{blocked}/project/workflows", key={"auth_kind": "internal"})
 
 
 def test_delete_package_allows_publishable_source_namespace(monkeypatch):
     # Regression guard for publish/delete symmetry: `source` is in publish's package-CONTENT
     # blocklist (_BLOCKED_TOP_LEVEL_PATHS via _safe_extract) but is a legitimate org namespace.
-    # Delete must therefore reach storage for `source/<name>` (not 400), or those envs would be
+    # Delete must therefore reach storage for `source/<project>/<name>` (not 400), or those envs would be
     # publishable-but-undeletable.
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     seen: dict[str, str] = {}
@@ -1555,15 +1473,17 @@ def test_delete_package_allows_publishable_source_namespace(monkeypatch):
         return True
 
     monkeypatch.setattr(envs, "_github_delete", fake_delete)
-    # A user key whose org slug is `source` deletes its OWN `source/<name>`.
+    # A user key whose org slug is `source` deletes its OWN `source/<project>/<name>`.
     source_key = {"org_slug": "source"}
     assert envs.namespace_for(source_key) == "source"
     assert "source" in envs._BLOCKED_TOP_LEVEL_PATHS  # still barred from package CONTENTS
-    assert envs.delete_package(slug="source/my-env", key=source_key) is True
-    assert seen["slug"] == "source/my-env"
+    assert envs.delete_package(slug="source/checkout-bot/my-env", key=source_key) is True
+    assert seen["slug"] == "source/checkout-bot/my-env"
     # And the internal key (which may delete any namespace) reaches storage too.
-    assert envs.delete_package(slug="source/other", key={"auth_kind": "internal"}) is True
-    assert seen["slug"] == "source/other"
+    assert (
+        envs.delete_package(slug="source/checkout-bot/other", key={"auth_kind": "internal"}) is True
+    )
+    assert seen["slug"] == "source/checkout-bot/other"
 
 
 def test_delete_package_validates_slug(monkeypatch):
@@ -1571,33 +1491,42 @@ def test_delete_package_validates_slug(monkeypatch):
     monkeypatch.setattr(
         envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
     )
-    # incl. a VALID two-segment id with a trailing/leading slash (e.g. from a `:path` route capture)
-    # or surrounding/embedded whitespace (e.g. an encoded `ns/env%20` decoded to `ns/env `): each
-    # must be REJECTED, not silently normalized to ns/env (which would leak a non-canonical id that
+    # incl. a valid three-segment id with a trailing or leading slash from a `:path` route
+    # capture, or surrounding or embedded whitespace: each must be rejected rather than normalized,
+    # which would leak a non-canonical id that
     # the response / metadata mirror would then carry while deletion targets the trimmed slug).
     for bad in (
         "noslash",
-        "a/b/c",
-        "ns/..",
-        "../escape",
-        "ns/",
-        "/name",
-        "ns/bad name",
-        "ns/env/",
-        "/ns/env",
-        "ns/env ",
-        " ns/env",
-        "ns/env\t",
-        "ns /env",
-        "  ns/env  ",
+        "a/b",
+        "a/b/c/d",
+        "ns/project/..",
+        "../project/escape",
+        "ns/project/",
+        "/project/name",
+        "ns/project/bad name",
+        "ns/project/env/",
+        "/ns/project/env",
+        "ns/project/env ",
+        " ns/project/env",
+        "ns/project/env\t",
+        "ns /project/env",
+        "  ns/project/env  ",
     ):
         with pytest.raises(envs.EnvPublishError):
             envs.delete_package(slug=bad, key={"auth_kind": "internal"})
 
 
 def test_canonical_env_id_accepts_only_canonical_form():
-    assert envs.canonical_env_id("acme/my-env") == "acme/my-env"
-    for bad in ("ns/env/", " ns/env", "ns/env ", "ns/env%20", "Ns/Env", "noslash"):
+    assert envs.canonical_env_id("acme/checkout-bot/my-env") == "acme/checkout-bot/my-env"
+    for bad in (
+        "ns/project/env/",
+        " ns/project/env",
+        "ns/project/env ",
+        "ns/project/env%20",
+        "Ns/Project/Env",
+        "ns/env",
+        "noslash",
+    ):
         with pytest.raises(envs.EnvPublishError):
             envs.canonical_env_id(bad)
 
@@ -1605,7 +1534,7 @@ def test_canonical_env_id_accepts_only_canonical_form():
 def test_delete_package_requires_github_token(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.delete_package(slug="acme/x", key={"auth_kind": "internal"})
+        envs.delete_package(slug="acme/checkout-bot/x", key={"auth_kind": "internal"})
     assert excinfo.value.status == 503
     assert "GITHUB_TOKEN" in str(excinfo.value)
 
@@ -1618,7 +1547,7 @@ def test_github_delete_once_removes_dir_and_pushes(tmp_path, monkeypatch):
     _git(seed, "config", "user.name", "test")
     _git(seed, "config", "user.email", "test@example.com")
     (seed / "README.md").write_text("hub\n")
-    env_dir = seed / "ns" / "env"
+    env_dir = seed / "ns" / "project" / "env"
     env_dir.mkdir(parents=True)
     (env_dir / "environment.py").write_text("def load_environment(**k): pass\n")
     _git(seed, "add", "-A")
@@ -1629,13 +1558,13 @@ def test_github_delete_once_removes_dir_and_pushes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
     removed = envs._github_delete_once(
-        repo="ignored/repo", token="tok", publish_root="ns/env", message="Delete test env"
+        repo="ignored/repo", token="tok", publish_root="ns/project/env", message="Delete test env"
     )
 
     assert removed is True
     verify = tmp_path / "verify"
     _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
-    assert not (verify / "ns" / "env").exists()
+    assert not (verify / "ns" / "project" / "env").exists()
     # unrelated content is untouched
     assert (verify / "README.md").read_text() == "hub\n"
 
@@ -1656,7 +1585,7 @@ def test_github_delete_once_idempotent_when_absent(tmp_path, monkeypatch):
 
     monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
     removed = envs._github_delete_once(
-        repo="ignored/repo", token="tok", publish_root="ns/absent", message="Delete absent"
+        repo="ignored/repo", token="tok", publish_root="ns/project/absent", message="Delete absent"
     )
     assert removed is False
 
@@ -1700,7 +1629,7 @@ def test_github_delete_once_reapplies_removal_after_concurrent_publish(tmp_path,
     _git(seed, "config", "user.name", "test")
     _git(seed, "config", "user.email", "test@example.com")
     (seed / "README.md").write_text("hub\n")
-    env_dir = seed / "ns" / "env"
+    env_dir = seed / "ns" / "project" / "env"
     env_dir.mkdir(parents=True)
     (env_dir / "environment.py").write_text("def load_environment(**k): pass\n")
     _git(seed, "add", "-A")
@@ -1713,7 +1642,7 @@ def test_github_delete_once_reapplies_removal_after_concurrent_publish(tmp_path,
 
     # Inject the concurrent publish exactly once, right as the original delete commit is staged
     # (the first `_staged_has_changes` call) — before `_push_environment_delete` rebases — by pushing
-    # a sidecar under ns/env through a separate clone.
+    # a sidecar under ns/project/env through a separate clone.
     real_staged = envs._staged_has_changes
     state = {"injected": False}
 
@@ -1725,7 +1654,9 @@ def test_github_delete_once_reapplies_removal_after_concurrent_publish(tmp_path,
             _git(tmp_path, "clone", "--branch", "main", str(remote), str(other))
             _git(other, "config", "user.name", "other")
             _git(other, "config", "user.email", "other@example.com")
-            (other / "ns" / "env" / "extra.py").write_text("# concurrently added sidecar\n")
+            (other / "ns" / "project" / "env" / "extra.py").write_text(
+                "# concurrently added sidecar\n"
+            )
             _git(other, "add", "-A")
             _git(other, "commit", "-m", "concurrent publish under same slug")
             _git(other, "push", "origin", "main")
@@ -1734,14 +1665,17 @@ def test_github_delete_once_reapplies_removal_after_concurrent_publish(tmp_path,
     monkeypatch.setattr(envs, "_staged_has_changes", staged_with_injection)
 
     removed = envs._github_delete_once(
-        repo="ignored/repo", token="tok", publish_root="ns/env", message="Delete ns/env"
+        repo="ignored/repo",
+        token="tok",
+        publish_root="ns/project/env",
+        message="Delete ns/project/env",
     )
     assert removed is True
 
     verify = tmp_path / "verify"
     _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
     # The slug directory is FULLY gone despite the concurrent re-add under it.
-    assert not (verify / "ns" / "env").exists()
+    assert not (verify / "ns" / "project" / "env").exists()
     assert (verify / "README.md").read_text() == "hub\n"
 
 
@@ -1756,7 +1690,7 @@ def test_github_delete_retries_concurrent_push(monkeypatch):
 
     monkeypatch.setattr(envs, "_github_delete_once", fake_delete_once)
     monkeypatch.setattr(envs.time, "sleep", lambda _seconds: None)
-    assert envs._github_delete("ns/env", token="tok") is True
+    assert envs._github_delete("ns/project/env", token="tok") is True
     assert calls["count"] == 2
 
 
@@ -1787,7 +1721,7 @@ def test_record_deleted_environment_sends_delete(monkeypatch):
 
     ok = environment_registry.record_deleted_environment(
         project_id="11111111-1111-4111-8111-111111111111",
-        slug="acme/my-env",
+        slug="acme/checkout-bot/my-env",
         key={"org_id": "org-1"},
     )
 
@@ -1798,7 +1732,7 @@ def test_record_deleted_environment_sends_delete(monkeypatch):
     assert json.loads(seen["body"]) == {
         "orgId": "org-1",
         "projectId": "11111111-1111-4111-8111-111111111111",
-        "slug": "acme/my-env",
+        "slug": "acme/checkout-bot/my-env",
     }
 
 
@@ -1809,7 +1743,7 @@ def test_record_deleted_environment_is_best_effort(monkeypatch):
     assert (
         environment_registry.record_deleted_environment(
             project_id="11111111-1111-4111-8111-111111111111",
-            slug="acme/my-env",
+            slug="acme/checkout-bot/my-env",
             key={"org_id": "org-1"},
         )
         is False
