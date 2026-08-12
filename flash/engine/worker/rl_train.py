@@ -527,7 +527,6 @@ from flash.engine.worker.train.rl.multi_turn import (  # noqa: E402,F401
 from flash.engine.worker.train.rl.single_turn import (  # noqa: E402,F401
     _finalize_single_turn_reward,
     _log_reward_profile,
-    _ScoreBatcher,
     _single_turn_scoring_state,
     score_single_turn,
     score_single_turn_batch,

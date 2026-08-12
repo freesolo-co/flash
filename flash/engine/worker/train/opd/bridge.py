@@ -125,7 +125,7 @@ class _TeacherAlignmentBridge:
         self.generated_tokens = int(state.get("generated_tokens", 0))
         self.teacher_input_tokens = int(state.get("teacher_input_tokens", 0))
         self.teacher_output_tokens = int(state.get("teacher_output_tokens", 0))
-        self.aligned_sequences = int(state.get("aligned_sequences", state.get("granularity_n", 0)))
+        self.aligned_sequences = int(state.get("aligned_sequences", 0))
         self.empty_alignments = int(
             state.get(
                 "empty_alignments", dict(state.get("skip_counts", {})).get("empty_alignment", 0)
@@ -134,11 +134,10 @@ class _TeacherAlignmentBridge:
         self.truncated_rollouts = int(state.get("truncated_rollouts", 0))
         self.forced_tokens = int(state.get("forced_tokens", 0))
         self.dropped_forced_groups = int(state.get("dropped_forced_groups", 0))
-        self.coverage_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
+        self.coverage_sum = float(state.get("coverage_sum", 0.0))
         # alignment GRANULARITY (mean aligned-groups-per-sequence), distinct from coverage: a
         # collapsed alignment that maps every student token onto one group still scores coverage
-        # ~1.0, so coverage alone cannot flag that failure mode. no legacy alias here -- the old
-        # granularity_* state keys held coverage, so reading them would restore the wrong quantity.
+        # ~1.0, so coverage alone cannot flag that failure mode.
         self.align_group_sum = float(state.get("align_group_sum", 0.0))
         self.align_group_n = int(state.get("align_group_n", 0))
         # resume: baseline the per-step delta counters at the restored cumulative mass, so the
@@ -261,7 +260,6 @@ class _TeacherAlignmentBridge:
                 "truncated_rollouts": self.truncated_rollouts,
                 "forced_tokens": self.forced_tokens,
                 "dropped_forced_groups": self.dropped_forced_groups,
-                "granularity_n": self.aligned_sequences,
                 "samples_seen": self.score_requests,
                 "teacher_ok": self.teacher_ok,
                 "teacher_transient": self.teacher_transient,
@@ -270,7 +268,6 @@ class _TeacherAlignmentBridge:
                 "no_signal_skipped_steps": self.no_signal_skipped_steps,
                 "episodes_seen": self.episodes_seen,
                 "mt_turn_records": self.mt_turn_records,
-                "granularity_sum": self.coverage_sum,
                 "skip_counts": skip_counts,
                 "opd_phase_seconds": dict(self.opd_phase_seconds),
                 "opd_phase_counts": dict(self.opd_phase_counts),

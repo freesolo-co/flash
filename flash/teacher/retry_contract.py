@@ -42,7 +42,7 @@ _OPD_RESUME_ACCOUNTING_SCHEMA = {
     "teacher_input_tokens": "nonneg_int",
     "teacher_output_tokens": "nonneg_int",
     "truncated_rollouts": "nonneg_int",
-    "granularity_n": "nonneg_int",
+    "aligned_sequences": "nonneg_int",
     "samples_seen": "nonneg_int",
     "teacher_ok": "nonneg_int",
     "teacher_transient": "nonneg_int",
@@ -51,7 +51,7 @@ _OPD_RESUME_ACCOUNTING_SCHEMA = {
     "no_signal_skipped_steps": "nonneg_int",
     "episodes_seen": "nonneg_int",
     "mt_turn_records": "nonneg_int",
-    "granularity_sum": "nonneg_number",
+    "coverage_sum": "nonneg_number",
     "train_wall_seconds": "nonneg_number",
     "loss_curve": "list",
     "coverage_curve": "list",
@@ -59,9 +59,9 @@ _OPD_RESUME_ACCOUNTING_SCHEMA = {
     "opd_phase_seconds": "dict",
     "opd_phase_counts": "dict",
 }
-# alignment granularity, accumulated by the verl worker. the granularity_* slots above hold COVERAGE
-# on this path, so alignment carries its own pair and both must be validated when present rather
-# than coerced past the fail-closed contract.
+# alignment granularity, accumulated by the verl worker. distinct from the coverage pair above, so
+# alignment carries its own pair and both must be validated when present rather than coerced past
+# the fail-closed contract.
 _OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA = {
     "align_group_sum": "nonneg_number",
     "align_group_n": "nonneg_int",

@@ -862,7 +862,6 @@ def _resume_accounting(step=2):
         "truncated_rollouts": 3,
         "forced_tokens": 9,
         "dropped_forced_groups": 4,
-        "granularity_n": 5,
         "samples_seen": 8,
         "teacher_ok": 6,
         "teacher_transient": 1,
@@ -871,7 +870,6 @@ def _resume_accounting(step=2):
         "no_signal_skipped_steps": 1,
         "episodes_seen": 8,
         "mt_turn_records": 0,
-        "granularity_sum": 3.5,
         "train_wall_seconds": 12.5,
         "loss_curve": [1.25, 0.75][:step],
         "coverage_curve": [0.5, 0.7][:step],
@@ -976,14 +974,14 @@ def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     assert "**_failure_accounting_metadata(final_accounting)" in write_train_meta_source
     assert '"teacher_transient":' not in write_train_meta_source
     assert '"teacher_error":' not in write_train_meta_source
-    # granularity IS reported, but only from its own accumulator. the snapshot's granularity_sum /
-    # granularity_n are legacy aliases holding COVERAGE, so deriving the ratio from them would
-    # publish coverage a second time under the name of the one signal coverage cannot provide.
+    # granularity IS reported, but only from its own accumulator. deriving the ratio from the
+    # coverage pair would publish coverage a second time under the name of the one signal coverage
+    # cannot provide.
     assert '"mean_align_granularity":' in write_train_meta_source
     assert 'final_accounting["align_group_sum"]' in write_train_meta_source
     assert 'final_accounting["align_group_n"]' in write_train_meta_source
-    assert "granularity_sum" not in write_train_meta_source
-    assert "granularity_n" not in write_train_meta_source
+    assert "coverage_sum" not in write_train_meta_source
+    assert "aligned_sequences" not in write_train_meta_source
 
 
 def _teacher_score(tokens, *, input_tokens=5, output_tokens=1):
@@ -1249,10 +1247,10 @@ def test_bridge_granularity_counts_only_sequences_that_reached_the_loss():
     assert bridge.align_group_sum == 1.0
 
 
-def test_bridge_granularity_survives_resume_without_reading_the_coverage_aliases():
-    # granularity_sum / granularity_n are LEGACY ALIASES for coverage. resuming granularity from
-    # them would silently restore coverage under the granularity name, so an old-format state must
-    # restart the accumulator at zero rather than inherit the wrong quantity.
+def test_bridge_granularity_survives_resume_without_reading_the_coverage_counters():
+    # granularity is a DIFFERENT quantity from coverage: resuming it from the coverage pair would
+    # silently restore coverage under the granularity name, so a state carrying no alignment
+    # accumulators must restart granularity at zero rather than inherit the wrong quantity.
     resumed = _text_bridge(_BridgeTeacher())
     state = dict(_resume_accounting())
     state.update({"align_group_sum": 6.0, "align_group_n": 3})
@@ -1272,7 +1270,7 @@ def test_bridge_granularity_survives_resume_without_reading_the_coverage_aliases
     assert snapshot["align_group_sum"] == 6.0
     assert snapshot["align_group_n"] == 3
 
-    legacy_only = _TeacherAlignmentBridge(
+    coverage_only = _TeacherAlignmentBridge(
         prompts=list(resumed.prompts),
         tokenizer=_BridgeTokenizer(),
         teacher=_ScoreManyTeacherAdapter(_BridgeTeacher()),
@@ -1282,12 +1280,12 @@ def test_bridge_granularity_survives_resume_without_reading_the_coverage_aliases
         mutation_callback=lambda: None,
         initial_state=_resume_accounting(),
     )
-    # granularity_sum is 3.5 and granularity_n is 5 in that state; both must be ignored here.
-    assert legacy_only.align_group_sum == 0.0
-    assert legacy_only.align_group_n == 0
-    # the coverage accumulators, whose aliases those really are, DO still resume from them.
-    assert legacy_only.coverage_sum == 3.5
-    assert legacy_only.aligned_sequences == 5
+    # coverage_sum is 3.5 and aligned_sequences is 5 in that state; neither may seed granularity.
+    assert coverage_only.align_group_sum == 0.0
+    assert coverage_only.align_group_n == 0
+    # the coverage accumulators themselves DO still resume.
+    assert coverage_only.coverage_sum == 3.5
+    assert coverage_only.aligned_sequences == 5
 
 
 def test_text_teacher_batcher_enforces_max_batch_size_across_concurrent_requests():
