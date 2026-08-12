@@ -323,8 +323,14 @@ def test_profile_honors_training_contract_precedence(tmp_path) -> None:
         },
     )
 
+    # an explicitly empty contract_path is a string, so the loader passes it through and
+    # _load_contract_text loads nothing (loader.py:838-843). quoting the packaged default here
+    # would bill a contract training never consumes.
+    _spec_value, empty_path = _profile(entrypoint, params={"contract_path": ""})
+
     assert default.real_tokens_per_epoch > custom_path.real_tokens_per_epoch
     assert custom_path.real_tokens_per_epoch > authored.real_tokens_per_epoch
+    assert empty_path.real_tokens_per_epoch < default.real_tokens_per_epoch
 
 
 def test_training_contract_participates_in_retention_and_truncation(tmp_path) -> None:
