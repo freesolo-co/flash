@@ -706,3 +706,104 @@ def test_setup_defaults_are_safe():
     assert args.yes is False
     assert args.force is False
     assert args.dry_run is False
+
+
+def test_status_verifies_the_serving_key_against_an_authenticated_route(monkeypatch, capsys):
+    """A wrong key must not read as `ready`.
+
+    /healthz is deliberately unauthenticated, so a missing or mismatched key sails through every
+    check the command makes and it prints `ready` -- then the very next `models deploy` 401s on
+    /adapters. That is the exact misconfiguration an operator runs `serve status` to diagnose, so
+    the key has to be exercised against a route that actually checks it.
+    """
+    import urllib.error
+
+    from flash.serve import urls as urls_mod
+
+    asked: list[str] = []
+
+    def _fake_request(url, headers, path="/healthz"):
+        asked.append(path)
+        if path == "/healthz":
+            return {
+                "ok": True,
+                "requires_key": True,
+                "base_models": ["Qwen/Qwen3.5-4B"],
+                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
+            }
+        raise urllib.error.HTTPError(url, 401, "invalid serving key", {}, None)
+
+    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "wrong")
+    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+
+    code = serve_cmd.cmd_serve_status(_args())
+    out = capsys.readouterr()
+    assert code == 1, (
+        "status reported success against a backend that rejects the key, so the next deploy 401s "
+        "on a backend this command just called ready"
+    )
+    assert "ready. deploy a run" not in out.out
+    assert "401" in out.err, f"the failure did not name the status it got: {out.err!r}"
+    assert "FREESOLO_INTERNAL_KEY" in out.err, (
+        f"the failure did not name the variable to fix: {out.err!r}"
+    )
+    assert any(p != "/healthz" for p in asked), (
+        "only /healthz was probed, which is unauthenticated -- nothing exercised the key"
+    )
+
+
+def test_status_reports_ready_when_the_serving_key_is_accepted(monkeypatch, capsys):
+    """The probe must pass a CORRECT key through.
+
+    Without this, rejecting every authenticated backend would satisfy the test above while making
+    `serve status` useless on a properly configured deployment.
+    """
+    import urllib.error
+
+    from flash.serve import urls as urls_mod
+
+    def _fake_request(url, headers, path="/healthz"):
+        if path == "/healthz":
+            return {
+                "ok": True,
+                "requires_key": True,
+                "base_models": ["Qwen/Qwen3.5-4B"],
+                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
+            }
+        # What the generated app answers a good key asking for an id that does not exist: the
+        # request got PAST authentication, which is the whole question.
+        raise urllib.error.HTTPError(url, 404, "unknown adapter id", {}, None)
+
+    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "right")
+    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+
+    assert serve_cmd.cmd_serve_status(_args()) == 0
+    assert "ready. deploy a run" in capsys.readouterr().out
+
+
+def test_status_skips_the_key_probe_on_a_backend_without_one(monkeypatch, capsys):
+    """A backend that authenticates nothing has no key to verify.
+
+    Probing anyway would send a request no answer could inform, and a backend that returns
+    something other than 404 for an unknown id would then read as broken.
+    """
+    from flash.serve import urls as urls_mod
+
+    asked: list[str] = []
+
+    def _fake_request(url, headers, path="/healthz"):
+        asked.append(path)
+        return {
+            "ok": True,
+            "requires_key": False,
+            "base_models": ["Qwen/Qwen3.5-4B"],
+            "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
+        }
+
+    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
+    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+    assert serve_cmd.cmd_serve_status(_args()) == 0
+    assert asked == ["/healthz"]
+    assert "ready. deploy a run" in capsys.readouterr().out

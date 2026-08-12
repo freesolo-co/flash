@@ -12,6 +12,7 @@ import json
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from flash._internal.channel import CLI_NAME
@@ -360,7 +361,7 @@ def _deployed_url(output: str) -> str:
     return ""
 
 
-def _status_request(url: str, headers: dict[str, str]) -> dict:
+def _status_request(url: str, headers: dict[str, str], path: str = "/healthz") -> dict:
     """GET one JSON document with the standard library.
 
     Not `flash.serve.deploy._serving_request`, which would be the natural reuse: that module
@@ -404,7 +405,7 @@ def _status_request(url: str, headers: dict[str, str]) -> dict:
             return new
 
     opener = urllib.request.build_opener(_SameOriginRedirect)
-    request = urllib.request.Request(f"{url}/healthz", headers=headers, method="GET")
+    request = urllib.request.Request(f"{url}{path}", headers=headers, method="GET")
     with opener.open(request, timeout=30) as response:
         return json.load(response)
 
@@ -488,6 +489,41 @@ def cmd_serve_status(args) -> int:
             file=sys.stderr,
         )
         return 1
+    # /healthz is deliberately unauthenticated, so everything above passes with a missing or wrong
+    # key and the command prints `ready` -- then the very next `models deploy` 401s on /adapters.
+    # That is the exact misconfiguration an operator runs this command to diagnose, so the key has
+    # to be exercised against a route that actually checks it.
+    #
+    # A GET of an id that cannot exist: authentication runs before the record read, so a wrong key
+    # is 401 and a right key is 404. Read-only and side-effect free either way, which registering
+    # something would not be. Only when the backend says it authenticates at all -- against one
+    # that does not, every key is accepted and there is nothing to verify.
+    if payload.get("requires_key") is True:
+        import urllib.error
+
+        probe = f"flash-serve-status-probe-{uuid.uuid4().hex}"
+        try:
+            _status_request(base, internal_key_header(), f"/adapters/{probe}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                print(
+                    f"\nthe backend at {shown} rejected the serving key (401). set "
+                    f"FREESOLO_INTERNAL_KEY to the value of the app's FLASH_SERVING_KEY secret; "
+                    f"deploys will fail until it matches.",
+                    file=sys.stderr,
+                )
+                return 1
+            # Any other status means the key was ACCEPTED and the request got past
+            # authentication -- 404 for this made-up id is the expected answer. Nothing to report.
+        except Exception as exc:
+            # The backend answered /healthz a moment ago, so a transport failure here is a real
+            # inconsistency worth surfacing rather than swallowing. Reported without claiming to
+            # know which side is at fault.
+            print(
+                f"\ncould not verify the serving key against {shown}: {_redacted(exc, base)}",
+                file=sys.stderr,
+            )
+            return 1
     print(f"\nready. deploy a run with: {CLI_NAME} models deploy <run-id>")
     return 0
 

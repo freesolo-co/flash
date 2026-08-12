@@ -259,6 +259,10 @@ def client(monkeypatch, tmp_path):
     # Every adapter the app asked the GPU to evict. Reaching the engine at all is the assertion:
     # eviction is skipped when nothing is warm, so "was it called" is the behavior under test.
     unregistered: list[str] = []
+    # Every revision whose cached download the app asked to reclaim. Separate from `unregistered`
+    # because the two are deliberately different calls: cleanup after a failed load must not touch
+    # the GPU, whose int-id claim that failure already released.
+    discarded: list[str] = []
 
     async def register(record):
         if record.get("repo_id") == BAD_REPO:
@@ -269,6 +273,10 @@ def client(monkeypatch, tmp_path):
     async def unregister(adapter_id):
         unregistered.append(adapter_id)
         loaded.pop(adapter_id, None)
+        return {"ok": True}
+
+    async def discard_cache(adapter_id):
+        discarded.append(adapter_id)
         return {"ok": True}
 
     async def generate(payload, record):
@@ -293,6 +301,7 @@ def client(monkeypatch, tmp_path):
         {
             "register": register,
             "unregister": unregister,
+            "discard_cache": discard_cache,
             "generate": generate,
             "generate_stream": generate_stream,
         },
@@ -307,6 +316,7 @@ def client(monkeypatch, tmp_path):
     module.engine_classes = engine_classes
     module.runners = runners
     module.unregistered = unregistered
+    module.discarded = discarded
     test_client = TestClient(module.api())
     # Reach the generated module from a test: its Dict and its functions ARE the durable state,
     # so lifecycle races have to be driven through them rather than simulated alongside.
@@ -2611,3 +2621,273 @@ def test_a_failed_eviction_keeps_the_superseded_load_findable(client, monkeypatc
         "a failed eviction dropped the _int_ids entry, so the still-resident lora is invisible to "
         "the collision sweep that would otherwise evict it before loading over the id"
     )
+
+
+def test_provenance_must_agree_with_the_revision_id(client):
+    """The id IS the identity, so metadata sent alongside it cannot contradict it.
+
+    `run_id` decides which run's alias and membership this revision joins, so a mismatch files the
+    artifact under a DIFFERENT run -- undeploying that run then reports success while this revision
+    keeps serving under its own id. `checkpoint_step` is echoed back as provenance the client
+    cross-checks on its 5xx recovery path. Neither is repairable afterwards.
+
+    Checked on the FIRST registration, which is what widening the fingerprint alone cannot do: by
+    the second one the alias has already been written to the wrong run.
+    """
+    module = client.app.state.generated_module
+    for bad_metadata, label in (
+        ({"run_id": "some-other-run"}, "run_id"),
+        ({"checkpoint_step": 99}, "checkpoint_step"),
+        ({"checkpoint_step": None}, "checkpoint_step dropped"),
+        ({"checkpoint_step": "ten"}, "checkpoint_step not an int"),
+        ({"hf_revision": "b" * 40}, "hf_revision"),
+    ):
+        response = client.post(
+            "/adapters",
+            json={**REGISTRATION, "metadata": {**REGISTRATION["metadata"], **bad_metadata}},
+        )
+        assert response.status_code == 422, (
+            f"registration accepted {label} disagreeing with the revision id "
+            f"({response.status_code}); the record's provenance then contradicts its own id"
+        )
+        assert module._record_key(REVISION) not in module.adapter_records, (
+            f"the record was stored despite {label} contradicting the id"
+        )
+    # A non-revision id cannot be registered at all: every downstream path parses identity out of
+    # it, and there is nothing to reconcile the metadata against.
+    assert (
+        client.post("/adapters", json={**REGISTRATION, "adapter_id": "not-a-revision"}).status_code
+        == 422
+    )
+    # And the matching payload still registers.
+    assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
+
+
+def test_changed_provenance_under_one_id_is_a_conflict(client):
+    """Re-registering an id with different provenance is different content, so it must 409.
+
+    The fingerprint took only `hf_revision` from metadata, so a re-registration that changed
+    `run_id` or `checkpoint_step` compared equal and was accepted as an identical retry.
+    """
+    module = client.app.state.generated_module
+    _register_and_ready(client)
+    stored = module.adapter_records[module._record_key(REVISION)]
+    for field, value in (("run_id", "other-run"), ("checkpoint_step", 999)):
+        mutated = {**stored, "metadata": {**stored["metadata"], field: value}}
+        assert module._fingerprint(mutated) != module._fingerprint(stored), (
+            f"a record differing only in {field} fingerprinted identically, so a re-registration "
+            f"that changes it is accepted as an unchanged retry instead of conflicting"
+        )
+
+
+def test_registration_requires_a_pinned_commit_sha(client):
+    """A mutable ref cannot back a revision this app advertises as immutable.
+
+    `metadata.hf_revision` is what `_adapter_path` hands to `snapshot_download`, so a branch name
+    makes one immutable id serve whatever that branch points at today: undeploy, re-register the
+    same id, and different weights load while `_fingerprint` sees no change at all.
+    """
+    for bad in ("main", "", "a" * 39, "A" * 40, "refs/heads/main"):
+        response = client.post(
+            "/adapters",
+            json={
+                **REGISTRATION,
+                "adapter_id": "run-mutable@final." + "c" * 40,
+                "metadata": {**REGISTRATION["metadata"], "hf_revision": bad},
+            },
+        )
+        assert response.status_code == 422, (
+            f"registration accepted hf_revision={bad!r} with "
+            f"{response.status_code}: a moved ref can then serve different weights under an id "
+            f"the client is told is immutable"
+        )
+    # And the good case still registers, so the guard is not simply refusing everything.
+    assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
+
+
+def test_metadata_cannot_turn_a_revision_into_an_alias(client):
+    """`record_type` is this endpoint's to state, not the caller's to supply.
+
+    A record registered as an alias loads onto the GPU but can never be activated (`/activate`
+    refuses non-revisions) and undeploy classifies it as an alias, so it skips both eviction and
+    cache cleanup. An identical retry cannot repair it either: `_fingerprint` does not cover
+    `record_type`, so the retry is a no-op conflict-free re-registration of the same broken record.
+    """
+    module = client.app.state.generated_module
+    assert client.post(
+        "/adapters",
+        json={
+            **REGISTRATION,
+            "metadata": {**REGISTRATION["metadata"], "record_type": "alias"},
+        },
+    ).status_code in (200, 202)
+    record = module.adapter_records[module._record_key(REVISION)]
+    assert record["metadata"]["record_type"] == "revision", (
+        "a caller relabelled its own revision as an alias, producing a record that can never be "
+        "activated and that undeploy will not evict or clean up"
+    )
+
+
+def test_a_failed_load_reclaims_its_downloaded_weights(client):
+    """A terminally failed revision must not keep its download forever.
+
+    `_adapter_path` runs before `add_lora`, so a rejected adapter is one that downloaded fine and
+    then failed to load. Nothing else ever collects it: DELETE skips records that are already
+    `disabled`, and settling the failure is what made it so. The digest is a hash of the adapter
+    id, so every distinct bad revision leaves its own directory behind permanently.
+    """
+    module = client.app.state.generated_module
+    bad_revision = "run-badcache@final." + "e" * 40
+    client.post(
+        "/adapters",
+        json={
+            **REGISTRATION,
+            "adapter_id": bad_revision,
+            "repo_id": BAD_REPO,
+            "checkpoint": "run-badcache",
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "run-badcache",
+                "checkpoint_step": None,
+                "hf_revision": "e" * 40,
+            },
+        },
+    )
+    assert _lifecycle(client, bad_revision) == "failed"
+    assert bad_revision in module.discarded, (
+        "a load that failed after downloading left its weights on the shared volume, and no other "
+        "path ever collects them: delete skips records that are already disabled"
+    )
+    assert bad_revision not in module.unregistered, (
+        "cleanup went through unregister, which evicts by int id -- but the failure already "
+        "released that claim, so it can evict an adapter that has since taken the id"
+    )
+
+
+def test_a_stale_resident_that_cannot_be_evicted_refuses_the_load(client, monkeypatch):
+    """Suppressing a failed stale-resident eviction loses the adapter and loads over it anyway.
+
+    Clearing the maps first made the still-resident LoRA untracked, so no later sweep could find
+    it; proceeding to `add_lora` then bound a second adapter to an int id vLLM still has mapped to
+    the first. Refusing keeps the resident findable and the claim held.
+    """
+    lora = types.ModuleType("vllm.lora.request")
+    lora.LoRARequest = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora)
+
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._loaded = {}
+    instance._int_ids = {}
+
+    mine = "run-newcomer@final." + "f" * 40
+    int_id = module._lora_int_id(mine)
+    stale = "run-stale@final." + "0" * 40
+    # A leftover from an adapter this replica served before the id was released and re-claimed.
+    instance._int_ids[int_id] = stale
+    instance._loaded[stale] = object()
+
+    added: list = []
+
+    async def _remove(_int_id):
+        raise RuntimeError("engine refused the eviction")
+
+    async def _add(request):
+        added.append(request)
+
+    instance._adapter_path = _path_returning("/cache/adapter")
+    instance.engine = types.SimpleNamespace(add_lora=_add, remove_lora=_remove)
+
+    # Not `pytest.raises`: the raise is the fix, but the DAMAGE is what this test has to see. A
+    # short-circuit on "it raised" would skip every assertion below, and those are the ones that
+    # describe the state the suppressed version left behind.
+    with contextlib.suppress(RuntimeError):
+        _run_awaitable(engine_class._lora_request(instance, {"adapter_id": mine}))
+
+    assert not added, (
+        "the load went ahead over an int id vllm still has bound to the stale adapter, which is "
+        "the two-adapters-one-id state the claim exists to prevent"
+    )
+    assert instance._int_ids.get(int_id) == stale, (
+        "a failed eviction dropped the stale resident's map entry, so the lora it left on the gpu "
+        "is invisible to the sweep that would otherwise evict it"
+    )
+    assert module.adapter_records.get(module._lora_id_key(int_id)) == mine, (
+        "the claim was released while the stale adapter is still resident, so a collider can take "
+        "the id and load on top of the old weights"
+    )
+
+
+def _path_returning(path: str):
+    async def _path(_record):
+        return path
+
+    return _path
+
+
+def test_undeploy_reports_conflict_when_it_never_saw_a_clean_pass(client, monkeypatch):
+    """Exhausting the pass budget is itself a failure, even with nothing left unvisited.
+
+    Re-registering an ALREADY SEEN revision grows neither the membership nor the unseen set, so a
+    run that keeps reviving the same id runs out of passes with an empty straggler list. Reporting
+    200 there tells the operator the run is down while that revision settles back to `ready` and
+    stays directly callable by its immutable id.
+    """
+    module = client.app.state.generated_module
+    _register_and_ready(client)
+    client.post(
+        f"/adapters/{REVISION}/activate",
+        json={"run_id": RUN_ID, "expected_adapter_revision": None},
+    )
+
+    original_read = module._run_members
+    calls = types.SimpleNamespace(count=0)
+
+    async def _reviving_members(run_id):
+        # Revive on every read AFTER the first, modelling a deploy that keeps landing inside the
+        # undeploy. The id is already in `members` and already in `seen`, so neither convergence
+        # signal notices; only "did a pass actually re-read everything and find nothing live"
+        # does.
+        calls.count += 1
+        if calls.count > 1:
+            record = module.adapter_records.get(module._record_key(REVISION))
+            if isinstance(record, dict):
+                record["status"] = "ready"
+                record["metadata"] = {**record["metadata"], "lifecycle_state": "ready"}
+                module.adapter_records[module._record_key(REVISION)] = record
+        return await original_read(run_id)
+
+    module._run_members = _reviving_members
+    try:
+        response = client.delete(f"/adapters/{RUN_ID}")
+    finally:
+        module._run_members = original_read
+
+    assert response.status_code == 409, (
+        f"undeploy returned {response.status_code} after exhausting its passes without one clean "
+        f"sweep: the revision is still ready and callable by its immutable id while delete "
+        f"reported the run down"
+    )
+
+
+def test_undeploy_still_reports_success_when_it_converges(client):
+    """The 409 above must come from a real failure to converge, not from every undeploy.
+
+    Without this, tightening the conflict check to "always 409" would satisfy the test above while
+    making ordinary undeploy unusable.
+    """
+    _register_and_ready(client)
+    client.post(
+        f"/adapters/{REVISION}/activate",
+        json={"run_id": RUN_ID, "expected_adapter_revision": None},
+    )
+    response = client.delete(f"/adapters/{RUN_ID}")
+    assert response.status_code == 200, (
+        f"a quiet undeploy reported {response.status_code}; the convergence check is refusing "
+        f"runs that did settle"
+    )
+    assert REVISION in response.json()["disabled_revisions"]

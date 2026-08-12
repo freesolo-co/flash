@@ -20,6 +20,7 @@ import hmac
 import json
 import math
 import os
+import re
 import shutil
 import time
 import uuid
@@ -168,6 +169,19 @@ def _lora_id_key(int_id: int) -> str:
     return f"loraid:{{int_id}}"
 
 
+# A full git commit sha, matching the `[0-9a-f]{{40}}` suffix flash's own revision-id grammar
+# requires. Registration checks `metadata.hf_revision` against this because that value, not the id,
+# is what gets downloaded.
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{{40}}")
+
+# The immutable revision id flash builds: `<run_id>@final.<sha>` or `<run_id>@step-<N>.<sha>`.
+# Mirrors `_ADAPTER_REVISION_RE` in flash/schema. The id is the identity, so the provenance a
+# caller supplies alongside it has to AGREE with it rather than be trusted on its own.
+_REVISION_ID_RE = re.compile(
+    r"(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{{0,127}})@"
+    r"(?:final|step-(?P<step>0|[1-9]\d{{0,17}}))\.(?P<hf_revision>[0-9a-f]{{40}})"
+)
+
 # How many times to re-contest a LoRA id whose holder vanished mid-claim. See `_claim_lora_int_id`.
 _CLAIM_ATTEMPTS = 3
 
@@ -265,6 +279,31 @@ async def _release_lora_int_id(int_id: int, adapter_id: str) -> bool:
         await adapter_records.put.aio(_lora_id_key(int_id), removed, skip_if_exists=True)
         return False
     return True
+
+
+async def _discard_cached_adapter(adapter_id: str) -> None:
+    """Delete one revision's downloaded weights from the shared volume.
+
+    Every immutable revision lands in its own digest directory, so a backend that serves successive
+    checkpoints accumulates every one it has ever downloaded -- paid storage that grows without
+    bound until the volume fills and no adapter can download at all.
+
+    Gated on the DURABLE record still being disabled, re-read here rather than assumed. Callers
+    hold at most a per-container lock, and the volume is shared by every replica, so a `models
+    deploy` can re-register this exact revision and settle it `ready` while this runs. Deleting
+    then removes the files out from under a live load on another container -- a `ready` record
+    whose weights are gone, which fails at the next cold start rather than here. Re-registration is
+    an explicit request that downloads the revision again, so a record that is no longer disabled
+    is exactly the signal to leave the directory alone; the next undeploy collects it.
+    """
+    current = await adapter_records.get.aio(_record_key(adapter_id))
+    if isinstance(current, dict) and current.get("status") == "disabled":
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(
+                shutil.rmtree,
+                f"{{ADAPTER_DIR}}/{{_adapter_digest(adapter_id)}}",
+                ignore_errors=True,
+            )
 
 
 async def _rebuild_run_members(run_id: str) -> list[str]:
@@ -426,7 +465,16 @@ def _fingerprint(record: dict[str, Any]) -> tuple:
         # violation, so it has to be part of identity here too: the same revision id serving a
         # different grammar is different content, not an update.
         record.get("structured_outputs") or None,
-        (record.get("metadata") or {{}}).get("hf_revision"),
+        # EVERY provenance field, not just the commit. The client cross-checks all three of these
+        # on its 5xx recovery readback, so a re-registration that changes one is different content
+        # by the client's own definition and must conflict. Registration additionally pins them to
+        # the revision id, which catches the first registration too; this covers the comparison
+        # itself, so a record that reached the store any other way is still compared on identity
+        # rather than on the commit alone.
+        *(
+            (record.get("metadata") or {{}}).get(field)
+            for field in ("run_id", "checkpoint_step", "hf_revision")
+        ),
     )
 
 
@@ -537,12 +585,29 @@ class Engine:
                 # without evicting first would leave two adapters mapped to one int on this
                 # container, which is precisely what vLLM cannot represent. Cheap: the map is
                 # empty for this int on every replica that never served the old adapter.
+                #
+                # EVICT FIRST, CLEAR AFTER, and REFUSE TO LOAD if the eviction did not happen.
+                # Suppressing the failure here was wrong in both halves: the maps were already
+                # cleared, so the still-resident stale LoRA became untracked and no later sweep
+                # could find it; and the load below then went ahead over an int id vLLM still has
+                # bound to the old adapter. That `add_lora` typically fails, settle releases this
+                # adapter's claim, and the id is free for the next collider to take -- with the
+                # old weights still sitting under it, which is the wrong-run's-weights outcome the
+                # whole claim mechanism exists to prevent. Keeping the maps costs one `max_loras`
+                # slot on a container that is about to recycle, and leaves the resident adapter
+                # findable so the next attempt's sweep can evict it properly.
                 stale = self._int_ids.get(int_id)
                 if stale is not None and stale != adapter_id:
+                    try:
+                        await self.engine.remove_lora(int_id)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"lora id {{int_id}} is still held by {{stale}} on this container and "
+                            f"could not be evicted, so {{adapter_id}} cannot load over it: "
+                            f"{{exc}}. retry the deploy."
+                        ) from exc
                     self._loaded.pop(stale, None)
                     self._int_ids.pop(int_id, None)
-                    with contextlib.suppress(Exception):
-                        await self.engine.remove_lora(int_id)
             if owner != adapter_id:
                 raise RuntimeError(
                     f"lora id collision: {{adapter_id}} and {{owner}} both hash to {{int_id}}, and "
@@ -667,28 +732,20 @@ class Engine:
                     evicted = False
                 if evicted:
                     await _release_lora_int_id(int_id, adapter_id)
-            # And delete the downloaded weights. Every immutable revision lands in its own digest
-            # directory on the persistent volume, so a backend that serves successive checkpoints
-            # accumulates every one it has ever loaded -- paid storage that grows without bound
-            # until the volume fills and new adapters cannot download at all.
-            #
-            # Gated on the DURABLE record still being disabled, re-read here rather than assumed.
-            # The adapter lock is per-container and this call is awaited outside the run lock, so
-            # it does not exclude a redeploy: `models deploy` can re-register this exact revision
-            # and settle it `ready` while this eviction is in flight, and the volume is shared by
-            # every replica. Deleting then removes the files under a live load on another
-            # container -- a `ready` record whose weights are gone, which fails at the next cold
-            # start rather than here. Re-registration is an explicit request that downloads the
-            # revision again, so a record that is no longer disabled is exactly the signal to
-            # leave the directory alone; the next undeploy collects it.
-            current = await adapter_records.get.aio(_record_key(adapter_id))
-            if isinstance(current, dict) and current.get("status") == "disabled":
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(
-                        shutil.rmtree,
-                        f"{{ADAPTER_DIR}}/{{_adapter_digest(adapter_id)}}",
-                        ignore_errors=True,
-                    )
+            await _discard_cached_adapter(adapter_id)
+        return {{"ok": True}}
+
+    @modal.method()
+    async def discard_cache(self, adapter_id: str) -> dict[str, Any]:
+        """Reclaim a terminally-failed revision's download, without touching the GPU.
+
+        Deliberately NOT `unregister`, which would be the obvious reuse. A load that failed left
+        nothing resident to evict, and by the time settle calls this it has already released the
+        int-id claim -- so `unregister`'s `_owns_lora_int_id` would read an absent claim, answer
+        "no peer to disturb", and evict an id a colliding adapter may have taken and loaded into
+        in that window. Cleanup has no reason to touch the engine at all.
+        """
+        await _discard_cached_adapter(adapter_id)
         return {{"ok": True}}
 
     async def _prepare(self, payload: dict[str, Any], record: dict[str, Any]):
@@ -824,6 +881,7 @@ async def settle_adapter(record: dict[str, Any]) -> None:
     except Exception as exc:
         result = {{"ok": False, "failure": f"the serving engine did not answer: {{exc}}"}}
     stand_down = False
+    discard_cache = False
     # The load ran OUTSIDE the lock -- it takes minutes, and the lock's TTL only holds because
     # nothing slow runs under it. But the decision of whether this result may be committed, and
     # the commit itself, must be one atomic step: read-then-write leaves a window in which an
@@ -868,12 +926,23 @@ async def settle_adapter(record: dict[str, Any]) -> None:
                 # undeploy skips already-disabled records, and the id is a hash of the adapter id,
                 # so a retry cannot get a different one.
                 await _release_lora_int_id(_lora_int_id(adapter_id), adapter_id)
+                discard_cache = True
             current["updated_at"] = _utc_now()
             await adapter_records.put.aio(_record_key(adapter_id), current)
     # Outside the lock: an engine round trip is slow, and the record is already durably correct.
     if stand_down:
         with contextlib.suppress(Exception):  # gpu eviction is best effort
             await Engine().unregister.remote.aio(adapter_id)
+    # A revision whose load failed terminally still has its download on the volume: `_adapter_path`
+    # runs before `add_lora`, so a rejected adapter (wrong rank, missing tensors) is one that
+    # downloaded fine and then failed to load. Nothing else ever collects it -- DELETE skips
+    # records that are already `disabled`, and this branch just made it so -- and the id is a hash
+    # of the adapter id, so each distinct bad revision leaves its own directory behind forever.
+    # Best effort and last: the record is already durably `failed`, which is what the client is
+    # polling for, and reclaiming disk must not turn a reported failure into an unreported one.
+    if discard_cache:
+        with contextlib.suppress(Exception):
+            await Engine().discard_cache.remote.aio(adapter_id)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1040,6 +1109,57 @@ def api():
                 status.HTTP_409_CONFLICT,
                 f"this app serves {{BASE_MODEL}}, not {{payload.get('base_model')}}",
             )
+        # The ID IS THE IDENTITY, so the provenance sent alongside it must agree with it. Checked
+        # against the id rather than merely stored, because these fields are load-bearing in three
+        # separate ways and none of them can be repaired after the fact:
+        #
+        #   - `hf_revision` is what `_adapter_path` hands to `snapshot_download`. A branch name
+        #     like `main` makes one immutable id serve whatever that branch points at today.
+        #   - `run_id` decides which run's alias and membership this revision joins, so a mismatch
+        #     files this artifact under a DIFFERENT run -- and undeploying that run then reports
+        #     success while this revision keeps serving under its own id.
+        #   - `checkpoint_step` is echoed back as provenance, which the client cross-checks on its
+        #     5xx recovery path against a backend advertising `revision_provenance`.
+        #
+        # Comparing them to the id closes all three at once, and it works on the FIRST
+        # registration -- widening `_fingerprint` alone only catches the second one, by which time
+        # the alias has already been written to the wrong run.
+        parsed = _REVISION_ID_RE.fullmatch(adapter_id)
+        if parsed is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"adapter_id {{adapter_id!r}} is not an immutable revision id "
+                f"(<run_id>@final.<40-hex sha> or <run_id>@step-<N>.<40-hex sha>)",
+            )
+        expected_step = parsed.group("step")
+        supplied_step = metadata.get("checkpoint_step")
+        # Coerced defensively: `int()` on a caller-supplied value raises TypeError/ValueError for a
+        # string or a dict, and an uncaught raise here is a 500 for what is a malformed REQUEST.
+        # An uncoercible value can never equal the parsed step, so it falls into `mismatched` and
+        # is reported as the 422 it is.
+        if supplied_step is not None:
+            try:
+                supplied_step = int(supplied_step)
+            except (TypeError, ValueError):
+                supplied_step = repr(supplied_step)
+        mismatched = [
+            f"{{name}}={{supplied!r}} (id says {{expected!r}})"
+            for name, supplied, expected in (
+                ("run_id", run_id, parsed.group("run_id")),
+                ("hf_revision", str(metadata.get("hf_revision") or "").strip(), parsed.group("hf_revision")),
+                (
+                    "checkpoint_step",
+                    supplied_step,
+                    None if expected_step is None else int(expected_step),
+                ),
+            )
+            if supplied != expected
+        ]
+        if mismatched:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"metadata disagrees with the revision id {{adapter_id}}: {{', '.join(mismatched)}}",
+            )
         record = {{
             "adapter_id": adapter_id,
             "repo_id": payload.get("repo_id"),
@@ -1051,12 +1171,16 @@ def api():
             "org_id": payload.get("org_id"),
             "structured_outputs": payload.get("structured_outputs"),
             "status": "registered",
-            # record_type comes from the client, but default it rather than trusting it to be
-            # present: /activate refuses anything that is not a revision, so a missing value here
-            # would 404 every activation.
+            # record_type is written AFTER the caller's metadata, not before it. This endpoint
+            # registers revisions and nothing else, so the value is ours to state. Merged in
+            # front, a caller sending `record_type: "alias"` overrode it and produced a record
+            # that loads onto the GPU but can never be activated (`/activate` refuses non
+            # revisions) and is misclassified by undeploy as an alias, so it skips both eviction
+            # and cache cleanup -- and an identical retry cannot repair it, because `_fingerprint`
+            # does not cover `record_type`.
             "metadata": {{
-                "record_type": "revision",
                 **metadata,
+                "record_type": "revision",
                 "lifecycle_state": "registered",
             }},
         }}
@@ -1253,6 +1377,7 @@ def api():
             # grows when a registration actually lands. `seen` survives only to decide when the
             # loop has converged and to name the stragglers.
             seen: set[str] = set()
+            converged = False
             for _ in range(_UNDEPLOY_PASSES):
                 disabled_here = 0
                 for member_id in sorted(members, key=lambda m: m == run_id):
@@ -1293,6 +1418,7 @@ def api():
                             seen.discard(member_id)
                             break
                     if not live:
+                        converged = True
                         break
                     continue
             # The pass budget is bounded, so it can run out with members still unvisited: a
@@ -1303,7 +1429,16 @@ def api():
             # for every revision this call DID disable. Those are already `disabled`, so a retry
             # passes over them and their `max_loras` slots stay occupied until the container
             # recycles. So: finish the eviction, then report.
+            #
+            # Unvisited members are not the only way to finish dirty. Re-registering an ALREADY
+            # SEEN revision grows neither `members` nor the unseen set, so a run that keeps
+            # reviving the same id exhausts the budget with an empty straggler list -- and DELETE
+            # would answer 200 while that revision settles back to `ready`. Running out of passes
+            # is itself the signal: only a pass that re-read every member and found nothing live
+            # sets `converged`, so anything else reports 409 and the retry is the caller's.
             stragglers = [member for member in members if member not in seen]
+            if not converged and not stragglers:
+                stragglers = [member for member in members if member != run_id]
         # Outside the lock: evicting from the GPU is slow and best effort, and the records are
         # already durably disabled, so holding the lock across it would only block other deploys.
         #

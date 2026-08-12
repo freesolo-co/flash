@@ -78,12 +78,20 @@ refuse that combination rather than serve broken output.
 ```json
 {
   "ok": true,
+  "requires_key": true,
   "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"]
 }
 ```
 
 Must answer before the model is loaded. The client calls it during deploy preflight, and a cold
 container that blocks health on a multi-minute weight load reads as an unreachable backend.
+
+`requires_key` is optional and reports whether the backend authenticates writes at all - not
+whether the caller's own key is correct. `flash serve status` reads it to decide whether to verify
+the key: when it is `true`, status follows up with an authenticated `GET /adapters/{unknown-id}`
+and treats `401` as a misconfigured key. Health itself may stay unauthenticated (the generated app
+leaves it open so a cold backend is still diagnosable), which is exactly why status cannot conclude
+anything about the key from this endpoint alone.
 
 ### `POST /adapters`
 
@@ -110,14 +118,27 @@ Registers a revision. The client sends:
 `org_id` and `structured_outputs` appear when set. Accept `200` or `202`; anything else is treated
 as a failure.
 
-Three rules:
+Five rules:
 
 - **Do not reject unknown top-level fields.** The client adds keys over time.
 - **Do not require a `status` field.** The client deliberately does not send one, because the
   backend owns the record's status. A schema that demands it 422s every deploy.
 - **Re-registration of identical content must succeed**, because the client retries after an
   ambiguous 5xx. Re-registration of _different_ content under the same `adapter_id` must be
-  `409`. That conflict is what `immutable_adapter_revisions` means.
+  `409`. That conflict is what `immutable_adapter_revisions` means. "Content" includes the
+  provenance metadata, not just the artifact location: the client cross-checks `run_id`,
+  `checkpoint_step`, and `hf_revision` on its recovery readback, so a comparison that ignores them
+  accepts a changed record as an unchanged retry.
+- **`metadata` must agree with the `adapter_id`.** The id already encodes `run_id`,
+  `checkpoint_step`, and `hf_revision`, so a backend should parse it and reject a payload whose
+  metadata contradicts it with `422`, rather than storing both. `hf_revision` in particular must be
+  a full 40-character commit sha: it is the value the backend downloads, so a mutable ref like
+  `main` lets one immutable id serve different weights over time while every content check still
+  sees the same string. A disagreeing `run_id` is worse than cosmetic - it files the revision under
+  a different run's alias, so undeploying that run reports success while the revision keeps serving.
+- **`metadata.record_type` belongs to the backend, not the caller.** This endpoint registers
+  revisions, so a backend should write `"revision"` itself rather than trusting the field. A record
+  stored as an alias loads but can never be activated, and undeploy will not evict or clean it up.
 
 Registration may return before the adapter has loaded. `202` plus a `registered` lifecycle state is
 the expected shape for a backend that loads in the background.
