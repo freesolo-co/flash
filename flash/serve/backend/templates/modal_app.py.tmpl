@@ -141,8 +141,42 @@ def _lock_key(name: str) -> str:
     return f"lock:{{name}}"
 
 
+def _members_key(run_id: str) -> str:
+    return f"members:{{run_id}}"
+
+
+async def _run_members(run_id: str) -> list[str]:
+    """Every adapter id belonging to one run: its alias plus each revision registered under it.
+
+    An index rather than a scan. Undeploy needs the run's members, and finding them by walking the
+    whole Dict costs time proportional to every adapter ever registered on the app -- under a lock
+    whose TTL assumes bounded work. This keeps that cost proportional to the run.
+    """
+    members = await adapter_records.get.aio(_members_key(run_id))
+    return list(members) if isinstance(members, list) else []
+
+
+async def _remember_member(run_id: str, adapter_id: str) -> None:
+    """Add one adapter id to its run's index, idempotently.
+
+    Called only from inside the run lock, which is what makes the read-modify-write safe: the lock
+    serializes every registration for a run, so no two writers race on this key.
+    """
+    members = await _run_members(run_id)
+    if adapter_id not in members:
+        await adapter_records.put.aio(_members_key(run_id), [*members, adapter_id])
+
+
 # How long one held lock stays valid. Long enough for a record read-modify-write, short enough that
 # a container killed mid-update does not wedge a run's alias forever.
+#
+# The TTL is a real bound, not a hope: everything inside a critical section here is a fixed, small
+# number of Dict operations. Nothing slow may be added under this lock -- no adapter download, no
+# engine call, no scan that grows with the number of adapters. That constraint is what makes the
+# expiry safe, because renewing a lease cannot be done atomically on modal.Dict: `pop`-then-`put`
+# vacates the key between the two calls, and a waiter can win `put(skip_if_exists=True)` in that
+# gap and enter alongside the live holder. So the rule is to stay well inside the TTL rather than
+# to extend it.
 LOCK_TTL_SECONDS = 30.0
 
 
@@ -220,38 +254,9 @@ async def _run_lock(run_id: str):
             )
         await asyncio.sleep(0.1)
 
-    async def _renew() -> None:
-        """Keep the held lease from expiring underneath its own holder.
-
-        `expires_at` is stamped once at acquire, so any critical section longer than the TTL marks
-        ITSELF reclaimable -- `remove` scans every key in the Dict, which grows with the number of
-        adapters, so this is reachable in normal use rather than only after a crash. A waiter would
-        then reclaim a live lease and enter alongside the holder, which is precisely the exclusion
-        `alias_compare_and_swap` advertises.
-
-        Ownership-conditional, like every other write to this key: pop, and only write back if what
-        came back is still ours. If another container has already reclaimed it, put THEIR lease back
-        untouched and stop -- the holder's own release then finds a value that is not its lease and
-        correctly leaves it alone.
-        """
-        nonlocal lease
-        while True:
-            await asyncio.sleep(LOCK_TTL_SECONDS / 3)
-            current = await adapter_records.pop.aio(key, None)
-            if current != lease:
-                if current is not None:
-                    await adapter_records.put.aio(key, current, skip_if_exists=True)
-                return
-            lease = {{"token": token, "expires_at": time.time() + LOCK_TTL_SECONDS}}
-            await adapter_records.put.aio(key, lease, skip_if_exists=True)
-
-    heartbeat = asyncio.create_task(_renew())
     try:
         yield
     finally:
-        heartbeat.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat
         await _drop_if(lease)
 
 
@@ -297,7 +302,11 @@ class Engine:
         from transformers import AutoTokenizer
         from vllm import AsyncEngineArgs, AsyncLLMEngine
 
-        self._lock = asyncio.Lock()
+        # Per adapter, not one lock for the container. A first load downloads weights from HF and
+        # calls add_lora, which takes minutes; a single lock would make every concurrent generation
+        # on this container queue behind it -- including requests for adapters that are already
+        # resident and merely need to READ this dict. One slow cold load would stall live traffic.
+        self._locks: dict[str, asyncio.Lock] = {{}}
         self._loaded: dict[str, Any] = {{}}
         self.tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
         engine_args = AsyncEngineArgs(
@@ -342,7 +351,15 @@ class Engine:
         from vllm.lora.request import LoRARequest
 
         adapter_id = record["adapter_id"]
-        async with self._lock:
+        # Fast path first, with no lock at all: a resident adapter is a plain dict read, and the
+        # overwhelming majority of generate calls take this branch. Making them wait on a lock held
+        # across somebody else's multi-minute download is what stalls live traffic.
+        cached = self._loaded.get(adapter_id)
+        if cached is not None:
+            return cached
+        # One lock PER adapter, so a cold load serializes only its own duplicate loads. asyncio has
+        # no await between the get and the set below, so this is not racy on a single event loop.
+        async with self._locks.setdefault(adapter_id, asyncio.Lock()):
             cached = self._loaded.get(adapter_id)
             if cached is not None:
                 return cached
@@ -365,7 +382,9 @@ class Engine:
 
     @modal.method()
     async def unregister(self, adapter_id: str) -> dict[str, Any]:
-        async with self._lock:
+        # This adapter's own lock, so an undeploy cannot race its own in-flight load, and does not
+        # block loads or generations for any OTHER adapter on this container.
+        async with self._locks.setdefault(adapter_id, asyncio.Lock()):
             self._loaded.pop(adapter_id, None)
             # Drop it from vLLM too, not just from this dict. The LoRA cache is bounded by
             # max_loras, so repeated deploy/undeploy cycles would otherwise keep disabled adapters
@@ -490,37 +509,51 @@ class Engine:
 async def settle_adapter(record: dict[str, Any]) -> None:
     """Load one adapter onto the engine, then write the lifecycle state the client waits on."""
     adapter_id = record["adapter_id"]
-    attempt = (record.get("metadata") or {{}}).get("settle_attempt")
+    metadata = record.get("metadata") or {{}}
+    attempt = metadata.get("settle_attempt")
+    run_id = metadata.get("run_id") or adapter_id
     result = await Engine().register.remote.aio(record)
-    current = (await adapter_records.get.aio(_record_key(adapter_id))) or record
-    current_metadata = current.get("metadata") or {{}}
-    # An undeploy that lands while the load is still running wins. Without this, a slow load
-    # finishing after DELETE would write `ready` back over `disabled` and resurrect a revision
-    # the user already took out of service -- and it could then be activated again.
-    if current.get("status") == "disabled" and current_metadata.get("lifecycle_state") == "disabled":
+    stand_down = False
+    # The load ran OUTSIDE the lock -- it takes minutes, and the lock's TTL only holds because
+    # nothing slow runs under it. But the decision of whether this result may be committed, and
+    # the commit itself, must be one atomic step: read-then-write leaves a window in which an
+    # undeploy or a retried registration lands between them, and this write then silently
+    # overwrites that newer state (resurrecting an undeployed revision, or replacing the current
+    # attempt's result with a stale one). Everything below is a small fixed number of Dict calls.
+    async with _run_lock(run_id):
+        current = (await adapter_records.get.aio(_record_key(adapter_id))) or record
+        current_metadata = current.get("metadata") or {{}}
+        # An undeploy that lands while the load is still running wins. Without this, a slow load
+        # finishing after DELETE would write `ready` back over `disabled` and resurrect a revision
+        # the user already took out of service -- and it could then be activated again.
+        if (
+            current.get("status") == "disabled"
+            and current_metadata.get("lifecycle_state") == "disabled"
+        ):
+            stand_down = True
+        # Only the CURRENT attempt may write a terminal state. A user who retries `models deploy`
+        # after the client's readiness budget expires re-registers while the first load is still
+        # running, so two settles for one revision are in flight on different containers and finish
+        # in any order. Unguarded, a stale transient failure lands after a fresh success and pins
+        # the record to `failed`, which an identical re-registration then treats as a state to reset
+        # rather than a load to retry.
+        elif attempt is None or current_metadata.get("settle_attempt") == attempt:
+            if result.get("ok"):
+                current["status"] = "ready"
+                current["metadata"] = {{**current_metadata, "lifecycle_state": "ready"}}
+            else:
+                current["status"] = "disabled"
+                current["metadata"] = {{
+                    **current_metadata,
+                    "lifecycle_state": "failed",
+                    "failure": result.get("failure"),
+                }}
+            current["updated_at"] = _utc_now()
+            await adapter_records.put.aio(_record_key(adapter_id), current)
+    # Outside the lock: an engine round trip is slow, and the record is already durably correct.
+    if stand_down:
         with contextlib.suppress(Exception):  # gpu eviction is best effort
             await Engine().unregister.remote.aio(adapter_id)
-        return
-    # Only the CURRENT attempt may write a terminal state. A user who retries `models deploy` after
-    # the client's readiness budget expires re-registers while the first load is still running, so
-    # two settles for one revision are in flight on different containers and finish in any order.
-    # Unguarded, a stale transient failure lands after a fresh success and pins the record to
-    # `failed`, which an identical re-registration then treats as a state to reset rather than a
-    # load to retry. Stamped by the handler under the run lock, so "current" is unambiguous.
-    if attempt is not None and current_metadata.get("settle_attempt") != attempt:
-        return
-    if result.get("ok"):
-        current["status"] = "ready"
-        current["metadata"] = {{**current.get("metadata", {{}}), "lifecycle_state": "ready"}}
-    else:
-        current["status"] = "disabled"
-        current["metadata"] = {{
-            **current.get("metadata", {{}}),
-            "lifecycle_state": "failed",
-            "failure": result.get("failure"),
-        }}
-    current["updated_at"] = _utc_now()
-    await adapter_records.put.aio(_record_key(adapter_id), current)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -557,6 +590,28 @@ def api():
     async def _write(record: dict[str, Any]) -> None:
         record["updated_at"] = _utc_now()
         await adapter_records.put.aio(_record_key(record["adapter_id"]), record)
+
+    async def _ensure_run_alias(run_id: str, revision_id: str) -> None:
+        """Make sure the run's alias and member index exist. Idempotent, and called on every
+        registration for the run rather than only the first.
+
+        The alias starts `disabled` and points at nothing: activation is what makes a run serve, so
+        a half-finished deploy never takes traffic. Repairing rather than creating-once is what
+        makes an interrupted first registration recoverable -- see the caller.
+
+        Runs under the run lock, which is what makes the index's read-modify-write safe.
+        """
+        if await _read(run_id) is None:
+            await _write(
+                {{
+                    "adapter_id": run_id,
+                    "base_model": BASE_MODEL,
+                    "status": "disabled",
+                    "metadata": {{"record_type": "alias", "run_id": run_id, "alias_of": None}},
+                }}
+            )
+        await _remember_member(run_id, run_id)
+        await _remember_member(run_id, revision_id)
 
     @web.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -638,34 +693,32 @@ def api():
                 # This is safe precisely because it requires a fresh POST: a late settle finishing
                 # after an undeploy carries no registration behind it, and still stands down.
                 state = (existing.get("metadata") or {{}}).get("lifecycle_state")
-                if state == "ready":
-                    return {{"ok": True, "adapter": existing}}
-                existing["status"] = "registered"
-                existing["metadata"] = {{
-                    **(existing.get("metadata") or {{}}),
-                    "lifecycle_state": "registered",
-                    # A new attempt id retires whatever settle is still running for this revision:
-                    # it stops the older one from writing a terminal state over this attempt's.
-                    "settle_attempt": uuid.uuid4().hex,
-                }}
-                # Drop a stale failure reason so a retried load does not report the old one.
-                existing["metadata"].pop("failure", None)
-                await _write(existing)
-                settle_adapter.spawn(existing)
+                if state != "ready":
+                    existing["status"] = "registered"
+                    existing["metadata"] = {{
+                        **(existing.get("metadata") or {{}}),
+                        "lifecycle_state": "registered",
+                        # A new attempt id retires whatever settle is still running for this
+                        # revision: it stops the older one writing a terminal state over this one's.
+                        "settle_attempt": uuid.uuid4().hex,
+                    }}
+                    # Drop a stale failure reason so a retried load does not report the old one.
+                    existing["metadata"].pop("failure", None)
+                    await _write(existing)
+                # Repaired on EVERY registration, including the `ready` no-op, not only on the
+                # first. Registration writes the revision and the alias as two operations, so a
+                # container that died between them leaves a revision whose run has no alias. Every
+                # retry then took the identical-registration path and returned before reaching the
+                # alias creation below, so the revision could reach `ready` while activation failed
+                # forever with "run alias is missing" -- a run permanently undeployable, recoverable
+                # only by a new artifact.
+                await _ensure_run_alias(run_id, adapter_id)
+                if state != "ready":
+                    settle_adapter.spawn(existing)
                 return {{"ok": True, "adapter": existing}}
             record["metadata"]["settle_attempt"] = uuid.uuid4().hex
             await _write(record)
-            # Create the run alias disabled, pointing at nothing yet. Activation is what makes it
-            # serve, so a half-finished deploy never takes traffic.
-            if await _read(run_id) is None:
-                await _write(
-                    {{
-                        "adapter_id": run_id,
-                        "base_model": BASE_MODEL,
-                        "status": "disabled",
-                        "metadata": {{"record_type": "alias", "run_id": run_id, "alias_of": None}},
-                    }}
-                )
+            await _ensure_run_alias(run_id, adapter_id)
 
         # Spawned, NOT `asyncio.create_task`: this web function scales horizontally and to zero, so a
         # task parked in one container's event loop dies with that container -- and because the very
@@ -744,12 +797,18 @@ def api():
         run_id = (record.get("metadata") or {{}}).get("run_id") or adapter_id
         disabled_aliases: list[str] = []
         disabled_revisions: list[str] = []
+        # Collect the run's members BEFORE taking the lock, from the run's own index. Two reasons,
+        # both load-bearing: the lock's TTL is only safe if nothing under it grows with the size of
+        # the Dict, and the previous full-keyspace scan grew with every adapter ever registered on
+        # this app. A registration racing this read simply is not in the index yet, and it takes
+        # the same lock to activate, so it cannot slip an alias past the disable below.
+        members = list(await _run_members(run_id))
         # Under the SAME per-run lock `activate` takes. Without it, an in-flight activation can
         # write the alias back to `ready` after this loop disabled it, and undeploy returns success
         # while the run stays callable -- the lost update `alias_compare_and_swap` rules out.
         async with _run_lock(run_id):
-            for key in [k async for k in adapter_records.keys.aio()]:
-                candidate = await adapter_records.get.aio(key)
+            for member_id in members:
+                candidate = await _read(member_id)
                 if not isinstance(candidate, dict):
                     continue
                 metadata = candidate.get("metadata") or {{}}

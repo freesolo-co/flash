@@ -132,6 +132,17 @@ def _run_awaitable(awaitable):
         raise error[0]
 
 
+def _run_awaitable_result(awaitable):
+    """`_run_awaitable` for a coroutine whose return value the test needs."""
+    box: list = []
+
+    async def _capture():
+        box.append(await awaitable)
+
+    _run_awaitable(_capture())
+    return box[0]
+
+
 def _stub_modal(monkeypatch, engine_methods, spawned=None, engine_classes=None):
     modal = types.ModuleType("modal")
     # Every `.spawn()` the app makes, so a test can assert that a settle was (or was not) driven.
@@ -921,7 +932,7 @@ def test_a_disabled_revision_is_dropped_from_the_engine(client):
     removed: list[int] = []
 
     instance = engine_class.__new__(engine_class)
-    instance._lock = asyncio.Lock()
+    instance._locks = {}
     instance._loaded = {REVISION: object()}
 
     async def _remove_lora(lora_id):
@@ -992,32 +1003,240 @@ class _StaleReadBarrier(_FakeDict):
         return gated
 
 
-def test_a_held_lock_does_not_expire_underneath_its_own_holder(client):
-    """A critical section longer than the TTL must not mark ITSELF reclaimable.
+def test_undeploy_does_not_scan_the_whole_keyspace_under_the_lock(client):
+    """Work under the run lock must not grow with the number of adapters on the app.
 
-    `expires_at` is stamped once at acquire. Undeploy scans every key in the Dict, so the hold time
-    grows with the number of adapters and crossing the TTL needs no crash at all -- and a waiter
-    that finds an expired lease reclaims it and enters alongside the live holder, which is exactly
-    the exclusion `alias_compare_and_swap` advertises.
+    The lease expires on a fixed TTL and cannot be renewed atomically -- modal.Dict has no
+    compare-and-update, and pop-then-put vacates the key between the two calls, so a waiter can win
+    the insert in that gap and enter alongside the live holder. The TTL is therefore only safe if
+    every critical section is bounded, which makes "no unbounded work under the lock" the real
+    invariant rather than an optimization.
 
-    Driven with a TTL far shorter than the hold, which is the same shape as a slow scan under the
-    real 30s TTL.
+    Undeploy is where it was violated: it walked the entire Dict, so hold time grew with every
+    adapter ever registered. Asserted by counting reads against a keyspace padded with unrelated
+    runs -- a scan's cost tracks that padding, an indexed lookup's does not.
     """
+    _register_and_ready(client)
     module = client.app.state.generated_module
-    key = module._lock_key(RUN_ID)
-    module.LOCK_TTL_SECONDS = 0.3
+    for i in range(50):
+        module.adapter_records[module._record_key(f"other-run-{i}")] = {
+            "adapter_id": f"other-run-{i}",
+            "status": "ready",
+            "metadata": {"record_type": "alias", "run_id": f"other-run-{i}"},
+        }
+    reads: list[str] = []
+    records = module.adapter_records
 
-    async def _hold_past_the_ttl():
-        async with module._run_lock(RUN_ID):
-            await asyncio.sleep(0.7)
-            lease = module.adapter_records.get(key)
-            assert lease is not None, "the holder's lease vanished while it was inside"
-            assert lease["expires_at"] > time.time(), (
-                "the lease expired while still held, so another container may enter alongside"
-            )
+    class _CountingDict(type(records)):
+        @property
+        def get(self):
+            def _read(key, default=None):
+                reads.append(key)
+                return dict.get(self, key, default)
 
-    _run_awaitable(_hold_past_the_ttl())
-    assert module.adapter_records.get(key) is None, "the lock outlived its holder"
+            return _Aio(_read)
+
+    counting = _CountingDict()
+    counting.update(records)
+    module.adapter_records = counting
+    assert client.delete(f"/adapters/{REVISION}").status_code == 200
+    assert len(reads) < 20, (
+        f"undeploy made {len(reads)} reads against a 50-run keyspace, so it is scanning rather "
+        "than using the run index, and hold time grows with the app's total adapter count"
+    )
+
+
+def test_an_interrupted_first_registration_can_still_be_activated(client):
+    """A revision whose alias write never landed must be repairable by re-registering.
+
+    Registration writes the revision and the alias as two operations. A container that dies between
+    them leaves a revision with no run alias -- and every retry took the identical-registration
+    path and returned BEFORE the alias creation, so the revision could reach `ready` while
+    activation failed forever with "run alias is missing". A permanently undeployable run,
+    recoverable only by producing a new artifact.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    # Exactly the state an interruption leaves: revision present, alias never written.
+    del module.adapter_records[module._record_key(RUN_ID)]
+
+    assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
+    assert (
+        client.post(
+            f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None}
+        ).status_code
+        == 200
+    ), "a revision left without its alias could never be activated"
+
+
+def test_an_undeploy_landing_mid_settle_is_not_overwritten(client):
+    """Settle's decision and its write must be one atomic step, not a read then a write.
+
+    `test_undeploy_is_not_undone_by_a_load_that_finishes_afterwards` covers the settle that starts
+    after the DELETE has fully landed. It cannot see the narrower race: the DELETE arriving between
+    settle's read of the record and its write of the result. Read-then-write judges `ready` against
+    a record that was still live, and the write then lands over `disabled` -- undeploy returns
+    success while the revision goes back to serving. Taking the run lock around both closes it,
+    because undeploy holds that same lock for its whole disable pass.
+
+    Driven by hooking settle's read of the record and landing the disable right after it -- but
+    only when the run lock is unheld, which is precisely when a real undeploy could have got in.
+    Under the fix the read happens inside the lock, so the lease is present, the undeploy is
+    excluded, and the record legitimately reaches `ready`.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    in_flight = dict(module.adapter_records[module._record_key(REVISION)])
+    record_key = module._record_key(REVISION)
+    lock_key = module._lock_key(RUN_ID)
+    landed: list[str] = []
+    records = module.adapter_records
+
+    class _UndeployMidSettle(type(records)):
+        @property
+        def get(self):
+            async def _read(key, default=None):
+                value = dict.get(self, key, default)
+                if key == record_key and not landed and not self._lock_is_held():
+                    self._disable()
+                    landed.append(key)
+                return value
+
+            gated = _Aio(lambda key, default=None: dict.get(self, key, default))
+            gated.aio = _read
+            return gated
+
+        def _lock_is_held(self) -> bool:
+            lease = dict.get(self, lock_key)
+            expires_at = lease.get("expires_at") if isinstance(lease, dict) else None
+            return isinstance(expires_at, (int, float)) and expires_at > time.time()
+
+        def _disable(self) -> None:
+            record = dict.get(self, record_key)
+            self[record_key] = {
+                **record,
+                "status": "disabled",
+                "metadata": {**record["metadata"], "lifecycle_state": "disabled"},
+            }
+
+    hooked = _UndeployMidSettle()
+    hooked.update(records)
+    module.adapter_records = hooked
+    try:
+        module.settle_adapter.local(in_flight)
+        after = hooked[record_key]
+    finally:
+        module.adapter_records = records
+
+    if landed:
+        assert after["status"] == "disabled", (
+            "an undeploy landed between settle's read and its write, and settle's `ready` "
+            "overwrote it -- the revision is serving again after a successful undeploy"
+        )
+    else:
+        assert after["status"] == "ready", (
+            "the run lock excluded the undeploy, so this settle's result must stand"
+        )
+
+
+def test_a_cold_adapter_load_does_not_block_a_resident_one(client, monkeypatch):
+    """Loading one adapter must not stall generations for adapters already resident.
+
+    A first load downloads from HF and calls add_lora, which takes minutes. Held under one
+    container-wide lock, every concurrent generation queues behind it -- including requests for
+    adapters that are already loaded and only need to read a dict.
+    """
+    lora = types.ModuleType("vllm.lora.request")
+    lora.LoRARequest = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora)
+
+    engine_class = client.app.state.generated_module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    resident = object()
+    instance._loaded = {REVISION: resident}
+    started = threading.Event()
+
+    async def _slow_path(record):
+        started.set()
+        await asyncio.sleep(5)
+        return "/tmp/never"
+
+    instance._adapter_path = _slow_path
+
+    async def _resident_while_cold_loads():
+        cold = asyncio.create_task(
+            engine_class._lora_request(instance, {"adapter_id": "run-other@final." + "c" * 40})
+        )
+        await asyncio.get_running_loop().run_in_executor(None, started.wait, 5)
+        # The cold load is mid-download. A resident adapter must still be served immediately.
+        got = await asyncio.wait_for(engine_class._lora_request(instance, dict(REGISTRATION)), 1.0)
+        cold.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cold
+        return got
+
+    assert _run_awaitable_result(_resident_while_cold_loads()) is resident
+
+
+def test_two_cold_adapters_do_not_serialize_behind_each_other(client, monkeypatch):
+    """Two different adapters loading at once must download concurrently.
+
+    The lock-free fast path only helps adapters that are ALREADY resident, so it hides this: with
+    one lock shared across the container, a second cold adapter waits out the first one's
+    multi-minute HF download before its own even begins. That is the ordinary case of two runs
+    deploying at the same time -- and the same lock also puts an undeploy of one adapter behind an
+    unrelated adapter's load. Keying the lock by adapter id is what separates them.
+
+    Driven by parking the first adapter inside its download and asserting the second still reaches
+    its own; under a shared lock the second never gets there.
+    """
+    lora = types.ModuleType("vllm.lora.request")
+    lora.LoRARequest = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora)
+
+    engine_class = client.app.state.generated_module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._loaded = {}
+    first = "run-first@final." + "d" * 40
+    second = "run-second@final." + "e" * 40
+    reached: list[str] = []
+    first_started = threading.Event()
+
+    async def _hanging_download(record):
+        reached.append(record["adapter_id"])
+        if record["adapter_id"] == first:
+            first_started.set()
+        await asyncio.sleep(30)
+        return "/tmp/never"
+
+    instance._adapter_path = _hanging_download
+
+    async def _both_cold():
+        loads = [
+            asyncio.create_task(engine_class._lora_request(instance, {"adapter_id": adapter_id}))
+            for adapter_id in (first, second)
+        ]
+        await asyncio.get_running_loop().run_in_executor(None, first_started.wait, 5)
+        # Long enough for the second load to be scheduled and run up to its own download -- unless
+        # something is holding it back.
+        await asyncio.sleep(0.25)
+        for load in loads:
+            load.cancel()
+        for load in loads:
+            with contextlib.suppress(asyncio.CancelledError):
+                await load
+
+    _run_awaitable(_both_cold())
+    assert second in reached, (
+        "a second adapter's load never started while an unrelated adapter was downloading, so one "
+        "container-wide lock is serializing cold loads that have nothing to do with each other"
+    )
 
 
 def test_two_waiters_reclaiming_one_dead_lease_do_not_both_enter(client):
