@@ -255,91 +255,6 @@ def _build_messages(environment, case: EvalCase) -> list[dict] | _GenerationFail
         return _GenerationFailure(f"prompt construction failed: {reason}")
 
 
-def _drive_episode(client, target: str, environment, case: EvalCase, args) -> dict | str:
-    """Play one multi-turn episode against the deployed model, or say why it could not run.
-
-    Mirrors the worker turn loop the same way `env test` does (see `_drive_multi_turn` there):
-    one model turn, then stop at the hard turn ceiling, on the env's own done signal, or when the
-    env yields no reply. A single generation would grade only the first turn of a task whose
-    reward reads the whole transcript.
-    """
-    example = _evaluation_example(case)
-    state = environment.new_rollout_state(example)
-    hard_cap = int(environment.max_turns)
-    turns = 0
-    # True while the newest turn has not been through env_reply, mirroring the worker's own flag.
-    env_step_pending = False
-    while True:
-        messages = state.get("messages")
-        if not messages:
-            return "rollout produced no messages to generate from"
-        response = _generate_case(client, target, [dict(m) for m in messages], args)
-        if isinstance(response, _GenerationFailure):
-            return response.error
-        environment.record_model_turn(state, response)
-        env_step_pending = True
-        turns += 1
-        if turns >= hard_cap or environment.rollout_done(state, max_turns=hard_cap):
-            break
-        env_messages = environment.env_reply(state["messages"], state)
-        env_step_pending = False
-        if not env_messages:
-            break
-        if environment.rollout_done(state, max_turns=hard_cap):
-            break
-
-    # The loop exits before the inter-turn env_reply, leaving the last model turn unapplied. A
-    # stateful env would then score a transcript missing the last thing the model did, so give it
-    # that turn before scoring; only the inter-turn glue is skipped, since no further model turn
-    # is conditioned on the reply. This matches `env test` and the worker loops.
-    if env_step_pending and not environment.rollout_done(state, hard_cap):
-        environment.env_reply(state["messages"], state)
-    return state
-
-
-def _score_episode_case(
-    suite, case: EvalCase, case_id: str, state: dict, *, thinking: bool = False
-) -> EvalResult:
-    """Grade a finished episode through the suite's own scorer.
-
-    `EvalSuite.score` takes text, so the episode is represented by the text the environment itself
-    considers scored (`state["response_text"]`, which `env_reply` replaces outright when
-    `step_episode` returns a `final_response_text` override). A suite that grades the transcript
-    reads it from the environment it was built with; this keeps the published suite contract
-    unchanged rather than adding a second scoring entry point.
-    """
-    response = state.get("response_text")
-    if not isinstance(response, str):
-        turns = state.get("turns") or []
-        response = str(turns[-1]) if turns else ""
-    return _score_case(suite, case, case_id, response, thinking=thinking)
-
-
-def _run_episode_cases(
-    client, target: str, suite, cases: list[EvalCase], args, environment, thinking=False
-) -> tuple[EvalResult, ...]:
-    """Run multi-turn cases one episode at a time.
-
-    Each turn's prompt depends on the previous turn's env reply, so a case cannot be batched into
-    one generation. Episodes run serially: the environment carries per-episode rollout state, and
-    `env test` drives it on one thread for the same reason.
-    """
-    case_ids = _case_ids(cases)
-    results = []
-    for case, case_id in zip(cases, case_ids, strict=True):
-        try:
-            outcome = _drive_episode(client, target, environment, case, args)
-        except (Exception, SystemExit) as exc:
-            reason = str(exc) or exc.__class__.__name__
-            results.append(_generation_error(case_id, f"episode failed: {reason}"))
-            continue
-        if isinstance(outcome, str):
-            results.append(_generation_error(case_id, outcome))
-            continue
-        results.append(_score_episode_case(suite, case, case_id, outcome, thinking=thinking))
-    return tuple(results)
-
-
 def _run_cases(
     client, target: str, suite, cases: list[EvalCase], args, environment=None, thinking=False
 ) -> tuple[EvalResult, ...]:
@@ -347,9 +262,17 @@ def _run_cases(
 
     Scorers can hold thread-bound resources, so a lock around worker scoring is insufficient.
     """
-    # a multi-turn env's reward reads the whole transcript, so one generation per case would score
-    # a different task than the run trains on -- and would still report a number for it.
-    if environment is not None and getattr(environment, "multi_turn", False):
+    # A transcript-grading suite must play the episode out: scoring one reply would grade a
+    # different task than the run trains on, and would still report a number for it. The suite
+    # opts in, because a multi-turn ENVIRONMENT does not imply a transcript-grading SUITE -- the
+    # scaffolded starter pairs a multi-turn env with a suite that deliberately grades only the
+    # first action, and playing its cases as episodes scores the wrong turn.
+    #
+    # Imported here, not at module scope: episode.py resolves this module's helpers back out of
+    # it, so a top-level import would be circular.
+    from flash.cli.commands.env.episode import _grades_episodes, _run_episode_cases
+
+    if _grades_episodes(suite) and environment is not None:
         return _run_episode_cases(
             client, target, suite, cases, args, environment, thinking=thinking
         )

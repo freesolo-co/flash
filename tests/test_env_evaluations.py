@@ -3336,6 +3336,8 @@ def _multi_turn_env_dir(tmp_path, monkeypatch):
         "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'episodes'\n"
+        # the suite opts in: a multi-turn env alone must not promote a suite to episode grading.
+        "    grades_episodes = True\n"
         "    def cases(self): return [EvalCase(id='only', input='only', expected='a|b|c')]\n"
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
@@ -3420,3 +3422,68 @@ def test_env_eval_keeps_one_generation_per_case_for_single_turn(
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
     assert calls == ["only"]
     assert "case only: PASS" in capsys.readouterr().out
+
+
+def test_env_eval_does_not_promote_a_first_action_suite_to_an_episode(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A multi-turn ENVIRONMENT must not turn a single-shot SUITE into an episode.
+
+    `flash env setup --multi` scaffolds exactly this pair: a multi-turn env plus a suite that
+    grades only the opening action. Playing its cases as episodes scored the wrong turn, and the
+    scaffolded case carries no `output` for `step_episode` to advance from, so a well-formed
+    opening action came back as an error instead of 1.0.
+    """
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'first-action'\n"
+        # no grades_episodes flag: this suite scores one reply, like every pre-flag suite.
+        "    def cases(self): return [EvalCase(id='only', input='only', expected='50')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    environment = _MultiTurnEnvironment()
+    calls: list[str] = []
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            calls.append("gen")
+            yield "50"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
+    # one generation, graded as the opening action -- the episode driver never ran.
+    assert calls == ["gen"]
+    assert environment.generated == []
+    assert "case only: PASS" in capsys.readouterr().out
+
+
+def test_env_eval_refuses_an_episode_suite_on_a_single_turn_environment(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """An episode suite on a single-turn env has no transcript to grade, so say so."""
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'episodes'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self): return [EvalCase(id='only', input='only', expected='x')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            yield "x"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
+    captured = capsys.readouterr()
+    # an error, not a 0.0: a mismatched pairing is unmeasurable, not a bad model.
+    assert "single-turn" in captured.out + captured.err
+    assert "errors=1" in captured.out
