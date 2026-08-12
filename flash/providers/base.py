@@ -503,20 +503,14 @@ def smallest_fitting_gpu_count(
     """Return the smallest rentable count whose structural pool can hold the run.
 
     ``executed_width`` maps a rented count to the ranks that actually JOIN the run, defaulting to
-    "all of them". Only sft narrows it (it shards by data, so the batch and retained rows bound the
-    rank count), and every consumer of this function is deciding something the user pays for -- an
-    auto-sized ceiling, an authored-ceiling check, a `--gpus N` suggestion. Crediting cards that
-    never join makes all three name a width that cannot hold the run.
-
-    The rank count is valued directly rather than through ``gpu_capacity_shape``, which snaps its
-    argument to a RENTABLE count (``largest_rentable_count``). That is right for cards you buy and
-    wrong for ranks that launch: sft widths are not powers of two (batch 3 over 3 rows launches 3),
-    and snapping 3 to 2 under-credits a shape that fits. Rented counts are still searched over
-    ``rentable_gpu_counts``, so only the width being VALUED changes.
-
-    The search visits every rentable count rather than stopping at the first miss, because the
-    executed width is not monotonic in the rented count: batch 3 over 3 rows launches 1 rank on 2
-    cards but 3 on 4. Returning the SMALLEST fitting count keeps the cheapest shape winning.
+    "all of them"; only sft narrows it (``allocator._executed_width``). Two consequences shape this
+    search. The rank count is valued directly rather than through ``gpu_capacity_shape``, which
+    snaps its argument to a RENTABLE count -- right for cards you buy, wrong for ranks that launch,
+    since sft widths are not powers of two (batch 3 over 3 rows launches 3, and snapping to 2
+    under-credits a shape that fits). And every rentable count is visited rather than stopping at
+    the first miss, because the executed width is not monotonic in the rented count: that same run
+    launches 1 rank on 2 cards but 3 on 4. Returning the SMALLEST fitting count keeps the cheapest
+    shape winning.
     """
     launched = executed_width or (lambda count: count)
     fitting = [
@@ -739,10 +733,9 @@ def wider_shape_remedy(
     (see ``rents_arbitrary_card_counts``); passing none leaves the failure a bare dead end, which
     is the honest answer when no offline check can confirm the wider SKU exists.
 
-    ``executed_width`` maps a rented count to the ranks that actually JOIN the run, defaulting to
-    "all of them". Only sft narrows it, and a suggestion has to respect it: `--gpus 2` on a run whose
-    batch launches one rank buys a second card that contributes no memory, so the user pays twice to
-    fail identically. Advice must be searched with the same rule that will judge the retry.
+    ``executed_width`` (``allocator._executed_width``) has to bound the suggestion too: `--gpus 2`
+    on a run whose batch launches one rank buys a second card that contributes no memory, so the
+    user pays twice to fail identically. Advice is searched with the rule that will judge the retry.
 
     Every fit-rejection message routes through here so the remedy cannot drift in wording or in
     the rule that produces it.
