@@ -120,7 +120,13 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     adapter exists, is platform-managed and read from the internal worker spec (see
     _internal_spec_from_status); run_id comes from the RunStatus itself.
     """
-    if not (status.effective_preparation or {}).get("worker_spec"):
+    raw_worker = (status.effective_preparation or {}).get("worker_spec")
+    if not raw_worker:
+        return None
+    # a workload-profile run recorded before #1095 removed the profile job has a managed hf_repo but
+    # never produced an adapter. its worker payload still carries the marker, which JobSpec.from_dict
+    # now drops, so read it off the raw record rather than reviving the field.
+    if isinstance(raw_worker, dict) and raw_worker.get("workload_profile_kind"):
         return None
     try:
         spec = _internal_spec_from_status(status)

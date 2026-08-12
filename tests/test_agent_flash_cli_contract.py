@@ -264,6 +264,35 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
     assert get_status(rid).to_dict()["adapter_ref"] == rid
 
 
+def test_legacy_workload_profile_run_exposes_no_adapter_ref(tmp_path, monkeypatch) -> None:
+    # a profile run recorded before #1095 removed the profile job carries a managed hf_repo but
+    # never produced an adapter. JobSpec.from_dict now drops workload_profile_kind, so the marker
+    # has to be read off the raw persisted payload or the listing points users at an adapter that
+    # cannot be deployed or exported.
+    from flash import runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    rid = "flash-sft-profile-legacy"
+    legacy_worker = {
+        "run_id": rid,
+        "algorithm": "sft",
+        "model": "Qwen/Qwen3.5-2B",
+        "workload_profile_kind": "sft",
+        "train": {"epochs": 1, "hf_repo": f"Freesolo-Co/flashrun-{rid}"},
+    }
+    os.makedirs(runner.RUNS_DIR, exist_ok=True)
+    record = RunStatus(
+        run_id=rid,
+        state="done",
+        spec={"run_id": rid, "algorithm": "sft", "model": "Qwen/Qwen3.5-2B", "train": {}},
+        effective_preparation={"worker_spec": legacy_worker},
+    )
+    with open(os.path.join(runner.RUNS_DIR, f"{rid}.json"), "w") as f:
+        json.dump(dataclasses.asdict(record), f)
+
+    assert get_status(rid).to_dict()["adapter_ref"] is None
+
+
 def test_done_status_with_removed_spec_key_serializes_without_adapter_ref(
     tmp_path, monkeypatch
 ) -> None:
