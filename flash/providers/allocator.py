@@ -467,7 +467,19 @@ def allocate(
     """
     if workload_profile:
         need = profile_required_vram_gb()
-        max_gpu_count = 1
+        # one card is what this job USES, not a shape requirement. providers sell a card count as a
+        # distinct product rather than a divisible pool -- vast filters offers on `num_gpus` equality
+        # and lambda names the count in the instance type -- so a class whose 4-card shape is live
+        # while its 1-card shape is sold out yields NO candidate for a hard ceiling of one. a pinned
+        # run in that state is allocatable while its mandatory profile is not, which reinstates the
+        # exact deadlock the pin inheritance above exists to break.
+        #
+        # so a ceiling of one is a preference, not a constraint: keep it when the caller authored
+        # nothing (the unpinned common case still ranks the cheapest single card first, since a
+        # wider shape costs more and loses on rate), and otherwise let the profile reach the same
+        # widths its own run may rent. the cheapest fitting shape still wins, and a 1 GB job fits
+        # every one of them.
+        max_gpu_count = 1 if max_gpu_count is None and not gpu_type else max_gpu_count
     else:
         need = required_vram_gb(
             model_id,

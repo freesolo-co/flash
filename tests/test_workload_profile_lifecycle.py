@@ -447,6 +447,80 @@ def test_profile_allocates_the_cheapest_card_not_the_training_shape(monkeypatch)
     assert profile_alloc.min_vram_gb < training_alloc.min_vram_gb
 
 
+def test_a_pinned_profile_reaches_a_class_sold_only_in_multi_card_shapes(monkeypatch) -> None:
+    """A pin whose 1-card shape is sold out must not strand the profile that gates its own run.
+
+    Providers sell a card count as a distinct product (vast filters offers on ``num_gpus``
+    equality, lambda names the count in the instance type), so a hard ceiling of one returns NO
+    candidate for a class whose only live shape is wider. The training run stays allocatable, its
+    mandatory profile does not, and the sft path deadlocks again -- which is what inheriting the
+    pin exists to prevent.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate
+
+    # the pinned class exists ONLY as a 2-card shape, the state this regression is about.
+    def fake_live_candidates(_need, constraints):
+        if int(getattr(constraints, "max_gpu_count", 1) or 1) < 2:
+            return []
+        return [Candidate(provider="lambda", gpu="H100", hourly_usd=3.29, vram_gb=80, gpu_count=2)]
+
+    provider = type(
+        "P",
+        (),
+        {"live_candidates": staticmethod(fake_live_candidates), "live_capacity": False},
+    )
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda",))
+    monkeypatch.setattr(allocator, "get_provider", lambda _name: provider)
+
+    alloc = allocator.allocate(
+        "Qwen/Qwen3.5-0.8B",
+        "sft",
+        train=_spec().train,
+        provider="lambda",
+        gpu_type="H100",
+        max_gpu_count=2,
+        workload_profile=True,
+    )
+
+    assert alloc.gpu == "H100"
+    assert alloc.gpu_count == 2  # the profile rides the shape that actually has capacity
+
+
+def test_an_unpinned_profile_still_takes_a_single_cheap_card(monkeypatch) -> None:
+    """The paired control: widening is for pinned runs only, never a licence to rent two cards.
+
+    Without this, the fix above could quietly let every profile allocate a multi-card shape and the
+    test above would pass just as well.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate
+
+    seen: list[int] = []
+
+    def fake_live_candidates(_need, constraints):
+        seen.append(int(getattr(constraints, "max_gpu_count", 1) or 1))
+        return [
+            Candidate(provider="runpod", gpu="RTX 4090", hourly_usd=0.69, vram_gb=24),
+            Candidate(provider="runpod", gpu="H100", hourly_usd=3.29, vram_gb=80, gpu_count=2),
+        ]
+
+    provider = type(
+        "P",
+        (),
+        {"live_candidates": staticmethod(fake_live_candidates), "live_capacity": False},
+    )
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    monkeypatch.setattr(allocator, "get_provider", lambda _name: provider)
+
+    alloc = allocator.allocate(
+        "Qwen/Qwen3.5-0.8B", "sft", train=_spec().train, workload_profile=True
+    )
+
+    assert seen == [1]  # an unpinned profile never even queries a wider shape
+    assert alloc.gpu_count == 1
+
+
 def test_profile_provenance_is_covered_by_preparation_digest(tmp_path, monkeypatch) -> None:
     runner = fresh_runner(tmp_path, monkeypatch)
     spec = _spec()
