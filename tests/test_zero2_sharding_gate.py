@@ -176,9 +176,12 @@ def test_the_worker_and_the_allocator_cannot_disagree():
 
     checked = 0
     fired = 0
+    # grpo and opd only: they are the two callers that render the key. sft never calls the resolver,
+    # so sweeping it here would assert agreement about a run that stays on zero-3 either way and
+    # read as coverage the gate does not have.
     for model_id in MODELS:
         params_b = float(MODELS[model_id].params_b)
-        for algorithm in ("grpo", "opd", "sft"):
+        for algorithm in ("grpo", "opd"):
             need = float(model_required_vram_gb(model_id, algorithm))
             for gpu_type in ("RTX 4090", "RTX 5090", "A100 PCIe", "H200", "B200"):
                 vram = int(get_gpu_info(gpu_type).vram_gb)

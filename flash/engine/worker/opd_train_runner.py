@@ -533,6 +533,16 @@ def _write_child_shims(
     return entry_path, reward_path
 
 
+def _spec_gpu_type(spec: Any) -> str:
+    """The card class the run landed on, from the spec the caller passed.
+
+    Absent spec or absent gpu table answers "", which the zero-2 gate reads as "unknown hardware"
+    and falls closed to zero-3 on. Guessing a card here would price the gate off hardware the run
+    may not have.
+    """
+    return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
+
+
 def _build_base_config(
     request: _OpdRequest,
     prompt_state: _PromptState,
@@ -563,12 +573,16 @@ def _build_base_config(
         # zero-2 vs zero-3, decided by the allocator's own fit model so the worker cannot spend
         # memory the shape was not admitted with. the spec carries the SELECTED class and count
         # (`_spec_with_gpu`), so this asks about the hardware the run actually landed on.
+        # read it off `request.spec` like every other spec lookup here: the caller may pass a spec
+        # that is NOT the process-global JOB_SPEC (`opd_train.py`: `spec or _w.JOB_SPEC`), and
+        # sizing the gate off different hardware than the run uses is the exact allocator/worker
+        # divergence this gate exists to prevent.
         "reshard_after_forward": resolve_reshard_after_forward(
             model_id=request.model_id,
             algorithm="opd",
-            gpu_type=(_opd_train._w.JOB_SPEC.gpu.type if _opd_train._w.JOB_SPEC else ""),
+            gpu_type=_spec_gpu_type(getattr(request, "spec", None)),
             n_gpus=int(runtime.gpu_count),
-            train=(_opd_train._w.JOB_SPEC.train if _opd_train._w.JOB_SPEC else None),
+            train=getattr(getattr(request, "spec", None), "train", None),
             thinking=bool(_opd_train._w.THINKING),
             model_revision=str(getattr(request, "model_revision", "") or ""),
         ),
