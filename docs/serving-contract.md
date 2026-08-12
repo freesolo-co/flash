@@ -281,15 +281,9 @@ error as `{"detail": {...}}` does not match, and the retry silently never happen
 
 ## Conformance suite
 
-`tests/serving_conformance/` runs this document against a live backend:
-
-```bash
-uv run pytest tests/serving_conformance --serving-url http://localhost:8100
-```
-
-It registers a revision, waits for `ready`, activates it, chats through the alias, checks that a
-stale compare-and-swap is rejected and that a mutated re-registration conflicts, then undeploys.
-Without `--serving-url` the whole suite skips, so it costs nothing in the offline run.
+`tests/serving_conformance/` runs this document against a live backend. It registers a revision,
+waits for `ready`, activates it, chats through the alias, checks that a stale compare-and-swap is
+rejected and that a mutated re-registration conflicts, then undeploys.
 
 The adapter it registers is real and must exist - point it at one your backend can load:
 
@@ -301,6 +295,11 @@ uv run pytest tests/serving_conformance \
   --conformance-base-model Qwen/Qwen3.5-4B \
   --conformance-hf-revision 8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f
 ```
+
+Without `--serving-url` the whole suite skips, so it costs nothing in the offline run. With
+`--serving-url` but no adapter, it FAILS rather than skipping: at that point only `/healthz` and the
+404 checks can run, and a green exit there would prove none of registration, readiness, activation,
+chat, or teardown.
 
 `--conformance-hf-revision` is required and must be a real 40-character commit sha. It is both the
 commit the backend downloads and the suffix of the immutable revision id, so a branch name or a

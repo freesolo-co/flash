@@ -67,7 +67,16 @@ def adapter_source(request) -> dict:
         if not value
     ]
     if missing:
-        pytest.skip(f"serving conformance needs a real adapter to register; missing {missing}")
+        # Fail, do not skip. `--serving-url` was passed, so the suite is explicitly ON, and skipping
+        # here leaves only /healthz and the 404 checks running -- a green exit that proves none of
+        # registration, readiness, activation, chat, or teardown. The shorter command in
+        # docs/serving-contract.md lands exactly here, so the skip made the documented invocation
+        # silently vacuous.
+        pytest.fail(
+            f"serving conformance needs a real adapter to register; missing {missing}. "
+            f"Without one the suite can only check /healthz, which does not prove the contract. "
+            f"Pass --serving-url alone only if you meant to run nothing."
+        )
     if not _COMMIT_SHA.fullmatch(hf_revision or "") or hf_revision == PLACEHOLDER_HF_REVISION:
         pytest.fail(
             f"--conformance-hf-revision must be a real 40-character commit sha, got "

@@ -127,8 +127,25 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _adapter_digest(adapter_id: str) -> str:
+    """A filesystem-safe, injective name for one adapter's cached files.
+
+    Injective is the point. This used to be the 31-bit id below, which is a hash truncated to four
+    bytes -- so two revisions colliding there also shared a download directory, and the second
+    adapter's files silently overwrote the first's. A full digest has no such collision in practice,
+    and the directory is then never the thing that aliases two adapters.
+    """
+    return hashlib.sha1(adapter_id.encode()).hexdigest()
+
+
 def _lora_int_id(adapter_id: str) -> int:
-    """A stable positive int32 id for one adapter, which is what vLLM's LoRARequest requires."""
+    """A stable positive int32 id for one adapter, which is what vLLM's LoRARequest requires.
+
+    vLLM demands an int, so 160 bits of digest have to become 31 -- collisions are possible in
+    principle (birthday-bound around tens of thousands of live revisions). Rather than widen this,
+    the engine keeps a reverse map and REFUSES a colliding load, because the failure mode of not
+    noticing is serving one run's weights under another run's name.
+    """
     digest = hashlib.sha1(adapter_id.encode()).digest()
     return (int.from_bytes(digest[:4], "big") & 0x7FFFFFFF) or 1
 
@@ -308,6 +325,9 @@ class Engine:
         # resident and merely need to READ this dict. One slow cold load would stall live traffic.
         self._locks: dict[str, asyncio.Lock] = {{}}
         self._loaded: dict[str, Any] = {{}}
+        # int id -> the adapter that owns it, so a second adapter hashing to the same 31 bits is
+        # refused instead of quietly taking over the first one's LoRA slot.
+        self._int_ids: dict[int, str] = {{}}
         self.tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
         engine_args = AsyncEngineArgs(
             model=BASE_MODEL,
@@ -333,7 +353,7 @@ class Engine:
         from huggingface_hub import snapshot_download
 
         adapter_id = record["adapter_id"]
-        target = f"{{ADAPTER_DIR}}/{{_lora_int_id(adapter_id)}}"
+        target = f"{{ADAPTER_DIR}}/{{_adapter_digest(adapter_id)}}"
         subfolder = record.get("subfolder") or ""
         pattern = f"{{subfolder}}/*" if subfolder else "*"
         path = await asyncio.to_thread(
@@ -363,13 +383,26 @@ class Engine:
             cached = self._loaded.get(adapter_id)
             if cached is not None:
                 return cached
+            int_id = _lora_int_id(adapter_id)
+            # Refused, not resolved. vLLM addresses a LoRA solely by this int, so a collision would
+            # make `add_lora` and `remove_lora` unable to tell the two apart and a chat could answer
+            # from the wrong run's weights. There is no safe way to serve the second one, so the
+            # registration fails loudly with the pair named -- deploying under a new run id is the
+            # fix, and settle turns this into `failed` with this reason attached.
+            owner = self._int_ids.get(int_id)
+            if owner is not None and owner != adapter_id:
+                raise RuntimeError(
+                    f"lora id collision: {{adapter_id}} and {{owner}} both hash to {{int_id}}, and "
+                    f"vllm cannot tell them apart. redeploy under a different run id."
+                )
             path = await self._adapter_path(record)
-            request = LoRARequest(adapter_id, _lora_int_id(adapter_id), path)
+            request = LoRARequest(adapter_id, int_id, path)
             # Load it NOW rather than lazily on first generate: a bad adapter (wrong rank, missing
             # tensors) must fail here so registration reports `failed` with a real reason, instead
             # of reporting ready and then 500ing on the user's first chat.
             await self.engine.add_lora(request)
             self._loaded[adapter_id] = request
+            self._int_ids[int_id] = adapter_id
             return request
 
     @modal.method()
@@ -386,11 +419,17 @@ class Engine:
         # block loads or generations for any OTHER adapter on this container.
         async with self._locks.setdefault(adapter_id, asyncio.Lock()):
             self._loaded.pop(adapter_id, None)
+            int_id = _lora_int_id(adapter_id)
+            # Only if THIS adapter still owns the int id. Releasing it unconditionally would let an
+            # undeploy hand the slot to a colliding adapter that the guard above had refused, which
+            # is the collision reintroduced through the back door.
+            if self._int_ids.get(int_id) == adapter_id:
+                self._int_ids.pop(int_id, None)
             # Drop it from vLLM too, not just from this dict. The LoRA cache is bounded by
             # max_loras, so repeated deploy/undeploy cycles would otherwise keep disabled adapters
             # resident until the container restarts and start evicting live ones.
             with contextlib.suppress(Exception):  # eviction is best effort, never fails an undeploy
-                await self.engine.remove_lora(_lora_int_id(adapter_id))
+                await self.engine.remove_lora(int_id)
         return {{"ok": True}}
 
     async def _prepare(self, payload: dict[str, Any], record: dict[str, Any]):

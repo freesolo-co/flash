@@ -933,6 +933,7 @@ def test_a_disabled_revision_is_dropped_from_the_engine(client):
 
     instance = engine_class.__new__(engine_class)
     instance._locks = {}
+    instance._int_ids = {}
     instance._loaded = {REVISION: object()}
 
     async def _remove_lora(lora_id):
@@ -1155,6 +1156,7 @@ def test_a_cold_adapter_load_does_not_block_a_resident_one(client, monkeypatch):
     engine_class = client.app.state.generated_module.engine_classes[0]
     instance = engine_class.__new__(engine_class)
     instance._locks = {}
+    instance._int_ids = {}
     resident = object()
     instance._loaded = {REVISION: resident}
     started = threading.Event()
@@ -1181,6 +1183,73 @@ def test_a_cold_adapter_load_does_not_block_a_resident_one(client, monkeypatch):
     assert _run_awaitable_result(_resident_while_cold_loads()) is resident
 
 
+def test_two_adapters_sharing_one_lora_int_id_are_refused_not_aliased(client, monkeypatch):
+    """A 31-bit LoRA id collision must fail the load, not silently serve the wrong weights.
+
+    vLLM addresses a LoRA only by that int, so two revisions hashing to the same value are one
+    adapter as far as `add_lora` and `remove_lora` are concerned: the second registration takes over
+    the first's slot, and a chat against either run answers from whichever weights are resident.
+    Wrong answers under a correct-looking `ready`, which is worse than a failed deploy.
+
+    Driven by forcing the hash to collide, since a natural collision is birthday-bound at tens of
+    thousands of revisions and cannot be produced in a test.
+    """
+    lora = types.ModuleType("vllm.lora.request")
+    lora.LoRARequest = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora)
+
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._int_ids = {}
+    instance._loaded = {}
+    instance._int_ids = {}
+    added: list = []
+
+    async def _add_lora(request):
+        added.append(request)
+
+    instance.engine = types.SimpleNamespace(add_lora=_add_lora)
+
+    async def _path(record):
+        return f"/tmp/{record['adapter_id']}"
+
+    instance._adapter_path = _path
+    monkeypatch.setattr(module, "_lora_int_id", lambda adapter_id: 12345)
+
+    first = {"adapter_id": "run-one@final." + "a" * 40}
+    second = {"adapter_id": "run-two@final." + "b" * 40}
+    _run_awaitable(engine_class._lora_request(instance, first))
+    with pytest.raises(RuntimeError, match="collision"):
+        _run_awaitable(engine_class._lora_request(instance, second))
+    assert len(added) == 1, (
+        "a colliding adapter was loaded over the one already holding its lora id"
+    )
+
+    # The registration path turns that into a `failed` record with the reason, not a crash.
+    result = _run_awaitable_result(engine_class.register(instance, second))
+    assert result["ok"] is False
+    assert "collision" in result["failure"]
+
+
+def test_two_adapters_do_not_share_one_download_directory(client):
+    """The cache directory must be keyed injectively, not by the truncated LoRA int id.
+
+    Keyed by the 31-bit id, two colliding revisions download into the SAME directory and the second
+    overwrites the first's files -- so even a backend that refuses the colliding load has already
+    corrupted the resident adapter's weights on disk.
+    """
+    module = client.app.state.generated_module
+    first = "run-one@final." + "a" * 40
+    second = "run-two@final." + "b" * 40
+    assert module._adapter_digest(first) != module._adapter_digest(second)
+    # And it must not be the colliding id itself, whatever that id happens to be.
+    assert module._adapter_digest(first) != str(module._lora_int_id(first))
+
+
 def test_two_cold_adapters_do_not_serialize_behind_each_other(client, monkeypatch):
     """Two different adapters loading at once must download concurrently.
 
@@ -1202,6 +1271,7 @@ def test_two_cold_adapters_do_not_serialize_behind_each_other(client, monkeypatc
     engine_class = client.app.state.generated_module.engine_classes[0]
     instance = engine_class.__new__(engine_class)
     instance._locks = {}
+    instance._int_ids = {}
     instance._loaded = {}
     first = "run-first@final." + "d" * 40
     second = "run-second@final." + "e" * 40
