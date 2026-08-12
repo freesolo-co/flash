@@ -177,7 +177,13 @@ def preflight_validate_environment_ref(spec: JobSpec) -> JobSpec:
     if parsed is None:
         return spec
     try:
-        sha = _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
+        # 4s, not the pin's 10s: this call is on the API request thread for every submit (the server
+        # always passes background=True, so the pin below it is off-thread and can afford to wait).
+        # a GitHub incident that hangs every submit for 10s exhausts the plane's request workers,
+        # and the run it would have blocked is one the deferral admits anyway -- a timeout is
+        # transient, so this gate's answer for it is "defer" no matter how long it waits. the only
+        # thing a longer budget buys is a named refusal for a 404 that GitHub is slow to give.
+        sha = _resolve_ref_sha(parsed, timeout=4.0, max_rate_limit_retries=0)
     except GitHubPermanentError as exc:
         # what GitHub rejected is the repo or the ref -- ``/repos/{repo}/commits/{ref}`` is the only
         # call made -- so the message names those two and not the path, which is checked by nobody
