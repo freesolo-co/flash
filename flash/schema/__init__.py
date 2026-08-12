@@ -244,6 +244,11 @@ _TOP_LEVEL_KEYS = frozenset(
         "project",
     }
 )
+# keys that WERE user-authorable and are now rejected with their own targeted error. they are absent
+# from _TOP_LEVEL_KEYS, so the unknown-key check below would otherwise report them as a typo and bury
+# the explanation of why they went away. distinct from core.spec._DROPPED_TOP_LEVEL_KEYS, which is
+# about tolerating removed keys on READ so persisted records still parse and rehash.
+_REMOVED_TOP_LEVEL_KEYS = frozenset({"model_revision"})
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
@@ -332,7 +337,7 @@ def _validate_top_level(
             f"`{CLI_NAME} models export` publishes the adapter, but for a fresh GRPO or OPD run it "
             "does not turn the moving upstream default into a fixed base revision."
         )
-    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS - {"model_revision"})
+    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS - _REMOVED_TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
         if {"grpo", "sft", "opd"} & set(unknown):
