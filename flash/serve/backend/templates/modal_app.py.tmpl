@@ -556,6 +556,7 @@ class Engine:
             )
         sampling = SamplingParams(
             temperature=float(payload.get("temperature") or 0.0),
+            # `or 512` only for an ABSENT field; an explicit value was validated at the boundary.
             max_tokens=int(payload.get("max_tokens") or 512),
             top_p=float(payload.get("top_p") or 1.0),
             stop=payload.get("stop") or None,
@@ -687,6 +688,24 @@ async def settle_adapter(record: dict[str, Any]) -> None:
 def api():
     web = FastAPI(title=f"flash serving: {{BASE_MODEL}}")
     engine = Engine()
+
+    async def _engine_is_warm() -> bool:
+        """Whether any Engine container is already running.
+
+        Asked before a best-effort eviction, so undeploying an idle run does not cold-start a GPU
+        just to remove an adapter that is not resident. `num_total_runners` counts containers
+        starting or running, which is the right question: one that is still booting will load the
+        durable records, and those are already `disabled` by the time this is called.
+
+        Fails CLOSED -- an unavailable stats call answers "not warm" and skips the eviction, which
+        costs at most a `max_loras` slot on a live container until it recycles. Answering "warm"
+        instead would reinstate exactly the paid cold start this avoids.
+        """
+        try:
+            stats = await engine.unregister.get_current_stats.aio()
+        except Exception:
+            return False
+        return bool(getattr(stats, "num_total_runners", 0))
 
     def _require_key(request: Request) -> None:
         """Authenticate the caller when a key is configured.
@@ -977,9 +996,17 @@ def api():
                     disabled_revisions.append(candidate["adapter_id"])
         # Outside the lock: evicting from the GPU is slow and best effort, and the records are
         # already durably disabled, so holding the lock across it would only block other deploys.
-        for revision_id in disabled_revisions:
-            with contextlib.suppress(Exception):  # gpu eviction is best effort
-                await engine.unregister.remote.aio(revision_id)
+        #
+        # And skipped entirely when nothing is warm. Eviction exists to free a `max_loras` slot on
+        # a RESIDENT engine; with every container scaled to zero there is no slot to free, and the
+        # remote call would START one -- pulling the weights and compiling the base model, minutes
+        # of paid GPU time against the 30-minute request timeout, to remove an adapter that is not
+        # loaded anywhere. A container that starts later loads from the durable records, which are
+        # already `disabled`, so it never brings the adapter back.
+        if disabled_revisions and await _engine_is_warm():
+            for revision_id in disabled_revisions:
+                with contextlib.suppress(Exception):  # gpu eviction is best effort
+                    await engine.unregister.remote.aio(revision_id)
         return {{
             "ok": True,
             "run_id": run_id,
@@ -1012,6 +1039,17 @@ def api():
                     "multi_modal_data to vLLM, so serving an image-bearing request would answer "
                     "without seeing the image",
                 )
+        # An explicit limit is validated here rather than defaulted away. `or 512` cannot tell an
+        # omitted field from a supplied 0, so `max_tokens: 0` -- an invalid request -- silently
+        # became a 512-token generation the caller pays for, and a negative reached vLLM and came
+        # back as an opaque 500. Rejected at the boundary, because the check below runs inside the
+        # Engine where a raise becomes an RPC failure rather than a readable 400.
+        limit = payload.get("max_tokens")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"max_tokens must be a positive integer, got {{limit!r}}",
+            )
         record = await _read(requested)
         if record is None or record.get("status") == "disabled":
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown model {{requested}}")

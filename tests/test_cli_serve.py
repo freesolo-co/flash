@@ -189,6 +189,20 @@ def test_setup_refuses_to_overwrite_an_existing_app(tmp_path, capsys):
     assert "--force" in capsys.readouterr().err
 
 
+def test_setup_creates_the_parent_directory_of_a_custom_output(tmp_path):
+    """`--output deploy/generated/app.py` names a destination, not a path that must already exist.
+
+    Without this the write fails on a bare errno 2 that names the FILE, so the user is told the
+    app does not exist when the real problem is the directory above it. Creating the parent is
+    what the flag asks for; the overwrite guard still runs first, so a refused run leaves no
+    directories behind.
+    """
+    destination = tmp_path / "deploy" / "generated" / "serving.py"
+    assert serve_cmd.cmd_serve_setup(_setup_args(tmp_path, output=str(destination))) == 0
+    assert destination.exists()
+    assert 'BASE_MODEL = "Qwen/Qwen3.5-4B"' in destination.read_text()
+
+
 def test_force_overwrites(tmp_path):
     destination = tmp_path / "flash_serving_app.py"
     destination.write_text("# my edits\n")

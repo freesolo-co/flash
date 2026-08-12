@@ -143,13 +143,19 @@ def _run_awaitable_result(awaitable):
     return box[0]
 
 
-def _stub_modal(monkeypatch, engine_methods, spawned=None, engine_classes=None):
+def _stub_modal(monkeypatch, engine_methods, spawned=None, engine_classes=None, runners=None):
     modal = types.ModuleType("modal")
     # Every `.spawn()` the app makes, so a test can assert that a settle was (or was not) driven.
     spawned = [] if spawned is None else spawned
     # The real classes `@app.cls` was applied to. The handle below stands in for the GPU, so the
     # class body is otherwise unreachable -- and it holds the vLLM call the engine tests assert on.
     engine_classes = [] if engine_classes is None else engine_classes
+    # How many Engine containers the app should believe are warm. A test flips this to 0 to model
+    # a scaled-to-zero deployment, where an eviction would cold-start a GPU for nothing.
+    runners = types.SimpleNamespace(count=1) if runners is None else runners
+
+    async def _engine_stats():
+        return types.SimpleNamespace(num_total_runners=runners.count, backlog=0)
 
     class _Named:
         @classmethod
@@ -186,7 +192,14 @@ def _stub_modal(monkeypatch, engine_methods, spawned=None, engine_classes=None):
             method = engine_methods[name]
             if inspect.isasyncgenfunction(method):
                 return types.SimpleNamespace(remote_gen=types.SimpleNamespace(aio=method))
-            return types.SimpleNamespace(remote=types.SimpleNamespace(aio=method))
+            # `get_current_stats` alongside `remote`, because Modal's bound method IS a Function
+            # and carries both. The app asks it how many containers are warm before paying for a
+            # cold start to evict; a stub without it would AttributeError on every undeploy.
+            # Defaults to one runner, so the eviction tests still exercise eviction.
+            return types.SimpleNamespace(
+                remote=types.SimpleNamespace(aio=method),
+                get_current_stats=types.SimpleNamespace(aio=_engine_stats),
+            )
 
     class _Spawnable:
         """A Modal function handle.
@@ -243,6 +256,9 @@ def _stub_modal(monkeypatch, engine_methods, spawned=None, engine_classes=None):
 @pytest.fixture
 def client(monkeypatch, tmp_path):
     loaded: dict[str, dict] = {}
+    # Every adapter the app asked the GPU to evict. Reaching the engine at all is the assertion:
+    # eviction is skipped when nothing is warm, so "was it called" is the behavior under test.
+    unregistered: list[str] = []
 
     async def register(record):
         if record.get("repo_id") == BAD_REPO:
@@ -251,6 +267,7 @@ def client(monkeypatch, tmp_path):
         return {"ok": True}
 
     async def unregister(adapter_id):
+        unregistered.append(adapter_id)
         loaded.pop(adapter_id, None)
         return {"ok": True}
 
@@ -270,6 +287,7 @@ def client(monkeypatch, tmp_path):
 
     spawned: list = []
     engine_classes: list = []
+    runners = types.SimpleNamespace(count=1)
     _stub_modal(
         monkeypatch,
         {
@@ -280,12 +298,15 @@ def client(monkeypatch, tmp_path):
         },
         spawned=spawned,
         engine_classes=engine_classes,
+        runners=runners,
     )
     source = render_app(MODELS[BASE_MODEL])
     module = types.ModuleType("generated_serving_app")
     exec(compile(source, str(tmp_path / "app.py"), "exec"), module.__dict__)
     module.spawned = spawned
     module.engine_classes = engine_classes
+    module.runners = runners
+    module.unregistered = unregistered
     test_client = TestClient(module.api())
     # Reach the generated module from a test: its Dict and its functions ARE the durable state,
     # so lifecycle races have to be driven through them rather than simulated alongside.
@@ -783,6 +804,49 @@ def test_an_image_request_is_refused_rather_than_answered_blind(client):
     assert "text-only" in response.json()["detail"]
 
 
+@pytest.mark.parametrize("limit", [0, -1, "many", 1.5, True])
+def test_an_invalid_max_tokens_is_rejected_rather_than_defaulted(client, limit):
+    """`max_tokens: 0` must not silently become a 512-token generation.
+
+    `int(payload.get("max_tokens") or 512)` cannot tell an omitted field from an explicit 0, so an
+    invalid request became a long billable completion the caller never asked for. A negative went
+    through to vLLM and came back as an opaque 500 rather than a client error.
+
+    `True` is in the list because `bool` is an `int` subclass: `max_tokens: true` would otherwise
+    pass an `isinstance` check and generate exactly one token.
+    """
+    _register_and_ready(client)
+    client.post(f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None})
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": RUN_ID,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": limit,
+        },
+    )
+    assert response.status_code == 400, (
+        f"max_tokens={limit!r} was accepted with {response.status_code}, so an invalid limit "
+        "either became a default-length billable generation or reached vLLM as a 500"
+    )
+    assert "max_tokens" in response.json()["detail"]
+
+
+def test_an_omitted_max_tokens_still_gets_the_default(client):
+    """The validation above must reject explicit bad values, not require the field.
+
+    `max_tokens` is optional in the OpenAI schema and flash's own chat path omits it, so a guard
+    that demanded it would reject every ordinary request.
+    """
+    _register_and_ready(client)
+    client.post(f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None})
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": RUN_ID, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200, "an omitted max_tokens must keep its default"
+
+
 def test_a_text_request_is_unaffected_by_the_image_guard(client):
     """The guard must not reject ordinary structured text content.
 
@@ -1116,6 +1180,50 @@ def test_undeploy_works_when_the_member_index_is_missing(client):
         "still serving"
     )
     assert response.json()["disabled_revisions"] == [REVISION]
+
+
+def test_undeploying_an_idle_run_does_not_cold_start_the_gpu(client):
+    """Eviction must be skipped when every container is scaled to zero.
+
+    Eviction exists to free a `max_loras` slot on a RESIDENT engine. With nothing warm there is no
+    slot to free, and `engine.unregister.remote` would start a container -- pulling the weights and
+    compiling the base model, minutes of paid GPU time against a 30-minute request timeout, to
+    remove an adapter that is not loaded anywhere. Scale-to-zero is the default, so undeploying a
+    run nobody has called recently is the ORDINARY case, not an edge one.
+
+    Safe to skip because a container that starts later loads from the durable records, and those
+    are already `disabled` by then.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    module.runners.count = 0
+
+    response = client.delete(f"/adapters/{RUN_ID}")
+    assert response.status_code == 200
+    assert module.adapter_records[module._record_key(REVISION)]["status"] == "disabled", (
+        "skipping eviction must not skip disabling the record"
+    )
+    assert module.unregistered == [], (
+        "an idle deployment reached the engine to evict an adapter, so undeploy cold-started a "
+        "GPU and paid for a weight load to remove something that was not resident"
+    )
+
+
+def test_undeploy_still_evicts_from_a_warm_engine(client):
+    """The skip above must not become "never evict".
+
+    A warm container is the case eviction is FOR: the adapter is resident, `max_loras` is bounded,
+    and leaving it there across repeated deploy/undeploy cycles eventually evicts live adapters or
+    fails new loads until the container recycles.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    module.runners.count = 1
+
+    assert client.delete(f"/adapters/{RUN_ID}").status_code == 200
+    assert REVISION in module.unregistered, (
+        "a warm engine was left holding the disabled adapter, so its max_loras slot never frees"
+    )
 
 
 def test_undeploy_by_run_id_disables_revisions_when_the_index_is_missing(client):

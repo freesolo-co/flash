@@ -97,10 +97,15 @@ def write_app(
     secret_name: str = "flash-serving",
     overwrite: bool = False,
 ) -> Path:
-    """Write the rendered app to ``destination``.
+    """Write the rendered app to ``destination``, creating its parent directory.
 
     Refuses to clobber an existing file unless ``overwrite``: the generated app is meant to be
     edited, so silently overwriting it would discard the user's changes.
+
+    The parent is created because `--output deploy/generated/app.py` is a destination the user
+    named, not a path they claimed already exists -- and without this it fails on a bare errno 2
+    that names the file rather than the missing directory. Only the parent, and only after the
+    clobber check, so a bad path cannot leave directories behind on a run that then refuses.
     """
     if destination.exists() and not overwrite:
         raise FileExistsError(f"{destination} already exists; pass --force to overwrite it")
@@ -111,6 +116,8 @@ def write_app(
         secret_name=secret_name,
         app_file=destination.name,
     )
+    if destination.parent != Path():
+        destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(source)
     return destination
 
