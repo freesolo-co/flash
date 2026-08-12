@@ -30,9 +30,14 @@ MAX_COMBINATION_CARDS = 8
 # 0.883 x the full bf16 weight size PER CARD, flat in card count (2.808 GB at n=2, 2.809 GB at n=4
 # on the same model). Adding cards never amortizes it -- only the non-weight part shards -- so this
 # is a per-card floor, exactly like `REPLICATED_PER_CARD_GB`, and not a divisible pool term.
+#
+# The "constant multiple of weight size" part is what the gate actually leans on, so it was measured
+# a second time at a different scale: 3.37B on 2x RTX 4090, peak 5.824 -> 11.504 GB against a 6.735
+# GB bf16 weight, i.e. 0.843x. Across a 2.1x weight increase the ratio moved -4.5%, so the penalty
+# tracks weight size rather than growing super-linearly with it.
 ZERO2_WEIGHT_RESIDENCY = 0.883
-# What the GATE charges, which is deliberately more than what was measured. The constant above comes
-# from ONE model at 1.59B; the catalog runs up to 35B, so the gate extrapolates it as much as 22x
+# What the GATE charges, which is deliberately more than what was measured. The measurements above
+# span 1.59B-3.37B; the catalog runs up to 35B, so the gate still extrapolates the ratio about 10x
 # beyond its evidence. Charging the measured value directly leaves the biggest models almost no room
 # for that extrapolation to be wrong: 35B-A3B opd on 2x B200 clears the requirement by 0.4% and
 # breaks if the true residency is 0.906 (2.6% above measured), and 27B grpo on 4x H200 breaks at
