@@ -362,6 +362,25 @@ def _normalize_env_name(raw: str) -> str | None:
     return f"{parts[0]}/{parts[1]}/{name}"
 
 
+def _env_name_error(raw: str) -> str:
+    """Why this `--name` was rejected, in the caller's own terms.
+
+    A qualified id that is not three segments is the single most likely mistake right now: it is
+    the form every script used before names became unique per project. Answering it with "env
+    name required" sends the user looking for a missing flag they actually passed.
+    """
+    text = str(raw or "").strip()
+    if "/" in text:
+        return (
+            f"env name invalid: {text!r} is not `<namespace>/<project>/<name>`. "
+            "environment names are unique per project, so a qualified id needs the project "
+            "segment; or pass a bare `--name <name>` with `--project <project-uuid>`"
+        )
+    if text:
+        return f"env name invalid: {text!r} has no usable characters"
+    return "env name required: pass `--name <name>`"
+
+
 def _with_syspath_bootstrap(env_source: str) -> str:
     """Prepend a sys.path bootstrap so a published env can resolve shipped sibling helpers."""
     import ast
@@ -648,9 +667,10 @@ def _resolve_local_env_entrypoint(path: str | Path) -> tuple[Path, Path, Path, b
 
 
 def cmd_env_push(args) -> int:
-    env_name = _normalize_env_name(str(getattr(args, "name", "") or ""))
+    raw_env_name = str(getattr(args, "name", "") or "")
+    env_name = _normalize_env_name(raw_env_name)
     if not env_name:
-        return _err("env name required: pass `--name <name>`")
+        return _err(_env_name_error(raw_env_name))
 
     from flash.core.spec import require_project_id
 

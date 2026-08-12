@@ -910,6 +910,36 @@ def test_push_requires_explicit_name(tmp_path, capsys):
     assert "--name" in capsys.readouterr().err
 
 
+def test_push_names_the_missing_project_segment_for_a_legacy_id(tmp_path, capsys):
+    """The old two-segment id must not be reported as a missing flag.
+
+    `namespace/name` is the form every pre-existing script passes, and it is now rejected
+    because names are unique per project. Answering it with "env name required: pass --name"
+    sends the user hunting for a flag they demonstrably did pass, and says nothing about the
+    segment that is actually missing.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+
+    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file), name="acme/math")) == 1
+
+    err = capsys.readouterr().err
+    assert "acme/math" in err
+    assert "<namespace>/<project>/<name>" in err
+    # the misleading answer is specifically what this guards against.
+    assert "env name required" not in err
+
+
+def test_push_still_reports_a_genuinely_absent_name(tmp_path, capsys):
+    """No `--name` at all keeps the flag-shaped message, which is the right one there."""
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+
+    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file), name="")) == 1
+
+    assert "env name required" in capsys.readouterr().err
+
+
 def test_push_sibling_config_does_not_override_explicit_name(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
