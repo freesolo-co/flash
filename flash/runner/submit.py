@@ -172,6 +172,12 @@ def _persist_effective_worker_spec(
     legacy_public_keys = {
         k: raw_public[k] for k in _runner()._DROPPED_TOP_LEVEL_KEYS if k in raw_public
     }
+    # same reason for the rollout optimizer batch: `status.spec` is never rewritten, so a legacy
+    # grpo/opd run keeps the old spelling for life and every read replays it. Hashing without that
+    # replay writes a digest the next integrity check cannot reproduce, so the run recovers until
+    # its first quote refresh or realloc and fails afterwards. Only the public half needs this --
+    # the worker half is rewritten right here, so its stored bytes already match what is hashed.
+    stored_public_rollout_batch = _runner()._stored_rollout_batch_spelling(raw_public)
     effective_preparation = {
         "worker_spec": worker_spec.to_internal_dict(),
         "workload_profile": worker_spec.workload_profile or None,
@@ -182,6 +188,7 @@ def _persist_effective_worker_spec(
             adapter_identity,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=_runner()._prepared_before_public_alpha(raw_public),
+            stored_public_rollout_batch=stored_public_rollout_batch,
         ),
         "backend": _runner().TRAINER_BACKEND,
     }

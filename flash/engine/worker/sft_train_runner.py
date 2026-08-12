@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
+from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_sft_width
 from flash.engine.worker import sft_train as _sft_train
+from flash.providers.base import rentable_gpu_counts
 
 RECIPE = _sft_train.RECIPE
 _w = _sft_train._w
@@ -115,6 +117,13 @@ class _SftChild:
     watcher: object
     child_env: dict[str, str]
     command: list[str]
+    # ranks actually launched, which is the allocated card count only when the batch divides by it.
+    # reported so a reader comparing realized step time against the quote sees the executed width.
+    world_size: int
+    # the micro-batch verl RAN, which is `model.micro_batch` capped to one rank's share of the batch.
+    # carried because the result file reports it: recording the uncapped request would tell a reader
+    # reconstructing the token budget that each rank held twice the rows it did.
+    micro_batch: int
     shim_markers: str
     expected_shims: tuple[str, ...]
 
@@ -378,6 +387,124 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     )
 
 
+def _widest_rentable_width(max_cards: int, train_batch_size: int, row_count: int) -> int:
+    """Widest allocation that is both rentable and fully usable by SFT, at most ``max_cards``.
+
+    Two constraints, and only counts meeting BOTH are worth advising: providers sell powers of two
+    (`rentable_gpu_counts`), and SFT needs the width to divide the batch and the row count or it is
+    back to idling cards. Neither implies the other, so this searches the rentable shapes rather
+    than clamping a resolved width -- `sft_data_parallel_cards` walks downward to find a divisor and
+    happily returns 3 or 5, which are not shapes anyone can allocate. 1 always qualifies.
+    """
+    return widest_usable_sft_width(rentable_gpu_counts(max_cards), train_batch_size, row_count)
+
+
+def _idle_card_warning(
+    world_size: int, gpu_count: int, train_batch_size: int, row_count: int
+) -> str:
+    """The live `[sft][warn]` line naming the binding input and a remedy that can actually work.
+
+    The run is BILLED for every allocated card, so a card the batch cannot feed is money spent on an
+    idle gpu. The notes carry the width too, but those are read after the fact -- say it while the
+    run is live, and say what would actually use the card.
+
+    The remedy differs by which input is binding, and a remedy that cannot be acted on is worse than
+    none. BOTH inputs have to divide the allocation, so the batch is only worth naming as a knob
+    when the rows already fit: at 4 cards with a batch of 6 over 10 rows, every multiple of 4 the
+    batch could be raised still resolves to 2 ranks because 10 rows cannot be split 4 ways. Batch 1
+    is a third case rather than a degenerate version of either -- it binds, but `sft_workload` fixes
+    it at 1 for every unpacked run, so it is named as a fact and never as a knob.
+
+    A card count BELOW the launched width is qualified rather than prescribed. The ranks that joined
+    are what hold the model, so shrinking the allocation is a VRAM change and not only a billing one:
+    a 27B at 32k needs 159 GB, runs on the 191.6 GB that 3 H100 ranks provide, and would be rejected
+    at the 130.4 GB two cards give. This runs after allocation with no VRAM need in scope and cannot
+    check that itself, so it says the smaller shape is worth checking instead of asserting it works.
+    """
+    rows_fit = row_count == 0 or row_count % gpu_count == 0
+    batch_fits = train_batch_size % gpu_count == 0
+    unpacked = train_batch_size <= 1
+    # the batch is only worth naming as a knob when fixing it is sufficient, i.e. the rows already
+    # fit. an unpacked batch of 1 is named as a fact instead: it binds, but it cannot be raised.
+    batch_helps = rows_fit and not batch_fits and not unpacked
+    rentable = _widest_rentable_width(world_size, train_batch_size, row_count)
+    if unpacked:
+        limiter = "an unpacked run's single example per update"
+    elif batch_helps:
+        limiter = f"a batch of {train_batch_size}"
+    else:
+        limiter = f"a dataset of {row_count} rows"
+    # dropping below the launched width takes memory away from a run the fit gate already accepted
+    # on this shape, so it is offered as a question rather than as the fix.
+    card_advice = (
+        f"allocate {rentable} card(s) instead"
+        if rentable >= world_size
+        else f"allocate {rentable} card(s) instead if the run still fits on {rentable}"
+    )
+    remedy = (
+        f"raise [train] batch_size to a multiple of {gpu_count}, or {card_advice}"
+        if batch_helps
+        else card_advice
+    )
+    return (
+        f"[sft][warn] training on {world_size} of {gpu_count} allocated cards: {limiter} "
+        f"cannot be split across {gpu_count} ranks without starving one or dropping rows. "
+        f"the idle cards are still billed -- {remedy}."
+    )
+
+
+def _resolve_sft_world_size(gpu_count: int, train_batch_size: int, row_count: int) -> int:
+    """Ranks to launch, warning when that is fewer than the cards the run is paying for.
+
+    SFT shards by DATA, not by sequence: ulysses is pinned to 1 and fsdp splits the batch. verl's
+    ulysses support patches `_flash_attention_forward` and slices the qwen text model's inputs, but
+    passes NO state between ranks -- and every catalog model is a GatedDeltaNet hybrid whose layers
+    are mostly linear attention plus a causal conv, both of which carry state along the sequence. A
+    sequence shard would run its recurrence and conv as if it were a whole sequence, so sequence
+    parallelism is not merely unimplemented for this family, it is incorrect for it.
+
+    It also crashed outright. remove-padding flattens the batch to one `(1, total_nnz)` row, and
+    verl slices that row per rank, so the shapes reaching the GDN kernels stop agreeing and a
+    sharded run died on `seq_idx must have shape (batch_size, seqlen)` -- at any batch size,
+    including 1, because "remove padding" leaves no batch dimension to keep an example whole.
+
+    The width must also divide the ROW count, or verl's sampler drops the remainder from every
+    epoch while the quote still bills it. See `sft_data_parallel_cards`.
+    """
+    world_size = sft_data_parallel_cards(gpu_count, train_batch_size, row_count)
+    if world_size < gpu_count:
+        print(_idle_card_warning(world_size, gpu_count, train_batch_size, row_count))
+    return world_size
+
+
+def _resolve_sft_width_and_micro_batch(
+    options: _SftOptions, data: _SftData, model: _SftModelSetup
+) -> tuple[int, int]:
+    """The data-parallel width and the micro-batch that fits one rank's share of the batch.
+
+    Resolved together because the second depends on the first: the micro-batch was sized against
+    the GLOBAL batch, but each rank only ever receives ``train_batch_size // world_size``. verl
+    rejects a micro-batch larger than the per-rank batch before the first optimizer step, so batch
+    8 across 4 ranks -- per-rank 2 -- cannot keep a micro-batch of 4. The token budget derives from
+    the capped value too, or it reserves for rows the rank never receives.
+    """
+    world_size = _resolve_sft_world_size(options.gpu_count, model.train_batch_size, len(data.rows))
+    micro_batch = max(1, min(model.micro_batch, model.train_batch_size // max(1, world_size)))
+    return world_size, micro_batch
+
+
+def _resolve_sft_run_identity(
+    options: _SftOptions, capabilities: _SftCapabilities
+) -> tuple[list[str], str, str]:
+    """The child's ``(loggers, project_name, experiment_name)``."""
+    # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
+    loggers = _sft_train.resolve_verl_loggers(capabilities.caps)
+    project_name = (
+        options.spec.wandb.project if options.spec and options.spec.wandb else None
+    ) or "flash"
+    return loggers, project_name, _w.wandb_run_name()
+
+
 def _prepare_sft_child(
     options: _SftOptions,
     data: _SftData,
@@ -387,12 +514,7 @@ def _prepare_sft_child(
     gdn_reset_arch: str | None,
 ) -> _SftChild:
     model_path = _sft_train._cached_model_path(options.model_id, options.model_revision)
-    # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
-    loggers = _sft_train.resolve_verl_loggers(capabilities.caps)
-    project_name = (
-        options.spec.wandb.project if options.spec and options.spec.wandb else None
-    ) or "flash"
-    experiment_name = _w.wandb_run_name()
+    loggers, project_name, experiment_name = _resolve_sft_run_identity(options, capabilities)
     shim_dir = os.path.join(options.paths.workdir, "shim")
     os.makedirs(shim_dir, exist_ok=True)
     custom_dataset_path = os.path.join(shim_dir, "flash_verl_sft_dataset.py")
@@ -403,12 +525,13 @@ def _prepare_sft_child(
     # `gdn_reset_arch` is resolved by the caller, inside the configuring liveness wrap, because the
     # probe is part of the setup silence that wrap exists to cover, and because a packed run must
     # take the RAISING gate there rather than the soft form.
+    world_size, micro_batch = _resolve_sft_width_and_micro_batch(options, data, model)
     config = {
         "train_files": data.train_file,
         "train_batch_size": model.train_batch_size,
         "max_length": data.max_length,
-        "micro_batch": model.micro_batch,
-        "max_token_len_per_gpu": data.realized_max_length * model.micro_batch,
+        "micro_batch": micro_batch,
+        "max_token_len_per_gpu": data.realized_max_length * micro_batch,
         "custom_dataset_path": custom_dataset_path,
         "model_path": model_path,
         "lora_rank": model.lora_rank,
@@ -416,7 +539,7 @@ def _prepare_sft_child(
         "target_modules": model.target_modules,
         "target_parameters": _w.lora_target_parameters(options.model_id),
         "lora_adapter_path": model.warmstart_adapter,
-        "ulysses_sp_size": options.gpu_count,
+        "ulysses_sp_size": 1,
         "lr": options.learning_rate,
         "warmup_ratio": RECIPE.sft.warmup_frac,
         "optimizer_impl": _VERL_OPTIMIZER_IMPL,
@@ -424,7 +547,7 @@ def _prepare_sft_child(
         "optimizer_kwargs": None,
         "local_dir": options.paths.local_dir,
         "save_freq": model.save_freq,
-        "n_gpus_per_node": options.gpu_count,
+        "n_gpus_per_node": world_size,
         "seed": _w.backend_seed(_w.SEED),
         "project_name": project_name,
         "experiment_name": experiment_name,
@@ -475,11 +598,12 @@ def _prepare_sft_child(
     with open(custom_dataset_path, "w", encoding="utf-8") as file:
         file.write(_render_sft_dataset_module())
 
-    # the same count that becomes --nproc-per-node below, so the guard compares the checkpoint
-    # against the topology this attempt really launches.
-    resume_step = _sft_train._restore_verl_resume(
-        options.paths.local_dir, world_size=options.gpu_count
-    )
+    # the RESOLVED width, not the allocated card count: it is what becomes --nproc-per-node below,
+    # so the guard compares the checkpoint against the topology this attempt really launches. sft
+    # shards by data and the width is bounded by the batch and the row count, so the two differ
+    # whenever either fails to divide the allocation -- passing gpu_count here would discard a
+    # checkpoint that matches the run about to start, and keep one that does not.
+    resume_step = _sft_train._restore_verl_resume(options.paths.local_dir, world_size=world_size)
     watcher = _sft_train._VerlCheckpointWatcher(
         local_dir=options.paths.local_dir,
         export_root=options.paths.export_root,
@@ -508,7 +632,9 @@ def _prepare_sft_child(
         "torch.distributed.run",
         "--standalone",
         "--nnodes=1",
-        f"--nproc-per-node={options.gpu_count}",
+        # the RESOLVED width, not the allocated card count: verl splits the global batch across
+        # every rank torchrun starts, so a rank the batch cannot feed is the `batch_size=0` crash.
+        f"--nproc-per-node={world_size}",
         "-m",
         "verl.trainer.sft_trainer",
         *overrides,
@@ -524,6 +650,8 @@ def _prepare_sft_child(
         watcher=watcher,
         child_env=child_env,
         command=command,
+        world_size=world_size,
+        micro_batch=micro_batch,
         shim_markers=shim_markers,
         expected_shims=tuple(name for name, source in required_fragments if source),
     )

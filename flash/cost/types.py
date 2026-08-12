@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from flash.core.catalog import normalize_algorithm, samples_on_policy
+from flash.core.catalog import normalize_algorithm, optimizer_batch_key, samples_on_policy
 from flash.core.spec import parse_positive_int_tuple
 from flash.engine.plan.recipe import RECIPE
 from flash.providers import PROVIDER_NAMES
@@ -59,6 +59,13 @@ class RunConfig:
     # on the tail; sft uses the same split through train_tokens.
     measured_completion_tokens: float | None = None
     measured_prompt_tokens: float | None = None
+    # rows the trainer iterates (profile `retained_examples`), which is what verl's sampler shards.
+    # NOT derivable from sft_packed_blocks: that is ceil(rows / examples_per_update), so a packed
+    # profile with 10 rows and a batch of 8 reports 2 blocks and reconstructs as 16.
+    # APPENDED, not slotted beside the other sft fields: this class keeps a positional constructor
+    # (see `test_runconfig_preserves_old_positional_constructor`), so inserting here would shift
+    # every later field and silently rebind an old caller's opd flag to this one.
+    sft_retained_examples: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -111,6 +118,20 @@ class RunConfig:
             raise ValueError("unsupported sft_packing_mode")
         if self.sft_packed_blocks is not None and self.sft_packed_blocks < 1:
             raise ValueError("sft_packed_blocks must be >= 1")
+        if self.sft_retained_examples is not None:
+            # a bad value here does not raise downstream, it UNDER-CREDITS: `sft_data_parallel_cards`
+            # reads a non-positive row count as "unknown, do not constrain", so 0 or a negative
+            # silently credits every rented card and quotes a width the run will not launch on --
+            # the exact failure the retained-example count was added to prevent. reject it here,
+            # where the type boundary is, rather than teaching the width rule to distrust its input.
+            if isinstance(self.sft_retained_examples, bool) or not isinstance(
+                self.sft_retained_examples, int
+            ):
+                raise TypeError("sft_retained_examples must be an integer or none")
+            if self.sft_retained_examples < 1:
+                raise ValueError(
+                    f"sft_retained_examples must be >= 1, got {self.sft_retained_examples}"
+                )
         if not isinstance(self.opd_multi_turn, bool):
             raise TypeError("opd_multi_turn must be a boolean")
         if self.opd_max_turns is not None and (
@@ -176,7 +197,10 @@ class RunConfig:
         n = self.normalized()
         knobs: dict[str, int] = {"lora_rank": n.lora_rank}
         if self.batch_size is not None:
-            knobs["batch_size"] = self.batch_size
+            # `RunConfig.batch_size` is the optimizer batch whatever the algorithm; the TRAIN TABLE
+            # spells it per algorithm and sizing reads it by that name, so emit the name sizing
+            # will look for or an authored rl batch silently sizes as the recipe default.
+            knobs[optimizer_batch_key(self.method)] = self.batch_size
         if n.seq_len is not None:
             knobs["max_context_tokens"] = n.seq_len
         if n.completion_len is not None:

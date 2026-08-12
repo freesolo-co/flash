@@ -16,7 +16,9 @@ import json
 import os
 import re
 from dataclasses import replace
+from typing import Any
 
+from flash.core.catalog import normalize_algorithm, samples_on_policy
 from flash.core.spec import JobSpec
 
 
@@ -309,6 +311,74 @@ def _prepared_before_public_alpha(raw_public: object) -> bool:
     return not train.get("init_from_adapter")
 
 
+_ROLLOUT_BATCH_KEYS = ("batch_size", "prompts_per_step")
+
+
+def _stored_rollout_batch_spelling(raw_spec: object) -> dict[str, Any] | None:
+    """How a PERSISTED rollout spec spelled its optimizer batch, or None if it is not one.
+
+    Same discriminator style as ``_prepared_before_public_alpha``: the answer comes from the stored
+    bytes, which are never rewritten, so it is stable for the run's life.
+
+    ``JobSpec.from_dict`` MOVES the pre-1.1.43 ``batch_size`` onto ``prompts_per_step`` when
+    reparsing, so rehashing a persisted spec with today's parse can produce different bytes than
+    were hashed at persist time -- failing integrity validation for exactly the warm-start grpo/opd
+    runs this migration exists to rescue.
+
+    Both keys are reported, rather than just the value there is to migrate. Reporting only the
+    latter conflates snapshots that have nothing to move but still change shape: a mixed-version
+    payload storing both names (the migration drops the old one, so the stored ``batch_size`` still
+    has to be rehashed), one whose legacy value is non-positive (discarded by the parser), and a
+    modern payload (nothing to do). Replaying the stored spelling covers all of them uniformly.
+
+    A key merely holding null reports None; a key genuinely OMITTED is omitted from the reading too,
+    because the two hash differently. Every digest is taken over a serialized ``JobSpec``, which
+    emits both names, so a null was really hashed as null -- while 1.1.40 predates
+    ``prompts_per_step`` entirely and hashed no such key. Each half's reading therefore carries its
+    OWN absence rather than sharing one flag: after a re-persist the worker half is rewritten in the
+    modern shape while ``status.spec`` keeps the legacy one, so the halves genuinely disagree about
+    which keys exist and a single flag would misdescribe one of them.
+
+    This is not a way to forge a batch: the replayed values are the STORED ones, and the digest they
+    are compared against was computed over the ORIGINAL ones, so any tampering still mismatches.
+
+    Only a rollout algorithm is eligible: for sft ``batch_size`` is the current, un-migrated name,
+    which ``from_dict`` leaves alone.
+    """
+    if not isinstance(raw_spec, dict):
+        return None
+    if not samples_on_policy(normalize_algorithm(str(raw_spec.get("algorithm") or ""))):
+        return None
+    train = raw_spec.get("train")
+    if not isinstance(train, dict):
+        return None
+    stored = {key: train.get(key) for key in _ROLLOUT_BATCH_KEYS}
+    # the 1.1.40 shape, read off the bytes themselves: it carried the old name and no new one.
+    # a payload omitting BOTH says nothing about when it was written, and the serializer always
+    # emits both -- so treating that as absence would drop a key that WAS hashed.
+    if "batch_size" in train and "prompts_per_step" not in train:
+        del stored["prompts_per_step"]
+    return stored
+
+
+def _restore_rollout_batch_spelling(payload: dict, stored: dict | None) -> None:
+    """Put the optimizer-batch keys back exactly as the stored payload hashed them.
+
+    A key absent from ``stored`` was absent from the hashed bytes, so it is removed rather than
+    written -- that is the 1.1.40 shape, which predates ``prompts_per_step``.
+    """
+    if stored is None:
+        return
+    train = payload.get("train")
+    if not isinstance(train, dict):
+        return
+    for key in _ROLLOUT_BATCH_KEYS:
+        if key in stored:
+            train[key] = stored[key]
+        else:
+            train.pop(key, None)
+
+
 def _preparation_digest(
     public_spec: JobSpec,
     worker_spec: JobSpec,
@@ -317,9 +387,26 @@ def _preparation_digest(
     legacy_keys: dict | None = None,
     legacy_public_keys: dict | None = None,
     legacy_public_alpha: bool = False,
+    stored_rollout_batch: dict | None = None,
+    stored_public_rollout_batch: dict | None = None,
 ) -> str:
     worker_payload = worker_spec.to_internal_dict()
     public_payload = public_spec.to_dict()
+    # the rollout optimizer batch was renamed `batch_size` -> `prompts_per_step`, and from_dict now
+    # MOVES it when reparsing a persisted spec. Rehash under the spelling the snapshot actually
+    # stored -- including a key it did not have -- so a spec written before or across the rename
+    # still reproduces its digest. Same reason as the omissions and restorations below.
+    #
+    # Each half is restored from ITS OWN stored payload, exactly like legacy_keys vs
+    # legacy_public_keys below. Feeding the worker's spelling to both would overwrite whatever the
+    # public payload held before hashing -- and since the parse DROPS a superseded `batch_size`,
+    # `_validate_effective_spec` cannot see it either, so a tampered public value would be erased
+    # rather than caught. The two halves legitimately differ (the public spec is a stripped view),
+    # so they cannot share one reading -- including which keys they carry at all, which is why each
+    # reading holds its own absence instead of a shared flag. Re-persisting rewrites the worker half
+    # in the modern shape and leaves `status.spec` legacy, so from then on the halves disagree.
+    _restore_rollout_batch_spelling(worker_payload, stored_rollout_batch)
+    _restore_rollout_batch_spelling(public_payload, stored_public_rollout_batch)
     # ``[environment] pip`` became user-authorable, so to_dict() now emits it where it used to be
     # stripped, and a pre-upgrade snapshot hashed an environment with no pip key at all. Dropping it
     # when empty reproduces those bytes without needing to know when the run was prepared: absent

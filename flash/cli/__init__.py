@@ -11,7 +11,7 @@ import sys
 from typing import NoReturn
 
 from flash import __version__
-from flash._internal.channel import CLI_NAME
+from flash._internal.channel import BRAND_NAME, CLI_NAME
 from flash._internal.logging import configure_logging
 
 # package-level command imports remain available through flash.cli.
@@ -270,7 +270,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _add_root_flags(parser: argparse.ArgumentParser) -> None:
     """Flags on the root parser itself, ahead of any subcommand."""
-    parser.add_argument("-V", "--version", action="version", version=f"{CLI_NAME} {__version__}")
+    parser.add_argument("-V", "--version", action="version", version=f"{BRAND_NAME} {__version__}")
     parser.add_argument(
         "--debug",
         action="store_true",

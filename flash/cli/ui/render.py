@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 
-from flash._internal.channel import CLI_NAME
+from flash._internal.channel import BRAND_NAME, CLI_NAME
 
 # Cost selection lives in `flash.cli.ui.cost` (split out to keep this module under the file-size
 # limit). Imported at the TOP rather than the bottom like `tables` below, because that module
@@ -134,7 +134,7 @@ def login_ok(me: dict | None) -> str:
     head = f"{_paint(_glyph('✓', 'ok:'), _GREEN, '1')} {_bold('logged in to flash')}"
     if not me:
         return _safe(
-            f"{head}\n{_dim('  account details unavailable right now — run `flash whoami` later')}"
+            f"{head}\n{_dim(f'  account details unavailable right now — run `{CLI_NAME} whoami` later')}"
         )
     return _safe(f"{head}\n\n{format_identity(me)}")
 
@@ -147,7 +147,7 @@ def login_failed(reason: str) -> str:
     return _safe(
         f"{_paint(_glyph('✗', 'x:'), _RED, '1')} {_bold('login failed')}\n"
         f"  {reason}\n"
-        f"  {_dim('then run `flash login --api-key <key>` to try again')}\n"
+        f"  {_dim(f'then run `{CLI_NAME} login --api-key <key>` to try again')}\n"
         f"  {_dim('if it keeps failing, email founders@freesolo.co')}"
     )
 
@@ -278,7 +278,7 @@ def _rule(width: int | None = None) -> str:
 
 def header(cmd: str, desc: str | None = None) -> str:
     """Brand header line + a faint rule: the wordmark, the command, and an optional descriptor."""
-    mark = _paint(CLI_NAME, _ACCENT, "1")
+    mark = _paint(BRAND_NAME, _ACCENT, "1")
     sep = _paint(_glyph("›", ">"), _FAINT)  # noqa: RUF001 (the glyph is the point)
     line = f"{mark} {sep} {_bold(cmd)}"
     if desc:
@@ -460,7 +460,7 @@ def _hide_provider_metadata(obj):
 
 def version(value: str) -> str:
     """The wordmark + version."""
-    mark = _paint(CLI_NAME, _ACCENT, "1")
+    mark = _paint(BRAND_NAME, _ACCENT, "1")
     return _safe(f"{mark} {_dim('v' + value)}")
 
 
@@ -701,7 +701,7 @@ def env_setup(paths: list[str], project_id: str, *, can_publish: bool = True) ->
     )
     head = f"{header('env setup', 'starter Freesolo environment')}\n{ok('scaffold ready')}\n"
     if can_publish:
-        next_step = arrow(f"publish it: flash env push --project {project_id} --name my-env .")
+        next_step = arrow(f"publish it: {CLI_NAME} env push --project {project_id} --name my-env .")
     else:
         # `env push` targets the managed hub, which a self-hosted plane cannot write to. The
         # standalone caveat is part of the wording: a github: id is accepted only by a plane
@@ -757,7 +757,7 @@ def help_page(
     here. Only ever called on the styled path; piped/scripted ``--help`` keeps argparse's
     plain text (see ``flash.cli._FlashParser``), so existing greps stay byte-for-byte.
     """
-    mark = _paint(CLI_NAME, _ACCENT, "1")
+    mark = _paint(BRAND_NAME, _ACCENT, "1")
     banner = f"{mark}  {_paint(tagline, _GRAY)}"
     usage_line = f"{_dim('usage:')} {_paint(usage, _GRAY)}"
     # one name-column width across every group AND the options block, so every summary lines up

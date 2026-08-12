@@ -443,8 +443,11 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "configured_max_length": data.max_length,
             "realized_max_length": data.realized_max_length,
             "runtime_max_length": data.realized_max_length,
-            "per_device_train_batch_size": model.micro_batch,
-            "gradient_accumulation_steps": math.ceil(model.train_batch_size / model.micro_batch),
+            # the EXECUTED micro-batch, not the requested one: data parallelism caps it to a rank's
+            # share of the batch, so a reader reconstructing the token budget off the request would
+            # believe each rank held rows it never received.
+            "per_device_train_batch_size": child.micro_batch,
+            "gradient_accumulation_steps": math.ceil(model.train_batch_size / child.micro_batch),
             # verl concatenates either way; the profile's mode records whether more than one
             # example was allowed to share a concatenated batch, which is what a reader of these
             # metrics needs in order to compare a run's step count against its row count.
@@ -464,7 +467,11 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "loraplus_optim": _VERL_OPTIMIZER_NAME,
             "loraplus_applied": progress.loraplus_applied,
             "verl_backend": "fsdp2",
-            "ulysses_sequence_parallel_size": options.gpu_count,
+            # sft shards by DATA: ulysses is pinned off and fsdp splits the batch across the ranks
+            # actually launched, which is the allocated card count only when the batch divides by
+            # it. report both, and report the executed width rather than the allocation ceiling.
+            "ulysses_sequence_parallel_size": 1,
+            "data_parallel_size": child.world_size,
             "wandb_project": child.project_name if "wandb" in child.loggers else None,
             "wandb_run_name": child.experiment_name if "wandb" in child.loggers else None,
             # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the parent's live

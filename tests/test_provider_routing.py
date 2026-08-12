@@ -2020,6 +2020,53 @@ def test_workload_profile_mismatch_fails_fast_instead_of_retrying(orch, monkeypa
     assert slept == []  # and never backed off waiting for it to clear
 
 
+def test_unknown_prompt_pool_size_fails_fast_instead_of_retrying(orch, monkeypatch):
+    """A spec that states no prompt-pool size states none on every attempt.
+
+    Same shape as the profile mismatch above, and it has to be classified the same way. grpo/opd
+    price their horizon from a stated pool size and refuse to guess without one; this refresh asks
+    for a PREDICTED horizon (there are no completed steps to prorate from), which is exactly the
+    question the refusal exists to answer. Retrying re-asks it and gets the same refusal, so an
+    in-flight unbounded run would spend its entire retry budget on backoff sleeps before failing.
+    """
+    from flash.cost.spec import UnknownPromptPoolSize
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    submits = []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        submits.append(attempt)
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+
+    import flash.cost.spec as cost_spec
+
+    def refuse(*_a, **_kw):
+        raise UnknownPromptPoolSize("cannot price grpo without a prompt-pool size")
+
+    monkeypatch.setattr(cost_spec, "estimate_for_spec", refuse)
+
+    slept = []
+    from flash.runner.supervise import lifecycle
+
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda s: slept.append(s))
+
+    spec = _spec(max_retries=2)
+    _seed_status(orch, spec)
+    with pytest.raises(UnknownPromptPoolSize):
+        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+
+    assert submits == []  # never reached a provider
+    assert slept == []  # and never burned the retry budget re-asking an unanswerable question
+
+
 def test_submit_supplies_the_worker_pip_when_the_author_declared_none() -> None:
     """``worker_pip_for_env`` is the baseline every worker needs to run a Freesolo environment.
 

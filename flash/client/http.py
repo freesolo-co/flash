@@ -14,6 +14,7 @@ import urllib.request
 from collections.abc import Iterator, Mapping
 from typing import Any
 
+from flash._internal.channel import CLI_NAME
 from flash.client.config import load_credentials_with_source
 from flash.client.shapes import RequireSpec, matches_require
 from flash.client.streaming import (
@@ -263,7 +264,7 @@ class ApiClient:
             return detail
         return (
             f"{detail}; FREESOLO_API_KEY is set and overrides the key saved by "
-            "`flash login`. Unset FREESOLO_API_KEY or update it to a valid freesolo API key."
+            f"`{CLI_NAME} login`. Unset FREESOLO_API_KEY or update it to a valid freesolo API key."
         )
 
     @contextlib.contextmanager
@@ -611,7 +612,7 @@ class ApiClient:
             if time.monotonic() >= deadline:
                 raise ClientError(
                     f"cancel request timed out before confirmation; latest state={last_state!r}. "
-                    f"Run `flash runs status {run_id}` to check the authoritative state before retrying."
+                    f"Run `{CLI_NAME} runs status {run_id}` to check the authoritative state before retrying."
                 ) from cause
             time.sleep(2.0)
 
@@ -806,6 +807,6 @@ def client_from_config(require_key: bool = True) -> ApiClient:
     api_url, api_key, key_source = load_credentials_with_source()
     if require_key and not api_key:
         raise ClientError(
-            "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
+            f"not logged in — run `{CLI_NAME} login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
     return ApiClient(api_url, api_key, key_source=key_source)

@@ -376,9 +376,9 @@ def test_hosted_plane_still_refuses_when_logged_out(monkeypatch, capsys) -> None
     monkeypatch.setattr("flash.client.list_projects", _unreachable)
 
     assert _run(["projects", "create", "no key"]) == 1
-    assert "flash login" in capsys.readouterr().err
+    assert f"{cli.commands.CLI_NAME} login" in capsys.readouterr().err
     assert _run(["projects", "list"]) == 1
-    assert "flash login" in capsys.readouterr().err
+    assert f"{cli.commands.CLI_NAME} login" in capsys.readouterr().err
 
 
 def test_configured_backend_keeps_the_hosted_path_on_a_self_hosted_plane(
@@ -1062,7 +1062,7 @@ def test_identity_render_is_ascii_locale_safe(monkeypatch) -> None:
     fallback = render.login_ok(None)
     for text in (card, fallback):
         text.encode("ascii")  # raises if any non-ASCII slipped through
-    assert "run `flash whoami`" in fallback
+    assert f"run `{render.CLI_NAME} whoami`" in fallback
 
 
 def test_models_table(fake_client, capsys) -> None:
@@ -1389,8 +1389,8 @@ def test_ctrl_c_while_following_says_the_run_is_still_billing(
     assert _run([str(config) if a == "CONFIG" else a for a in argv]) == 130
     err = capsys.readouterr().err
     assert "still going and still billing" in err
-    assert "flash runs cancel flash-1" in err
-    assert "flash runs log flash-1 --follow" in err
+    assert f"{cli.commands.CLI_NAME} runs cancel flash-1" in err
+    assert f"{cli.commands.CLI_NAME} runs log flash-1 --follow" in err
     # the run was never cancelled on the user's behalf -- detaching is not stopping.
     assert not any(c[0] == "cancel" for c in fake_client.calls)
 
@@ -1416,7 +1416,7 @@ def test_train_submit_note_warns_that_ctrl_c_keeps_billing(
     assert _run(["train", str(config)]) == 0
     err = capsys.readouterr().err
     assert "keeps billing" in err
-    assert "flash runs cancel flash-1" in err
+    assert f"{cli.commands.CLI_NAME} runs cancel flash-1" in err
 
 
 def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> None:
@@ -1625,8 +1625,10 @@ def test_cancel_surfaces_surviving_checkpoints(fake_client, capsys) -> None:
     out, err = capsys.readouterr()
     assert _json.loads(out)["state"] == "cancelled"  # stdout stays pure JSON in the plain path
     assert "2 deployable checkpoint(s) survive this cancel" in err
-    assert "flash runs checkpoint flash-1" in err
-    assert "flash models deploy flash-1/step-40" in err  # points at the newest surviving step
+    assert f"{cli.commands.CLI_NAME} runs checkpoint flash-1" in err
+    assert (
+        f"{cli.commands.CLI_NAME} models deploy flash-1/step-40" in err
+    )  # points at the newest surviving step
 
 
 def test_cancel_hint_is_best_effort_when_checkpoint_listing_fails(
@@ -1655,7 +1657,9 @@ def test_cancel_hint_survives_malformed_checkpoint_shape(fake_client, capsys, mo
     out, err = capsys.readouterr()
     assert '"state": "cancelled"' in out
     assert "3 deployable checkpoint(s) survive this cancel" in err
-    assert "flash models deploy flash-1/step-7" in err  # max of the RECOVERABLE steps
+    assert (
+        f"{cli.commands.CLI_NAME} models deploy flash-1/step-7" in err
+    )  # max of the RECOVERABLE steps
 
     monkeypatch.setattr(fake_client, "checkpoints", lambda run_id: [{"no_step": 1}])
     assert _run(["runs", "cancel", "flash-1"]) == 0

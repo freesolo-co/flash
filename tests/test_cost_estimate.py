@@ -106,6 +106,53 @@ def test_runconfig_preserves_old_positional_constructor():
     assert config.opd_multi_turn is False
     assert config.opd_max_turns is None
 
+    # the 16 args above stop short of the opd fields, so they cannot catch a field INSERTED among
+    # the later ones -- the shift only rebinds from that position on. pin the order itself, which is
+    # what the positional contract actually is.
+    import dataclasses
+
+    order = [f.name for f in dataclasses.fields(RunConfig)]
+    assert order.index("opd_multi_turn") < order.index("opd_max_turns")
+    assert order.index("opd_max_turns") < order.index("measured_completion_tokens")
+    # anything added later must be APPENDED, never slotted beside a related field: an old positional
+    # caller would silently bind its opd flag to the newcomer rather than fail.
+    assert order[-1] == "sft_retained_examples", (
+        "a new RunConfig field must be appended; inserting one shifts every later parameter and "
+        "silently reinterprets old positional calls as different quantities"
+    )
+
+
+def test_a_malformed_retained_example_count_is_rejected_not_read_as_unknown():
+    """A bad row count must raise, because the width rule reads it as "no constraint" instead.
+
+    `sft_data_parallel_cards` treats a non-positive row count as "unknown, do not constrain" -- the
+    quote runs before the dataset is materialized, so that default is correct there. It is exactly
+    wrong for a malformed value: 0 or a negative silently credits every rented card, producing the
+    understated width and cost this field exists to prevent. A guard downstream cannot recover the
+    difference, since by then both cases look identical, so the type boundary has to reject it.
+    """
+    import pytest
+
+    from flash.cost.analytical import executed_gpu_count
+    from flash.cost.types import RunConfig
+
+    def config(rows):
+        return RunConfig("Qwen/Qwen3.6-27B", "sft", 10, batch_size=8, sft_retained_examples=rows)
+
+    for bad in (0, -5):
+        with pytest.raises(ValueError, match="sft_retained_examples must be >= 1"):
+            config(bad)
+    # bools are ints in python, and True would silently mean "one row" -- one rank, not a wide run.
+    for wrong_type in (True, False, 2.5, "8"):
+        with pytest.raises(TypeError, match="sft_retained_examples must be an integer"):
+            config(wrong_type)
+
+    # None still means UNKNOWN and must keep crediting every rented card: the quote legitimately
+    # runs before the row count exists, and narrowing there would reject runs that are fine.
+    assert executed_gpu_count(config(None), 4) == 4
+    # a real count still narrows, so the guard did not disable the rule it protects.
+    assert executed_gpu_count(config(10), 4) == 2
+
 
 def test_provisional_estimate_preserves_auto_provider():
     # Preparation stays offline: it cannot truthfully name a live substrate before allocation. The
@@ -858,6 +905,46 @@ def test_offline_quote_remedy_only_names_widths_a_provider_sells_freely():
             )
         )
     assert "no available provider is confirmed to sell" not in str(oversized.value)
+
+
+def test_quote_catalog_check_is_withheld_when_the_sft_width_would_not_launch():
+    """Regression: the quote's catalog remedy kept crediting cards its allocator mirror does not.
+
+    `_catalog_check_remedy` documents itself as the mirror of the allocator's `catalog_check_hint`,
+    so the two must answer alike or `--cost` names a `--gpus N` that submit rejects. An unpacked sft
+    run launches one rank however many cards are rented, so a width whose extra cards never join is
+    not a check worth a provider round trip.
+
+    The grpo control is the point: same pool, same pin, same shortfall, and it still names the width
+    -- so this cannot pass by suppressing the remedy everywhere.
+    """
+    from flash.cost.analytical import _offline_gpu_shape
+    from flash.cost.types import RunConfig
+
+    # the length is what makes this reachable: a batch-1 sft run needs LESS vram, so it only falls
+    # through to a remedy once the shortfall survives the clamp. at 400k it exceeds every card.
+    shared = {
+        "model_id": "Qwen/Qwen3.6-35B-A3B",
+        "steps": 10,
+        "seq_len": 400_000,
+        "completion_len": 512,
+        "batch_size": 1,
+        "group_size": 4,
+        "lora_rank": 16,
+        "gpu_count": 1,
+        "provider": "lambda",
+    }
+    with pytest.raises(ValueError, match="VRAM") as sft:
+        _offline_gpu_shape(RunConfig(method="sft", **shared))
+    assert "--gpus" not in str(sft.value), (
+        "an sft run clamped to one rank gains nothing from a wider SKU, so asking lambda to "
+        "confirm one is a round trip that cannot fix the quote"
+    )
+
+    # grpo launches every card it rents, so its catalog check is unchanged at the SAME shortfall.
+    with pytest.raises(ValueError, match="VRAM") as grpo:
+        _offline_gpu_shape(RunConfig(method="grpo", **shared))
+    assert "--gpus" in str(grpo.value)
 
 
 def test_offline_exact_pin_on_a_fixed_count_provider_still_names_a_width_to_check():

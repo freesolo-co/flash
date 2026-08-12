@@ -10,6 +10,7 @@ is how every call site and `monkeypatch.setattr(commands.render, ...)` reach the
 
 from __future__ import annotations
 
+from flash._internal.channel import CLI_NAME
 from flash.cli.ui.render import (
     _ACCENT2,
     _AMBER,
@@ -35,7 +36,7 @@ def models_table(rows: list[dict]) -> str:
     """Supported base models — a clean themed list of ids (the CLI lists ids only)."""
     dot = _glyph("•", "-")
     ids = "\n".join(f"  {_paint(dot, _FAINT)} {_paint(r['id'], _ACCENT2)}" for r in rows)
-    foot = arrow("train one with: flash train configs/sft.toml")
+    foot = arrow(f"train one with: {CLI_NAME} train configs/sft.toml")
     return _safe(f"{header('models', 'supported base models')}\n{ids}\n\n{foot}")
 
 
@@ -51,7 +52,7 @@ def projects_table(rows: list[dict]) -> str:
     if not body:
         return _safe(
             f"{header('projects list', 'Freesolo projects')}\n"
-            f"{_dim('  no projects yet; create one with `flash projects create NAME`')}"
+            f"{_dim(f'  no projects yet; create one with `{CLI_NAME} projects create NAME`')}"
         )
     return _safe(
         f"{header('projects list', 'Freesolo projects')}\n{_table(['NAME', 'PROJECT ID'], body)}"
@@ -148,5 +149,5 @@ def checkpoints_table(run_id: str, rows: list[dict]) -> str:
         for c in sorted(rows, key=lambda c: c.get("step", 0))
     ]
     table = _table(["STEP", "CHECKPOINT"], body, aligns=["r", "l"])
-    foot = arrow(f"deploy one with: flash models deploy {run_id}/step-<STEP>")
+    foot = arrow(f"deploy one with: {CLI_NAME} models deploy {run_id}/step-<STEP>")
     return _safe(f"{header('checkpoints', f'{len(rows)} deployable')}\n{table}\n\n{foot}")

@@ -8,6 +8,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from flash._internal.channel import CLI_NAME
 from flash.client.http import (
     FREESOLO_AUTH_VERIFY_PATH,
     FREESOLO_EVAL_RUNS_PATH,
@@ -47,7 +48,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
                 f"{displayable_url(base)} rejected this API key: check that this is the right "
                 "service for the key (a stale --freesolo-url or FREESOLO_BASE_URL rejects a "
                 "perfectly valid key), then create or copy a valid key at "
-                "https://freesolo.co/sign-in and pass it with `flash login --api-key` "
+                f"https://freesolo.co/sign-in and pass it with `{CLI_NAME} login --api-key` "
                 "(or FREESOLO_API_KEY)"
             ) from exc
         raise _api_error(exc) from exc
@@ -81,7 +82,7 @@ def _freesolo_request(
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             raise ClientError(
-                "freesolo rejected this API key — run `flash login` with a valid key "
+                f"freesolo rejected this API key — run `{CLI_NAME} login` with a valid key "
                 "(or set FREESOLO_API_KEY)"
             ) from exc
         raise _api_error(exc) from exc

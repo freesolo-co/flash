@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -190,6 +191,244 @@ def test_verl_packs_every_batch_so_the_batch_size_is_the_isolation_boundary():
     assert overrides["model.use_remove_padding"] == "true"
     assert "data.pad_mode" not in overrides
     assert overrides["data.train_batch_size"] == "1"
+
+
+def test_sft_pins_ulysses_off_because_sequence_parallelism_breaks_gdn():
+    """`ulysses_sp_size` must be the literal 1, never the card count.
+
+    Two independent reasons, either sufficient. Correctness: every catalog model is a GDN hybrid
+    whose layers are mostly linear attention plus a short causal conv, and both carry state ALONG
+    the sequence. Pinned verl patches ulysses into `_flash_attention_forward` and slices the Qwen
+    text model's inputs, but passes no recurrent or conv state between ranks -- so a sequence shard
+    would run its recurrence as if it were a whole sequence. Liveness: it also crashed, because
+    remove-padding leaves one `(1, total_nnz)` row and the slice desynchronizes the shapes the GDN
+    kernels are handed (`seq_idx must have shape (batch_size, seqlen)`), at every batch size.
+
+    Read the source: `build_sft_overrides` renders whatever it is given, so a test driving a cfg
+    dict would assert on its own fixture and stay green if the caller went back to `gpu_count`.
+    """
+    import inspect
+
+    from flash.engine.worker import sft_train_runner
+
+    src = inspect.getsource(sft_train_runner._prepare_sft_child)
+    line = next(ln.strip() for ln in src.splitlines() if ln.strip().startswith('"ulysses_sp_size"'))
+
+    assert line == '"ulysses_sp_size": 1,', line
+
+
+def test_sft_card_count_never_starves_a_rank_of_its_batch():
+    """The card count must divide the batch, because verl floor-divides the batch across ranks.
+
+    With ulysses pinned off, `dp_size == world_size`, and verl computes
+    `train_batch_size_per_dp = train_batch_size // dp_size` and hands that straight to a
+    DataLoader. Two widths are unusable: one ABOVE the batch floors to 0, and
+    `DataLoader(batch_size=0)` raises ValueError; one that does not DIVIDE the batch silently
+    shrinks the global batch, because the sampler and loader both drop the remainder.
+
+    The unpacked case is the one that matters most: `examples_per_update` is 1 for every
+    exact-unpacked run, which is exactly what a GDN model without the boundary-reset contract
+    gets -- so a 2-card allocation would otherwise compute 1 // 2 == 0 and die before step 1.
+    """
+    from flash.engine.worker.sft_train_runner import sft_data_parallel_cards
+
+    # unpacked: one example cannot be split, so extra cards have nothing to hold.
+    for cards in (1, 2, 4, 8):
+        assert sft_data_parallel_cards(cards, 1) == 1
+
+    # the batch divides the allocation: use every card.
+    assert sft_data_parallel_cards(2, 32) == 2
+    assert sft_data_parallel_cards(4, 32) == 4
+    assert sft_data_parallel_cards(8, 32) == 8
+
+    # it does not divide: fall to the largest divisor <= the allocation, never a remainder split.
+    assert sft_data_parallel_cards(4, 6) == 3
+    assert sft_data_parallel_cards(8, 12) == 6
+    assert sft_data_parallel_cards(3, 4) == 2
+    assert sft_data_parallel_cards(4, 10) == 2
+
+    # batch smaller than the allocation: bounded by the batch, never 0.
+    assert sft_data_parallel_cards(8, 2) == 2
+    assert sft_data_parallel_cards(8, 3) == 3
+
+    # exhaustive: never 0, never above the allocation, and always an exact divisor of the batch --
+    # the three properties that together mean no rank is starved and the global batch is preserved.
+    for cards in range(1, 9):
+        for batch in range(1, 33):
+            resolved = sft_data_parallel_cards(cards, batch)
+            assert 1 <= resolved <= cards
+            assert batch % resolved == 0, (cards, batch, resolved)
+
+
+def test_sft_warns_while_the_run_is_live_when_it_leaves_cards_idle(monkeypatch, capsys):
+    """An unused card is billed, so the run must say so while it is running.
+
+    Reducing the width keeps the run correct, but it is not free: the allocation is charged whole.
+    The notes record the executed width, and those are read afterwards -- the warning is what makes
+    the waste visible in `flash runs log` in time to cancel and resubmit.
+    """
+    from flash.engine.worker import sft_train
+
+    spec, captured = _stub_sft_run(monkeypatch)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        captured["command"] = command
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        heartbeat()
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+    sft_train.run_sft_train(spec)
+
+    # the fixture allocates 2 cards and resolves to 1 (unpacked profile -> batch of 1).
+    out = capsys.readouterr().out
+    assert "[sft][warn] training on 1 of 2 allocated cards" in out, out
+    assert "still billed" in out
+    assert "--nproc-per-node=1" in captured["command"]
+
+
+def test_sft_width_never_drops_a_profiled_row():
+    """The width must divide the ROW count, not just the batch.
+
+    verl builds `DistributedSampler(..., drop_last=True)` (`sft_trainer.py:237`) and Flash's
+    exact-dataloader shim overrides `drop_last` on the LOADER only -- its sampler patch sets
+    `shuffle` and nothing else. So a width that leaves a row remainder drops it from every epoch
+    while the frozen quote still bills it: 11 rows on 2 ranks trains 10, on 4 ranks trains 8.
+
+    This could not fire before Ulysses was pinned off, because `sp = gpu_count` forced `dp_size`
+    to 1. Making multi-rank SFT reachable is what puts this in scope.
+    """
+    from flash.engine.plan.steps import sft_data_parallel_cards
+
+    # 11 rows is prime: no width above 1 divides it, so every extra card would drop rows.
+    assert sft_data_parallel_cards(4, 8, 11) == 1
+    # 12 rows with batch 8 -> 4 divides both.
+    assert sft_data_parallel_cards(4, 8, 12) == 4
+    # rows divide but the batch does not: the batch still binds.
+    assert sft_data_parallel_cards(4, 2, 12) == 2
+    # batch divides but the rows do not: the rows now bind. 8 % 2 == 0, but 10 % 4 != 0.
+    assert sft_data_parallel_cards(4, 8, 10) == 2
+
+    # unknown row count (the cost path quotes before the dataset exists) must not constrain.
+    assert sft_data_parallel_cards(4, 8) == 4
+    assert sft_data_parallel_cards(4, 8, 0) == 4
+
+    # exhaustive: whatever comes back divides BOTH, so no rank is starved and no row is dropped.
+    for cards in range(1, 9):
+        for batch in range(1, 17):
+            for rows in range(1, 25):
+                got = sft_data_parallel_cards(cards, batch, rows)
+                assert 1 <= got <= cards
+                assert batch % got == 0, (cards, batch, rows, got)
+                assert rows % got == 0, (cards, batch, rows, got)
+
+
+def test_sft_idle_card_warning_names_a_remedy_that_can_actually_work():
+    """The advice has to move the width it is printed about, and name a shape you can rent.
+
+    Two ways this line can be confidently wrong. An unpacked profile pins the batch to 1 in
+    `sft_workload` regardless of `[train] batch_size`, so telling that operator to raise the batch
+    points at a knob that cannot change the answer. And only powers of two are rentable, so naming
+    an odd rank count as an allocation buys the next one DOWN -- "allocate 3" gets 2 cards, which
+    can leave a run that only fit on 4 unplaceable.
+    """
+    from flash.engine.worker.sft_train_runner import _resolve_sft_world_size
+
+    unpacked = io.StringIO()
+    with contextlib.redirect_stdout(unpacked):
+        assert _resolve_sft_world_size(2, 1, 12) == 1
+    text = unpacked.getvalue()
+    assert "[sft][warn] training on 1 of 2 allocated cards" in text, text
+    assert "batch_size" not in text, "raising the batch cannot move an unpacked run off one card"
+    assert "allocate 1 card(s)" in text, text
+
+    # batch 6 on 4 cards resolves to 3 ranks, but 3 is not rentable -- recommend 2.
+    odd = io.StringIO()
+    with contextlib.redirect_stdout(odd):
+        assert _resolve_sft_world_size(4, 6, 12) == 3
+    text = odd.getvalue()
+    assert "training on 3 of 4 allocated cards" in text, text
+    assert "allocate 2 card(s)" in text, text
+    assert "allocate 3 card(s)" not in text
+
+
+def test_sft_quote_credits_only_the_ranks_that_will_execute():
+    """A quote must not promise throughput from cards the batch cannot feed.
+
+    `gpu_count` at the quote boundary is the BILLED shape. SFT shards by data, so the executed
+    width is bounded by the batch: an unpacked run on 2 cards trains on one rank. Crediting the
+    billed width there understates wall time against the run's own cap. GRPO and OPD keep Ulysses
+    and do use every card, so the clamp must be SFT-only.
+    """
+    from flash.cost import analytical
+    from flash.cost.types import RunConfig
+
+    def speedup(method: str, batch: int, cards: int) -> float:
+        config = RunConfig(model_id="Qwen/Qwen3.5-4B", method=method, steps=10, batch_size=batch)
+        return analytical.method_card_speedup(config, cards, "H100", "runpod")
+
+    one_card = speedup("sft", 1, 1)
+    # unpacked sft: 2 billed cards, 1 executing rank -> quoted like the single card it is.
+    assert speedup("sft", 1, 2) == one_card
+    # a batch that divides the allocation keeps the full multi-card credit.
+    assert speedup("sft", 8, 2) > one_card
+    # grpo shards by data with ulysses across every card, so it is untouched by the batch.
+    assert speedup("grpo", 1, 2) > speedup("grpo", 1, 1)
+
+
+def test_sft_stays_quiet_when_every_allocated_card_is_used(monkeypatch, capsys):
+    """The warning must not fire on the normal path, or it trains readers to ignore it."""
+    from flash.engine.worker import sft_train
+
+    spec, _ = _stub_sft_run(monkeypatch)
+
+    # one card allocated: the resolved width can only equal it, so there is nothing to warn about.
+    spec.gpu.count = 1
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        heartbeat()
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+    sft_train.run_sft_train(spec)
+
+    assert "allocated cards" not in capsys.readouterr().out
+
+
+def test_sft_launches_the_resolved_width_not_the_allocated_cards():
+    """torchrun must start the RESOLVED rank count.
+
+    `sft_data_parallel_cards` is inert if the child is still launched with `--nproc-per-node` set
+    to the allocated card count: verl would split the batch across every rank torchrun started, so
+    the extra ranks would hit the batch_size=0 crash the resolver exists to prevent.
+    """
+    import inspect
+
+    from flash.engine.worker import sft_train_runner
+
+    src = inspect.getsource(sft_train_runner._prepare_sft_child)
+    # the ARGUMENT line, not a comment that happens to name the flag -- match on the f-string so a
+    # nearby comment mentioning `--nproc-per-node` cannot be picked up instead.
+    line = next(
+        ln.strip()
+        for ln in src.splitlines()
+        if "nproc-per-node" in ln and not ln.strip().startswith("#")
+    )
+
+    assert line == 'f"--nproc-per-node={world_size}",', line
+    assert '"n_gpus_per_node": world_size,' in src
+    # and the width is the RESOLVED one, not the raw allocation. the resolution lives in
+    # `_resolve_sft_width_and_micro_batch` (it also caps the micro-batch, which needs the width),
+    # so follow it there rather than pinning a call that moved.
+    assert "_resolve_sft_width_and_micro_batch(options, data, model)" in src
+    assert "options.gpu_count" in inspect.getsource(
+        sft_train_runner._resolve_sft_width_and_micro_batch
+    )
 
 
 def test_remove_padding_is_unconditional():
@@ -1608,7 +1847,13 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     sft_train.run_sft_train(spec)
 
     assert captured["command"][:3] == ["/venv/bin/python", "-m", "torch.distributed.run"]
-    assert "--nproc-per-node=2" in captured["command"]
+    # ONE rank, on a 2-card spec: this fixture's probes answer "not gdn, not pure attention", so
+    # the profile is exact-unpacked and `examples_per_update` is 1. verl would floor-divide that
+    # single example across 2 dp ranks and hand a DataLoader batch_size=0, so the second card is
+    # unusable for this run and must not be launched. See sft_data_parallel_cards.
+    assert "--nproc-per-node=1" in captured["command"]
+    assert "trainer.n_gpus_per_node=1" in captured["command"]
+    assert "engine.ulysses_sequence_parallel_size=1" in captured["command"]
     assert "verl.trainer.sft_trainer" in captured["command"]
     custom_path = next(
         value.split("=", 1)[1]
@@ -2149,6 +2394,330 @@ def test_sft_ships_no_val_file_so_the_child_cannot_validate():
     code = "\n".join(ln for ln in worker.splitlines() if not ln.strip().startswith("#"))
     assert "val.parquet" not in code
     assert "val_file" not in code
+
+
+def test_sft_hardware_ranking_prices_the_profiled_batch_not_the_authored_one(monkeypatch):
+    """Ranking must clamp on the batch the run EXECUTES, not the one the user typed.
+
+    `sharded_step_seconds` credits SFT only the ranks `sft_data_parallel_cards` allows, and that
+    reads `batch_size`. The workload profile reduces the authored batch to `examples_per_update`
+    (1 for every exact-unpacked run), so ranking off the authored number would credit a 4-card
+    candidate four ranks the worker will never launch -- picking a wider, costlier shape than the
+    run can use, and disagreeing with the persisted quote, which does read the profile.
+    """
+    import types
+
+    # a profile that reduces the authored batch of 8 to a single example per update.
+    import flash.cost.spec as cost_spec
+    from flash.core.spec import TrainSpec
+    from flash.providers.base import run_config_for_ranking
+
+    monkeypatch.setattr(
+        cost_spec,
+        "_sft_profile",
+        lambda spec: types.SimpleNamespace(
+            examples_per_update=1, retained_examples=10, max_length=1404
+        ),
+    )
+
+    spec = types.SimpleNamespace(algorithm="sft", train=TrainSpec(batch_size=8))
+    overrides = cost_spec.sft_ranking_overrides(spec)
+    assert overrides["batch_size"] == 1
+
+    # the row count binds the width too, and the MEASURED length is what a step is priced on --
+    # ranking that reads the authored context length prices work the run will not do.
+    assert overrides["sft_retained_examples"] == 10
+    assert overrides["seq_len"] == 1404
+
+    # the overrides must actually reach the config ranking prices, not just be computed.
+    config = run_config_for_ranking(
+        "Qwen/Qwen3.5-4B",
+        "sft",
+        train={"batch_size": 8, "max_context_tokens": 4096},
+        overrides=overrides,
+    )
+    assert (config.batch_size, config.sft_retained_examples, config.seq_len) == (1, 10, 1404)
+
+    # a non-sft run has no profile clamp and must pass its knobs through untouched.
+    grpo = types.SimpleNamespace(algorithm="grpo", train=TrainSpec(batch_size=8))
+    assert cost_spec.sft_ranking_overrides(grpo) == {}
+
+    # an unreadable profile must not fail the submission -- rank on the authored knobs instead.
+    # ranking runs BEFORE the quote, so raising here would fail a submission the quote would catch.
+    def boom(spec):
+        raise ValueError("digest mismatch")
+
+    monkeypatch.setattr(cost_spec, "_sft_profile", boom)
+    assert cost_spec.sft_ranking_overrides(spec) == {}
+    fallback = run_config_for_ranking(
+        "Qwen/Qwen3.5-4B",
+        "sft",
+        train={"batch_size": 8},
+        overrides=cost_spec.sft_ranking_overrides(spec),
+    )
+    assert fallback.batch_size == 8
+
+
+def test_sft_vram_sizing_uses_the_profiled_batch_not_the_authored_one(monkeypatch):
+    """Submit must RESERVE for the work that runs, not the batch the user typed.
+
+    Ranking takes the profile through `overrides`, but `required_vram_gb` sizes from `train`. Those
+    are different vocabularies (`seq_len` vs `max_context_tokens`), so moving the profiled batch
+    into `overrides` silently left sizing on the authored one: a 4B at the authored batch 8 / 4096
+    reserves 23.0 GB while the run executes batch 1 / 1404 and needs 19.0 GB. That over-reserves by
+    4 GB and can reject a card the run would have fit on -- the same authored-vs-executed split the
+    ranking clamp exists to close.
+
+    The assertion drives `allocate` and captures what sizing actually receives. Exercising
+    `_overridden_train` alone cannot catch this: the helper keeps translating correctly whether or
+    not the call site uses it, so a version that sizes off the authored `train` still passes.
+    """
+    from flash.core.spec import TrainSpec
+    from flash.providers import allocator
+
+    authored = {"batch_size": 8, "max_context_tokens": 4096}
+    overrides = {"batch_size": 1, "seq_len": 1404, "sft_retained_examples": 10}
+
+    sized_authored = allocator.required_vram_gb("Qwen/Qwen3.5-4B", "sft", train=authored)
+    sized_executed = allocator.required_vram_gb(
+        "Qwen/Qwen3.5-4B", "sft", train={"batch_size": 1, "max_context_tokens": 1404}
+    )
+    assert sized_executed < sized_authored, (
+        f"sizing off the authored batch reserves {sized_authored} GB for work that needs "
+        f"{sized_executed} GB"
+    )
+
+    captured = {}
+
+    def capture(model_id, algorithm, *, train=None, thinking=False, model_revision=""):
+        captured["train"] = train
+        return sized_executed
+
+    monkeypatch.setattr(allocator, "required_vram_gb", capture)
+    # allocation itself may fail on provider availability; sizing runs first, which is the contract
+    # under test.
+    with contextlib.suppress(Exception):
+        allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=authored, overrides=overrides)
+    assert captured["train"] == {"batch_size": 1, "max_context_tokens": 1404}, (
+        f"allocate() sized VRAM from {captured.get('train')!r}; it must pass the profile-overridden "
+        "knobs or submit reserves for a batch the run never executes"
+    )
+
+    # a dataclass train table must substitute the same way, and absent overrides must not touch it.
+    spec_train = TrainSpec(batch_size=8, max_context_tokens=4096)
+    with contextlib.suppress(Exception):
+        allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=spec_train, overrides=overrides)
+    assert captured["train"].batch_size == 1
+    assert captured["train"].max_context_tokens == 1404
+    with contextlib.suppress(Exception):
+        allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=spec_train)
+    assert captured["train"] is spec_train
+
+
+def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
+    """A remedy that cannot be acted on is worse than no remedy.
+
+    Three ways the earlier wording failed. It routed the card advice through
+    `largest_rentable_count(world_size)`, which is the next power of two DOWN and need not divide
+    the batch or the rows either -- at 4 cards with a batch of 3 it named 2, and 2 does not divide
+    3. And it advised raising `batch_size` whenever the batch was above 1, including when the batch
+    already divided the allocation and the ROWS were what bound the width, where raising the batch
+    changes nothing.
+
+    Fixing the first by re-resolving under a rentable ceiling then broke rentability instead:
+    `sft_data_parallel_cards` searches DOWNWARD for a divisor, so it walks back off the power-of-two
+    grid and named 3 cards at 7/batch 6/rows 6. Divisibility and rentability are independent, so the
+    sweep below asserts BOTH -- it passed on that revision while providers sold none of what it
+    advised.
+    """
+    import contextlib
+    import io
+    import re
+
+    from flash.engine.plan.steps import sft_data_parallel_cards
+    from flash.engine.worker.sft_train_runner import _resolve_sft_world_size
+    from flash.providers.base import rentable_gpu_counts
+
+    def warn(cards, batch, rows):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            width = _resolve_sft_world_size(cards, batch, rows)
+        return width, buf.getvalue()
+
+    # rows bind (8 divides 4 cards cleanly), so raising the batch is not the remedy.
+    width, text = warn(4, 8, 10)
+    assert width == 2
+    assert "a dataset of 10 rows" in text, text
+    assert "batch_size" not in text, "rows bind here, so raising the batch cannot help"
+    assert "allocate 2 card(s)" in text, text
+
+    # the batch binds AND fixing it is sufficient (12 rows already divide 4), so the batch remedy
+    # is legitimate and must still be offered.
+    _, text = warn(4, 3, 12)
+    assert "a batch of 3" in text, text
+    assert "batch_size" in text, text
+
+    # neither divides: raising the batch cannot reach full width because the rows still will not
+    # split 4 ways, so name the dataset and the lower card count instead.
+    _, text = warn(4, 6, 10)
+    assert "a dataset of 10 rows" in text, text
+    assert "batch_size" not in text, "rows block full width too, so the batch remedy is a dead end"
+
+    # an unpacked run pins the batch to 1, which binds on its own -- but it is not the ROWS that
+    # bind, and saying so is a false statement about the dataset. 12 divides 4 exactly here, so
+    # blaming the rows sends the operator to reshape a dataset that was never the problem.
+    width, text = warn(4, 1, 12)
+    assert width == 1
+    assert "single example per update" in text, text
+    assert "12 rows" not in text, "12 divides 4 cleanly; the rows are not what bind at batch 1"
+    assert "batch_size" not in text, "packing mode fixes the batch at 1, so it cannot be raised"
+    assert "allocate 1 card(s)" in text, text
+
+    # a batch remedy is only ever printed when acting on it actually restores the full allocation.
+    for cards in range(1, 9):
+        for batch in range(1, 17):
+            for rows in range(32):
+                _, text = warn(cards, batch, rows)
+                if "batch_size" not in text:
+                    continue
+                raised = cards * (batch // cards + 1)
+                assert sft_data_parallel_cards(cards, raised, rows) == cards, (
+                    f"advised raising batch to {raised} at {cards}/{batch}/{rows}, which still "
+                    "does not use every card"
+                )
+
+    # every width this warning recommends must be BOTH rentable and usable. neither implies the
+    # other: the rentable count need not divide the batch (4 cards, batch 3 -> 2, and 3 % 2 != 0),
+    # and a divisor need not be rentable (7 cards, batch 6, rows 6 -> 3, which nobody sells).
+    for cards in range(1, 9):
+        for batch in range(1, 17):
+            for rows in range(1, 32):
+                width, text = warn(cards, batch, rows)
+                if width >= cards:
+                    assert text == "", "must stay quiet when every allocated card is used"
+                    continue
+                found = re.search(r"allocate (\d+) card", text)
+                assert found, text
+                advised = int(found.group(1))
+                assert advised in rentable_gpu_counts(cards), (
+                    f"advised {advised} cards at {cards}/{batch}/{rows}: not a shape providers rent"
+                )
+                assert batch % advised == 0, (cards, batch, rows, advised)
+                assert rows % advised == 0, (cards, batch, rows, advised)
+                assert advised == sft_data_parallel_cards(advised, batch, rows)
+                assert advised <= width, "advising more cards than the run can use is the same bug"
+
+
+def test_sft_idle_card_advice_does_not_shrink_the_memory_the_run_is_running_on():
+    """Advising FEWER cards than the run launched can take away memory it needs to exist.
+
+    The idle-card warning fires on a rented shape the fit gate already accepted, and the ranks that
+    joined are what hold the model. Dropping to the next rentable divisor is a VRAM change, not just
+    a billing one: Qwen3.6-27B sft at 32k is sized at 159 GB, a 4x H100 rental launching 3 ranks
+    provides 191.6 GB and runs, but batch 6 over 6 rows advised "allocate 2 card(s)" -- 130.4 GB,
+    which the fit gate rejects. Acting on that remedy turns a working run into an unplaceable one.
+
+    The worker cannot check the fit itself: it runs after allocation, on hardware already rented,
+    and has no VRAM need in scope. So the advice is QUALIFIED rather than computed -- it stays a
+    billing observation and never claims the smaller shape still holds the model. A width at or
+    above the launched one needs no qualifier, because it takes no memory away.
+    """
+    import contextlib
+    import io
+    import re
+
+    from flash.engine.worker.sft_train_runner import _resolve_sft_world_size
+
+    def warn(cards, batch, rows):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            width = _resolve_sft_world_size(cards, batch, rows)
+        return width, buf.getvalue()
+
+    # the reported case: 3 ranks hold the run, the advised 2 cards would not.
+    width, text = warn(4, 6, 6)
+    assert width == 3, "batch 6 over 6 rows launches 3 of the 4 rented cards"
+    assert "allocate 2 card(s)" in text, text
+    assert "fits" in text, (
+        "advice that drops below the launched width must be qualified as a fit question, "
+        f"not presented as the remedy: {text!r}"
+    )
+
+    # whenever the advised width is BELOW the ranks actually running, the line must not present
+    # the smaller shape as a straight remedy -- that shape may not hold the model at all.
+    for cards in range(1, 9):
+        for batch in range(1, 17):
+            for rows in range(1, 32):
+                width, text = warn(cards, batch, rows)
+                if not text:
+                    continue
+                found = re.search(r"allocate (\d+) card", text)
+                assert found, text
+                advised = int(found.group(1))
+                if advised < width:
+                    assert "fits" in text, (
+                        f"at {cards}/{batch}/{rows} advised {advised} cards below the {width} "
+                        f"ranks running, unqualified: {text!r}"
+                    )
+
+
+def test_sft_quote_credits_the_width_the_rows_allow_not_just_the_batch():
+    """Pricing must clamp on the rows too, or it re-opens the gap the batch clamp closed.
+
+    A packed profile can leave a row count that narrows the width below what the batch alone
+    permits: batch 8 with 10 retained rows on 4 cards launches 2 ranks, not 4. Crediting 4 there
+    understates wall time and cost exactly as the authored-batch bug did.
+
+    The row count must be carried explicitly rather than derived from `sft_packed_blocks`, which is
+    `ceil(rows / examples_per_update)` and reconstructs those 10 rows as 16 -- an OVER-credit, i.e.
+    the very failure this clamp exists to prevent.
+    """
+    from flash.cost import analytical
+    from flash.cost.types import RunConfig
+    from flash.engine.plan.steps import sft_data_parallel_cards
+
+    def speedup(rows):
+        config = RunConfig(
+            model_id="Qwen/Qwen3.5-4B",
+            method="sft",
+            steps=10,
+            batch_size=8,
+            sft_retained_examples=rows,
+        )
+        return analytical.method_card_speedup(config, 4, "H100", "runpod")
+
+    # the worker would launch 2 ranks on 10 rows and 4 on 16; the quote must agree with both.
+    assert sft_data_parallel_cards(4, 8, 10) == 2
+    assert sft_data_parallel_cards(4, 8, 16) == 4
+    assert speedup(10) < speedup(16)
+    assert speedup(10) == speedup(2 * 5)
+
+    # an unknown row count must not constrain: the quote is built before the dataset exists on some
+    # paths, and inventing a bound there would misprice every one of them.
+    assert speedup(None) == speedup(16)
+
+
+def test_sft_resume_guard_checks_the_launched_width_not_the_allocation():
+    """The fsdp resume guard must compare against the width verl actually starts at.
+
+    `_restore_verl_resume(..., world_size=...)` discards a checkpoint written at a different rank
+    count. SFT shards by data, so the launched width is bounded by the batch and the row count and
+    is NOT the allocated card count whenever either fails to divide it. Passing `options.gpu_count`
+    there would discard a checkpoint that matches the run about to start, and keep one that does
+    not -- the exact inversion the guard exists to prevent.
+    """
+    import inspect
+
+    from flash.engine.worker import sft_train_runner
+
+    src = inspect.getsource(sft_train_runner._prepare_sft_child)
+    assert "_restore_verl_resume(options.paths.local_dir, world_size=world_size)" in src
+    assert "world_size=options.gpu_count" not in src
+
+    # and the resolved width must be established before the resume call that consumes it.
+    assert src.index("world_size, micro_batch = _resolve_sft_width_and_micro_batch(") < src.index(
+        "_restore_verl_resume("
+    )
 
 
 def test_publish_does_not_leave_every_step_adapter_on_the_container_disk(monkeypatch, tmp_path):
@@ -2889,3 +3458,69 @@ def test_the_worker_disables_xet_as_its_very_first_action():
         f"_run_worker_mode starts by calling {name!r}, not _disable_xet_upload_staging; "
         "uploads would stage a second copy of every checkpoint through the xet cache"
     )
+
+
+def test_sft_micro_batch_never_exceeds_a_ranks_share_of_the_batch():
+    """The micro-batch is sized against the GLOBAL batch, but each rank only sees its slice.
+
+    Pinning ulysses off makes SFT shard by DATA, so verl hands each rank
+    `train_batch_size // world_size` and rejects a micro-batch larger than that before the first
+    optimizer step. Batch 8 on 4 ranks is a per-rank batch of 2, so a micro-batch of 4 -- correct
+    for the global batch -- is an incompatible geometry the run dies on.
+
+    Asserted on the config the child actually receives, because the micro-batch is computed long
+    before `world_size` is resolved; a test that only exercised the sizing helper would keep passing
+    while the call site shipped the uncapped value.
+    """
+    from types import SimpleNamespace
+
+    from flash.engine.worker import sft_train_runner as runner
+
+    def capped(train_batch_size, micro_batch, gpu_count, rows):
+        _world, mb = runner._resolve_sft_width_and_micro_batch(
+            SimpleNamespace(gpu_count=gpu_count),
+            SimpleNamespace(rows=[{}] * rows),
+            SimpleNamespace(train_batch_size=train_batch_size, micro_batch=micro_batch),
+        )
+        return mb
+
+    # codex's case: batch 8 across 4 ranks -> per-rank 2, so a global-derived 4 must come down
+    assert capped(8, 4, 4, 64) == 2
+    # and the token budget must follow the same number, not the uncapped one
+    assert capped(8, 4, 8, 64) == 1
+    # a micro-batch already within the rank's share is untouched
+    assert capped(8, 2, 4, 64) == 2
+    assert capped(8, 1, 4, 64) == 1
+    # single card: the rank owns the whole batch, so nothing is capped away
+    assert capped(8, 4, 1, 64) == 4
+    # never zero -- a DataLoader with batch_size=0 raises
+    assert capped(1, 4, 8, 64) >= 1
+
+
+def test_sft_result_records_the_micro_batch_that_ran_not_the_one_requested():
+    """The result file must report the EXECUTED per-rank micro-batch.
+
+    Data parallelism caps the micro-batch to one rank's share of the batch (batch 8 over 4 ranks
+    leaves 2), and verl rejects anything larger. Recording `model.micro_batch` instead reports the
+    REQUEST: a completed run claimed 4 while every rank ran 2, so a reader reconstructing the token
+    budget or reproducing the run doubles the rows each rank actually held. `gradient_accumulation_
+    steps` is derived from the same number, so it inherits the error.
+
+    Asserted against the source because the writer's inputs are a live verl child; the point is
+    which object the value is read FROM, and that is what the fix changes.
+    """
+    import inspect
+
+    from flash.engine.worker import sft_train
+
+    src = inspect.getsource(sft_train._write_sft_result)
+    assert '"per_device_train_batch_size": child.micro_batch,' in src
+    assert "child.micro_batch)" in src, "gradient accumulation must derive from the executed value"
+    # the uncapped request must not reach the result under either key.
+    assert '"per_device_train_batch_size": model.micro_batch,' not in src
+    assert "math.ceil(model.train_batch_size / model.micro_batch)" not in src
+
+    # and the child must actually carry it, or the writer above cannot read it.
+    from flash.engine.worker import sft_train_runner
+
+    assert "micro_batch" in sft_train_runner._SftChild.__dataclass_fields__

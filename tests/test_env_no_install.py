@@ -11,6 +11,7 @@ import argparse
 import pytest
 
 import flash.cli.commands.env.list as env_list_commands
+from flash._internal.channel import CLI_NAME
 from flash.cli import _build_parser
 from flash.cli.commands.env.list import cmd_env_list
 
@@ -69,7 +70,7 @@ def test_env_list_reports_local_only(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "local env sources" in out
     assert "." in out
-    assert "flash env push --project <project-uuid> --name <name> <path>" in out
+    assert f"{CLI_NAME} env push --project <project-uuid> --name <name> <path>" in out
     assert "installed environments" not in out  # the removed manifest section
 
 

@@ -28,6 +28,8 @@ def _env_spec(resolved_sha: str = "", **extra) -> JobSpec:
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "grpo",
             "environment": {"id": "org/env", "resolved_sha": resolved_sha},
+            # a grpo quote needs a stated prompt-pool size; these tests are about the env pin.
+            "train": {"max_examples": 8},
             **extra,
         }
     )
@@ -156,7 +158,8 @@ def _retry_spec() -> JobSpec:
             "algorithm": "grpo",
             "seed": 0,
             "run_id": "flash-1700000001-pin1",
-            "train": {"epochs": 1, "hf_repo": "owner/runs"},
+            # max_examples: a grpo quote needs a stated pool size; these tests are about the pin.
+            "train": {"epochs": 1, "hf_repo": "owner/runs", "max_examples": 8},
             "gpu": {"type": "RTX 4090", "max_retries": 2},
             "environment": {"id": "org/env"},
         }

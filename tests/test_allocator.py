@@ -142,15 +142,24 @@ def test_step_cost_key_none_for_uncatalogued_model():
 def test_latency_bound_step_ignores_gpu_speed():
     """When a step is dominated by waits no card shortens, ranking collapses back toward $/hr.
 
-    GRPO spends most of a step waiting on concurrent reward grading, so buying more FLOPs cannot
-    pay for itself and the cheaper rental legitimately wins.
+    The wait has to be MEASURED to exist. This used to pass on the default reward wall, which put
+    ``completions x 1.0s`` beside a step floor already fitted with grading included -- so the step
+    read as latency-bound because of a charge that was counted twice. The realized graders in the
+    2026-08-01 campaign ran 0.0001-0.001s and left GRPO firmly gpu-bound. An env whose reward calls
+    an LLM judge genuinely does wait seconds per completion, and that is the case this covers.
     """
+    from dataclasses import replace
+
     from flash.cost.analytical import step_seconds_split
     from flash.cost.types import RunConfig
 
-    gpu_bound, fixed = step_seconds_split(
-        RunConfig(model_id="Qwen/Qwen3.5-0.8B", method="grpo", steps=1), "H100"
-    )
+    fast = RunConfig(model_id="Qwen/Qwen3.5-0.8B", method="grpo", steps=1)
+    gpu_bound, fixed = step_seconds_split(fast, "H100")
+    # a local grader adds nothing beyond the floor: the math, not a wait, is the step.
+    assert gpu_bound > fixed
+
+    judge = replace(fast, reward_seconds_per_completion=5.0)
+    gpu_bound, fixed = step_seconds_split(judge, "H100")
     assert fixed > gpu_bound  # the wait, not the math, is what the step is made of
 
 
@@ -304,6 +313,86 @@ def test_exact_dynamic_provider_empty_capacity_is_retryable(monkeypatch, provide
             provider=provider,
             gpu_type="H100",
         )
+
+
+@pytest.mark.parametrize("gpu_type", ["", "H100"])
+def test_sft_width_that_never_fits_is_terminal_not_a_capacity_retry(monkeypatch, gpu_type):
+    """Regression: a width the fit filter always rejects was reported as sold-out capacity.
+
+    The filter credits only the ranks an sft run launches, and an unpacked batch of 1 launches ONE
+    however many cards are rented. When that empties the candidate set, the classification has to
+    agree: it asked whether any offered class fits at the RENTED count, so it still found a shape,
+    called the miss retryable, and `_allocate_attempt` turned it into a `poll_error`. On a
+    Lambda/Vast-only fleet that re-polls a live market for capacity that cannot help -- no lookup
+    makes a batch of 1 use more ranks -- burning the infra budget instead of failing with the reason.
+
+    Parametrized over both branches because a pin and an unpinned search classify separately.
+    """
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import Candidate, CapacityLookupError, UnsupportedGpuError
+
+    # 200 GB does not fit one H100 card, and the clamp means one card is all that ever launches.
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda",))
+    # capacity is HEALTHY: the provider offers the shape, so nothing here is a stock or outage
+    # artifact. only the executed-width clamp removes it, which is exactly the terminal case.
+    monkeypatch.setattr(
+        get_provider("lambda"),
+        "live_candidates",
+        lambda need, constraints: [
+            Candidate(provider="lambda", gpu="H100", hourly_usd=2.0, vram_gb=80, gpu_count=n)
+            for n in (1, 2, 4, 8)
+        ],
+    )
+
+    with pytest.raises(UnsupportedGpuError) as ei:
+        allocator.allocate(
+            "Qwen/Qwen3.5-0.8B",
+            "sft",
+            train={"batch_size": 1},
+            gpu_type=gpu_type,
+            max_gpu_count=8,
+        )
+    assert not isinstance(ei.value, CapacityLookupError), (
+        "an unpacked sft run launches one rank, so no market lookup can widen it -- classifying "
+        "this as capacity makes the runner retry a deterministic rejection until the budget dies"
+    )
+
+
+def test_lookup_blip_is_only_retryable_when_a_launchable_shape_exists(monkeypatch):
+    """Regression: the lookup-failure branch returned retryable before consulting executed width.
+
+    A live-capacity blip is retryable because the outage may be HIDING a shape that fits. When the
+    run's executed width fits no advertised class, the outage is not what stands in the way and a
+    retry cannot help -- `_allocate_attempt` turns it into `poll_error` and burns the infra budget on
+    a deterministic miss. The advertised class list is static and readable during the outage, so this
+    is decidable exactly when it matters.
+
+    Both halves are asserted: the blip must STILL be retryable when a launchable shape does exist, or
+    this guard would trade a retry bug for an outage that kills every run.
+    """
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import CapacityLookupError, UnsupportedGpuError
+
+    def _blip(need, constraints):
+        raise CapacityLookupError("lambda live capacity lookup failed")
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda",))
+    monkeypatch.setattr(get_provider("lambda"), "live_candidates", _blip)
+
+    # 200 GB against an sft run clamped to one rank: no advertised class holds it at any count.
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
+    with pytest.raises(UnsupportedGpuError) as ei:
+        allocator.allocate("Qwen/Qwen3.5-0.8B", "sft", train={"batch_size": 1}, max_gpu_count=8)
+    assert not isinstance(ei.value, CapacityLookupError), (
+        "the blip did not cause this and cannot cure it -- no lookup makes a batch of 1 use more "
+        "ranks, so retrying spends the infra budget on a shape that will never exist"
+    )
+
+    # same blip, same provider, but a need one card CAN hold: still retryable, as before.
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    with pytest.raises(CapacityLookupError):
+        allocator.allocate("Qwen/Qwen3.5-0.8B", "sft", train={"batch_size": 1}, max_gpu_count=8)
 
 
 def test_exact_runpod_empty_capacity_stays_terminal(monkeypatch):
@@ -1918,6 +2007,166 @@ def test_wider_shape_remedy_names_the_cheapest_fitting_width():
     assert "--gpus 2" in wider_shape_remedy((vram,), vram + 40, ceiling=8, above=1)
 
 
+def test_remedy_never_names_a_width_the_run_will_not_launch_on():
+    """Regression: `--gpus N` was searched with the RENTED count, not the ranks that join.
+
+    The fit gate credits only launched ranks, so an unpacked sft run (batch 1, one rank however many
+    cards are rented) is rejected at every width. The remedy searched the same failure with the full
+    count and answered `--gpus 2`: the user pays for a second card that contributes no memory and
+    fails identically. Advice has to be proved with the rule that will judge the retry.
+
+    Codex's shape exactly: a batch-1 4B at 32k needs 28 GB and does not fit a 24 GB card.
+    """
+    from flash.providers.base import wider_shape_remedy
+
+    need, card = 28.0, 24
+    assert (
+        wider_shape_remedy((card,), need, ceiling=8, above=1, executed_width=lambda _n: 1) == ""
+    ), (
+        "an sft run pinned to one rank gains nothing from more cards, so no width is a remedy -- "
+        "naming one sends the user to pay twice for the same failure"
+    )
+    # the default is unchanged for everything that DOES launch what it rents, so this cannot
+    # silently suppress a real remedy on grpo/opd.
+    assert "--gpus 2" in wider_shape_remedy((card,), need, ceiling=8, above=1)
+    assert "--gpus 2" in wider_shape_remedy(
+        (card,), need, ceiling=8, above=1, executed_width=lambda n: n
+    )
+
+
+def test_pin_rejection_names_the_width_it_actually_credited():
+    """Regression: the message claimed a `cap`-card combination the VRAM math never tried.
+
+    Once the precheck credits `launched(cap)`, saying "cannot fit even as an 8-card combination" for
+    a run that launches one rank points the operator at the card ceiling -- they raise `--gpus` and
+    hit the identical failure. The real limiter is the batch that bounds the rank count, so the
+    message has to name the width it credited and why it is smaller than the one allowed.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import UnsupportedGpuError
+
+    def reject(executed_width):
+        with pytest.raises(UnsupportedGpuError) as ei:
+            _resolve_exact_gpu(
+                "H100",
+                need=500.0,
+                cap=8,
+                max_gpu_count=8,
+                provider="",
+                available=("runpod",),
+                widest_cap=8,
+                executed_width=executed_width,
+            )
+        return str(ei.value)
+
+    clamped = reject(lambda _n: 1)
+    assert "1-card combination" in clamped, (
+        "the math credited one rank, so claiming a wider combination was tried sends the operator "
+        "to raise a ceiling that is not the limiter"
+    )
+    assert "8-card combination" not in clamped
+    assert "only 1 joins this run" in clamped, "the message must say WHY the width is smaller"
+
+    # a run that launches what it rents keeps the original wording, with no confusing aside.
+    full = reject(lambda n: n)
+    assert "8-card combination" in full
+    # "join this run" also covers the singular "joins this run", which contains it.
+    assert "join this run" not in full
+
+
+def test_width_search_credits_only_the_ranks_that_join():
+    """Regression: the shared width search credited rented cards on every consumer.
+
+    `smallest_fitting_gpu_count` backs the auto-sized ceiling, the authored-ceiling check, and both
+    catalog hints. Crediting cards that never join made all of them name a width that cannot hold
+    the run -- an unpinned sft run with `gpu.count=1` was told to raise the ceiling to two, and the
+    resubmission failed identically because `executed_width(2)` is still one.
+
+    Fixing the shared helper rather than each caller is what makes the ceiling search, the pinned
+    precheck, and the `--gpus N` advice answer one question.
+    """
+    from flash.providers.base import GPU_INFO, smallest_fitting_gpu_count
+
+    need = GPU_INFO["H100"].vram_gb + 40.0  # fits on 2 rented cards, never on 1
+
+    assert (
+        smallest_fitting_gpu_count(
+            need, max_gpu_count=8, gpu_names=("H100",), executed_width=lambda _n: 1
+        )
+        is None
+    ), "a run clamped to one rank has no fitting width, so no ceiling can be promised"
+
+    # unchanged for runs that launch what they rent, and unchanged when no rule is supplied at all.
+    assert smallest_fitting_gpu_count(need, max_gpu_count=8, gpu_names=("H100",)) == 2
+    assert (
+        smallest_fitting_gpu_count(
+            need, max_gpu_count=8, gpu_names=("H100",), executed_width=lambda n: n
+        )
+        == 2
+    )
+
+
+def test_width_search_finds_a_shape_the_executed_width_reaches_non_monotonically():
+    """Crediting the executed width is not enough on its own: it must be VALUED as a rank count.
+
+    Two things break a first-hit search once the width rule is applied. The executed width is not
+    monotonic in the rented count -- sft over 3 rows with batch 3 launches 1 rank on 2 cards but 3
+    on 4 -- so a search that stops at the first miss abandons a wider shape that does fit. And a
+    rank count is not a rentable count, so valuing it through the rentable snap floors 3 ranks to
+    2, under-crediting a combination by a whole card.
+
+    Together they made a run that fits on 4 cards report that no width could hold it, which the
+    caller turns into a terminal rejection of a job the allocator would have launched.
+    """
+    from flash.engine.plan.steps import sft_data_parallel_cards
+    from flash.providers.base import GPU_INFO, combined_vram_gb, smallest_fitting_gpu_count
+
+    width = lambda count: sft_data_parallel_cards(count, 3, 3)  # noqa: E731
+    assert (width(2), width(4)) == (1, 3), "premise: the executed width dips, then climbs"
+
+    vram = GPU_INFO["H100"].vram_gb
+    need = combined_vram_gb(vram, 2) + 1.0  # over 2 ranks, under 3
+    assert combined_vram_gb(vram, 3) >= need > combined_vram_gb(vram, 2)
+
+    assert (
+        smallest_fitting_gpu_count(need, max_gpu_count=8, gpu_names=("H100",), executed_width=width)
+        == 4
+    ), "4 rented cards launch 3 ranks, which hold the run -- the search must not stop at 2"
+
+
+def test_catalog_hint_is_withheld_when_the_width_would_not_launch():
+    """The `--gpus N` catalog hint searched widths crediting rented cards, like the remedy did.
+
+    `smallest_fitting_gpu_count` has no executed-width notion, so for a clamped sft run it names a
+    count that buys nothing -- sending the user to ask a provider to confirm a SKU that cannot help.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError
+
+    need = GPU_INFO["H100"].vram_gb + 40.0  # fits on 2 rented cards, never on 1
+
+    def message(executed_width):
+        with pytest.raises(UnsupportedGpuError) as ei:
+            _resolve_exact_gpu(
+                "H100",
+                need=need,
+                cap=1,
+                max_gpu_count=1,
+                provider="lambda",
+                available=("lambda",),
+                widest_cap=8,
+                executed_width=executed_width,
+            )
+        return str(ei.value)
+
+    assert "--gpus" not in message(lambda _n: 1), (
+        "a clamped sft run stays at one rank, so asking lambda to confirm a 2-card SKU is a round "
+        "trip that cannot fix the run"
+    )
+    # unchanged for runs that launch what they rent: the hint is real advice there.
+    assert "--gpus 2" in message(lambda n: n)
+
+
 def test_provider_incompatible_pin_reports_the_incompatibility_not_a_fit_remedy():
     """A class the pinned provider does not carry is a provider error at EVERY width.
 
@@ -2253,6 +2502,108 @@ def test_the_obstacle_never_contradicts_the_remedy_printed_after_it():
     for msg in (wider, same, catalog):
         if "Drop the provider pin" in msg:
             assert "exists only if their live catalog lists one" not in msg
+
+
+def test_the_fit_message_states_capacity_the_run_will_actually_have():
+    """The shapes a fit rejection PRINTS must be valued at the width the search accepted them on.
+
+    The width search credits launched ranks, but the two shapes quoted in the message were valued
+    on rented cards, so the message argued against itself: a 2-card ceiling that launches one rank
+    was reported as providing 234.1 GB against a 230 GB need -- more than it needs, printed as the
+    reason for rejection -- and then recommended a 4-card shape credited 252.8 GB that really
+    delivers 191.6. Every number a user reads has to be memory the run will actually have.
+    """
+    from flash.engine.plan.steps import sft_data_parallel_cards
+    from flash.providers.fit_errors import vram_fit_error_message
+
+    width = lambda count: sft_data_parallel_cards(count, 3, 3)  # noqa: E731
+
+    def message(executed_width):
+        return vram_fit_error_message(
+            "sft",
+            230,
+            requested_gpu_count=2,
+            effective_gpu_count=2,
+            max_gpu_count=8,
+            gpu_names=("H100", "H200"),
+            executed_width=executed_width,
+        )
+
+    clamped = message(width)
+    assert "provides at most 141 GB" in clamped, "2 rented cards launch 1 rank, so 141 GB is all"
+    assert "234.1 GB" not in clamped, "the rented-card capacity must not be quoted anywhere"
+    # the rejection has to READ like a rejection: a stated capacity above the stated need does not.
+    assert "needs >= 230 GB" in clamped
+
+    # unchanged for runs that launch what they rent, whether the rule is identity or absent.
+    for control in (message(None), message(lambda count: count)):
+        assert "provides at most 234.1 GB" in control
+        assert "`--gpus 2` (2x H200 = 234.1 GB)" in control
+
+
+def test_a_shape_label_reconciles_with_the_capacity_printed_beside_it():
+    """A rented COUNT next to a launched CAPACITY states a false equation unless the gap is named.
+
+    Valuing capacity at the executed width fixed the arithmetic but left the labels reading as
+    though the hardware were smaller: `2x H200` beside 141 GB says an H200 is a 70 GB card, and an
+    `8-card combination` capped at 446.6 GB understates the class without saying why. A user who
+    cannot reconcile the two numbers reaches for `--gpus`, which is the one knob that cannot help
+    when the batch is the limiter -- so the label has to name the join count and the reason.
+    """
+    from flash.engine.plan.steps import sft_data_parallel_cards
+    from flash.providers.fit_errors import vram_fit_error_message
+
+    width = lambda count: sft_data_parallel_cards(count, 3, 3)  # noqa: E731
+    reason = "sft shards by data, so the batch and retained rows bound the rank count"
+
+    pinned = vram_fit_error_message(
+        "sft",
+        230,
+        requested_gpu_count=2,
+        effective_gpu_count=2,
+        max_gpu_count=8,
+        gpu_names=("H100", "H200"),
+        executed_width=width,
+    )
+    # both shapes carry their join count, and the reason is stated once rather than per shape.
+    assert "(2x H200, 1 of which joins this run)" in pinned
+    assert "(4x H200 = 347.15 GB, 3 of which join this run)" in pinned
+    assert pinned.count(reason) == 1
+
+    terminal = vram_fit_error_message(
+        "sft",
+        9000,
+        requested_gpu_count=8,
+        effective_gpu_count=8,
+        max_gpu_count=8,
+        gpu_names=None,
+        executed_width=width,
+    )
+    # the count attaches to the CARDS, never to the GB figure ("446.6 GB max, 3 of which join").
+    assert "8-card validated GPU combination, 3 of which join this run (446.6 GB max)" in terminal
+    assert terminal.count(reason) == 1
+
+    # a run that launches every card it rents is never told about ranks at all.
+    for control in (
+        vram_fit_error_message(
+            "sft",
+            230,
+            requested_gpu_count=2,
+            effective_gpu_count=2,
+            max_gpu_count=8,
+            gpu_names=("H100", "H200"),
+        ),
+        vram_fit_error_message(
+            "grpo",
+            500,
+            requested_gpu_count=4,
+            effective_gpu_count=4,
+            max_gpu_count=8,
+            gpu_names=("H100",),
+        ),
+    ):
+        assert "of which" not in control
+        assert reason not in control
 
 
 def test_unreachable_class_reports_the_configuration_not_the_vram_shortfall():

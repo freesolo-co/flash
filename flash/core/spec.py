@@ -10,7 +10,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
-from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
+from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm, samples_on_policy
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
@@ -134,6 +134,37 @@ def _opt_float(value: Any) -> float | None:
     if isinstance(value, bool):
         raise TypeError(f"expected a number, got bool {value!r}")
     return float(value)
+
+
+def _migrated_optimizer_batch(train: dict, algorithm: str) -> tuple[int | None, int | None]:
+    """``(batch_size, prompts_per_step)`` with the pre-1.1.43 rollout spelling migrated.
+
+    grpo/opd authored the optimizer batch as ``batch_size`` until it was split into
+    ``prompts_per_step``. The schema rejects the old name on SUBMISSION, but `from_dict` also
+    reparses PERSISTED specs, and the deployed release (1.1.40) has no ``prompts_per_step`` at all
+    -- so every rollout run in flight across this upgrade carries only the old key. The workers read
+    ``prompts_per_step`` alone, so without this a recovered run silently resumes on the recipe
+    default: 64 instead of an authored 32 on grpo, which OOMs a card rented for 32, and 8 on opd.
+
+    The old key is MOVED, not copied, and is dropped whenever the new one is present. Leaving it
+    populated would re-emit both names from ``to_dict()``, and a spec carrying both is rejected by
+    the schema -- breaking the resubmit that recovery and ``flash runs get`` perform, and leaving
+    `vram.py::_optimizer_batch_value` (which takes the larger of the two) free to size a card off
+    the stale value that ranking ignores. That applies to a payload written mid-upgrade carrying
+    BOTH spellings too: ``prompts_per_step`` wins, so the superseded key has to go with it.
+
+    A non-positive legacy value is discarded rather than migrated: ``minimum=1`` would have
+    rejected it at submission, and carrying it forward only fails later on a rented GPU. It is
+    discarded from BOTH names for the same round-trip reason -- retaining it under the old one
+    would re-emit a key the schema rejects for this algorithm.
+    """
+    batch_size = _opt_int(train.get("batch_size"))
+    prompts_per_step = _opt_int(train.get("prompts_per_step"))
+    if not samples_on_policy(algorithm):
+        return batch_size, prompts_per_step
+    if prompts_per_step is not None:
+        return None, prompts_per_step
+    return None, batch_size if batch_size is not None and batch_size >= 1 else None
 
 
 _MAX_GPU_COUNT = 8
@@ -619,10 +650,14 @@ class JobSpec:
         if not isinstance(project_raw, str):
             raise TypeError("project must be a string")
         project = require_project_id(project_raw) if project_raw.strip() else ""
+        algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
+        # one reading of the optimizer batch for both keys: the rollout spelling changed in 1.1.43
+        # and a persisted spec can still carry the old one.
+        batch_size, prompts_per_step = _migrated_optimizer_batch(train, algorithm)
         return cls(
             model=data.get("model", cls.model),
             model_revision=_model_revision(data.get("model_revision", cls.model_revision)),
-            algorithm=normalize_algorithm(data.get("algorithm", cls.algorithm)),
+            algorithm=algorithm,
             environment=EnvironmentSpec(
                 id=env.get("id", ""),
                 params=dict(env.get("params") or {}),
@@ -644,8 +679,8 @@ class JobSpec:
                 init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),
-                batch_size=_opt_int(train.get("batch_size")),
-                prompts_per_step=_opt_int(train.get("prompts_per_step")),
+                batch_size=batch_size,
+                prompts_per_step=prompts_per_step,
                 max_context_tokens=_opt_int(train.get("max_context_tokens")),
                 save_every=_opt_int(train.get("save_every")),
                 max_steps=parse_max_steps(train.get("max_steps")),
