@@ -137,7 +137,7 @@ jobs:
     name: mypy (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # mypy is configured in pyproject but has never been enforced, and currently reports 412
+    # mypy is configured in pyproject but has never been enforced, and currently reports 411
     # errors across 95 files. This job REPORTS that debt on every PR without gating anything:
     # flip the `|| true` below into a hard failure once the count reaches zero.
     #
