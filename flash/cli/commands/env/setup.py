@@ -426,7 +426,7 @@ _SELF_HOSTED_GUIDANCE = {
         "\n"
         "REF is your repo's default branch: `main` or `master` depending on how it was created\n"
         "(`gh repo create` still makes `master`). A ref that does not exist fails with GitHub's\n"
-        "\"No commit found for SHA: <ref>\"."
+        '"No commit found for SHA: <ref>".'
     ),
     "EVALUATIONS_GUIDANCE": (
         "Keep this file beside environment.py in the git repo named by [environment] id."
