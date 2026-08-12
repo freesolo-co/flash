@@ -346,6 +346,7 @@ from flash.engine.profiling.sft_workload import (  # noqa: E402,F401
     sft_tokens_for_updates,
 )
 from flash.engine.worker.backend_common import (  # noqa: E402,F401
+    SHIM_FRAGMENT_FAILED_EXIT_CODE,
     fused_ce_backend,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
@@ -354,14 +355,18 @@ from flash.engine.worker.backend_common import (  # noqa: E402,F401
     parse_wandb_link,
     probe_verl_capabilities,
     render_gdn_varlen_shim,
+    render_shim_marker_prologue,
     render_wandb_link_shim,
     require_gdn_boundary_resets,
     resolve_verl_loggers,
     resolve_verl_python,
     run_verl_training,
+    shim_marker_file,
     stage_verl_resume,
     strict_gdn_probe_module,
+    verify_applied_shim_markers,
     verl_step_number,
+    wrap_shim_fragment,
 )
 from flash.engine.worker.entry.sft import _model_arch_dims, sft_under_ran  # noqa: E402,F401
 from flash.engine.worker.io.heartbeat import liveness_heartbeat  # noqa: E402
@@ -551,7 +556,7 @@ def run_sft_train(spec=None) -> None:
     child = _prepare_sft_child(
         options, data, model, capabilities, use_remove_padding, gdn_reset_arch
     )
-    child_progress = _prepare_sft_progress(data, model, child.resume_step)
+    child_progress = _prepare_sft_progress(data, model, child)
     progress = child_progress.values
 
     def on_line(line: str) -> None:
