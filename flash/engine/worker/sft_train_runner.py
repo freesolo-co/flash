@@ -413,6 +413,12 @@ def _idle_card_warning(
     batch could be raised still resolves to 2 ranks because 10 rows cannot be split 4 ways. Batch 1
     is a third case rather than a degenerate version of either -- it binds, but `sft_workload` fixes
     it at 1 for every unpacked run, so it is named as a fact and never as a knob.
+
+    A card count BELOW the launched width is qualified rather than prescribed. The ranks that joined
+    are what hold the model, so shrinking the allocation is a VRAM change and not only a billing one:
+    a 27B at 32k needs 159 GB, runs on the 191.6 GB that 3 H100 ranks provide, and would be rejected
+    at the 130.4 GB two cards give. This runs after allocation with no VRAM need in scope and cannot
+    check that itself, so it says the smaller shape is worth checking instead of asserting it works.
     """
     rows_fit = row_count == 0 or row_count % gpu_count == 0
     batch_fits = train_batch_size % gpu_count == 0
@@ -427,11 +433,17 @@ def _idle_card_warning(
         limiter = f"a batch of {train_batch_size}"
     else:
         limiter = f"a dataset of {row_count} rows"
+    # dropping below the launched width takes memory away from a run the fit gate already accepted
+    # on this shape, so it is offered as a question rather than as the fix.
+    card_advice = (
+        f"allocate {rentable} card(s) instead"
+        if rentable >= world_size
+        else f"allocate {rentable} card(s) instead if the run still fits on {rentable}"
+    )
     remedy = (
-        f"raise [train] batch_size to a multiple of {gpu_count}, or allocate {rentable} card(s) "
-        "instead"
+        f"raise [train] batch_size to a multiple of {gpu_count}, or {card_advice}"
         if batch_helps
-        else f"allocate {rentable} card(s) instead"
+        else card_advice
     )
     return (
         f"[sft][warn] training on {world_size} of {gpu_count} allocated cards: {limiter} "

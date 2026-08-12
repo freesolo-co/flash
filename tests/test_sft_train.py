@@ -2599,6 +2599,59 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
                 assert advised <= width, "advising more cards than the run can use is the same bug"
 
 
+def test_sft_idle_card_advice_does_not_shrink_the_memory_the_run_is_running_on():
+    """Advising FEWER cards than the run launched can take away memory it needs to exist.
+
+    The idle-card warning fires on a rented shape the fit gate already accepted, and the ranks that
+    joined are what hold the model. Dropping to the next rentable divisor is a VRAM change, not just
+    a billing one: Qwen3.6-27B sft at 32k is sized at 159 GB, a 4x H100 rental launching 3 ranks
+    provides 191.6 GB and runs, but batch 6 over 6 rows advised "allocate 2 card(s)" -- 130.4 GB,
+    which the fit gate rejects. Acting on that remedy turns a working run into an unplaceable one.
+
+    The worker cannot check the fit itself: it runs after allocation, on hardware already rented,
+    and has no VRAM need in scope. So the advice is QUALIFIED rather than computed -- it stays a
+    billing observation and never claims the smaller shape still holds the model. A width at or
+    above the launched one needs no qualifier, because it takes no memory away.
+    """
+    import contextlib
+    import io
+    import re
+
+    from flash.engine.worker.sft_train_runner import _resolve_sft_world_size
+
+    def warn(cards, batch, rows):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            width = _resolve_sft_world_size(cards, batch, rows)
+        return width, buf.getvalue()
+
+    # the reported case: 3 ranks hold the run, the advised 2 cards would not.
+    width, text = warn(4, 6, 6)
+    assert width == 3, "batch 6 over 6 rows launches 3 of the 4 rented cards"
+    assert "allocate 2 card(s)" in text, text
+    assert "fits" in text, (
+        "advice that drops below the launched width must be qualified as a fit question, "
+        f"not presented as the remedy: {text!r}"
+    )
+
+    # whenever the advised width is BELOW the ranks actually running, the line must not present
+    # the smaller shape as a straight remedy -- that shape may not hold the model at all.
+    for cards in range(1, 9):
+        for batch in range(1, 17):
+            for rows in range(1, 32):
+                width, text = warn(cards, batch, rows)
+                if not text:
+                    continue
+                found = re.search(r"allocate (\d+) card", text)
+                assert found, text
+                advised = int(found.group(1))
+                if advised < width:
+                    assert "fits" in text, (
+                        f"at {cards}/{batch}/{rows} advised {advised} cards below the {width} "
+                        f"ranks running, unqualified: {text!r}"
+                    )
+
+
 def test_sft_quote_credits_the_width_the_rows_allow_not_just_the_batch():
     """Pricing must clamp on the rows too, or it re-opens the gap the batch clamp closed.
 

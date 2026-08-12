@@ -1412,6 +1412,12 @@ power of two, since those are the shapes providers rent. Batch 2 on 4 cards uses
 An unpacked run trains one example per update, so it always resolves to a single card whatever
 `batch_size` says — there, allocate one card rather than raising the batch.
 
+One caveat on shrinking the allocation: the cards that joined the run are the ones holding the
+model, so fewer cards can mean less memory, not just a smaller bill. When the suggested count is
+below the ranks you are training on, the warning says "if the run still fits" — check it before
+acting, because a large model can run on the ranks it launched and be rejected on the narrower
+shape. Raising `batch_size` never has this problem: it uses cards you are already paying for.
+
 OPD has one unsupported combination, and because there is no other backend to fall back to it
 raises at startup: a multi-turn env together with `[train] structured_outputs`. Multi-turn OPD
 alone runs, and structured outputs alone run; only the combination is refused.
