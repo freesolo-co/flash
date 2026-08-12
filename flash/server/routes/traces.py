@@ -26,6 +26,7 @@ from flash.server.platform.traces import (
     list_projects,
     store_trace,
 )
+from flash.server.routes.trace_sse import SseDoneGate
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -451,77 +452,6 @@ def _merge_fragment_dict(target: dict[str, Any], fragment: dict[str, Any]) -> No
             target[key] = value
 
 
-class _SseDoneGate:
-    def __init__(self) -> None:
-        self._buffer = b""
-        self._done = bytearray()
-        self.done_event: bytes | None = None
-
-    def feed(self, chunk: bytes) -> list[bytes]:
-        self._buffer += chunk
-        if self._done:
-            self._consume_done_suffix()
-            return []
-
-        cursor = 0
-        while True:
-            newline = self._buffer.find(b"\n", cursor)
-            if newline < 0:
-                break
-            content = self._buffer[cursor:newline].rstrip(b"\r")
-            if content.startswith(b"data:") and content[len(b"data:") :].strip() == b"[DONE]":
-                forwarded = self._buffer[:cursor]
-                self._done.extend(self._buffer[cursor : newline + 1])
-                self._buffer = self._buffer[newline + 1 :]
-                self._consume_done_suffix()
-                return [forwarded] if forwarded else []
-            cursor = newline + 1
-
-        trailing = self._buffer[cursor:]
-        if _could_be_done_line(trailing):
-            forwarded = self._buffer[:cursor]
-            self._buffer = trailing
-        else:
-            forwarded = self._buffer
-            self._buffer = b""
-        return [forwarded] if forwarded else []
-
-    def finish(self) -> list[bytes]:
-        if self._done:
-            self._done.extend(self._buffer)
-            self._buffer = b""
-            self.done_event = bytes(self._done)
-            self._done.clear()
-            return []
-        forwarded = self._buffer
-        self._buffer = b""
-        return [forwarded] if forwarded else []
-
-    def _consume_done_suffix(self) -> None:
-        newline = self._buffer.find(b"\n")
-        if newline < 0:
-            return
-        if self._buffer[:newline].rstrip(b"\r"):
-            return
-        self._done.extend(self._buffer[: newline + 1])
-        self._buffer = self._buffer[newline + 1 :]
-        self.done_event = bytes(self._done)
-        self._done.clear()
-
-
-def _could_be_done_line(line: bytes) -> bool:
-    prefix = b"data:"
-    if len(line) < len(prefix):
-        return prefix.startswith(line)
-    if not line.startswith(prefix):
-        return False
-    data = line[len(prefix) :].lstrip()
-    target = b"[DONE]"
-    return target.startswith(data) or (
-        data.startswith(target) and not data[len(target) :].strip(b" \t\r")
-    )
-
-
 class _SseAccumulator:
     def __init__(self) -> None:
         self._buffer = b""
@@ -640,12 +570,19 @@ class _SseAccumulator:
                 else position
             )
             state = self._choice_state(index)
-            delta = choice.get("delta")
-            if isinstance(delta, dict):
-                self._consume_delta(state, delta)
-            logprobs = choice.get("logprobs")
-            if isinstance(logprobs, dict):
-                _merge_fragment_dict(state["logprobs"], logprobs)
+            if "delta" in choice:
+                delta = choice["delta"]
+                if isinstance(delta, dict):
+                    self._consume_delta(state, delta)
+                else:
+                    self._note_defect("stream choice contained a non-object delta")
+            if "logprobs" in choice:
+                logprobs = choice["logprobs"]
+                if isinstance(logprobs, dict):
+                    _merge_fragment_dict(state["logprobs"], logprobs)
+                else:
+                    # malformed logprobs lose scored fragments just as a malformed delta loses text.
+                    self._note_defect("stream choice contained non-object logprobs")
             if choice.get("finish_reason") is not None:
                 state["finish_reason"] = choice["finish_reason"]
 
@@ -710,7 +647,7 @@ async def _stream_response(
         if _is_error_status(upstream_response.status_code)
         else MAX_PAYLOAD_TOTAL_BYTES
     )
-    done_gate = _SseDoneGate() if context.record_trace and not raw_body else None
+    done_gate = SseDoneGate() if context.record_trace and not raw_body else None
     error = _error_for_status(upstream_response.status_code)
     client_disconnected = False
     try:
@@ -791,6 +728,30 @@ async def _stream_response(
         )
 
 
+async def _bounded_request_body(request: Request) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header") from exc
+        if declared < 0:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header")
+        if declared > MAX_PAYLOAD_TOTAL_BYTES:
+            raise HTTPException(status_code=413, detail="Request body exceeds the 8 MiB limit")
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            if len(chunk) > MAX_PAYLOAD_TOTAL_BYTES - len(body):
+                raise HTTPException(status_code=413, detail="Request body exceeds the 8 MiB limit")
+            body.extend(chunk)
+    except (HTTPException, asyncio.CancelledError):
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Failed to read request body") from exc
+    return bytes(body)
+
+
 def _request_context(
     *,
     request: Request,
@@ -843,8 +804,9 @@ async def chat_completions(
     request: Request,
     key: Annotated[dict, Depends(require_key)],
 ) -> Response:
+    raw_body = await _bounded_request_body(request)
     try:
-        parsed_body = await request.json()
+        parsed_body = json.loads(raw_body)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
     if not isinstance(parsed_body, dict):

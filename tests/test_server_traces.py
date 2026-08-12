@@ -601,6 +601,63 @@ def test_recording_rejects_missing_invalid_project_or_auth(
     assert _StaticAsyncClient.requests == []
 
 
+def test_an_oversized_declared_request_is_rejected_before_json_decoding(
+    trace_api, monkeypatch
+) -> None:
+    """The persistence cap is too late to protect ingress. A declared oversized body must be refused
+    before decoding or forwarding, even when its bytes are not valid JSON."""
+    _StaticAsyncClient.requests.clear()
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions",
+        headers={**_HEADERS, "Content-Length": str(platform_traces.MAX_PAYLOAD_TOTAL_BYTES + 1)},
+        content=b"not json",
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Request body exceeds the 8 MiB limit"
+    assert _StaticAsyncClient.requests == []
+
+
+def test_an_oversized_chunked_request_is_rejected_while_streaming(trace_api, monkeypatch) -> None:
+    """Chunked requests have no trustworthy declared size. The reader must stop on the first chunk
+    that crosses the cap rather than materializing the full attacker-controlled body."""
+    _StaticAsyncClient.requests.clear()
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    def body_chunks():
+        yield b"{" + b" " * (platform_traces.MAX_PAYLOAD_TOTAL_BYTES - 1)
+        yield b"x"
+
+    response = trace_api.post(
+        "/v1/chat/completions",
+        headers={**_HEADERS, "Transfer-Encoding": "chunked"},
+        content=body_chunks(),
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Request body exceeds the 8 MiB limit"
+    assert _StaticAsyncClient.requests == []
+
+
+def test_a_small_request_still_reaches_the_provider_after_ingress_bounding(
+    trace_api, monkeypatch
+) -> None:
+    """The streaming bound must remain transparent for ordinary JSON requests: the provider receives
+    the same object and the caller receives the provider's response."""
+    _StaticAsyncClient.requests.clear()
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 200
+    assert response.json() == _RESPONSE
+    assert len(_StaticAsyncClient.requests) == 1
+    assert _StaticAsyncClient.requests[0]["json"] == _REQUEST
+
+
 def test_export_formats_convert_and_count_skips(trace_api) -> None:
     owner = db.ensure_standalone_owner()
     store_trace(
@@ -1190,6 +1247,118 @@ def test_a_system_instruction_makes_the_single_turn_export_unreachable(trace_api
 
     assert export["records"] == []
     assert export["skipped"] == 1
+
+
+def test_a_response_schema_makes_the_exported_prompt_unreachable(trace_api) -> None:
+    """A JSON schema can determine the entire reply shape while the user text stays vague. Omitting
+    that top-level instruction makes both converted formats claim an input that cannot reach the row."""
+    owner = db.ensure_standalone_owner()
+    request = {
+        **_REQUEST,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                },
+            },
+        },
+    }
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="schema context",
+        metadata=None,
+        spans=[
+            TraceSpan(input_payload=request, output_payload=_reply_envelope('{"answer":"yes"}'))
+        ],
+    )
+
+    records = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+    prompts = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="prompts", limit=1000
+    )
+
+    assert records["records"] == []
+    assert records["skipped"] == 1
+    assert prompts["records"] == []
+    assert prompts["skipped"] == 1
+
+
+def test_a_non_empty_tool_list_makes_the_exported_prompt_unreachable(trace_api) -> None:
+    """Available tools instruct the model which actions and arguments it may produce. User text alone
+    does not contain that contract, so a reply conditioned on it is not a faithful converted row."""
+    owner = db.ensure_standalone_owner()
+    request = {
+        **_REQUEST,
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ],
+    }
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="tool context",
+        metadata=None,
+        spans=[TraceSpan(input_payload=request, output_payload=_reply_envelope("use lookup"))],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == []
+    assert export["skipped"] == 1
+
+
+def test_an_empty_tool_list_does_not_disqualify_a_single_user_message(trace_api) -> None:
+    """An empty tool list carries no instruction. Treating mere field presence as context would drop
+    ordinary rows emitted by clients that serialize optional arrays unconditionally."""
+    owner = db.ensure_standalone_owner()
+    request = {**_REQUEST, "tools": []}
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="empty tools",
+        metadata=None,
+        spans=[TraceSpan(input_payload=request, output_payload=_reply_envelope("world"))],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == [{"input": "hello", "output": "world"}]
+    assert export["skipped"] == 0
+
+
+def test_ordinary_sampling_controls_do_not_disqualify_a_single_user_message(trace_api) -> None:
+    """Sampling knobs shape decoding but add no missing instruction to the exported prompt. Rejecting
+    them would discard the normal proxy path, including streamed collection requests."""
+    owner = db.ensure_standalone_owner()
+    request = {**_REQUEST, "temperature": 0.2, "max_tokens": 64, "stream": True}
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="sampling controls",
+        metadata=None,
+        spans=[TraceSpan(input_payload=request, output_payload=_reply_envelope("world"))],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == [{"input": "hello", "output": "world"}]
+    assert export["skipped"] == 0
 
 
 def test_a_single_user_message_still_exports_as_training_data(trace_api) -> None:
@@ -2122,6 +2291,69 @@ def test_a_malformed_data_event_marks_the_stream_errored(trace_api, monkeypatch)
         limit=1000,
     )
     assert records["records"] == []
+
+
+def test_a_non_object_delta_marks_the_stream_errored(trace_api, monkeypatch) -> None:
+    """A present malformed delta can stand between valid fragments and silently remove paid output.
+    A later finish and terminator must not relabel the surviving partial text as a complete target."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"hel"}}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":"missing fragment"}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert "non-object delta" in span["error"]
+    records = export_traces(
+        key_id=db.ensure_standalone_owner()["id"],
+        project_id=_PROJECT_ID,
+        export_format="records",
+        limit=1000,
+    )
+    assert records["records"] == []
+
+
+def test_a_choice_without_delta_is_not_a_stream_defect(trace_api, monkeypatch) -> None:
+    """Usage and finish bookkeeping may arrive without `delta`. Absence loses no fragment, so marking
+    it defective would reject clean provider streams that separate content from termination metadata."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"world"}}]}\n\n',
+            b'data: {"choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "OK"
+    assert span["error"] is None
+    records = export_traces(
+        key_id=db.ensure_standalone_owner()["id"],
+        project_id=_PROJECT_ID,
+        export_format="records",
+        limit=1000,
+    )
+    assert records["records"] == [{"input": "hello", "output": "world"}]
 
 
 def test_a_mid_stream_error_envelope_marks_the_stream_errored(trace_api, monkeypatch) -> None:

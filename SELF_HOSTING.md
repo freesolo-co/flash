@@ -177,8 +177,10 @@ flash traces export --project 11111111-1111-4111-8111-111111111111 --format raw
 
 For recording-proxy traces, each converted row is one prompt and one reply. A request converts
 only when its user message is the sole message; a system prompt, an earlier turn, or a trailing
-assistant prefill disqualifies it. Replies must finish cleanly and carry no tool call. Text content
-parts are joined. `prompts` applies the same request rule without requiring a reply. Both converted
+assistant prefill disqualifies it. Top-level response schemas, tools, and tool choices also disqualify
+it because the exported prompt omits those instructions. Replies must finish cleanly and carry no
+tool call. Text content parts are joined. `prompts` applies the same request rule without requiring
+a reply. Both converted
 formats exclude traces whose required stored payload was truncated, and `records` also skips calls
 that failed, redirected, ended mid-stream, or never answered. Use `--format raw` for contextual,
 multi-turn, tool-calling, or otherwise non-convertible traces. Non-proxy spans retain their stored

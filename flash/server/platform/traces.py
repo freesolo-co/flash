@@ -53,6 +53,18 @@ _PAYLOAD_TRUNCATED_ATTRIBUTE = "payload_truncated"
 # reject it left a hole: a provider that reports `finish_reason: "tool_calls"` while sending an
 # empty or absent `tool_calls` array passed both guards, and its narration exported as the target.
 _ACCEPTED_FINISH_REASONS = {None, "stop"}
+# fields that add instructions the exported prompt text would not contain. decoding controls stay out:
+# even `stop` can shorten a reply, but it does not supply content needed to reach that reply.
+_INSTRUCTION_CONTEXT_FIELDS = frozenset(
+    {
+        "response_format",
+        "tools",
+        "functions",
+        "tool_choice",
+        "function_call",
+        "response_schema",
+    }
+)
 
 
 @dataclass
@@ -412,12 +424,19 @@ def _chat_prompt(payload: Any) -> str | None:
 
     `records` deliberately exports only the last user turn rather than a transcript containing prior
     answers. That conversion is correct only for a genuinely single-turn request: system or developer
-    instructions, earlier turns, and trailing assistant prefills can all make the target unreachable
-    from the exported text. This trades recall for correct training rows; `raw` still preserves every
-    message, while converted formats skip any request whose user message is not the sole message.
+    instructions, earlier turns, trailing assistant prefills, and instruction-bearing top-level fields
+    can all make the target unreachable from the exported text. This trades recall for correct training
+    rows; `raw` still preserves every message, while converted formats skip requests whose exported user
+    text omits context that materially determines the reply.
     """
     if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
         return None
+    for field in _INSTRUCTION_CONTEXT_FIELDS:
+        value = payload.get(field)
+        if field == "response_format" and value == {"type": "text"}:
+            continue
+        if value:
+            return None
     messages = payload["messages"]
     if len(messages) != 1:
         return None
