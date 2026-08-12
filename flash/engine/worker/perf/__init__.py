@@ -131,47 +131,11 @@ def _find_real_libcudart() -> str | None:
     return None
 
 
-def _neutralize_tilelang_cudart_stub() -> None:
-    """Repoint tilelang's libcudart_stub.so at the real libcudart to prevent a vLLM crash.
-
-    tilelang's stub is missing cudaDeviceReset; vLLM scans /proc/self/maps for libcudart and can
-    pick up the stub, aborting import. Must run AFTER _ensure_fla_fastpath_on_hopper (tilelang
-    reinstall would overwrite the stub) and BEFORE any model/vLLM import.
-    """
-    import importlib.util
-
-    try:
-        spec = importlib.util.find_spec("tilelang")
-    except Exception:
-        spec = None
-    locs = list(getattr(spec, "submodule_search_locations", None) or []) if spec else []
-    if not locs:
-        return  # tilelang not installed -> nothing can shadow libcudart
-    stub = os.path.join(locs[0], "lib", "libcudart_stub.so")
-    if not os.path.lexists(stub):  # lexists: dangling symlink still counts as present
-        return
-    # Do NOT probe with ctypes.CDLL — that dlopens the stub into /proc/self/maps, the exact crash.
-    # A dangling symlink is NOT done (os.path.exists follows links), fall through to re-point.
-    if os.path.islink(stub) and os.path.exists(stub):
-        return
-    real = _find_real_libcudart()
-    if real is None:
-        print(
-            "[worker] libcudart stub shadow: no real libcudart found; left as-is",
-            flush=True,
-        )
-        return
-    try:
-        backup = stub + ".orig"
-        if not os.path.exists(backup):
-            os.replace(stub, backup)
-        else:
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(stub)
-        os.symlink(real, stub)
-        print(f"[worker] redirected tilelang libcudart_stub.so -> {real}", flush=True)
-    except Exception as e:
-        print(f"[worker] libcudart stub neutralize failed: {e}", flush=True)
+# NOTE: the stub repoint itself lives in `verl.child_io.render_tilelang_cudart_shim`, NOT here. The
+# stub only matters to the interpreter that builds a sleeping vLLM engine, and that is the verl child
+# (`FLASH_VERL_PYTHON`, `/opt/verl-venv`), which Dockerfile.worker gives its own tilelang install. A
+# parent-side repoint fixed the parent's copy and never reached the one the trainer loads. The probe
+# above stays because the child fragment ships ITS SOURCE via `inspect.getsource`.
 
 
 def _force_fla_triton_gdn_on_sm100() -> None:
@@ -424,7 +388,6 @@ __all__ = [
     "_int_or_none",
     "_liger_default_for_model",
     "_memory_mode",
-    "_neutralize_tilelang_cudart_stub",
     "_query_nvidia_gpu",
     "_query_nvidia_processes",
     "_remove_fla_from_disk",

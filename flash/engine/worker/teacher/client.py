@@ -28,6 +28,21 @@ from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
 _BROKER_PROVIDER_TIMEOUT_CEILING_S = 90.0
 _DEFAULT_TEACHER_TIMEOUT_S = 105.0
+# the token every managed vision teacher's chat template uses to close a turn. it bounds the text
+# we supplied: the provider's own generation header comes after it.
+_TURN_END_TOKEN = "<|im_end|>"
+# the text an assistant header ends with ("<|im_start|>assistant\n"). a completion opening a new
+# turn is tokenized directly after it, so it is the prefix that completion merges against.
+_ASSISTANT_HEADER_TRAILING_TEXT = "\n"
+# imported rather than redeclared: the renderer rejects both markers from source text, and the
+# drop guard below counts pad runs. if the two ever named different strings, text-origin runs
+# would silently re-enter the count the guard depends on.
+from flash.content.multimodal import (  # noqa: E402
+    IMAGE_PAD_TOKEN as _IMAGE_PAD_TOKEN,
+)
+from flash.content.multimodal import (  # noqa: E402
+    IMAGE_TEACHER_PLACEHOLDER as _IMAGE_TEACHER_PLACEHOLDER,
+)
 
 
 class TeacherError(RuntimeError):
@@ -335,6 +350,175 @@ def _normalize_response(
     )
 
 
+def _chat_messages(
+    prompt_messages: list[dict[str, Any]],
+    completion_text: str,
+    image_data_uris: list[str] | tuple[str, ...],
+    *,
+    continue_final_assistant: bool = False,
+) -> list[dict[str, Any]]:
+    if not prompt_messages:
+        raise _permanent("teacher multimodal scoring requires prompt messages")
+    if not completion_text:
+        raise _permanent("teacher scoring requires a nonempty completion")
+    images = iter(image_data_uris)
+    image_count = 0
+    output: list[dict[str, Any]] = []
+    for message_index, message in enumerate(prompt_messages):
+        if not isinstance(message, dict):
+            raise _permanent(f"teacher prompt message {message_index} is not an object")
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(role, str) or not role or not isinstance(content, str):
+            raise _permanent(
+                f"teacher prompt message {message_index} requires string role and content"
+            )
+        if _IMAGE_TEACHER_PLACEHOLDER not in content:
+            output.append({"role": role, "content": content})
+            continue
+        blocks: list[dict[str, Any]] = []
+        parts = content.split(_IMAGE_TEACHER_PLACEHOLDER)
+        for part_index, part in enumerate(parts):
+            if part:
+                blocks.append({"type": "text", "text": part})
+            if part_index == len(parts) - 1:
+                continue
+            try:
+                image_uri = next(images)
+            except StopIteration:
+                raise _permanent(
+                    "teacher prompt has more image placeholders than image data URIs"
+                ) from None
+            if not isinstance(image_uri, str) or not image_uri.startswith("data:image/"):
+                raise _permanent("teacher multimodal scoring requires image data URIs")
+            blocks.append({"type": "image_url", "image_url": {"url": image_uri}})
+            image_count += 1
+        output.append({"role": role, "content": blocks})
+    try:
+        next(images)
+    except StopIteration:
+        pass
+    else:
+        raise _permanent("teacher prompt has fewer image placeholders than image data URIs")
+    if image_count == 0:
+        raise _permanent("teacher multimodal scoring requires at least one image")
+    # the student froze its prompt with add_generation_prompt=True, so the sampled tokens live
+    # after a NEW assistant boundary. concatenating onto a historical assistant turn would score
+    # them as a continuation of that turn, conditioning the opd target on a different prefix than
+    # the one the student actually sampled under. the text path has the same contract: it always
+    # appends a fresh "Assistant: " (see _teacher_prompt_text). the ONE case that genuinely
+    # continues the trailing turn is the synthetic thinking prefill, which the caller flags,
+    # because the student sampled after that prefill within the same assistant turn.
+    if (
+        continue_final_assistant
+        and output[-1]["role"] == "assistant"
+        and isinstance(output[-1]["content"], str)
+    ):
+        output[-1]["content"] += completion_text
+    else:
+        output.append({"role": "assistant", "content": completion_text})
+    return output
+
+
+def _supplied_turn_end(values: list[int], turn_end_token_id: int) -> int | None:
+    """Locate the terminator closing the assistant turn that carries the completion.
+
+    the completion is the last thing inside the LAST supplied message, so its turn terminator is
+    the last one in the rendered prompt. anything after it is template the provider appended for
+    its own generation turn, never content we supplied.
+    """
+    for index in range(len(values) - 1, -1, -1):
+        if values[index] == turn_end_token_id:
+            return index
+    return None
+
+
+def _image_pad_runs(values: list[int], image_pad_token_id: int) -> int:
+    """Count maximal runs of the image-pad token, i.e. how many images actually expanded.
+
+    one image expands to MANY identical pad tokens (64 for a 64px image), so a raw count cannot
+    distinguish "two images" from "one image, one silently dropped": the surviving image alone
+    supplies far more pads than the image count. runs are per-image, so they can.
+    """
+    runs = 0
+    previous_was_pad = False
+    for value in values:
+        is_pad = value == image_pad_token_id
+        if is_pad and not previous_was_pad:
+            runs += 1
+        previous_was_pad = is_pad
+    return runs
+
+
+def _normalize_multimodal_response(
+    response: dict[str, Any],
+    *,
+    encoded_completion: list[EncodedTeacherToken],
+    completion_text: str,
+    image_count: int,
+    image_pad_token_id: int,
+    turn_end_token_id: int,
+) -> TeacherScore:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        raise _permanent("teacher response must contain exactly one choice")
+    generated_ids = _integer_list(choices[0].get("token_ids"), field="token_ids")
+    if len(generated_ids) != 1:
+        raise _permanent("teacher response must contain exactly one generated token id")
+    remote_ids = _integer_list(response.get("prompt_token_ids"), field="prompt_token_ids")
+    local_completion_ids = [token.token_id for token in encoded_completion]
+    # anchor to the terminator of the supplied assistant turn, NOT to the last matching run. the
+    # chat route renders its own "<|im_start|>assistant\n" generation header after our final
+    # message, and those template ids collide with ordinary completions: a completion of
+    # "assistant" is a single id that occurs both where the student actually answered and inside
+    # that trailing header, so picking the last run scores fixed template tokens as the model's
+    # answer -- silently, since every structural check still passes. confirmed live: the provider
+    # returns [..., 77091, 151645, 198, 151644, 77091, 198] for that completion.
+    turn_end = _supplied_turn_end(remote_ids, turn_end_token_id)
+    if turn_end is None:
+        raise _permanent(
+            "teacher response does not terminate the supplied assistant turn; "
+            "cannot locate the completion token ids"
+        )
+    start = turn_end - len(local_completion_ids)
+    if start < 0 or remote_ids[start:turn_end] != local_completion_ids:
+        # fail closed rather than score a guess. the completion ends its turn by construction, so
+        # a mismatch means the rendered ids are not what we encoded -- a boundary merge with the
+        # template's own "assistant\n" (a completion starting with "\n" merges into it), or a
+        # provider-side template change. scoring the wrong span is worse than retrying.
+        raise _permanent(
+            "teacher response does not end the supplied assistant turn with the completion "
+            "token ids; cannot attribute prompt logprobs to the sampled tokens"
+        )
+    # count pads over the PROMPT only, which is everything before the completion. the completion is
+    # sampled by the student, and a vision student can emit the literal image-pad token: that token
+    # lands in remote_ids as its own run and would satisfy the count for an image the provider
+    # actually dropped, handing back image-unconditioned targets. rejecting the marker in prompt
+    # text does not cover this -- the completion is appended after that check, straight from the
+    # sampled ids.
+    if _image_pad_runs(remote_ids[:start], image_pad_token_id) < image_count:
+        raise _permanent(
+            "teacher response expanded fewer images than were supplied; the provider may have "
+            "silently dropped an image"
+        )
+    input_tokens, output_tokens = _validated_usage(response, len(remote_ids))
+    scores = _token_keyed_scores(response.get("prompt_logprobs"), remote_ids)
+    if scores is None:
+        raise _permanent("teacher response is missing top-level prompt_logprobs")
+    completion_scores = scores[start : start + len(encoded_completion)]
+    tokens = _completion_tokens(
+        encoded_completion,
+        completion_scores,
+        full=completion_text,
+        prompt_length=0,
+    )
+    return TeacherScore(
+        tokens=tuple(tokens),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
 class TeacherClient:
     def __init__(
         self,
@@ -461,6 +645,140 @@ class TeacherClient:
             prompt_length=len(prompt_text),
         )
 
+    def _encode_completion_in_context(
+        self,
+        prompt_messages: list[dict[str, Any]],
+        completion_text: str,
+        *,
+        continue_final_assistant: bool,
+    ) -> list[EncodedTeacherToken]:
+        """Encode the completion as it tokenizes AFTER the text it follows, not in isolation.
+
+        BPE merges across the boundary. a completion starting with "\\n" placed after a thinking
+        prefill ending in "\\n" renders as the single token 271, so the standalone encoding
+        ``[198, ...]`` never appears in the provider's prompt ids: the contiguous-run lookup then
+        rejects a perfectly valid rollout, or -- worse -- matches the standalone ids somewhere
+        EARLIER in the conversation and silently returns logprobs for the wrong text.
+
+        so encode ``prefix + completion`` and keep only the tail the prefix does not already
+        account for, which is what the text path gets for free by encoding the whole prompt and
+        slicing.
+
+        a completion that opens its own turn still has a boundary: the chat template renders
+        "<|im_start|>assistant\\n", so the header's trailing newline merges with a completion that
+        starts with one exactly as a thinking prefill would. measured on the pinned Qwen3-VL
+        tokenizer, encoding in isolation loses 5 of 8 whitespace-leading completions -- "\\nred"
+        encodes to [198, 1151] while the render contains [..., 77091, 271, 1151]. so the new-turn
+        prefix is that newline, not the empty string.
+
+        the boundary token can belong to BOTH sides -- "<think>\\n" + "\\nred" merges the prefix's
+        trailing "\\n" and the completion's leading "\\n" into one "\\n\\n". that token is kept: it is
+        the token the provider actually emitted, it carries the completion's first character, and
+        dropping it would leave a run that does not occur in the rendered prompt at all. keeping it
+        scores one boundary token that is partly prefill, which is honest about what the model saw;
+        refusing instead would permanently fail every thinking-mode rollout that starts with a
+        newline, which is most of them.
+        """
+        prefix = ""
+        if continue_final_assistant and prompt_messages:
+            last = prompt_messages[-1]
+            if isinstance(last, dict) and last.get("role") == "assistant":
+                content = last.get("content")
+                if isinstance(content, str):
+                    prefix = content
+        if not prefix:
+            # the assistant header's own trailing newline, which is what a new turn merges against.
+            prefix = _ASSISTANT_HEADER_TRAILING_TEXT
+        encoded_prefix = self.tokenizer.encode(prefix)
+        encoded_joined = self.tokenizer.encode(prefix + completion_text)
+        # keep every token from the first position where the two encodings diverge. an unmerged
+        # boundary diverges exactly at len(prefix), reducing this to a plain slice; a merged one
+        # diverges at the shared token and keeps it.
+        shared = 0
+        # strict=False on purpose: the joined encoding is longer than the prefix by construction,
+        # and comparing only the overlap is exactly what locates the divergence point.
+        for joined, pre in zip(encoded_joined, encoded_prefix, strict=False):
+            if joined.token_id != pre.token_id:
+                break
+            shared += 1
+        tail = encoded_joined[shared:]
+        if not tail:
+            raise _permanent(
+                "teacher completion contributed no tokens after its assistant prefix; "
+                "cannot attribute prompt logprobs to the sampled tokens"
+            )
+        # the tail must start no earlier than the boundary token. real BPE merges only the token
+        # straddling the seam, so the tail begins at most one token inside the prefix; a tokenizer
+        # that rewrote MORE than that would hand back tokens whose text is largely prefill, and
+        # scoring them as the completion would attribute the prefill's logprobs to sampled tokens.
+        if tail[0].start < len(prefix) and shared + 1 < len(encoded_prefix):
+            raise _permanent(
+                "teacher completion boundary rewrote more than one prefix token; "
+                "cannot attribute prompt logprobs to the sampled tokens"
+            )
+        # rebase the character spans onto completion_text. they currently index into
+        # prefix + completion, and the caller slices the COMPLETION with them. a merged boundary
+        # token starts inside the prefix, so its rebased start clamps to 0 -- it covers the
+        # completion's first character, which is the part that belongs to the completion.
+        shift = len(prefix)
+        return [
+            EncodedTeacherToken(
+                token_id=token.token_id,
+                start=max(0, token.start - shift),
+                end=max(0, token.end - shift),
+            )
+            for token in tail
+        ]
+
+    def _score_one_multimodal(
+        self,
+        prompt_messages: list[dict[str, Any]],
+        completion_text: str,
+        image_data_uris: list[str] | tuple[str, ...],
+        continue_final_assistant: bool = False,
+    ) -> TeacherScore:
+        encoded_completion = self._encode_completion_in_context(
+            prompt_messages,
+            completion_text,
+            continue_final_assistant=continue_final_assistant,
+        )
+        image_pad_tokens = self.tokenizer.encode(_IMAGE_PAD_TOKEN)
+        if len(image_pad_tokens) != 1:
+            raise _permanent(
+                "managed vision teacher tokenizer must encode the image-pad marker as one token"
+            )
+        turn_end_tokens = self.tokenizer.encode(_TURN_END_TOKEN)
+        if len(turn_end_tokens) != 1:
+            raise _permanent(
+                "managed vision teacher tokenizer must encode the turn terminator as one token"
+            )
+        messages = _chat_messages(
+            prompt_messages,
+            completion_text,
+            image_data_uris,
+            continue_final_assistant=continue_final_assistant,
+        )
+        response = self._post(
+            "/v1/teacher/chat_completions",
+            {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": 1,
+                "temperature": 0,
+                "seed": 0,
+                "prompt_logprobs": 1,
+                "return_token_ids": True,
+            },
+        )
+        return _normalize_multimodal_response(
+            response,
+            encoded_completion=encoded_completion,
+            completion_text=completion_text,
+            image_count=len(image_data_uris),
+            image_pad_token_id=image_pad_tokens[0].token_id,
+            turn_end_token_id=turn_end_tokens[0].token_id,
+        )
+
     def score_many(self, items: list[tuple[str, str]]) -> list[TeacherScore]:
         """Score each unique prompt and completion through one idempotent broker request.
 
@@ -477,6 +795,19 @@ class TeacherClient:
         return map_bounded(
             items,
             lambda item: self._score_one(*item),
+            cap=OPD_TEACHER_SCORING_CONCURRENCY,
+        )
+
+    def score_many_multimodal(
+        self,
+        items: list[tuple[list[dict[str, Any]], str, list[str] | tuple[str, ...], bool]],
+    ) -> list[TeacherScore]:
+        """Score image-conditioned completions through the managed chat broker route."""
+        if not items:
+            return []
+        return map_bounded(
+            items,
+            lambda item: self._score_one_multimodal(*item),
             cap=OPD_TEACHER_SCORING_CONCURRENCY,
         )
 

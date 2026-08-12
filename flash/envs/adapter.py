@@ -690,27 +690,6 @@ class FreesoloEnvironment(BaseEnvironment):
         rewards = self._env.score_episodes(task, [self._episode_from_state(state)])
         return self._single(rewards, "score_episodes")
 
-    def reward_from_messages(
-        self, completion_msgs: list[dict], example: dict, prompt_msgs: list[dict] | None = None
-    ) -> float:
-        messages = [*(prompt_msgs or []), *completion_msgs]
-        response_text: object = ""
-        turns = []
-        for message in completion_msgs:
-            content = str(message.get("content", ""))
-            role = str(message.get("role", ""))
-            turns.append(self._EnvironmentTurn(role=role, content=content))
-            if role == "assistant":
-                # same shape the single-turn path grades; see record_model_turn.
-                response_text = self._scored_turn_text(content)
-        episode = self._EnvironmentEpisode(
-            messages=tuple(dict(m) for m in messages),
-            response_text=response_text,
-            turns=tuple(turns),
-        )
-        rewards = self._env.score_episodes(self._task_example(example), [episode])
-        return float(self._single(rewards, "score_episodes").score)
-
 
 __all__ = [
     "FreesoloEnvironment",

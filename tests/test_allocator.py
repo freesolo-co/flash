@@ -983,6 +983,8 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             "lora_rank": 32,
         },
         "recipe_default": {"epochs": 1},
+        # opd takes the optimizer batch as `prompts_per_step`; `batch_size` is sft-only and is
+        # rejected outright, so spelling it here would fail the parse rather than size a shape.
         "opd_prompt_batch": {
             "epochs": 1,
             "prompts_per_step": 8,

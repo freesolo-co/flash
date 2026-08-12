@@ -2,7 +2,7 @@
 
 The SDK ships the GRPO recipe knobs (group_size/temperature/
 kl_penalty_coef/thinking_length_penalty_coef) plus the optimizer/batching knobs
-(learning_rate/batch_size/max_context_tokens/save_every) in the job spec's ``[train]`` table
+(learning_rate/prompts_per_step/max_context_tokens/save_every) in the job spec's ``[train]`` table
 (TrainSpec) — NOT ``[environment.params]``, which is forwarded verbatim to the Freesolo
 env's ``load_environment`` — and an optional ``train.init_from_adapter``; these tests
 cover the pure plumbing the worker uses to honor them (the GPU trainer wiring itself is
@@ -480,8 +480,10 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         "gpu": {},
     }
     bad_cases = [
-        {"batch_size": 0},  # must be >= 1
-        {"batch_size": -4},
+        # the batching knob for a rollout algorithm is prompts_per_step; spelling it batch_size
+        # here would raise for being sft-only and would pass even with range checking removed.
+        {"prompts_per_step": 0},  # must be >= 1
+        {"prompts_per_step": -4},
         {"max_context_tokens": 0},
         {"save_every": 0},
         {"group_size": 0},
@@ -491,15 +493,15 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         {"kl_penalty_coef": -1},
         {"entropy_quantile": -0.01},
         {"entropy_quantile": 1.01},
-        {"batch_size": 1.5},  # non-integer
-        {"batch_size": "16"},  # wrong type (string)
+        {"prompts_per_step": 1.5},  # non-integer
+        {"prompts_per_step": "16"},  # wrong type (string)
         {"learning_rate": [1]},  # wrong type (list) -> 400, not a 500 TypeError
         {"stop_sequences": {"a": 1}},  # dict not allowed
         {"stop_sequences": [1, 2]},  # non-string entries
         {"learning_rate": float("nan")},  # non-finite -> 400, not a silent NaN to the optimizer
         {"learning_rate": float("inf")},
         {"temperature": float("inf")},
-        {"batch_size": float("inf")},  # int knob: must 400, not OverflowError(500) from int(inf)
+        {"prompts_per_step": float("inf")},  # int knob: 400, not OverflowError(500) from int(inf)
         {"max_completion_tokens": float("nan")},
     ]
     for bad in bad_cases:
