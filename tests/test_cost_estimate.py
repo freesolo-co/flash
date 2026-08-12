@@ -612,11 +612,25 @@ def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
 
 
 def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
-    """A pinned revision must not receive an eight-card quote allocation will never honor."""
+    """The offline quote stays OFFLINE: it caps on the catalog row and never reaches the hub.
+
+    `_offline_gpu_shape` is documented as structural preparation that must not consume live
+    failures, so it does not certify the pin. 3.5-4B records 16 heads, which divide 8, so the quote
+    reaches an eight-card shape whether or not the hub is reachable.
+
+    Asserting both hub states is the point: certifying here would let a transient hub error convert
+    a quotable eight-card run into a hard "does not fit across up to 4 cards" ValueError, from a
+    code path whose whole contract is that it does no network i/o. Certification belongs on the
+    submission path.
+    """
+    import flash.engine.plan.model_config_probe as model_config_probe
+    import flash.engine.plan.vram as vram
+    from flash.core.catalog import MODELS
     from flash.cost.analytical import _offline_gpu_shape
 
     monkeypatch.setattr("flash.cost.analytical.required_vram_gb", lambda *a, **k: 700)
     monkeypatch.setattr("flash.cost.analytical.total_params_b", lambda *a, **k: 4.7)
+    monkeypatch.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
     config = RunConfig(
         "Qwen/Qwen3.5-4B",
         "sft",
@@ -625,10 +639,31 @@ def test_offline_estimate_applies_the_pinned_revision_geometry_cap(monkeypatch):
         model_revision="a" * 40,
     )
 
-    # four: the pin keeps the unvalidated-revision ceiling, and 3.5-4B's 16 recorded heads divide it,
-    # so the geometry check narrows nothing further.
-    with pytest.raises(ValueError, match="any 4-card validated GPU combination"):
-        _offline_gpu_shape(config)
+    def _unreadable(*_a, **_k):
+        raise RuntimeError("transient hub error")
+
+    # hub down: the offline quote never calls it, so the row's 16 heads still reach eight cards.
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _unreadable)
+    _gpu_d, _need_d, count_down, _provider_d, _rate_d = _offline_gpu_shape(config)
+    assert count_down == 8, "a hub outage must not narrow an offline quote"
+
+    # hub healthy: identical answer, proving the quote does not depend on hub reachability.
+    info = MODELS["Qwen/Qwen3.5-4B"]
+    monkeypatch.setattr(
+        vram,
+        "fetch_hf_model_geometry",
+        lambda *_a, **_k: (
+            info.params_b,
+            info.vocab_size,
+            info.hidden_size,
+            info.num_layers,
+            info.num_attention_heads,
+        ),
+    )
+    # note the real order is (gpu, need, count, provider, hourly); the annotation on
+    # `_offline_gpu_shape` says (gpu, count, need, ...) and is wrong, which is pre-existing.
+    _gpu, need, count, _provider, _rate = _offline_gpu_shape(config)
+    assert (need, count) == (700, 8)
 
 
 def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypatch):
@@ -639,6 +674,7 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
     revision through rather than quoting default-revision weights -- still holds for a pinned
     catalog model, which is the only way to reach revision-specific sizing at all.)
     """
+    import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
     from flash.cost.analytical import _offline_gpu_shape
@@ -649,13 +685,20 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
     expected_revision = "f" * 40
     seen_revisions = []
 
-    def _pinned_geometry(model_id, revision="", strict=False):
+    def _model_config_probe(model_id, revision="", strict=False):
         assert model_id == model
         seen_revisions.append(revision)
-        return (info.params_b, info.vocab_size, info.hidden_size, info.num_layers)
+        return (
+            info.params_b,
+            info.vocab_size,
+            info.hidden_size,
+            info.num_layers,
+            info.num_attention_heads,
+        )
 
-    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _pinned_geometry)
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _model_config_probe)
     monkeypatch.setattr("flash.cost.facts._PINNED_SIZE_MEMO", dict(_PINNED_SIZE_MEMO))
+    monkeypatch.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
     _PINNED_SIZE_MEMO.pop((model, expected_revision), None)
 
     gpu, count, need, provider, rate = _offline_gpu_shape(
@@ -667,12 +710,15 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
     assert need > 0
     assert provider
     assert rate > 0
-    # TWO independent sites size a pinned run here -- the fail-closed params check and the VRAM
-    # requirement -- and each must carry the pin. Asserting only "some call saw the revision" cannot
-    # tell them apart: dropping the pin from either one still leaves the other populating the list,
-    # so the count is what makes this test able to fail.
-    assert len(seen_revisions) == 2, (
-        f"expected both the params check and the VRAM sizing to pass the pin, saw {seen_revisions}"
+    # Several independent sites read a pinned run here -- the fail-closed params check, the VRAM
+    # requirement, and the head-geometry cap that decides how wide it may be rented. Each must carry
+    # the pin, and they must SHARE the one lookup: a site that re-fetched independently let a hub
+    # blip between two of them narrow a just-validated pin (see
+    # test_a_blip_after_sizing_cannot_narrow_an_already_validated_pin). One fetch, and the revision
+    # is the one that was asked for -- a site that dropped the pin would fetch the default revision
+    # under a different memo key and push this above one.
+    assert len(seen_revisions) == 1, (
+        f"a pinned quote must reach the hub exactly once, saw {seen_revisions}"
     )
     assert set(seen_revisions) == {expected_revision}
 
