@@ -16,6 +16,7 @@ one implementation of it.
 from __future__ import annotations
 
 import contextlib
+import json
 import time
 
 import pytest
@@ -323,4 +324,75 @@ def test_undeploying_an_unknown_run_is_a_clean_404(http):
     response = http.delete("/adapters/conformance-run-never-existed")
     assert response.status_code == 404, (
         f"undeploying an unknown run returned {response.status_code}, expected 404"
+    )
+
+
+def test_chat_streams_deltas_the_way_the_cli_asks_for_them(http, deployed):
+    """`flash models chat` streams; a backend that only serves non-streaming fails the CLI.
+
+    `flash/serve/streaming.py` sends `stream: true` and decodes SSE `data:` frames, taking the
+    text from `choices[0].delta.content` and stopping at `[DONE]`. A backend that ignores the flag
+    and returns one JSON body, or emits frames without deltas, passes every other test here and
+    then produces an empty answer in the shipped client.
+    """
+    run = deployed["metadata"]["run_id"]
+    assert _activate(http, deployed["adapter_id"], None).status_code == 200
+    body = {
+        "model": run,
+        "messages": [{"role": "user", "content": "Say hello."}],
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "stream": True,
+    }
+    deltas: list[str] = []
+    saw_done = False
+    with http.stream("POST", "/v1/chat/completions", json=body) as response:
+        assert response.status_code == 200, f"streaming chat returned {response.status_code}"
+        media = response.headers.get("content-type", "")
+        assert "text/event-stream" in media, (
+            f"streaming chat answered with content-type {media!r}; the client decodes SSE frames "
+            f"and a plain JSON body yields no deltas"
+        )
+        for line in response.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:") :].strip()
+            if data == "[DONE]":
+                saw_done = True
+                break
+            chunk = json.loads(data)
+            delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+            content = delta.get("content")
+            if isinstance(content, str):
+                deltas.append(content)
+    assert saw_done, "the stream never sent the [DONE] sentinel the client stops on"
+    assert "".join(deltas).strip(), (
+        "the stream carried no delta content, so `flash models chat` would print nothing"
+    )
+
+
+def test_a_wrong_serving_key_is_rejected(http, serving_url, internal_key):
+    """A backend that ignores the key passes every other test while being publicly writable.
+
+    The rest of the suite only ever sends the CORRECT key, so it cannot tell "checks the key" from
+    "ignores the header". This sends a deliberately wrong one at a mutating endpoint: registration
+    is what an unauthenticated caller would abuse to load arbitrary adapters onto the GPU.
+
+    Skipped when no key is configured, because a backend with no key set is legitimately open (a
+    laptop, a private network) and the contract does not require one.
+    """
+    if not internal_key:
+        pytest.skip("no FREESOLO_INTERNAL_KEY configured; the backend is intentionally open")
+    import httpx
+
+    with httpx.Client(base_url=serving_url, timeout=30.0) as client:
+        response = client.post(
+            "/adapters",
+            json={"adapter_id": "conformance-unauthorized@final." + "0" * 40},
+            headers={"X-Freesolo-Internal-Key": internal_key + "-wrong"},
+        )
+    assert response.status_code in (401, 403), (
+        f"registration with a WRONG serving key returned {response.status_code}; the backend does "
+        f"not check the key, so registration, activation, chat, and deletion are publicly callable"
     )
