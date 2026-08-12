@@ -2495,6 +2495,43 @@ def test_the_obstacle_never_contradicts_the_remedy_printed_after_it():
             assert "exists only if their live catalog lists one" not in msg
 
 
+def test_the_fit_message_states_capacity_the_run_will_actually_have():
+    """The shapes a fit rejection PRINTS must be valued at the width the search accepted them on.
+
+    The width search credits launched ranks, but the two shapes quoted in the message were valued
+    on rented cards, so the message argued against itself: a 2-card ceiling that launches one rank
+    was reported as providing 234.1 GB against a 230 GB need -- more than it needs, printed as the
+    reason for rejection -- and then recommended a 4-card shape credited 252.8 GB that really
+    delivers 191.6. Every number a user reads has to be memory the run will actually have.
+    """
+    from flash.engine.plan.steps import sft_data_parallel_cards
+    from flash.providers.fit_errors import vram_fit_error_message
+
+    width = lambda count: sft_data_parallel_cards(count, 3, 3)  # noqa: E731
+
+    def message(executed_width):
+        return vram_fit_error_message(
+            "sft",
+            230,
+            requested_gpu_count=2,
+            effective_gpu_count=2,
+            max_gpu_count=8,
+            gpu_names=("H100", "H200"),
+            executed_width=executed_width,
+        )
+
+    clamped = message(width)
+    assert "provides at most 141 GB" in clamped, "2 rented cards launch 1 rank, so 141 GB is all"
+    assert "234.1 GB" not in clamped, "the rented-card capacity must not be quoted anywhere"
+    # the rejection has to READ like a rejection: a stated capacity above the stated need does not.
+    assert "needs >= 230 GB" in clamped
+
+    # unchanged for runs that launch what they rent, whether the rule is identity or absent.
+    for control in (message(None), message(lambda count: count)):
+        assert "provides at most 234.1 GB" in control
+        assert "`--gpus 2` (2x H200 = 234.1 GB)" in control
+
+
 def test_unreachable_class_reports_the_configuration_not_the_vram_shortfall():
     """One root cause must not produce two different errors depending on the run's size.
 

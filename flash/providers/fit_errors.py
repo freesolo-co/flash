@@ -161,6 +161,98 @@ def catalog_check_hint(
     )
 
 
+def _unbuyable_width_message(
+    algorithm: str,
+    need: float,
+    *,
+    requested_gpu_count: int,
+    max_gpu_count: int,
+    gpu_names: tuple[str, ...] | None,
+    widenable_without_pin: tuple[str, ...] | None,
+    executed_width=None,
+) -> str:
+    """Diagnose a run that FITS at some width but cannot buy it, and say what to do about it.
+
+    Split out from ``vram_fit_error_message`` because it is a self-contained diagnosis: it decides
+    the obstacle and the remedy together, and those two must agree -- an obstacle claiming nobody
+    sells the shape reads as a contradiction above a remedy offering to rent exactly that shape.
+    """
+    # the remedy differs by WHY only fixed-count providers are in play. dropping a pin helps
+    # only when the fleet BEHIND it still sells the wider shape; a pin on a Lambda-only plane
+    # drops to the same pool and the same rejection, so it gets the configure-a-provider advice
+    # exactly like the operator who pinned nothing at all.
+    #
+    # the ceiling is usually ALSO too small -- `requested_gpu_count` already failed -- so a
+    # remedy naming only the provider costs a second rejection that finally reveals `--gpus N`.
+    # but it is not always: the unpinned pool may carry a BIGGER class the pin hid (Vast tops
+    # out at 80 GB/card while RunPod has H200/B200), and then the same width fits and the raise
+    # clause would name a ceiling the user already set. only append it when it really rises.
+    unpinned_width = smallest_fitting_gpu_count(
+        need,
+        max_gpu_count=max_gpu_count,
+        gpu_names=widenable_without_pin or (),
+        executed_width=executed_width,
+    )
+    if unpinned_width is not None:
+        remedy = (
+            (
+                "Drop the provider pin and raise the card ceiling with "
+                f"`--gpus {unpinned_width}` to let the allocator choose"
+            )
+            if unpinned_width > requested_gpu_count
+            else "Drop the provider pin to let the allocator choose"
+        )
+    else:
+        # `live_capacity` means the count must be confirmed DYNAMICALLY -- not that the wider
+        # SKU is absent. Lambda really does resolve `gpu_4x_h100_pcie` against its catalog, and
+        # rejects a shape it does not sell with its own precise error. So naming the width to
+        # try and letting the catalog decide beats sending the user to switch providers.
+        catalog_width = smallest_fitting_gpu_count(
+            need,
+            max_gpu_count=max_gpu_count,
+            gpu_names=gpu_names,
+            executed_width=executed_width,
+        )
+        # the identical fit check guarding this block guarantees a catalog width is present.
+        remedy = (
+            f"Raise the card ceiling with `--gpus {catalog_width}` to check it against their "
+            "catalog, or configure a provider that rents card counts directly (RunPod)"
+            if catalog_width > requested_gpu_count
+            else "Configure a provider that rents card counts directly (RunPod)"
+        )
+    # the obstacle must agree with the remedy printed right after it. whenever an unpinned width
+    # exists, the PIN is what blocks the run -- saying "no available provider is confirmed to
+    # sell" contradicts a remedy that offers to drop the pin and rent exactly that shape. only
+    # when nothing behind the pin fits is the fixed-count catalog wording the true diagnosis.
+    if unpinned_width is None:
+        obstacle = (
+            "which fits only on a multi-card shape that no available provider is confirmed to "
+            "sell: they offer fixed card counts as distinct instance types, so a wider shape "
+            "exists only if their live catalog lists one"
+        )
+    elif unpinned_width <= (requested_gpu_count or 0):
+        # dropping the pin reveals a BIGGER CARD at the count already authored (Vast tops out
+        # at 80 GB/card while RunPod has H200/B200), so no width has to change at all.
+        obstacle = (
+            "which no available provider is confirmed to sell at "
+            f"{requested_gpu_count} {'card' if requested_gpu_count == 1 else 'cards'}: the "
+            "pinned provider's largest card is too small, and the classes that would fit are "
+            "sold by providers this pin excludes"
+        )
+    else:
+        # the pinned pool cannot reach it at any purchasable width, but the fleet behind the
+        # pin rents this shape directly -- so the run is two flags from working, not unsellable.
+        obstacle = (
+            f"which needs {unpinned_width} cards that the pinned provider is not confirmed to "
+            "sell: they offer fixed card counts as distinct instance types, while a provider "
+            "this pin excludes rents that shape directly"
+        )
+    return (
+        f"{algorithm} needs >= {need:g} GB VRAM, {obstacle}. "
+        f"{remedy}, or {vram_knob_advice(algorithm)}."
+    )
+
+
 def vram_fit_error_message(
     algorithm: str,
     need: float,
@@ -192,8 +284,14 @@ def vram_fit_error_message(
         need, max_gpu_count=max_gpu_count, gpu_names=widenable, executed_width=executed_width
     )
     if requested_gpu_count is not None and fitting_count is not None:
-        provided = gpu_capacity_shape(effective_gpu_count, gpu_names=gpu_names)
-        fitting = gpu_capacity_shape(fitting_count, min_vram_gb=need, gpu_names=widenable)
+        # both shapes are valued at the width the SEARCH above used, or the message rejects a count
+        # for holding less than it claims to provide and then recommends one that holds less still.
+        provided = gpu_capacity_shape(
+            effective_gpu_count, gpu_names=gpu_names, executed_width=executed_width
+        )
+        fitting = gpu_capacity_shape(
+            fitting_count, min_vram_gb=need, gpu_names=widenable, executed_width=executed_width
+        )
         if provided is not None and fitting is not None:
             provided_gpu, provided_count, provided_vram = provided
             fitting_gpu, fitting_count, fitting_vram = fitting
@@ -213,82 +311,19 @@ def vram_fit_error_message(
     if requested_gpu_count is not None and smallest_fitting_gpu_count(
         need, max_gpu_count=max_gpu_count, gpu_names=gpu_names, executed_width=executed_width
     ):
-        # the remedy differs by WHY only fixed-count providers are in play. dropping a pin helps
-        # only when the fleet BEHIND it still sells the wider shape; a pin on a Lambda-only plane
-        # drops to the same pool and the same rejection, so it gets the configure-a-provider advice
-        # exactly like the operator who pinned nothing at all.
-        #
-        # the ceiling is usually ALSO too small -- `requested_gpu_count` already failed -- so a
-        # remedy naming only the provider costs a second rejection that finally reveals `--gpus N`.
-        # but it is not always: the unpinned pool may carry a BIGGER class the pin hid (Vast tops
-        # out at 80 GB/card while RunPod has H200/B200), and then the same width fits and the raise
-        # clause would name a ceiling the user already set. only append it when it really rises.
-        unpinned_width = smallest_fitting_gpu_count(
+        return _unbuyable_width_message(
+            algorithm,
             need,
+            requested_gpu_count=requested_gpu_count,
             max_gpu_count=max_gpu_count,
-            gpu_names=widenable_without_pin or (),
+            gpu_names=gpu_names,
+            widenable_without_pin=widenable_without_pin,
             executed_width=executed_width,
         )
-        if unpinned_width is not None:
-            remedy = (
-                (
-                    "Drop the provider pin and raise the card ceiling with "
-                    f"`--gpus {unpinned_width}` to let the allocator choose"
-                )
-                if unpinned_width > requested_gpu_count
-                else "Drop the provider pin to let the allocator choose"
-            )
-        else:
-            # `live_capacity` means the count must be confirmed DYNAMICALLY -- not that the wider
-            # SKU is absent. Lambda really does resolve `gpu_4x_h100_pcie` against its catalog, and
-            # rejects a shape it does not sell with its own precise error. So naming the width to
-            # try and letting the catalog decide beats sending the user to switch providers.
-            catalog_width = smallest_fitting_gpu_count(
-                need,
-                max_gpu_count=max_gpu_count,
-                gpu_names=gpu_names,
-                executed_width=executed_width,
-            )
-            # the identical fit check guarding this block guarantees a catalog width is present.
-            remedy = (
-                f"Raise the card ceiling with `--gpus {catalog_width}` to check it against their "
-                "catalog, or configure a provider that rents card counts directly (RunPod)"
-                if catalog_width > requested_gpu_count
-                else "Configure a provider that rents card counts directly (RunPod)"
-            )
-        # the obstacle must agree with the remedy printed right after it. whenever an unpinned width
-        # exists, the PIN is what blocks the run -- saying "no available provider is confirmed to
-        # sell" contradicts a remedy that offers to drop the pin and rent exactly that shape. only
-        # when nothing behind the pin fits is the fixed-count catalog wording the true diagnosis.
-        if unpinned_width is None:
-            obstacle = (
-                "which fits only on a multi-card shape that no available provider is confirmed to "
-                "sell: they offer fixed card counts as distinct instance types, so a wider shape "
-                "exists only if their live catalog lists one"
-            )
-        elif unpinned_width <= (requested_gpu_count or 0):
-            # dropping the pin reveals a BIGGER CARD at the count already authored (Vast tops out
-            # at 80 GB/card while RunPod has H200/B200), so no width has to change at all.
-            obstacle = (
-                "which no available provider is confirmed to sell at "
-                f"{requested_gpu_count} {'card' if requested_gpu_count == 1 else 'cards'}: the "
-                "pinned provider's largest card is too small, and the classes that would fit are "
-                "sold by providers this pin excludes"
-            )
-        else:
-            # the pinned pool cannot reach it at any purchasable width, but the fleet behind the
-            # pin rents this shape directly -- so the run is two flags from working, not unsellable.
-            obstacle = (
-                f"which needs {unpinned_width} cards that the pinned provider is not confirmed to "
-                "sell: they offer fixed card counts as distinct instance types, while a provider "
-                "this pin excludes rents that shape directly"
-            )
-        return (
-            f"{algorithm} needs >= {need:g} GB VRAM, {obstacle}. "
-            f"{remedy}, or {vram_knob_advice(algorithm)}."
-        )
 
-    widest = gpu_capacity_shape(max_gpu_count, gpu_names=gpu_names)
+    # the terminal message states the ceiling this run cannot clear, so the ceiling has to be the
+    # memory it would actually get -- crediting idle cards understates the shortfall it is reporting.
+    widest = gpu_capacity_shape(max_gpu_count, gpu_names=gpu_names, executed_width=executed_width)
     widest_count = largest_rentable_count(max_gpu_count)
     biggest = widest[2] if widest is not None else 0.0
     shape = (

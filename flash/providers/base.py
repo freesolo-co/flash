@@ -463,11 +463,21 @@ def gpu_capacity_shape(
     *,
     min_vram_gb: float | None = None,
     gpu_names: tuple[str, ...] | None = None,
+    executed_width=None,
 ) -> tuple[GpuClass, int, float] | None:
-    """Return the largest shape, or the smallest shape clearing ``min_vram_gb``."""
+    """Return the largest shape, or the smallest shape clearing ``min_vram_gb``.
+
+    The count in the returned shape is the RENTED count -- it labels what the user buys and what
+    `--gpus N` asks for. The capacity is valued at ``executed_width(count)``, the ranks that join.
+    For sft those differ, and a message that mixes them contradicts itself: a 2-card ceiling that
+    launches one rank was reported as providing 234.1 GB against a 230 GB need (so the rejection
+    read as a fit), then pointed at a 4-card shape credited 252.8 GB that really delivers 191.6.
+    """
     count = largest_rentable_count(gpu_count)
+    launched = executed_width(count) if executed_width else count
     shapes = [
-        (gpu, count, combined_vram_gb(gpu.vram_gb, count)) for gpu in _eligible_gpu_infos(gpu_names)
+        (gpu, count, combined_vram_gb(gpu.vram_gb, launched))
+        for gpu in _eligible_gpu_infos(gpu_names)
     ]
     if min_vram_gb is not None:
         shapes = [shape for shape in shapes if shape[2] >= min_vram_gb]
