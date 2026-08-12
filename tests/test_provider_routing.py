@@ -714,6 +714,36 @@ def test_transient_github_failure_still_defers_the_pin(orch, monkeypatch, blip_k
     assert allocated == ["submitted"], "a transient blip must still defer the pin and submit"
 
 
+def test_the_gate_keeps_the_sha_it_resolved_instead_of_resolving_twice(orch, monkeypatch):
+    """The 404 check and the pin are the same GitHub call, so it must be made once.
+
+    Both ask ``/repos/{repo}/commits/{ref}``. Resolving for the gate, discarding the answer, then
+    resolving again for the pin doubles this submit's spend against the secondary rate limit the
+    pin exists to protect -- and the two calls can disagree, since a ref can move between them.
+    """
+    import flash.envs.loader as env_loader
+    from flash.providers import allocator
+
+    sha = "a" * 40
+    calls = []
+
+    def counting_resolve(_parsed, *_args, **_kwargs):
+        calls.append(1)
+        return sha
+
+    submitted = []
+    monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", counting_resolve)
+    monkeypatch.setattr(orch, "_run_job", lambda spec, **k: submitted.append(spec) or None)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+
+    orch.submit_job(_public_spec(algorithm="grpo"))
+
+    assert len(calls) == 1, f"the env ref was resolved {len(calls)} times, expected once"
+    assert submitted
+    assert submitted[0].environment.resolved_sha == sha
+
+
 def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     """A pin the lifecycle fallback recovers must survive a control-plane restart.
 

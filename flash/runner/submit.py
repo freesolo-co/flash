@@ -229,7 +229,12 @@ def submit_job(
     # the opd image preflight below resolves the same ref to read its dataset, so leaving this
     # second would surface an unresolvable environment as a raw GitHub error from whichever
     # preflight happened to touch it first, instead of the named refusal.
-    _runner().preflight_validate_environment_ref(worker_spec)
+    #
+    # keeps the pin it resolved. the http route hoists this same gate ahead of affordability and
+    # hands the pinned spec back in `prepared_job`, in which case `resolved_sha` is already set and
+    # this returns without a request; a direct caller resolves here instead. either way the pin is
+    # made once, which is the point of `_assign_resolved_env_sha` further down.
+    worker_spec = _runner().preflight_validate_environment_ref(worker_spec)
     preflight_validate_image_opd(worker_spec)
     preflight_validate_managed_teacher(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers

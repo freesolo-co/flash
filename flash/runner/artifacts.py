@@ -111,7 +111,7 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
     return runner.JobSpec.from_dict(d)
 
 
-def preflight_validate_environment_ref(spec: JobSpec) -> None:
+def preflight_validate_environment_ref(spec: JobSpec) -> JobSpec:
     """Refuse an environment ref GitHub has permanently rejected, before a GPU is allocated.
 
     ``_assign_resolved_env_sha`` is best-effort by design: grpo and opd have no workload profile
@@ -132,13 +132,27 @@ def preflight_validate_environment_ref(spec: JobSpec) -> None:
     an authenticated 404 means "not there", so a tokenless plane keeps the old deferral rather than
     refusing runs whose environment it simply cannot see.
 
+    Two things it deliberately does not catch, because catching them costs a request each and the
+    deferral is already correct for both. A ref that is itself a 40-hex commit sha short-circuits
+    inside ``_resolve_ref_sha`` without contacting GitHub, so a fabricated sha still reaches the
+    worker -- and it must, since the pinned-sha path is the fan-out this exists to keep cheap. And
+    the ref's PATH is never fetched: ``/repos/{repo}/commits/{ref}`` proves the repo and the ref,
+    not that ``environment.py`` sits where the id says. A typo'd path therefore fails on the worker
+    with ``environment archive did not contain required entrypoint``, which names the file.
+
     sft never reaches this state -- its profile gate already fails closed on any unpinned
     environment -- but this runs for it as well, so the failure names the ref rather than the
     missing profile it caused.
+
+    Returns the spec with the resolved sha pinned when the resolve succeeded. The gate has to make
+    the call anyway, and ``_assign_resolved_env_sha`` would otherwise make the identical one a few
+    lines later; keeping the answer removes that second round trip against the same secondary rate
+    limit the pin exists to protect. Callers that do not want the pin can ignore the return value --
+    it is the same spec whenever nothing was resolved.
     """
     env_id = spec.environment.id
     if not env_id or spec.environment.resolved_sha:
-        return
+        return spec
     from flash.envs.identity import GitHubPermanentError
     from flash.envs.loader import (
         _github_token,
@@ -149,7 +163,7 @@ def preflight_validate_environment_ref(spec: JobSpec) -> None:
     )
 
     if not _github_token():
-        return
+        return spec
 
     try:
         ref_str = (
@@ -159,17 +173,25 @@ def preflight_validate_environment_ref(spec: JobSpec) -> None:
     except Exception:
         # not a resolvable github ref (a local path, a malformed slug). the loader owns that
         # verdict and reports it far better than a half-parsed ref could here.
-        return
+        return spec
     if parsed is None:
-        return
+        return spec
     try:
-        _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
+        sha = _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
     except GitHubPermanentError as exc:
+        # what GitHub rejected is the repo or the ref -- ``/repos/{repo}/commits/{ref}`` is the only
+        # call made -- so the message names those two and not the path, which is checked by nobody
+        # here. see the note below on why it stays that way.
         raise runner.EnvironmentRefNotFound(
-            f"environment {env_id!r} could not be resolved on GitHub: {exc}. Verify the repository, "
-            "ref and path exist and that the plane's GitHub token can read them"
+            f"environment {env_id!r} could not be resolved on GitHub: {exc}. Verify the repository "
+            "and ref exist and that the plane's GitHub token can read them"
         ) from exc
     except Exception:
         # transient, or anything else unproven: keep the documented best-effort deferral. the pin
         # is an optimisation for these, and the worker resolves the ref on its own.
-        return
+        return spec
+    if not sha:
+        return spec
+    d = spec.to_internal_dict()
+    d["environment"] = {**d["environment"], "resolved_sha": sha}
+    return runner.JobSpec.from_dict(d)

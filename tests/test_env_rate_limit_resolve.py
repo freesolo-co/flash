@@ -256,8 +256,9 @@ def test_background_submit_defers_env_sha_off_creation_path(monkeypatch, tmp_pat
     monkeypatch.setattr(runner, "_run_job", fake_run_job)
     # the submit-time 404 gate resolves the ref too, and this spec names a placeholder repo that
     # really does 404. its subject is WHICH THREAD pins, so stub the gate out rather than let a live
-    # GitHub lookup decide whether the test runs.
-    monkeypatch.setattr(runner, "preflight_validate_environment_ref", lambda spec: None)
+    # GitHub lookup decide whether the test runs. pass the spec through unpinned: the gate returns
+    # what it resolved, and returning a pinned spec here would answer the question under test.
+    monkeypatch.setattr(runner, "preflight_validate_environment_ref", lambda spec: spec)
 
     spec = JobSpec(
         run_id="flash-bg-resolve",

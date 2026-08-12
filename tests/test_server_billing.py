@@ -390,6 +390,34 @@ def test_submit_blocked_when_precheck_402(api, monkeypatch):
     assert api.get("/v1/runs", headers=_bearer("fslo-user-1")).json()["runs"] == []
 
 
+def test_a_nonexistent_environment_is_refused_before_the_402(api, monkeypatch):
+    """A run that can never launch must not be reported as an affordability problem.
+
+    The budget precheck runs on the request path, so a gate placed after it answers "insufficient
+    balance" for a typo'd environment -- sending the user to top up, for a run no balance can buy.
+    Both faults are live here at once, and the spec's own defect has to win.
+    """
+    import flash.envs.loader as env_loader
+    import flash.server.billing.charges as billing_mod
+    from flash.envs.identity import GitHubPermanentError
+
+    def _block(**k):
+        raise billing_mod.BillingError(402, "insufficient balance")
+
+    def _permanent(_parsed, *_a, **_k):
+        raise GitHubPermanentError("GitHub environment request failed (404): Not Found")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
+    monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", _permanent)
+
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
+
+    assert res.status_code == 400, res.text
+    assert "could not be resolved on GitHub" in res.text
+    assert "insufficient" not in res.text
+
+
 def test_submit_fails_open_when_precheck_unreachable(api, monkeypatch):
     # a non-402 billing error (backend unreachable / 5xx) must NOT block training; the completion
     # charge is the backstop. The run is still accepted and recorded.
