@@ -569,6 +569,7 @@ def _submit_candidate(
     prepared: _PreparedAttempt,
     plan: _CandidatePlan,
 ):
+    from flash.cost.spec import UnknownPromptPoolSize
     from flash.engine.profiling.workload_profile import WorkloadProfileMismatch
     from flash.providers.base import PollResult
     from flash.runner import (
@@ -596,11 +597,16 @@ def _submit_candidate(
             selected_quote = _estimate_selected_quote(ctx, plan, latest)
         except _lifecycle._SelectedQuoteUnaffordable:
             raise
-        except WorkloadProfileMismatch:
-            # the quote is backed by a workload profile whose identity is derived from this
-            # spec, so a mismatch here is a defect in the run's own inputs, not a market or
-            # metadata blip. retrying re-derives the same identity and fails the same way,
-            # spending the run's remaining deadline in backoff sleeps to get there.
+        except (WorkloadProfileMismatch, UnknownPromptPoolSize):
+            # both are defects in the run's own inputs rather than a market or metadata blip, so
+            # retrying re-derives the same answer and fails the same way, spending the run's
+            # remaining deadline in backoff sleeps to get there.
+            #
+            # the profile mismatch is an identity derived from this spec. the missing pool size is
+            # the same shape: grpo/opd price their horizon from a stated prompt-pool size, and a
+            # spec that states none states none on every attempt. this refresh asks for a
+            # PREDICTED horizon (no steps to prorate from), which is exactly the question the
+            # refusal exists to answer -- so it must fail closed once, not once per attempt.
             raise
         except Exception as exc:
             # revision-aware quote inputs can depend on remote metadata. a transient refresh

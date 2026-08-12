@@ -20,6 +20,10 @@ from flash.engine.profiling.workload_profile import (
 )
 
 
+class UnknownPromptPoolSize(ValueError):
+    """Raised when a grpo/opd quote has no stated prompt-pool size to derive a horizon from."""
+
+
 def _on_policy_epochs(spec) -> int:
     from flash.engine.plan.recipe import RECIPE
 
@@ -90,7 +94,7 @@ def _rollout_profile(spec):
 
 
 def _on_policy_example_count(spec) -> int:
-    """Prompts this quote prices, preferring the cap flash actually enforces.
+    """Retained prompts the run will iterate, from the only two places that state a row count.
 
     Deliberately NOT ``min()`` of the two caps. ``[train] max_examples`` is a validated ``TrainSpec``
     field the worker enforces unconditionally as ``train[:max_examples]``, so it is a real ceiling on
@@ -101,8 +105,11 @@ def _on_policy_example_count(spec) -> int:
     the smaller value would underquote real training. The train cap can overquote when the
     environment returns fewer rows, which is the safe direction.
 
-    Reading the env value when no train cap is set is pre-existing behavior (#465) and is left
-    alone; narrowing it needs a real enforced cap, which is pricing work outside this change.
+    Falling back to one step's worth of prompts is what this raises instead of. The worker sizes
+    the horizon from ``len(prompts)`` -- every row the environment yields -- so a pool the config
+    never bounded derived exactly one step and quoted a full run at one step's price. The error
+    below is the same refusal sft already makes: a horizon nothing measured is not a cheap quote,
+    it is an absent one.
     """
     pinned_examples = int(spec.train.max_examples) if spec.train.max_examples else 0
     if pinned_examples > 0:
@@ -110,7 +117,15 @@ def _on_policy_example_count(spec) -> int:
     env_examples = _env_max_examples(spec)
     if env_examples > 0:
         return env_examples
-    return _on_policy_requested_prompts_per_step(spec)
+    # only [train] max_examples is named here. [environment.params] max_examples is still READ
+    # above, because an environment that honours it really does bound the pool -- but it reaches
+    # the environment as an opaque `load_environment(**params)` kwarg, and the starter templates
+    # swallow it into **kwargs and ignore it. Only [train] max_examples is applied by the worker
+    # itself (rl/inputs.py:195, opd_train_runner.py:166), so it is the one this can promise.
+    raise UnknownPromptPoolSize(
+        f"cannot price {spec.algorithm} without a prompt-pool size: set [train] max_examples to "
+        "the row count the run will train on, or [train] max_steps to state the horizon directly"
+    )
 
 
 def _env_max_examples(spec) -> int:
@@ -151,9 +166,13 @@ def spec_steps(spec) -> int:
     retained rows, realized batch, and ``max_steps`` against the exact tokenized dataset, so
     re-deriving it here from the config would reintroduce the guess the profile exists to replace.
     grpo/opd still derive passes over retained prompts, and positive ``max_steps`` replaces that
-    derived count.
+    derived count -- so it is read first: a stated horizon needs no pool size to derive one from,
+    and asking for a row count the answer does not depend on would reject a fully specified run.
     """
     if spec.algorithm in ("grpo", "opd"):
+        pinned_horizon = int(spec.train.max_steps or 0)
+        if pinned_horizon > 0:
+            return pinned_horizon
         examples = _on_policy_example_count(spec)
         derived = on_policy_steps(
             epochs=_on_policy_epochs(spec),
@@ -274,9 +293,13 @@ def runconfig_from_spec(spec) -> RunConfig:
             rollout.completion_tokens_mean if rollout is not None else None
         ),
         measured_prompt_tokens=(rollout.prompt_tokens_mean if rollout is not None else None),
+        # a probe that ran and FAILED is not a measurement. reward_failures == reward_samples is a
+        # permitted profile state and trustworthy() has no reward-success check, so comparing
+        # against 0 would let an all-failed probe contribute its ~0s latency as though it were
+        # evidence. requiring a successful sample sends that case to the default instead.
         reward_seconds_per_completion=(
             rollout.reward_seconds_per_completion
-            if rollout is not None and rollout.reward_samples > 0
+            if rollout is not None and rollout.reward_samples > rollout.reward_failures
             else None
         ),
     )
