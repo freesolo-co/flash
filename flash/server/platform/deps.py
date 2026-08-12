@@ -120,30 +120,62 @@ def _require_bool(payload: dict, field: str, default: bool) -> bool:
     return value
 
 
-def _require_hosted_environment_form(env_raw: dict) -> None:
-    """On the managed service, an environment id must be a hub slug, not an arbitrary repo.
+def _require_supported_environment_form(env_raw: dict) -> None:
+    """The environment id must name a source THIS plane can actually fetch.
 
-    The managed hub is the only repo this plane can vouch for: it is the one ``flash env push``
-    writes to, the one whose packages carry a validated project association, and the one whose
-    slugs the submit route canonicalizes. A ``github:``/browser-URL ref names a repo the plane has
-    no relationship with, so accepting it would train against unreviewed code under a Freesolo run.
+    The two deployments have opposite, non-overlapping environment sources, so each has to reject
+    the other's form:
 
-    A self-hosted plane is the opposite case: its hub repo is Freesolo's and it cannot publish
-    there, so the explicit GitHub forms are its ONLY environment source (a local ``path`` is
-    already rejected above). Gate on ``standalone()`` rather than deleting the grammar, or
-    self-hosting has no way to name an environment at all.
+    The managed hub is the only repo the managed service can vouch for: it is the one
+    ``flash env push`` writes to, the one whose packages carry a validated project association, and
+    the one whose slugs the submit route canonicalizes. A ``github:``/browser-URL ref names a repo
+    that plane has no relationship with, so accepting it would train against unreviewed code under
+    a Freesolo run.
+
+    A self-hosted plane is the exact inverse: the hub is ``freesolo-co/environment-hub``, which is
+    private and hardcoded with no override, and ``managed_slug_to_github_ref`` maps EVERY slug onto
+    it. So a slug names the one repo such a plane provably cannot read -- not an environment it
+    happens to lack. Accepted, it passes submit, survives the best-effort sha pin in
+    ``_assign_resolved_env_sha`` (which logs and defers to the worker), and surfaces on the rented
+    GPU as a bare GitHub 404 naming a repo the operator has never heard of, after the run has
+    already cost money. Rejecting at submit turns that into a free, explained failure. The explicit
+    GitHub forms remain a self-hosted plane's only environment source (a local ``path`` is already
+    rejected above).
+
+    Checked through ``canonical_managed_environment_slug`` rather than ``is_managed_...`` because
+    the hub has four spellings that all resolve to the same private repo -- the bare slug, the
+    ``github:`` ref, the browser URL, and case variants of each. It returns the slug for all of
+    them, and raises for a ref that targets the hub but is malformed, which is equally unfetchable.
 
     Enforced here rather than in the schema because ``FLASH_STANDALONE`` lives on the server and
     the CLI cannot see it -- a client-side check would reject the self-hosted operator's own refs.
     """
-    if auth.standalone():
-        return
     env_id = env_raw.get("id")
     if not isinstance(env_id, str) or not env_id.strip():
         return  # absent/malformed ids are the schema's error to report, with its own message
-    from flash.envs.adapter import is_managed_environment_slug
+    from flash.envs.adapter import canonical_managed_environment_slug, is_managed_environment_slug
 
     env_id = env_id.strip()
+    if auth.standalone():
+        try:
+            names_hub = canonical_managed_environment_slug(env_id) is not None
+        except ValueError:
+            # targets the hub repo but is malformed: still the unreachable repo, not the
+            # operator's own, so it gets this explanation rather than a shape complaint.
+            names_hub = True
+        if not names_hub:
+            return
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"[environment] id {env_id!r} names Freesolo's managed environment hub "
+                "(freesolo-co/environment-hub), which is private and unreadable from a "
+                "self-hosted plane -- the run would fail on a rented GPU with a GitHub 404. "
+                "Reference your own repository instead, as "
+                "`github:OWNER/REPO@REF:path/to/environment.py`, and set GITHUB_TOKEN on this "
+                "plane if it is private."
+            ),
+        )
     if is_managed_environment_slug(env_id):
         return
     raise HTTPException(
@@ -177,7 +209,7 @@ def _parse_spec(payload: dict, run_id: str) -> JobSpec:
             "then reference it "
             "by the returned environment id",
         )
-    _require_hosted_environment_form(env_raw)
+    _require_supported_environment_form(env_raw)
     try:
         return spec_from_dict(spec_raw, run_id=run_id, project_required=True)
     except (ConfigError, ValueError) as exc:
