@@ -11,6 +11,7 @@ would no longer reach the episode path.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 
 from flash.cli.commands.env.test import _evaluation_example
@@ -220,15 +221,45 @@ def _run_episode_cases(
             for case_id in case_ids
         )
     results = []
-    for case, case_id in zip(cases, case_ids, strict=True):
-        try:
-            outcome = _drive_episode(client, target, environment, case, args)
-        except (Exception, SystemExit) as exc:
-            reason = str(exc) or exc.__class__.__name__
-            results.append(eval_module._generation_error(case_id, f"episode failed: {reason}"))
-            continue
-        if isinstance(outcome, str):
-            results.append(eval_module._generation_error(case_id, outcome))
-            continue
-        results.append(_score_episode_case(suite, case, case_id, outcome, thinking=thinking))
+    # The adapter defaults to `thinking = False` (flash/envs/adapter.py), and with it off
+    # `_scored_turn_text` returns the turn unstripped -- so `state["response_text"]` keeps its
+    # `<think>...</think>` wrapper. Scoring the separate `response` argument hides that, because
+    # `_score_case` strips it; a suite that reads the STATE instead sees raw reasoning and marks a
+    # correct answer wrong. Training sets this on the env, so eval has to as well.
+    with _reasoning_mode(environment, thinking):
+        for case, case_id in zip(cases, case_ids, strict=True):
+            try:
+                outcome = _drive_episode(client, target, environment, case, args)
+            except (Exception, SystemExit) as exc:
+                reason = str(exc) or exc.__class__.__name__
+                results.append(eval_module._generation_error(case_id, f"episode failed: {reason}"))
+                continue
+            if isinstance(outcome, str):
+                results.append(eval_module._generation_error(case_id, outcome))
+                continue
+            results.append(_score_episode_case(suite, case, case_id, outcome, thinking=thinking))
     return tuple(results)
+
+
+@contextlib.contextmanager
+def _reasoning_mode(environment, thinking: bool):
+    """Put the environment in the run's reasoning mode for the duration of the episodes.
+
+    Restored afterwards rather than set once: the caller owns the adapter and may reuse it for
+    another suite, and leaving a flipped flag behind would change how THAT one grades.
+    """
+    previous = getattr(environment, "thinking", None)
+    try:
+        environment.thinking = bool(thinking)
+    except AttributeError:
+        # a stand-in environment that does not expose the flag grades on its own terms
+        yield
+        return
+    try:
+        yield
+    finally:
+        if previous is None:
+            with contextlib.suppress(AttributeError):
+                del environment.thinking
+        else:
+            environment.thinking = previous

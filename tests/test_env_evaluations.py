@@ -3943,3 +3943,80 @@ def test_env_eval_honours_a_per_example_turn_budget_below_the_env_ceiling() -> N
     # two turns, not the six the dataset-wide ceiling would have allowed
     assert state["turns"] == ["turn1", "turn2"]
     assert len(generated) == 2
+
+
+def test_env_eval_strips_reasoning_from_the_state_a_thinking_episode_scores() -> None:
+    """A thinking run must not hand the suite raw `<think>` text through the episode state.
+
+    `_score_case` strips the separate `response` argument, so scoring that alone hides this. But a
+    `grades_episodes` suite reads `state["response_text"]`, which `record_model_turn` fills via
+    `_scored_turn_text` -- and that returns the turn UNSTRIPPED while the adapter's `thinking` flag
+    is at its default False. The suite then sees `<think>2+2 is 4</think>4` and marks a correct
+    answer wrong. Training sets the flag on the env, so eval has to as well.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class Environment:
+        """Uses the real adapter's turn-recording, which is where the stripping lives."""
+
+        multi_turn = True
+        max_turns = 1
+        package_root = None
+
+        def __init__(self):
+            self.thinking = False
+            self.prompt_opens_thinking = False
+
+        def new_rollout_state(self, example):
+            return {"messages": [{"role": "user", "content": "2+2?"}], "turns": [], "turn": 0}
+
+        def record_model_turn(self, state, content):
+            scored = FreesoloEnvironment._scored_turn_text(self, content)
+            state["turns"].append(scored)
+            state["messages"].append({"role": "assistant", "content": content})
+            state["response_text"] = scored
+
+        def rollout_done(self, state, max_turns=None):
+            if state.get("done"):
+                return True
+            return max_turns is not None and int(state.get("turn", 0)) >= int(max_turns)
+
+        def env_reply(self, messages, state):
+            state["turn"] = int(state.get("turn", 0)) + 1
+            return []
+
+    seen = {}
+
+    class Suite:
+        name = "episode"
+        grades_episodes = True
+
+        def score(self, case, response, state=None):
+            seen["state_response"] = str((state or {}).get("response_text"))
+            return 1.0 if seen["state_response"] == "4" else 0.0
+
+    environment = Environment()
+    original = env_eval._generate_case
+    env_eval._generate_case = lambda client, target, messages, args: "<think>2+2 is 4</think>4"
+    try:
+        results = episode_module._run_episode_cases(
+            object(),
+            "t",
+            Suite(),
+            [EvalCase(id="c", input="2+2?")],
+            argparse.Namespace(),
+            environment,
+            thinking=True,
+        )
+    finally:
+        env_eval._generate_case = original
+
+    # the scorer read the answer, not the reasoning wrapper
+    assert seen["state_response"] == "4"
+    assert results[0].score == 1.0
+    # and the caller's environment is left as it was found
+    assert environment.thinking is False
