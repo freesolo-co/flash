@@ -3295,3 +3295,128 @@ def test_env_eval_refuses_when_the_run_spec_is_unreadable(monkeypatch, capsys) -
     captured = capsys.readouterr().err
     assert "could not read the target run flash-1" in captured
     assert "overall: FAIL" in captured
+
+
+class _MultiTurnEnvironment:
+    """Minimal stand-in for the multi-turn half of `FreesoloEnvironment`.
+
+    Only the surface `env eval` drives: prompt state, one recorded model turn at a time, an env
+    reply between turns, and a done signal. The transcript it accumulates is what a real
+    multi-turn scorer grades.
+    """
+
+    multi_turn = True
+    max_turns = 3
+
+    def __init__(self) -> None:
+        self.generated: list[str] = []
+
+    def new_rollout_state(self, example):
+        return {"messages": [{"role": "user", "content": "turn-1"}], "turns": []}
+
+    def record_model_turn(self, state, content):
+        self.generated.append(content)
+        state["turns"].append(content)
+        state["messages"] = [*state["messages"], {"role": "assistant", "content": content}]
+        # what a real env exposes as the scored text: the whole transcript, not the last reply.
+        state["response_text"] = "|".join(state["turns"])
+
+    def rollout_done(self, state, max_turns=None):
+        return len(state["turns"]) >= self.max_turns
+
+    def env_reply(self, messages, state):
+        reply = [{"role": "user", "content": f"turn-{len(state['turns']) + 1}"}]
+        state["messages"] = [*messages, *reply]
+        return reply
+
+
+def _multi_turn_env_dir(tmp_path, monkeypatch):
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'episodes'\n"
+        "    def cases(self): return [EvalCase(id='only', input='only', expected='a|b|c')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    return env_dir
+
+
+def test_env_eval_drives_every_turn_of_a_multi_turn_environment(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A multi-turn case must generate once per turn, not once per case.
+
+    Scoring one reply of a task whose reward reads the whole transcript reports a number for a
+    different task, which is indistinguishable from a weak model.
+    """
+    _multi_turn_env_dir(tmp_path, monkeypatch)
+    environment = _MultiTurnEnvironment()
+    replies = iter(["a", "b", "c"])
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            yield next(replies)
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
+    # one generation per turn, and the graded text is the accumulated transcript.
+    assert environment.generated == ["a", "b", "c"]
+    assert "case only: PASS" in capsys.readouterr().out
+
+
+def test_env_eval_reports_a_failed_turn_without_losing_the_case(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A generation failure mid-episode fails that case, not the whole suite.
+
+    The failure is raised on the second turn, which only ever happens once the episode is driven,
+    so this also pins that a partially-played episode reports the reason instead of a bare 0.0.
+    """
+    _multi_turn_env_dir(tmp_path, monkeypatch)
+    environment = _MultiTurnEnvironment()
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            if environment.generated:
+                raise RuntimeError("upstream refused")
+            yield "a"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
+    captured = capsys.readouterr()
+    # the upstream reason has to survive to the case line; a bare 0.0 would read as a weak model.
+    assert "case only: FAIL" in captured.out
+    assert "upstream refused" in captured.out
+    assert "errors=1" in captured.out
+
+
+def test_env_eval_keeps_one_generation_per_case_for_single_turn(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The single-turn path must not start driving episodes."""
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'single'\n"
+        "    def cases(self): return [EvalCase(id='only', input='only', expected='only')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    calls: list[str] = []
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            calls.append(messages[0]["content"])
+            yield messages[0]["content"]
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
+    assert calls == ["only"]
+    assert "case only: PASS" in capsys.readouterr().out
