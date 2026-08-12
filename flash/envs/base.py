@@ -151,7 +151,7 @@ class BaseEnvironment:
         return bool(gold) and gold in (completion or "")
 
 
-FREESOLO_WORKER_SPEC = "freesolo>=0.4.0"
+FREESOLO_WORKER_SPEC = "freesolo>=0.4.1"
 
 
 def worker_pip_for_env(env_id: str) -> list[str]:

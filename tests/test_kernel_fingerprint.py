@@ -1,7 +1,7 @@
 """Unit tests for docker/kernel_fingerprint.py (the per-arch rebake SSOT).
 
 The whole auto-rebake feature rests on two invariants this file pins:
-  * the cheap/expensive split: a base-only change (e.g. an FA3 wheel) moves fp_base but NOT fp_cache
+  * the cheap/expensive split: a base-only change (e.g. an FA2 wheel) moves fp_base but NOT fp_cache
     (cheap re-layer), while a cache-toolchain change (e.g. the fla sha) moves BOTH (paid GPU re-warm),
   * fail-loud parsing: a stale baked cache is a SILENT cold-JIT, so a parser that silently returns a
     constant would hide staleness. Every input must parse, and the parsed values must match the repo.
@@ -66,12 +66,12 @@ def test_fingerprints_are_deterministic():
 def test_split_invariant_cheap_vs_expensive():
     """The contract the feature rests on: base-only edits move fp_base only; cache edits move both."""
     cache = {"fla": "sha-A", "from_image": "torch:1"}
-    base = {"fa3": "wheel-A", "causal_conv1d": "cc==1"}
+    base = {"fa2": "wheel-A", "causal_conv1d": "cc==1"}
 
     fc0, fb0, _ = kf.compute_fingerprints(cache, base)
 
-    # a base-only change (new FA3 wheel) -> fp_base moves, fp_cache unchanged -> cheap re-layer
-    fc1, fb1, _ = kf.compute_fingerprints(cache, {**base, "fa3": "wheel-B"})
+    # a base-only change (new FA2 wheel) -> fp_base moves, fp_cache unchanged -> cheap re-layer
+    fc1, fb1, _ = kf.compute_fingerprints(cache, {**base, "fa2": "wheel-B"})
     assert fc1 == fc0
     assert fb1 != fb0
 
@@ -93,9 +93,7 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
         assert cache_inputs[key], f"cache input {key} not populated"
     for key in (
         "fa2",
-        "fa3",
         "fa2_sha256",
-        "fa3_sha256",
         "causal_conv1d",
         "pip_base",
         "dockerfile_sha256",
@@ -129,21 +127,17 @@ def test_fa_sha256_digest_only_change_moves_fp_base_not_fp_cache():
     move fp_base (so auto-rebake re-layers every stale per-arch tag) while leaving fp_cache untouched
     (a wheel digest plays no part in what the Triton/Inductor mega-cache holds, so no GPU re-warm)."""
     fp_cache0, fp_base0, _, _ = kf.fingerprints(ROOT)
-    fp_cache1, fp_base1, _, _ = kf.fingerprints(ROOT, fa3_sha256="0" * 64)
+    fp_cache1, fp_base1, _, _ = kf.fingerprints(ROOT, fa2_sha256="0" * 64)
     assert fp_cache1 == fp_cache0, "a wheel digest rotation must not invalidate the kernel cache"
     assert fp_base1 != fp_base0, (
         "a wheel digest rotation must move fp_base so auto-rebake re-layers"
     )
 
-    fp_cache2, fp_base2, _, _ = kf.fingerprints(ROOT, fa2_sha256="1" * 64)
-    assert fp_cache2 == fp_cache0
-    assert fp_base2 != fp_base0
-
 
 def test_cli_fa_sha256_override_moves_fp_base():
-    """worker-image.yml invokes the CLI with resolved --fa2-sha256/--fa3-sha256 values (mirroring
-    --fa2-spec/--fa3-spec); prove the argparse wiring actually reaches base_inputs_partial and not
-    just the Python-level collect_inputs kwarg."""
+    """worker-image.yml invokes the CLI with a resolved --fa2-sha256 value (mirroring --fa2-spec);
+    prove the argparse wiring actually reaches base_inputs_partial and not just the Python-level
+    collect_inputs kwarg."""
     baseline = json.loads(
         subprocess.run(
             [sys.executable, str(KERNEL_FINGERPRINT_SCRIPT), "--format", "json"],
@@ -159,7 +153,7 @@ def test_cli_fa_sha256_override_moves_fp_base():
                 str(KERNEL_FINGERPRINT_SCRIPT),
                 "--format",
                 "json",
-                "--fa3-sha256",
+                "--fa2-sha256",
                 "0" * 64,
             ],
             text=True,
@@ -171,20 +165,8 @@ def test_cli_fa_sha256_override_moves_fp_base():
     assert overridden["fp_base"] != baseline["fp_base"]
 
 
-def test_fa3_default_is_in_lockstep():
-    """worker-image.yml's FA3 build-arg default must equal Dockerfile.worker's ARG default (today a
-    comment-only, untested 'keep in sync'). collect_inputs reads the yml value, so assert it matches."""
-    _cache, base_partial = kf.collect_inputs(ROOT)
-    dockerfile = (ROOT / "Dockerfile.worker").read_text()
-    arg_default = re.search(r"(?m)^ARG FLASH_ATTN_3_SPEC=(\S+)", dockerfile).group(1)
-    assert base_partial["fa3"] == arg_default, (
-        "Dockerfile.worker ARG FLASH_ATTN_3_SPEC default must match worker-image.yml's build-arg "
-        f"default (dockerfile={arg_default}, yml={base_partial['fa3']})"
-    )
-
-
 def test_the_flash_attn_wheel_digests_are_in_lockstep():
-    """Both FA wheels are verified before install, so both digests are declared twice.
+    """The FA2 wheel is verified before install, so its digest is declared twice.
 
     Dockerfile.worker carries the ARG defaults it verifies against; worker-image.yml passes the same
     values as build-args. A drifted pair means the build verifies against a digest nobody reviewed
@@ -193,10 +175,9 @@ def test_the_flash_attn_wheel_digests_are_in_lockstep():
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
     yml = (ROOT / ".github" / "workflows" / "worker-image.yml").read_text()
 
-    for arg, env in (("FLASH_ATTN_SHA256", "FA2_SHA256"), ("FLASH_ATTN_3_SHA256", "FA3_SHA256")):
+    for arg, env in (("FLASH_ATTN_SHA256", "FA2_SHA256"),):
         docker_sha = re.search(rf"(?m)^ARG {arg}=([0-9a-f]{{64}})$", dockerfile)
         assert docker_sha, f"Dockerfile.worker must pin a 64-hex ARG {arg}"
-        # FA3's is behind a workflow input (`${{ inputs || 'default' }}`); FA2's is a bare literal.
         yml_sha = re.search(rf"{env}:.*?'([0-9a-f]{{64}})'", yml) or re.search(
             rf"(?m)^\s*{env}:\s*([0-9a-f]{{64}})$", yml
         )

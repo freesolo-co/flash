@@ -61,7 +61,7 @@ RUN pip install --no-cache-dir \
     "tilelang==0.1.11" \
     "apache-tvm-ffi==0.1.11" \
     "hf_transfer" \
-    "freesolo>=0.4.0" \
+    "freesolo>=0.4.1" \
     "runpod"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
@@ -128,50 +128,24 @@ RUN set -eu; \
     && echo "flash-attn: installed (${FLASH_ATTN_SPEC})" || echo "flash-attn: build failed, SDPA fallback"; \
     [ -z "${workdir}" ] || rm -rf "${workdir}"
 
-# FlashAttention-3 (used on Hopper sm90: H100/H200). transformers routes
-# attn_implementation="flash_attention_3" to a LOCAL ``flash_attn_interface`` module (the
-# ``flash-attn-3`` build) — NOT the HF Kernels-Hub, whose torch2.10-compatible versions break
-# ``import transformers``. Baking it in lets the trainer use FA3 on the model's FULL-attention
-# (softmax) layers on Hopper (verl resolves the attn impl child-side); the Qwen3.5 Gated-DeltaNet
-# linear-attention layers are unaffected (FA does not apply to linear attention).
-# DEFAULT-ON, like FA2: FLASH_ATTN_3_SPEC defaults to a validated prebuilt cu128/torch2.10 wheel so
-# ``flash_attn_interface`` is ALWAYS present on Hopper — we control the image, so FA3 should never be
-# missing and the engine's SDPA fallback is pure defense-in-depth (only hit via FLASH_DISABLE_FA3).
-# It's a no-op on non-Hopper archs (FA3 is only probed on sm90); the wheel just rides
-# along. Override FLASH_ATTN_3_SPEC to pin a different wheel, or set it to "" to drop FA3. Best-effort:
-# a failed install never blocks the image, and ``import flash_attn_interface`` is verified so a broken
-# install can't ship as "present" and then crash a run.
-# NOTE: keep this default in sync with .github/workflows/worker-image.yml's flash_attn_3_spec input.
-ARG FLASH_ATTN_3_SPEC=https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl
-# sha256 of the wheel FLASH_ATTN_3_SPEC defaults to. Same argument as FLASH_ATTN_SHA256 above: an
-# unofficial rebuild repo owned by an individual, fetched into the interpreter that trains, so it is
-# verified before install rather than trusted by url. Override it together with FLASH_ATTN_3_SPEC
-# (worker-image.yml exposes both as workflow inputs); a url spec with an empty sha is refused.
-ARG FLASH_ATTN_3_SHA256=13ec39bc8cb37d37b1efd3bff76ee5e994f5cac3ca6a8ce35db6f54b98ca3862
-# Same wheel-filename constraint as FLASH_ATTN_SPEC above: pip rejects a fixed /tmp name outright, so
-# the curl target is the url's own percent-decoded basename, landed in a per-install temp dir.
-RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
-      set -eu; \
-      spec="${FLASH_ATTN_3_SPEC}"; \
-      workdir=""; \
-      case "${spec}" in \
-          http*) \
-              [ -n "${FLASH_ATTN_3_SHA256}" ] || { echo "FLASH_ATTN_3_SHA256 is required for a wheel url" >&2; exit 1; }; \
-              workdir="$(mktemp -d)"; \
-              wheel_name="$(python3 -c 'import posixpath, sys, urllib.parse as u; print(posixpath.basename(u.unquote(u.urlsplit(sys.argv[1]).path)))' "${spec}")"; \
-              wheel="${workdir}/${wheel_name}"; \
-              curl -fsSL -o "${wheel}" "${spec}" \
-                  || { rm -rf "${workdir}"; echo "flash-attn-3: wheel download failed -> SDPA fallback on Hopper"; exit 0; }; \
-              echo "${FLASH_ATTN_3_SHA256}  ${wheel}" | sha256sum -c -; \
-              spec="${wheel}" ;; \
-      esac; \
-      FLASH_ATTN_CUDA_ARCHS=90 TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=4 \
-      pip install --no-cache-dir "${spec}" --no-build-isolation \
-      && python -c "import flash_attn_interface; print('flash_attn_interface: import OK')" \
-      && echo "flash-attn-3: installed (${FLASH_ATTN_3_SPEC})" \
-      || echo "flash-attn-3: install failed -> SDPA fallback on Hopper"; \
-      [ -z "${workdir}" ] || rm -rf "${workdir}"; \
-    else echo "flash-attn-3: skipped (FLASH_ATTN_3_SPEC unset) -> SDPA on Hopper"; fi
+# FlashAttention-3 is NOT installed. It was, on the theory that the trainer would use it for the
+# Hopper full-attention layers, but it never reached the training forward for two independent
+# reasons and the wheel was pure build cost:
+#
+#   1. WRONG INTERPRETER. The install was a bare `pip install`, which targets THIS interpreter.
+#      Training runs in /opt/verl-venv, built without --system-site-packages (see the comment above
+#      the causal_conv1d install below), so the two have disjoint paths. FA2 and causal-conv1d both
+#      install with an explicit `--python /opt/verl-venv/bin/python`; FA3 never did, and the verl
+#      venv's own import assertion checks flash_attn + fla but never flash_attn_interface.
+#   2. NEVER SELECTED. Nothing sets `attn_implementation`, and verl hard-defaults it to
+#      "flash_attention_2" (verl/workers/config/model.py: the override_config.get default), so
+#      transformers dispatched FA2 on every arch regardless of what was installed.
+#
+# `FLASH_DISABLE_FA3`, described at the time as the escape hatch, was itself already a dead key
+# filtered by providers/_lifecycle/worker.py's _REMOVED_OPTIMIZATION_ENV.
+#
+# Re-adding FA3 means doing BOTH: install into /opt/verl-venv AND plumb attn_implementation through
+# to the child, gated to sm90. Do not re-add the wheel alone -- that is the state this removes.
 
 # causal_conv1d: the short depthwise causal conv kernel whose ``seq_idx`` arg resets the conv at
 # example boundaries. Together with fla's ``cu_seqlens`` (which resets the DeltaNet recurrence) it
