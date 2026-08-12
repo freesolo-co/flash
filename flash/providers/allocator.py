@@ -167,19 +167,11 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision="", o
 
 
 def _fits(candidate: Candidate, need: int, executed_gpu_count: int = 0) -> bool:
-    """Whether this rentable shape can actually hold the run.
+    """Whether this rentable shape can actually hold the run on the ranks it will launch.
 
     ``combined_vram_gb`` is the shared fit model, so a shape accepted here is a shape parse-time
-    sizing also accepted -- the two must not be able to disagree.
-
-    Credit only the cards that JOIN the run. Multi-card fit comes from sharding, so a card that
-    never enters the fsdp group contributes no memory: sft shards by data and bounds its width by
-    the batch and the row count, so an unpacked profile pins the batch to 1 and launches ONE rank
-    however many cards are rented. Crediting the billed count there admits a run on memory it will
-    not have -- a 4B at 32k needs 28 GB and is correctly REJECTED on one 24 GB card, but renting
-    two credits 35 GB, passes, and then OOMs on the single rank that starts. Renting more cards is
-    not a way to pass this gate. ``method_card_speedup`` already clamps throughput to the same
-    width; this is the other half of that.
+    sizing also accepted -- the two must not be able to disagree. See ``_executed_width`` for why
+    the credited count is the launched one rather than the billed one.
     """
     fit_count = executed_gpu_count or candidate.gpu_count
     return combined_vram_gb(candidate.vram_gb, fit_count) >= need
@@ -188,13 +180,11 @@ def _fits(candidate: Candidate, need: int, executed_gpu_count: int = 0) -> bool:
 def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int:
     """Ranks a run of this shape would actually launch, which is the card count except for sft.
 
-    Reads the executed batch from the SAME substituted knobs sizing does (see ``_overridden_train``)
-    so the fit gate and the VRAM requirement describe one run rather than two. The retained row
-    count comes from ``overrides`` instead: it is a profile measurement, not a ``TrainSpec`` sizing
-    knob, so ``_TRAIN_KNOB_FOR_OVERRIDE`` does not carry it onto ``train`` and reading it from there
-    would silently find nothing and miss every rows-bound narrowing.
-
-    Every other algorithm launches the shape it rents, so this returns the card count unchanged.
+    Reads the executed batch from the SAME substituted knobs sizing does (``_overridden_train``) so
+    the fit gate and the VRAM requirement describe one run. The retained row count comes from
+    ``overrides`` instead: it is a profile measurement rather than a ``TrainSpec`` sizing knob, so
+    ``_TRAIN_KNOB_FOR_OVERRIDE`` never carries it onto ``train`` and reading it there would miss
+    every rows-bound narrowing.
     """
     if (algorithm or "").strip().lower() != "sft":
         return gpu_count
@@ -215,7 +205,14 @@ def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int
 
 
 def _executed_width(algorithm: str, train, overrides):
-    """The executed-width rule for one run, as a function of a rentable card count.
+    """THE rule for how many of a rented card count actually join the run.
+
+    Multi-card fit comes from sharding, so a card that never enters the fsdp group contributes no
+    memory. sft shards by data and bounds its width by the batch and the row count, so an unpacked
+    profile pins the batch to 1 and launches ONE rank however many cards are rented. Crediting the
+    billed count admits a run on memory it will not have: a 4B at 32k needs 28 GB and is correctly
+    rejected on one 24 GB card, but renting two credits 35 GB, passes, then OOMs on the single rank
+    that starts. Renting more cards is not a way to pass the fit gate.
 
     Bound ONCE per allocation and handed to every site that asks a question about a card count: the
     filter that removes shapes, the classification that says why none were left, the pinned-class
@@ -223,7 +220,8 @@ def _executed_width(algorithm: str, train, overrides):
     site was left crediting the RENTED count instead, it contradicted the filter: a width the filter
     deterministically rejects was reported as "structurally offered" (a terminal miss raised as
     retryable, re-polling a market that cannot widen a batch), and advice named a card count that
-    buys memory the run never joins.
+    buys memory the run never joins. ``method_card_speedup`` already clamps throughput to this same
+    width; crediting VRAM is the other half of that.
     """
     return lambda gpu_count: _executed_gpu_count(algorithm, train, overrides, gpu_count)
 
@@ -261,10 +259,9 @@ def _structurally_fits(available, need: int, cap: int, executed_width, exact: st
     being offered -- the same rule ``_structural_gpu_names`` applies. Empty for an unpinned search,
     where any offered class counts.
 
-    Credits ``executed_width`` rather than the rented count, because a width the run will not launch
-    on is not a shape waiting to come back in stock -- no market lookup can make an unpacked sft
-    batch use more ranks. Sharing the filter's own rule is what makes "no candidate fit" and "no
-    shape could fit" answer the same question; see ``_executed_width``.
+    Credits ``_executed_width`` rather than the rented count: a width the run will not launch on is
+    not a shape waiting to come back in stock, so sharing the filter's own rule is what makes "no
+    candidate fit" and "no shape could fit" answer the same question.
     """
     for name in available:
         try:
@@ -391,9 +388,9 @@ def _resolve_exact_gpu(
     when nothing was pinned. A pin can hide the only provider that rents this class at a wider
     count, and suppressing the remedy entirely would hide a fix the user can actually apply.
 
-    ``executed_width`` maps a rented count to the ranks that join the run (see ``_executed_width``).
-    Both the combination precheck below and every ``--gpus N`` remedy have to apply it, or a pinned
-    sft run whose batch caps it at one rank is told to buy cards that cannot hold it.
+    ``executed_width`` is ``_executed_width``'s rule. Both the combination precheck below and every
+    ``--gpus N`` remedy have to apply it, or a pinned sft run whose batch caps it at one rank is told
+    to buy cards that cannot hold it.
     """
     launched = executed_width or (lambda count: count)
     exact = canonical_gpu(gpu_type)
@@ -476,9 +473,8 @@ def _resolve_exact_gpu(
         and combined_vram_gb(exact_info.vram_gb, launched(cap)) < need
     ):
         # the width the VRAM math above actually credited, which is what the message has to name.
-        # crediting `launched(cap)` while claiming a `cap`-card combination was tried points the
-        # operator at the card ceiling when the real limiter is the batch that caps the rank count:
-        # they raise `--gpus` and hit the identical failure. see `_executed_width`.
+        # naming `cap` instead points the operator at the card ceiling when the real limiter is the
+        # batch: they raise `--gpus` and hit the identical failure.
         tried = launched(cap)
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} cannot fit this run even as a {tried}-card combination"
@@ -530,9 +526,9 @@ def _resolved_gpu_count(
     ``available`` alone cannot tell a pin from a plane that only ever configured one provider, and
     a pin on such a plane drops to the same pool and the same failure.
 
-    ``executed_width`` maps a rented count to the ranks that join the run, so an auto-sized ceiling
-    and an authored-ceiling check are both decided on the width that will run. Without it an sft run
-    the batch caps at one rank is told to raise `[gpu] count` to a width that changes nothing.
+    ``executed_width`` (``_executed_width``) decides both the auto-sized ceiling and the
+    authored-ceiling check on the width that will run. Without it an sft run the batch caps at one
+    rank is told to raise `[gpu] count` to a width that changes nothing.
 
     Certifies the pin (``certify=True``): this runs inside ``allocate()``, which already does
     network i/o and can retry, and the width decided here is the one the run is really rented at. A
@@ -644,10 +640,10 @@ def _raise_no_candidate_error(
 ) -> NoReturn:
     """Classify an empty candidate set as retryable capacity or a terminal structural miss.
 
-    ``executed_width`` is the filter's own rule for how many of a rented count actually join the run.
-    Retryable means "the shape exists but is sold out", so both branches below have to ask about the
-    shape the run would EXECUTE: a width the filter deterministically rejects is a dead end, and
-    calling it retryable spends the infra budget re-polling for capacity that would not help.
+    Retryable means "the shape exists but is sold out", so both branches below ask about the shape
+    the run would EXECUTE (``_executed_width``): a width the filter deterministically rejects is a
+    dead end, and calling it retryable spends the infra budget re-polling for capacity that would
+    not help.
     """
     if not supported_available and structurally_unsupported:
         # Every configured provider rejected the shape structurally. Surface one provider's
@@ -660,12 +656,9 @@ def _raise_no_candidate_error(
     if lookup_failed and could_fit:
         # No candidate fit, but a live capacity lookup blipped and was the only possible source of one
         # -> retryable, NOT terminal: a Vast/Lambda-only run must ride out a market/API outage on its
-        # infra budget instead of dying as if the job exceeds every GPU class.
-        #
-        # Gated on the shape being one the outage could actually have hidden. The advertised class
-        # list is readable during the outage (it is static), so a run whose EXECUTED width fits no
-        # offered class is a dead end the blip did not cause and cannot cure -- retrying it just
-        # spends the infra budget. Only a blip standing between the run and a real shape is retryable.
+        # infra budget instead of dying as if the job exceeds every GPU class. The class list stays
+        # readable during the outage (it is static), so `could_fit` keeps a run the blip did not
+        # cause and cannot cure from burning that budget.
         raise CapacityLookupError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}): a provider's live capacity lookup "
             f"failed transiently and was the only source of a fitting class — retry may find hidden capacity"

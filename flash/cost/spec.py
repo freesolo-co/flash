@@ -281,11 +281,10 @@ def sft_ranking_overrides(spec) -> dict:
     keys here mirror the profile-derived fields there so the two cannot describe different work.
 
     ``batch_size`` is the executed batch, not the authored one -- the profile reduces it to
-    ``examples_per_update``, which every exact-unpacked run pins to 1. ``sft_retained_examples`` is
-    the row count. Both bound the width ``sft_data_parallel_cards`` credits, so ranking without them
-    would credit ranks the worker never launches and pick a wider, costlier shape than the run can
-    use. ``seq_len`` follows for the same reason: pricing a step on the authored context length when
-    the profile measured a shorter one ranks candidates on work that will not happen.
+    ``examples_per_update``, which every exact-unpacked run pins to 1. It and
+    ``sft_retained_examples`` both bound the width ``sft_data_parallel_cards`` credits, so ranking
+    without them picks a wider, costlier shape than the run can use. ``seq_len`` follows for the
+    same reason: the authored context length is not the one measured.
     """
     if getattr(spec, "algorithm", "") != "sft":
         return {}

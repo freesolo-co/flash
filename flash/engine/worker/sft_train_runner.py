@@ -408,24 +408,11 @@ def _idle_card_warning(
     run is live, and say what would actually use the card.
 
     The remedy differs by which input is binding, and a remedy that cannot be acted on is worse than
-    none. Three ways to get it wrong:
-
-     - an unpacked profile pins the batch to 1 (`sft_workload` sets examples_per_update = 1 for
-       every non-packed mode), so "raise [train] batch_size" names a knob that cannot move this
-       width at all.
-     - BOTH inputs have to divide the allocation to reach full width, so raising the batch only
-       helps when the rows ALREADY divide it. Asking whether the batch divides it is the wrong
-       question: at 4 cards with a batch of 6 over 10 rows, neither divides, and every multiple of 4
-       the batch could be raised to still resolves to 2 ranks because the 10 rows cannot be split 4
-       ways. Name the dataset as the limiter there instead.
-     - only powers of two are rentable, and the resolved width usually is not one -- see
-       `_widest_rentable_width` for why clamping cannot produce one.
-
-    Batch 1 is its own case, not a degenerate version of either. The batch IS the binding input --
-    one example cannot be dealt to two ranks -- but raising it is not the remedy, because the packing
-    mode fixes it at 1. Folding it into the rows branch made the line state something false: at 4
-    cards over 12 rows it read "a dataset of 12 rows cannot be split across 4 ranks" when 12 divides
-    4 exactly and the single example was the whole problem.
+    none. BOTH inputs have to divide the allocation, so the batch is only worth naming as a knob
+    when the rows already fit: at 4 cards with a batch of 6 over 10 rows, every multiple of 4 the
+    batch could be raised still resolves to 2 ranks because 10 rows cannot be split 4 ways. Batch 1
+    is a third case rather than a degenerate version of either -- it binds, but `sft_workload` fixes
+    it at 1 for every unpacked run, so it is named as a fact and never as a knob.
     """
     rows_fit = row_count == 0 or row_count % gpu_count == 0
     batch_fits = train_batch_size % gpu_count == 0

@@ -31,28 +31,22 @@ def sft_data_parallel_cards(gpu_count: int, train_batch_size: int, row_count: in
     SFT runs data-parallel (see ``sft_train_runner._prepare_sft_child``), so verl derives
     ``train_batch_size_per_dp = train_batch_size // dp_size`` and hands that straight to a
     DataLoader. A count ABOVE the batch floors the per-rank batch to 0, and
-    ``DataLoader(batch_size=0)`` raises ``ValueError`` -- measured, not inferred. A count that does
-    not DIVIDE the batch leaves a remainder that cannot be dealt to every rank equally.
+    ``DataLoader(batch_size=0)`` raises ``ValueError`` -- measured, not inferred.
 
-    The width must divide ``row_count`` for the same reason, and this one silently corrupts the
-    run rather than raising. verl builds ``DistributedSampler(..., drop_last=True)``
-    (``sft_trainer.py:237``), and Flash's exact-dataloader shim overrides ``drop_last`` on the
-    LOADER only -- its sampler patch sets ``shuffle`` and nothing else. So a width that leaves a
-    remainder drops it from every epoch: MEASURED at 11 rows, 2 ranks trains 10 and 4 ranks trains
-    8, while the frozen quote still bills all 11. Flipping the sampler to ``drop_last=False`` is
-    not the fix -- it pads by DUPLICATING rows (11 rows becomes 12 samples), which trades silent
-    row loss for silent row repetition and breaks exact-token accounting just as badly.
+    The width must divide ``row_count`` too, and that one silently corrupts the run rather than
+    raising: verl builds ``DistributedSampler(..., drop_last=True)`` (``sft_trainer.py:237``) and
+    Flash's exact-dataloader shim overrides ``drop_last`` on the LOADER only, so a remainder is
+    dropped from every epoch -- MEASURED at 11 rows, 2 ranks trains 10 and 4 ranks trains 8, while
+    the frozen quote still bills all 11. ``drop_last=False`` is not the fix: it pads by DUPLICATING
+    rows, trading silent row loss for silent row repetition.
 
-    So take the largest count <= the allocated cards that divides both. That keeps the realized
-    global batch exactly ``train_batch_size`` and every profiled row trained exactly once, which is
-    what makes the card count a pure throughput choice rather than a hyperparameter change.
+    So take the largest count <= the allocated cards that divides both, keeping the realized global
+    batch exactly ``train_batch_size`` and every profiled row trained exactly once. That is what
+    makes the card count a pure throughput choice rather than a hyperparameter change. Returns 1 for
+    an unpacked run, which is correct: one example cannot be split.
 
     ``row_count`` defaults to 0, meaning "unknown, do not constrain" -- the cost path quotes before
-    the dataset is materialized. That is quote-side only; the worker always passes the real count,
-    so a width the rows cannot support is never launched.
-
-    Returns 1 for an unpacked run (``examples_per_update`` is 1 there), which is correct: one
-    example cannot be split, so extra cards would have nothing to hold.
+    the dataset is materialized. Quote-side only; the worker always passes the real count.
 
     Lives here rather than beside its caller because the cost path must quote the width that will
     execute, and ``sft_train_runner`` is not importable from it (it cycles through ``sft_train``).
