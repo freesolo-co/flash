@@ -181,6 +181,10 @@ def _fingerprint(record: dict[str, Any]) -> tuple:
         record.get("checkpoint"),
         bool(record.get("thinking")),
         record.get("org_id") or None,
+        # The client cross-checks this field on readback and treats a change as an immutability
+        # violation, so it has to be part of identity here too: the same revision id serving a
+        # different grammar is different content, not an update.
+        record.get("structured_outputs") or None,
         (record.get("metadata") or {{}}).get("hf_revision"),
     )
 
@@ -332,6 +336,15 @@ async def settle_adapter(record: dict[str, Any]) -> None:
     adapter_id = record["adapter_id"]
     result = await Engine().register.remote.aio(record)
     current = (await adapter_records.get.aio(_record_key(adapter_id))) or record
+    # An undeploy that lands while the load is still running wins. Without this, a slow load
+    # finishing after DELETE would write `ready` back over `disabled` and resurrect a revision
+    # the user already took out of service -- and it could then be activated again.
+    if current.get("status") == "disabled" and (current.get("metadata") or {{}}).get(
+        "lifecycle_state"
+    ) == "disabled":
+        with contextlib.suppress(Exception):  # gpu eviction is best effort
+            await Engine().unregister.remote.aio(adapter_id)
+        return
     if result.get("ok"):
         current["status"] = "ready"
         current["metadata"] = {{**current.get("metadata", {{}}), "lifecycle_state": "ready"}}
@@ -445,6 +458,13 @@ def api():
                     raise HTTPException(
                         status.HTTP_409_CONFLICT, "immutable adapter revision already exists"
                     )
+                # Same id, same content: a no-op EXCEPT when the first attempt never reached a
+                # terminal state. Retrying after an ambiguous failure is exactly how the client
+                # recovers, so a record still sitting at `registered` gets another settle rather
+                # than being stranded there forever. `ready`/`failed`/`disabled` are terminal and
+                # left alone -- re-settling those would undo an undeploy or reload a live adapter.
+                if (existing.get("metadata") or {{}}).get("lifecycle_state") == "registered":
+                    settle_adapter.spawn(existing)
                 return {{"ok": True, "adapter": existing}}
             await _write(record)
             # Create the run alias disabled, pointing at nothing yet. Activation is what makes it

@@ -130,8 +130,10 @@ def _run_awaitable(awaitable):
         raise error[0]
 
 
-def _stub_modal(monkeypatch, engine_methods):
+def _stub_modal(monkeypatch, engine_methods, spawned=None):
     modal = types.ModuleType("modal")
+    # Every `.spawn()` the app makes, so a test can assert that a settle was (or was not) driven.
+    spawned = [] if spawned is None else spawned
 
     class _Named:
         @classmethod
@@ -177,9 +179,15 @@ def _stub_modal(monkeypatch, engine_methods):
             return self._fn(*args, **kwargs)
 
         def spawn(self, *args, **kwargs):
+            spawned.append((self._fn.__name__, args, kwargs))
+            return self.local(*args, **kwargs)
+
+        def local(self, *args, **kwargs):
+            """Run the function body here, the way `.local()` does on a real Modal handle."""
             result = self._fn(*args, **kwargs)
             if inspect.isawaitable(result):
-                _run_awaitable(result)
+                return _run_awaitable(result)
+            return result
 
     class _App:
         def __init__(self, *args, **kwargs):
@@ -224,14 +232,21 @@ def client(monkeypatch, tmp_path):
             "completion_tokens": 4,
         }
 
+    spawned: list = []
     _stub_modal(
         monkeypatch,
         {"register": register, "unregister": unregister, "generate": generate},
+        spawned=spawned,
     )
     source = render_app(MODELS[BASE_MODEL])
     module = types.ModuleType("generated_serving_app")
     exec(compile(source, str(tmp_path / "app.py"), "exec"), module.__dict__)
-    return TestClient(module.api())
+    module.spawned = spawned
+    test_client = TestClient(module.api())
+    # Reach the generated module from a test: its Dict and its functions ARE the durable state,
+    # so lifecycle races have to be driven through them rather than simulated alongside.
+    test_client.app.state.generated_module = module
+    return test_client
 
 
 def _lifecycle(
@@ -301,6 +316,73 @@ def test_reregistering_different_content_under_one_revision_is_a_conflict(client
     _register_and_ready(client)
     mutated = {**REGISTRATION, "repo_id": "acme/somewhere-else"}
     assert client.post("/adapters", json=mutated).status_code == 409
+
+
+def test_reregistering_a_different_grammar_under_one_revision_is_a_conflict(client):
+    """`structured_outputs` is identity too: the client cross-checks it on readback.
+
+    Left out of the fingerprint, the same revision id could be re-registered with a different
+    grammar and accepted as identical -- the client would then see a field it did not send.
+    """
+    _register_and_ready(client)
+    mutated = {**REGISTRATION, "structured_outputs": '{"type": "object"}'}
+    assert client.post("/adapters", json=mutated).status_code == 409
+
+
+def test_undeploy_is_not_undone_by_a_load_that_finishes_afterwards(client):
+    """A settle that outlives the DELETE must not resurrect the revision.
+
+    The load runs server-side and can finish after undeploy has already written `disabled`. If
+    settle overwrites that with `ready`, undeploy silently does not stick and the revision can be
+    activated again.
+    """
+    _register_and_ready(client)
+    assert client.delete(f"/adapters/{REVISION}").status_code == 200
+    record = client.get(f"/adapters/{REVISION}").json()["adapter"]
+    assert record["status"] == "disabled"
+
+    # Re-run the settle the way a slow in-flight load would land, then assert it stood down.
+    module = client.app.state.generated_module
+    module.settle_adapter.local(dict(REGISTRATION))
+    after = client.get(f"/adapters/{REVISION}").json()["adapter"]
+    assert after["status"] == "disabled", "a late settle resurrected an undeployed revision"
+    assert (after.get("metadata") or {}).get("lifecycle_state") == "disabled"
+
+
+def test_a_registration_stuck_at_registered_is_retried_not_stranded(client):
+    """Re-registering identical content must re-drive a load that never reached a terminal state.
+
+    This is the client's only recovery path after an ambiguous failure: if the first settle died
+    without writing `ready` or `failed`, an early return leaves the revision at `registered`
+    forever and every retry is a no-op.
+    """
+    module = client.app.state.generated_module
+    module.spawned.clear()
+    assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
+    assert _lifecycle(client, REVISION) == "ready"
+
+    # Force the stuck state a dead settle would leave behind, then retry.
+    stuck = client.get(f"/adapters/{REVISION}").json()["adapter"]
+    stuck["status"] = "registered"
+    stuck["metadata"] = {**stuck["metadata"], "lifecycle_state": "registered"}
+    module.adapter_records[module._record_key(REVISION)] = stuck
+    module.spawned.clear()
+
+    assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
+    assert module.spawned, "a stuck registration was not re-settled on retry"
+
+
+def test_a_terminal_record_is_not_resettled_on_reregistration(client):
+    """The retry above must not reload a revision that already settled.
+
+    Re-settling a `ready` record would reload a live adapter, and re-settling a `disabled` one
+    would undo an undeploy.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    module.spawned.clear()
+    assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
+    assert not module.spawned, "a settled revision was re-settled"
 
 
 def test_a_failed_adapter_load_reports_failed_not_ready(client):

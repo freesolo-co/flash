@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 import types
+from pathlib import Path
 
 import pytest
 
@@ -212,6 +213,23 @@ def test_deploy_reports_the_export_line_users_need(tmp_path, monkeypatch, capsys
     assert serve_cmd._deploy(tmp_path / "app.py") == 0
     out = capsys.readouterr().out
     assert "export FREESOLO_SERVING_URL=https://acme--flash-serve-api.modal.run" in out
+
+
+def test_an_explicit_scaledown_window_is_not_collapsed_by_the_default(tmp_path, capsys):
+    """`or DEFAULT` rewrites any falsy value, so an explicit 0 silently became 300.
+
+    0 is outside Modal's supported range, so the right answer is a clear error before anything is
+    written -- not a file that quietly disagrees with what was asked for.
+    """
+    args = _setup_args(tmp_path, scaledown_window=0)
+    assert serve_cmd.cmd_serve_setup(args) == 1
+    assert "outside Modal's supported range" in capsys.readouterr().err
+
+
+def test_a_valid_non_default_scaledown_window_reaches_the_generated_app(tmp_path):
+    args = _setup_args(tmp_path, scaledown_window=60)
+    assert serve_cmd.cmd_serve_setup(args) == 0
+    assert "SCALEDOWN_WINDOW_SECONDS = 60" in Path(args.output).read_text()
 
 
 @pytest.mark.parametrize(

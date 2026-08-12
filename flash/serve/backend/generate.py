@@ -22,6 +22,9 @@ VLLM_VERSION = "0.23.0"
 # Modal stops the container after this idle period and the GPU stops costing anything. 5 minutes
 # trades a little idle spend for far fewer cold starts than Modal's 60s default.
 DEFAULT_SCALEDOWN_WINDOW = 300
+# Modal's own bounds for scaledown_window. 0 is NOT "stop immediately" -- it is rejected.
+MIN_SCALEDOWN_WINDOW = 2
+MAX_SCALEDOWN_WINDOW = 20 * 60
 
 _TEMPLATE = "modal_app.py.tmpl"
 # Modal app names allow letters, digits and dashes.
@@ -54,6 +57,13 @@ def render_app(
     card = gpu or default_gpu(info)
     if card is None:
         raise ValueError(f"{info.id} names serving GPU {serving.gpu!r}, which Modal does not offer")
+    # Modal accepts 2s to 20min. Catch it here rather than letting `modal deploy` fail after the
+    # file is already written and the user thinks setup succeeded.
+    if not MIN_SCALEDOWN_WINDOW <= scaledown_window <= MAX_SCALEDOWN_WINDOW:
+        raise ValueError(
+            f"scaledown window {scaledown_window}s is outside Modal's supported range "
+            f"({MIN_SCALEDOWN_WINDOW}-{MAX_SCALEDOWN_WINDOW} seconds)"
+        )
 
     dtype = serving_dtype(info)
     template = resources.files("flash.serve.backend.templates").joinpath(_TEMPLATE).read_text()

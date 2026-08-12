@@ -182,7 +182,13 @@ def cmd_serve_setup(args) -> int:
             info,
             destination,
             gpu=gpu,
-            scaledown_window=getattr(args, "scaledown_window", None) or DEFAULT_SCALEDOWN_WINDOW,
+            # `is None`, not `or`: 0 is a meaningful value (stop the container as soon as it goes
+            # idle) and `or` would silently rewrite it to the 300s default.
+            scaledown_window=(
+                DEFAULT_SCALEDOWN_WINDOW
+                if getattr(args, "scaledown_window", None) is None
+                else args.scaledown_window
+            ),
             secret_name=SECRET_NAME,
             overwrite=bool(getattr(args, "force", False)),
         )

@@ -388,7 +388,7 @@ def _add_serve_commands(sub: argparse._SubParsersAction) -> None:
         "--scaledown-window",
         type=int,
         default=None,
-        help="seconds of idle before the GPU container stops (default: 300)",
+        help="seconds of idle before the GPU container stops (2-1200, default: 300)",
     )
     setup.add_argument("--dry-run", action="store_true", help="write the app but do not deploy it")
     setup.add_argument("--force", action="store_true", help="overwrite an existing app file")
