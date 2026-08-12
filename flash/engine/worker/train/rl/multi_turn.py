@@ -87,9 +87,9 @@ class MultiTurnBridge:
         # score many episodes under one lock-held env call so judge work can use the env's own
         # max_score_concurrency. keep the lock: reward_thread_safe permits scorer/scorer concurrency,
         # not racing scoring against env_reply.
-        # recheck_closed_after_wait stays off (the default): an env batch assembled during the flush
-        # window costs nothing external to finish, so scoring it lets the last requests of a run
-        # answer normally instead of failing on a shutdown that arrived while they were queued.
+        # the defaults are what this path wants: env scoring errors propagate as raised (the reward
+        # routes already translate them for the child), and a batch assembled during the flush window
+        # is still scored, so the last requests of a run answer instead of failing on shutdown.
         self._scorer = ScoreBatcher(
             self._score_batch,
             max_batch_size=int(score_batch_size),
