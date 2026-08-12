@@ -1933,13 +1933,13 @@ def test_submit_supplies_the_worker_pip_when_the_author_declared_none() -> None:
 
     payload = build_payload(spec, spec.seed, 0, arm="a", deadline_at=1_800_000_000.0)
 
-    assert payload["extra_pip"] == ["freesolo>=0.4.0"]
+    assert payload["extra_pip"] == ["freesolo>=0.4.1"]
 
 
 def test_submit_appends_authored_pip_without_displacing_the_worker_spec() -> None:
     """The author's scorer deps are additional to the worker requirement, never a replacement.
 
-    Substituting instead of appending would drop ``freesolo>=0.4.0`` the moment anyone declared a
+    Substituting instead of appending would drop ``freesolo>=0.4.1`` the moment anyone declared a
     dependency, breaking the worker outright for exactly the users the knob exists to serve.
     """
     from dataclasses import replace
@@ -1951,16 +1951,16 @@ def test_submit_appends_authored_pip_without_displacing_the_worker_spec() -> Non
 
     payload = build_payload(spec, spec.seed, 0, arm="a", deadline_at=1_800_000_000.0)
 
-    assert payload["extra_pip"] == ["freesolo>=0.4.0", "pymongo>=4.6", "rapidfuzz"]
+    assert payload["extra_pip"] == ["freesolo>=0.4.1", "pymongo>=4.6", "rapidfuzz"]
 
 
 def test_worker_pip_with_extras_dedupes_and_ignores_blanks() -> None:
     """Restating the worker spec must not install it twice, and blanks must not reach pip."""
     from flash.envs.base import worker_pip_with_extras
 
-    assert worker_pip_with_extras("e", ["freesolo>=0.4.0", "pymongo"]) == [
-        "freesolo>=0.4.0",
+    assert worker_pip_with_extras("e", ["freesolo>=0.4.1", "pymongo"]) == [
+        "freesolo>=0.4.1",
         "pymongo",
     ]
-    assert worker_pip_with_extras("e", ["  pymongo  ", ""]) == ["freesolo>=0.4.0", "pymongo"]
-    assert worker_pip_with_extras("e", None) == ["freesolo>=0.4.0"]
+    assert worker_pip_with_extras("e", ["  pymongo  ", ""]) == ["freesolo>=0.4.1", "pymongo"]
+    assert worker_pip_with_extras("e", None) == ["freesolo>=0.4.1"]
