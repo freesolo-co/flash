@@ -175,15 +175,34 @@ def _scored_response(response: str, *, thinking: bool) -> str:
 
 
 def _score_case(
-    suite, case: EvalCase, case_id: str, response: str, *, thinking: bool = False
+    suite,
+    case: EvalCase,
+    case_id: str,
+    response: str,
+    *,
+    thinking: bool = False,
+    state=None,
+    state_keyword: bool = False,
 ) -> EvalResult:
     """Grade one response on the caller's thread.
 
     Scorers may require main-thread resources such as signal-based timeouts; a lock prevents
     overlap but does not provide thread affinity.
+
+    `state` is the finished episode, passed only for a multi-turn suite that accepts it (see
+    `episode._score_episode_case`); single-turn scoring keeps the two-argument contract.
+    `state_keyword` says which way that suite's signature can take it -- `**kwargs` and
+    keyword-only scorers reject a third positional, `*args` scorers reject the keyword -- so the
+    caller decides, having read the signature.
     """
     try:
-        scored = suite.score(case, _scored_response(response, thinking=thinking))
+        scored_text = _scored_response(response, thinking=thinking)
+        if state is None:
+            scored = suite.score(case, scored_text)
+        elif state_keyword:
+            scored = suite.score(case, scored_text, state=state)
+        else:
+            scored = suite.score(case, scored_text, state)
         return normalize_eval_result(case, response, scored, case_id=case_id)
     except (Exception, SystemExit) as exc:
         return EvalResult(
@@ -262,6 +281,20 @@ def _run_cases(
 
     Scorers can hold thread-bound resources, so a lock around worker scoring is insufficient.
     """
+    # A transcript-grading suite must play the episode out: scoring one reply would grade a
+    # different task than the run trains on, and would still report a number for it. The suite
+    # opts in, because a multi-turn ENVIRONMENT does not imply a transcript-grading SUITE -- the
+    # scaffolded starter pairs a multi-turn env with a suite that deliberately grades only the
+    # first action, and playing its cases as episodes scores the wrong turn.
+    #
+    # Imported here, not at module scope: episode.py resolves this module's helpers back out of
+    # it, so a top-level import would be circular.
+    from flash.cli.commands.env.episode import _grades_episodes, _run_episode_cases
+
+    if _grades_episodes(suite) and environment is not None:
+        return _run_episode_cases(
+            client, target, suite, cases, args, environment, thinking=thinking
+        )
     case_ids = _case_ids(cases)
     prompts = [_build_messages(environment, case) for case in cases]
     if args.concurrency == 1 or len(cases) <= 1:

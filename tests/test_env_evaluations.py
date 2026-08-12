@@ -3295,3 +3295,728 @@ def test_env_eval_refuses_when_the_run_spec_is_unreadable(monkeypatch, capsys) -
     captured = capsys.readouterr().err
     assert "could not read the target run flash-1" in captured
     assert "overall: FAIL" in captured
+
+
+class _MultiTurnEnvironment:
+    """Minimal stand-in for the multi-turn half of `FreesoloEnvironment`.
+
+    Only the surface `env eval` drives: prompt state, one recorded model turn at a time, an env
+    reply between turns, and a done signal. The transcript it accumulates is what a real
+    multi-turn scorer grades.
+    """
+
+    multi_turn = True
+    max_turns = 3
+
+    def __init__(self) -> None:
+        self.generated: list[str] = []
+
+    def new_rollout_state(self, example):
+        return {"messages": [{"role": "user", "content": "turn-1"}], "turns": []}
+
+    def record_model_turn(self, state, content):
+        self.generated.append(content)
+        state["turns"].append(content)
+        state["messages"] = [*state["messages"], {"role": "assistant", "content": content}]
+        # what a real env exposes as the scored text: the whole transcript, not the last reply.
+        state["response_text"] = "|".join(state["turns"])
+
+    def rollout_done(self, state, max_turns=None):
+        return len(state["turns"]) >= self.max_turns
+
+    def env_reply(self, messages, state):
+        reply = [{"role": "user", "content": f"turn-{len(state['turns']) + 1}"}]
+        state["messages"] = [*messages, *reply]
+        return reply
+
+
+def _multi_turn_env_dir(tmp_path, monkeypatch):
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'episodes'\n"
+        # the suite opts in: a multi-turn env alone must not promote a suite to episode grading.
+        "    grades_episodes = True\n"
+        "    def cases(self): return [EvalCase(id='only', input='only', expected='a|b|c')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    return env_dir
+
+
+def test_env_eval_drives_every_turn_of_a_multi_turn_environment(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A multi-turn case must generate once per turn, not once per case.
+
+    Scoring one reply of a task whose reward reads the whole transcript reports a number for a
+    different task, which is indistinguishable from a weak model.
+    """
+    _multi_turn_env_dir(tmp_path, monkeypatch)
+    environment = _MultiTurnEnvironment()
+    replies = iter(["a", "b", "c"])
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            yield next(replies)
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
+    # one generation per turn, and the graded text is the accumulated transcript.
+    assert environment.generated == ["a", "b", "c"]
+    assert "case only: PASS" in capsys.readouterr().out
+
+
+def test_env_eval_reports_a_failed_turn_without_losing_the_case(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A generation failure mid-episode fails that case, not the whole suite.
+
+    The failure is raised on the second turn, which only ever happens once the episode is driven,
+    so this also pins that a partially-played episode reports the reason instead of a bare 0.0.
+    """
+    _multi_turn_env_dir(tmp_path, monkeypatch)
+    environment = _MultiTurnEnvironment()
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            if environment.generated:
+                raise RuntimeError("upstream refused")
+            yield "a"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
+    captured = capsys.readouterr()
+    # the upstream reason has to survive to the case line; a bare 0.0 would read as a weak model.
+    assert "case only: FAIL" in captured.out
+    assert "upstream refused" in captured.out
+    assert "errors=1" in captured.out
+
+
+def test_env_eval_keeps_one_generation_per_case_for_single_turn(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The single-turn path must not start driving episodes."""
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'single'\n"
+        "    def cases(self): return [EvalCase(id='only', input='only', expected='only')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    calls: list[str] = []
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            calls.append(messages[0]["content"])
+            yield messages[0]["content"]
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
+    assert calls == ["only"]
+    assert "case only: PASS" in capsys.readouterr().out
+
+
+def test_env_eval_does_not_promote_a_first_action_suite_to_an_episode(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A multi-turn ENVIRONMENT must not turn a single-shot SUITE into an episode.
+
+    `flash env setup --multi` scaffolds exactly this pair: a multi-turn env plus a suite that
+    grades only the opening action. Playing its cases as episodes scored the wrong turn, and the
+    scaffolded case carries no `output` for `step_episode` to advance from, so a well-formed
+    opening action came back as an error instead of 1.0.
+    """
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'first-action'\n"
+        # no grades_episodes flag: this suite scores one reply, like every pre-flag suite.
+        "    def cases(self): return [EvalCase(id='only', input='only', expected='50')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    environment = _MultiTurnEnvironment()
+    calls: list[str] = []
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            calls.append("gen")
+            yield "50"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
+    # one generation, graded as the opening action -- the episode driver never ran.
+    assert calls == ["gen"]
+    assert environment.generated == []
+    assert "case only: PASS" in capsys.readouterr().out
+
+
+def test_env_eval_refuses_an_episode_suite_on_a_single_turn_environment(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """An episode suite on a single-turn env has no transcript to grade, so say so."""
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'episodes'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self): return [EvalCase(id='only', input='only', expected='x')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class Client(_EvalClient):
+        def chat_stream(self, target, messages, **kwargs):
+            yield "x"
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", Client)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
+    captured = capsys.readouterr()
+    # an error, not a 0.0: a mismatched pairing is unmeasurable, not a bad model.
+    assert "single-turn" in captured.out + captured.err
+    assert "errors=1" in captured.out
+
+
+def test_env_eval_normalizes_images_on_every_episode_turn() -> None:
+    """Each turn's prompt must go through the same image normalization as a single-turn case.
+
+    `_drive_episode` builds its prompt from rollout state rather than `_case_messages`, so it does
+    not inherit that normalization for free. Sending the state messages raw ships a data-URI-less
+    `image` block the chat API cannot read, and the case would still be graded -- scoring a model
+    that never saw the image.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 1
+        package_root = None
+
+        def new_rollout_state(self, example):
+            return {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+                            },
+                            {"type": "text", "text": "describe it"},
+                        ],
+                    }
+                ],
+                "turns": [],
+            }
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["response_text"] = content
+
+        def rollout_done(self, state, max_turns=None):
+            return True
+
+        def env_reply(self, messages, state):
+            return []
+
+    sent: list[list[dict]] = []
+
+    def capture(client, target, messages, args):
+        sent.append(messages)
+        return "a cat"
+
+    original = env_eval._generate_case
+    env_eval._generate_case = capture
+    try:
+        episode_module._drive_episode(
+            object(),
+            "t",
+            Environment(),
+            EvalCase(id="row", input="describe it"),
+            argparse.Namespace(),
+        )
+    finally:
+        env_eval._generate_case = original
+
+    assert len(sent) == 1
+    content = sent[0][0]["content"]
+    # the raw `image` block must be gone, rewritten into the image_url shape the backend reads.
+    assert not any(block.get("type") == "image" for block in content)
+    assert {
+        "type": "image_url",
+        "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        },
+    } in content
+
+
+def test_env_eval_hands_the_finished_episode_to_a_suite_that_accepts_it() -> None:
+    """A transcript-grading suite must receive the episode, not just the last turn.
+
+    `record_model_turn` overwrites `state["response_text"]` on every turn, so the scalar is the
+    LAST reply. Scoring a running-total task on that grades one turn of an episode the run just
+    paid to play out -- the same defect as generating once, moved one step later.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 3
+        package_root = None
+
+        def new_rollout_state(self, example):
+            return {"messages": [{"role": "user", "content": "go"}], "turns": []}
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["messages"] = [*state["messages"], {"role": "assistant", "content": content}]
+            state["response_text"] = content
+
+        def rollout_done(self, state, max_turns=None):
+            return len(state["turns"]) >= 3
+
+        def env_reply(self, messages, state):
+            reply = [{"role": "user", "content": "next"}]
+            state["messages"] = [*messages, *reply]
+            return reply
+
+    class TranscriptSuite:
+        name = "running-total"
+        grades_episodes = True
+
+        def cases(self):
+            return [EvalCase(id="c", input="x", expected="1,3,6")]
+
+        def score(self, case, response, state=None):
+            turns = (state or {}).get("turns") or []
+            seen = ",".join(turns)
+            return EvalResult(
+                case_id=case.id,
+                passed=seen == case.expected,
+                score=1.0 if seen == case.expected else 0.0,
+                response=response,
+                reason=f"saw {seen}",
+            )
+
+    replies = iter(["1", "3", "6"])
+    original = env_eval._generate_case
+    env_eval._generate_case = lambda client, target, messages, args: next(replies)
+    try:
+        suite = TranscriptSuite()
+        results = episode_module._run_episode_cases(
+            object(), "t", suite, suite.cases(), argparse.Namespace(concurrency=1), Environment()
+        )
+    finally:
+        env_eval._generate_case = original
+
+    assert results[0].error is None
+    assert results[0].score == 1.0, results[0].reason
+    assert results[0].reason == "saw 1,3,6"
+
+
+def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes() -> None:
+    """A suite that takes only (case, response) must not be handed a third argument."""
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 2
+        package_root = None
+
+        def new_rollout_state(self, example):
+            return {"messages": [{"role": "user", "content": "go"}], "turns": []}
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["messages"] = [*state["messages"], {"role": "assistant", "content": content}]
+            state["response_text"] = content
+
+        def rollout_done(self, state, max_turns=None):
+            return len(state["turns"]) >= 2
+
+        def env_reply(self, messages, state):
+            return [{"role": "user", "content": "next"}]
+
+    class TextOnlySuite:
+        name = "last-turn"
+        grades_episodes = True
+
+        def cases(self):
+            return [EvalCase(id="c", input="x", expected="b")]
+
+        def score(self, case, response):
+            return EvalResult(
+                case_id=case.id,
+                passed=response == case.expected,
+                score=1.0 if response == case.expected else 0.0,
+                response=response,
+            )
+
+    replies = iter(["a", "b"])
+    original = env_eval._generate_case
+    env_eval._generate_case = lambda client, target, messages, args: next(replies)
+    try:
+        suite = TextOnlySuite()
+        results = episode_module._run_episode_cases(
+            object(), "t", suite, suite.cases(), argparse.Namespace(concurrency=1), Environment()
+        )
+    finally:
+        env_eval._generate_case = original
+
+    # scored on the last turn, with no TypeError from an unexpected third argument
+    assert results[0].error is None
+    assert results[0].score == 1.0
+
+
+def test_state_argument_detects_how_the_scorer_takes_state() -> None:
+    # detecting only WHETHER state is accepted is not enough: **kwargs and keyword-only scorers
+    # reject a third positional, and *args scorers reject the keyword. the two groups are disjoint,
+    # so the call style has to come from the signature.
+    from flash.cli.commands.env.episode import _state_argument
+
+    assert _state_argument(lambda case, response: None) is None
+    assert _state_argument(None) is None
+    assert _state_argument(lambda case, response, state=None: None) == "keyword"
+    assert _state_argument(lambda case, response, *, state=None: None) == "keyword"
+    assert _state_argument(lambda case, response, **kwargs: None) == "keyword"
+    assert _state_argument(lambda case, response, *args, **kwargs: None) == "keyword"
+    assert _state_argument(lambda case, response, *args: None) == "positional"
+    assert _state_argument(lambda case, response, episode=None: None) == "positional"
+
+
+@pytest.mark.parametrize(
+    "scorer_source",
+    [
+        "def score(self, case, response, state=None): return _graded(case, state)",
+        "def score(self, case, response, *, state=None): return _graded(case, state)",
+        "def score(self, case, response, **kwargs): return _graded(case, kwargs.get('state'))",
+        "def score(self, case, response, *args): return _graded(case, args[0] if args else None)",
+    ],
+    ids=["positional", "keyword_only", "kwargs", "varargs"],
+)
+def test_every_state_accepting_scorer_shape_actually_receives_the_episode(
+    scorer_source: str,
+) -> None:
+    """Each signature that opts in must be CALLED in the way it can accept.
+
+    Detection alone shipped a scorer that was marked supported and then called with a third
+    positional argument it could not take, so every case came back `scoring failed` -- a hard zero
+    that looks like the model failed. Asserting the score, not the detection, is what catches that.
+    """
+    from flash.cli.commands.env.episode import _state_argument
+    from flash.cli.commands.env.eval import _score_case
+
+    namespace: dict = {
+        "_graded": lambda case, state: (
+            1.0 if ",".join((state or {}).get("turns", [])) == case.expected else 0.0
+        )
+    }
+    exec(
+        f"class Suite:\n    name = 'suite'\n    grades_episodes = True\n    {scorer_source}",
+        namespace,
+    )
+    suite = namespace["Suite"]()
+
+    case = EvalCase(input="count up", expected="1,3,6", id="c1")
+    state = {"turns": ["1", "3", "6"], "response_text": "6"}
+
+    style = _state_argument(suite.score)
+    assert style is not None
+    result = _score_case(suite, case, "c1", "6", state=state, state_keyword=style == "keyword")
+
+    # the whole transcript reached the scorer, and no TypeError was reported as a scoring failure
+    assert result.error is None
+    assert result.score == 1.0
+
+
+def test_env_eval_applies_the_last_model_turn_before_scoring_at_the_turn_cap() -> None:
+    """The final model action must reach the scored state, including at the turn cap.
+
+    `env_reply` is what runs the env's `step_episode`, so a state that never sees the last action
+    is scored with board state, metadata and `final_response_text` one move stale -- the model is
+    graded as though its last turn never happened.
+
+    Training does apply it. `rl/multi_turn.py` gates its reply solely on `rollout_done`, which
+    counts `state["turn"]` -- incremented only by `env_reply`, never by `record_model_turn` -- so
+    at the cap the counter is still one short, the check passes, and the env is stepped.
+
+    What is skipped is only the inter-turn glue: no SECOND reply that would append a user turn no
+    model turn will ever answer, which is what `opd/bridge.py` guards against.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 2
+        package_root = None
+
+        def __init__(self):
+            self.env_replies = 0
+
+        def new_rollout_state(self, example):
+            return {"messages": [{"role": "user", "content": "go"}], "turns": [], "turn": 0}
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["messages"].append({"role": "assistant", "content": content})
+            state["response_text"] = content
+
+        def rollout_done(self, state, max_turns=None):
+            # mirrors the adapter: the counter only advances on env_reply
+            if state.get("done"):
+                return True
+            return max_turns is not None and int(state.get("turn", 0)) >= int(max_turns)
+
+        def env_reply(self, messages, state):
+            self.env_replies += 1
+            state["turn"] = int(state.get("turn", 0)) + 1
+            # stand-in for step_episode's side effects: only a reply makes the last action count
+            state["applied"] = list(state["turns"])
+            state["messages"] = [*messages, {"role": "user", "content": "next"}]
+            return [{"role": "user", "content": "next"}]
+
+    replies = iter(["a", "b"])
+    environment = Environment()
+    original = env_eval._generate_case
+    env_eval._generate_case = lambda client, target, messages, args: next(replies)
+    try:
+        state = episode_module._drive_episode(
+            object(), "t", environment, EvalCase(id="c", input="x"), argparse.Namespace()
+        )
+    finally:
+        env_eval._generate_case = original
+
+    assert state["turns"] == ["a", "b"]
+    # the capped turn "b" was applied, so the scored state is not one action stale
+    assert state["applied"] == ["a", "b"]
+    # one inter-turn reply plus the final apply; no third that would glue on an unanswerable prompt
+    assert environment.env_replies == 2
+
+
+def test_env_eval_does_not_step_an_environment_that_already_reported_done() -> None:
+    """An env that ended the episode itself must not be stepped again before scoring.
+
+    `env_reply` runs `step_episode`. Once the env reports done there is nothing left to apply, and
+    both `env test` and the RL worker stop there. Stepping anyway scores a state past the end of
+    the episode -- and for an env that validates each action, can raise on a turn that never was.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 5
+        package_root = None
+
+        def __init__(self):
+            self.env_replies = 0
+
+        def new_rollout_state(self, example):
+            return {"messages": [{"role": "user", "content": "go"}], "turns": [], "turn": 0}
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["messages"].append({"role": "assistant", "content": content})
+            state["response_text"] = content
+            # the env decides the episode is over the moment it sees this action
+            if content == "stop":
+                state["done"] = True
+
+        def rollout_done(self, state, max_turns=None):
+            if state.get("done"):
+                return True
+            return max_turns is not None and int(state.get("turn", 0)) >= int(max_turns)
+
+        def env_reply(self, messages, state):
+            self.env_replies += 1
+            state["turn"] = int(state.get("turn", 0)) + 1
+            state["messages"] = [*messages, {"role": "user", "content": "next"}]
+            return [{"role": "user", "content": "next"}]
+
+    replies = iter(["stop"])
+    environment = Environment()
+    original = env_eval._generate_case
+    env_eval._generate_case = lambda client, target, messages, args: next(replies)
+    try:
+        state = episode_module._drive_episode(
+            object(), "t", environment, EvalCase(id="c", input="x"), argparse.Namespace()
+        )
+    finally:
+        env_eval._generate_case = original
+
+    assert state["turns"] == ["stop"]
+    # the env ended it; no step may follow
+    assert environment.env_replies == 0
+
+
+def test_env_eval_honours_a_per_example_turn_budget_below_the_env_ceiling() -> None:
+    """A case whose `max_episode_turns` is lower than `max_turns` must stop at its own budget.
+
+    `rollout_done` gives the per-example budget precedence (`flash/envs/adapter.py`), and both
+    training bridges derive the same effective limit (`opd/bridge.py:512`, `rl/multi_turn.py:174`).
+    Counting only the dataset-wide ceiling generates turns training would never have run.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+
+    class Environment:
+        multi_turn = True
+        max_turns = 6
+        package_root = None
+
+        def __init__(self):
+            self.env_replies = 0
+
+        def new_rollout_state(self, example):
+            return {
+                "messages": [{"role": "user", "content": "go"}],
+                "turns": [],
+                "turn": 0,
+                # this case gets a shorter budget than the dataset-wide ceiling
+                "max_episode_turns": 2,
+            }
+
+        def record_model_turn(self, state, content):
+            state["turns"].append(content)
+            state["messages"].append({"role": "assistant", "content": content})
+            state["response_text"] = content
+
+        def rollout_done(self, state, max_turns=None):
+            # deliberately honours ONLY the cap it is handed, so this test measures the cap the
+            # driver computes rather than the env re-deriving the budget for it. the real adapter
+            # applies the same precedence internally (flash/envs/adapter.py:670), which would mask
+            # a driver that passed the wrong ceiling.
+            if state.get("done"):
+                return True
+            return max_turns is not None and int(state.get("turn", 0)) >= int(max_turns)
+
+        def env_reply(self, messages, state):
+            self.env_replies += 1
+            state["turn"] = int(state.get("turn", 0)) + 1
+            state["messages"] = [*messages, {"role": "user", "content": "next"}]
+            return [{"role": "user", "content": "next"}]
+
+    generated = []
+
+    def _fake_generate(client, target, messages, args):
+        generated.append(messages)
+        return f"turn{len(generated)}"
+
+    environment = Environment()
+    original = env_eval._generate_case
+    env_eval._generate_case = _fake_generate
+    try:
+        state = episode_module._drive_episode(
+            object(), "t", environment, EvalCase(id="c", input="x"), argparse.Namespace()
+        )
+    finally:
+        env_eval._generate_case = original
+
+    # two turns, not the six the dataset-wide ceiling would have allowed
+    assert state["turns"] == ["turn1", "turn2"]
+    assert len(generated) == 2
+
+
+def test_env_eval_strips_reasoning_from_the_state_a_thinking_episode_scores() -> None:
+    """A thinking run must not hand the suite raw `<think>` text through the episode state.
+
+    `_score_case` strips the separate `response` argument, so scoring that alone hides this. But a
+    `grades_episodes` suite reads `state["response_text"]`, which `record_model_turn` fills via
+    `_scored_turn_text` -- and that returns the turn UNSTRIPPED while the adapter's `thinking` flag
+    is at its default False. The suite then sees `<think>2+2 is 4</think>4` and marks a correct
+    answer wrong. Training sets the flag on the env, so eval has to as well.
+    """
+    import argparse
+
+    from flash.cli.commands.env import episode as episode_module
+    from flash.cli.commands.env import eval as env_eval
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class Environment:
+        """Uses the real adapter's turn-recording, which is where the stripping lives."""
+
+        multi_turn = True
+        max_turns = 1
+        package_root = None
+
+        def __init__(self):
+            self.thinking = False
+            self.prompt_opens_thinking = False
+
+        def new_rollout_state(self, example):
+            return {"messages": [{"role": "user", "content": "2+2?"}], "turns": [], "turn": 0}
+
+        def record_model_turn(self, state, content):
+            scored = FreesoloEnvironment._scored_turn_text(self, content)
+            state["turns"].append(scored)
+            state["messages"].append({"role": "assistant", "content": content})
+            state["response_text"] = scored
+
+        def rollout_done(self, state, max_turns=None):
+            if state.get("done"):
+                return True
+            return max_turns is not None and int(state.get("turn", 0)) >= int(max_turns)
+
+        def env_reply(self, messages, state):
+            state["turn"] = int(state.get("turn", 0)) + 1
+            return []
+
+    seen = {}
+
+    class Suite:
+        name = "episode"
+        grades_episodes = True
+
+        def score(self, case, response, state=None):
+            seen["state_response"] = str((state or {}).get("response_text"))
+            return 1.0 if seen["state_response"] == "4" else 0.0
+
+    environment = Environment()
+    original = env_eval._generate_case
+    env_eval._generate_case = lambda client, target, messages, args: "<think>2+2 is 4</think>4"
+    try:
+        results = episode_module._run_episode_cases(
+            object(),
+            "t",
+            Suite(),
+            [EvalCase(id="c", input="2+2?")],
+            argparse.Namespace(),
+            environment,
+            thinking=True,
+        )
+    finally:
+        env_eval._generate_case = original
+
+    # the scorer read the answer, not the reasoning wrapper
+    assert seen["state_response"] == "4"
+    assert results[0].score == 1.0
+    # and the caller's environment is left as it was found
+    assert environment.thinking is False

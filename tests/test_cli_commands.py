@@ -2231,6 +2231,14 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
     assert failing.score == 0.0
     assert "single integer" in failing.reason
 
+    # the environment is multi-turn but this suite grades one reply, so it must NOT opt into
+    # episode play. driving it would score the last turn instead of the opening action, and these
+    # cases carry no `output` for `step_episode` to advance from, so the case would error out.
+    from flash.cli.commands.env.episode import _grades_episodes
+
+    assert environment.multi_turn is True
+    assert _grades_episodes(suite) is False
+
 
 def test_env_setup_multi_turn_eval_case_does_not_duplicate_the_episode_prompt(
     monkeypatch, tmp_path
