@@ -14,7 +14,7 @@ class SseDoneGate:
 
     @property
     def terminated(self) -> bool:
-        return bool(self._done) or self.done_event is not None
+        return self.done_event is not None
 
     def feed(self, chunk: bytes) -> list[bytes]:
         self._buffer += chunk

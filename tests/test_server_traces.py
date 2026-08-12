@@ -394,6 +394,24 @@ def test_an_oversized_sse_stream_forwards_every_byte_and_marks_output_truncated(
     assert prompts["skipped"] == 0
 
 
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_done_gate_waits_for_split_event_terminator(line_ending: bytes) -> None:
+    completion = b'data: {"a":1}' + line_ending * 2
+    terminator = b"data: [DONE]" + line_ending * 2
+    gate = trace_sse.SseDoneGate()
+    forwarded: list[bytes] = []
+
+    for chunk in [completion, terminator[: -len(line_ending)], terminator[-len(line_ending) :]]:
+        forwarded.extend(gate.feed(chunk))
+        if gate.terminated:
+            break
+    forwarded.extend(gate.finish())
+    if gate.done_event is not None:
+        forwarded.append(gate.done_event)
+
+    assert b"".join(forwarded) == completion + terminator
+
+
 def test_repeated_sse_envelope_fields_do_not_consume_the_stream_budget() -> None:
     accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=700)
     fragment = "x"
