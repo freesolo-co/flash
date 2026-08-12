@@ -381,6 +381,27 @@ def test_profile_refuses_oversized_inline_records(tmp_path) -> None:
         _profile(entrypoint, params={"records": records})
 
 
+def test_profile_treats_a_missing_packaged_contract_path_as_empty(tmp_path) -> None:
+    # _resolve_path_arg returns a relative path unresolved when it does not exist, so a missing
+    # in-package contract still reads as a bare relative string. the loader turns that into an empty
+    # contract and trains; the quote must agree rather than refuse a config the worker accepts.
+    entrypoint = _package(tmp_path, {"dataset/train.jsonl": '{"input":"a","output":"b"}\n'})
+
+    _spec, profile = _profile(entrypoint, params={"contract_path": "TRAINING_CONTRACT.md"})
+
+    assert profile.selected_examples == 1
+
+
+@pytest.mark.parametrize("configured", ["/etc/passwd", "../outside.md"])
+def test_profile_refuses_a_contract_path_outside_the_package(tmp_path, configured) -> None:
+    # the missing-file allowance above must not weaken containment: absolute and dotdot paths still
+    # land outside base_dir and stay refused.
+    entrypoint = _package(tmp_path, {"dataset/train.jsonl": '{"input":"a","output":"b"}\n'})
+
+    with pytest.raises(PackagedDatasetUnavailable, match="outside the environment package"):
+        _profile(entrypoint, params={"contract_path": configured})
+
+
 def test_profile_refuses_an_oversized_authored_contract(tmp_path) -> None:
     entrypoint = _package(tmp_path, {"dataset/train.jsonl": '{"input":"a","output":"b"}\n'})
 

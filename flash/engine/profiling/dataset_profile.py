@@ -130,10 +130,14 @@ def _contract_text(base_dir: Path, params: dict[str, Any]) -> str:
     if authored:
         return _bounded_contract_text(str(authored), source="[environment.params] contract_text")
     configured_path = params.get("contract_path")
-    contract_path = _resolve_path_arg(configured_path, base_dir)
-    if not isinstance(contract_path, str):
-        contract_path = str(base_dir / "TRAINING_CONTRACT.md")
-    path = Path(contract_path)
+    if not isinstance(configured_path, str) or not configured_path:
+        path = base_dir / "TRAINING_CONTRACT.md"
+    else:
+        # NOT _resolve_path_arg: it leaves a relative path unresolved when the file is absent, which
+        # would read here as an escape from the package and refuse a config the worker trains on
+        # (_load_contract_text treats a missing file as an empty contract). resolving it against the
+        # package unconditionally keeps the containment check about escapes only.
+        path = base_dir / configured_path
     try:
         packaged = path.resolve().is_relative_to(base_dir.resolve())
     except (OSError, RuntimeError):
@@ -153,7 +157,7 @@ def _contract_text(base_dir: Path, params: dict[str, Any]) -> str:
             f"{_MAX_PROFILE_CONTRACT_BYTES // 1024} KiB control-plane profiling limit. Shorten the "
             "packaged training contract."
         )
-    return _bounded_contract_text(str(_load_contract_text(contract_path)), source=path.name)
+    return _bounded_contract_text(_load_contract_text(str(path)), source=path.name)
 
 
 def _reject_oversized_records(records: object) -> None:
