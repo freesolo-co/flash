@@ -475,6 +475,30 @@ def test_our_own_cuda_contexts_are_not_counted_as_a_co_tenant(monkeypatch):
     lc.preflight_free_vram()
 
 
+def test_a_co_tenant_row_is_not_credited_to_us(monkeypatch):
+    """`nvidia-smi` listing a pid does not make it ours, and crediting it hides the dirty card.
+
+    On the observed host the container's pid namespace hid the co-tenant, but that is one host's
+    behaviour, not a guarantee -- `--pid=host` or a privileged container can surface a co-tenant's
+    row. Subtracting it would silently defeat the entire check, so ownership is proved rather than
+    assumed: the pid has to resolve in THIS namespace.
+    """
+    import subprocess
+
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.undo()  # this test is about _own_vram_gb itself, not its stub
+
+    # pid 1 exists in every namespace; the huge pid does not. only the first may be counted.
+    fake = "1, 512\n4000999, 18300\n"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_a, **_k: types.SimpleNamespace(returncode=0, stdout=fake, stderr=""),
+    )
+    assert lc._own_vram_gb() == pytest.approx(0.5, abs=0.01)
+
+
 def test_unattributable_memory_counts_as_foreign(monkeypatch):
     """`nvidia-smi` failing must not turn into a clean bill of health for a dirty card.
 

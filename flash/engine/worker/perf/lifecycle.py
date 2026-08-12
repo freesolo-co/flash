@@ -66,18 +66,46 @@ def _own_vram_gb() -> float:
     to subtract: a context is a few hundred MB, but SFT probes readiness in a subprocess while the
     parent already holds one, so two of ours can be live at once.
 
-    ``nvidia-smi --query-compute-apps`` attributes used memory per process, and a container sees its
-    own pids. It cannot see a co-tenant's (that is the whole reason the co-tenanted card was
-    invisible from inside), which is exactly the asymmetry wanted here: everything it reports is
-    ours, everything it misses is not.
+    ``nvidia-smi --query-compute-apps`` attributes used memory per pid. On the observed dirty card it
+    listed only our own (0.486 GB against 18.6 GB used), because a container's pid namespace hides the
+    co-tenant -- but that is an OBSERVATION of one host, not a guarantee. With `--pid=host`, a
+    privileged container, or a driver that reports host pids, a co-tenant's row can appear, and
+    subtracting it would credit the tenant's memory to us and wave the dirty card through. That
+    failure is silent and defeats the whole check, so each row is proved ours before it counts:
+    ``/proc/<pid>`` must exist in THIS namespace.
 
     Zero on any failure, which makes the caller's occupancy reading conservative rather than
     permissive: unattributed memory counts as foreign.
     """
-    try:
-        from flash.engine.worker.perf.diagnostics import _query_nvidia_processes
+    import os
+    import subprocess
 
-        return sum(float(row.get("used_memory_gb") or 0.0) for row in _query_nvidia_processes())
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--id=0",  # the device free/total were read from; ours on device 1 are not ours here
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8.0,
+        )
+        if out.returncode != 0:
+            return 0.0
+        total = 0.0
+        for line in out.stdout.splitlines():
+            pid, _, used = line.partition(",")
+            # proving the pid resolves HERE is what makes this an ownership test rather than a
+            # restatement of what nvidia-smi chose to show us.
+            if not pid.strip().isdigit() or not os.path.isdir(f"/proc/{pid.strip()}"):
+                continue
+            try:
+                total += float(used.strip()) / 1024.0  # MiB -> GiB
+            except ValueError:
+                continue
+        return total
     except Exception:
         return 0.0
 
