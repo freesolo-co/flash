@@ -155,6 +155,10 @@ names are `openai`, `anthropic`, `openrouter`, and `google`; the provider key is
 that upstream request and is not stored. Set `X-Freesolo-Record: false` to proxy a request
 without recording it. Otherwise `X-Freesolo-Project-Id` is required and must be a uuid.
 
+Your request reaches the provider exactly as you sent it. Redaction applies only to the copy the
+plane stores, so a tool schema with a `password` property, or a prompt that quotes a credential,
+is never rewritten on the way out.
+
 Each request records one `chat.completions` span after a normal response, a streamed response,
 a client disconnect, or an upstream failure. The request and response payloads land in the
 plane's own SQLite database under the authenticated single-tenant owner. Export them with:
@@ -164,6 +168,11 @@ flash traces export --project 11111111-1111-4111-8111-111111111111
 flash traces export --project 11111111-1111-4111-8111-111111111111 --format prompts
 flash traces export --project 11111111-1111-4111-8111-111111111111 --format raw
 ```
+
+`records` pairs a request with its reply and skips calls that failed or never answered, so a
+provider error is never exported as a completion to train toward. `prompts` needs only the
+request. `raw` returns every stored trace, failures included. An export reads the newest 1000
+traces; past that it says so rather than presenting a partial dump as the whole project.
 
 A standalone plane is single-tenant and applies no rate limit or spend limit to this proxy.
 Every forwarded call uses the caller-supplied paid provider key. Do not expose the endpoint to

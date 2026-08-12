@@ -20,6 +20,15 @@ _MAX_ATTRIBUTE_VALUE_LENGTH = 8_192
 _MAX_ATTRIBUTE_DEPTH = 6
 _MAX_SEQUENCE_LENGTH = 128
 _MAX_TRACE_TITLE_LENGTH = 500
+# payloads are the product, not telemetry: a recorded completion is what `traces export` turns into
+# a training row, so cutting it at the 8 KiB attribute bound would ship a truncated target with an
+# ellipsis in it and no indication the text was ever longer. they still need A bound -- an untrimmed
+# payload is unbounded rows in SQLite -- just one far above any real chat completion.
+_MAX_PAYLOAD_VALUE_LENGTH = 1_000_000
+# likewise for nesting. an ordinary tool schema (`tools[] > function > parameters > properties >
+# field > type`) already sits at depth 6, so the attribute depth would repr() the leaf and store a
+# JSON schema as the string "{}".
+_MAX_PAYLOAD_DEPTH = 24
 
 
 @dataclass
@@ -37,29 +46,38 @@ class TraceSpan:
     error: str | None = None
 
 
-def sanitize_json_value(value: Any, *, depth: int = 0) -> Any:
-    """Bound nested values before they enter the plane's durable trace store."""
-    if depth >= _MAX_ATTRIBUTE_DEPTH:
-        return _truncate(repr(value), _MAX_ATTRIBUTE_VALUE_LENGTH)
+def sanitize_json_value(
+    value: Any, *, depth: int = 0, max_string: int | None = None, max_depth: int | None = None
+) -> Any:
+    """Bound nested values before they enter the plane's durable trace store.
+
+    `max_string` and `max_depth` select the bounds: metadata and attributes keep the tight attribute
+    limits, while payloads pass the payload limits so an exported completion is the whole completion
+    and a nested tool schema survives as a schema.
+    """
+    limit = _MAX_ATTRIBUTE_VALUE_LENGTH if max_string is None else max_string
+    depth_limit = _MAX_ATTRIBUTE_DEPTH if max_depth is None else max_depth
+    if depth >= depth_limit:
+        return _truncate(repr(value), limit)
     if value is None or isinstance(value, bool | int):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else str(value)
     if isinstance(value, str):
-        return _truncate(value, _MAX_ATTRIBUTE_VALUE_LENGTH)
+        return _truncate(value, limit)
     if isinstance(value, dict):
         return {
-            _truncate(str(key), _MAX_ATTRIBUTE_VALUE_LENGTH): sanitize_json_value(
-                item, depth=depth + 1
+            _truncate(str(key), limit): sanitize_json_value(
+                item, depth=depth + 1, max_string=max_string, max_depth=max_depth
             )
             for key, item in list(value.items())[:_MAX_ATTRIBUTE_COUNT]
         }
     if isinstance(value, list | tuple):
         return [
-            sanitize_json_value(item, depth=depth + 1)
+            sanitize_json_value(item, depth=depth + 1, max_string=max_string, max_depth=max_depth)
             for item in list(value)[:_MAX_SEQUENCE_LENGTH]
         ]
-    return _truncate(repr(value), _MAX_ATTRIBUTE_VALUE_LENGTH)
+    return _truncate(repr(value), limit)
 
 
 def store_trace(
@@ -111,8 +129,16 @@ def store_trace(
                     span.duration_ms,
                     span.input_tokens,
                     span.output_tokens,
-                    _json_dump(span.input_payload),
-                    _json_dump(span.output_payload),
+                    _json_dump(
+                        span.input_payload,
+                        max_string=_MAX_PAYLOAD_VALUE_LENGTH,
+                        max_depth=_MAX_PAYLOAD_DEPTH,
+                    ),
+                    _json_dump(
+                        span.output_payload,
+                        max_string=_MAX_PAYLOAD_VALUE_LENGTH,
+                        max_depth=_MAX_PAYLOAD_DEPTH,
+                    ),
                     _json_dump(span.attributes),
                     span.status_code,
                     span.error,
@@ -180,6 +206,9 @@ def export_traces(
         "traces": trace_count,
         "skipped": 0 if export_format == "raw" else trace_count - len(records),
         "format": export_format,
+        # the read is capped, so a project at the cap has older traces this response does not
+        # contain. reporting the truncated count alone would read as "that is all of them".
+        "truncated": trace_count >= limit,
     }
 
 
@@ -221,7 +250,10 @@ def _training_pair(spans: list[dict[str, Any]]) -> tuple[Any, Any]:
         (
             span.get("output_payload")
             for span in reversed(spans)
-            if _usable_payload(span.get("output_payload"))
+            # an ERROR span's output is the provider's rejection -- a 429 body, a partial response
+            # from an interrupted stream -- not a reply anyone wants to train toward. `raw` still
+            # exports it; `records` must not present it as a desired completion.
+            if span.get("status_code") != "ERROR" and _usable_payload(span.get("output_payload"))
         ),
         None,
     )
@@ -232,10 +264,16 @@ def _usable_payload(value: Any) -> bool:
     return value is not None and (not isinstance(value, str) or bool(value.strip()))
 
 
-def _json_dump(value: Any) -> str | None:
+def _json_dump(
+    value: Any, *, max_string: int | None = None, max_depth: int | None = None
+) -> str | None:
     if value is None:
         return None
-    return json.dumps(sanitize_json_value(value), ensure_ascii=False, sort_keys=True)
+    return json.dumps(
+        sanitize_json_value(value, max_string=max_string, max_depth=max_depth),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 def _json_load(value: str | None) -> Any:

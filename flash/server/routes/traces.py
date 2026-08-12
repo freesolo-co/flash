@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _UPSTREAM_TIMEOUT_SECONDS = 300.0
+# how much of an upstream ERROR body to keep for the trace. generously above the 8 KiB the stored
+# copy is truncated to, so the recorded message is never the part that got cut, while still bounding
+# what one response can hold in memory.
+_MAX_RECORDED_ERROR_BYTES = 64 * 1024
 _PROVIDER_HEADER = "X-Freesolo-Provider"
 _PROVIDER_KEY_HEADER = "X-Freesolo-Provider-Key"
 _PROJECT_HEADER = "X-Freesolo-Project-Id"
@@ -163,8 +167,13 @@ def _is_secret_key(key: Any) -> bool:
 def _is_schema_definition(value: Any) -> bool:
     if isinstance(value, bool):
         return True
-    if not isinstance(value, dict) or not value:
+    if not isinstance(value, dict):
         return False
+    if not value:
+        # `{}` is the permissive JSON Schema ("any value"), so under a `properties` map it is a
+        # declaration, not a secret. Treating it as one rewrote `{"password": {}}` into the string
+        # "[redacted]" and turned a valid schema into an invalid one.
+        return True
     keys = [key for key in value if not (isinstance(key, str) and key.startswith("x-"))]
     if any(key not in _JSON_SCHEMA_KEYWORDS for key in keys):
         return False
@@ -192,17 +201,28 @@ def _redact_secret_fields(value: Any, *, schema_property_map: bool = False) -> A
     return value
 
 
+def _redact_secret_string(value: str, secrets: tuple[str, ...]) -> str:
+    for secret in secrets:
+        if secret:
+            value = value.replace(secret, "[redacted]")
+    return value
+
+
 def _redact_secret_values(value: Any, secrets: tuple[str, ...]) -> Any:
     if isinstance(value, dict):
-        return {key: _redact_secret_values(item, secrets) for key, item in value.items()}
+        # keys are redacted too. a credential used as an object key -- `{"sk-live-...": "seen"}` --
+        # is still the credential, and a key-blind pass would write it into the span verbatim and
+        # hand it back through `format=raw`.
+        return {
+            (_redact_secret_string(key, secrets) if isinstance(key, str) else key): (
+                _redact_secret_values(item, secrets)
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, list | tuple):
         return [_redact_secret_values(item, secrets) for item in value]
     if isinstance(value, str):
-        sanitized = value
-        for secret in secrets:
-            if secret:
-                sanitized = sanitized.replace(secret, "[redacted]")
-        return sanitized
+        return _redact_secret_string(value, secrets)
     return value
 
 
@@ -340,6 +360,9 @@ class _SseAccumulator:
         self._buffer = b""
         self._choices: dict[int, dict[str, Any]] = {}
         self.usage: Any = None
+        # whether any parseable SSE event arrived, so an empty stream is distinguishable from a
+        # stream whose events carried no choices.
+        self.received = False
 
     def feed(self, chunk: bytes) -> None:
         self._buffer += chunk
@@ -391,6 +414,7 @@ class _SseAccumulator:
             return
         if not isinstance(payload, dict):
             return
+        self.received = True
         if isinstance(payload.get("usage"), dict):
             self.usage = payload["usage"]
         choices = payload.get("choices")
@@ -459,7 +483,11 @@ async def _stream_response(
         async for chunk in upstream_response.aiter_bytes():
             if context.record_trace:
                 if is_error:
-                    raw_output.extend(chunk)
+                    # bounded: an error body is stored truncated anyway, so retaining an unbounded
+                    # one only to throw most of it away lets a single upstream response grow the
+                    # plane's memory without limit. the caller still receives every byte below.
+                    if len(raw_output) < _MAX_RECORDED_ERROR_BYTES:
+                        raw_output.extend(chunk[: _MAX_RECORDED_ERROR_BYTES - len(raw_output)])
                 else:
                     accumulator.feed(chunk)
             yield chunk
@@ -485,7 +513,12 @@ async def _stream_response(
                             output_payload = bytes(raw_output).decode(errors="replace")
                     else:
                         accumulator.finish()
-                        output_payload = accumulator.output()
+                        # a stream that ended before any content arrived has NO output, which is
+                        # not the same as an output with zero choices. recording the synthesized
+                        # `{"choices": [], "usage": null}` would make `format=records` emit a
+                        # training pair whose response half is an empty envelope -- exactly the
+                        # row that format exists to skip.
+                        output_payload = accumulator.output() if accumulator.received else None
                     await _record_trace(context, output_payload=output_payload, error=error)
 
 
@@ -598,7 +631,13 @@ async def chat_completions(
         metadata=metadata,
         record_trace=record_trace,
     )
-    forwarded_body = _sanitize_for_trace(context.body, context.secrets)
+    # the CALLER'S request, verbatim. redaction belongs to the stored copy only (`_record_trace`
+    # sanitizes `context.body` itself): a proxy that rewrote the body before forwarding would send
+    # the provider something the caller never wrote -- a tool schema whose `password` property got
+    # replaced by the string "[redacted]", or a prompt that happens to quote the key. the caller
+    # would be billed for inference on a request they did not make, and could not tell from the
+    # response that it had been altered.
+    forwarded_body = context.body
 
     if body.get("stream") is True:
         client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT_SECONDS)

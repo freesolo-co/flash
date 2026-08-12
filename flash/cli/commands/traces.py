@@ -207,6 +207,10 @@ def cmd_traces_export(args) -> int:
     if skipped:
         reason = _SKIP_REASON.get(export_format)
         summary += f" ({skipped} traces skipped: {reason})" if reason else f" ({skipped} skipped)"
+    # the export reads a capped window of the newest traces. say so, or a project past the cap looks
+    # like it was exported whole and the older traces are silently missing from the dataset.
+    if exported.get("truncated"):
+        summary += " -- newest traces only; the project holds more than this export can read"
     if render.styled():
         print(render.ok(summary))
         # raw rows are for taking away, not for training: pointing them at
