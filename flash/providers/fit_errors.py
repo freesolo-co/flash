@@ -52,6 +52,12 @@ def _batch_bound_width_note(*counts: str, algorithm: str = "", parenthetical: bo
     the sequences one step holds. Naming sft's rows to an opd user would point them at a knob opd
     rejects at parse time.
 
+    For grpo and opd it also states the DIRECTION, because the general knob advice appended after it
+    says to lower those same knobs and here that is a dead end: a step bound by its sequence count
+    cannot go below one prompt, and RAISING the count is what buys ranks. MEASURED at 32k on eight
+    180 GB cards -- every width-bound catalog row fits once the step is wide enough to fill more
+    ranks (27B grpo at 4, 35B grpo and both 27B/35B opd at 2), and none of them fits by shrinking.
+
     ``parenthetical`` when a remedy clause follows -- a trailing dash clause would swallow it, so
     "..., or lower batch_size" would read as part of the explanation rather than as the fix.
     """
@@ -60,7 +66,7 @@ def _batch_bound_width_note(*counts: str, algorithm: str = "", parenthetical: bo
     if (algorithm or "").lower() in ("grpo", "rl", "opd"):
         reason = (
             "every rank needs its own share of the step, so prompts_per_step x group_size bounds "
-            "the rank count"
+            "the rank count; RAISE it to buy ranks"
         )
     else:
         reason = "sft shards by data, so the batch and retained rows bound the rank count"
