@@ -162,9 +162,9 @@ the git form instead — commit this folder to a repo your plane can read, then 
 id = "github:OWNER/REPO@REF:environment.py"    # REF is a branch/tag name without `/`, or a commit
                                                # sha; the path is the file, or a directory holding
                                                # environment.py. For a branch, use the repo's
-                                               # DEFAULT branch -- `main` or `master` depending on
-                                               # how it was created (`gh repo create` still makes
-                                               # `master`). A ref that does not exist fails with
+                                               # actual DEFAULT branch -- check it rather than
+                                               # assuming `main`, since it depends on how the repo
+                                               # was created. A ref that does not exist fails with
                                                # GitHub's "No commit found for SHA: <ref>".
 ```
 

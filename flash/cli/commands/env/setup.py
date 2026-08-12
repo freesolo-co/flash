@@ -424,8 +424,8 @@ _SELF_HOSTED_GUIDANCE = {
         "`github:OWNER/REPO@REF:environment.py` -- this plane is self-hosted, so publishing\n"
         "to Freesolo's managed environment hub does not apply.\n"
         "\n"
-        "REF is your repo's default branch: `main` or `master` depending on how it was created\n"
-        "(`gh repo create` still makes `master`). A ref that does not exist fails with GitHub's\n"
+        "REF is your repo's actual default branch -- check it rather than assuming `main`, since\n"
+        "it depends on how the repo was created. A ref that does not exist fails with GitHub's\n"
         '"No commit found for SHA: <ref>".'
     ),
     "EVALUATIONS_GUIDANCE": (
@@ -478,8 +478,8 @@ def _environment_comment(project_id: str, *, can_publish: bool, extra: str = "")
             f"# Environment: this plane is self-hosted, so `{CLI_NAME} env push` does not apply -- it\n"
             "# publishes to Freesolo's managed environment hub. Name a git repo instead:\n"
             "#   github:OWNER/REPO@REF:PATH   (PATH is the file, or the directory holding environment.py)\n"
-            "# REF is your repo's default branch -- `main` or `master` depending on how it was\n"
-            "# created (`gh repo create` still makes `master`). A ref that does not exist fails with\n"
+            "# REF is your repo's actual default branch -- check it rather than assuming `main`,\n"
+            "# since it depends on how the repo was created. A ref that does not exist fails with\n"
             "# GitHub's 'No commit found for SHA: <ref>'.\n"
             "# Push this folder to a repo your plane can read, then fill in the id below.\n"
             "# A github: id needs a plane running with FLASH_STANDALONE=1; an identity-backed plane\n"
@@ -488,8 +488,8 @@ def _environment_comment(project_id: str, *, can_publish: bool, extra: str = "")
         )
         # REF, not `main`: this line is a placeholder to be edited, and every other token in it
         # (OWNER, REPO) is obviously one. `main` looks like a value that is already correct, so it
-        # survives the edit -- and on a repo created by `gh repo create`, whose default branch is
-        # still `master`, it is silently wrong.
+        # survives the edit -- and on a repo whose default branch is anything else, it is silently
+        # wrong, surfacing much later as a pinning error at submit.
         placeholder = 'id = "github:OWNER/REPO@REF:environment.py"\n\n'
     return f"{head}{extra}[environment]\n{placeholder}"
 
