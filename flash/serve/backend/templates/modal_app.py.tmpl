@@ -597,9 +597,19 @@ class Engine:
                 # and its record stays `ready` while its next load re-adds the adapter. The
                 # orphan has no such path back.
                 self._int_ids[int_id] = adapter_id
-                with contextlib.suppress(Exception):
+                evicted = True
+                try:
                     await self.engine.remove_lora(int_id)
-                self._int_ids.pop(int_id, None)
+                except Exception:  # best effort: the raise below reports the real failure
+                    evicted = False
+                # Cleared ONLY on a confirmed eviction. Popping unconditionally would undo the
+                # line above for exactly the case it exists to cover: `remove_lora` failing leaves
+                # the LoRA resident, and with no `_int_ids` entry nothing can find it again --
+                # the orphan this ordering was written to prevent. Keeping the entry costs one
+                # `max_loras` slot on a container that is about to recycle, and the collision
+                # sweep repairs it by evicting before it loads over the id.
+                if evicted:
+                    self._int_ids.pop(int_id, None)
                 self._loaded.pop(adapter_id, None)
                 raise RuntimeError(
                     f"lora id {{int_id}} changed hands while {{adapter_id}} was loading, so this "
@@ -1262,15 +1272,29 @@ def api():
                         disabled_revisions.append(candidate["adapter_id"])
                 seen.update(members)
                 members = list(dict.fromkeys([*members, *await _run_members(run_id)]))
-                # Converged only when a FULL pass found nothing left to disable and the membership
-                # stopped growing. Stopping on membership alone is not enough: re-registering an
-                # existing revision resets it to `registered` without adding a new member id, so a
-                # loop that watched only the member list would exit with that revision heading back
-                # to `ready` -- DELETE answering 200 for a run still callable by its immutable id.
-                # A pass that disabled something is evidence the run was in flux, so it costs one
-                # more read per member to confirm nothing came back.
                 if not disabled_here and seen.issuperset(members):
-                    break
+                    # `disabled_here` was counted BEFORE the membership refresh above, so it cannot
+                    # speak for a revision revived during that read -- and a revive adds no member
+                    # id, so `seen.issuperset` cannot see one either. Both convergence signals are
+                    # therefore stale by exactly one Dict round trip. Confirm against the records
+                    # themselves before declaring the run down; anything still live keeps the loop
+                    # going, and if the budget runs out it lands in `stragglers` and 409s.
+                    live = False
+                    for member_id in members:
+                        candidate = await _read(member_id)
+                        if not isinstance(candidate, dict):
+                            continue
+                        metadata = candidate.get("metadata") or {{}}
+                        if (
+                            metadata.get("run_id") == run_id
+                            and candidate.get("status") != "disabled"
+                        ):
+                            live = True
+                            seen.discard(member_id)
+                            break
+                    if not live:
+                        break
+                    continue
             # The pass budget is bounded, so it can run out with members still unvisited: a
             # registration landing during the final pass is appended by the read above and then
             # never processed. Recorded here but NOT raised here -- returning 200 with a revision

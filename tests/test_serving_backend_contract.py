@@ -2527,3 +2527,87 @@ def test_a_non_finite_sampling_value_is_rejected(client, field, literal):
         f"value reaches the gpu"
     )
     assert "finite" in response.text
+
+
+def test_undeploy_rechecks_after_the_membership_read_that_revived_a_member(client):
+    """A revive landing on the CONFIRMATION read must not slip through as convergence.
+
+    `disabled_here` is counted before the membership refresh, and a revive adds no member id, so
+    `seen.issuperset(members)` cannot see one either. Both convergence signals are stale by exactly
+    one Dict round trip: a re-registration landing on that read leaves the revision `ready` with an
+    empty straggler list, and DELETE returns 200 for a run that is live again.
+    """
+    module = client.app.state.generated_module
+    _register_and_ready(client)
+
+    original_read = module._run_members
+    calls = {"n": 0}
+
+    async def _revives_on_the_confirmation_read(run_id):
+        # Call 1 and 2 are the pre-loop repair probe and membership read; call 3 ends pass one and
+        # is where the earlier regression test revives. Call 4 is the read that CONFIRMS
+        # convergence -- reviving there is what this test exists for.
+        calls["n"] += 1
+        if calls["n"] == 4:
+            record = dict(module.adapter_records[module._record_key(REVISION)])
+            record["status"] = "ready"
+            record["metadata"] = {**(record.get("metadata") or {}), "lifecycle_state": "ready"}
+            module.adapter_records[module._record_key(REVISION)] = record
+        return await original_read(run_id)
+
+    module._run_members = _revives_on_the_confirmation_read
+    try:
+        response = client.delete(f"/adapters/{RUN_ID}")
+    finally:
+        module._run_members = original_read
+
+    final = module.adapter_records[module._record_key(REVISION)]
+    assert final["status"] == "disabled" or response.status_code == 409, (
+        f"undeploy returned {response.status_code} with the revision still "
+        f"{final['status']!r}: a revive on the confirmation read was reported as a clean undeploy"
+    )
+
+
+def test_a_failed_eviction_keeps_the_superseded_load_findable(client, monkeypatch):
+    """A `remove_lora` that FAILS must leave the `_int_ids` entry behind.
+
+    The entry is recorded before the eviction precisely so a failure stays findable. Popping it
+    unconditionally undoes that for the one case it exists to cover: the LoRA is still resident and
+    nothing can locate it, which is the orphan the ordering was written to prevent.
+    """
+    lora = types.ModuleType("vllm.lora.request")
+    lora.LoRARequest = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora)
+
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._loaded = {}
+    instance._int_ids = {}
+
+    mine = "run-superseded@final." + "d" * 40
+    int_id = module._lora_int_id(mine)
+
+    async def _remove(_evicted_id):
+        raise RuntimeError("engine refused the eviction")
+
+    async def _path(record):
+        module.adapter_records.pop(module._lora_id_key(int_id), None)
+        return "/cache/adapter"
+
+    async def _add(request):
+        return None
+
+    instance._adapter_path = _path
+    instance.engine = types.SimpleNamespace(add_lora=_add, remove_lora=_remove)
+
+    with pytest.raises(RuntimeError, match="changed hands"):
+        _run_awaitable(engine_class._lora_request(instance, {"adapter_id": mine}))
+
+    assert instance._int_ids.get(int_id) == mine, (
+        "a failed eviction dropped the _int_ids entry, so the still-resident lora is invisible to "
+        "the collision sweep that would otherwise evict it before loading over the id"
+    )
