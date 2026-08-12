@@ -206,15 +206,22 @@ def test_sft_pins_ulysses_off_because_sequence_parallelism_breaks_gdn():
 
     Read the source: `build_sft_overrides` renders whatever it is given, so a test driving a cfg
     dict would assert on its own fixture and stay green if the caller went back to `gpu_count`.
+    `_prepare_sft_child` itself downloads weights, so the source is what is reachable offline.
+
+    Two assertions, because the site names a shared constant rather than a literal: the grep proves
+    the WIRING (this site did not regress to the card count), and the constant proves the VALUE.
+    Either alone would pass while the contract was broken.
     """
     import inspect
 
     from flash.engine.worker import sft_train_runner
+    from flash.engine.worker.backend_common import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
     src = inspect.getsource(sft_train_runner._prepare_sft_child)
     line = next(ln.strip() for ln in src.splitlines() if ln.strip().startswith('"ulysses_sp_size"'))
 
-    assert line == '"ulysses_sp_size": 1,', line
+    assert line == '"ulysses_sp_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,', line
+    assert ULYSSES_SEQUENCE_PARALLEL_SIZE == 1
 
 
 def test_sft_card_count_never_starves_a_rank_of_its_batch():

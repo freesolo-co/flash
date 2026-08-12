@@ -15,6 +15,7 @@ from math import gcd
 
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_sft_width
 from flash.engine.worker import sft_train as _sft_train
+from flash.engine.worker.backend_common import ULYSSES_SEQUENCE_PARALLEL_SIZE
 from flash.providers.base import rentable_gpu_counts
 
 RECIPE = _sft_train.RECIPE
@@ -538,7 +539,7 @@ def _prepare_sft_child(
         "target_modules": model.target_modules,
         "target_parameters": _w.lora_target_parameters(options.model_id),
         "lora_adapter_path": model.warmstart_adapter,
-        "ulysses_sp_size": 1,
+        "ulysses_sp_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
         "lr": options.learning_rate,
         "warmup_ratio": RECIPE.sft.warmup_frac,
         "optimizer_impl": _VERL_OPTIMIZER_IMPL,

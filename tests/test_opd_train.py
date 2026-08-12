@@ -5476,12 +5476,14 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
     # a GDN hybrid, so this must hold at every width flash can rent.
     from flash.engine.worker import opd_train_runner as _runner
 
+    # `_build_base_config` reads plain attributes off its four state objects, so namespaces carry the
+    # inputs without re-listing every unrelated dataclass field (which a later field addition would
+    # break). only the values this config actually reads are spelled out.
     config = _runner._build_base_config(
-        request=_runner._OpdRequest(
-            spec=SimpleNamespace(),
-            env=None,
+        request=SimpleNamespace(
             multi_turn=False,
-            max_turns=1,
+            structured_outputs=None,
+            model_id="Qwen/Qwen3.5-4B",
             knobs=SimpleNamespace(
                 max_completion=512,
                 learning_rate=1e-5,
@@ -5490,31 +5492,12 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
                 temperature=1.0,
                 top_p=1.0,
             ),
-            model_id="Qwen/Qwen3.5-4B",
-            model_revision="",
         ),
-        prompt_state=_runner._PromptState(
-            teacher=None,
-            tokenizer=None,
-            thinking_prefill="",
-            max_model_len=1536,
-            prompt_budget=1024,
-            prompts=[],
-            dropped_long=0,
-        ),
-        workload=_runner._WorkloadState(
+        prompt_state=SimpleNamespace(max_model_len=1536, prompt_budget=1024),
+        workload=SimpleNamespace(
             prompts_per_step=8,
             update_horizon=10,
-            prompt_pool_fingerprint="f",
-            workdir="/w",
-            shim_dir="/w/shim",
             local_dir="/w/checkpoints",
-            export_root="/w/export",
-            mutation_failure_path="/w/mutation",
-            score_delivery_failure_path="/w/score",
-            abandonment_failure_path="/w/abandon",
-            resample_failure_path="/w/resample",
-            cycle_commit_failure_path="/w/cycle",
             train_file="/w/train.parquet",
             val_file="/w/val.parquet",
             lora_rank=32,
@@ -5522,19 +5505,13 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
             target_modules="all-linear",
             warmstart_adapter=None,
         ),
-        runtime=_runner._RuntimeState(
-            python_bin="python",
+        runtime=SimpleNamespace(
             model_path="/models/student",
             gpu_count=gpu_count,
             save_freq=20,
-            loggers=[],
             project_name="flash",
             experiment_name="opd-test",
-            gdn_reset_arch=None,
-            entry_path="/w/shim/entry.py",
             reward_path="/w/shim/flash_opd_reward.py",
-            resume_step=0,
-            resume_state=None,
             bridge=SimpleNamespace(url="http://127.0.0.1:1234", token="token"),
         ),
         eos_token_ids=(151645,),

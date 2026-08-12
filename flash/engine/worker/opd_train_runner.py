@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from flash.engine.worker import opd_train as _opd_train
+from flash.engine.worker.backend_common import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 
 @dataclass(frozen=True)
@@ -546,12 +547,8 @@ def _build_base_config(
         "local_dir": workload.local_dir,
         "save_freq": runtime.save_freq,
         "n_gpus_per_node": runtime.gpu_count,
-        # opd shards by DATA: ulysses is pinned off and fsdp splits the batch across the ranks. the
-        # catalog is all GatedDeltaNet hybrids whose linear-attention and conv layers carry state
-        # along the sequence, and verl gathers only inside full attention, so a sequence shard runs
-        # its recurrence from zero state. see the actor override in `train/rl/verl_config.py` for the
-        # measured divergence. capacity is unaffected: fsdp's mesh is independent of this width.
-        "ulysses_sequence_parallel_size": 1,
+        # opd shards by DATA -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why.
+        "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
         "seed": _opd_train._w.backend_seed(_opd_train._w.SEED),
         "project_name": runtime.project_name,
         "experiment_name": runtime.experiment_name,
@@ -915,11 +912,10 @@ def _build_train_note_sections(
             "rollout_backend": "verl_vllm",
             "verl_version": "0.8.0",
             "verl_backend": "fsdp",
-            # opd shards by DATA: report the EXECUTED ulysses width, not the allocation. reporting
-            # the card count here would claim a sequence-parallel run that did not happen.
-            "ulysses_sequence_parallel_size": 1,
-            # token-balanced batching means every allocated rank is a dp rank, so unlike sft the
-            # executed dp width is the full card count.
+            # report the EXECUTED width, not the allocation: the card count here would claim a
+            # sequence-parallel run that did not happen. token-balanced batching makes every
+            # allocated rank a dp rank, so unlike sft the executed dp width IS the card count.
+            "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
             "data_parallel_size": runtime.gpu_count,
         },
         {

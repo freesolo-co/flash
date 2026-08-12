@@ -347,6 +347,7 @@ from flash.engine.profiling.sft_workload import (  # noqa: E402,F401
 )
 from flash.engine.worker.backend_common import (  # noqa: E402,F401
     SHIM_FRAGMENT_FAILED_EXIT_CODE,
+    ULYSSES_SEQUENCE_PARALLEL_SIZE,
     fused_ce_backend,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
@@ -467,10 +468,10 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "loraplus_optim": _VERL_OPTIMIZER_NAME,
             "loraplus_applied": progress.loraplus_applied,
             "verl_backend": "fsdp2",
-            # sft shards by DATA: ulysses is pinned off and fsdp splits the batch across the ranks
-            # actually launched, which is the allocated card count only when the batch divides by
-            # it. report both, and report the executed width rather than the allocation ceiling.
-            "ulysses_sequence_parallel_size": 1,
+            # sft shards by DATA -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why. fsdp splits the batch
+            # across the ranks actually LAUNCHED, which is the allocated card count only when the
+            # batch divides by it, so report the executed width rather than the allocation ceiling.
+            "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
             "data_parallel_size": child.world_size,
             "wandb_project": child.project_name if "wandb" in child.loggers else None,
             "wandb_run_name": child.experiment_name if "wandb" in child.loggers else None,
