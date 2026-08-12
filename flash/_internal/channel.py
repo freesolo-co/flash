@@ -55,6 +55,37 @@ def _entered_via_dash_m() -> bool:
     return orig[-len(sys.argv)] == _CLI_MODULE
 
 
+def _on_windows() -> bool:
+    """Whether printed commands need Windows quoting.
+
+    A seam, because tests cannot mutate process-wide ``os.name``: doing so breaks ``pathlib.Path``
+    on 3.11. ``flash.cli.commands.env.push`` carries its own copy for the same reason; that one
+    may return "" to refuse an unsafe destination, which this caller cannot do, so they stay
+    separate rather than share a helper this module would have to import back from its own importer.
+    """
+    return os.name == "nt"
+
+
+def _quote_interpreter(path: str) -> str:
+    """Quote an interpreter path as one token for the shell it will be pasted into.
+
+    `shlex.quote` is POSIX-only, and not merely suboptimal on Windows: a backslash is outside its
+    safe set, so EVERY Windows path -- `C:\\Python311\\python.exe`, which needed no quoting at all
+    -- comes back wrapped in single quotes. cmd.exe does not strip those, so it looks for a program
+    whose name literally starts with a quote and fails. That would break the ordinary Windows
+    install to fix the spaced one.
+
+    `list2cmdline` is the Windows counterpart: it leaves that path bare and double-quotes only when
+    a space or tab makes it necessary, which both cmd.exe and PowerShell honour.
+    """
+    if _on_windows():
+        # deferred rather than top-level: unused off Windows, and this module is imported early
+        import subprocess
+
+        return subprocess.list2cmdline([path])
+    return shlex.quote(path)
+
+
 def _module_launch_interpreter() -> str:
     """The interpreter to print `-m` commands under: the one this process is actually running.
 
@@ -69,17 +100,17 @@ def _module_launch_interpreter() -> str:
     an absolute interpreter) is echoed as `sys.executable` instead, because a relative one is only
     valid from the directory they happened to be in.
 
-    The result is shell-quoted, because it is pasted into a shell. `C:\\Program Files\\...` and a
-    virtualenv under a spaced directory otherwise split into several argv words, so the printed
-    cancel command reaches a path that does not exist -- the same silent non-cancel this whole
-    module exists to prevent. Quoting is a no-op for the ordinary unspaced path.
+    The result is quoted for the local shell, because it is pasted into one. `C:\\Program
+    Files\\...` and a virtualenv under a spaced directory otherwise split into several argv words,
+    so the printed cancel command reaches a path that does not exist -- the same silent non-cancel
+    this whole module exists to prevent. Quoting is a no-op for the ordinary unspaced path.
     """
     orig = getattr(sys, "orig_argv", None) or []
     typed = orig[0] if orig else ""
     # a bare word is a PATH lookup that just succeeded; anything with a separator is location-bound
     if typed and os.sep not in typed and (os.altsep is None or os.altsep not in typed):
-        return shlex.quote(typed)
-    return shlex.quote(sys.executable) if sys.executable else "python3"
+        return _quote_interpreter(typed)
+    return _quote_interpreter(sys.executable) if sys.executable else "python3"
 
 
 def _invoked_cli_name() -> str:

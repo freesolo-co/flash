@@ -379,6 +379,47 @@ def test_module_launch_interpreter_survives_a_path_with_spaces():
     importlib.reload(channel)  # restore the pytest-invoked value for later tests
 
 
+def test_windows_interpreter_paths_are_quoted_for_cmd_not_for_sh():
+    """Windows quoting is not POSIX quoting, and using the POSIX form breaks the COMMON case.
+
+    A backslash is outside `shlex.quote`'s safe set, so `C:\\Python311\\python.exe` -- a path with
+    nothing in it that needs escaping -- comes back `'C:\\Python311\\python.exe'`. cmd.exe does not
+    strip single quotes, so it searches for a program whose name begins with one and fails. That is
+    the ordinary Windows install, regressed by the quoting added for the spaced one.
+
+    `list2cmdline` is the platform's own answer: bare when it can be, double-quoted when a space
+    forces it, which is the form both cmd.exe and PowerShell accept.
+    """
+    import sys
+    from unittest import mock
+
+    from flash._internal import channel
+
+    # called directly rather than through `importlib.reload`: a reload re-executes the module and
+    # would restore the real `_on_windows`, discarding the patch that makes this test Windows.
+    for exe, expected in (
+        # the common install: no space, so no quoting at all is the correct output
+        (r"C:\Python311\python.exe", r"C:\Python311\python.exe"),
+        (r"C:\Users\dev\.venv\Scripts\python.exe", r"C:\Users\dev\.venv\Scripts\python.exe"),
+        # ...and the spaced ones the quoting exists for get cmd.exe's double quotes
+        (r"C:\Program Files\Python\python.exe", '"C:\\Program Files\\Python\\python.exe"'),
+        # parentheses are inert inside double quotes, so the most common 32-bit path still works
+        (
+            r"C:\Program Files (x86)\Python\python.exe",
+            '"C:\\Program Files (x86)\\Python\\python.exe"',
+        ),
+    ):
+        with (
+            mock.patch.object(channel, "_on_windows", return_value=True),
+            mock.patch.object(sys, "executable", exe),
+            mock.patch.object(sys, "orig_argv", [exe, "-m", "flash.cli"]),
+            mock.patch.object(sys, "argv", ["-m"]),
+        ):
+            resolved = channel._invoked_cli_name()
+        assert resolved == f"{expected} -m flash.cli", exe
+        assert "'" not in resolved, f"single quotes are not quoting to cmd.exe: {resolved}"
+
+
 def test_the_wordmark_does_not_follow_the_invoked_entry_point():
     """BRAND_NAME identifies the product; CLI_NAME says what to type. Only the latter varies.
 
