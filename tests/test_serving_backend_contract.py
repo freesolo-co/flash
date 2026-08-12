@@ -3032,6 +3032,59 @@ def _path_returning(path: str):
     return _path
 
 
+def test_a_pending_reclaim_is_collected_once_across_undeploy_passes(client):
+    """The member loop runs up to `_UNDEPLOY_PASSES` times over the same records.
+
+    A marked revision stays marked until the reclaim runs after the loop, so collecting it
+    unconditionally on every pass queues the same `rmtree` round trip three times for one
+    directory. Harmless in outcome, wasteful in calls, and it scales with the pass budget.
+    """
+    module = client.app.state.generated_module
+    module.runners.count = 0
+    revision = "run-multipass@final." + "b" * 40
+    client.post(
+        "/adapters",
+        json={
+            **REGISTRATION,
+            "adapter_id": revision,
+            "repo_id": BAD_REPO,
+            "checkpoint": "run-multipass",
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "run-multipass",
+                "checkpoint_step": None,
+                "hf_revision": "b" * 40,
+            },
+        },
+    )
+    assert _lifecycle(client, revision) == "failed"
+
+    # Force the loop to use its whole budget: a member that never converges keeps every pass
+    # running, so the marked revision is re-read on each one.
+    original_read = module._run_members
+    calls = types.SimpleNamespace(count=0)
+
+    async def _never_converging_members(run_id):
+        calls.count += 1
+        if run_id == "run-multipass" and calls.count > 1:
+            alias = module.adapter_records.get(module._record_key("run-multipass"))
+            if isinstance(alias, dict):
+                alias["status"] = "ready"
+                module.adapter_records[module._record_key("run-multipass")] = alias
+        return await original_read(run_id)
+
+    module._run_members = _never_converging_members
+    try:
+        client.delete("/adapters/run-multipass")
+    finally:
+        module._run_members = original_read
+
+    assert module.discarded.count(revision) <= 1, (
+        f"the pending reclaim ran {module.discarded.count(revision)} times for one directory; it "
+        f"is queued once per undeploy pass instead of once per revision"
+    )
+
+
 def test_undeploy_reports_conflict_when_it_never_saw_a_clean_pass(client, monkeypatch):
     """Exhausting the pass budget is itself a failure, even with nothing left unvisited.
 

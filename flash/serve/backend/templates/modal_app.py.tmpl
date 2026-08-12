@@ -1430,7 +1430,15 @@ def api():
                         # skipped its cache reclaim to avoid a cold start left its download on the
                         # volume and flagged it for exactly this pass. Collected here and only
                         # here: this is the one path that revisits a disabled revision.
-                        if metadata.get("cache_reclaim_pending"):
+                        #
+                        # Added once, not once per pass: the loop re-reads every member up to
+                        # `_UNDEPLOY_PASSES` times, and a marked revision stays marked until the
+                        # reclaim below runs, so appending unconditionally would repeat the same
+                        # `rmtree` round trip on each pass.
+                        if (
+                            metadata.get("cache_reclaim_pending")
+                            and candidate["adapter_id"] not in reclaimable
+                        ):
                             reclaimable.append(candidate["adapter_id"])
                         continue
                     candidate["status"] = "disabled"
