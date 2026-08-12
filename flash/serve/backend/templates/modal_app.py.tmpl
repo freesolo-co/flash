@@ -907,6 +907,10 @@ async def settle_adapter(record: dict[str, Any]) -> None:
         result = {{"ok": False, "failure": f"the serving engine did not answer: {{exc}}"}}
     stand_down = False
     discard_cache = False
+    # Sampled BEFORE the lock, because the commit inside it has to record whether the reclaim can
+    # happen now or must be deferred, and an engine round trip is exactly what must not run under
+    # a lock whose TTL depends on nothing slow happening.
+    engine_warm = await _engine_is_warm()
     # The load ran OUTSIDE the lock -- it takes minutes, and the lock's TTL only holds because
     # nothing slow runs under it. But the decision of whether this result may be committed, and
     # the commit itself, must be one atomic step: read-then-write leaves a window in which an
@@ -952,6 +956,16 @@ async def settle_adapter(record: dict[str, Any]) -> None:
                 # so a retry cannot get a different one.
                 await _release_lora_int_id(_lora_int_id(adapter_id), adapter_id)
                 discard_cache = True
+                # The reclaim itself runs after the lock, but whether it CAN run now is known
+                # here, and the deferral has to be recorded in this same write. Undeploy passes
+                # over records that are already `disabled` -- which this branch just made it --
+                # so a marker written separately afterwards could be lost to an interleaving
+                # write, and nothing would ever collect the directory.
+                if not engine_warm:
+                    current["metadata"] = {{
+                        **current["metadata"],
+                        "cache_reclaim_pending": True,
+                    }}
             current["updated_at"] = _utc_now()
             await adapter_records.put.aio(_record_key(adapter_id), current)
     # Outside the lock: an engine round trip is slow, and the record is already durably correct.
@@ -971,9 +985,14 @@ async def settle_adapter(record: dict[str, Any]) -> None:
     # minutes of paid time, billed against a deploy that already failed -- purely to run `rmtree`.
     # And the common path here is `register.remote` itself failing because no container could
     # start, which is exactly when nothing is warm, so the unguarded version turned every engine
-    # outage into a paid cold start per failed registration. Skipping costs one cached directory
-    # until the next undeploy of that run collects it.
-    if discard_cache and await _engine_is_warm():
+    # outage into a paid cold start per failed registration.
+    #
+    # Skipping DEFERS the reclaim, it does not cancel it, and the deferral has to be recorded to
+    # be real: this settle already marked the record `disabled`, and undeploy passes over records
+    # that are already disabled, so without a marker nothing would ever collect the directory and
+    # every cold failed load would leak its download onto the volume permanently. The flag is what
+    # undeploy looks for.
+    if discard_cache and engine_warm:
         with contextlib.suppress(Exception):
             await Engine().discard_cache.remote.aio(adapter_id)
 
@@ -1328,6 +1347,10 @@ def api():
         run_id = (record.get("metadata") or {{}}).get("run_id") or adapter_id
         disabled_aliases: list[str] = []
         disabled_revisions: list[str] = []
+        # Revisions whose download a cold settle deliberately left on the volume. Not part of the
+        # response: they were disabled by an earlier call, so reporting them here would tell the
+        # client this undeploy disabled something it did not.
+        reclaimable: list[str] = []
         # Repair BEFORE the lock, because the scan is unbounded and the lease is not renewable.
         # Only when the index is empty, so the ordinary path stays one indexed read.
         #
@@ -1400,7 +1423,15 @@ def api():
                     if not isinstance(candidate, dict):
                         continue
                     metadata = candidate.get("metadata") or {{}}
-                    if metadata.get("run_id") != run_id or candidate.get("status") == "disabled":
+                    if metadata.get("run_id") != run_id:
+                        continue
+                    if candidate.get("status") == "disabled":
+                        # Already disabled, so there is no state to change -- but a settle that
+                        # skipped its cache reclaim to avoid a cold start left its download on the
+                        # volume and flagged it for exactly this pass. Collected here and only
+                        # here: this is the one path that revisits a disabled revision.
+                        if metadata.get("cache_reclaim_pending"):
+                            reclaimable.append(candidate["adapter_id"])
                         continue
                     candidate["status"] = "disabled"
                     candidate["metadata"] = {{**metadata, "lifecycle_state": "disabled"}}
@@ -1467,6 +1498,25 @@ def api():
             for revision_id in disabled_revisions:
                 with contextlib.suppress(Exception):  # gpu eviction is best effort
                     await engine.unregister.remote.aio(revision_id)
+        # The deferred reclaims, run whether or not anything is warm. Unlike eviction, this has no
+        # cheaper time to happen: undeploy is the last event in the run's life, so skipping here
+        # leaves the directory on the volume for good. It is also bounded -- one `rmtree` per
+        # revision whose load failed while scaled to zero -- and `discard_cache` deliberately does
+        # not touch the GPU, so this cannot evict an id a colliding adapter has since taken.
+        for revision_id in reclaimable:
+            with contextlib.suppress(Exception):  # reclaiming disk is best effort
+                await Engine().discard_cache.remote.aio(revision_id)
+            reclaimed = await _read(revision_id)
+            if isinstance(reclaimed, dict):
+                metadata = reclaimed.get("metadata") or {{}}
+                if metadata.get("cache_reclaim_pending"):
+                    # Cleared so a repeated undeploy does not re-run the reclaim on every call.
+                    reclaimed["metadata"] = {{
+                        key: value
+                        for key, value in metadata.items()
+                        if key != "cache_reclaim_pending"
+                    }}
+                    await adapter_records.put.aio(_record_key(revision_id), reclaimed)
         # Reported only now, after everything this call did disable has been evicted. 409 says the
         # run is in flux and the retry is theirs to make; what this pass disabled stays disabled
         # and is off the GPU, so a retry converges on the remainder.

@@ -2846,6 +2846,65 @@ def test_a_failed_load_still_reclaims_its_cache_on_a_warm_engine(client):
     )
 
 
+def test_a_cold_failed_load_is_reclaimed_by_the_next_undeploy(client):
+    """The skip must DEFER the reclaim, not cancel it.
+
+    Skipping the cold-start reclaim is only defensible if something later collects the directory.
+    The obvious candidate is undeploy -- but the same settle that skipped the reclaim also marked
+    the record `disabled`, and undeploy's loop skips records that are already disabled, so it never
+    reaches this one. Left there, every failed-load-while-scaled-to-zero leaks its download onto
+    the volume permanently, and the volume is what the user pays for.
+
+    Nothing here is warm at any point: this is the cold path end to end, which is exactly the case
+    the guard was written for.
+    """
+    module = client.app.state.generated_module
+    module.runners.count = 0
+    bad_revision = "run-coldreclaim@final." + "9" * 40
+    client.post(
+        "/adapters",
+        json={
+            **REGISTRATION,
+            "adapter_id": bad_revision,
+            "repo_id": BAD_REPO,
+            "checkpoint": "run-coldreclaim",
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "run-coldreclaim",
+                "checkpoint_step": None,
+                "hf_revision": "9" * 40,
+            },
+        },
+    )
+    assert _lifecycle(client, bad_revision) == "failed"
+    assert module.discarded == [], "the cold path must not have reclaimed inline"
+
+    response = client.delete("/adapters/run-coldreclaim")
+    assert response.status_code == 200, f"undeploy returned {response.status_code}"
+    assert bad_revision in module.discarded, (
+        "undeploy did not reclaim the download the cold settle deliberately left behind. the "
+        "record was already `disabled` (the failed settle set it), so undeploy's skip-if-disabled "
+        "branch passed over it and nothing ever collects the directory -- the volume grows without "
+        "bound across failed deploys"
+    )
+    # Reported as what this call disabled, and it disabled nothing: the revision was already
+    # `disabled` before the request arrived. Claiming it here would tell the client the undeploy
+    # took a live revision out of service when it only swept a leftover.
+    assert bad_revision not in (response.json().get("disabled_revisions") or []), (
+        "undeploy reported an already-disabled revision as one it disabled"
+    )
+
+    # Once collected, the marker is gone: a second undeploy of the same run must not re-run the
+    # reclaim on every call for the life of the record.
+    module.discarded.clear()
+    again = client.delete("/adapters/run-coldreclaim")
+    assert again.status_code in (200, 404), f"repeat undeploy returned {again.status_code}"
+    assert module.discarded == [], (
+        f"a repeated undeploy reclaimed {module.discarded} again; the pending marker was never "
+        f"cleared, so every future delete re-runs the rmtree"
+    )
+
+
 def test_a_stale_resident_that_cannot_be_evicted_refuses_the_load(client, monkeypatch):
     """Suppressing a failed stale-resident eviction loses the adapter and loads over it anyway.
 
