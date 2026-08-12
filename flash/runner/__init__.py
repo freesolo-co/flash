@@ -751,7 +751,7 @@ from flash.runner.artifacts import (  # noqa: E402,F401
     _assign_resolved_env_sha,
     _environment_artifact_repo_name,
     _file_digest,
-    _pin_failure_reason,
+    _pin_env_sha_with_reason,
     artifact_namespace,
     flash_code_prefix,
     managed_hf_repo_for_environment,

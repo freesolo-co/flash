@@ -77,46 +77,26 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return runner.JobSpec.from_dict(d)
 
 
-def _pin_failure_reason(spec: JobSpec) -> str:
-    """Why the env ref->sha pin failed, as one short user-facing clause, or "".
+def _pin_env_sha_with_reason(spec: JobSpec) -> tuple[JobSpec, str]:
+    """Pin env ref->SHA, returning the spec and why the pin failed (or "" when it did not).
 
-    ``_assign_resolved_env_sha`` is best-effort and returns the spec unpinned on any failure, so its
-    caller sees only the ABSENCE of a pin and has to describe it generically. GitHub's own answer is
-    the diagnosis -- "No commit found for SHA: main" names the wrong ref, the fix, and distinguishes
-    itself from a rate limit or a private-repo auth failure, all of which produce the identical
-    missing pin. Resolving twice is acceptable here: this runs only on the failure path, where the
-    submit is already being rejected and one extra call costs nothing anyone is waiting on.
+    One resolve, two answers. The pin itself is best-effort and its caller only ever sees the
+    ABSENCE of a sha, which is the same observation for four different causes -- a ref that does
+    not exist, a rate limit, an outage, a private repo the token cannot read -- each needing a
+    different fix. GitHub already answered with which one; this carries that answer out instead of
+    discarding it.
+
+    Returning the reason rather than re-resolving on the failure path matters for correctness, not
+    just cost: a second call can succeed where the first failed (a rate-limit window that reset, a
+    blip that cleared), and a caller that has already committed to rejecting would then report an
+    empty reason for a ref that just resolved fine. The reason must describe the attempt whose
+    result is actually being used.
     """
-    env_id = spec.environment.id
-    if not env_id or spec.environment.resolved_sha:
-        return ""
-    try:
-        from flash.envs.loader import (
-            _parse_github_environment_ref,
-            _resolve_ref_sha,
-            is_managed_environment_slug,
-            managed_slug_to_github_ref,
-        )
-
-        ref_str = (
-            managed_slug_to_github_ref(env_id) if is_managed_environment_slug(env_id) else env_id
-        )
-        parsed = _parse_github_environment_ref(ref_str)
-        if parsed is None:
-            return ""
-        _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
-    except Exception as exc:
-        return str(exc).strip()
-    return ""
-
-
-def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
-    """Pin env ref->SHA once so N workers don't fan-out N GitHub API calls (secondary rate-limit). Best-effort."""
     import logging
 
     env_id = spec.environment.id
     if not env_id or spec.environment.resolved_sha:
-        return spec
+        return spec, ""
     try:
         from flash.envs.loader import (
             _parse_github_environment_ref,
@@ -130,15 +110,20 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
         )
         parsed = _parse_github_environment_ref(ref_str)
         if parsed is None:
-            return spec
+            return spec, ""
         sha = _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
     except Exception as e:
         logging.getLogger(runner.__name__).warning(
             "resolve-once: could not pin env ref->sha for %r (%s); worker will resolve", env_id, e
         )
-        return spec
+        return spec, str(e).strip()
     if not sha:
-        return spec
+        return spec, ""
     d = spec.to_internal_dict()
     d["environment"] = {**d["environment"], "resolved_sha": sha}
-    return runner.JobSpec.from_dict(d)
+    return runner.JobSpec.from_dict(d), ""
+
+
+def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
+    """Pin env ref->SHA once so N workers don't fan-out N GitHub API calls (secondary rate-limit). Best-effort."""
+    return _pin_env_sha_with_reason(spec)[0]

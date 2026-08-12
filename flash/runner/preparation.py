@@ -619,7 +619,7 @@ def _profile_producer_version() -> str:
 
 
 def _require_pinned_profile_environment(spec: JobSpec) -> JobSpec:
-    pinned = _runner()._assign_resolved_env_sha(spec)
+    pinned, reason = _runner()._pin_env_sha_with_reason(spec)
     if not pinned.environment.id:
         raise _runner().WorkloadProfileUnavailable(
             "sft workload profiling requires an environment id"
@@ -629,7 +629,6 @@ def _require_pinned_profile_environment(spec: JobSpec) -> JobSpec:
         # causes (a ref that does not exist, a rate limit, an outage, a private repo the token
         # cannot read) need four different fixes. GitHub already answered with which one; name it
         # instead of describing the missing pin it produced.
-        reason = _runner()._pin_failure_reason(spec)
         detail = f": {reason}" if reason else ""
         raise _runner().WorkloadProfileUnavailable(
             f"sft workload profiling requires a pinned environment package revision, but "
