@@ -54,6 +54,28 @@ def _entered_via_dash_m() -> bool:
     return orig[-len(sys.argv)] == _CLI_MODULE
 
 
+def _module_launch_interpreter() -> str:
+    """The interpreter to print `-m` commands under: the one this process is actually running.
+
+    Hardcoding `python` reintroduces this module's own bug in a second form. `python` is absent on
+    a host that ships only `python3`, and inside a virtualenv invoked by absolute path it may
+    resolve to a system interpreter with no flash installed -- so the printed cancel command fails
+    while the invocation that printed it worked, which is exactly the "exits without cancelling"
+    hazard the console-script fix exists to close.
+
+    Prefer the typed word from `sys.orig_argv[0]` when it is a bare name: it resolved for the
+    operator moments ago, and it keeps the hint short and copy-pasteable. A path (`./venv/bin/python`,
+    an absolute interpreter) is echoed as `sys.executable` instead, because a relative one is only
+    valid from the directory they happened to be in.
+    """
+    orig = getattr(sys, "orig_argv", None) or []
+    typed = orig[0] if orig else ""
+    # a bare word is a PATH lookup that just succeeded; anything with a separator is location-bound
+    if typed and os.sep not in typed and (os.altsep is None or os.altsep not in typed):
+        return typed
+    return sys.executable or "python3"
+
+
 def _invoked_cli_name() -> str:
     """The name to print commands under: the console script typed, when it is one of ours.
 
@@ -66,7 +88,7 @@ def _invoked_cli_name() -> str:
     on a client-only install and stays copy-pasteable rather than naming `__main__.py`.
     """
     if _entered_via_dash_m():
-        return f"python -m {_CLI_MODULE}"
+        return f"{_module_launch_interpreter()} -m {_CLI_MODULE}"
     argv0 = os.path.basename((sys.argv[0] or "").strip()) if sys.argv else ""
     if argv0.endswith(".exe"):  # windows console scripts
         argv0 = argv0[: -len(".exe")]

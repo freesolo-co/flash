@@ -25,7 +25,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   usage strings, `next:` hints) now name the executable actually invoked rather than always
   `flash`. On a host where `runpod-flash` owns the `flash` script, the printed
   `flash runs cancel <run-id>` exited 0 without cancelling, leaving a run billing while the
-  operator believed they had stopped it.
+  operator believed they had stopped it. Reached through the `python -m flash.cli` escape hatch,
+  the printed command now names the interpreter that is actually running, rather than a bare
+  `python` that is absent on a python3-only host and may resolve to a different environment
+  inside a virtualenv.
 
 - `flash env setup` scaffolded hosted-only environment instructions on every plane. A
   self-hosted plane cannot publish to Freesolo's managed environment hub, so the generated

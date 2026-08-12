@@ -11,7 +11,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-INVOKED_CLI_NAME = "python -m flash.cli"
+# `_run` launches the child with sys.executable, an absolute path, so the CLI names that
+# interpreter back rather than a bare `python` -- which is absent entirely on a python3-only host.
+# Derived from the same value the subprocess uses, so the two cannot drift apart.
+INVOKED_CLI_NAME = f"{sys.executable} -m flash.cli"
 
 
 def _run(args, env=None):

@@ -264,12 +264,15 @@ def test_module_invocation_is_named_back_as_itself_not_as_flash():
     from flash._internal import channel
 
     py = "/usr/bin/python3"
+    # an absolute interpreter is echoed as sys.executable -- the running one, which is the only
+    # path guaranteed to still have flash installed. Bare names are covered by the test below.
+    exe = sys.executable
     for orig_argv, argv, expected in (
-        ([py, "-m", "flash.cli", "runs", "list"], ["-m", "runs", "list"], "python -m flash.cli"),
+        ([py, "-m", "flash.cli", "runs", "list"], ["-m", "runs", "list"], f"{exe} -m flash.cli"),
         ([py, "-m", "pytest", "tests/"], ["-m", "tests/"], "flash"),
         ([py, "-m", "flash.server"], ["-m"], "flash"),
         # interpreter flags shift the module's index, including one that takes its own value
-        ([py, "-W", "ignore", "-m", "flash.cli", "-v"], ["-m", "-v"], "python -m flash.cli"),
+        ([py, "-W", "ignore", "-m", "flash.cli", "-v"], ["-m", "-v"], f"{exe} -m flash.cli"),
         # a console script names no module: `-m` in ITS arguments must not read as the flag
         (
             [py, "/usr/local/bin/flash-cli", "-m", "flash.cli"],
@@ -285,6 +288,49 @@ def test_module_invocation_is_named_back_as_itself_not_as_flash():
         ):
             resolved = importlib.reload(channel).CLI_NAME
         assert resolved == expected, orig_argv
+
+    importlib.reload(channel)  # restore the pytest-invoked value for later tests
+
+
+def test_module_invocation_names_a_runnable_interpreter_not_bare_python():
+    """Printing `python` reintroduces this module's own bug in a second form.
+
+    A host that ships only `python3` has no `python` on PATH at all, so the printed cancel command
+    fails with "command not found" while the invocation that printed it worked -- the same
+    "operator believes the run is cancelled while it keeps billing" hazard the console-script fix
+    exists to close. Inside a virtualenv it is worse than absent: bare `python` may RESOLVE, to a
+    system interpreter running a different flash entirely.
+
+    So the interpreter is preserved, not assumed. A bare word typed by the operator is echoed back
+    (it resolved for them a moment ago, and stays short); anything carrying a path separator is
+    location-bound, so `sys.executable` is printed instead -- the interpreter actually running,
+    which is the one that definitely has this flash installed.
+    """
+    import importlib
+    import sys
+    from unittest import mock
+
+    from flash._internal import channel
+
+    exe = sys.executable
+    for orig_argv, expected in (
+        # bare names are echoed as typed: they are a PATH lookup that just succeeded
+        (["python3", "-m", "flash.cli"], "python3 -m flash.cli"),
+        (["python3.12", "-m", "flash.cli"], "python3.12 -m flash.cli"),
+        (["python", "-m", "flash.cli"], "python -m flash.cli"),
+        # paths are location-bound; echo the running interpreter instead
+        (["/usr/bin/python3", "-m", "flash.cli"], f"{exe} -m flash.cli"),
+        ([".venv/bin/python", "-m", "flash.cli"], f"{exe} -m flash.cli"),
+        (["./python3", "-m", "flash.cli"], f"{exe} -m flash.cli"),
+    ):
+        with (
+            mock.patch.object(sys, "orig_argv", orig_argv),
+            mock.patch.object(sys, "argv", ["-m"]),
+        ):
+            resolved = importlib.reload(channel).CLI_NAME
+        assert resolved == expected, orig_argv
+        # whatever we print, it must never be a bare `python` the operator did not type
+        assert not resolved.startswith("python -m") or orig_argv[0] == "python", orig_argv
 
     importlib.reload(channel)  # restore the pytest-invoked value for later tests
 
