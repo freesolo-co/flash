@@ -6,7 +6,7 @@ Split out of ``flash.runner.supervise.lifecycle`` to keep that module under the 
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from flash.core.spec import JobSpec
 from flash.runner.supervise import lifecycle as _lifecycle
@@ -145,6 +145,11 @@ class _PreparedAttempt:
     attempt: int
     attempt_spec: JobSpec
     runtime_secrets: dict[str, str]
+    # the rank count a pinned opd resume checkpoint was written at, or None when this attempt
+    # resumes from nothing. allocation is pinned to it: the worker refuses a pinned checkpoint
+    # whose fsdp width differs from the attempt's, so re-ranking onto another shape would strand
+    # the run on the only checkpoint it is authorized to continue from.
+    resume_world_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -329,9 +334,11 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
         ctx.gc_seen_endpoints()
         raise
     if ctx.spec.algorithm == "opd":
-        expected_next_attempt, opd_resume_revision = _verified_opd_retry_state(ctx.spec.run_id)
+        expected_next_attempt, opd_resume_revision, resume_world_size = _verified_opd_retry_state(
+            ctx.spec.run_id
+        )
     else:
-        expected_next_attempt, opd_resume_revision = None, None
+        expected_next_attempt, opd_resume_revision, resume_world_size = None, None, None
     attempt = _reserve_attempt(
         ctx.spec.run_id,
         minimum_attempt=ctx.attempt_start if local_attempt == 0 else 0,
@@ -343,7 +350,14 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
     if opd_resume_revision is not None:
         attempt_runtime_secrets[OPD_RESUME_REVISION_ENV] = opd_resume_revision
     return _PreparationOutcome(
-        prepared=_PreparedAttempt(local_attempt, attempt, attempt_spec, attempt_runtime_secrets)
+        prepared=_PreparedAttempt(
+            local_attempt,
+            attempt,
+            attempt_spec,
+            attempt_runtime_secrets,
+            # only a pinned resume constrains the shape; without one the retry re-ranks freely.
+            resume_world_size=resume_world_size if opd_resume_revision is not None else None,
+        )
     )
 
 
@@ -404,7 +418,48 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
             failure="poll_error",
             detail=f"allocation failed ({type(exc).__name__})",
         )
-    return allocation, None
+    return _pinned_to_resume_width(allocation, prepared.resume_world_size), None
+
+
+def _pinned_to_resume_width(allocation, resume_world_size: int | None):
+    """Drop shapes a pinned OPD resume checkpoint cannot be loaded on.
+
+    The worker fails closed when a pinned resume's fsdp shards were written at a width other than
+    the one the attempt runs at: it refuses to train rather than restart from step 0, because the
+    control-plane gate authorized this replacement only to continue from exactly that checkpoint.
+    Allocation, though, re-ranks every retry from scratch -- capacity and live pricing move, and
+    2x/4x of a class are distinct rentable shapes -- so a 2-card attempt can legitimately be
+    re-ranked onto 4 cards and then permanently reject the only checkpoint it may resume from.
+
+    Narrowing the candidates is what closes that gap, and it is done HERE rather than by passing a
+    count into ``allocate()``: ``max_gpu_count`` is a ceiling, not an exact width, so a ceiling of 2
+    still admits a 1-card shape. Every candidate already carries its own ``gpu_count``, so the
+    exact-width rule is one filter over the ranked list, leaving the ranking itself untouched.
+
+    An empty result is left empty deliberately: the caller reports no-capacity and retries, which is
+    the truthful outcome when the only loadable shape is unavailable. Restarting from step 0 instead
+    would repeat already-billed teacher work and optimizer steps outside what the gate approved.
+    """
+    if not resume_world_size:
+        return allocation
+    loadable = tuple(
+        candidate
+        for candidate in allocation.candidates
+        if int(getattr(candidate, "gpu_count", 1)) == resume_world_size
+    )
+    if loadable == allocation.candidates:
+        return allocation
+    if not loadable:
+        return replace(allocation, candidates=())
+    best = loadable[0]
+    return replace(
+        allocation,
+        candidates=loadable,
+        provider=best.provider,
+        gpu=best.gpu,
+        hourly_usd=best.hourly_usd,
+        gpu_count=best.gpu_count,
+    )
 
 
 def _build_candidate_plan(
@@ -416,6 +471,22 @@ def _build_candidate_plan(
 
     candidates = tuple(_lifecycle._oom_escalated(allocation.candidates, ctx.oom_vram_floor))
     if not candidates:
+        # an exhausted list has two causes and they need different words. attributing the pinned-
+        # width one to OOM would send an operator to raise VRAM when the run is not out of memory
+        # at all: no fitting shape has the card count its resume checkpoint can be loaded on.
+        if prepared.resume_world_size and not allocation.candidates:
+            width = prepared.resume_world_size
+            ctx.last_detail = (
+                f"no fitting {width}-card shape is available, and this retry must resume from a "
+                f"checkpoint written at {width} cards"
+            )
+            print(
+                f"seed={ctx.seed} no {width}-card candidate for the pinned OPD resume checkpoint; "
+                "not retrying",
+                file=ctx.log,
+                flush=True,
+            )
+            return None
         ctx.last_detail = f"oom: exceeded the largest available GPU ({ctx.oom_vram_floor:g} GB)"
         print(
             f"seed={ctx.seed} OOM on the largest GPU class ({ctx.oom_vram_floor:g} GB); not retrying",

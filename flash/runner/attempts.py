@@ -48,8 +48,13 @@ def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
     return floor is None or expected >= floor
 
 
-def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
-    """Verify one locked opd retry snapshot and return its attempt plus resume revision."""
+def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]:
+    """Verify one locked opd retry snapshot: its attempt, resume revision, and checkpoint width.
+
+    The width is the rank count the pinned checkpoint's fsdp shards were written at, or ``None``
+    when nothing is pinned (no mutation) or the shards named no single width. A pinned retry has to
+    be allocated at exactly that count -- see ``verify_opd_replacement_safe``.
+    """
     with runner._status_guard(run_id):
         raw = runner._load_status_json(run_id)
         status = runner._runstatus_from_json(raw)
@@ -75,7 +80,7 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
         seed = spec.seed
     from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
-    resume_revision = verify_opd_replacement_safe(
+    verified = verify_opd_replacement_safe(
         hf_repo=hf_repo,
         run_id=run_id,
         seed=seed,
@@ -83,7 +88,8 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
         contract_version=contract_version,
         phase=phase,
     )
-    return next_attempt, resume_revision
+    resume_revision, checkpoint_world_size = verified if verified is not None else (None, None)
+    return next_attempt, resume_revision, checkpoint_world_size
 
 
 def _verified_opd_next_attempt(run_id: str) -> int:
