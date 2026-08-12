@@ -537,8 +537,8 @@ def run_sft_train(spec=None) -> None:
             gdn_module=gdn_module,
         )
 
-    # the quote-side gate cannot answer whether resets actually run: it is device-independent by
-    # construction (the cpu-only profile job freezes it), so it can prove the kernels are installed
+    # the control-plane gate cannot answer whether resets actually run: it is device-independent by
+    # construction, so it can prove the kernels are installed
     # but not that the conv kernel runs on THIS card. the child probe is the only place that
     # question can be answered, and continuing without resets would train across packed example
     # boundaries while looking patched. an exact-unpacked run keeps the soft form:

@@ -64,43 +64,16 @@ _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
 _OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
-# when the plane first heard from a profile's worker. a profile's wall bounds the WORK it does, not
-# the wait for a machine to do it on, so its deadline runs from here rather than from submission --
-# see _canonical_run_deadline.
-_PROFILE_WALL_ARMED_AT_KEY = "profile_wall_armed_at"
-# the lowest attempt id belonging to THIS profile lifecycle. a relaunch reuses the run id and
-# carries the attempt counter, so without a floor `next_attempt - 1` still names the spent
-# lifecycle's attempt while the fresh one queues -- see _persist_profile_submission.
-_PROFILE_ATTEMPT_FLOOR_KEY = "profile_attempt_floor"
 _PRIVATE_STATUS_KEYS = frozenset(
     {
         _RUN_DEADLINE_AT_KEY,
         _NEXT_ATTEMPT_KEY,
         _CLEANUP_REMOTES_KEY,
         _OPD_RETRY_CONTRACT_KEY,
-        _PROFILE_WALL_ARMED_AT_KEY,
-        _PROFILE_ATTEMPT_FLOOR_KEY,
     }
 )
 _PRIVATE_VALUE_UNSET = object()
 MIN_PROVIDER_WALL_SECONDS = 60
-_WORKLOAD_PROFILE_WALL_SECONDS = 10 * 60
-_WORKLOAD_PROFILE_MAX_RETRIES = 1
-# a profile's wall bounds the WORK it does, not the wait for a machine to do it on. each provider
-# attempt gets its own IN_QUEUE grace (300s) and the infra retry floor allows several of them, so
-# a 600s deadline measured from submission cannot survive even two capacity cycles: the run dies
-# "run wall deadline exceeded" having profiled nothing, on hardware it never got. queue time gets
-# this separate explicit allowance and the wall itself starts at the first heartbeat, so the quote
-# stays wall x hourly (see estimate_profile_cost) rather than paying for the queue.
-_WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS = 30 * 60
-# the plane arms work time at the first heartbeat, but the box enforces a deadline minted when the
-# machine was RENTED. between those two clocks sits everything cloud-init does before the worker
-# can speak -- waiting
-# for docker+gpu (itself budgeted up to ~600s), image pull with retries, extra_pip install and the
-# HF code fetch. The box timer is only a backstop against a silent box: the plane re-reads the run
-# deadline every poll, tightens it the moment arming happens, and tears the box down when it gives
-# up.
-_WORKLOAD_PROFILE_PROVISION_ALLOWANCE_SECONDS = 20 * 60
 
 
 def artifacts_dir(spec: JobSpec) -> str:
@@ -147,7 +120,13 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     adapter exists, is platform-managed and read from the internal worker spec (see
     _internal_spec_from_status); run_id comes from the RunStatus itself.
     """
-    if not (status.effective_preparation or {}).get("worker_spec"):
+    raw_worker = (status.effective_preparation or {}).get("worker_spec")
+    if not raw_worker:
+        return None
+    # a workload-profile run recorded before #1095 removed the profile job has a managed hf_repo but
+    # never produced an adapter. its worker payload still carries the marker, which JobSpec.from_dict
+    # now drops, so read it off the raw record rather than reviving the field.
+    if isinstance(raw_worker, dict) and raw_worker.get("workload_profile_kind"):
         return None
     try:
         spec = _internal_spec_from_status(status)
@@ -158,7 +137,7 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
         # operational tolerance as _runstatus_from_json: the record stays readable, it just shows no
         # adapter ref (its spec cannot name one we could resolve).
         return None
-    if spec.workload_profile_kind or not spec.train.hf_repo:
+    if not spec.train.hf_repo:
         return None
     return status.run_id
 
@@ -209,7 +188,6 @@ class RunStatus:
     platform_context: dict | None = None
     last_heartbeat: dict | None = None
     gpu_status: dict | None = None
-    workload_profile_kind: str | None = None
     workload_profile_input_digest: str | None = None
     workload_profile: dict | None = None
     effective_preparation: dict | None = None
@@ -308,33 +286,8 @@ class WarmStartPreparationError(ValueError):
     """
 
 
-class WorkloadProfilePending(RuntimeError):
-    """Training preparation is blocked on a separately billed workload-profile run."""
-
-    def __init__(
-        self,
-        profile_run_id: str,
-        state: str,
-        *,
-        prepared_job: object | None = None,
-        spent_at: float | None = None,
-    ) -> None:
-        self.profile_run_id = profile_run_id
-        self.state = state
-        self.prepared_job = prepared_job
-        # set when the previous profile under this id is spent (failed/cancelled/dry_run) and its
-        # claim has to be taken over before a replacement can run. the value is that run's own
-        # created_at, which is what makes the takeover decidable: a claim stamp re-read at takeover
-        # time would already be the winner's, so every later caller would think it won too.
-        # None means no spent run was observed and the claim is taken by insert instead.
-        self.spent_at = spent_at
-        super().__init__(
-            f"workload profile {profile_run_id} is {state}; retry training preparation after it succeeds"
-        )
-
-
 class WorkloadProfileUnavailable(ValueError):
-    """The exact workload profile failed or cannot be trusted."""
+    """the sft packaged-dataset estimate failed or cannot be trusted."""
 
 
 class _RunCancelled(RuntimeError):
@@ -714,8 +667,6 @@ def _save_status(
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
-    _profile_wall_armed_at: float | object = _PRIVATE_VALUE_UNSET,
-    _profile_attempt_floor: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     with _status_guard(status.run_id):
         if _opd_retry_contract_version is not _PRIVATE_VALUE_UNSET:
@@ -729,10 +680,6 @@ def _save_status(
                 # reloads consistently (see _canonical_run_deadline).
                 spec = _internal_spec_from_status(status)
                 base = _require_valid_deadline(status.created_at)
-                if spec.workload_profile_kind:
-                    # a fresh profile has not been armed yet, so it holds the queue allowance on top
-                    # of its work budget -- same basis _canonical_run_deadline reconstructs on read.
-                    base += _WORKLOAD_PROFILE_QUEUE_ALLOWANCE_SECONDS
                 _run_deadline_at = _require_valid_deadline(
                     base + _require_valid_deadline(spec.gpu.max_wall_seconds)
                 )
@@ -744,8 +691,6 @@ def _save_status(
             _next_attempt=_next_attempt,
             _cleanup_remotes=_cleanup_remotes,
             _opd_retry_contract_version=_opd_retry_contract_version,
-            _profile_wall_armed_at=_profile_wall_armed_at,
-            _profile_attempt_floor=_profile_attempt_floor,
         )
 
 
@@ -756,8 +701,6 @@ def _save_status_unlocked(
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
-    _profile_wall_armed_at: float | object = _PRIVATE_VALUE_UNSET,
-    _profile_attempt_floor: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     os.makedirs(RUNS_DIR, exist_ok=True)
     # write-then-rename so concurrent readers never see a half-written file.
@@ -776,8 +719,6 @@ def _save_status_unlocked(
         _NEXT_ATTEMPT_KEY: _next_attempt,
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
         _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
-        _PROFILE_WALL_ARMED_AT_KEY: _profile_wall_armed_at,
-        _PROFILE_ATTEMPT_FLOOR_KEY: _profile_attempt_floor,
     }
     data = _status_storage_dict(status)
     for key in _PRIVATE_STATUS_KEYS:
@@ -828,7 +769,6 @@ from flash.runner.costs import (  # noqa: E402,F401
     actual_steps_run,
     cancelled_charge_usd,
     charge_usd_for_spec,
-    profile_steps_run,
     record_billing_state,
     record_realized_cost,
 )
@@ -841,11 +781,6 @@ from flash.runner.deadlines import (  # noqa: E402,F401
     _spec_with_remaining_wall,
     _worker_deadline_at,
 )
-
-# redundant-alias form: this is a pure re-export for the sibling modules that resolve the name as
-# `runner._profile_wall_armed_at`, and `_save_status` below takes a keyword argument of the same
-# name, so a plain import would read as a redefinition of it.
-from flash.runner.deadlines import _profile_wall_armed_at as _profile_wall_armed_at  # noqa: E402
 from flash.runner.preparation import (  # noqa: E402,F401
     _adopted_warmstart_revision,
     _inherit_warmstart_revision,
@@ -854,7 +789,6 @@ from flash.runner.preparation import (  # noqa: E402,F401
     _prepare_init_from_adapter,
     _prepare_init_from_adapter_inner,
     _prepared_before_public_alpha,
-    _prepared_sft_profile_job,
     _profile_producer_version,
     _require_pinned_profile_environment,
     _require_sft_workload_profile,
@@ -904,7 +838,6 @@ from flash.runner.status import (  # noqa: E402,F401
 )
 from flash.runner.submit import (  # noqa: E402,F401
     _persist_effective_worker_spec,
-    _persist_profile_submission,
     _reject_managed_volume_removal,
     prepare_job,
     submit_job,

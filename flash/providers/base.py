@@ -242,6 +242,16 @@ class UnreconciledCreateError(RuntimeError):
     """
 
 
+class RunExhaustedProviderPoolError(RuntimeError):
+    """Every fitting offer for this class is one THIS run already rented and lost.
+
+    Distinct from an empty pool: the operator fix is another class or provider, not waiting. The
+    message is authored by Flash rather than quoted from a provider response, which is what lets
+    supervision surface it verbatim -- generic provider text is withheld from the run record
+    because it can quote a request that carried a credential.
+    """
+
+
 def canonical_gpu(name: str) -> str:
     """Normalize a friendly GPU name to a managed GPU class; raise otherwise."""
     key = (name or "").strip().lower()

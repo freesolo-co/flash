@@ -32,11 +32,26 @@ def _prepared_spec(*, revision: str = "main", resolves_to: str = "a" * 40):
     return replace(attach_sft_profile(spec), model_revision=revision)
 
 
-def _stub_prepare_dependencies(monkeypatch):
+def _resolved_profile_spec(*, resolves_to: str = "a" * 40):
+    """``_prepared_spec`` as preparation will see it: model_revision already resolved to a sha."""
+    from dataclasses import replace
+
+    return replace(_prepared_spec(resolves_to=resolves_to), model_revision=resolves_to)
+
+
+def _stub_prepare_dependencies(monkeypatch, spec=None):
     import flash.core.catalog as catalog
     import flash.runner as runner
 
     monkeypatch.setattr(runner, "resolve_model", lambda *args, **kwargs: catalog.MODELS[args[0]])
+    if spec is not None:
+        # sft preparation profiles the packaged dataset itself, which resolves the environment
+        # package over the network. these tests are about revision resolution, so the profile is
+        # recorded up front and the download never happens. it is keyed on the RESOLVED revision,
+        # which is what preparation re-derives before it profiles.
+        from tests._helpers.profile import record_sft_profile
+
+        record_sft_profile(runner, spec, monkeypatch)
     monkeypatch.setattr(
         "flash.cost.spec.estimate_for_spec", lambda _spec: SimpleNamespace(total_usd=1.0)
     )
@@ -90,7 +105,7 @@ def test_prepare_job_resolves_ref_to_sha_with_operator_token(monkeypatch):
 
     import flash.runner as runner
 
-    _stub_prepare_dependencies(monkeypatch)
+    _stub_prepare_dependencies(monkeypatch, _resolved_profile_spec())
     seen = {}
     sha = "a" * 40
 
@@ -144,7 +159,7 @@ def test_prepare_job_moving_ref_persists_first_resolved_commit(monkeypatch):
 
     import flash.runner as runner
 
-    _stub_prepare_dependencies(monkeypatch)
+    _stub_prepare_dependencies(monkeypatch, _resolved_profile_spec(resolves_to="b" * 40))
     shas = iter(("b" * 40, "c" * 40))
 
     class Api:

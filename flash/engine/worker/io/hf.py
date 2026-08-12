@@ -15,6 +15,10 @@ from collections.abc import Callable
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES, attempt_scoped_artifact_name
+from flash.engine.profiling.tokenizer import (  # noqa: F401
+    load_tokenizer,
+    model_revision_kwargs,
+)
 
 # `gpu_diagnostics` has no call site here since prefetch moved to `.prefetch`, but it is kept
 # imported on purpose: the prefetch tests patch `hf.gpu_diagnostics` and the prefetcher reads it
@@ -81,22 +85,6 @@ def hf_api():
     from huggingface_hub import HfApi
 
     return HfApi(token=os.environ.get("HF_TOKEN"))
-
-
-def model_revision_kwargs(revision: str = "") -> dict[str, str]:
-    """return the hf revision keyword only for a nonempty pinned revision."""
-    return {"revision": revision} if revision else {}
-
-
-def load_tokenizer(model_id: str, revision: str = ""):
-    """load the student tokenizer under the run's optional model revision."""
-    from transformers import AutoTokenizer
-
-    return AutoTokenizer.from_pretrained(
-        model_id,
-        trust_remote_code=True,
-        **model_revision_kwargs(revision),
-    )
 
 
 def hf_prefix() -> str:

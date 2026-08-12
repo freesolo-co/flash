@@ -1946,23 +1946,149 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     assert [step for _adapter, step in captured["published"]] == [2]
 
 
-def test_a_workload_that_moved_under_the_frozen_quote_stops_before_training(monkeypatch):
-    """The worker re-derives the workload and refuses to train on one the quote never priced.
+def test_worker_uses_the_accepted_unpacked_quote_when_its_stack_can_pack(monkeypatch):
+    """worker capability must not replace the packing contract the user accepted.
 
-    The environment is pinned by SHA, so this is not the ordinary case: it is the one where the
-    pinned inputs still produce different rows (a non-deterministic dataset build, a tokenizer
-    resolving differently). Training anyway would bill a run against a quote measured on other
-    data, so the profile is evidence to check rather than metadata to carry.
+    the control plane lacks the gdn packing stack and freezes an exact-unpacked quote, while the gpu
+    worker has that stack and would independently choose packed execution. rows still come from the
+    worker recomputation, but the child batch and update horizon must remain the quoted shape.
+    """
+    from flash.engine.profiling import sft_workload
+    from flash.engine.worker import sft_train, sft_train_runner
 
-    The drift has to come from the workload, not from the artifact. A profile carries its own
-    content digest, so an edited one is rejected as corrupt before this guard is reached; only a
-    re-derivation that legitimately disagrees can exercise it.
+    spec, _captured = _stub_sft_run(monkeypatch)
+    monkeypatch.setattr(sft_workload, "probe_is_gdn_hybrid", lambda _m, revision="": True)
+    monkeypatch.setattr(
+        sft_workload, "gdn_packing_contract_available", lambda _m, revision="": True
+    )
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+    recomputed_profiles = []
+    prepare = sft_train.prepare_sft_workload
+
+    def capture_recomputed_profile(*args, **kwargs):
+        prepared = prepare(*args, **kwargs)
+        recomputed_profiles.append(prepared.profile)
+        return prepared
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", capture_recomputed_profile)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    data = sft_train_runner._prepare_sft_data(options)
+    model = sft_train_runner._prepare_sft_model(options, data)
+
+    assert recomputed_profiles[0].packing_mode == "packed"
+    assert recomputed_profiles[0].examples_per_update == 2
+    assert data.profile.packing_mode == "exact-unpacked"
+    assert data.profile.examples_per_update == 1
+    assert model.train_batch_size == 1
+    assert model.update_horizon == data.profile.authoritative_steps
+
+
+def test_the_child_caps_at_the_quoted_horizon_without_an_authored_max_steps(monkeypatch):
+    """the accepted step count binds even when the user never authored max_steps.
+
+    the plane profiles raw records without running environment.py, so an environment that expands
+    the rows makes the realized epoch longer than the quote assumed. verl stops at
+    total_training_steps, so leaving it unset would run past the horizon the run was priced for.
+    """
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    # the shared fixture authors max_steps; this test is about the path where the user did not.
+    spec.train.max_steps = 0
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    assert options.max_steps <= 0
+
+    data = sft_train_runner._prepare_sft_data(options)
+    model = sft_train_runner._prepare_sft_model(options, data)
+    capabilities = sft_train_runner._SftCapabilities(
+        python_bin="/venv/bin/python", caps={}, gdn_hybrid=False, gdn_module=""
+    )
+    child = sft_train_runner._prepare_sft_child(options, data, model, capabilities, True, None)
+
+    # the horizon reaches verl as a rendered hydra override, so assert on what the child is
+    # actually launched with rather than an intermediate dict. before this cap it rendered as
+    # null whenever the user left max_steps unauthored, leaving the realized epoch as the only
+    # bound; verl stops at whichever of the two limits it reaches first.
+    horizon = data.profile.authoritative_steps
+    assert f"trainer.total_training_steps={horizon}" in child.command
+    assert "trainer.total_training_steps=null" not in child.command
+
+
+def test_a_packed_quote_fails_closed_when_environment_filtering_leaves_less_than_one_batch(
+    monkeypatch,
+):
+    """the worker must not silently shrink the accepted batch and change the billed contract."""
+    from flash.engine.profiling.workload_profile import SftWorkloadProfile
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    quoted = SftWorkloadProfile.from_dict(spec.workload_profile)
+    spec.workload_profile = replace(
+        quoted,
+        packing_mode="packed",
+        architecture_mode="pure-attention",
+        examples_per_update=2,
+        packed_blocks=1,
+    ).to_dict()
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+    from flash.engine.profiling import sft_workload
+
+    monkeypatch.setattr(sft_workload, "probe_is_pure_attention", lambda _m, revision="": True)
+    prepared = sft_train.prepare_sft_workload
+
+    def retain_one(*args, **kwargs):
+        workload = prepared(*args, **kwargs)
+        return replace(workload, rows=workload.rows[:1])
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", retain_one)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    with pytest.raises(
+        RuntimeError, match="more examples per update than the environment retained"
+    ):
+        sft_train_runner._prepare_sft_data(options)
+
+
+def test_a_packed_quote_fails_closed_when_the_worker_cannot_pack_safely(monkeypatch):
+    """a worker without boundary resets must never execute a packed accepted quote."""
+    from flash.engine.profiling.workload_profile import SftWorkloadProfile
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    quoted = SftWorkloadProfile.from_dict(spec.workload_profile)
+    spec.workload_profile = replace(
+        quoted,
+        packing_mode="packed",
+        architecture_mode="gdn-hybrid",
+        examples_per_update=2,
+        packed_blocks=1,
+    ).to_dict()
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    with pytest.raises(RuntimeError, match="cannot reproduce its boundary-safe packing contract"):
+        sft_train_runner._prepare_sft_data(options)
+
+
+def test_environment_processing_may_change_the_static_estimate_without_repricing(
+    monkeypatch, capsys
+):
+    """the worker reports estimate drift and trains the environment-produced rows.
+
+    the control plane tokenizes only packaged input and output fields, while the worker executes
+    environment prompt construction and filtering. those profiles are not expected to match. the
+    accepted quote remains on the spec, and the worker uses its recomputed rows for training.
     """
     from flash.engine.profiling import sft_workload
     from flash.engine.worker import sft_train
 
     spec, _captured = _stub_sft_run(monkeypatch)
+    frozen_quote = dict(spec.workload_profile)
     honest = sft_workload.prepare_sft_workload
+    training_calls = []
 
     def drifted(*args, **kwargs):
         prepared = honest(*args, **kwargs)
@@ -1971,15 +2097,25 @@ def test_a_workload_that_moved_under_the_frozen_quote_stops_before_training(monk
         )
         return replace(prepared, profile=moved)
 
+    def completed_training(command, *, env, on_step, on_line, heartbeat):
+        training_calls.append(command)
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        heartbeat()
+        return 0
+
     monkeypatch.setattr(sft_train, "prepare_sft_workload", drifted)
+    monkeypatch.setattr(sft_train, "run_verl_training", completed_training)
 
-    def unreachable_training(command, *, env, on_step, on_line, heartbeat):
-        raise AssertionError("training must not start on a workload the quote did not price")
+    sft_train.run_sft_train(spec)
 
-    monkeypatch.setattr(sft_train, "run_verl_training", unreachable_training)
-
-    with pytest.raises(ValueError, match="workload changed after the quote was frozen"):
-        sft_train.run_sft_train(spec)
+    assert training_calls
+    assert spec.workload_profile == frozen_quote
+    assert (
+        "environment processing changed the packaged-dataset token estimate"
+        in capsys.readouterr().out
+    )
 
 
 def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monkeypatch):

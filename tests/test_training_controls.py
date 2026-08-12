@@ -233,12 +233,10 @@ def test_seed_training_rngs_initializes_all_supported_generators(monkeypatch):
 
 
 def test_seed_host_rngs_reaches_the_dataset_generators_without_importing_torch(monkeypatch):
-    """The workload-profile run seeds these and nothing else.
+    """host seeding reaches python and numpy without importing the model stack.
 
-    Environment code is user code and may consume Python's or NumPy's global generator while
-    building its dataset, so a profile that skipped them could select a different sample than
-    training and fail the parity check. torch is the opposite case: seeding it would import the
-    model stack into a job that is allocated and billed as cpu-only.
+    environment code may consume python's or numpy's global generator while building training rows.
+    torch is the opposite case: importing it here would make a host-only helper load the model stack.
     """
     from flash.engine.worker.runtime import rng
 
@@ -296,14 +294,12 @@ def test_lifecycle_rejects_seed_mismatch_before_provider_work():
 def test_sft_under_ran_only_fails_a_genuine_under_run():
     from flash.engine.worker.entry.sft import sft_under_ran
 
-    # a real under-run (fewer updates than the authoritative horizon) fails loudly.
-    assert sft_under_ran(9, 10, 10)
+    # a real under-run (fewer updates than the quoted horizon) fails loudly.
+    assert sft_under_ran(9, 10)
     # a fresh run landed exactly on the horizon passes.
-    assert not sft_under_ran(10, 10, 10)
+    assert not sft_under_ran(10, 10)
     # a resume from a checkpoint past a lowered horizon did zero new steps yet is fully trained.
-    assert not sft_under_ran(12, 10, 10)
-    # non-positive max_steps keeps the derived-fallback behavior (never authoritative under-run).
-    assert not sft_under_ran(9, 10, 0)
+    assert not sft_under_ran(12, 10)
 
 
 def test_grpo_under_ran_only_fails_a_genuine_under_run():

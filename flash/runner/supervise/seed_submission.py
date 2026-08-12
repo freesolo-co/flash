@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass, field
 
+from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
 from flash.runner.supervise import lifecycle as _lifecycle
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
@@ -392,9 +393,6 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
             # spec is only a placeholder, so the marker must reach allocation as none or auto-sizing
             # silently collapses back to one card after the preparation round trips.
             max_gpu_count=prepared.attempt_spec.authored_gpu_count,
-            # a profile job tokenizes on cpu and exits before weights load, so it allocates the
-            # cheapest rentable card rather than the training shape it is measuring.
-            workload_profile=bool(prepared.attempt_spec.workload_profile_kind),
         )
     except Exception as exc:
         if isinstance(exc, UnsupportedGpuError):
@@ -516,7 +514,11 @@ def _submit_provider(
     plan: _CandidatePlan,
 ):
     from flash.providers import get_provider
-    from flash.providers.base import PollResult, UnreconciledCreateError
+    from flash.providers.base import (
+        PollResult,
+        RunExhaustedProviderPoolError,
+        UnreconciledCreateError,
+    )
     from flash.runner import (
         _load_run_deadline_at,
         _TerminalHandleRace,
@@ -559,6 +561,23 @@ def _submit_provider(
                 ),
                 False,
             )
+        if isinstance(exc, RunExhaustedProviderPoolError):
+            # the one submit-side message worth reading, and the only one safe to read: Flash
+            # authors this string, so unlike a provider response body it cannot quote a request
+            # that carried a credential. without this the class name alone would make "this run
+            # burned the whole pool" indistinguishable from "the market is dry", which is exactly
+            # the distinction the error exists to draw. still sanitized and bounded, because the
+            # gpu class it interpolates comes from the spec.
+            return (
+                PollResult(
+                    False,
+                    failure="no_capacity",
+                    detail=sanitize_diagnostic(str(exc), limit=1000),
+                ),
+                True,
+            )
+        # every other provider exception keeps its class name only. the text can quote a request
+        # body, and this detail is persisted into the run record.
         return (
             PollResult(
                 False,
@@ -731,9 +750,40 @@ def _retry_target(
         _lifecycle._shape_key(candidate) in retry_tried for candidate in outcome.candidates
     )
     no_escalation = ", no untried GPU class fits this run" if exhausted else ""
+    # a projected provider this run has ALREADY marked failed is not a failover, it is a clamp back
+    # onto the pool that is failing. `_select_candidate` sorts on `provider in failed_providers`
+    # first, so once every candidate's provider has failed that key is True for all of them and the
+    # escape degrades to the plain cheapest-first order. the line then reads like recovery while the
+    # run loops on the same substrate, which is what made a 46-attempt loop look like progress.
+    # naming it is the difference between "waiting" and "unpin gpu.provider / add another provider".
+    retry_failed_providers = (
+        ctx.failed_providers
+        if first_cache_drop
+        else ctx.failed_providers | {outcome.chosen.provider}
+    )
+    # what landing on a failed provider actually proves is that no UNFAILED one is left, not that
+    # this is the only provider with a fitting class. with fitting candidates on two providers that
+    # have both failed, sort key 1 is True for either, so "no other provider offers a fitting class"
+    # would deny a provider sitting right there in the list. read the list instead of inferring from
+    # the sort, and distinguish the two cases: another failed provider is still somewhere to go
+    # (unpin, or wait for it to recover), whereas a single-provider candidate list is not.
+    other_providers = {candidate.provider for candidate in outcome.candidates} - {
+        projected.provider
+    }
+    no_escape = (
+        (
+            ", which this run has already lost an attempt on -- every provider offering a fitting "
+            f"class ({', '.join(sorted(other_providers | {projected.provider}))}) has now failed"
+            if other_providers
+            else ", which this run has already lost an attempt on -- no other provider offers a "
+            "fitting class"
+        )
+        if projected.provider in retry_failed_providers
+        else ""
+    )
     return (
         f"expecting to retry on {projected.gpu} @ {projected.provider}"
-        f"{' again' if same else ''}{no_escalation} (resume from last checkpoint; "
+        f"{' again' if same else ''}{no_escalation}{no_escape} (resume from last checkpoint; "
         "reallocated against live capacity, so the class may change)"
     )
 

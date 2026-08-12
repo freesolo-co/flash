@@ -10,6 +10,7 @@ import http.client
 import json
 import math
 import sys
+import threading
 import time
 from collections.abc import Callable
 
@@ -37,6 +38,7 @@ from flash.providers.artifacts.hf import (
 from flash.providers.base import (
     GPU_INFO,
     PollResult,
+    RunExhaustedProviderPoolError,
     UnreconciledCreateError,
     UnsupportedGpuError,
     canonical_gpu,
@@ -72,6 +74,73 @@ MIN_DISK_GB = 60.0
 # yet emits no DONE/heartbeat, so classify it dead for fast failover. Unlike ``unknown`` it is never
 # this poller's no-status fallback, so it needs no ``became_running`` gate.
 _DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
+
+# Machines this run has already rented and lost, keyed by run id.
+#
+# ``deploy_and_submit``'s own ``tried`` list is rebuilt per call and only covers offers that
+# REJECTED the create. A machine that accepts the rental and then never boots is the worse case: it
+# is not in ``tried``, it stays in the market at the top of the cheapest-first ranking, and the next
+# attempt rents it again. a failed run once rented the same two dead offers eleven and seven times,
+# spending its whole retry budget re-renting known-dead boxes.
+#
+# Process-local and best-effort by design. It is an optimisation over the ranking, not a
+# correctness gate: a control plane restart or a second process legitimately starts with an empty
+# set and merely re-learns. Persisting it would put market trivia in the run record and still not
+# be authoritative, since offer ids churn.
+_run_dead_machines: dict[str, set[int]] = {}
+# Supervision runs on background threads (flash/server/app.py, supervise/attach.py), so two runs can
+# reach the map at once. Its mutations are read-modify-write (size check then evict; setdefault then
+# add), which is not atomic under the GIL.
+_dead_machines_lock = threading.Lock()
+# Bound the per-process footprint of the map above: a long-lived control plane submits unboundedly
+# many runs, and nothing else would ever evict a finished run's entry.
+_DEAD_MACHINE_RUNS_MAX = 512
+# widened row cap for the one re-search that separates "this run burned the cheap page" from "the
+# class is gone". only paid when the default page is entirely blacklisted, which needs a run that
+# already lost that many hosts.
+_EXHAUSTION_RECHECK_LIMIT = 1024
+# The tail of vast's own ``load_timeout_detail`` below. It is what identifies the ONE stall that
+# indicts the host, and interpolating the same constant into both sides is what keeps them from
+# drifting apart.
+#
+# Keying on ``failure == "stalled"`` alone was wrong: four different conditions report that name,
+# and only this one is the pre-boot load timeout (``_classify_load_timeout``, gated on ``not
+# state.became_running``). The others -- a mid-TRAINING progress stall, a post-running liveness
+# stall, and the client-side wall deadline -- all describe a box that booted and worked. Retiring a
+# healthy host for one of those shrinks the pool on every attempt and, with a small pool, makes the
+# next resumable attempt hit the "already rented and lost" error instead of reusing the only machine
+# available: the same starvation this fix exists to stop, arriving from the other direction.
+_NEVER_STARTED_MARKER = "never started; image pull / host issue"
+
+
+def _is_never_started_stall(result: PollResult) -> bool:
+    """True only for the pre-boot load timeout: rented, never ran, never sent a heartbeat."""
+    return result.failure == "stalled" and _NEVER_STARTED_MARKER in (result.detail or "")
+
+
+def _note_dead_machine(run_id: str, machine_id: int | None) -> None:
+    """Remember that ``machine_id`` took this run's money and did not deliver a worker."""
+    if not run_id or not machine_id or machine_id <= 0:
+        return
+    with _dead_machines_lock:
+        if run_id not in _run_dead_machines and len(_run_dead_machines) >= _DEAD_MACHINE_RUNS_MAX:
+            # drop the oldest run's set (dicts preserve insertion order) rather than let the map
+            # grow without bound. evicting a live run's set only forfeits the optimisation for it.
+            with contextlib.suppress(StopIteration):
+                _run_dead_machines.pop(next(iter(_run_dead_machines)), None)
+        _run_dead_machines.setdefault(run_id, set()).add(int(machine_id))
+
+
+def dead_machine_ids(run_id: str) -> frozenset[int]:
+    """Machines this run already rented and lost; excluded from further offer searches."""
+    with _dead_machines_lock:
+        return frozenset(_run_dead_machines.get(run_id, ()))
+
+
+def forget_dead_machines(run_id: str) -> None:
+    """Drop a finished run's blacklist so the map does not grow for the process's lifetime."""
+    with _dead_machines_lock:
+        _run_dead_machines.pop(run_id, None)
 
 
 def _effective_disk_gb(spec) -> float:
@@ -408,7 +477,19 @@ def deploy_and_submit(
                         for o in usable_offers(
                             min(o.vram_gb for o in offers),
                             _effective_disk_gb(spec),
-                            exclude_machine_ids={o.machine_id for o in tried},
+                            # this call's create-rejections AND the machines earlier attempts of
+                            # this run rented and lost. `tried` alone is per-call, so a refresh
+                            # would happily re-offer a box a previous attempt already killed.
+                            exclude_machine_ids={o.machine_id for o in tried}
+                            | dead_machine_ids(spec.run_id),
+                            # the exclusion this refresh exists to apply is what makes the default
+                            # page too small: `search_offers` caps rows SERVER-side on a price-sorted
+                            # prefix, and the machines are dropped client-side afterwards. so the
+                            # more boxes this run has burned, the more of the page is already spent
+                            # -- and once they fill it the refresh returns empty while dearer usable
+                            # capacity sits just past the cap. widen for the same reason, and by the
+                            # same amount, as the exhaustion recheck below.
+                            limit=_EXHAUSTION_RECHECK_LIMIT,
                             max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
                             # the transient attempt spec always carries the concrete allocated class.
                             gpu_type=spec.gpu.type,
@@ -587,7 +668,7 @@ def poll_vast_job(
             hf_repo, prefix, spec.phase, marker, handle.instance_id, attempt=handle.attempt
         ),
         load_timeout_detail=lambda status, elapsed: (
-            f"instance stuck in '{status}' for {int(elapsed)}s (never started; image pull / host issue)"
+            f"instance stuck in '{status}' for {int(elapsed)}s ({_NEVER_STARTED_MARKER})"
         ),
         first_liveness_detail=lambda elapsed, fl: (
             f"no worker heartbeat AND no container-log output for {int(elapsed)}s after the container "
@@ -633,7 +714,10 @@ def submit_run_vast(
 
     absolute_deadline = require_deadline_at(deadline_at)
     info = GPU_INFO[spec.gpu.type]
-    offers = [
+    # the market for this class BEFORE this run's own dead hosts come out. one search answers both
+    # questions -- what to rent, and why the list is empty when it is -- because `usable_offers`
+    # applies `exclude_machine_ids` client-side anyway, so filtering here costs no extra call.
+    market = [
         o
         for o in usable_offers(
             info.vram_gb,
@@ -648,6 +732,44 @@ def submit_run_vast(
         )
         if o.gpu == spec.gpu.type
     ]
+    excluded = dead_machine_ids(spec.run_id)
+    offers = [o for o in market if o.machine_id not in excluded]
+    if market and not offers:
+        # every row of the cheapest page belongs to a host this run already lost. the page is a
+        # price-sorted prefix, not the class: `search_offers` applies its row cap server-side and
+        # the machine exclusion is client-side, so dearer usable capacity can sit just past the
+        # cap. widen once and re-filter before calling the class exhausted -- concluding it from
+        # the first page turns "the cheap boxes are burned" into a false terminal failure.
+        market = [
+            o
+            for o in usable_offers(
+                info.vram_gb,
+                _effective_disk_gb(spec),
+                limit=_EXHAUSTION_RECHECK_LIMIT,
+                max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
+                gpu_type=spec.gpu.type,
+                num_gpus=gpu_count_of(spec),
+                **deadline_kwargs(usable_offers, absolute_deadline),
+            )
+            if o.gpu == spec.gpu.type
+        ]
+        offers = [o for o in market if o.machine_id not in excluded]
+    if market and not offers:
+        # the class HAD offers and this run had already lost every one of them. the generic empty-
+        # pool error reads as "vast has no capacity" when the truth is "this run has burned all of
+        # it" -- a different operator fix (different class or provider, not waiting).
+        #
+        # gated on `market`, not on `excluded` being non-empty: the blacklist is keyed by run, so it
+        # can hold hosts from a GPU class this attempt already escalated away from, and a dry market
+        # would otherwise be blamed on hosts that were never in it. counting the machines actually
+        # removed here keeps the number honest for the same reason.
+        # a dedicated type, not VastApiError: supervision withholds provider exception text from the
+        # run record (it can quote a request that carried a credential), so the one error worth
+        # reading would be reduced to its class name like any other. this message is authored here.
+        raise RunExhaustedProviderPoolError(
+            f"no usable vast offers for {spec.gpu.type} outside the "
+            f"{len({o.machine_id for o in market})} machine(s) this run already rented and lost"
+        )
     handle = None
     try:
         handle = deploy_and_submit(
@@ -666,7 +788,7 @@ def submit_run_vast(
             spec,
             **deadline_kwargs(heartbeat_reader_for, absolute_deadline),
         )
-        return poll_vast_job(
+        result = poll_vast_job(
             handle,
             spec,
             seed,
@@ -674,6 +796,16 @@ def submit_run_vast(
             heartbeat_reader=reader,
             **deadline_kwargs(poll_vast_job, absolute_deadline),
         )
+        if not result.ok and _is_never_started_stall(result):
+            # the machine took the rental and never produced a working worker. blacklist the HOST,
+            # not the offer id: vast relists the same box under a fresh offer id, so an offer-keyed
+            # entry would be stale before the next attempt searched.
+            #
+            # only the pre-boot load timeout qualifies (see `_NEVER_STARTED_MARKER`). a box that
+            # booted and then stalled mid-training is not indicted: that failure would recur
+            # anywhere, and retiring a working host for it starves the pool.
+            _note_dead_machine(spec.run_id, getattr(handle, "machine_id", None))
+        return result
     finally:
         if handle is not None:
             confirmed = False

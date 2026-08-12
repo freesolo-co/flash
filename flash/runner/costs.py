@@ -146,22 +146,12 @@ def charge_usd_for_spec(
     run actually rented so the estimate reproduces the accepted quote's work model. ``gpu_type``
     and ``gpu_count`` together pin the rented card shape the same way: the spec's count is only the
     ceiling the allocator searched under, so without the pin a 4-card rental could be repriced on
-    the 1-card offline optimum. a profile's bounded-wall charge has no multi-card step term, so
-    the overrides do not apply there.
+    the 1-card offline optimum.
     """
     try:
         from flash.cost.analytical import estimate_cost
-        from flash.cost.spec import UnknownPromptPoolSize, estimate_for_spec, runconfig_from_spec
+        from flash.cost.spec import UnknownPromptPoolSize, runconfig_from_spec
 
-        if getattr(spec, "workload_profile_kind", ""):
-            # a profile job has no optimizer steps to prorate, so its charge is all-or-nothing: the
-            # bounded wall it rented, or zero if it never started. the caller passes steps=0 for the
-            # latter (see profile_steps_run), and honouring it matters because the id is derived
-            # from the workload rather than the account. a profile cancelled before launch would
-            # otherwise bill the full wall cap to whichever submitter happened to win the claim.
-            if steps is not None and int(steps) <= 0:
-                return 0.0
-            return float(estimate_for_spec(spec).total_usd)
         try:
             cfg = runconfig_from_spec(spec)
         except UnknownPromptPoolSize:
@@ -363,29 +353,6 @@ def actual_steps_run(status: RunStatus) -> int:
     if hb.get("stage") in runner._TRAINING_STAGES:
         return 1
     return 0
-
-
-def profile_steps_run(status: RunStatus) -> int:
-    """Whether a cancelled profile job rented anything: 1 if it started, 0 if it never did.
-
-    The signal is that a worker spoke, but a profile's run id is derived from the workload, so a
-    relaunch REUSES it and the stored word may belong to the previous lifecycle. Billing the stored
-    stage there charges a relaunch cancelled in the queue for a machine it never rented. So a
-    relaunch -- and only a relaunch, marked by the attempt floor its takeover records -- is
-    billed on the arm, which is written only for a heartbeat that passed
-    ``_heartbeat_attempt_is_current``. A first lifecycle has no earlier worker to be confused with
-    and bills on the stored word as before.
-    """
-    hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
-    if not hb.get("stage"):
-        return 0
-    try:
-        raw = runner._load_status_json(status.run_id)
-    except (FileNotFoundError, ValueError):
-        return 1
-    if runner._PROFILE_ATTEMPT_FLOOR_KEY not in raw:
-        return 1
-    return 1 if runner._profile_wall_armed_at(raw) is not None else 0
 
 
 def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
