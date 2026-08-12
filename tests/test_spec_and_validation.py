@@ -1491,15 +1491,33 @@ def test_migrating_a_legacy_rollout_batch_keeps_its_preparation_digest_valid() -
             None,
         ), label
 
-        # control: the digest still binds BOTH names. without this, "recovery works" would also be
-        # satisfied by a restore that let any value through.
+        # control: the digest still binds both names on BOTH halves. without this, "recovery works"
+        # would also be satisfied by a restore that let any value through.
+        #
+        # each half is tampered ALONE. Changing both together hides a hole in either one, which is
+        # how a public-side gap got through review: the parse DROPS a superseded `batch_size`, so
+        # `_validate_effective_spec` never compares it, and a restore that fed the worker's reading
+        # to the public payload overwrote the tampered value before hashing. Only the public spec
+        # is user-visible, so that half is the one an attacker can reach.
         for key in ("batch_size", "prompts_per_step"):
-            if key not in worker["train"]:
-                continue
-            tampered_worker = {**worker, "train": {**worker["train"], key: 999}}
-            tampered_public = {**public, "train": {**public["train"], key: 999}}
-            with pytest.raises(ValueError, match="failed integrity validation"):
-                _recover(tampered_worker, tampered_public, digest)
+            for half in ("worker", "public"):
+                source = worker if half == "worker" else public
+                if key not in source["train"]:
+                    continue
+                tampered = {**source, "train": {**source["train"], key: 999}}
+                # either rejection is correct: a value the parse KEEPS is caught structurally by
+                # `_validate_effective_spec` (public/worker mismatch) before the digest is even
+                # reached, and one it DROPS reaches the digest. What must never happen is the
+                # tamper being accepted, so both messages are allowed and neither is required.
+                with pytest.raises(
+                    ValueError,
+                    match=r"failed integrity validation|does not match the public run",
+                ):
+                    _recover(
+                        tampered if half == "worker" else worker,
+                        tampered if half == "public" else public,
+                        digest,
+                    )
 
     # sft authors `batch_size` under its CURRENT name, so from_dict leaves it alone and the digest
     # must not replay anything for it.

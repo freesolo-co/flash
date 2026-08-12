@@ -387,6 +387,7 @@ def _preparation_digest(
     legacy_public_keys: dict | None = None,
     legacy_public_alpha: bool = False,
     stored_rollout_batch: dict | None = None,
+    stored_public_rollout_batch: dict | None = None,
     stored_rollout_batch_key_absent: bool = False,
 ) -> str:
     worker_payload = worker_spec.to_internal_dict()
@@ -394,14 +395,19 @@ def _preparation_digest(
     # the rollout optimizer batch was renamed `batch_size` -> `prompts_per_step`, and from_dict now
     # MOVES it when reparsing a persisted spec. Rehash under the spelling the snapshot actually
     # stored -- including a key it did not have -- so a spec written before or across the rename
-    # still reproduces its digest. Same reason as the omissions and restorations below, and scoped
-    # the same way: this replays STORED bytes, so a digest created from here on binds
-    # `prompts_per_step` normally and tampering still mismatches.
+    # still reproduces its digest. Same reason as the omissions and restorations below.
+    #
+    # Each half is restored from ITS OWN stored payload, exactly like legacy_keys vs
+    # legacy_public_keys below. Feeding the worker's spelling to both would overwrite whatever the
+    # public payload held before hashing -- and since the parse DROPS a superseded `batch_size`,
+    # `_validate_effective_spec` cannot see it either, so a tampered public value would be erased
+    # rather than caught. The two halves legitimately differ (the public spec is a stripped view),
+    # so they cannot share one reading.
     _restore_rollout_batch_spelling(
         worker_payload, stored_rollout_batch, drop_new_key=stored_rollout_batch_key_absent
     )
     _restore_rollout_batch_spelling(
-        public_payload, stored_rollout_batch, drop_new_key=stored_rollout_batch_key_absent
+        public_payload, stored_public_rollout_batch, drop_new_key=stored_rollout_batch_key_absent
     )
     # ``[environment] pip`` became user-authorable, so to_dict() now emits it where it used to be
     # stripped, and a pre-upgrade snapshot hashed an environment with no pip key at all. Dropping it
