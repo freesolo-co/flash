@@ -4109,8 +4109,8 @@ def test_the_child_fragment_repoints_the_tilelang_libcudart_stub(tmp_path):
     """THE regression (5 of 6 GRPO models): tilelang's stub lacks ``cudaDeviceReset``, vLLM's
     CuMemAllocator binds it, and engine init dies with an undefined-symbol AttributeError.
 
-    The parent's ``perf._neutralize_tilelang_cudart_stub`` cannot reach this: the trainer runs in a
-    separate interpreter (``/opt/verl-venv``) that has its OWN tilelang and no flash at all. Assert
+    A parent-side repoint could not reach this: the trainer runs in a separate interpreter
+    (``/opt/verl-venv``) that has its OWN tilelang and no flash at all. Assert
     on the filesystem AFTER executing the fragment -- a substring match on the rendered source would
     pass on a fragment that never runs.
     """
@@ -4158,6 +4158,40 @@ def test_the_child_fragment_leaves_the_stub_alone_without_a_real_libcudart(tmp_p
     assert not stub.is_symlink()
     assert stub.read_bytes() == b"STUB"
     assert not (tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig").exists()
+
+
+def test_the_child_fragment_repoints_a_dangling_stub_symlink(tmp_path):
+    """A DANGLING stub symlink is NOT "already repointed" -- it leaves tilelang with a broken
+    libcudart_stub.so, so the fragment must re-point it at a real runtime.
+
+    This is the case the ``islink and exists`` pair exists for: ``islink`` alone would read a dangling
+    link as done and skip, and ``exists`` alone follows the link away and reads it as absent. Distinct
+    from the stale *temp swap* link covered below -- that one is a leftover at
+    ``.flash-<pid>-<rand>``, while this is the stub path itself pointing at a target that is gone.
+    """
+    pkg, stub = _fake_child_tilelang(tmp_path)
+    stub.unlink()
+    stub.symlink_to(tmp_path / "gone-libcudart.so.12")  # dangling: target does not exist
+    assert stub.is_symlink()
+    assert not stub.exists()
+
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    result = _run_cudart_fragment(
+        vc.render_tilelang_cudart_shim(),
+        tmp_path,
+        real=str(real),
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert stub.is_symlink()
+    assert stub.exists(), "the stub symlink still dangles; tilelang's libcudart is broken"
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    # nothing to preserve: the original stub was already gone before this ran, so a .orig would be a
+    # hard link to a dangling symlink rather than tilelang's real file.
+    assert not (pkg / "lib" / "libcudart_stub.so.orig").exists()
 
 
 def test_the_child_fragment_never_aborts_a_paid_run(tmp_path):

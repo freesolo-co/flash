@@ -56,21 +56,22 @@ except Exception:
 #   AttributeError: .../tilelang/lib/libcudart_stub.so: undefined symbol: cudaDeviceReset
 #   RuntimeError: Engine core initialization failed
 #
-# `perf._neutralize_tilelang_cudart_stub` fixes exactly this, but it runs in the flash PARENT and
-# locates tilelang with `importlib.util.find_spec` THERE. Training runs in a separate interpreter
+# This repoint used to live in the flash PARENT, which located tilelang with
+# `importlib.util.find_spec` THERE. Training runs in a separate interpreter
 # (`FLASH_VERL_PYTHON`, `/opt/verl-venv`) that is built without --system-site-packages and where
 # flash is not installed at all -- and Dockerfile.worker installs tilelang into BOTH (the main
 # interpreter at the fla/Hopper layer, the child venv at its own layer), as does the run-time
-# rebuild in `verl.capabilities.resolve_verl_python`. So the parent fix never reaches the copy the
-# trainer actually loads, and the stub survives into the process that builds the vLLM engine.
+# rebuild in `verl.capabilities.resolve_verl_python`. So a parent-side repoint never reached the copy
+# the trainer loads, and the stub survived into the process that builds the vLLM engine.
 #
 # The allocator is only constructed when rollout sleep mode is on, which is why the one catalog
 # model flagged `sleep_unsupported` (35B-A3B, pinned resident by `rollout_resident_overrides`) got
 # past engine init while every other GRPO model crashed here.
 #
-# This is the same repoint the parent performs, re-expressed as a child fragment so it runs in the
-# interpreter that owns the loaded stub. It must run BEFORE any vLLM/model import, so it is emitted
-# at the top of the generated sitecustomize next to the tf32 fragment.
+# So the repoint lives HERE and only here: a child fragment running in the interpreter that owns the
+# loaded stub. It must run BEFORE any vLLM/model import, so it is emitted at the top of the generated
+# sitecustomize next to the tf32 fragment. The parent no longer repoints anything -- it never builds a
+# vLLM engine, so its own copy of the stub is inert (see the note in `perf/__init__.py`).
 FLASH_CUDART_STUB_MARKER = "[flash-verl] tilelang libcudart stub repointed"
 
 
