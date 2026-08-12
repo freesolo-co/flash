@@ -16,7 +16,10 @@ from typing import Any
 
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
-from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
+from flash.engine.worker.verl.parallelism import (
+    ULYSSES_SEQUENCE_PARALLEL_SIZE,
+    resolve_reshard_after_forward,
+)
 
 
 @dataclass(frozen=True)
@@ -557,6 +560,18 @@ def _build_base_config(
         "n_gpus_per_node": runtime.gpu_count,
         # opd shards by DATA -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why.
         "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
+        # zero-2 vs zero-3, decided by the allocator's own fit model so the worker cannot spend
+        # memory the shape was not admitted with. the spec carries the SELECTED class and count
+        # (`_spec_with_gpu`), so this asks about the hardware the run actually landed on.
+        "reshard_after_forward": resolve_reshard_after_forward(
+            model_id=request.model_id,
+            algorithm="opd",
+            gpu_type=(_opd_train._w.JOB_SPEC.gpu.type if _opd_train._w.JOB_SPEC else ""),
+            n_gpus=int(runtime.gpu_count),
+            train=(_opd_train._w.JOB_SPEC.train if _opd_train._w.JOB_SPEC else None),
+            thinking=bool(_opd_train._w.THINKING),
+            model_revision=str(getattr(request, "model_revision", "") or ""),
+        ),
         "seed": _opd_train._w.backend_seed(_opd_train._w.SEED),
         "project_name": runtime.project_name,
         "experiment_name": runtime.experiment_name,
