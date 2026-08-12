@@ -42,13 +42,17 @@ bare `pip install freesolo-flash` does not - it is client-only and pulls nothing
 where you author environments without the server extra, validation fails until you add it:
 
 ```bash
-pip install freesolo                            # same interpreter as the CLI
-uv tool install freesolo-flash --with freesolo  # isolated tool venv: inject it there instead
+pip install freesolo                                     # same interpreter as the CLI
+uv tool install freesolo-flash --with freesolo --force   # existing uv tool: rewrite it with the SDK
+pipx inject freesolo-flash freesolo                      # existing pipx tool
 ```
 
-The second form matters if you installed the CLI with `uv tool` or `pipx`: the `flash` executable
-then lives in its own venv, and a plain `pip install freesolo` lands in your shell's interpreter
-instead - `python -c "import freesolo"` works while `flash env test` still fails.
+The lower two matter if you installed the CLI with `uv tool` or `pipx`: the `flash` executable then
+lives in its own venv, and a plain `pip install freesolo` lands in your shell's interpreter instead
+
+- `python -c "import freesolo"` works while `flash env test` still fails. Use the line for the
+  manager you installed with; `--force` is what makes `uv tool install` update an existing tool
+  rather than no-op, and pipx has no equivalent of `--with`, so the SDK goes in via `inject`.
 
 (`flash env eval` is not local in this sense. It evaluates a run against a **published** hub
 environment and refuses a generic `github:` ref outright, which is the only kind a standalone plane
