@@ -122,6 +122,38 @@ def test_runconfig_preserves_old_positional_constructor():
     )
 
 
+def test_a_malformed_retained_example_count_is_rejected_not_read_as_unknown():
+    """A bad row count must raise, because the width rule reads it as "no constraint" instead.
+
+    `sft_data_parallel_cards` treats a non-positive row count as "unknown, do not constrain" -- the
+    quote runs before the dataset is materialized, so that default is correct there. It is exactly
+    wrong for a malformed value: 0 or a negative silently credits every rented card, producing the
+    understated width and cost this field exists to prevent. A guard downstream cannot recover the
+    difference, since by then both cases look identical, so the type boundary has to reject it.
+    """
+    import pytest
+
+    from flash.cost.analytical import executed_gpu_count
+    from flash.cost.types import RunConfig
+
+    def config(rows):
+        return RunConfig("Qwen/Qwen3.6-27B", "sft", 10, batch_size=8, sft_retained_examples=rows)
+
+    for bad in (0, -5):
+        with pytest.raises(ValueError, match="sft_retained_examples must be >= 1"):
+            config(bad)
+    # bools are ints in python, and True would silently mean "one row" -- one rank, not a wide run.
+    for wrong_type in (True, False, 2.5, "8"):
+        with pytest.raises(TypeError, match="sft_retained_examples must be an integer"):
+            config(wrong_type)
+
+    # None still means UNKNOWN and must keep crediting every rented card: the quote legitimately
+    # runs before the row count exists, and narrowing there would reject runs that are fine.
+    assert executed_gpu_count(config(None), 4) == 4
+    # a real count still narrows, so the guard did not disable the rule it protects.
+    assert executed_gpu_count(config(10), 4) == 2
+
+
 def test_provisional_estimate_preserves_auto_provider():
     # Preparation stays offline: it cannot truthfully name a live substrate before allocation. The
     # lifecycle replaces this provisional provider/count/rate from the selected candidate.

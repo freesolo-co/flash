@@ -118,6 +118,20 @@ class RunConfig:
             raise ValueError("unsupported sft_packing_mode")
         if self.sft_packed_blocks is not None and self.sft_packed_blocks < 1:
             raise ValueError("sft_packed_blocks must be >= 1")
+        if self.sft_retained_examples is not None:
+            # a bad value here does not raise downstream, it UNDER-CREDITS: `sft_data_parallel_cards`
+            # reads a non-positive row count as "unknown, do not constrain", so 0 or a negative
+            # silently credits every rented card and quotes a width the run will not launch on --
+            # the exact failure the retained-example count was added to prevent. reject it here,
+            # where the type boundary is, rather than teaching the width rule to distrust its input.
+            if isinstance(self.sft_retained_examples, bool) or not isinstance(
+                self.sft_retained_examples, int
+            ):
+                raise TypeError("sft_retained_examples must be an integer or none")
+            if self.sft_retained_examples < 1:
+                raise ValueError(
+                    f"sft_retained_examples must be >= 1, got {self.sft_retained_examples}"
+                )
         if not isinstance(self.opd_multi_turn, bool):
             raise TypeError("opd_multi_turn must be a boolean")
         if self.opd_max_turns is not None and (
