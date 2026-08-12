@@ -448,6 +448,7 @@ from flash.providers.sharding import (  # noqa: E402,F401
     MAX_COMBINATION_CARDS,
     REPLICATED_PER_CARD_GB,
     SHARD_VRAM_EFFICIENCY,
+    ZERO2_CHARGED_RESIDENCY,
     ZERO2_WEIGHT_RESIDENCY,
     combined_vram_gb,
     zero2_enabled,

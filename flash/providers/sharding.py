@@ -31,14 +31,32 @@ MAX_COMBINATION_CARDS = 8
 # on the same model). Adding cards never amortizes it -- only the non-weight part shards -- so this
 # is a per-card floor, exactly like `REPLICATED_PER_CARD_GB`, and not a divisible pool term.
 ZERO2_WEIGHT_RESIDENCY = 0.883
+# What the GATE charges, which is deliberately more than what was measured. The constant above comes
+# from ONE model at 1.59B; the catalog runs up to 35B, so the gate extrapolates it as much as 22x
+# beyond its evidence. Charging the measured value directly leaves the biggest models almost no room
+# for that extrapolation to be wrong: 35B-A3B opd on 2x B200 clears the requirement by 0.4% and
+# breaks if the true residency is 0.906 (2.6% above measured), and 27B grpo on 4x H200 breaks at
+# 0.927 (5.0% above). An understatement there does not forgo a speedup, it OOMs a paid multi-card
+# run that ZeRO-3 would have completed.
+#
+# 1.25 is above 1.0 -- a FULL retained bf16 copy plus a quarter -- so the charge stays conservative
+# even if the residency is really "the whole weight copy and then some" at scale. It costs almost
+# nothing: 155 of the 168 firing configs survive it, and the 13 it drops are exactly the ones
+# sitting closest to the edge. Lower it only with matched multi-size measurements, never to admit a
+# specific shape.
+ZERO2_CHARGED_RESIDENCY = 1.25
 _BF16_BYTES_PER_PARAM = 2.0
 
 
 def zero2_replicated_floor_gb(params_b: float) -> float:
-    """Per-card VRAM floor under ZeRO-2: the ZeRO-3 floor plus the retained weight copy."""
+    """Per-card VRAM floor under ZeRO-2: the ZeRO-3 floor plus the retained weight copy.
+
+    Charges ``ZERO2_CHARGED_RESIDENCY``, not the bare measured ``ZERO2_WEIGHT_RESIDENCY`` -- see
+    that constant for why the extrapolation to catalog-scale models needs the margin.
+    """
     if params_b <= 0:
         return float(REPLICATED_PER_CARD_GB)
-    return REPLICATED_PER_CARD_GB + ZERO2_WEIGHT_RESIDENCY * params_b * _BF16_BYTES_PER_PARAM
+    return REPLICATED_PER_CARD_GB + ZERO2_CHARGED_RESIDENCY * params_b * _BF16_BYTES_PER_PARAM
 
 
 def combined_vram_gb(vram_gb: int, gpu_count: int, *, zero2_params_b: float = 0.0) -> float:

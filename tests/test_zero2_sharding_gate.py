@@ -20,6 +20,8 @@ from flash.engine.worker.train.opd.overrides import build_opd_overrides
 from flash.engine.worker.verl.parallelism import resolve_reshard_after_forward
 from flash.providers.base import (
     REPLICATED_PER_CARD_GB,
+    ZERO2_CHARGED_RESIDENCY,
+    ZERO2_WEIGHT_RESIDENCY,
     combined_vram_gb,
     zero2_enabled,
     zero2_replicated_floor_gb,
@@ -54,8 +56,22 @@ def test_zero2_floor_is_the_zero3_floor_plus_a_retained_weight_copy():
     for params_b in _CATALOG_PARAMS_B:
         floor = zero2_replicated_floor_gb(params_b)
         assert floor > REPLICATED_PER_CARD_GB
-        # measured constant: 0.883 x the full bf16 weight size, independent of width.
-        assert floor == pytest.approx(REPLICATED_PER_CARD_GB + 0.883 * params_b * 2.0)
+        # the CHARGED constant, deliberately above the measured 0.883: the measurement comes from
+        # one 1.59B model and the catalog runs to 35B, so the gate pays for that extrapolation.
+        assert floor == pytest.approx(
+            REPLICATED_PER_CARD_GB + ZERO2_CHARGED_RESIDENCY * params_b * 2.0
+        )
+        assert ZERO2_CHARGED_RESIDENCY > ZERO2_WEIGHT_RESIDENCY
+
+
+def test_the_gate_charges_more_than_it_measured():
+    """A full retained bf16 copy, plus margin, is the floor the gate is allowed to assume.
+
+    The residency was measured once, at 1.59B. Charging it bare left 35B-A3B opd on 2x B200 clearing
+    its requirement by 0.4%, which an extrapolation error of 2.6% would turn into an OOM on a paid
+    multi-card run. Anything at or below 1.0 would be assuming the retained copy is FREE in part.
+    """
+    assert ZERO2_CHARGED_RESIDENCY >= 1.0
 
 
 @pytest.mark.parametrize("params_b", _CATALOG_PARAMS_B)
@@ -137,10 +153,14 @@ def test_a_shape_without_room_for_the_retained_copy_stays_on_zero3():
 
 
 def test_a_shape_with_room_takes_zero2():
-    """The gate has to actually fire somewhere, or it is dead code shipped as an optimization."""
-    assert zero2_enabled(32, 2, 4.7, 41)
+    """The gate has to actually fire somewhere, or it is dead code shipped as an optimization.
+
+    A small model on big cards is where the retained copy is cheapest relative to the card, so this
+    is the shape class the gate exists to serve.
+    """
+    assert zero2_enabled(80, 2, 0.9, 84)
     assert not resolve_reshard_after_forward(
-        model_id="Qwen/Qwen3.5-4B", algorithm="opd", gpu_type="RTX 5090", n_gpus=2
+        model_id="Qwen/Qwen3.5-0.8B", algorithm="opd", gpu_type="A100 SXM", n_gpus=2
     )
 
 
