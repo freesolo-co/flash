@@ -818,6 +818,71 @@ def test_a_content_filtered_completion_is_not_exported_as_a_training_target(trac
     assert export["skipped"] == 1
 
 
+@pytest.mark.parametrize(
+    ("action_key", "action"),
+    [
+        (
+            "tool_calls",
+            [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"id": 7}'},
+                }
+            ],
+        ),
+        ("function_call", {"name": "lookup", "arguments": '{"id": 7}'}),
+    ],
+)
+def test_a_reply_with_text_and_tool_calls_is_not_exported_as_text_only(
+    trace_api, action_key, action
+) -> None:
+    """One assistant action can contain both visible text and a tool invocation. Exporting only the
+    text silently changes what happened and trains an incomplete target, so the whole row must skip.
+    """
+    owner = db.ensure_standalone_owner()
+    response = _reply_envelope("I will look that up.")
+    response["choices"][0]["finish_reason"] = "tool_calls"
+    response["choices"][0]["message"][action_key] = action
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="tool call",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=response)],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == []
+    assert export["skipped"] == 1
+
+
+def test_a_text_only_reply_still_exports_after_tool_call_filtering(trace_api) -> None:
+    """The tool-call guard must not reduce ordinary completed assistant text, which remains a complete
+    action and is the primary records export path.
+    """
+    owner = db.ensure_standalone_owner()
+    response = _reply_envelope("complete")
+    response["choices"][0]["finish_reason"] = "stop"
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="text only",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=response)],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == [{"input": "hello", "output": "complete"}]
+    assert export["skipped"] == 0
+
+
 def test_a_completion_without_a_finish_reason_still_exports(trace_api) -> None:
     """Older and non-OpenAI-shaped providers may omit `finish_reason` entirely. Absence is not an
     explicit failure signal, so rejecting it would silently empty otherwise valid provider exports."""
@@ -891,6 +956,116 @@ def test_a_string_truncated_payload_is_skipped_by_converted_exports(trace_api) -
     assert prompts["skipped"] == 1
 
 
+def test_a_collection_clipped_payload_is_marked_and_skipped(trace_api, monkeypatch) -> None:
+    """Dropping a collection tail changes the request just as surely as shortening a string. Without
+    the marker, the bounded prefix looked intact and converted into a prompt the model never received.
+    """
+    monkeypatch.setattr(platform_traces, "_MAX_PAYLOAD_COLLECTION", 2)
+    owner = db.ensure_standalone_owner()
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="clipped collection",
+        metadata=None,
+        spans=[
+            TraceSpan(
+                input_payload={
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"text": "first "},
+                                {"text": "second"},
+                                {"text": " dropped"},
+                            ],
+                        }
+                    ]
+                },
+                output_payload=_reply_envelope("reply"),
+            )
+        ],
+    )
+
+    raw = export_traces(key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000)
+    records = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    span = raw["records"][0]["spans"][0]
+    assert span["input_payload"]["messages"] == [
+        {"role": "user", "content": [{"text": "first "}, {"text": "second"}]}
+    ]
+    assert span["attributes"] == {"payload_truncated": ["input"]}
+    assert records["records"] == []
+    assert records["skipped"] == 1
+
+
+def test_an_output_only_truncation_keeps_the_intact_prompt(trace_api) -> None:
+    """Prompts deliberately need no usable reply. An oversized completion must still disqualify a
+    records pair, but sharing its marker with the intact request silently discarded valid GRPO input.
+    """
+    owner = db.ensure_standalone_owner()
+    oversized_reply = "y" * (platform_traces.MAX_PAYLOAD_VALUE_LENGTH + 1)
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="output truncated",
+        metadata=None,
+        spans=[
+            TraceSpan(
+                input_payload=_REQUEST,
+                output_payload=_reply_envelope(oversized_reply),
+            )
+        ],
+    )
+
+    prompts = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="prompts", limit=1000
+    )
+    records = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+    raw = export_traces(key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000)
+
+    assert prompts["records"] == [{"input": "hello"}]
+    assert prompts["skipped"] == 0
+    assert records["records"] == []
+    assert records["skipped"] == 1
+    assert raw["records"][0]["spans"][0]["attributes"] == {"payload_truncated": ["output"]}
+
+
+def test_an_input_truncation_disqualifies_records_and_prompts(trace_api) -> None:
+    """Every converted shape requires the request. If its stored text was shortened, neither a pair
+    nor a prompt-only row represents what the provider saw, even when the reply remains intact.
+    """
+    owner = db.ensure_standalone_owner()
+    oversized_prompt = "x" * (platform_traces.MAX_PAYLOAD_VALUE_LENGTH + 1)
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="input truncated",
+        metadata=None,
+        spans=[
+            TraceSpan(
+                input_payload={"messages": [{"role": "user", "content": oversized_prompt}]},
+                output_payload=_reply_envelope("reply"),
+            )
+        ],
+    )
+
+    records = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+    prompts = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="prompts", limit=1000
+    )
+
+    assert records["records"] == []
+    assert records["skipped"] == 1
+    assert prompts["records"] == []
+    assert prompts["skipped"] == 1
+
+
 def test_a_string_truncated_payload_remains_available_in_raw_export(trace_api) -> None:
     """Raw is the diagnostic escape hatch and must never hide a trace because converted training
     formats reject it. It preserves both the bounded payload and the marker explaining the mutation."""
@@ -914,7 +1089,24 @@ def test_a_string_truncated_payload_remains_available_in_raw_export(trace_api) -
     span = raw["records"][0]["spans"][0]
     assert raw["skipped"] == 0
     assert span["output_payload"]["choices"][0]["message"]["content"].endswith("...")
-    assert span["attributes"] == {"payload_truncated": True}
+    assert span["attributes"] == {"payload_truncated": ["output"]}
+
+
+def test_unexpected_truncation_marker_shapes_do_not_hide_converted_rows() -> None:
+    """Stored attributes are caller-facing raw data and may be absent, malformed, or from another
+    producer. Only the exact side-list marker written by this recorder may suppress converted output.
+    """
+    base_span = {
+        "input_payload": _REQUEST,
+        "output_payload": _reply_envelope("reply"),
+        "status_code": "OK",
+    }
+    for attributes in (None, "not-a-dict", {"payload_truncated": True}, {"payload_truncated": 7}):
+        raw = {"spans": [{**base_span, "attributes": attributes}]}
+        assert platform_traces._export_record(raw, "records") == {
+            "input": "hello",
+            "output": "reply",
+        }
 
 
 def test_an_untruncated_trace_keeps_null_attributes(trace_api) -> None:
@@ -1036,7 +1228,7 @@ def test_an_aggregate_oversized_payload_is_dropped_marked_and_skipped(
     dropped = span["input_payload"]["flash_payload_dropped"]
     assert dropped["reason"] == "payload exceeded the stored size limit"
     assert dropped["bytes"] > platform_traces.MAX_PAYLOAD_TOTAL_BYTES
-    assert span["attributes"] == {"payload_truncated": True}
+    assert span["attributes"] == {"payload_truncated": ["input"]}
     assert records["records"] == []
     assert records["skipped"] == 1
 
@@ -1065,7 +1257,7 @@ def test_the_aggregate_payload_cap_counts_encoded_bytes_not_characters(
 
     span = raw["records"][0]["spans"][0]
     assert "flash_payload_dropped" in span["input_payload"]
-    assert span["attributes"] == {"payload_truncated": True}
+    assert span["attributes"] == {"payload_truncated": ["input"]}
 
 
 def test_a_capped_export_reports_that_it_is_incomplete(trace_api) -> None:
@@ -1201,6 +1393,66 @@ def test_a_long_completion_is_stored_whole(trace_api) -> None:
     ).json()
 
     assert records["records"] == [{"input": "hi", "output": long_reply}]
+
+
+def test_conventional_cloud_credential_fields_are_redacted(trace_api, monkeypatch) -> None:
+    """Cloud SDKs conventionally name credentials `access_key_id`, `secret_key`, and
+    `secret_access_key`. Suffix matching missed all three normalized forms, so unrelated credentials
+    in metadata or tool arguments survived into raw exports even though ordinary tokens did not.
+    """
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+    body = {
+        **_REQUEST,
+        "metadata": {
+            "access_key_id": "AKIAEXAMPLE",
+            "secret_key": "short-secret",
+            "secret_access_key": "long-secret",
+        },
+        "tool_arguments": {"accesskey": "tool-secret"},
+    }
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=body)
+
+    assert response.status_code == 200
+    stored = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]
+    assert stored["metadata"] == {
+        "access_key_id": "[redacted]",
+        "secret_key": "[redacted]",
+        "secret_access_key": "[redacted]",
+    }
+    assert stored["tool_arguments"]["accesskey"] == "[redacted]"
+
+
+def test_a_bare_key_field_is_not_mistaken_for_a_credential(trace_api, monkeypatch) -> None:
+    """`key` is ordinary data in schemas and tool arguments. Redacting it to catch access keys would
+    mutate common requests and make the stored raw trace differ from the call the provider received.
+    """
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+    body = {
+        **_REQUEST,
+        "tool_arguments": {"key": "customer-id"},
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"key": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    }
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=body)
+
+    assert response.status_code == 200
+    stored = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]
+    assert stored["tool_arguments"]["key"] == "customer-id"
+    assert stored["tools"][0]["function"]["parameters"]["properties"]["key"] == {"type": "string"}
 
 
 def test_an_empty_schema_under_a_secret_name_survives_redaction(trace_api, monkeypatch) -> None:
@@ -1858,13 +2110,18 @@ def test_a_mid_stream_error_envelope_marks_the_stream_errored(trace_api, monkeyp
 
 
 def test_a_large_successful_non_sse_stream_body_is_kept_whole(trace_api, monkeypatch) -> None:
-    """The 64 KiB bound exists for ERROR bodies, which are stored truncated anyway. Applying it to
-    a successful non-SSE completion cut the JSON mid-object, so it failed to decode and `records`
-    skipped a reply the caller was billed for and did receive."""
-    reply = "y" * 200_000
+    """A successful body may exceed the per-string cap while remaining below the aggregate payload
+    cap. Cutting it at 1 MB makes valid multi-field JSON undecodable before persistence can accept it.
+    """
+    reply = "y" * 600_000
     payload = json.dumps(
-        {"choices": [{"message": {"role": "assistant", "content": reply}}]}
+        {
+            "choices": [{"message": {"role": "assistant", "content": reply}}],
+            "provider_details": reply,
+        }
     ).encode()
+    assert len(payload) > platform_traces.MAX_PAYLOAD_VALUE_LENGTH
+    assert len(payload) < platform_traces.MAX_PAYLOAD_TOTAL_BYTES
 
     class _BigJsonStreamingClient(_StreamingAsyncClient):
         requests: ClassVar[list[dict]] = []
@@ -1889,6 +2146,39 @@ def test_a_large_successful_non_sse_stream_body_is_kept_whole(trace_api, monkeyp
     span = _raw(trace_api)["records"][0]["spans"][0]
     # decoded as JSON, not stored as a truncated text prefix
     assert span["output_payload"]["choices"][0]["message"]["content"] == reply
+    assert span["output_payload"]["provider_details"] == reply
+
+
+def test_an_error_non_sse_stream_body_remains_capped_at_64_kib(trace_api, monkeypatch) -> None:
+    """Provider failures are diagnostics, not training payloads. Keeping only 64 KiB prevents an
+    attacker-sized error response from growing proxy memory even though successful bodies get 8 MiB.
+    """
+    payload = b"e" * (traces._MAX_RECORDED_ERROR_BYTES + 10_000)
+
+    class _BigErrorStreamingClient(_StreamingAsyncClient):
+        requests: ClassVar[list[dict]] = []
+        body = _StreamingBody([payload])
+
+        async def send(self, request, *, stream) -> httpx.Response:
+            assert stream is True
+            return httpx.Response(
+                500,
+                headers={"content-type": "text/plain"},
+                stream=type(self).body,
+                request=request,
+            )
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _BigErrorStreamingClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 500
+    assert response.content == payload
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["output_payload"] == "e" * traces._MAX_RECORDED_ERROR_BYTES
+    assert span["status_code"] == "ERROR"
 
 
 def test_an_export_that_ends_on_the_last_row_is_not_reported_truncated(

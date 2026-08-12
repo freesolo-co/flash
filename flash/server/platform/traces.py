@@ -48,6 +48,8 @@ _MAX_PAYLOAD_COLLECTION = 100_000
 _PAYLOAD_TRUNCATED_ATTRIBUTE = "payload_truncated"
 # absent finish reasons are accepted for providers and older envelopes that never supplied one;
 # explicit unknown reasons are rejected because they are not evidence of a clean terminal response.
+# `tool_calls` is a clean termination signal, but the message payload check below still rejects it
+# because converted text cannot represent the whole assistant action.
 _ACCEPTED_FINISH_REASONS = {None, "stop", "tool_calls"}
 
 
@@ -99,6 +101,8 @@ def sanitize_json_value(
     if isinstance(value, str):
         return _truncate(value, limit, flag=flag)
     if isinstance(value, dict):
+        if len(value) > keys and flag is not None:
+            flag.hit = True
         return {
             _truncate(str(key), limit, flag=flag): sanitize_json_value(
                 item,
@@ -111,6 +115,8 @@ def sanitize_json_value(
             for key, item in itertools.islice(value.items(), keys)
         }
     if isinstance(value, list | tuple):
+        if len(value) > items and flag is not None:
+            flag.hit = True
         return [
             sanitize_json_value(
                 item,
@@ -154,13 +160,14 @@ def store_trace(
     serialized_metadata = _json_dump(metadata)
     serialized_spans = []
     for span in spans:
-        truncation = _TruncationFlag()
+        input_truncation = _TruncationFlag()
+        output_truncation = _TruncationFlag()
         input_payload = _json_dump(
             span.input_payload,
             max_string=MAX_PAYLOAD_VALUE_LENGTH,
             max_depth=_MAX_PAYLOAD_DEPTH,
             max_collection=_MAX_PAYLOAD_COLLECTION,
-            flag=truncation,
+            flag=input_truncation,
             max_bytes=MAX_PAYLOAD_TOTAL_BYTES,
         )
         output_payload = _json_dump(
@@ -168,15 +175,22 @@ def store_trace(
             max_string=MAX_PAYLOAD_VALUE_LENGTH,
             max_depth=_MAX_PAYLOAD_DEPTH,
             max_collection=_MAX_PAYLOAD_COLLECTION,
-            flag=truncation,
+            flag=output_truncation,
             max_bytes=MAX_PAYLOAD_TOTAL_BYTES,
         )
         attributes = dict(span.attributes) if span.attributes is not None else None
-        if truncation.hit:
+        truncated_sides = [
+            side
+            for side, flag in (("input", input_truncation), ("output", output_truncation))
+            if flag.hit
+        ]
+        if truncated_sides:
             # the marker last, so a caller-supplied attribute of the same name cannot overwrite it.
-            # it is the only signal that a stored payload is no longer the payload, and `records`
-            # skips the row on it alone.
-            attributes = {**(attributes or {}), _PAYLOAD_TRUNCATED_ATTRIBUTE: True}
+            # converted exports can now reject only the payload side their row actually requires.
+            attributes = {
+                **(attributes or {}),
+                _PAYLOAD_TRUNCATED_ATTRIBUTE: truncated_sides,
+            }
         serialized_spans.append(
             (
                 str(uuid.uuid4()),
@@ -309,13 +323,15 @@ def _export_record(raw: dict[str, Any], export_format: str) -> dict[str, Any] | 
     """One export row in the requested shape, or None when the trace has nothing usable in it."""
     if export_format == "raw":
         return raw
-    if any(_span_payload_was_truncated(span) for span in raw["spans"]):
+    if any(_span_payload_was_truncated(span, "input") for span in raw["spans"]):
         return None
     input_payload, output_payload = _training_pair(raw["spans"])
     if not _usable_payload(input_payload):
         return None
     if export_format == "prompts":
         return {"input": input_payload}
+    if any(_span_payload_was_truncated(span, "output") for span in raw["spans"]):
+        return None
     if not _usable_payload(output_payload):
         return None
     return {"input": input_payload, "output": output_payload}
@@ -350,9 +366,16 @@ def _raw_trace(trace_row: Any, span_rows: list[Any]) -> dict[str, Any]:
     }
 
 
-def _span_payload_was_truncated(span: dict[str, Any]) -> bool:
+def _span_payload_was_truncated(span: dict[str, Any], side: str) -> bool:
     attributes = span.get("attributes")
-    return isinstance(attributes, dict) and attributes.get(_PAYLOAD_TRUNCATED_ATTRIBUTE) is True
+    if not isinstance(attributes, dict):
+        return False
+    truncated = attributes.get(_PAYLOAD_TRUNCATED_ATTRIBUTE)
+    return (
+        isinstance(truncated, list)
+        and all(isinstance(item, str) for item in truncated)
+        and side in truncated
+    )
 
 
 def _training_pair(spans: list[dict[str, Any]]) -> tuple[Any, Any]:
@@ -419,7 +442,12 @@ def _chat_reply(payload: Any) -> str | None:
         return None
     if choice.get("finish_reason") not in _ACCEPTED_FINISH_REASONS:
         return None
-    return _message_text(choice["message"].get("content"))
+    message = choice["message"]
+    if message.get("tool_calls") or message.get("function_call"):
+        # a training target must contain the whole assistant action. exporting only the accompanying
+        # text would silently discard the invocation, so skipping the row is the only faithful choice.
+        return None
+    return _message_text(message.get("content"))
 
 
 def _message_text(content: Any) -> str | None:

@@ -20,7 +20,7 @@ from flash.core.spec import require_project_id
 from flash.server.platform.deps import require_key
 from flash.server.platform.traces import (
     MAX_EXPORT_TRACES,
-    MAX_PAYLOAD_VALUE_LENGTH,
+    MAX_PAYLOAD_TOTAL_BYTES,
     TraceSpan,
     export_traces,
     list_projects,
@@ -65,6 +65,11 @@ _SAFE_PROVIDER_RESPONSE_HEADER_PREFIXES = ("x-ratelimit-", "anthropic-ratelimit-
 _SECRET_KEY_EXACT = frozenset({"authorization", "proxyauthorization"})
 _SECRET_KEY_SUFFIXES = (
     "apikey",
+    # conventional cloud credential fields end in these normalized forms. bare `key` is deliberately
+    # excluded because JSON schemas and tool arguments use it pervasively for harmless data.
+    "accesskeyid",
+    "secretkey",
+    "accesskey",
     "secret",
     "token",
     "password",
@@ -703,7 +708,7 @@ async def _stream_response(
     raw_output_limit = (
         _MAX_RECORDED_ERROR_BYTES
         if _is_error_status(upstream_response.status_code)
-        else MAX_PAYLOAD_VALUE_LENGTH
+        else MAX_PAYLOAD_TOTAL_BYTES
     )
     done_gate = _SseDoneGate() if context.record_trace and not raw_body else None
     error = _error_for_status(upstream_response.status_code)
@@ -715,9 +720,8 @@ async def _stream_response(
                     # bounded, but by which bound depends on what the body IS. an error body is
                     # stored truncated anyway, so retaining an unbounded one only to discard most
                     # of it lets one response grow the plane's memory without limit. a SUCCESSFUL
-                    # non-SSE body is a real completion the payload caps are sized for, and the
-                    # 64 KiB error bound would cut it mid-JSON -- it would then fail to decode and
-                    # `records` would skip a reply the caller was billed for and did receive.
+                    # non-SSE body keeps exactly the aggregate bound persistence accepts, so a body
+                    # that could be stored whole is not pre-truncated into undecodable JSON.
                     if len(raw_output) < raw_output_limit:
                         raw_output.extend(chunk[: raw_output_limit - len(raw_output)])
                 else:
