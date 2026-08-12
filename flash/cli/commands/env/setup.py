@@ -570,9 +570,12 @@ def _traces_dataset(args, project_id: str) -> str | None:
     # project comes back cut short. `traces export` says so; scaffolding a dataset silently would
     # let someone train on a partial project believing it was the whole one.
     if exported.get("truncated"):
+        # no "run it again to get the rest": the export always reads the NEWEST rows and offers no
+        # cursor or offset, so re-running returns the same prefix. say what the scaffold holds and
+        # leave it there rather than advertising a recovery path that cannot complete the dataset.
         _warn(
-            f"{project_id} holds more traces than one export can read, so these are the newest "
-            f"rows only. Run `{CLI_NAME} traces export` to page through the rest"
+            f"{project_id} holds more traces than one export can read, so this dataset is the "
+            "newest rows only"
         )
     return traces.records_to_jsonl(records)
 

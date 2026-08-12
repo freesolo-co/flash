@@ -20,6 +20,7 @@ from flash.core.spec import require_project_id
 from flash.server.platform.deps import require_key
 from flash.server.platform.traces import (
     MAX_EXPORT_TRACES,
+    MAX_PAYLOAD_VALUE_LENGTH,
     TraceSpan,
     export_traces,
     list_projects,
@@ -523,6 +524,12 @@ class _SseAccumulator:
         self._envelope: dict[str, Any] = {}
         self._done = False
         self.usage: Any = None
+        # why this stream cannot be trusted as a complete reply, if anything went wrong in it. a
+        # 200 SSE stream can still fail: an unparseable `data:` event drops a fragment out of the
+        # middle of the text, and a `data: {"error": ...}` envelope reports a mid-stream failure.
+        # both used to leave the span `OK`, so `records` exported the surviving text as a complete
+        # training target with a hole in it.
+        self.defect: str | None = None
 
     def feed(self, chunk: bytes) -> None:
         self._buffer += chunk
@@ -534,6 +541,11 @@ class _SseAccumulator:
         if self._buffer:
             self._consume_line(self._buffer.rstrip(b"\r"))
             self._buffer = b""
+
+    def _note_defect(self, reason: str) -> None:
+        """Record the FIRST thing that went wrong; later ones are usually consequences of it."""
+        if self.defect is None:
+            self.defect = reason
 
     @property
     def received(self) -> bool:
@@ -596,9 +608,15 @@ class _SseAccumulator:
         try:
             payload = json.loads(data)
         except (json.JSONDecodeError, UnicodeDecodeError):
+            self._note_defect("stream contained an unparseable data event")
             return
         if not isinstance(payload, dict):
+            self._note_defect("stream contained a non-object data event")
             return
+        if payload.get("error") is not None:
+            # providers report a mid-stream failure in-band, as a data event on a 200 response,
+            # sometimes after real deltas have already arrived. the partial text is not a reply.
+            self._note_defect("upstream reported an error mid-stream")
         self._envelope.update(
             {key: value for key, value in payload.items() if key not in {"choices", "usage"}}
         )
@@ -682,6 +700,11 @@ async def _stream_response(
     # non-SSE body, but a 2xx gateway envelope is another, and feeding either to the accumulator
     # stores None in place of the bytes the caller actually received.
     raw_body = not _is_event_stream(upstream_response)
+    raw_output_limit = (
+        _MAX_RECORDED_ERROR_BYTES
+        if _is_error_status(upstream_response.status_code)
+        else MAX_PAYLOAD_VALUE_LENGTH
+    )
     done_gate = _SseDoneGate() if context.record_trace and not raw_body else None
     error = _error_for_status(upstream_response.status_code)
     client_disconnected = False
@@ -689,11 +712,14 @@ async def _stream_response(
         async for chunk in upstream_response.aiter_bytes():
             if context.record_trace:
                 if raw_body:
-                    # bounded: a raw body is stored truncated anyway, so retaining an unbounded
-                    # one only to throw most of it away lets a single upstream response grow the
-                    # plane's memory without limit. the caller still receives every byte below.
-                    if len(raw_output) < _MAX_RECORDED_ERROR_BYTES:
-                        raw_output.extend(chunk[: _MAX_RECORDED_ERROR_BYTES - len(raw_output)])
+                    # bounded, but by which bound depends on what the body IS. an error body is
+                    # stored truncated anyway, so retaining an unbounded one only to discard most
+                    # of it lets one response grow the plane's memory without limit. a SUCCESSFUL
+                    # non-SSE body is a real completion the payload caps are sized for, and the
+                    # 64 KiB error bound would cut it mid-JSON -- it would then fail to decode and
+                    # `records` would skip a reply the caller was billed for and did receive.
+                    if len(raw_output) < raw_output_limit:
+                        raw_output.extend(chunk[: raw_output_limit - len(raw_output)])
                 else:
                     accumulator.feed(chunk)
             if done_gate is None:
@@ -738,12 +764,27 @@ async def _stream_response(
                         output_payload = accumulator.output() if accumulator.received else None
                         if error is None and accumulator.received and not accumulator.terminal:
                             error = "upstream stream ended before completion"
+                        # a defect outranks a clean finish: a stream can drop a fragment or carry
+                        # an error envelope and still deliver `[DONE]`, which would otherwise
+                        # store the holed text as an OK reply for `records` to train on.
+                        if accumulator.defect is not None:
+                            error = error or accumulator.defect
                     await _record_trace(context, output_payload=output_payload, error=error)
     if not client_disconnected and done_gate is not None:
         if context.record_failed:
             yield b": freesolo-record-failed\n\n"
         if done_gate.done_event is not None:
             yield done_gate.done_event
+    elif not client_disconnected and context.record_failed:
+        # a non-SSE streamed body cannot carry the SSE comment -- appending one to JSON is the
+        # corruption an earlier fix removed -- and the headers left before persistence ran, so the
+        # header cannot say it either. log it: a silent failure would let a collection run finish
+        # believing every paid call was recorded while its export quietly omits this one.
+        logger.warning(
+            "trace not recorded for a streamed non-SSE response (project=%s, provider=%s)",
+            context.project_id,
+            context.provider,
+        )
 
 
 def _request_context(

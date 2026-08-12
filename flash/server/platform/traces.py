@@ -33,7 +33,7 @@ _MAX_IDENTIFIER_LENGTH = 500
 # a training row, so cutting it at the 8 KiB attribute bound would ship a truncated target with an
 # ellipsis in it and no indication the text was ever longer. they still need A bound -- an untrimmed
 # payload is unbounded rows in SQLite -- just one far above any real chat completion.
-_MAX_PAYLOAD_VALUE_LENGTH = 1_000_000
+MAX_PAYLOAD_VALUE_LENGTH = 1_000_000
 # likewise for nesting. an ordinary tool schema (`tools[] > function > parameters > properties >
 # field > type`) already sits at depth 6, so the attribute depth would repr() the leaf and store a
 # JSON schema as the string "{}".
@@ -150,13 +150,13 @@ def store_trace(
             span.output_tokens,
             _json_dump(
                 span.input_payload,
-                max_string=_MAX_PAYLOAD_VALUE_LENGTH,
+                max_string=MAX_PAYLOAD_VALUE_LENGTH,
                 max_depth=_MAX_PAYLOAD_DEPTH,
                 max_collection=_MAX_PAYLOAD_COLLECTION,
             ),
             _json_dump(
                 span.output_payload,
-                max_string=_MAX_PAYLOAD_VALUE_LENGTH,
+                max_string=MAX_PAYLOAD_VALUE_LENGTH,
                 max_depth=_MAX_PAYLOAD_DEPTH,
                 max_collection=_MAX_PAYLOAD_COLLECTION,
             ),
@@ -259,7 +259,10 @@ def export_traces(
             # characters let an emoji-heavy export ship several times the nominal budget.
             remaining_bytes -= len(json.dumps(record, ensure_ascii=False).encode("utf-8"))
             if remaining_bytes <= 0:
-                truncated = True
+                # exhausting the budget ON the last row is not truncation: everything was
+                # returned. claiming otherwise sends the CLI and the env scaffold to warn about
+                # older traces that do not exist.
+                truncated = truncated or examined < len(trace_rows)
                 break
 
     return {

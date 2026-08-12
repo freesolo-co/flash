@@ -1498,3 +1498,164 @@ def test_a_multimodal_prompt_is_skipped_rather_than_stripped_to_its_text(trace_a
 
     assert records["records"] == []
     assert records["skipped"] == 1
+
+
+def test_a_malformed_data_event_marks_the_stream_errored(trace_api, monkeypatch) -> None:
+    """A 200 SSE stream can still be broken. An unparseable `data:` event between valid deltas
+    drops a fragment out of the MIDDLE of the reply, and the stream can still deliver a finish
+    reason and `[DONE]` afterwards -- so the span looked OK and `records` exported text with a
+    hole in it as a complete training target."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"hel"}}]}\n\n',
+            b"data: {not json at all\n\n",
+            b'data: {"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert "unparseable" in span["error"]
+    # and the holed text must not become a training row
+    records = export_traces(
+        key_id=db.ensure_standalone_owner()["id"],
+        project_id=_PROJECT_ID,
+        export_format="records",
+        limit=1000,
+    )
+    assert records["records"] == []
+
+
+def test_a_mid_stream_error_envelope_marks_the_stream_errored(trace_api, monkeypatch) -> None:
+    """Providers report a mid-stream failure in-band: a `data: {"error": ...}` event on a 200
+    response, sometimes after real deltas already arrived. A trailing `[DONE]` then made the
+    accumulator terminal, so the partial text was stored OK and exported as a finished reply."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n',
+            b'data: {"error":{"message":"provider overloaded"}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert "error mid-stream" in span["error"]
+
+
+def test_a_large_successful_non_sse_stream_body_is_kept_whole(trace_api, monkeypatch) -> None:
+    """The 64 KiB bound exists for ERROR bodies, which are stored truncated anyway. Applying it to
+    a successful non-SSE completion cut the JSON mid-object, so it failed to decode and `records`
+    skipped a reply the caller was billed for and did receive."""
+    reply = "y" * 200_000
+    payload = json.dumps(
+        {"choices": [{"message": {"role": "assistant", "content": reply}}]}
+    ).encode()
+
+    class _BigJsonStreamingClient(_StreamingAsyncClient):
+        requests: ClassVar[list[dict]] = []
+        body = _StreamingBody([payload])
+
+        async def send(self, request, *, stream) -> httpx.Response:
+            assert stream is True
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=type(self).body,
+                request=request,
+            )
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _BigJsonStreamingClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    # decoded as JSON, not stored as a truncated text prefix
+    assert span["output_payload"]["choices"][0]["message"]["content"] == reply
+
+
+def test_an_export_that_ends_on_the_last_row_is_not_reported_truncated(
+    trace_api, monkeypatch
+) -> None:
+    """Exhausting the byte budget ON the final row is not truncation -- everything was returned.
+    Reporting it anyway sends the CLI and the environment scaffold to warn about older traces that
+    do not exist."""
+    monkeypatch.setattr(platform_traces, "MAX_EXPORT_BYTES", 200)
+    owner = db.ensure_standalone_owner()
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="only one",
+        metadata=None,
+        spans=[
+            TraceSpan(
+                input_payload={"messages": [{"role": "user", "content": "q"}]},
+                output_payload=_reply_envelope("y" * 400),
+            )
+        ],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert len(export["records"]) == 1
+    assert export["truncated"] is False
+
+
+def test_a_failed_recording_on_a_non_sse_stream_is_reported(trace_api, monkeypatch, caplog) -> None:
+    """A non-SSE streamed body cannot carry the SSE failure comment (appending one to JSON is the
+    corruption an earlier fix removed) and its headers left before persistence ran, so neither
+    caller-facing signal is available. It must at least not fail silently: a silent drop lets a
+    collection run finish believing every paid call was recorded."""
+    envelope = b'{"choices":[{"message":{"role":"assistant","content":"hi"}}]}'
+
+    class _JsonStreamClient(_StreamingAsyncClient):
+        requests: ClassVar[list[dict]] = []
+        body = _StreamingBody([envelope])
+
+        async def send(self, request, *, stream) -> httpx.Response:
+            assert stream is True
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=type(self).body,
+                request=request,
+            )
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _JsonStreamClient)
+    monkeypatch.setattr(
+        traces,
+        "store_trace",
+        lambda **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+    )
+
+    with caplog.at_level("WARNING"):
+        response = trace_api.post(
+            "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+        )
+
+    assert response.status_code == 200
+    # the caller still receives the provider's body unaltered -- no SSE comment spliced into JSON
+    assert response.content == envelope
+    assert any("trace not recorded" in record.message for record in caplog.records)

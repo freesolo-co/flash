@@ -456,7 +456,10 @@ def test_env_setup_says_when_the_scaffolded_traces_are_only_the_newest(
     captured = capsys.readouterr()
     assert "exported 2 rows from your traces" in captured.out
     assert "newest" in captured.err
-    assert "traces export" in captured.err
+    # and it must NOT offer a way to fetch the rest: the export always reads the newest rows and
+    # has no cursor or offset, so re-running returns the same prefix. advertising a recovery path
+    # that cannot complete the dataset is worse than saying nothing.
+    assert "traces export" not in captured.err
 
 
 def test_env_setup_scaffolds_starter_rows_when_declined(fake_traces, monkeypatch, tmp_path) -> None:
