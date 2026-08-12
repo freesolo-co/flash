@@ -20,6 +20,7 @@ from flash.engine.worker.train.opd.overrides import build_opd_overrides
 from flash.engine.worker.verl.parallelism import resolve_reshard_after_forward
 from flash.providers.base import (
     REPLICATED_PER_CARD_GB,
+    SHARD_VRAM_EFFICIENCY,
     ZERO2_CHARGED_RESIDENCY,
     ZERO2_WEIGHT_RESIDENCY,
     combined_vram_gb,
@@ -162,6 +163,47 @@ def test_a_shape_with_room_takes_zero2():
     assert not resolve_reshard_after_forward(
         model_id="Qwen/Qwen3.5-0.8B", algorithm="opd", gpu_type="A100 SXM", n_gpus=2
     )
+
+
+def test_the_gate_never_admits_more_than_a_card_physically_holds():
+    """Every enabled shape must fit CARD-BY-CARD, not just in the pooled model.
+
+    The pooled comparison is not sufficient on its own: `combined_vram_gb` ends in a trailing
+    addend, and adding the ZeRO-2 floor there instead of `REPLICATED_PER_CARD_GB` refunds exactly
+    the retained copy the floor just charged. That refund is invisible to a pooled check (the gate
+    and the capacity move together) but shows up immediately here, because `need` never included a
+    retained copy. It admitted 10 catalog shapes whose per-card demand exceeded the card, including
+    35B-A3B opd on 2x B200 asking 210.79 GB of a 180 GB card -- paid runs ZeRO-3 would have
+    completed.
+    """
+    from flash.engine.plan.vram import model_required_vram_gb
+    from flash.providers.base import get_gpu_info
+
+    impossible = []
+    fired = 0
+    for model_id in MODELS:
+        params_b = float(MODELS[model_id].params_b)
+        for algorithm in ("grpo", "opd"):
+            need = float(model_required_vram_gb(model_id, algorithm))
+            for gpu_type in ("RTX 4090", "RTX 5090", "A100 PCIe", "H200", "B200"):
+                vram = int(get_gpu_info(gpu_type).vram_gb)
+                for n_gpus in _WIDTHS:
+                    if not zero2_enabled(vram, n_gpus, params_b, need):
+                        continue
+                    fired += 1
+                    # what one card actually has to hold: the ZeRO-2 replicated floor plus this
+                    # card's share of the shardable remainder, at the same efficiency the pooled
+                    # model credits.
+                    per_card = zero2_replicated_floor_gb(params_b) + (
+                        need - REPLICATED_PER_CARD_GB
+                    ) / (n_gpus * SHARD_VRAM_EFFICIENCY)
+                    if per_card > vram + 1e-9:
+                        impossible.append(
+                            f"{model_id} {algorithm} {n_gpus}x{gpu_type}: "
+                            f"needs {per_card:.2f} GB per card, card holds {vram}"
+                        )
+    assert fired, "the gate never fired, so this proves nothing"
+    assert not impossible, "gate admitted shapes no card can hold:\n" + "\n".join(impossible)
 
 
 def test_the_worker_and_the_allocator_cannot_disagree():

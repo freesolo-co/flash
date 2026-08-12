@@ -87,7 +87,13 @@ def combined_vram_gb(vram_gb: int, gpu_count: int, *, zero2_params_b: float = 0.
     )
     if vram_gb <= floor:
         return 0.0
-    return gpu_count * (vram_gb - floor) * SHARD_VRAM_EFFICIENCY + floor
+    # the trailing addend is REPLICATED_PER_CARD_GB, never `floor`. what this returns is compared
+    # against a need that was computed WITHOUT a retained weight copy, and that need decomposes as
+    # `REPLICATED_PER_CARD_GB + shardable`. so the per-card constraint `floor + shardable/n <= vram`
+    # rearranges to `need <= n * (vram - floor) * efficiency + REPLICATED_PER_CARD_GB`. adding the
+    # ZeRO-2 floor back instead would refund exactly the retained copy this gate just charged, and
+    # the gate would admit shapes whose true per-card demand exceeds the card.
+    return gpu_count * (vram_gb - floor) * SHARD_VRAM_EFFICIENCY + REPLICATED_PER_CARD_GB
 
 
 def zero2_enabled(vram_gb: int, executed_gpu_count: int, params_b: float, need_gb: float) -> bool:
