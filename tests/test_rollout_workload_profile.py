@@ -493,18 +493,7 @@ def test_a_profile_with_no_reward_samples_does_not_claim_reward_is_free(monkeypa
     assert sampled.reward_seconds_per_completion == pytest.approx(0.0003)
 
 
-def test_the_reward_fallback_costs_a_whole_legacy_wall(monkeypatch):
-    """Quantifies what the guard above chooses, end to end, so the tradeoff cannot be silently
-    reversed: an unsampled profile pays 1.0s per completion that a sampled one does not."""
-    from flash.cost.analytical import seconds_per_step
-    from flash.cost.facts import AVG_REWARD_SECONDS_PER_COMPLETION
-    from flash.cost.spec import runconfig_from_spec
-
-    monkeypatch.setattr("time.time", lambda: NOW)
-    none_sampled = runconfig_from_spec(_spec_with_profile(reward_samples=0, reward_failures=0))
-    sampled = runconfig_from_spec(_spec_with_profile(reward_seconds_per_completion=0.0))
-    completions = _Train.group_size * (none_sampled.batch_size or 1)
-
-    extra = seconds_per_step(none_sampled, "H200") - seconds_per_step(sampled, "H200")
-    assert extra == pytest.approx(completions * AVG_REWARD_SECONDS_PER_COMPLETION)
-    assert extra > 0.0
+# the companion test that quantified the 1.0s fallback wall is gone with the double-count fix: it
+# asserted an unsampled profile pays `completions x 1.0s` more than a sampled one, which is exactly
+# the charge AVG_REWARD_SECONDS_PER_COMPLETION = 0.0 removes. test_cost_rewards.py pins the new
+# behavior.

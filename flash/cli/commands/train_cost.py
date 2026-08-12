@@ -81,7 +81,8 @@ def _cmd_train_cost_offline(spec) -> int:
         print(
             "warning: warm-start (train.init_from_adapter) cost uses the default LoRA rank; the "
             "source adapter's rank is authoritative and resolved at submit, so a higher-rank source "
-            "may cost more than this estimate. Run `flash train --dry-run` for a source-rank quote.",
+            f"may cost more than this estimate. Run `{_commands().CLI_NAME} train --dry-run` "
+            "for a source-rank quote.",
             file=sys.stderr,
         )
     estimate = estimate_cost(runconfig_from_spec(spec))

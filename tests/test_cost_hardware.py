@@ -328,6 +328,199 @@ def test_a_vast_sharded_quote_reads_the_provider_off_the_run_config():
         assert method_card_speedup(cfg("auto", method), 2, "H100", "vast") == vast
 
 
+def test_ranking_prices_the_authored_rollout_batch_not_the_recipe_default():
+    """Regression: hardware ranking read the optimizer batch from the sft-only key.
+
+    `RunConfig.batch_size` means "examples per optimizer update", but grpo/opd author that as
+    `prompts_per_step` -- the schema rejects `batch_size` for them outright. Reading only the sft
+    name left the ranker at None for every authored rollout batch, so it priced the recipe default
+    (64) against an authored 32 and could select a costlier shape than the run needs. The persisted
+    quote already reads the new key, so the two silently disagreed.
+    """
+    from flash.engine.plan.recipe import RECIPE
+    from flash.providers.base import run_config_for_ranking
+
+    authored = int(RECIPE.rl.prompts_per_step) // 2
+    assert authored >= 1
+    # must differ from the default, or the assertions below pass on the broken read too.
+    assert authored != RECIPE.rl.prompts_per_step
+
+    for algorithm in ("grpo", "opd"):
+        train = {"epochs": 1, "group_size": 4, "prompts_per_step": authored}
+        config = run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+        assert config.batch_size == authored, algorithm
+        assert config.normalized().batch_size == authored, algorithm
+
+    # sft still authors the batch under its own name, and it is a different quantity.
+    sft = run_config_for_ranking("Qwen/Qwen3.5-4B", "sft", train={"epochs": 1, "batch_size": 4})
+    assert sft.batch_size == 4
+    # an unauthored rollout batch still falls through to the recipe default.
+    bare = run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo", train={"epochs": 1})
+    assert bare.batch_size is None
+    assert bare.normalized().batch_size == RECIPE.rl.prompts_per_step
+
+
+def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
+    """Ranking must price the batch a step can actually reach, not the authored ceiling.
+
+    Both rollout workers retain at most ``max_examples`` rows and then clamp the batch to what is
+    left, so `prompts_per_step = 128` with `max_examples = 2` trains on 2. Ranking the raw 128 sizes
+    hardware for a step that cannot happen, and disagrees with the persisted quote, which already
+    takes this minimum -- so the run is billed against one number and provisioned against another.
+
+    Only the validated ``[train] max_examples`` is a cap here. ``[environment.params] max_examples``
+    is an opaque kwarg flash never enforces, and `_on_policy_example_count` deliberately does not
+    take a min() with it; a run whose environment ignores the key would otherwise be underprovisioned.
+    """
+    from types import SimpleNamespace
+
+    from flash.cost.spec import _on_policy_prompts_per_step, _on_policy_requested_prompts_per_step
+    from flash.engine.plan.recipe import RECIPE
+    from flash.providers.base import run_config_for_ranking
+
+    for algorithm in ("grpo", "opd"):
+        default = int((RECIPE.opd if algorithm == "opd" else RECIPE.rl).prompts_per_step)
+        # (authored prompts_per_step, max_examples, expected ranked batch)
+        for authored, retained, expected in (
+            (128, 2, 2),  # the reported shape: pool far below the authored batch
+            (2, 128, 2),  # pool above the batch changes nothing
+            (8, 8, 8),  # equal
+            (8, 0, 8),  # 0 means uncapped, not "a pool of zero"
+            (8, None, 8),  # unset
+            # UNAUTHORED batch: the recipe default must be capped too, because the workers clamp
+            # whatever the batch resolved to. Leaving this to `normalized()` ranked 64/8 uncapped.
+            (None, 2, 2),
+            (None, None, None),  # nothing to cap; `normalized()` fills the default
+            (None, 0, None),  # 0 is uncapped, so there is still nothing to resolve
+            (None, 10**6, default),  # pool far above the default
+        ):
+            train = {"epochs": 1, "group_size": 4}
+            if authored is not None:
+                train["prompts_per_step"] = authored
+            if retained is not None:
+                train["max_examples"] = retained
+            config = run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+            assert config.batch_size == expected, (algorithm, authored, retained)
+            # what actually gets priced, after the recipe fills any remaining None.
+            assert config.normalized().batch_size == (
+                expected if expected is not None else default
+            ), (algorithm, authored, retained)
+
+    # sft is untouched: its `batch_size` is examples per update on a dataset it may revisit across
+    # epochs, so a small `max_examples` does not bound it the way a rollout pool bounds a step.
+    sft = run_config_for_ranking(
+        "Qwen/Qwen3.5-4B", "sft", train={"epochs": 1, "batch_size": 8, "max_examples": 2}
+    )
+    assert sft.batch_size == 8
+
+    # and it agrees with the quote that bills the run, which is the disagreement being fixed.
+    spec = SimpleNamespace(
+        algorithm="grpo", train=SimpleNamespace(prompts_per_step=128, max_examples=2)
+    )
+    assert _on_policy_requested_prompts_per_step(spec) == 128
+    assert _on_policy_prompts_per_step(spec, spec.train.max_examples) == 2
+
+
+def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for():
+    """The quote a run is BILLED from must price the batch the ranker sized the card for.
+
+    `runconfig_from_spec` fed `RunConfig.batch_size` the raw authored `prompts_per_step`, so a run
+    with `prompts_per_step = 128, max_examples = 2` was quoted for a batch of 128 while training on
+    2. The persisted quote is what a completed or cancelled run is charged against
+    (`flash/runner/costs.py`), and it also gates the pre-submit affordability check, so the gap both
+    overcharges and can reject an affordable run.
+
+    Internally inconsistent too: `spec_steps` already counted steps against the CAPPED batch, so one
+    quote mixed a capped step count with an uncapped per-step price.
+    """
+    from flash.core.spec import JobSpec
+    from flash.cost.spec import runconfig_from_spec
+    from flash.providers.base import run_config_for_ranking
+
+    base = {
+        "model": "Qwen/Qwen3.5-4B",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "gpu": {"type": "H100", "count": 1},
+    }
+    for algorithm in ("grpo", "opd"):
+        for label, train in (
+            (
+                "authored above the pool",
+                {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 2},
+            ),
+            ("unauthored, small pool", {"epochs": 1, "group_size": 4, "max_examples": 2}),
+            (
+                "authored below the pool",
+                {"epochs": 1, "group_size": 4, "prompts_per_step": 2, "max_examples": 128},
+            ),
+            # no pool size, horizon stated instead -- quotable, and nothing to cap against.
+            (
+                "authored, max_steps horizon",
+                {"epochs": 1, "group_size": 4, "prompts_per_step": 32, "max_steps": 10},
+            ),
+            (
+                "uncapped pool, max_steps horizon",
+                {
+                    "epochs": 1,
+                    "group_size": 4,
+                    "prompts_per_step": 8,
+                    "max_examples": 0,
+                    "max_steps": 10,
+                },
+            ),
+        ):
+            spec = JobSpec.from_dict(
+                {**base, "algorithm": algorithm, "run_id": "q", "train": train}
+            )
+            quoted = runconfig_from_spec(spec).normalized().batch_size
+            ranked = (
+                run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+                .normalized()
+                .batch_size
+            )
+            # compared after normalization: the two reach the recipe default by different routes,
+            # and it is the effective number that has to match, not how each got there.
+            assert quoted == ranked, (algorithm, label, quoted, ranked)
+
+    # the headline shape, pinned to its literal value so a change to BOTH sides cannot pass silently.
+    capped = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 2},
+        }
+    )
+    assert runconfig_from_spec(capped).normalized().batch_size == 2
+
+    # a stated horizon needs no pool size, so capping must not turn `max_steps` into a refusal.
+    # `spec_steps` returns before asking for a row count; asking anyway here would reject a fully
+    # specified run at submit time.
+    stated = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 32, "max_steps": 10},
+        }
+    )
+    assert runconfig_from_spec(stated).normalized().batch_size == 32
+
+    # and a pool that genuinely cannot be known is still dev's explicit refusal, not a cheap quote.
+    from flash.cost.spec import UnknownPromptPoolSize
+
+    unbounded = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 32},
+        }
+    )
+    with pytest.raises(UnknownPromptPoolSize):
+        runconfig_from_spec(unbounded)
+
+
 def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     """The ranking config carries NO provider, so reading it off the config alone was inert.
 
@@ -362,7 +555,14 @@ def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     }
     assert single["vast"] == single["runpod"]
     # not a blanket penalty: a genuinely cheaper vast pair still wins, it is just priced honestly.
-    assert at("vast", hourly=1.70) < at("runpod", hourly=1.95)
+    #
+    # the discount has to clear the interconnect penalty, and how big that is depends on how much of
+    # the step is gpu work. it used to be swamped: a phantom `completions x 1.0s` reward wall sat
+    # beside a step floor already fitted with grading included, so most of a modelled grpo step was
+    # an off-gpu wait no interconnect touches and a 12.8% discount was enough. with the double-count
+    # removed the step is gpu-bound, pcie costs ~17.4% more wall, and the discount must beat that.
+    # 1.70 (12.8% off) no longer does; 1.55 (20.5% off) does.
+    assert at("vast", hourly=1.55) < at("runpod", hourly=1.95)
 
 
 def test_a_live_vast_allocation_is_requoted_without_nvlink_credit():

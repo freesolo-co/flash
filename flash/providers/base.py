@@ -335,7 +335,7 @@ def run_config_for_ranking(
     are derived. They are applied last because the profile measured what will actually execute and
     the authored value is only the request.
     """
-    from flash.core.catalog import optimizer_batch_key
+    from flash.core.catalog import samples_on_policy
     from flash.cost.types import RunConfig
 
     def knob(key):
@@ -357,13 +357,44 @@ def run_config_for_ranking(
             return None
         return int(number)
 
+    def rollout_batch():
+        """Prompts a rollout step really trains on: the authored batch, capped by the pool.
+
+        Both workers retain at most ``max_examples`` rows and then clamp the batch to what is left
+        (`resolve_grpo_prompts_per_step`, and opd's `min(knobs.prompts_per_step, len(prompts))`), so
+        an authored 128 against `max_examples = 2` trains on 2. Ranking the raw 128 would size
+        hardware for a step that cannot happen. `flash.cost.spec._on_policy_prompts_per_step` already
+        takes this same minimum, so skipping it here left ranking and the persisted quote disagreeing.
+
+        The recipe default is resolved BEFORE the minimum, because the workers clamp it too: they
+        cap whatever the batch resolved to, authored or defaulted. Returning None for an unauthored
+        batch would let `normalized()` fill 64 (grpo) or 8 (opd) uncapped, so a run whose whole pool
+        is 2 rows would still rank for 64.
+        """
+        from flash.engine.plan.recipe import RECIPE
+
+        authored = knob("prompts_per_step")
+        retained = knob("max_examples")
+        if retained is None:
+            return authored
+        recipe = RECIPE.opd if algorithm == "opd" else RECIPE.rl
+        return min(authored if authored is not None else int(recipe.prompts_per_step), retained)
+
     fields = {
         "model_id": model_id,
         "method": algorithm,
         "steps": 1,
         "seq_len": knob("max_context_tokens"),
         "completion_len": knob("max_completion_tokens"),
-        "batch_size": knob(optimizer_batch_key(algorithm)),
+        # RunConfig.batch_size is "examples per optimizer update", which each algorithm authors
+        # under a different key: sft as `batch_size`, grpo/opd as `prompts_per_step` (the schema
+        # rejects `batch_size` outright for them). Reading only the sft name left every authored
+        # rollout batch as None here, so ranking priced the recipe default -- 64 against an
+        # authored 32 -- and could select a costlier shape than the run actually needs.
+        # `flash.cost.spec.estimate_for_spec` splits the same way, with a third branch this has no
+        # input for: it prefers a measured sft workload profile, which ranking runs before --
+        # `overrides` below is how that measurement reaches this function.
+        "batch_size": (rollout_batch() if samples_on_policy(algorithm) else knob("batch_size")),
         "group_size": knob("group_size"),
         "lora_rank": knob("lora_rank"),
         "thinking": thinking,

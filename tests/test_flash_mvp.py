@@ -73,9 +73,14 @@ def test_orchestrator_dry_run(monkeypatch):
         importlib.reload(runner)
         # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.core.spec import JobSpec
+        from flash.core.spec import JobSpec, TrainSpec
 
-        spec = JobSpec(run_id="dry", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+        spec = JobSpec(
+            run_id="dry",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="grpo",
+            train=TrainSpec(max_examples=8),
+        )
         status = runner.submit_job(spec, dry_run=True)
         assert status.state == "dry_run"
         assert runner.get_status("dry").spec["model"] == "Qwen/Qwen3.5-4B"

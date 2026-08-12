@@ -8,7 +8,9 @@ import types
 
 import pytest
 
+from flash._internal.channel import CLI_NAME
 from flash.cli.commands import cmd_train
+from flash.cost.spec import UnknownPromptPoolSize
 from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
 from flash.cost.types import RunConfig
@@ -69,9 +71,33 @@ def test_grpo_epochs_derive_steps_from_max_examples():
     assert _spec_steps(spec) == 5  # ceil(33 rows * 2 epochs / batch_size 16)
 
 
-def test_grpo_epochs_need_max_examples_for_cost():
+def test_an_unbounded_prompt_pool_refuses_to_quote_instead_of_pricing_one_step():
+    """No stated row count used to mean "the pool is one step wide", which is never true.
+
+    The worker sizes the horizon from ``len(prompts)`` -- every row the environment yields -- so a
+    config that bounded nothing was quoted at one step regardless of dataset size. Against a
+    1153-row pool at batch 8 that is 145 real steps priced as 1, and the opd teacher capability in
+    ``capability_limits_for_spec`` is sized off the same number. The quote now refuses rather than
+    reporting a horizon nothing stated.
+    """
     spec = _spec(**{"train.max_examples": None, "train.epochs": 2})
-    assert _spec_steps(spec) == 2
+
+    with pytest.raises(UnknownPromptPoolSize, match="without a prompt-pool size") as refusal:
+        _spec_steps(spec)
+    # only the knob the WORKER applies is advertised; see the [environment.params] note below.
+    assert "[environment.params]" not in str(refusal.value)
+
+    # the two the message names: a row count, or a horizon that needs no row count at all.
+    assert _spec_steps(_spec(**{"train.max_examples": 1153, "train.epochs": 1})) == 73
+    assert _spec_steps(_spec(**{"train.max_examples": None, "train.max_steps": 145})) == 145
+
+    # [environment.params] max_examples is still honoured when present -- an environment that reads
+    # it really does yield fewer rows -- but it is not advertised above: it reaches the environment
+    # as an opaque load_environment(**params) kwarg and the starter templates ignore it, so only
+    # [train] max_examples is applied by the worker itself.
+    env_bounded = _spec(**{"train.max_examples": None, "train.epochs": 1})
+    object.__setattr__(env_bounded.environment, "params", {"max_examples": 1153})
+    assert _spec_steps(env_bounded) == 73
 
 
 def test_grpo_positive_max_steps_is_authoritative():
@@ -622,7 +648,7 @@ def test_sft_cost_on_a_profile_miss_explains_the_separate_charge_and_fails(
     assert "$0.25" in err
     assert "billed on its own" in err
     assert "no training run was created" in err
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert f"{CLI_NAME} runs status {PROFILE_RUN_ID}" in err
     assert client.get_run_calls == [PROFILE_RUN_ID]
 
 
@@ -683,7 +709,7 @@ def test_sft_cost_pending_without_an_ownership_flag_keeps_the_owner_wording(
 
     err = capsys.readouterr().err
     assert "billed on its own" in err
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert f"{CLI_NAME} runs status {PROFILE_RUN_ID}" in err
     assert client.get_run_calls == [PROFILE_RUN_ID]
 
 
@@ -709,7 +735,7 @@ def test_sft_cost_pending_on_your_own_running_profile_names_no_second_charge(
     assert "the server started a separate profile run" not in err
     assert "billed on its own" not in err
     # still the owner's run, so the poll instruction stays.
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert f"{CLI_NAME} runs status {PROFILE_RUN_ID}" in err
     # no charge is quoted for a launch that did not happen, so the run is never priced.
     assert "$" not in err
     assert client.get_run_calls == []
@@ -767,7 +793,7 @@ def test_sft_real_submit_shares_the_profile_pending_path(tmp_path, monkeypatch, 
     err = capsys.readouterr().err
     assert "billed on its own" in err
     assert "no training run was created" in err
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert f"{CLI_NAME} runs status {PROFILE_RUN_ID}" in err
 
 
 def test_sft_cost_leaves_unrelated_api_errors_alone(tmp_path, monkeypatch):

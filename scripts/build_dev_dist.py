@@ -36,7 +36,14 @@ from pathlib import Path
 
 DEV_DIST_NAME = "freesolo-flash-dev"
 # pyproject [project.scripts] key renames for side-by-side install with the prod package.
-SCRIPT_RENAMES = {"flash": "flash-dev", "flash-server": "flash-dev-server"}
+# Every key in [project.scripts] needs an entry: a key missing from here passes through
+# unrenamed, so the dev distribution would ship a script that collides with the prod package.
+# tests/test_dev_channel.py asserts the two stay in sync.
+SCRIPT_RENAMES = {
+    "flash": "flash-dev",
+    "flash-cli": "flash-dev-cli",
+    "flash-server": "flash-dev-server",
+}
 
 
 def read_dev_version(pyproject_text: str) -> str:

@@ -72,6 +72,22 @@ def _pinned_offline_allocation(provider: str, gpu_type: str, gpu_count: int):
         return None
 
 
+def _spec_pinned_to_horizon(spec, steps: int):
+    """``spec`` with its update horizon stated as ``steps``, for pricing a run that already ran.
+
+    ``max_steps`` is the one field that states a grpo/opd horizon outright, so pinning it is what
+    lets a completed step count stand in for the prompt-pool size the estimator would otherwise
+    have to derive one from. floored at 1 because ``RunConfig`` rejects a zero horizon; the callers
+    all return $0 for a zero-step cancel before the estimate is reached, so the floor never prices
+    anything. only reached when that derivation failed, which by construction means no save
+    schedule to rewrite: ``save_at_steps`` requires a positive ``max_steps`` (core/spec.py), and a
+    positive ``max_steps`` is itself a stated horizon that never needed a pool size.
+    """
+    from dataclasses import replace as _replace
+
+    return _replace(spec, train=_replace(spec.train, max_steps=max(1, int(steps))))
+
+
 def charge_usd_for_spec(
     spec,
     *,
@@ -94,7 +110,7 @@ def charge_usd_for_spec(
     """
     try:
         from flash.cost.analytical import estimate_cost
-        from flash.cost.spec import estimate_for_spec, runconfig_from_spec
+        from flash.cost.spec import UnknownPromptPoolSize, estimate_for_spec, runconfig_from_spec
 
         if getattr(spec, "workload_profile_kind", ""):
             # a profile job has no optimizer steps to prorate, so its charge is all-or-nothing: the
@@ -105,7 +121,18 @@ def charge_usd_for_spec(
             if steps is not None and int(steps) <= 0:
                 return 0.0
             return float(estimate_for_spec(spec).total_usd)
-        cfg = runconfig_from_spec(spec)
+        try:
+            cfg = runconfig_from_spec(spec)
+        except UnknownPromptPoolSize:
+            # a cancel prices work that already happened, so it must not need a PREDICTED horizon.
+            # grpo/opd derive theirs from a stated prompt-pool size and refuse to guess without one,
+            # which would make an unbounded run unpriceable at exactly the moment its cost is known
+            # exactly. the completed count answers that question with the measurement instead --
+            # spec_steps reads max_steps first, so the pool size is never consulted. only the
+            # prorating callers may do this: with no steps to state, there is still no horizon.
+            if steps is None:
+                raise
+            cfg = runconfig_from_spec(_spec_pinned_to_horizon(spec, int(steps)))
         if provider:
             # suppressed ValueError: the registry no longer maps this provider to the spec's
             # class. the combination was rentable when the run launched, so degrade to the spec's

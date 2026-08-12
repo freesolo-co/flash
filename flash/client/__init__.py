@@ -1,5 +1,6 @@
 """HTTP client for the managed Flash control plane (used by the CLI)."""
 
+from flash._internal.channel import CLI_NAME
 from flash.client.config import load_credentials, save_credentials
 from flash.client.http import (
     ApiClient,
@@ -54,7 +55,7 @@ def resolve_project_id(project_id: str, api_key: str, api_url: str | None = None
         if exc.status not in {403, 404}:
             raise
         raise ClientError(
-            f"project {project_id!r} is not accessible; run `flash projects list` "
+            f"project {project_id!r} is not accessible; run `{CLI_NAME} projects list` "
             "and pass a project UUID from the current organization"
         ) from exc
 
