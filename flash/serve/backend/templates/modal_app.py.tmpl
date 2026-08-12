@@ -1509,7 +1509,14 @@ def api():
             reclaimed = await _read(revision_id)
             if isinstance(reclaimed, dict):
                 metadata = reclaimed.get("metadata") or {{}}
-                if metadata.get("cache_reclaim_pending"):
+                # Cleared only when the record is STILL disabled, matching the same condition
+                # `_discard_cached_adapter` re-checks before deleting. A revision re-registered
+                # while this ran keeps its files on purpose -- clearing the marker then would drop
+                # the deferral for a directory nothing had collected, which is the leak again.
+                if (
+                    metadata.get("cache_reclaim_pending")
+                    and reclaimed.get("status") == "disabled"
+                ):
                     # Cleared so a repeated undeploy does not re-run the reclaim on every call.
                     reclaimed["metadata"] = {{
                         key: value

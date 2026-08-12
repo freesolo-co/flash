@@ -296,15 +296,16 @@ def client(monkeypatch, tmp_path):
     spawned: list = []
     engine_classes: list = []
     runners = types.SimpleNamespace(count=1)
+    engine_methods = {
+        "register": register,
+        "unregister": unregister,
+        "discard_cache": discard_cache,
+        "generate": generate,
+        "generate_stream": generate_stream,
+    }
     _stub_modal(
         monkeypatch,
-        {
-            "register": register,
-            "unregister": unregister,
-            "discard_cache": discard_cache,
-            "generate": generate,
-            "generate_stream": generate_stream,
-        },
+        engine_methods,
         spawned=spawned,
         engine_classes=engine_classes,
         runners=runners,
@@ -317,6 +318,9 @@ def client(monkeypatch, tmp_path):
     module.runners = runners
     module.unregistered = unregistered
     module.discarded = discarded
+    # The stub handle resolves each engine method through this dict per call, so a test can swap
+    # one out to model what a concurrent caller does in the middle of a remote round trip.
+    module.engine_methods = engine_methods
     test_client = TestClient(module.api())
     # Reach the generated module from a test: its Dict and its functions ARE the durable state,
     # so lifecycle races have to be driven through them rather than simulated alongside.
@@ -2902,6 +2906,64 @@ def test_a_cold_failed_load_is_reclaimed_by_the_next_undeploy(client):
     assert module.discarded == [], (
         f"a repeated undeploy reclaimed {module.discarded} again; the pending marker was never "
         f"cleared, so every future delete re-runs the rmtree"
+    )
+
+
+def test_a_revision_revived_during_its_reclaim_keeps_the_pending_marker(client):
+    """Clearing the marker must follow the same condition the delete itself is gated on.
+
+    `_discard_cached_adapter` re-reads the durable record and leaves the files alone when the
+    revision is no longer `disabled`: the volume is shared, so a `models deploy` re-registering
+    this exact revision mid-reclaim would otherwise have its weights deleted out from under a live
+    load on another container. Clearing the marker in that case drops the deferral for a directory
+    nothing collected, which is the original leak with an extra step.
+
+    The revive has to land DURING the reclaim, not before it -- arriving earlier just means the
+    undeploy disables the record again, and reclaiming a disabled record is correct.
+    """
+    module = client.app.state.generated_module
+    module.runners.count = 0
+    revision = "run-revived@final." + "a" * 40
+    key = module._record_key(revision)
+    client.post(
+        "/adapters",
+        json={
+            **REGISTRATION,
+            "adapter_id": revision,
+            "repo_id": BAD_REPO,
+            "checkpoint": "run-revived",
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "run-revived",
+                "checkpoint_step": None,
+                "hf_revision": "a" * 40,
+            },
+        },
+    )
+    assert _lifecycle(client, revision) == "failed"
+
+    # The engine stub stands in for the Modal method, so the revive is injected there. The real
+    # `_discard_cached_adapter` re-checks the record and would skip the delete for exactly this
+    # state; what is under test is whether the CALLER still clears the marker afterwards.
+    original = module.engine_methods["discard_cache"]
+
+    async def _revive_mid_reclaim(adapter_id):
+        record = module.adapter_records.get(key)
+        if isinstance(record, dict) and adapter_id == revision:
+            record["status"] = "registered"
+            module.adapter_records[key] = record
+        return await original(adapter_id)
+
+    module.engine_methods["discard_cache"] = _revive_mid_reclaim
+    try:
+        client.delete("/adapters/run-revived")
+    finally:
+        module.engine_methods["discard_cache"] = original
+
+    settled = module.adapter_records[key]
+    assert (settled.get("metadata") or {}).get("cache_reclaim_pending") is True, (
+        "the marker was cleared for a revision that was revived before its files were deleted, so "
+        "the directory is now orphaned with nothing left to collect it"
     )
 
 
