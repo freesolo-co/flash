@@ -58,6 +58,30 @@ def free_vram_gb() -> float | None:
         return None
 
 
+def _own_vram_gb() -> float:
+    """VRAM on device 0 held by processes in THIS container, in GB.
+
+    ``mem_get_info`` reports the driver's total, which includes our own CUDA contexts -- and simply
+    calling it creates one. So "used" is never purely somebody else's, and the gap is not a constant
+    to subtract: a context is a few hundred MB, but SFT probes readiness in a subprocess while the
+    parent already holds one, so two of ours can be live at once.
+
+    ``nvidia-smi --query-compute-apps`` attributes used memory per process, and a container sees its
+    own pids. It cannot see a co-tenant's (that is the whole reason the co-tenanted card was
+    invisible from inside), which is exactly the asymmetry wanted here: everything it reports is
+    ours, everything it misses is not.
+
+    Zero on any failure, which makes the caller's occupancy reading conservative rather than
+    permissive: unattributed memory counts as foreign.
+    """
+    try:
+        from flash.engine.worker.perf.diagnostics import _query_nvidia_processes
+
+        return sum(float(row.get("used_memory_gb") or 0.0) for row in _query_nvidia_processes())
+    except Exception:
+        return 0.0
+
+
 def total_vram_gb() -> float | None:
     """Total VRAM on device 0 in GB as the DRIVER reports it, or None if unavailable.
 
@@ -97,9 +121,7 @@ def preflight_free_vram(*, max_occupied_fraction: float = 0.05) -> None:
     Occupancy has neither failure mode: it needs no requirement, no profile, and no catalog number.
     An empty card reads ~0 whatever is scheduled on it, so the threshold can sit near zero rather
     than being padded to cover a requirement it never consults. 5% is the driver's own reserve plus
-    slack; the observed dirty card was at 83%. Nothing of ours has allocated at either call site --
-    boot is before any work, and ``wait_for_gpu`` runs before the trainer starts -- so anything
-    above that floor belongs to somebody else.
+    slack; the observed dirty card was at 83% with 0.486 GB attributable to us.
 
     The floor is low BECAUSE the check is occupancy: a loose threshold has to be justified against
     the biggest run that could be scheduled, and a 5 GB co-tenant that leaves a 20 GB run 17.5 GB on
@@ -113,13 +135,18 @@ def preflight_free_vram(*, max_occupied_fraction: float = 0.05) -> None:
         # no CUDA, or the driver would not answer. both are somebody else's failure to report, and
         # neither is evidence of a dirty card -- training fails soon enough with a better message.
         return
-    occupied = max(0.0, total - free)
-    if occupied <= total * max_occupied_fraction:
+    # only memory we cannot account for. reading the driver at all creates a context, and the SFT
+    # readiness probe runs in a subprocess while the parent holds one, so `total - free` always
+    # includes some of ours. subtracting a constant for that is what forces the threshold up until
+    # it stops catching the co-tenants it exists for -- 1.3 GB of context on a 22.5 GB card is 6%,
+    # and the 5 GB tenant that kills a close-fitting run is 22%. attribute instead of pad.
+    foreign = max(0.0, total - free - _own_vram_gb())
+    if foreign <= total * max_occupied_fraction:
         return
     raise DirtyGpuError(
-        f"allocated GPU is already {occupied:.1f} GB used of {total:.1f} GB "
-        f"({occupied / total:.0%}) before this run has done anything; the card is occupied by "
-        "another tenant or a previous tenant's leak, so retrying on a freshly allocated instance"
+        f"allocated GPU has {foreign:.1f} GB of {total:.1f} GB ({foreign / total:.0%}) held by "
+        "processes outside this container before this run has done anything; the card is occupied "
+        "by another tenant or a previous tenant's leak, so retrying on a freshly allocated instance"
     )
 
 

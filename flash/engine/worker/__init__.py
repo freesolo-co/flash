@@ -345,16 +345,18 @@ def _run_worker_mode() -> None:
     # the verl child, so it ships as a sitecustomize fragment (verl.child_io).
     # run before model imports: sm100 tilelang GDN computes wrong gradients, so use Triton.
     _force_fla_triton_gdn_on_sm100()
+    # before `_ensure_fla_fastpath_on_hopper`, whose repair path runs pip installs with 600s
+    # timeouts: a card handed over with a co-tenant's ~18GB still resident fails the run either
+    # way, and the only question is whether that happens now or after dependency repair, the model
+    # download and FSDP init have spent paid GPU reaching the same conclusion. nothing above this
+    # point touches CUDA, so the reading is as clean as it gets. `wait_for_gpu` checks again later
+    # for the case where CUDA was not yet answering here.
+    _preflight_free_vram_for_spec()
     _ensure_fla_fastpath_on_hopper()
     # AFTER the fla fast path (which may (re)install fla), BEFORE any model import / GDN
     # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
     _restrict_fla_gdn_autotune_on_blackwell()
     heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
-    # the boot heartbeat above already carries free VRAM; act on it here rather than only recording
-    # it. a card handed over with a co-tenant's ~18GB still resident fails the run either way, and
-    # the only question is whether that happens now or after the model download and FSDP init have
-    # spent ~80s of paid GPU reaching the same conclusion.
-    _preflight_free_vram_for_spec()
     load_mega_cache()
     handler()
     # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.

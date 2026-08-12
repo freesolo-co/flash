@@ -8,6 +8,20 @@ import types
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_nvidia_smi(monkeypatch):
+    """Attribute nothing to our own processes unless a test says otherwise.
+
+    `_own_vram_gb` shells out to `nvidia-smi`, which on a CI box is absent (0, harmless) and on a
+    developer's GPU box answers about THEIR card -- so the same test would measure different things
+    in the two places. Pinning it makes every occupancy assertion below read the numbers the test
+    actually set, and tests about attribution override it explicitly.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "_own_vram_gb", lambda: 0.0)
+
+
 def test_is_cuda_oom_is_structured(monkeypatch):
     # torch-free (the offline CI image has no torch): is_cuda_oom imports torch internally under a
     # try/except, so the counter + MemoryError paths classify without it.
@@ -396,7 +410,7 @@ def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
     with pytest.raises(lc.DirtyGpuError) as excinfo:
         lc.preflight_free_vram()
 
-    assert "19.1 GB used of 22.5 GB (85%)" in str(excinfo.value)
+    assert "19.1 GB of 22.5 GB (85%) held by processes outside this container" in str(excinfo.value)
     # the whole point: infra retry, NOT an oom escalation onto a bigger (equally dirty) card.
     monkeypatch.setattr(worker, "is_cuda_oom", lambda _exc: False)
     assert worker._worker_failure_flags(excinfo.value) == {"retriable": True, "oom": False}
@@ -438,6 +452,43 @@ def test_preflight_is_inert_when_the_driver_will_not_answer(monkeypatch):
     monkeypatch.setattr(lc, "free_vram_gb", lambda: 0.0)
     monkeypatch.setattr(lc, "total_vram_gb", lambda: 0.0)
     lc.preflight_free_vram()
+
+
+def test_our_own_cuda_contexts_are_not_counted_as_a_co_tenant(monkeypatch):
+    """Reading the driver creates a context, so `total - free` is never purely somebody else's.
+
+    Two of ours can be live at once: SFT probes readiness in a subprocess while the parent already
+    holds a context. On a 22.5 GB card 1.3 GB of context is 6%, over the threshold -- so counting
+    it would reject every clean card and burn the infra budget, which is the opposite of the point.
+    Padding the threshold to cover it stops catching the 5 GB tenant that kills a close-fitting run.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+
+    # driver: 20.5 of 22.5 GB free. the 2 GB gone is two of our own contexts, nothing foreign.
+    monkeypatch.setattr(lc, "free_vram_gb", lambda: 20.5)
+    monkeypatch.setattr(lc, "total_vram_gb", lambda: 22.5)
+    monkeypatch.setattr(lc, "_own_vram_gb", lambda: 2.0)
+    lc.preflight_free_vram()
+
+    # same card, but only half of that is ours: the other 1 GB is unattributable, still under 5%.
+    monkeypatch.setattr(lc, "_own_vram_gb", lambda: 1.0)
+    lc.preflight_free_vram()
+
+
+def test_unattributable_memory_counts_as_foreign(monkeypatch):
+    """`nvidia-smi` failing must not turn into a clean bill of health for a dirty card.
+
+    A container sees its own pids and not a co-tenant's -- that asymmetry is what makes attribution
+    safe here. When the query fails it returns 0, so everything unexplained stays foreign and the
+    check errs toward refusing, which costs one reallocation rather than a delayed OOM.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "free_vram_gb", lambda: 3.4)
+    monkeypatch.setattr(lc, "total_vram_gb", lambda: 22.5)
+    monkeypatch.setattr(lc, "_own_vram_gb", lambda: 0.0)
+    with pytest.raises(lc.DirtyGpuError, match="outside this container"):
+        lc.preflight_free_vram()
 
 
 def test_a_small_co_tenant_that_still_breaks_a_close_fitting_run_is_refused(monkeypatch):
