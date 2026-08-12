@@ -2221,3 +2221,116 @@ def test_a_colliding_load_evicts_a_stale_local_resident(client, monkeypatch):
         "mapped to one vllm int id on this container"
     )
     assert old not in instance._loaded
+
+
+def test_an_unclaimable_lora_id_fails_the_registration(client):
+    """Exhausting the claim attempts must raise, not report ownership that was never recorded.
+
+    Answering with the caller's own id looks conservative -- it lets a legitimate adapter proceed
+    over a slot nobody holds -- but it hands back a claim that does not exist, which is the exact
+    unclaimed-load path the function exists to remove: a colliding registration can take the id
+    while this one downloads, and both end up resident under one vLLM id.
+    """
+    module = client.app.state.generated_module
+
+    class _NeverSettles(_FakeDict):
+        """The claim key is always taken on insert and always gone by the time it is read.
+
+        The real shape of this is a holder that is undeployed in the gap between the failed insert
+        and the read, on every attempt.
+        """
+
+        def _put(self, key, value, skip_if_exists=False):
+            if skip_if_exists and key.startswith("loraid:"):
+                return False
+            return super()._put(key, value, skip_if_exists=skip_if_exists)
+
+    original = module.adapter_records
+    module.adapter_records = _NeverSettles()
+    try:
+        with pytest.raises(RuntimeError, match="could not establish ownership"):
+            _run_awaitable_result(module._claim_lora_int_id(7777, "run-x@final." + "c" * 40))
+    finally:
+        module.adapter_records = original
+
+
+def test_a_load_that_loses_its_claim_mid_download_undoes_itself(client, monkeypatch):
+    """A superseded load must not stay resident after the claim changes hands.
+
+    The download takes minutes and the claim can legitimately move inside that window: a retried
+    deploy makes this attempt superseded, and if the newer authoritative one then fails, settle
+    releases the claim while this load is still running. A colliding adapter takes the id from
+    there, and this `add_lora` lands on top of it -- two adapters under one vLLM int.
+    """
+    lora = types.ModuleType("vllm.lora.request")
+    lora.LoRARequest = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora)
+
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._loaded = {}
+    instance._int_ids = {}
+
+    mine = "run-superseded@final." + "f" * 40
+    int_id = module._lora_int_id(mine)
+    removed: list[int] = []
+
+    async def _remove(evicted_id):
+        removed.append(evicted_id)
+
+    async def _path(record):
+        # The claim changes hands DURING the download, exactly as a released-then-retaken claim
+        # would: by the time this load finishes, someone else owns the id.
+        module.adapter_records[module._lora_id_key(int_id)] = "run-other@final." + "9" * 40
+        return "/cache/adapter"
+
+    async def _add(request):
+        return None
+
+    instance._adapter_path = _path
+    instance.engine = types.SimpleNamespace(add_lora=_add, remove_lora=_remove)
+
+    with pytest.raises(RuntimeError, match="changed hands"):
+        _run_awaitable(engine_class._lora_request(instance, {"adapter_id": mine}))
+
+    assert removed == [int_id], (
+        "a load that lost its claim mid-download stayed resident, so it shares a vllm int id with "
+        "whichever adapter now owns the claim"
+    )
+    assert mine not in instance._loaded
+
+
+def test_undeploy_deletes_the_downloaded_adapter(client, monkeypatch, tmp_path):
+    """Retired revisions must not accumulate on the persistent volume forever.
+
+    Every immutable revision downloads into its own digest directory, so a backend serving
+    successive checkpoints keeps every one it has ever loaded -- paid storage growing without
+    bound until the volume fills and new adapters cannot download at all.
+    """
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._loaded = {}
+    instance._int_ids = {}
+
+    async def _remove(_int_id):
+        return None
+
+    instance.engine = types.SimpleNamespace(remove_lora=_remove)
+
+    downloaded = tmp_path / module._adapter_digest(REVISION)
+    downloaded.mkdir()
+    (downloaded / "adapter_model.safetensors").write_bytes(b"weights")
+    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
+
+    _run_awaitable_result(engine_class.unregister(instance, REVISION))
+
+    assert not downloaded.exists(), (
+        "undeploy left the downloaded adapter on the volume, so retired revisions accumulate "
+        "until storage runs out"
+    )

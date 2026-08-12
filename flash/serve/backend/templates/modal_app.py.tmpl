@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import time
 import uuid
 from typing import Any
@@ -193,9 +194,14 @@ async def _claim_lora_int_id(int_id: int, adapter_id: str) -> str:
     re-register into while this adapter downloads, so both end up resident under one vLLM id. So a
     vacated slot is re-contested rather than assumed. Bounded rather than `while True`: each pass
     needs another adapter to have been undeployed in a specific window, so an unbounded loop could
-    only ever spin on a Dict that is misbehaving. Exhausting the attempts answers with the caller's
-    own id, which is the conservative direction -- it lets the load proceed rather than refusing a
-    legitimate adapter over a slot nobody holds.
+    only ever spin on a Dict that is misbehaving.
+
+    Exhausting the attempts RAISES rather than answering with the caller's own id. Answering looks
+    conservative -- it lets a legitimate adapter proceed over a slot nobody holds -- but it hands
+    back an ownership claim that was never recorded, which is the unclaimed-load path this function
+    exists to remove: another colliding registration can take the id while this one downloads, and
+    both end up resident under one vLLM id. A registration that fails loudly is recoverable by
+    retrying; two adapters sharing an int id answers from the wrong run's weights and is not.
     """
     key = _lora_id_key(int_id)
     for _ in range(_CLAIM_ATTEMPTS):
@@ -204,7 +210,11 @@ async def _claim_lora_int_id(int_id: int, adapter_id: str) -> str:
         owner = await adapter_records.get.aio(key)
         if owner is not None:
             return str(owner)
-    return adapter_id
+    raise RuntimeError(
+        f"could not establish ownership of lora id {{int_id}} for {{adapter_id}} after "
+        f"{{_CLAIM_ATTEMPTS}} attempts: the claim keeps being taken and released. retry the "
+        f"deploy."
+    )
 
 
 async def _owns_lora_int_id(int_id: int, adapter_id: str) -> bool:
@@ -541,6 +551,20 @@ class Engine:
             # missing tensors) must fail here so registration reports `failed` with a real
             # reason, instead of reporting ready and then 500ing on the user's first chat.
             await self.engine.add_lora(request)
+            # Ownership is re-checked AFTER the load, because the download takes minutes and the
+            # claim can legitimately change hands inside that window: a retried deploy makes this
+            # attempt superseded, and if the newer authoritative one then fails, settle releases
+            # the claim while this load is still running. A colliding adapter can take the id from
+            # there -- and this `add_lora` would land on top of it, two adapters under one vLLM
+            # int. Losing the claim means this load must not stay resident, so it undoes itself
+            # and reports the failure rather than leaving the engine in that state.
+            if not await _owns_lora_int_id(int_id, adapter_id):
+                with contextlib.suppress(Exception):
+                    await self.engine.remove_lora(int_id)
+                raise RuntimeError(
+                    f"lora id {{int_id}} changed hands while {{adapter_id}} was loading, so this "
+                    f"load was superseded. redeploy to retry."
+                )
             self._loaded[adapter_id] = request
             self._int_ids[int_id] = adapter_id
             return request
@@ -593,6 +617,19 @@ class Engine:
                     evicted = False
                 if evicted:
                     await _release_lora_int_id(int_id, adapter_id)
+            # And delete the downloaded weights. Every immutable revision lands in its own digest
+            # directory on the persistent volume, so a backend that serves successive checkpoints
+            # accumulates every one it has ever loaded -- paid storage that grows without bound
+            # until the volume fills and new adapters cannot download at all. Safe here because
+            # the record is already `disabled`: re-registering the same revision is an explicit
+            # request that downloads it again. Best effort, and inside the adapter's own lock so
+            # it cannot delete files out from under a concurrent load of the same adapter.
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    shutil.rmtree,
+                    f"{{ADAPTER_DIR}}/{{_adapter_digest(adapter_id)}}",
+                    ignore_errors=True,
+                )
         return {{"ok": True}}
 
     async def _prepare(self, payload: dict[str, Any], record: dict[str, Any]):
