@@ -836,16 +836,23 @@ def api():
         run_id = (record.get("metadata") or {{}}).get("run_id") or adapter_id
         disabled_aliases: list[str] = []
         disabled_revisions: list[str] = []
-        # Collect the run's members BEFORE taking the lock, from the run's own index. Two reasons,
-        # both load-bearing: the lock's TTL is only safe if nothing under it grows with the size of
-        # the Dict, and the previous full-keyspace scan grew with every adapter ever registered on
-        # this app. A registration racing this read simply is not in the index yet, and it takes
-        # the same lock to activate, so it cannot slip an alias past the disable below.
-        members = list(await _run_members(run_id))
-        # Under the SAME per-run lock `activate` takes. Without it, an in-flight activation can
-        # write the alias back to `ready` after this loop disabled it, and undeploy returns success
-        # while the run stays callable -- the lost update `alias_compare_and_swap` rules out.
+        # Under the SAME per-run lock `activate` and registration take. Without it, an in-flight
+        # activation can write the alias back to `ready` after this loop disabled it, and undeploy
+        # returns success while the run stays callable -- the lost update
+        # `alias_compare_and_swap` rules out.
         async with _run_lock(run_id):
+            # The membership read is INSIDE the lock. Read before acquiring, it is a snapshot: a
+            # registration that completes in the gap adds its revision to the index and this pass
+            # never sees it, so the new revision stays `ready`, remains on the GPU, and is callable
+            # by its immutable id even though undeploy reported success. Being an indexed lookup
+            # rather than a keyspace scan is what makes it affordable to hold the lock across.
+            #
+            # `adapter_id` is unioned in because the index is a repairable cache, not the source of
+            # truth: an app upgraded from the earlier scan-based version has no `members:` key at
+            # all, and a container that died between the revision write and `_ensure_run_alias`
+            # left one incomplete. Without this, `_run_members` returns [] and the loop below does
+            # nothing -- undeploy answers 200 with empty lists while the adapter keeps serving.
+            members = list(dict.fromkeys([*await _run_members(run_id), adapter_id, run_id]))
             for member_id in members:
                 candidate = await _read(member_id)
                 if not isinstance(candidate, dict):

@@ -353,33 +353,85 @@ def _deployed_url(output: str) -> str:
     return ""
 
 
+def _status_request(url: str, headers: dict[str, str]) -> dict:
+    """GET one JSON document with the standard library.
+
+    Not `flash.serve.deploy._serving_request`, which would be the natural reuse: that module
+    imports httpx at module scope, and `[project].dependencies` is empty precisely so the client
+    CLI runs on a bare `pip install freesolo-flash`. Importing it here made `serve status` die with
+    `ModuleNotFoundError: httpx` before any of the error handling below could run -- and this is the
+    command a user reaches for when their backend is not answering, so it is the worst one to
+    require an extra for.
+
+    It still sends the internal key, because the contract permits a backend to authenticate
+    /healthz and an unauthenticated probe would report a working backend as down.
+    """
+    import urllib.request
+
+    request = urllib.request.Request(f"{url}/healthz", headers=headers, method="GET")
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def _redacted(exc: Exception, base: str) -> str:
+    """An exception's message with every credential from ``base`` removed.
+
+    Redacting the url we print is not enough on its own: urllib quotes the url it was handed back
+    into its own errors, so the userinfo arrives inside the exception text.
+
+    Each credential is redacted as its own token rather than by matching the whole url, because
+    urllib reports FRAGMENTS. Parsing `https://user:pw@host` for a port splits on the first colon
+    and raises "nonnumeric port: 'pw@host'" -- a string in which neither the full base nor the full
+    userinfo appears, so replacing those alone leaves the password in the message. Redaction here
+    is exact-substring against values we already hold, so nothing is guessed at and no unrelated
+    text can be caught by accident.
+    """
+    from flash.serve.urls import displayable_url
+
+    text = str(exc)
+    authority = base.split("://", 1)[-1].split("/", 1)[0]
+    userinfo = authority.rsplit("@", 1)[0] if "@" in authority else ""
+    # Longest first: redacting "user" before "user:pw" would leave "(redacted):pw" behind.
+    secrets = [base, base.rstrip("/"), authority, userinfo, *userinfo.split(":")]
+    for secret in sorted({s for s in secrets if s}, key=len, reverse=True):
+        text = text.replace(secret, displayable_url(base) if "://" in secret else "(redacted)")
+    return text
+
+
 def cmd_serve_status(args) -> int:
     """Check the configured serving backend and report what it supports."""
-    from flash.serve.deploy import ServingError, _serving_request, serving_base_url
+    # From `flash.serve.urls`, NOT `flash.serve.deploy`: same reason as `_status_request` above.
+    from flash.serve.errors import ServingError
+    from flash.serve.urls import displayable_url, internal_key_header, serving_base_url
 
     try:
         base = serving_base_url()
     except ServingError as exc:
         return _err(str(exc))
+    # Every message and every printed line names the REDACTED url. A base url is user-supplied and
+    # may carry credentials in its authority (https://user:token@host); printing it verbatim leaks
+    # them to the terminal and to whatever captures its output.
+    shown = displayable_url(base)
     try:
-        # The client's own request path, not a bare GET: it carries the internal key and scopes it
-        # to the configured origin. A backend that authenticates /healthz -- which the contract
-        # permits -- would otherwise 401 here and be reported as down while deploys work fine.
-        payload = _serving_request("GET", f"{base}/healthz").json()
+        payload = _status_request(base, internal_key_header())
     except Exception as exc:  # any transport or decode failure is the same answer to the user
-        return _err(f"serving backend at {base} did not answer /healthz: {exc}")
+        # The exception TEXT is redacted too, not just the prefix. urllib quotes the url it was
+        # given, so `https://user:token@host` with a malformed authority comes back as
+        # "nonnumeric port: 'token@host'" -- the credential, printed by the error path that exists
+        # to avoid printing it.
+        return _err(f"serving backend at {shown} did not answer /healthz: {_redacted(exc, base)}")
 
     # Diagnosing a malformed backend is exactly this command's job, so a payload that decodes but
     # is the wrong shape has to become the compatibility error rather than a traceback.
     if not isinstance(payload, dict):
-        return _err(f"serving backend at {base} returned a non-object /healthz payload")
+        return _err(f"serving backend at {shown} returned a non-object /healthz payload")
     capabilities = payload.get("capabilities") or []
     if not isinstance(capabilities, list) or any(not isinstance(c, str) for c in capabilities):
-        return _err(f"serving backend at {base} did not return capabilities as a list of strings")
+        return _err(f"serving backend at {shown} did not return capabilities as a list of strings")
     models = payload.get("base_models") or []
     if not isinstance(models, list):
         models = []
-    print(f"serving:      {base}")
+    print(f"serving:      {shown}")
     print(f"base models:  {', '.join(str(m) for m in models) or '-'}")
     print(f"capabilities: {', '.join(capabilities) or '-'}")
     required = {"immutable_adapter_revisions", "alias_compare_and_swap"}

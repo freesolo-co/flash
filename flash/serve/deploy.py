@@ -14,7 +14,6 @@ from urllib.parse import quote
 
 import httpx
 
-from flash._internal.channel import CHANNEL
 from flash._internal.logging import get_logger
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.envs.loader import is_commit_sha
@@ -26,22 +25,18 @@ from flash.serve.errors import (  # noqa: F401 -- re-exported: callers import th
     RetryableServingUnavailable,
     ServingError,
 )
-from flash.serve.urls import is_freesolo_hosted_url, openai_base_url, serving_control_url
+from flash.serve.urls import (  # noqa: F401 -- re-exported: callers import these from here
+    DEV_FREESOLO_SERVING_URL,
+    PROD_FREESOLO_SERVING_URL,
+    default_serving_url,
+    is_freesolo_hosted_url,
+    openai_base_url,
+    serving_base_url,
+    serving_control_url,
+)
+from flash.serve.urls import internal_key_header as _internal_key_header
 
 logger = get_logger(__name__)
-
-PROD_FREESOLO_SERVING_URL = "https://serve.freesolo.co"
-DEV_FREESOLO_SERVING_URL = "https://serve-dev.freesolo.co"
-
-
-def default_serving_url(channel: str = CHANNEL) -> str:
-    """Default serving control root for the given release channel.
-
-    Serving and control planes use separate per-channel databases; mixing them causes org FK 23503.
-    Dev serving is ``serve-dev.freesolo.co``.
-    """
-    return DEV_FREESOLO_SERVING_URL if channel == "dev" else PROD_FREESOLO_SERVING_URL
-
 
 DEFAULT_FREESOLO_SERVING_URL = default_serving_url()
 READBACK_DELAY_SECONDS = 0.5
@@ -212,39 +207,9 @@ def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
     return ServingError(msg, status_code=status, retry_after=retry_after)
 
 
-def serving_base_url() -> str:
-    """Env-overridable serving control root.
-
-    Standalone planes must target a backend they operate because every request carries the plane's
-    ``FREESOLO_INTERNAL_KEY``. Reject hosted URLs whether supplied explicitly or by fallback.
-    """
-    # imported lazily: flash.serve is the CLIENT side, and a module-level import would pull
-    # flash.server into every CLI invocation.
-    from flash.server.platform.auth import standalone
-
-    configured = (os.environ.get("FREESOLO_SERVING_URL") or "").strip()
-    if standalone() and (not configured or is_freesolo_hosted_url(configured)):
-        raise ServingError(
-            f"FREESOLO_SERVING_URL is {'not set' if not configured else 'a Freesolo-hosted URL'}. "
-            "A standalone plane has no serving backend of its own, and using the hosted one would "
-            "send FREESOLO_INTERNAL_KEY - the key that controls this plane - to a service you do "
-            "not operate. Point FREESOLO_SERVING_URL at your own multi-LoRA deployment, or export "
-            "the adapter and serve it yourself (see SELF_HOSTING.md). Training does not require "
-            "this."
-        )
-    return serving_control_url(configured or DEFAULT_FREESOLO_SERVING_URL)
-
-
 def serving_openai_base_url() -> str:
     """OpenAI-compatible base URL for the configured serving backend."""
     return openai_base_url(serving_base_url())
-
-
-def _internal_key_header() -> dict[str, str]:
-    # strip exactly as authenticate does: newlines are invalid headers and spaces change the key.
-    # blank values omit the header.
-    key = (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
-    return {"X-Freesolo-Internal-Key": key} if key else {}
 
 
 @dataclass

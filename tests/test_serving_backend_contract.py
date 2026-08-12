@@ -1047,6 +1047,77 @@ def test_undeploy_does_not_scan_the_whole_keyspace_under_the_lock(client):
     )
 
 
+def test_a_registration_landing_before_the_lock_is_still_undeployed(client):
+    """The member list must be read inside the lock, not snapshotted before it.
+
+    Read first, it is a snapshot: a registration that COMPLETES in the gap before the lock is taken
+    adds its revision to the index, and this pass never sees it. Undeploy then returns 200 with the
+    new revision left `ready`, resident on the GPU, and callable by its immutable id -- the exact
+    thing undeploy promises to have stopped.
+
+    Driven by registering a second revision at the moment the lock is acquired, which is inside the
+    window a pre-lock read would have missed.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    second = "run-abc@step-20." + "b" * 40
+    original = module._run_lock
+    landed: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def _register_then_lock(run_id):
+        # Before the lock is held, so a real concurrent registration could genuinely be here.
+        if not landed:
+            landed.append(second)
+            module.adapter_records[module._record_key(second)] = {
+                "adapter_id": second,
+                "status": "ready",
+                "base_model": BASE_MODEL,
+                "metadata": {
+                    "record_type": "revision",
+                    "run_id": RUN_ID,
+                    "lifecycle_state": "ready",
+                },
+            }
+            members = module.adapter_records.get(module._members_key(RUN_ID)) or []
+            module.adapter_records[module._members_key(RUN_ID)] = [*members, second]
+        async with original(run_id):
+            yield
+
+    module._run_lock = _register_then_lock
+    try:
+        response = client.delete(f"/adapters/{REVISION}")
+    finally:
+        module._run_lock = original
+    assert response.status_code == 200
+    assert module.adapter_records[module._record_key(second)]["status"] == "disabled", (
+        "a revision registered just before the lock survived undeploy as `ready`, so it is still "
+        "callable by its immutable id after undeploy reported success"
+    )
+
+
+def test_undeploy_works_when_the_member_index_is_missing(client):
+    """A run with no `members:` key must still be disabled.
+
+    Two ways to get there, neither exotic: an app upgraded from the earlier scan-based version has
+    no index at all for runs registered before the upgrade, and a container that died between the
+    revision write and the alias write left an incomplete one. If the index is treated as the only
+    source of truth, `_run_members` returns [] and the disable loop never runs -- so undeploy
+    answers 200 with empty `disabled_*` lists while the adapter keeps serving.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    del module.adapter_records[module._members_key(RUN_ID)]
+
+    response = client.delete(f"/adapters/{REVISION}")
+    assert response.status_code == 200
+    assert module.adapter_records[module._record_key(REVISION)]["status"] == "disabled", (
+        "undeploy reported success without disabling the record it was handed, so the adapter is "
+        "still serving"
+    )
+    assert response.json()["disabled_revisions"] == [REVISION]
+
+
 def test_an_interrupted_first_registration_can_still_be_activated(client):
     """A revision whose alias write never landed must be repairable by re-registering.
 

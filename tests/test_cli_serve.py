@@ -7,7 +7,9 @@ failure is caught before anything is written or deployed.
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 import types
 from pathlib import Path
 
@@ -341,34 +343,86 @@ def test_the_keyless_warning_redeploys_the_file_that_was_actually_deployed(
     assert serve_cmd.DEFAULT_APP_FILE not in err
 
 
-def test_status_asks_the_backend_the_way_deploy_does(monkeypatch, capsys):
-    """`serve status` must use the client's authenticated request path.
+def test_status_sends_the_internal_key_the_way_deploy_does(monkeypatch, capsys):
+    """`serve status` must carry the internal key.
 
     The contract permits a backend to authenticate /healthz. A bare unauthenticated GET then 401s
     and status reports the backend as unreachable while every deploy against it works fine.
     """
-    from flash.serve import deploy as deploy_mod
+    from flash.serve import urls as urls_mod
 
-    seen: list[tuple[str, str]] = []
+    seen: list[tuple[str, dict]] = []
 
-    class _Response:
-        @staticmethod
-        def json():
-            return {
-                "ok": True,
-                "base_models": ["Qwen/Qwen3.5-4B"],
-                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
-            }
+    def _fake_request(url, headers):
+        seen.append((url, headers))
+        return {
+            "ok": True,
+            "base_models": ["Qwen/Qwen3.5-4B"],
+            "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
+        }
 
-    def _fake_request(method, url, **kwargs):
-        seen.append((method, url))
-        return _Response()
-
-    monkeypatch.setattr(deploy_mod, "serving_base_url", lambda: "https://acme.modal.run")
-    monkeypatch.setattr(deploy_mod, "_serving_request", _fake_request)
+    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "sekrit")
+    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
     assert serve_cmd.cmd_serve_status(_args()) == 0
-    assert seen == [("GET", "https://acme.modal.run/healthz")], (
-        "status did not go through the authenticated serving request path"
+    assert seen == [("https://acme.modal.run", {"X-Freesolo-Internal-Key": "sekrit"})], (
+        "status did not send the internal key, so an authenticated backend reads as unreachable"
+    )
+
+
+def test_status_runs_without_the_optional_http_dependency(monkeypatch):
+    """`serve status` must work on a bare `pip install freesolo-flash`.
+
+    `[project].dependencies` is empty by design and the client CLI is pure standard library, but
+    `flash.serve.deploy` imports httpx at module scope. Importing it from this command made status
+    die with `ModuleNotFoundError: httpx` BEFORE any of its error handling ran -- and this is the
+    command a user reaches for when their backend is not answering, so it is the worst one to make
+    conditional on an extra.
+
+    Run in a SUBPROCESS with httpx made unimportable, rather than by asserting on the import lines
+    in this file. Import reachability is transitive -- a helper three modules down that pulls httpx
+    would break the base install just as thoroughly -- and only actually running the command with
+    httpx absent covers that. The command is pointed at an unroutable host so it fails on the
+    request, which is the success condition here: reaching its own error path means every import
+    it needed resolved.
+    """
+    blocker = (
+        "import sys\n"
+        "class _NoHttpx:\n"
+        "    def find_module(self, name, path=None):\n"
+        "        if name == 'httpx' or name.startswith('httpx.'):\n"
+        "            raise ImportError('httpx is not installed in a base install')\n"
+        "        return None\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        return self.find_module(name, path)\n"
+        "sys.meta_path.insert(0, _NoHttpx())\n"
+        "from flash.cli.commands import serve as s\n"
+        "import types\n"
+        "code = s.cmd_serve_status(types.SimpleNamespace())\n"
+        "print('EXIT', code)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", blocker],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=Path(serve_cmd.__file__).resolve().parents[3],
+        env={
+            **os.environ,
+            "FREESOLO_SERVING_URL": "https://status-probe.invalid",
+            "FREESOLO_INTERNAL_KEY": "x",
+        },
+        check=False,
+    )
+    missing_dependency = (
+        f"serve status could not run without httpx, which a base `pip install freesolo-flash` "
+        f"does not provide:\n{done.stderr[-2000:]}"
+    )
+    assert "ModuleNotFoundError" not in done.stderr, missing_dependency
+    assert "ImportError" not in done.stderr, missing_dependency
+    assert "EXIT 1" in done.stdout, (
+        f"expected the command to reach its own error path; got {done.stdout!r} "
+        f"{done.stderr[-500:]!r}"
     )
 
 
@@ -384,16 +438,44 @@ def test_a_malformed_health_payload_is_diagnosed_not_a_traceback(monkeypatch, ca
     unchecked `.get` reaches the user as an AttributeError traceback -- the command failing at
     exactly the moment its job starts. Every shape below has to come back as a stated error.
     """
-    from flash.serve import deploy as deploy_mod
+    from flash.serve import urls as urls_mod
 
-    monkeypatch.setattr(deploy_mod, "serving_base_url", lambda: "https://acme.modal.run")
-    monkeypatch.setattr(
-        deploy_mod,
-        "_serving_request",
-        lambda method, url, **kwargs: types.SimpleNamespace(json=lambda: payload),
-    )
+    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
+    monkeypatch.setattr(serve_cmd, "_status_request", lambda url, headers: payload)
     assert serve_cmd.cmd_serve_status(_args()) == 1
     assert "serving backend at" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("url", "secret"),
+    [
+        ("https://user:sup3rsecret@acme.modal.run", "sup3rsecret"),
+        ("https://t0ken@acme.modal.run", "t0ken"),
+        ("https://user:p@ss:word@acme.modal.run", "p@ss:word"),
+    ],
+    ids=["user-and-password", "token-only", "password-with-separators"],
+)
+def test_a_credential_in_the_serving_url_is_never_printed(monkeypatch, capsys, url, secret):
+    """A base URL is user-supplied and may carry credentials in its authority.
+
+    Printed verbatim, they land in the terminal and in whatever captures its output. Redacting the
+    URL we print is necessary but not sufficient: urllib quotes the URL it was handed back into its
+    OWN errors, and it reports FRAGMENTS -- parsing `https://user:pw@host` for a port raises
+    "nonnumeric port: 'pw@host'", a string containing neither the full base nor the full userinfo.
+    So the exception text has to be redacted too, token by token.
+    """
+    from flash.serve import urls as urls_mod
+
+    def _boom(request_url, headers):
+        # Exactly what urllib does: the value it was given, quoted back at the caller.
+        raise ValueError(f"nonnumeric port: {request_url.split('://', 1)[-1]!r}")
+
+    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: url)
+    monkeypatch.setattr(serve_cmd, "_status_request", _boom)
+    assert serve_cmd.cmd_serve_status(_args()) == 1
+    err = capsys.readouterr().err
+    assert secret not in err, f"the serving url's credential was printed: {err!r}"
+    assert "acme.modal.run" in err, "the redaction dropped the host, so the error names nothing"
 
 
 def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, capsys):
