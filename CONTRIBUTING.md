@@ -29,8 +29,20 @@ uv run pytest -q -m wallclock                 # asserts on real elapsed time; ru
 ```
 
 The size gates fail on the _whole_ file or function, so the fix is always to extract a
-cohesive piece into a sibling, never to reflow lines. A green local run of all six commands
-usually means a green CI run. CI runs them on both supported interpreters (3.11 and 3.12);
+cohesive piece into a sibling, never to reflow lines.
+
+If you change the verl pin (`Dockerfile.worker` or
+`flash/engine/worker/backend_common.py`), also run the one check that needs the network:
+
+```bash
+uv run python scripts/check_verl_pin_exists.py   # the pinned commit is reachable on the fork
+```
+
+The offline tests only compare the pin against a hardcoded copy of itself, so a
+mis-transcribed sha passes every one of them while naming a commit that was never pushed —
+which then fails every worker install at provisioning time.
+
+A green local run usually means a green CI run. CI runs them on both supported interpreters (3.11 and 3.12);
 locally, whichever one `uv` picks is normally enough.
 
 CI also runs `uv run mypy flash`, but that job is advisory: it reports the existing type

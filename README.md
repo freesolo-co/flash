@@ -21,11 +21,15 @@ Flash is the **client and control plane** for Freesolo's hosted post-training se
 
 | Path               | What it is                                                        |
 | ------------------ | ----------------------------------------------------------------- |
-| `flash/cli/`       | the `flash` CLI — pure standard library, no runtime dependencies  |
+| `flash/cli/`       | the `flash` CLI — no declared runtime dependencies\*              |
 | `flash/server/`    | the FastAPI control plane — run submission, auth, project scoping |
 | `flash/engine/`    | the GPU worker and training recipes — verl + colocated vLLM       |
 | `flash/providers/` | the GPU substrate — pricing, allocation, submit/poll              |
 | `flash/envs/`      | environment loading                                               |
+
+\* `pip install freesolo-flash` pulls nothing. Commands that run an environment **locally** —
+`flash env test` and `flash env eval` — do need the `freesolo` SDK, which they import at the
+point of use; install it with `pip install freesolo`.
 
 Two components stay Freesolo-operated and are **not** in this repository:
 
