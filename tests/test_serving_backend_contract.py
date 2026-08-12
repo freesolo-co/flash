@@ -2290,9 +2290,9 @@ def test_a_load_that_loses_its_claim_mid_download_undoes_itself(client, monkeypa
         removed.append(evicted_id)
 
     async def _path(record):
-        # The claim changes hands DURING the download, exactly as a released-then-retaken claim
-        # would: by the time this load finishes, someone else owns the id.
-        module.adapter_records[module._lora_id_key(int_id)] = "run-other@final." + "9" * 40
+        # The claim is RELEASED during the download, exactly as settle deciding this attempt was
+        # superseded would leave it: by the time the load finishes, this adapter holds nothing.
+        module.adapter_records.pop(module._lora_id_key(int_id), None)
         return "/cache/adapter"
 
     async def _add(request):
@@ -2309,6 +2309,59 @@ def test_a_load_that_loses_its_claim_mid_download_undoes_itself(client, monkeypa
         "whichever adapter now owns the claim"
     )
     assert mine not in instance._loaded
+
+
+def test_a_superseded_load_does_not_evict_the_adapter_that_took_its_id(client, monkeypatch):
+    """Undoing a superseded load must never kick the claim's new owner off the GPU.
+
+    `remove_lora` addresses the int id, not the adapter. Once a collider has taken the claim, the
+    same call that undoes this load evicts the WINNER -- the outcome `unregister` refuses eviction
+    to avoid. The superseded load reports the failure either way; the difference is whether a live
+    adapter loses its weights with a `ready` record still pointing at it.
+    """
+    lora = types.ModuleType("vllm.lora.request")
+    lora.LoRARequest = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora)
+
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._loaded = {}
+    instance._int_ids = {}
+
+    mine = "run-superseded@final." + "e" * 40
+    winner = "run-winner@final." + "7" * 40
+    int_id = module._lora_int_id(mine)
+    removed: list[int] = []
+
+    async def _remove(evicted_id):
+        removed.append(evicted_id)
+
+    async def _path(record):
+        # A COLLIDER takes the id mid-download and is now the live owner of this int.
+        module.adapter_records[module._lora_id_key(int_id)] = winner
+        return "/cache/adapter"
+
+    async def _add(request):
+        return None
+
+    instance._adapter_path = _path
+    instance.engine = types.SimpleNamespace(add_lora=_add, remove_lora=_remove)
+
+    with pytest.raises(RuntimeError, match="changed hands"):
+        _run_awaitable(engine_class._lora_request(instance, {"adapter_id": mine}))
+
+    assert removed == [], (
+        "undoing a superseded load evicted the int id a peer now owns, so the winning adapter is "
+        "off the gpu while its record still says ready"
+    )
+    assert mine not in instance._loaded
+    assert module.adapter_records[module._lora_id_key(int_id)] == winner, (
+        "the superseded load disturbed the winner's claim"
+    )
 
 
 def test_undeploy_deletes_the_downloaded_adapter(client, monkeypatch, tmp_path):
@@ -2334,10 +2387,56 @@ def test_undeploy_deletes_the_downloaded_adapter(client, monkeypatch, tmp_path):
     downloaded.mkdir()
     (downloaded / "adapter_model.safetensors").write_bytes(b"weights")
     monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
+    # Disabled first, which is the state undeploy has already written durably by the time it calls
+    # the engine. The delete is gated on it: a revision that is `ready` again has been redeployed
+    # and its files are in use.
+    module.adapter_records[module._record_key(REVISION)] = {
+        "adapter_id": REVISION,
+        "status": "disabled",
+    }
 
     _run_awaitable_result(engine_class.unregister(instance, REVISION))
 
     assert not downloaded.exists(), (
         "undeploy left the downloaded adapter on the volume, so retired revisions accumulate "
         "until storage runs out"
+    )
+
+
+def test_a_redeployed_revision_keeps_its_downloaded_adapter(client, monkeypatch, tmp_path):
+    """Cleanup must not delete weights a concurrent redeploy has already brought back.
+
+    The engine call is awaited OUTSIDE the run lock and the per-adapter lock is per-container, so
+    `models deploy` can re-register this exact revision and settle it `ready` while the eviction is
+    in flight. The volume is shared by every replica, so deleting then removes the files under a
+    live load on another container: a `ready` record whose weights are gone, which fails at the
+    next cold start rather than here.
+    """
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._loaded = {}
+    instance._int_ids = {}
+
+    async def _remove(_int_id):
+        return None
+
+    instance.engine = types.SimpleNamespace(remove_lora=_remove)
+
+    downloaded = tmp_path / module._adapter_digest(REVISION)
+    downloaded.mkdir()
+    (downloaded / "adapter_model.safetensors").write_bytes(b"weights")
+    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
+    # Redeployed: the record is `ready` again by the time cleanup reads it.
+    module.adapter_records[module._record_key(REVISION)] = {
+        "adapter_id": REVISION,
+        "status": "ready",
+    }
+
+    _run_awaitable_result(engine_class.unregister(instance, REVISION))
+
+    assert downloaded.exists(), (
+        "cleanup deleted the weights of a revision that had been redeployed, so a ready record "
+        "now points at files that are gone"
     )

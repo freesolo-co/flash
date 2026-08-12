@@ -231,6 +231,21 @@ async def _owns_lora_int_id(int_id: int, adapter_id: str) -> bool:
     return owner is None or owner == adapter_id
 
 
+async def _still_holds_lora_int_id(int_id: int, adapter_id: str) -> bool:
+    """Whether ``adapter_id`` STILL holds the claim on ``int_id``.
+
+    Deliberately not `_owns_lora_int_id`, which answers a different question. That one asks "would
+    evicting kick a peer off the GPU" and so treats an absent claim as True. Here the question is
+    "did this load keep the id it claimed", and an absent claim is a NO: the claim is taken before
+    the download and released only by settle deciding this attempt failed, so finding it gone means
+    this attempt was superseded and the id is free for a colliding adapter to take. Answering True
+    there would leave the load resident holding nothing, which is exactly the unclaimed-resident
+    state the claim exists to prevent.
+    """
+    owner = await adapter_records.get.aio(_lora_id_key(int_id))
+    return owner == adapter_id
+
+
 async def _release_lora_int_id(int_id: int, adapter_id: str) -> bool:
     """Drop ``adapter_id``'s claim on ``int_id``. False only when somebody ELSE holds it.
 
@@ -558,9 +573,17 @@ class Engine:
             # there -- and this `add_lora` would land on top of it, two adapters under one vLLM
             # int. Losing the claim means this load must not stay resident, so it undoes itself
             # and reports the failure rather than leaving the engine in that state.
-            if not await _owns_lora_int_id(int_id, adapter_id):
-                with contextlib.suppress(Exception):
-                    await self.engine.remove_lora(int_id)
+            if not await _still_holds_lora_int_id(int_id, adapter_id):
+                # Undone by evicting the int this load just wrote -- but ONLY while no peer holds
+                # the claim. `remove_lora` addresses the id, not the adapter, so once a collider
+                # has taken it the same call would kick the WINNER off the GPU: the very outcome
+                # `unregister` refuses eviction to avoid. A peer that already claimed the id has
+                # not loaded under it on this container (its own load evicts a stale resident
+                # first), so leaving this one resident costs a `max_loras` slot until the
+                # container recycles, while evicting would corrupt a live adapter.
+                if await _owns_lora_int_id(int_id, adapter_id):
+                    with contextlib.suppress(Exception):
+                        await self.engine.remove_lora(int_id)
                 raise RuntimeError(
                     f"lora id {{int_id}} changed hands while {{adapter_id}} was loading, so this "
                     f"load was superseded. redeploy to retry."
@@ -620,16 +643,25 @@ class Engine:
             # And delete the downloaded weights. Every immutable revision lands in its own digest
             # directory on the persistent volume, so a backend that serves successive checkpoints
             # accumulates every one it has ever loaded -- paid storage that grows without bound
-            # until the volume fills and new adapters cannot download at all. Safe here because
-            # the record is already `disabled`: re-registering the same revision is an explicit
-            # request that downloads it again. Best effort, and inside the adapter's own lock so
-            # it cannot delete files out from under a concurrent load of the same adapter.
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(
-                    shutil.rmtree,
-                    f"{{ADAPTER_DIR}}/{{_adapter_digest(adapter_id)}}",
-                    ignore_errors=True,
-                )
+            # until the volume fills and new adapters cannot download at all.
+            #
+            # Gated on the DURABLE record still being disabled, re-read here rather than assumed.
+            # The adapter lock is per-container and this call is awaited outside the run lock, so
+            # it does not exclude a redeploy: `models deploy` can re-register this exact revision
+            # and settle it `ready` while this eviction is in flight, and the volume is shared by
+            # every replica. Deleting then removes the files under a live load on another
+            # container -- a `ready` record whose weights are gone, which fails at the next cold
+            # start rather than here. Re-registration is an explicit request that downloads the
+            # revision again, so a record that is no longer disabled is exactly the signal to
+            # leave the directory alone; the next undeploy collects it.
+            current = await adapter_records.get.aio(_record_key(adapter_id))
+            if isinstance(current, dict) and current.get("status") == "disabled":
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        shutil.rmtree,
+                        f"{{ADAPTER_DIR}}/{{_adapter_digest(adapter_id)}}",
+                        ignore_errors=True,
+                    )
         return {{"ok": True}}
 
     async def _prepare(self, payload: dict[str, Any], record: dict[str, Any]):
