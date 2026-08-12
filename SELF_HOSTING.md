@@ -352,9 +352,19 @@ deploys it to your own Modal account, and prints the `FREESOLO_SERVING_URL` to e
 
 ```bash
 pip install 'freesolo-flash[serve-modal]'
+modal setup
+# HF_TOKEN pulls weights and adapters. FLASH_SERVING_KEY authenticates callers - set it: a
+# Modal URL is public, and without a key anyone who finds yours can load adapters onto your
+# GPU and bill you for it.
+modal secret create flash-serving HF_TOKEN=hf_... \
+  FLASH_SERVING_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+
 flash serve gpus --model Qwen/Qwen3.5-4B   # what fits where, and what it costs
 flash serve setup --model Qwen/Qwen3.5-4B  # generate, then ask before deploying
 ```
+
+Export that same key locally as `FREESOLO_INTERNAL_KEY` so flash sends it. `flash serve setup`
+checks after deploying and warns if the app came up without one.
 
 The generated file is yours to read and edit - it is written into your working directory,
 not hidden inside the package. Its engine settings come from the catalog's own

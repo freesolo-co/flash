@@ -8,6 +8,7 @@ account, and print the environment variable that connects the two.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -138,8 +139,11 @@ def _setup_instructions() -> str:
         f"Modal is not set up yet. Install it and authenticate:\n"
         f"  pip install 'freesolo-flash[serve-modal]'\n"
         f"  modal setup\n"
-        f"Then add your Hugging Face token so the app can pull weights and adapters:\n"
-        f"  modal secret create {SECRET_NAME} HF_TOKEN=hf_...\n"
+        f"Then create the secret. The app pulls weights with HF_TOKEN, and authenticates "
+        f"callers with FLASH_SERVING_KEY -- a Modal URL is public, so without a key anyone "
+        f"who finds it can load adapters and spend your GPU budget:\n"
+        f"  modal secret create {SECRET_NAME} HF_TOKEN=hf_... "
+        f"FLASH_SERVING_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')\n"
         f"Then re-run: {CLI_NAME} serve setup --model <model>"
     )
 
@@ -236,7 +240,43 @@ def _deploy(app_file: Path) -> int:
         return 0
     print(f"\ndeployed. point flash at it:\n  export FREESOLO_SERVING_URL={url}")
     print(f"then: {CLI_NAME} models deploy <run-id> && {CLI_NAME} models chat <run-id> -m 'hi'")
+    _warn_if_unauthenticated(url)
     return 0
+
+
+def _healthz(url: str) -> dict | None:
+    """The app's own /healthz, or None if it cannot be read. Never raises: this is advisory."""
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(f"{url}/healthz", timeout=15) as response:
+            payload = json.load(response)
+    # broad on purpose: a warning must never fail a deploy that already succeeded
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _warn_if_unauthenticated(url: str) -> None:
+    """Say so if the deployed app accepts unauthenticated writes.
+
+    The app only enforces a key when FLASH_SERVING_KEY is in its secret, and the URL is public.
+    Ask the app itself rather than guessing from local env: the secret lives in Modal, so the
+    deployed container is the only thing that knows whether a key is set. Silence on an
+    unreadable or older /healthz is deliberate -- warning without evidence trains users to
+    ignore the warning.
+    """
+    payload = _healthz(url)
+    if payload is None or payload.get("requires_key") is not False:
+        return
+    print(
+        "\nwarning: this app has no FLASH_SERVING_KEY, so anyone with the URL can register "
+        "adapters and spend your GPU budget. set one and redeploy:\n"
+        f"  modal secret create {SECRET_NAME} HF_TOKEN=hf_... "
+        "FLASH_SERVING_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')\n"
+        "  then export FREESOLO_INTERNAL_KEY to the same value",
+        file=sys.stderr,
+    )
 
 
 def _deployed_url(output: str) -> str:

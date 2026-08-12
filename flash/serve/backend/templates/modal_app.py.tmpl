@@ -387,6 +387,10 @@ def api():
             "ok": True,
             "base_models": [BASE_MODEL],
             "gpu": GPU,
+            # Whether this app authenticates writes at all. Deliberately not the key itself, and
+            # not a per-request answer: `flash serve setup` reads it once after deploying to warn
+            # about a URL that anyone could register adapters against.
+            "requires_key": bool(os.environ.get("FLASH_SERVING_KEY")),
             # Only what this backend genuinely implements. `revision_provenance` is advertised
             # because the records below echo the run/checkpoint/hf_revision metadata back.
             # thinking_structured_outputs_deferred_v1 is NOT advertised: deferring a grammar until

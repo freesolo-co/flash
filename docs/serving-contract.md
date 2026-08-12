@@ -31,9 +31,17 @@ loaded and addressable the entire time.
 ## Authentication
 
 Every request carries `X-Freesolo-Internal-Key`. On a standalone plane this is the plane's root
-credential, which is why `flash/serve/deploy.py` refuses to send it to a Freesolo-hosted URL when
-`FLASH_STANDALONE=1` is set: it would hand the key that controls your plane to a service you do not
-operate.
+credential, so treat it as the key that controls your whole deployment, not a per-service token.
+
+The client scopes it to one origin. `flash/serve/deploy.py` installs a request hook that deletes
+the header from any request whose origin differs from the configured `FREESOLO_SERVING_URL`, on
+every redirect hop. httpx strips only `Authorization` and `Cookie` across an origin change, so
+without that hook a single 302 from your serving host would forward the plane credential to
+whatever origin the redirect named.
+
+Two consequences for a backend you operate: a same-origin redirect keeps the key (Modal's
+async-result polls rely on this), and a cross-origin redirect silently arrives unauthenticated, so
+do not build one into a request path and expect it to authenticate.
 
 Compare the key in constant time (`hmac.compare_digest`). Reject with 401 when it does not match.
 
@@ -171,6 +179,15 @@ mystery 500 long after the deploy claimed success. Validate by actually loading 
 
 The client gives up after its readiness budget and reports the last state it saw, leaving the
 previous alias serving. A revision that never reaches `ready` never takes traffic.
+
+That budget is **5 minutes** (`REVISION_READY_BUDGET_SECONDS`), and on a scale-to-zero backend it
+is easy to exceed without anything being wrong: the first deploy after an idle period pays a cold
+start, and for a GDN-hybrid model that is a multi-minute `torch.compile` before the engine can
+load anything. Two things follow. Return `Retry-After` while loading, so the wait is paced by your
+estimate rather than the client's backoff. And do the load somewhere that outlives the request:
+if the work is a fire-and-forget task on a web container, an autoscaler can take the container
+away mid-load and the record sits at `registered` forever, which the client can only report as a
+timeout.
 
 ### `POST /adapters/{revision_id}/activate`
 

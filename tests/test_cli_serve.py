@@ -214,6 +214,35 @@ def test_deploy_reports_the_export_line_users_need(tmp_path, monkeypatch, capsys
     assert "export FREESOLO_SERVING_URL=https://acme--flash-serve-api.modal.run" in out
 
 
+@pytest.mark.parametrize(
+    ("healthz", "warns"),
+    [
+        ({"ok": True, "requires_key": False}, True),
+        ({"ok": True, "requires_key": True}, False),
+        # An older app predating the field, and an unreachable one. Neither is evidence the app is
+        # unauthenticated, so neither may cry wolf.
+        ({"ok": True}, False),
+        (None, False),
+    ],
+    ids=["no-key", "keyed", "field-absent", "unreachable"],
+)
+def test_a_keyless_deploy_warns_that_anyone_can_spend_the_gpu_budget(
+    tmp_path, monkeypatch, capsys, healthz, warns
+):
+    """A Modal URL is public. Deploying without a key is a real exposure, so say so out loud."""
+
+    def _fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="https://acme--flash-serve-api.modal.run\n", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr(serve_cmd, "_healthz", lambda url: healthz)
+    assert serve_cmd._deploy(tmp_path / "app.py") == 0
+    err = capsys.readouterr().err
+    assert ("no FLASH_SERVING_KEY" in err) is warns
+
+
 def test_a_failed_deploy_is_reported_as_a_failure(tmp_path, monkeypatch, capsys):
     def _fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
