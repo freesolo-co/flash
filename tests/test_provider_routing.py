@@ -631,6 +631,89 @@ def test_sft_submission_fails_closed_when_the_environment_cannot_be_pinned(orch,
     assert persisted == []
 
 
+def _permanent_404(_parsed, *_args, **_kwargs):
+    from flash.envs.identity import GitHubPermanentError
+
+    raise GitHubPermanentError("GitHub environment request failed (404): Not Found")
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_permanent_env_404_is_refused_before_a_gpu_is_allocated(
+    orch, monkeypatch, algorithm, dry_run
+):
+    """A nonexistent environment repo must fail AT SUBMIT, not on a rented worker.
+
+    grpo and opd keep the best-effort pin, so a 404 used to be swallowed exactly like a rate-limit
+    blip: `--dry-run` answered `state: dry_run, error: null`, and a real submit allocated a GPU that
+    existed only to rediscover the 404 the control plane already had. The dry-run case is the point
+    of the parametrisation -- that mode's entire job is to answer this without paying.
+    """
+    import flash.envs.loader as env_loader
+    from flash.providers import allocator
+
+    monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", _permanent_404)
+    monkeypatch.setattr(
+        allocator, "allocate", lambda *a, **k: pytest.fail("allocated a GPU for a 404 environment")
+    )
+
+    with pytest.raises(orch.EnvironmentRefNotFound, match="could not be resolved on GitHub"):
+        orch.submit_job(_public_spec(algorithm=algorithm), dry_run=dry_run)
+
+
+def test_unauthenticated_404_still_defers_rather_than_refusing(orch, monkeypatch):
+    """Without a token a 404 is not evidence of a typo, so it must not refuse the run.
+
+    GitHub answers 404 both for a repo that does not exist and for a private one the caller may not
+    see. Every managed-hub environment is private, so a tokenless plane 404s on refs that are
+    perfectly valid -- refusing those would ground legitimate runs to catch a typo.
+    """
+    import flash.envs.loader as env_loader
+    from flash.providers import allocator
+
+    monkeypatch.setattr(env_loader, "_github_token", lambda: None)
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", _permanent_404)
+    monkeypatch.setattr(orch, "_run_job", lambda *a, **k: None)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+
+    status = orch.submit_job(_public_spec(algorithm="grpo"), dry_run=True)
+
+    assert status.state == "dry_run"
+
+
+@pytest.mark.parametrize("blip_kind", ["rate-limit", "unavailable", "untyped"])
+def test_transient_github_failure_still_defers_the_pin(orch, monkeypatch, blip_kind):
+    """The 404 gate must not turn a blip into a refused submit.
+
+    The deferral above this is deliberate: grpo and opd have no profile keyed on the pin, the worker
+    resolves the ref itself, and the lifecycle fallback pins it on recovery. Only a PERMANENT answer
+    changes that, so every transient class -- and anything untyped, which is unproven -- keeps
+    reaching allocation.
+    """
+    import flash.envs.loader as env_loader
+    from flash.envs.identity import GitHubRateLimitError, GitHubUnavailableError
+    from flash.providers import allocator
+
+    blip = {
+        "rate-limit": GitHubRateLimitError("GitHub API rate limit exceeded (429)"),
+        "unavailable": GitHubUnavailableError("GitHub server error (503, transient)"),
+        "untyped": RuntimeError("some other github failure"),
+    }[blip_kind]
+
+    def raise_blip(_parsed, *_args, **_kwargs):
+        raise blip
+
+    allocated = []
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", raise_blip)
+    monkeypatch.setattr(orch, "_run_job", lambda *a, **k: allocated.append("submitted") or None)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+
+    orch.submit_job(_public_spec(algorithm="grpo"))
+
+    assert allocated == ["submitted"], "a transient blip must still defer the pin and submit"
+
+
 def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     """A pin the lifecycle fallback recovers must survive a control-plane restart.
 

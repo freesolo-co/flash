@@ -109,3 +109,67 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
     d = spec.to_internal_dict()
     d["environment"] = {**d["environment"], "resolved_sha": sha}
     return runner.JobSpec.from_dict(d)
+
+
+def preflight_validate_environment_ref(spec: JobSpec) -> None:
+    """Refuse an environment ref GitHub has permanently rejected, before a GPU is allocated.
+
+    ``_assign_resolved_env_sha`` is best-effort by design: grpo and opd have no workload profile
+    keyed on the pin, so a GitHub blip at submit must not fail the run -- the worker resolves the ref
+    itself, and the lifecycle fallback pins it on recovery. That deferral is correct for a blip and
+    wrong for a typo: a repo that does not exist gets the same "worker will resolve" treatment, so
+    ``--dry-run`` reported ``state: dry_run, error: null`` and a real submit rented a GPU to discover
+    a 404 the control plane already had in hand.
+
+    This splits the two cases on the only thing that distinguishes them -- whether GitHub's answer
+    can change on a retry. A permanent answer (404/422) is refused here; everything else, including
+    both transient classes, still defers. Read-only and allocation-independent, so it runs in
+    dry-run too: that is the mode whose whole purpose is to answer this question without paying.
+
+    Requires a GitHub token to refuse anything. GitHub answers 404 for a repo that does not exist
+    AND for a private one the caller may not see, so an unauthenticated 404 is not evidence of a
+    typo: every private environment, including every managed-hub slug, looks exactly like one. Only
+    an authenticated 404 means "not there", so a tokenless plane keeps the old deferral rather than
+    refusing runs whose environment it simply cannot see.
+
+    sft never reaches this state -- its profile gate already fails closed on any unpinned
+    environment -- but this runs for it as well, so the failure names the ref rather than the
+    missing profile it caused.
+    """
+    env_id = spec.environment.id
+    if not env_id or spec.environment.resolved_sha:
+        return
+    from flash.envs.identity import GitHubPermanentError
+    from flash.envs.loader import (
+        _github_token,
+        _parse_github_environment_ref,
+        _resolve_ref_sha,
+        is_managed_environment_slug,
+        managed_slug_to_github_ref,
+    )
+
+    if not _github_token():
+        return
+
+    try:
+        ref_str = (
+            managed_slug_to_github_ref(env_id) if is_managed_environment_slug(env_id) else env_id
+        )
+        parsed = _parse_github_environment_ref(ref_str)
+    except Exception:
+        # not a resolvable github ref (a local path, a malformed slug). the loader owns that
+        # verdict and reports it far better than a half-parsed ref could here.
+        return
+    if parsed is None:
+        return
+    try:
+        _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
+    except GitHubPermanentError as exc:
+        raise runner.EnvironmentRefNotFound(
+            f"environment {env_id!r} could not be resolved on GitHub: {exc}. Verify the repository, "
+            "ref and path exist and that the plane's GitHub token can read them"
+        ) from exc
+    except Exception:
+        # transient, or anything else unproven: keep the documented best-effort deferral. the pin
+        # is an optimisation for these, and the worker resolves the ref on its own.
+        return

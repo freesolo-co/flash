@@ -224,6 +224,12 @@ def submit_job(
     from flash.content.multimodal import preflight_validate_image_opd
     from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
 
+    # ahead of allocation and inside dry-run: an environment repo GitHub permanently rejects is the
+    # submitter's typo, and the plane already holds the 404 that proves it. FIRST of the three:
+    # the opd image preflight below resolves the same ref to read its dataset, so leaving this
+    # second would surface an unresolvable environment as a raw GitHub error from whichever
+    # preflight happened to touch it first, instead of the named refusal.
+    _runner().preflight_validate_environment_ref(worker_spec)
     preflight_validate_image_opd(worker_spec)
     preflight_validate_managed_teacher(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
