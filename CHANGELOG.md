@@ -19,6 +19,14 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   `pip install 'freesolo-flash[server]'` could leave `flash` running RunPod's CLI, which exits 0
   and does nothing. `flash` is unchanged and remains correct on a base (client-only) install.
 
+### Changed
+
+- CI runs the offline test suite on both supported interpreters (3.11 and 3.12) rather than
+  3.11 alone, and sets `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` so a test that reaches the
+  network fails deterministically instead of depending on runner connectivity.
+- Every GitHub Action is pinned to a commit SHA rather than a mutable tag.
+- `mypy` runs in CI as an advisory (non-blocking) job.
+
 ### Fixed
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
@@ -36,16 +44,6 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   command that could not work. Against a self-hosted plane the scaffold now emits the
   `github:owner/repo@ref:path` id form, which such a plane resolves directly. Output against
   the managed plane is unchanged.
-
-### Changed
-
-- CI runs the offline test suite on both supported interpreters (3.11 and 3.12) rather than
-  3.11 alone, and sets `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` so a test that reaches the
-  network fails deterministically instead of depending on runner connectivity.
-- Every GitHub Action is pinned to a commit SHA rather than a mutable tag.
-- `mypy` runs in CI as an advisory (non-blocking) job.
-
-### Fixed
 
 - `flash-server` reported missing operator configuration as an unhandled ASGI startup
   exception, so the actionable message arrived under ~20 frames of starlette/contextlib. The
