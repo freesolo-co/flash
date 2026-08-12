@@ -28,15 +28,17 @@ _USER_DATA_CAP = 64_000
 _USER_DATA_MARGIN = 2_000
 _USER_DATA_BUDGET = _USER_DATA_CAP - _USER_DATA_MARGIN
 
-# Fast path only: above this, the spec is spilled to HF without rendering a payload that cannot fit.
-# The budget is what is LEFT of the ~64,000-byte provider cap after the fixed framing: this module's
-# template plus every source file it heredocs in (bootstrap.py and bootstrap_secrets.py), which is
-# ~51,000 bytes and grows whenever that bootstrap does (docstrings are stripped on the way in, so
-# only real code counts). base64 + json escaping inflate the spec ~1.35x on the way in, so this
-# ceiling must stay well under the remaining budget; shrink it again whenever the embedded sources
-# grow. test_user_data_spills_large_job_spec_to_hf pins the worst case (a spec of exactly this
-# size) against the cap so the two cannot drift apart silently.
-_SPEC_SPILL_THRESHOLD = 6_000
+# Fast path only: above this, the spec is spilled to HF without first rendering a payload that
+# cannot fit. What is left of the ~64,000-byte cap after the fixed framing -- this module's template
+# plus every source it heredocs in (bootstrap.py, bootstrap_secrets.py, bootstrap_pip.py) -- is
+# ~5,800 bytes, and base64 + json escaping inflate the spec ~1.35x on the way in. Shrink this again
+# whenever those sources grow; docstrings are stripped on the way in, so only code and COMMENTS
+# count, and prose belongs in a docstring rather than a comment for exactly that reason.
+# test_build_user_data_spills_large_spec_out_of_cloud_init pins the worst inline case against the
+# cap so the two cannot drift apart silently. Sized for a REAL payload, which carries ~760 bytes of
+# env, deadline, and cache fields that the test's minimal one does not: at 4_000 the worst case
+# cleared the test but a production launch would re-render and force-spill anyway.
+_SPEC_SPILL_THRESHOLD = 3_000
 
 
 def run_label_prefix(run_id: str) -> str:
@@ -490,14 +492,17 @@ def _strip_docstrings(source: str) -> str:
 def _render_user_data(payload: dict, *, image: str) -> str:
     """The user_data text for an already-spill-decided ``payload``."""
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
-    bootstrap_src = (Path(__file__).parent / "bootstrap.py").read_text()
-    # shipped next to bootstrap.py: the bootstrap imports it as a bare sibling module on the box.
-    # docstrings are stripped on the way in. they are for the reader of the repo, not the box, and
-    # user_data is a hard-capped budget shared with the payload's runtime secrets -- prose that
-    # explains WHY a redactor is shaped a certain way must not be what pushes a launch over the cap.
+    # Both shipped modules are stripped of docstrings on the way in. They are for the reader of the
+    # repo, not the box, and user_data is a hard-capped budget shared with the payload's runtime
+    # secrets -- prose explaining WHY a module is shaped a certain way must not be what pushes a
+    # launch over the cap. Comments survive: those sit next to the line they explain and are what a
+    # reader debugging ON the box needs.
+    bootstrap_src = _strip_docstrings((Path(__file__).parent / "bootstrap.py").read_text())
+    # shipped next to bootstrap.py: the bootstrap imports each as a bare sibling module on the box.
     bootstrap_secrets_src = _strip_docstrings(
         (Path(__file__).parent / "bootstrap_secrets.py").read_text()
     )
+    bootstrap_pip_src = _strip_docstrings((Path(__file__).parent / "bootstrap_pip.py").read_text())
     # Bind the host cache mount into the container at the fixed /weight-cache so prefetch persists; absent -> cold.
     cache_host_mount = payload.get("cache_host_mount")
     cache_bind = (
@@ -518,6 +523,8 @@ cat > /opt/flash/bootstrap.py <<'FLASH_BOOTSTRAP_EOF'
 {bootstrap_src}FLASH_BOOTSTRAP_EOF
 cat > /opt/flash/bootstrap_secrets.py <<'FLASH_BOOTSTRAP_SECRETS_EOF'
 {bootstrap_secrets_src}FLASH_BOOTSTRAP_SECRETS_EOF
+cat > /opt/flash/bootstrap_pip.py <<'FLASH_BOOTSTRAP_PIP_EOF'
+{bootstrap_pip_src}FLASH_BOOTSTRAP_PIP_EOF
 cat > /opt/flash/deadline_sleep.py <<'FLASH_DEADLINE_SLEEP_EOF'
 {_DEADLINE_SLEEP_PY}FLASH_DEADLINE_SLEEP_EOF
 cat > /opt/flash/hostlog.py <<'FLASH_HOSTLOG_EOF'

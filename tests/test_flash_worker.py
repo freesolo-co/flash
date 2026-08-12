@@ -581,6 +581,33 @@ def test_train_body_has_no_prime_install_path():
     assert 'shutil.which("prime")' not in src
 
 
+class _FakePipProc:
+    """Popen stand-in for the extra_pip tee: an output stream plus one exit code."""
+
+    def __init__(self, output: str = "", returncode: int = 0):
+        import io
+
+        self.stdout = io.StringIO(output)
+        self._returncode = returncode
+
+    def wait(self) -> int:
+        return self._returncode
+
+
+def _extra_pip_input() -> dict:
+    return {
+        "phase": "sft",
+        "seed": 0,
+        "hf_repo": "owner/runs",
+        "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
+        "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
+        "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
+        # an invalid prefix stops the handler right after the pip step, which is what is under test
+        "code_prefix": "../code/flash",
+        **_run_deadline_fields(),
+    }
+
+
 def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     import os
     from pathlib import Path
@@ -590,29 +617,19 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     calls = []
     askpass_paths = []
 
-    def fake_run(cmd, *, check, env=None):
+    def fake_popen(cmd, *, env=None, **_kwargs):
         askpass = Path(env["GIT_ASKPASS"])
         assert askpass.exists()
         assert os.access(askpass, os.X_OK)
         assert "ghp-secret" not in askpass.read_text()
         askpass_paths.append(askpass)
-        calls.append({"cmd": cmd, "check": check, "env": env})
+        calls.append({"cmd": cmd, "env": env})
+        return _FakePipProc()
 
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
 
     with pytest.raises(ValueError, match="invalid code_prefix"):
-        endpoints._train_body(
-            {
-                "phase": "sft",
-                "seed": 0,
-                "hf_repo": "owner/runs",
-                "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
-                "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
-                "code_prefix": "../code/flash",
-                **_run_deadline_fields(),
-            }
-        )
+        endpoints._train_body(_extra_pip_input())
 
     assert len(calls) == 1
     env = calls[0]["env"]
@@ -630,8 +647,9 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
 
     askpass_paths = []
 
-    def fake_run(cmd, *, check, env=None):
+    def fake_popen(_cmd, *, env=None, **_kwargs):
         askpass_paths.append(Path(env["GIT_ASKPASS"]))
+        return _FakePipProc()
 
     original_remove = os.remove
 
@@ -640,29 +658,166 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
             raise PermissionError("locked askpass helper")
         return original_remove(path)
 
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
     monkeypatch.setattr(os, "remove", fake_remove)
 
     try:
         with pytest.raises(ValueError, match="invalid code_prefix"):
-            endpoints._train_body(
-                {
-                    "phase": "sft",
-                    "seed": 0,
-                    "hf_repo": "owner/runs",
-                    "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
-                    "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                    "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
-                    "code_prefix": "../code/flash",
-                    **_run_deadline_fields(),
-                }
-            )
+            endpoints._train_body(_extra_pip_input())
     finally:
         for askpass in askpass_paths:
             if askpass.exists():
                 original_remove(askpass)
 
     assert askpass_paths
+
+
+def _wire_train_body_pip(monkeypatch, results):
+    """Patch Popen to replay ``results`` (output, rc) in order; returns the recorded calls."""
+    calls = []
+    queue = list(results)
+
+    def fake_popen(cmd, *, env=None, **_kwargs):
+        calls.append(cmd)
+        output, rc = queue.pop(0) if queue else ("", 0)
+        return _FakePipProc(output, rc)
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    return calls
+
+
+def test_train_body_extra_pip_retries_a_transient_index_failure(monkeypatch):
+    # Same contract as the instance bootstrap: a PyPI blip is infra, not a bad requirement, so the
+    # handler retries in place instead of failing the paid run on the first connection error.
+    from flash.providers.runpod.serverless import endpoints
+
+    calls = _wire_train_body_pip(
+        monkeypatch,
+        [
+            (
+                "WARNING: Retrying (Retry(total=4)) after connection broken by NewConnectionError\n",
+                1,
+            ),
+            ("Successfully installed some-env-pkg-1.0\n", 0),
+        ],
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 2
+
+
+def test_train_body_extra_pip_resolution_error_stays_terminal(monkeypatch):
+    # A bad package spec reached the index fine; retrying it would just burn another attempt.
+    from flash.providers.runpod.serverless import endpoints
+
+    calls = _wire_train_body_pip(
+        monkeypatch,
+        [("ERROR: No matching distribution found for definitely-not-a-package\n", 1)],
+    )
+    with pytest.raises(RuntimeError, match="extra_pip install failed"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 1  # fails fast, never walks the retry ladder
+
+
+def test_train_body_extra_pip_build_failure_outranks_earlier_transient_text(monkeypatch):
+    # pip warns "Retrying (Retry(" on an index blip, recovers, then fails compiling a wheel. Both
+    # lines sit in the same captured tail, so matching transient text alone would call a
+    # deterministic failure infra and repeat it three more times for nothing.
+    from flash.providers.runpod.serverless import endpoints
+
+    calls = _wire_train_body_pip(
+        monkeypatch,
+        [
+            (
+                (
+                    "WARNING: Retrying (Retry(total=4)) after connection broken by "
+                    "NewConnectionError\n"
+                    "Collecting some-env-pkg\n"
+                    "  error: subprocess-exited-with-error\n"
+                    "ERROR: Failed building wheel for some-env-pkg\n"
+                ),
+                1,
+            )
+        ],
+    )
+    with pytest.raises(RuntimeError, match="extra_pip install failed"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 1  # the build failure names the cause, so no retry ladder
+
+
+def test_train_body_extra_pip_matches_the_bootstrap_on_git_http_blips(monkeypatch):
+    # the two classifiers must agree on what is retriable. A VCS pin fails through git, whose
+    # phrasing carries none of the urllib shapes, so a 502 must retry here exactly as it does on
+    # the instance bootstrap; a 404 is a bad pin and must still fail fast in both.
+    from flash.providers.runpod.serverless import endpoints
+
+    blip = (
+        "  Running command git clone --filter=blob:none -q https://github.com/org/repo\n"
+        "  fatal: unable to access 'https://github.com/org/repo/': "
+        "The requested URL returned error: 502\n"
+        "  error: subprocess-exited-with-error\n"
+    )
+    calls = _wire_train_body_pip(
+        monkeypatch, [(blip, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 2
+
+    # git's DNS wording, which urllib never emits, must retry here too.
+    dns = blip.replace(
+        "The requested URL returned error: 502", "Could not resolve host: github.com"
+    )
+    calls = _wire_train_body_pip(
+        monkeypatch, [(dns, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 2
+
+    missing = blip.replace("returned error: 502", "returned error: 404")
+    calls = _wire_train_body_pip(monkeypatch, [(missing, 1)])
+    with pytest.raises(RuntimeError, match="extra_pip install failed"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 1
+
+
+def test_train_body_extra_pip_matches_the_bootstrap_on_an_index_outage_footer(monkeypatch):
+    # an unreachable index prints the same no-candidate footer a typo'd name does, so that footer
+    # alone must not be terminal when the tail also carries a transient marker. A build failure in
+    # the same tail still decides it, since pip only reaches one with real content in hand. Both
+    # classifiers must agree on this, so the RunPod copy is pinned exactly as the bootstrap is.
+    from flash.providers.runpod.serverless import endpoints
+
+    outage = (
+        "WARNING: Retrying (Retry(total=4, connect=None)) after connection broken by "
+        "NewConnectionError\n"
+        "ERROR: Could not find a version that satisfies the requirement requests "
+        "(from versions: none)\n"
+        "ERROR: No matching distribution found for requests\n"
+    )
+    calls = _wire_train_body_pip(
+        monkeypatch, [(outage, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 2
+
+    built = outage + "ERROR: Failed building wheel for requests\n"
+    calls = _wire_train_body_pip(monkeypatch, [(built, 1)])
+    with pytest.raises(RuntimeError, match="extra_pip install failed"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 1
+
+
+def test_train_body_extra_pip_stops_after_the_bounded_retries(monkeypatch):
+    from flash.providers.runpod.serverless import endpoints
+
+    calls = _wire_train_body_pip(monkeypatch, [("read timed out\n", 1)] * 4)
+    with pytest.raises(RuntimeError, match="could not reach the package index"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 4  # one attempt plus the three bounded retries
 
 
 def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
