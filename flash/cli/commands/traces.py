@@ -148,9 +148,16 @@ _ROW_NOUN = {
 # exchange; `prompts` only needs the request, so blaming a missing response
 # there would contradict the reason that shape exists. `raw` converts nothing
 # and so can never skip.
+#
+# a missing half is no longer the only cause, and the others are the ones a
+# caller will actually hit: a converted row is one prompt in and one reply out,
+# so a request carrying a system prompt or an earlier turn is skipped rather
+# than exported without the context its reply depended on. naming only the
+# missing-pair case would send someone looking for an empty trace store when
+# every trace is present and multi-turn.
 _SKIP_REASON = {
-    RECORDS_FORMAT: "no usable request/response pair",
-    PROMPTS_FORMAT: "no usable request",
+    RECORDS_FORMAT: "no single-turn request paired with a complete reply",
+    PROMPTS_FORMAT: "no single-turn request",
 }
 
 
@@ -159,14 +166,16 @@ def _empty_export_error(project_id: str, export_format: str) -> ClientError:
 
     if export_format == RECORDS_FORMAT:
         return ClientError(
-            f"no exportable traces in project {project_id}. Traces need a recorded request and "
-            f"response to become training rows -- try --format {PROMPTS_FORMAT} if you only "
-            "need the prompts"
+            f"no exportable traces in project {project_id}. A training row is one prompt and one "
+            "reply, so a trace becomes one only if its request is a single user message and its "
+            f"reply finished cleanly -- try --format {PROMPTS_FORMAT} if the calls have no usable "
+            f"replies, or --format {RAW_FORMAT} to see what was recorded"
         )
     if export_format == PROMPTS_FORMAT:
         return ClientError(
-            f"no exportable traces in project {project_id}. Traces need a recorded request to "
-            "become prompts"
+            f"no exportable traces in project {project_id}. A prompt row is one user message, so "
+            "a request carrying a system prompt or an earlier turn is not converted -- try "
+            f"--format {RAW_FORMAT} to see what was recorded"
         )
     return ClientError(f"no traces in project {project_id}")
 

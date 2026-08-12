@@ -667,9 +667,10 @@ def test_export_formats_convert_and_count_skips(trace_api) -> None:
     assert len(raw["records"]) == 3
 
 
-def test_chat_envelopes_export_as_trainable_text(trace_api) -> None:
-    """The scaffold trains on `record.input` as prompt text. Exporting the whole request and choices
-    envelopes JSON-stringifies protocol metadata into both halves instead of the user's turn and reply."""
+def test_a_contextual_chat_envelope_is_preserved_only_in_raw_export(trace_api) -> None:
+    """A converted row contains only one prompt string, so exporting the final user turn from a full
+    transcript drops instructions and prior answers the target depends on. Raw remains the lossless
+    escape hatch for consumers that can represent the complete conversation."""
     owner = db.ensure_standalone_owner()
     request = {
         "model": "gpt-test",
@@ -709,8 +710,10 @@ def test_chat_envelopes_export_as_trainable_text(trace_api) -> None:
     )
     raw = export_traces(key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000)
 
-    assert records["records"] == [{"input": "latest question", "output": "final answer"}]
-    assert prompts["records"] == [{"input": "latest question"}]
+    assert records["records"] == []
+    assert records["skipped"] == 1
+    assert prompts["records"] == []
+    assert prompts["skipped"] == 1
     span = raw["records"][0]["spans"][0]
     assert span["input_payload"] == request
     assert span["output_payload"] == response
@@ -769,6 +772,300 @@ def test_a_non_chat_request_body_is_skipped_on_the_prompt_half_too(trace_api) ->
 
     assert prompts["records"] == []
     assert prompts["skipped"] == 1
+
+
+def test_a_length_limited_completion_is_not_exported_as_a_training_target(trace_api) -> None:
+    """A `length` stop cuts the paid completion at the token cap, often mid-word. Exporting that
+    partial text as the desired output teaches the model to reproduce an answer that never finished."""
+    owner = db.ensure_standalone_owner()
+    response = _reply_envelope("cut of")
+    response["choices"][0]["finish_reason"] = "length"
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="length limited",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=response)],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == []
+    assert export["skipped"] == 1
+
+
+def test_a_content_filtered_completion_is_not_exported_as_a_training_target(trace_api) -> None:
+    """A content-filter stop can carry censored partial text. Treating it as a successful terminal
+    reply turns provider safety intervention into the exact behavior the training row rewards."""
+    owner = db.ensure_standalone_owner()
+    response = _reply_envelope("partial")
+    response["choices"][0]["finish_reason"] = "content_filter"
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="content filtered",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=response)],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == []
+    assert export["skipped"] == 1
+
+
+def test_a_completion_without_a_finish_reason_still_exports(trace_api) -> None:
+    """Older and non-OpenAI-shaped providers may omit `finish_reason` entirely. Absence is not an
+    explicit failure signal, so rejecting it would silently empty otherwise valid provider exports."""
+    owner = db.ensure_standalone_owner()
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="no finish reason",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=_reply_envelope("complete"))],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == [{"input": "hello", "output": "complete"}]
+    assert export["skipped"] == 0
+
+
+def test_an_unknown_finish_reason_is_not_treated_as_a_clean_stop(trace_api) -> None:
+    """An unknown explicit reason is not evidence that generation completed successfully. Accepting
+    every new string would silently ship partial targets when a provider adds another failure reason."""
+    owner = db.ensure_standalone_owner()
+    response = _reply_envelope("uncertain")
+    response["choices"][0]["finish_reason"] = "provider_abort"
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="unknown finish reason",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=response)],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == []
+    assert export["skipped"] == 1
+
+
+def test_a_string_truncated_payload_is_skipped_by_converted_exports(trace_api) -> None:
+    """The stored ellipsis is indistinguishable from real authored text. Once any payload value was
+    shortened, neither records nor prompts may turn that mutated trace into training data."""
+    owner = db.ensure_standalone_owner()
+    oversized_prompt = "x" * (platform_traces.MAX_PAYLOAD_VALUE_LENGTH + 1)
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="truncated prompt",
+        metadata=None,
+        spans=[
+            TraceSpan(
+                input_payload={"messages": [{"role": "user", "content": oversized_prompt}]},
+                output_payload=_reply_envelope("reply"),
+            )
+        ],
+    )
+
+    records = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+    prompts = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="prompts", limit=1000
+    )
+
+    assert records["records"] == []
+    assert records["skipped"] == 1
+    assert prompts["records"] == []
+    assert prompts["skipped"] == 1
+
+
+def test_a_string_truncated_payload_remains_available_in_raw_export(trace_api) -> None:
+    """Raw is the diagnostic escape hatch and must never hide a trace because converted training
+    formats reject it. It preserves both the bounded payload and the marker explaining the mutation."""
+    owner = db.ensure_standalone_owner()
+    oversized_reply = "y" * (platform_traces.MAX_PAYLOAD_VALUE_LENGTH + 1)
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="truncated reply",
+        metadata=None,
+        spans=[
+            TraceSpan(
+                input_payload=_REQUEST,
+                output_payload=_reply_envelope(oversized_reply),
+            )
+        ],
+    )
+
+    raw = export_traces(key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000)
+
+    span = raw["records"][0]["spans"][0]
+    assert raw["skipped"] == 0
+    assert span["output_payload"]["choices"][0]["message"]["content"].endswith("...")
+    assert span["attributes"] == {"payload_truncated": True}
+
+
+def test_an_untruncated_trace_keeps_null_attributes(trace_api) -> None:
+    """The truncation marker is exceptional state, not default metadata. Writing an empty attributes
+    object on every happy-path span changes existing raw records and needlessly grows the database."""
+    owner = db.ensure_standalone_owner()
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="ordinary",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=_reply_envelope("reply"))],
+    )
+
+    raw = export_traces(key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000)
+
+    assert raw["records"][0]["spans"][0]["attributes"] is None
+
+
+def test_a_system_instruction_makes_the_single_turn_export_unreachable(trace_api) -> None:
+    """A target conditioned on a system instruction cannot be learned from the user text alone.
+    Dropping that instruction creates a context-free row whose output is unreachable from its input."""
+    owner = db.ensure_standalone_owner()
+    request = {
+        "messages": [
+            {"role": "system", "content": "answer in rhyme"},
+            {"role": "user", "content": "describe rain"},
+        ]
+    }
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="system context",
+        metadata=None,
+        spans=[TraceSpan(input_payload=request, output_payload=_reply_envelope("reply"))],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == []
+    assert export["skipped"] == 1
+
+
+def test_a_single_user_message_still_exports_as_training_data(trace_api) -> None:
+    """Correctness filtering must retain the ordinary case: a sole user turn contains all available
+    request context, so its completed reply remains a reachable and useful training target."""
+    owner = db.ensure_standalone_owner()
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="single turn",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=_reply_envelope("world"))],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == [{"input": "hello", "output": "world"}]
+
+
+def test_a_trailing_assistant_prefill_invalidates_the_single_turn_export(trace_api) -> None:
+    """A trailing assistant message can be a prefill that constrains the generated continuation.
+    Exporting only the preceding user text drops that context just as surely as dropping prior turns."""
+    owner = db.ensure_standalone_owner()
+    request = {
+        "messages": [
+            {"role": "user", "content": "complete this"},
+            {"role": "assistant", "content": "Once upon a"},
+        ]
+    }
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="assistant prefill",
+        metadata=None,
+        spans=[TraceSpan(input_payload=request, output_payload=_reply_envelope(" time"))],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == []
+    assert export["skipped"] == 1
+
+
+def test_an_aggregate_oversized_payload_is_dropped_marked_and_skipped(
+    trace_api, monkeypatch
+) -> None:
+    """Many individually valid strings can still form one attacker-sized sqlite value. Persistence
+    must replace that aggregate with a small diagnostic placeholder and keep it out of training data."""
+    monkeypatch.setattr(platform_traces, "MAX_PAYLOAD_TOTAL_BYTES", 300)
+    owner = db.ensure_standalone_owner()
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="aggregate oversized",
+        metadata=None,
+        spans=[
+            TraceSpan(
+                input_payload={
+                    "messages": [{"role": "user", "content": "x" * 400}],
+                },
+                output_payload=_reply_envelope("reply"),
+            )
+        ],
+    )
+
+    raw = export_traces(key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000)
+    records = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    span = raw["records"][0]["spans"][0]
+    dropped = span["input_payload"]["flash_payload_dropped"]
+    assert dropped["reason"] == "payload exceeded the stored size limit"
+    assert dropped["bytes"] > platform_traces.MAX_PAYLOAD_TOTAL_BYTES
+    assert span["attributes"] == {"payload_truncated": True}
+    assert records["records"] == []
+    assert records["skipped"] == 1
+
+
+def test_the_aggregate_payload_cap_counts_encoded_bytes_not_characters(
+    trace_api, monkeypatch
+) -> None:
+    """Non-ASCII text occupies multiple UTF-8 bytes. A character-count cap would let the stored blob
+    exceed its nominal budget several times over even though the same payload passes a code-point count."""
+    monkeypatch.setattr(platform_traces, "MAX_PAYLOAD_TOTAL_BYTES", 500)
+    owner = db.ensure_standalone_owner()
+    content = "\U0001f600" * 150
+    payload = {"messages": [{"role": "user", "content": content}]}
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert len(serialized) < platform_traces.MAX_PAYLOAD_TOTAL_BYTES
+    assert len(serialized.encode("utf-8")) > platform_traces.MAX_PAYLOAD_TOTAL_BYTES
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="encoded bytes",
+        metadata=None,
+        spans=[TraceSpan(input_payload=payload, output_payload=_reply_envelope("reply"))],
+    )
+
+    raw = export_traces(key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000)
+
+    span = raw["records"][0]["spans"][0]
+    assert "flash_payload_dropped" in span["input_payload"]
+    assert span["attributes"] == {"payload_truncated": True}
 
 
 def test_a_capped_export_reports_that_it_is_incomplete(trace_api) -> None:

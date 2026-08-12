@@ -34,6 +34,9 @@ _MAX_IDENTIFIER_LENGTH = 500
 # ellipsis in it and no indication the text was ever longer. they still need A bound -- an untrimmed
 # payload is unbounded rows in SQLite -- just one far above any real chat completion.
 MAX_PAYLOAD_VALUE_LENGTH = 1_000_000
+# far above a real chat exchange, but low enough that one authenticated caller cannot materialize
+# an attacker-sized sqlite value or stall the single writer with it.
+MAX_PAYLOAD_TOTAL_BYTES = 8 * 1024 * 1024
 # likewise for nesting. an ordinary tool schema (`tools[] > function > parameters > properties >
 # field > type`) already sits at depth 6, so the attribute depth would repr() the leaf and store a
 # JSON schema as the string "{}".
@@ -42,6 +45,15 @@ _MAX_PAYLOAD_DEPTH = 24
 # the newest turns, including the prompt the reply actually answers -- while the response was stored
 # whole, so `records` paired a completion with a conversation that no longer led to it.
 _MAX_PAYLOAD_COLLECTION = 100_000
+_PAYLOAD_TRUNCATED_ATTRIBUTE = "payload_truncated"
+# absent finish reasons are accepted for providers and older envelopes that never supplied one;
+# explicit unknown reasons are rejected because they are not evidence of a clean terminal response.
+_ACCEPTED_FINISH_REASONS = {None, "stop", "tool_calls"}
+
+
+@dataclass
+class _TruncationFlag:
+    hit: bool = False
 
 
 @dataclass
@@ -66,6 +78,7 @@ def sanitize_json_value(
     max_string: int | None = None,
     max_depth: int | None = None,
     max_collection: int | None = None,
+    flag: _TruncationFlag | None = None,
 ) -> Any:
     """Bound nested values before they enter the plane's durable trace store.
 
@@ -78,21 +91,22 @@ def sanitize_json_value(
     keys = _MAX_ATTRIBUTE_COUNT if max_collection is None else max_collection
     items = _MAX_SEQUENCE_LENGTH if max_collection is None else max_collection
     if depth >= depth_limit:
-        return _truncate(repr(value), limit)
+        return _truncate(repr(value), limit, flag=flag)
     if value is None or isinstance(value, bool | int):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else str(value)
     if isinstance(value, str):
-        return _truncate(value, limit)
+        return _truncate(value, limit, flag=flag)
     if isinstance(value, dict):
         return {
-            _truncate(str(key), limit): sanitize_json_value(
+            _truncate(str(key), limit, flag=flag): sanitize_json_value(
                 item,
                 depth=depth + 1,
                 max_string=max_string,
                 max_depth=max_depth,
                 max_collection=max_collection,
+                flag=flag,
             )
             for key, item in itertools.islice(value.items(), keys)
         }
@@ -104,10 +118,11 @@ def sanitize_json_value(
                 max_string=max_string,
                 max_depth=max_depth,
                 max_collection=max_collection,
+                flag=flag,
             )
             for item in itertools.islice(value, items)
         ]
-    return _truncate(repr(value), limit)
+    return _truncate(repr(value), limit, flag=flag)
 
 
 def store_trace(
@@ -137,35 +152,49 @@ def store_trace(
     # blocking unrelated writers (keys, runs, teacher ledgers) and pushing them toward the busy
     # timeout for work that touches no database state.
     serialized_metadata = _json_dump(metadata)
-    serialized_spans = [
-        (
-            str(uuid.uuid4()),
-            created_at,
-            trace_id,
-            _bounded_identifier(span.name),
-            _bounded_identifier(span.provider),
-            _bounded_identifier(span.model),
-            span.duration_ms,
-            span.input_tokens,
-            span.output_tokens,
-            _json_dump(
-                span.input_payload,
-                max_string=MAX_PAYLOAD_VALUE_LENGTH,
-                max_depth=_MAX_PAYLOAD_DEPTH,
-                max_collection=_MAX_PAYLOAD_COLLECTION,
-            ),
-            _json_dump(
-                span.output_payload,
-                max_string=MAX_PAYLOAD_VALUE_LENGTH,
-                max_depth=_MAX_PAYLOAD_DEPTH,
-                max_collection=_MAX_PAYLOAD_COLLECTION,
-            ),
-            _json_dump(span.attributes),
-            span.status_code,
-            span.error,
+    serialized_spans = []
+    for span in spans:
+        truncation = _TruncationFlag()
+        input_payload = _json_dump(
+            span.input_payload,
+            max_string=MAX_PAYLOAD_VALUE_LENGTH,
+            max_depth=_MAX_PAYLOAD_DEPTH,
+            max_collection=_MAX_PAYLOAD_COLLECTION,
+            flag=truncation,
+            max_bytes=MAX_PAYLOAD_TOTAL_BYTES,
         )
-        for span in spans
-    ]
+        output_payload = _json_dump(
+            span.output_payload,
+            max_string=MAX_PAYLOAD_VALUE_LENGTH,
+            max_depth=_MAX_PAYLOAD_DEPTH,
+            max_collection=_MAX_PAYLOAD_COLLECTION,
+            flag=truncation,
+            max_bytes=MAX_PAYLOAD_TOTAL_BYTES,
+        )
+        attributes = dict(span.attributes) if span.attributes is not None else None
+        if truncation.hit:
+            # the marker last, so a caller-supplied attribute of the same name cannot overwrite it.
+            # it is the only signal that a stored payload is no longer the payload, and `records`
+            # skips the row on it alone.
+            attributes = {**(attributes or {}), _PAYLOAD_TRUNCATED_ATTRIBUTE: True}
+        serialized_spans.append(
+            (
+                str(uuid.uuid4()),
+                created_at,
+                trace_id,
+                _bounded_identifier(span.name),
+                _bounded_identifier(span.provider),
+                _bounded_identifier(span.model),
+                span.duration_ms,
+                span.input_tokens,
+                span.output_tokens,
+                input_payload,
+                output_payload,
+                _json_dump(attributes),
+                span.status_code,
+                span.error,
+            )
+        )
     serialized_title = _truncate(trace_title or "", _MAX_TRACE_TITLE_LENGTH) or None
 
     conn = db._connect()
@@ -280,6 +309,8 @@ def _export_record(raw: dict[str, Any], export_format: str) -> dict[str, Any] | 
     """One export row in the requested shape, or None when the trace has nothing usable in it."""
     if export_format == "raw":
         return raw
+    if any(_span_payload_was_truncated(span) for span in raw["spans"]):
+        return None
     input_payload, output_payload = _training_pair(raw["spans"])
     if not _usable_payload(input_payload):
         return None
@@ -319,8 +350,13 @@ def _raw_trace(trace_row: Any, span_rows: list[Any]) -> dict[str, Any]:
     }
 
 
+def _span_payload_was_truncated(span: dict[str, Any]) -> bool:
+    attributes = span.get("attributes")
+    return isinstance(attributes, dict) and attributes.get(_PAYLOAD_TRUNCATED_ATTRIBUTE) is True
+
+
 def _training_pair(spans: list[dict[str, Any]]) -> tuple[Any, Any]:
-    """Return a trainable pair, reducing chat envelopes to their last user and assistant text."""
+    """Return a trainable pair, reducing chat envelopes to one user and assistant text pair."""
     input_payload = next(
         (span.get("input_payload") for span in spans if _usable_payload(span.get("input_payload"))),
         None,
@@ -347,19 +383,23 @@ def _training_pair(spans: list[dict[str, Any]]) -> tuple[Any, Any]:
 
 
 def _chat_prompt(payload: Any) -> str | None:
-    """The prompt text of a chat-completions request, or None when it is not one.
+    """The sole user turn of a chat-completions request, or None when context would be lost.
 
-    The LAST user turn, not the whole conversation: a recorded request carries the system prompt
-    and every prior turn, and `records` pairs one prompt with one reply. Joining the whole
-    transcript into the prompt half would train the model to produce a reply to a conversation it
-    is also being shown the answers to.
+    `records` deliberately exports only the last user turn rather than a transcript containing prior
+    answers. That conversion is correct only for a genuinely single-turn request: system or developer
+    instructions, earlier turns, and trailing assistant prefills can all make the target unreachable
+    from the exported text. This trades recall for correct training rows; `raw` still preserves every
+    message, while converted formats skip any request whose user message is not the sole message.
     """
     if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
         return None
-    for message in reversed(payload["messages"]):
-        if isinstance(message, dict) and message.get("role") == "user":
-            return _message_text(message.get("content"))
-    return None
+    messages = payload["messages"]
+    if len(messages) != 1:
+        return None
+    message = messages[0]
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+    return _message_text(message.get("content"))
 
 
 def _chat_reply(payload: Any) -> str | None:
@@ -376,6 +416,8 @@ def _chat_reply(payload: Any) -> str | None:
         return None
     choice = payload["choices"][0]
     if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+        return None
+    if choice.get("finish_reason") not in _ACCEPTED_FINISH_REASONS:
         return None
     return _message_text(choice["message"].get("content"))
 
@@ -414,14 +456,34 @@ def _json_dump(
     max_string: int | None = None,
     max_depth: int | None = None,
     max_collection: int | None = None,
+    flag: _TruncationFlag | None = None,
+    max_bytes: int | None = None,
 ) -> str | None:
     if value is None:
         return None
-    return json.dumps(
+    serialized = json.dumps(
         sanitize_json_value(
-            value, max_string=max_string, max_depth=max_depth, max_collection=max_collection
+            value,
+            max_string=max_string,
+            max_depth=max_depth,
+            max_collection=max_collection,
+            flag=flag,
         ),
         ensure_ascii=False,
+        sort_keys=True,
+    )
+    encoded_bytes = len(serialized.encode("utf-8"))
+    if max_bytes is None or encoded_bytes <= max_bytes:
+        return serialized
+    if flag is not None:
+        flag.hit = True
+    return json.dumps(
+        {
+            "flash_payload_dropped": {
+                "bytes": encoded_bytes,
+                "reason": "payload exceeded the stored size limit",
+            }
+        },
         sort_keys=True,
     )
 
@@ -430,8 +492,12 @@ def _json_load(value: str | None) -> Any:
     return None if value is None else json.loads(value)
 
 
-def _truncate(value: str, limit: int) -> str:
-    return value if len(value) <= limit else f"{value[: limit - 3]}..."
+def _truncate(value: str, limit: int, *, flag: _TruncationFlag | None = None) -> str:
+    if len(value) <= limit:
+        return value
+    if flag is not None:
+        flag.hit = True
+    return f"{value[: limit - 3]}..."
 
 
 def _bounded_identifier(value: str | None) -> str | None:

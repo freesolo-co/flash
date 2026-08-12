@@ -399,6 +399,36 @@ def test_traces_export_reports_a_project_with_no_usable_traces(
     assert not (tmp_path / "dataset/train.jsonl").exists()  # nothing written on failure
 
 
+def test_an_empty_records_export_says_what_disqualified_the_traces(
+    fake_traces, monkeypatch, tmp_path, capsys
+) -> None:
+    """An empty `records` export is the expected result for a project full of multi-turn chats,
+    so the error has to name the conversion rule rather than imply the traces are missing.
+
+    A converted row is one prompt and one reply: a request carrying a system prompt or an earlier
+    turn is skipped, because its reply depended on context the row would not contain. An app that
+    sends a system prompt on every call therefore records perfectly and converts to nothing. Told
+    only "no exportable traces", someone goes looking for a broken recorder or an empty project --
+    the two things that are provably fine. Naming the rule, and pointing at `raw` as the way to see
+    what actually landed, is what turns this from a bug report into a one-line explanation.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        lambda *a, **k: {"records": [], "traces": 12, "skipped": 12, "format": "records"},
+    )
+
+    assert cli.main(["traces", "export", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
+
+    printed = capsys.readouterr().err
+    assert "single user message" in printed
+    assert "finished cleanly" in printed
+    # and where to look instead. `raw` converts nothing, so it is the one shape that always shows
+    # the traces the conversion rejected.
+    assert "--format raw" in printed
+
+
 def test_env_setup_can_start_from_a_projects_traces(
     fake_traces, monkeypatch, tmp_path, capsys
 ) -> None:
@@ -737,9 +767,9 @@ def test_traces_export_skip_note_names_the_right_missing_half(
     )
 
     printed = capsys.readouterr().out
-    assert "1 traces skipped: no usable request)" in printed
+    assert "1 traces skipped: no single-turn request)" in printed
     # the records-shaped reason must not leak into a prompts export.
-    assert "request/response pair" not in printed
+    assert "reply" not in printed
 
 
 def test_traces_export_refuses_a_format_the_backend_ignored(monkeypatch, tmp_path, capsys) -> None:
