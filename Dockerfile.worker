@@ -354,7 +354,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
         "transformers>=5.6,<5.13" \
         "datasets>=4.7,<6" \
         "TransferQueue==0.1.7" \
-        liger-kernel "bitsandbytes>=0.49" qwen-vl-utils \
+        "bitsandbytes>=0.49" qwen-vl-utils \
         "wandb>=0.17" \
         cachetools uvicorn fastapi torchvision tqdm pyarrow \
         "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139" \

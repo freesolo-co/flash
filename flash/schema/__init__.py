@@ -234,7 +234,6 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",
-        "model_revision",
         "algorithm",
         "thinking",
         "seed",
@@ -245,6 +244,11 @@ _TOP_LEVEL_KEYS = frozenset(
         "project",
     }
 )
+# keys that WERE user-authorable and are now rejected with their own targeted error. they are absent
+# from _TOP_LEVEL_KEYS, so the unknown-key check below would otherwise report them as a typo and bury
+# the explanation of why they went away. distinct from core.spec._DROPPED_TOP_LEVEL_KEYS, which is
+# about tolerating removed keys on READ so persisted records still parse and rehash.
+_REMOVED_TOP_LEVEL_KEYS = frozenset({"model_revision"})
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
@@ -322,7 +326,18 @@ def _validate_top_level(
     raw: dict[str, Any], project_required: bool
 ) -> tuple[str, str, str, str, bool]:
     """Validate the top-level config section."""
-    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
+    revision_raw = raw.get("model_revision")
+    # released clients serialize an unpinned spec as model_revision="". tolerate that legacy wire
+    # artifact, including whitespace-only strings, while continuing to reject every authored pin.
+    if "model_revision" in raw and (not isinstance(revision_raw, str) or revision_raw.strip()):
+        raise ConfigError(
+            "config key `model_revision` was removed because Flash-managed serving loads a "
+            "pre-quantized FP8 checkpoint resolved per base model, so it cannot honor an arbitrary "
+            "upstream commit and an authored pin made the run undeployable. Remove the key. "
+            f"`{CLI_NAME} models export` publishes the adapter, but for a fresh GRPO or OPD run it "
+            "does not turn the moving upstream default into a fixed base revision."
+        )
+    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS - _REMOVED_TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
         if {"grpo", "sft", "opd"} & set(unknown):
@@ -343,10 +358,7 @@ def _validate_top_level(
     # escaping the callers' configerror/valueerror guards -> 500; type-check like the other scalars.
     if not isinstance(model, str) or not model.strip():
         raise ConfigError('config `model` must be a model id string (e.g. "Qwen/Qwen3.5-4B")')
-    model_revision_raw = raw.get("model_revision", "")
-    if not isinstance(model_revision_raw, str):
-        raise ConfigError("model_revision must be a string")
-    model_revision = model_revision_raw.strip()
+    model_revision = ""
     project_raw = raw.get("project", "")
     try:
         if project_required:

@@ -22,7 +22,11 @@ _PROFILE_CREATED_AT = 1_780_000_000.0
 
 
 def _pin_model_revision(spec: Any) -> Any:
-    return spec if spec.model_revision else replace(spec, model_revision=_MODEL_REVISION)
+    return (
+        spec
+        if spec.model_revision
+        else replace(spec, model_revision=_MODEL_REVISION, model_revision_auto=True)
+    )
 
 
 def _pin_env_revision(spec: Any) -> Any:

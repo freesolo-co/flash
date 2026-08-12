@@ -100,26 +100,6 @@ def test_spec_parsers_accept_valid_spec_without_execution_controls():
     assert JobSpec.from_dict(raw).model == raw["model"]
 
 
-def test_schema_defers_exact_vram_rejection_for_authored_revision(monkeypatch):
-    import flash.providers.allocator as allocator
-    from flash.schema import ConfigError, spec_from_dict
-
-    raw = _minimal_spec_dict()
-    raw.update(model="Qwen/Qwen3.5-9B", model_revision="refs/pr/123")
-    raw["gpu"] = {"type": "RTX 4090"}
-
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("revision-authored parse must defer exact sizing")
-
-    monkeypatch.setattr(allocator, "required_vram_gb", fail_if_called)
-    assert spec_from_dict(raw).gpu.type == "RTX 4090"
-
-    raw["model_revision"] = ""
-    monkeypatch.setattr(allocator, "required_vram_gb", lambda *args, **kwargs: 80)
-    with pytest.raises(ConfigError, match="requires at least"):
-        spec_from_dict(raw)
-
-
 def test_prepare_job_resolves_ref_to_sha_with_operator_token(monkeypatch):
     import huggingface_hub
 

@@ -54,7 +54,6 @@ def _public_spec(run_id="flash-1700000001-rt01", algorithm="sft") -> JobSpec:
     spec instead of a second hand-written copy that could drift from it.
     """
     public = _spec(run_id=run_id, algorithm=algorithm).to_dict()
-    public.pop("model_revision", None)  # authored-optional; submission resolves it
     return JobSpec.from_dict({**public, "run_id": run_id})
 
 
@@ -515,7 +514,9 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     monkeypatch.setattr(
         orch,
         "_resolve_model_revision",
-        lambda spec, **_kwargs: replace(spec, model_revision=resolved_model_sha),
+        lambda spec, **_kwargs: replace(
+            spec, model_revision=resolved_model_sha, model_revision_auto=True
+        ),
     )
     monkeypatch.setattr(
         orch,
@@ -584,9 +585,9 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         }
     ]
     stored = orch.get_status(public.run_id)
-    # resolved_sha is platform-managed: it is stripped from the public spec, not surfaced empty.
+    # resolved identities are platform-managed: they stay on the internal worker spec only.
     assert "resolved_sha" not in stored.spec["environment"]
-    assert stored.spec["model_revision"] == resolved_model_sha
+    assert "model_revision" not in stored.spec
     worker = stored.effective_preparation["worker_spec"]
     assert worker["environment"]["resolved_sha"] == resolved_sha
     assert worker["gpu"]["type"] == "RTX 5090"
@@ -615,7 +616,7 @@ def test_sft_submission_fails_closed_when_the_environment_cannot_be_pinned(orch,
     monkeypatch.setattr(
         orch,
         "_resolve_model_revision",
-        lambda spec, **_kw: replace(spec, model_revision="b" * 40),
+        lambda spec, **_kw: replace(spec, model_revision="b" * 40, model_revision_auto=True),
     )
     monkeypatch.setattr(orch, "_save_status", lambda *a, **k: persisted.append(a))
     monkeypatch.setattr(
@@ -668,7 +669,9 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
         return first_sha if len(resolutions) == 2 else moved_sha
 
     monkeypatch.setattr(
-        orch, "_resolve_model_revision", lambda spec, **_kw: replace(spec, model_revision="b" * 40)
+        orch,
+        "_resolve_model_revision",
+        lambda spec, **_kw: replace(spec, model_revision="b" * 40, model_revision_auto=True),
     )
     monkeypatch.setattr(orch, "resolve_model", lambda model, *a, **k: catalog.MODELS[model])
 

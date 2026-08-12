@@ -3126,7 +3126,9 @@ def test_deploy_rejects_revision_pinned_base_model(api):
     )
 
     assert response.status_code == 400
-    assert "does not support revision-pinned base models" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert "legacy revision-pinned base model" in detail
+    assert "flash models export" in detail
 
 
 def test_deploy_allows_runner_assigned_revision_pin(api):

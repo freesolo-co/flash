@@ -133,7 +133,7 @@ def format_gpu_status(gpu: Any) -> str:
     if not isinstance(gpu, dict) or not gpu:
         return ""
     parts: list[str] = []
-    name = gpu.get("device_name") or gpu.get("name")
+    name = gpu.get("device_name")
     if name:
         parts.append(str(name))
     driver = gpu.get("driver_version")
