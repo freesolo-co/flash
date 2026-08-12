@@ -21,10 +21,33 @@ def _temp_root_lever(config) -> str:
     effect on the path in front of them -- exactly the misdirection this hook exists to end.
     """
     if getattr(config.option, "basetemp", None):
-        return "pass a private directory to `--basetemp`"
+        return "pass a different directory to `--basetemp`"
     if os.environ.get("PYTEST_DEBUG_TEMPROOT"):
-        return "point `PYTEST_DEBUG_TEMPROOT` at a private directory"
-    return "point `TMPDIR` at a private directory"
+        return "point `PYTEST_DEBUG_TEMPROOT` elsewhere"
+    return "point `TMPDIR` elsewhere"
+
+
+def _failing_cache_root(text: str):
+    """The env cache root the exception refused, or None if the message does not name one.
+
+    Every branch of ``validate_cache_root_ancestors`` ends with "env cache root <path>" (with an
+    optional "use"/"load environment code from" in between), so the root is always recoverable from
+    the message the test actually failed with -- no re-deriving where the cache should have been.
+    """
+    import re
+    from pathlib import Path
+
+    match = re.search(r"env cache root (/\S+)", text[text.find("refusing") :] or text)
+    return Path(match.group(1)) if match else None
+
+
+def _is_within(path, base) -> bool:
+    """True when ``path`` is ``base`` or lives under it, comparing resolved paths."""
+    try:
+        resolved, root = path.resolve(), base.resolve()
+    except OSError:
+        return False
+    return resolved == root or root in resolved.parents
 
 
 def _untrusted_tmpdir_ancestor(base):
@@ -97,16 +120,26 @@ def pytest_runtest_makereport(item, call):
     if ancestor is None:
         return
     # the temp root having an unsafe ancestor does not make it the CAUSE. two tests here chmod a
-    # directory under `tmp_path` on purpose to exercise the refusal, and a cache root under HOME
-    # can fail while the temp tree is spotless -- in both cases blaming the temp dir sends the
-    # reader to a knob that changes nothing, which is the same misdirection as saying nothing.
-    # only claim it when the ancestor the exception named is the one found above.
-    if f"ancestor {ancestor} " not in text:
+    # directory under `tmp_path` on purpose to exercise the refusal, and a cache root under HOME can
+    # fail while the temp tree is spotless -- in both cases blaming the temp dir sends the reader to
+    # a knob that changes nothing, which is the same misdirection as saying nothing.
+    #
+    # matching on the ANCESTOR is not enough to establish it: with HOME and the temp root as
+    # siblings under one 0775 directory, both name that directory and the HOME cache looks like a
+    # temp-dir problem. what settles it is the failing cache root, which the exception also carries:
+    # if that root is inside the temp tree, the temp tree is where it came from.
+    failing_root = _failing_cache_root(text)
+    if failing_root is None or not _is_within(failing_root, base):
         return
+    # `chmod +t` on the offending ancestor is the only fix that always works. moving the temp root
+    # to a private directory does NOT, if that directory is still under the same bad ancestor --
+    # every parent is checked, so 0700 below a 0775 parent fails identically. say "outside", not
+    # "private".
     detail = (
         f"pytest's temp root is {base}, and its ancestor {ancestor} is group/other-writable "
         f"without the sticky bit (mode {mode:04o}), which the env cache trust checks refuse. "
-        f"fix with `chmod +t {ancestor}`, or {_temp_root_lever(item.config)}."
+        f"fix with `chmod +t {ancestor}`, or {_temp_root_lever(item.config)} -- one whose whole "
+        f"parent chain is trusted, so not another directory under {ancestor}."
     )
     report.sections.append(("the temp dir, not the code under test, caused this", detail))
 
