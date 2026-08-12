@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import types
 
 import pytest
@@ -115,6 +116,88 @@ def _shape(gpu, vram, count):
     return types.SimpleNamespace(
         gpu=gpu, vram_gb=vram, gpu_count=count, provider="runpod", hourly_usd=1.0
     )
+
+
+def test_sft_oom_escalation_uses_the_ranks_that_joined():
+    from flash.providers.allocator import _executed_width, _fitting_candidates
+    from flash.providers.base import Candidate, combined_vram_gb
+    from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
+
+    failed = Candidate("runpod", "RTX 4090", 0.69, 24, 4)
+    fallback = Candidate("runpod", "A100 SXM 40GB", 1.0, 40, 1)
+    candidates = _fitting_candidates(
+        [failed, fallback],
+        35,
+        _executed_width("sft", {"batch_size": 8}, {"sft_retained_examples": 10}),
+    )
+    failed, fallback = candidates
+
+    assert failed.gpu_count == 4
+    assert failed.executed_gpu_count == 2
+    assert _candidate_usable_vram_gb(failed) == pytest.approx(combined_vram_gb(24, 2))
+    assert _candidate_usable_vram_gb(failed) == pytest.approx(35.2)
+    assert _candidate_usable_vram_gb(failed) != pytest.approx(combined_vram_gb(24, 4))
+    assert _oom_escalated([fallback], _candidate_usable_vram_gb(failed)) == [fallback]
+
+
+def test_non_sft_oom_escalation_still_uses_every_rented_card():
+    from flash.providers.allocator import _executed_width, _fitting_candidates
+    from flash.providers.base import Candidate, combined_vram_gb
+    from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
+
+    failed = Candidate("runpod", "RTX 4090", 0.69, 24, 4)
+    fallback = Candidate("runpod", "A100 SXM 40GB", 1.0, 40, 1)
+    failed = _fitting_candidates(
+        [failed],
+        35,
+        _executed_width("grpo", {"batch_size": 8}, {"sft_retained_examples": 10}),
+    )[0]
+
+    assert failed.executed_gpu_count == failed.gpu_count == 4
+    assert _candidate_usable_vram_gb(failed) == pytest.approx(combined_vram_gb(24, 4))
+    assert _candidate_usable_vram_gb(failed) == pytest.approx(62.4)
+    assert _oom_escalated([fallback], _candidate_usable_vram_gb(failed)) == []
+
+
+def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
+    from flash.providers.allocator import _executed_width, _fitting_candidates
+    from flash.providers.base import Candidate, PollResult
+    from flash.runner.supervise import seed_submission
+    from flash.runner.supervise.lifecycle import _oom_escalated, _RetryBudget
+
+    failed = _fitting_candidates(
+        [Candidate("runpod", "RTX 4090", 0.69, 24, 4)],
+        35,
+        _executed_width("sft", {"batch_size": 8}, {"sft_retained_examples": 10}),
+    )[0]
+    ctx = types.SimpleNamespace(
+        raise_if_cancelled=lambda: None,
+        last_handle=None,
+        spec=types.SimpleNamespace(run_id="run"),
+        last_detail="",
+        oom_vram_floor=0.0,
+        drop_weight_cache=False,
+        retry_budget=_RetryBudget(0, 1, 0),
+        failed_providers=set(),
+        tried_classes=set(),
+        seed=1,
+        log=io.StringIO(),
+    )
+    prepared = types.SimpleNamespace(attempt=0)
+    outcome = seed_submission._AttemptOutcome(
+        result=PollResult(False, failure="oom", detail="cuda oom"),
+        chosen=failed,
+        candidates=(failed,),
+        run_spec=types.SimpleNamespace(gpu=types.SimpleNamespace(network_volume=None)),
+    )
+    monkeypatch.setattr(seed_submission._lifecycle, "_await_runpod_completed_metrics", lambda *a, **k: None)
+    monkeypatch.setattr("flash.runner._load_run_deadline_at", lambda _run_id: None)
+
+    decision = seed_submission._handle_failure(ctx, prepared, outcome)
+
+    assert decision.retry is True
+    assert ctx.oom_vram_floor == pytest.approx(35.2)
+    assert failed not in _oom_escalated([failed], ctx.oom_vram_floor)
 
 
 def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():

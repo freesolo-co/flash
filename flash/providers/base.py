@@ -792,6 +792,9 @@ class Candidate:
     # cards in this candidate combination; hourly_usd and vram_gb stay PER-CARD so existing
     # single-gpu consumers are unchanged. total cost = gpu_count * hourly_usd.
     gpu_count: int = 1
+    # ranks that join the run after allocation; none preserves all-rented-card behavior for candidates
+    # constructed by providers or tests before the allocator stamps the run-specific width.
+    executed_gpu_count: int | None = None
 
     @property
     def total_hourly_usd(self) -> float:
