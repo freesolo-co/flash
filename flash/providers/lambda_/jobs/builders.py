@@ -35,7 +35,8 @@ class LambdaInstance:
     """A launchable (region, instance_type, $/hr) for a managed GPU class.
 
     ``vram_gb`` and ``price_usd_hr`` are PER CARD (matching ``Candidate``), so an N-card box is
-    ``gpu_count * price_usd_hr`` per hour.
+    ``gpu_count * price_usd_hr`` per hour. ``disk_gb`` is the FIXED storage the instance type ships
+    with (Lambda has no launch-time disk parameter); ``None`` means the catalog did not report it.
     """
 
     gpu: str
@@ -44,6 +45,7 @@ class LambdaInstance:
     vram_gb: int
     price_usd_hr: float
     gpu_count: int = 1
+    disk_gb: float | None = None
 
 
 @dataclass

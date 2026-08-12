@@ -6,7 +6,7 @@ import re
 
 from flash.providers.base import UnsupportedGpuError, get_gpu_info, providers_for
 
-__all__ = ["instance_type_for"]
+__all__ = ["instance_type_disk_gb", "instance_type_for"]
 
 # Lambda encodes cards-per-box in the instance-type NAME (``gpu_8x_h100_sxm5``), not as a launch
 # parameter, so an N-card type is found by matching the count segment against the live catalog.
@@ -25,6 +25,30 @@ def _catalog_vram_gb(entry: object) -> int | None:
         match = _VRAM_GB.search(str(instance.get(key) or ""))
         if match:
             return int(match.group(1))
+    return None
+
+
+def instance_type_disk_gb(catalog, instance_type: str) -> float | None:
+    """Fixed disk Lambda ships with one instance type, or None when the catalog does not report it.
+
+    Lambda sells storage WITH the SKU: unlike Vast's create-time ``disk_gb`` or RunPod's
+    ``containerDiskInGb`` there is no launch parameter to raise, so this number is the only thing a
+    run's ``gpu.disk_gb`` floor can be checked against. ``storage_gib`` is compared to the run's GB
+    floor unconverted, which errs on the strict side (a GiB is larger) and never over-promises.
+
+    None means unknown, never zero: a caller must not invent a refusal the catalog cannot prove.
+    """
+    if not isinstance(catalog, dict):
+        return None
+    entry = catalog.get(instance_type)
+    instance = entry.get("instance_type") if isinstance(entry, dict) else None
+    specs = instance.get("specs") if isinstance(instance, dict) else None
+    if not isinstance(specs, dict):
+        return None
+    for key in ("storage_gib", "storage_gb"):
+        storage = specs.get(key)
+        if not isinstance(storage, bool) and isinstance(storage, (int, float)) and storage > 0:
+            return float(storage)
     return None
 
 

@@ -14,13 +14,13 @@ import os
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 if __package__:
+    from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
         _payload_secrets,
         _read_console_tail,
@@ -29,6 +29,7 @@ if __package__:
 else:
     # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
     # same directory, and the script directory leads sys.path.
+    import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
         _read_console_tail,
@@ -542,39 +543,17 @@ def build_worker_env(payload: dict) -> dict:
     return env
 
 
-def _extra_pip_env(payload: dict) -> tuple[dict[str, str], str | None]:
-    env = dict(os.environ)
-    env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    askpass = None
-    if env.get("GITHUB_TOKEN"):
-        fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
-        with os.fdopen(fd, "w") as f:
-            f.write(
-                "#!/bin/sh\n"
-                'case "$1" in\n'
-                '*Username*) printf "%s\\n" "x-access-token" ;;\n'
-                '*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
-                "esac\n"
-            )
-        os.chmod(askpass, 0o700)
-        env["GIT_ASKPASS"] = askpass
-    return env, askpass
-
-
 def install_extra_pip(payload: dict) -> None:
-    extra_pip = payload.get("extra_pip") or []
-    if not extra_pip:
-        return
-    env, askpass = _extra_pip_env(payload)
-    try:
-        if "deadline_at" in payload:
-            require_deadline_at(payload)
-        subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True, env=env)
-    finally:
-        if askpass:
-            with contextlib.suppress(OSError):
-                os.remove(askpass)
+    """Install the run's extra requirements under this bootstrap's deadline and retry policy.
+
+    The install itself lives in the shipped ``bootstrap_pip`` sibling, which stays a leaf: it takes
+    the deadline check and the retriable error class from here rather than importing them back.
+    """
+    bootstrap_pip.install(
+        payload,
+        require_deadline_at=require_deadline_at,
+        retriable_error=RetriableBootstrapError,
+    )
 
 
 def fetch_code(payload: dict) -> None:
@@ -625,8 +604,7 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
     worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
     # cap work from its actual start: the absolute deadline includes boot grace, whose unused
-    # portion
-    # must not extend the declared wall-time budget.
+    # portion must not extend the declared wall-time budget.
     budget = payload.get("run_max_wall_seconds")
     if isinstance(budget, (int, float)) and not isinstance(budget, bool):
         budget = float(budget)
@@ -652,6 +630,9 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            # the worker's own output can carry bytes invalid under the container locale; strict
+            # decoding would raise mid-stream and fail a paid run whose training actually ran.
+            errors="replace",
         )
         pump_done = threading.Event()
         pump_write_lock = threading.Lock()

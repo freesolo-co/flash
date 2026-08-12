@@ -415,9 +415,10 @@ class _QuotableTrain(_Train):
     """`_Train` plus the fields the quote path reads. Kept separate so the digest tests above keep
     exercising the minimal spec surface they were written against."""
 
-    # the optimizer batch is `prompts_per_step` here, not `batch_size`: these specs are grpo, and
-    # the quote path reads the rl name. `batch_size` stays None so a spec that reaches the sft
-    # branch by mistake fails loudly rather than quoting off an rl number.
+    # `_Spec.algorithm` is grpo, and the quote path reads the optimizer batch of a rollout
+    # algorithm from `prompts_per_step`; `batch_size` is sft-only and would never be consulted.
+    # pinned to None rather than left absent, so a spec that reaches the sft branch by mistake fails
+    # loudly instead of quoting off an rl number.
     batch_size = None
     prompts_per_step = 8
     lora_rank = 32
