@@ -12,7 +12,12 @@ from pathlib import Path
 import pytest
 
 from flash.engine.plan.recipe import TEACHER_MODELS, resolve_teacher
-from flash.engine.worker.teacher.client import TeacherClient, TeacherError, TeacherScore
+from flash.engine.worker.teacher.client import (
+    TeacherClient,
+    TeacherError,
+    TeacherScore,
+    _chat_messages,
+)
 from flash.engine.worker.teacher.encoding import (
     EncodedTeacherToken,
     _byte_piece_offsets,
@@ -26,6 +31,31 @@ class _FixedTokenizer:
 
     def encode(self, _text):
         return list(self.tokens)
+
+
+class _MultimodalTokenizer:
+    def encode(self, text):
+        if text == "<|image_pad|>":
+            return [EncodedTeacherToken(151655, 0, len(text))]
+        if text == "<|im_end|>":
+            return [EncodedTeacherToken(151645, 0, len(text))]
+        # the assistant header's trailing newline, which a new-turn completion is encoded after
+        if text == "\n":
+            return [EncodedTeacherToken(198, 0, 1)]
+        if text == "red":
+            return [
+                EncodedTeacherToken(201, 0, 1),
+                EncodedTeacherToken(202, 1, 3),
+            ]
+        # "red" does not merge with the header newline, so the joined encoding is the plain
+        # concatenation and the prefix-diff tail is exactly the completion's own ids.
+        if text == "\nred":
+            return [
+                EncodedTeacherToken(198, 0, 1),
+                EncodedTeacherToken(201, 1, 2),
+                EncodedTeacherToken(202, 2, 4),
+            ]
+        raise AssertionError(f"unexpected tokenizer input: {text!r}")
 
 
 def _tokens():
@@ -70,6 +100,29 @@ def _positional_response():
     }
 
 
+def _multimodal_response(prompt_ids=None):
+    # the completion sits at the END of the supplied assistant turn, closed by <|im_end|> (151645)
+    # and followed by the chat template's own generation header. that trailing header is what the
+    # live route really returns, and scoring must not mistake it for the completion.
+    prompt_ids = prompt_ids or [10, 151655, 11, 201, 202, 151645, 198]
+    return {
+        "choices": [{"index": 0, "token_ids": [999], "message": {"role": "assistant"}}],
+        "prompt_token_ids": prompt_ids,
+        "prompt_logprobs": [
+            None,
+            *[
+                {str(token_id): {"logprob": -0.1 * index, "rank": 1}}
+                for index, token_id in enumerate(prompt_ids[1:], 1)
+            ],
+        ],
+        "usage": {
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 1,
+            "total_tokens": len(prompt_ids) + 1,
+        },
+    }
+
+
 def _client(response, capture=None):
     client = TeacherClient(
         "capability",
@@ -87,23 +140,42 @@ def _client(response, capture=None):
     return client
 
 
+def _multimodal_client(response, capture=None):
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3-vl-235b-a22b-instruct",
+        tokenizer=_MultimodalTokenizer(),
+    )
+
+    def post(path, body):
+        if capture is not None:
+            capture.update({"path": path, "body": body})
+        return response
+
+    client._post = post
+    return client
+
+
 def test_training_guide_lists_only_the_managed_teacher_aliases():
     guide = (Path(__file__).parents[1] / "flash" / "cli" / "scaffold" / "TRAINING.md").read_text()
 
     assert "glm-5.2 (default) | kimi-k3 |" in guide
-    assert "qwen3.5-397b-a17b | deepseek-v4-pro" in guide
+    assert "qwen3.5-397b-a17b | deepseek-v4-pro |" in guide
+    assert "#                                                       # qwen3-vl-235b" in guide
     assert "kimi-k2.6" not in guide
     assert "The control-plane broker owns `PARASAIL_API_KEY`" in guide
     assert "`FLASH_PUBLIC_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`" in guide
     assert "platform's Parasail key is used only inside the paid OPD worker" not in guide
 
 
-def test_catalog_contains_exactly_four_parasail_aliases():
+def test_catalog_contains_exactly_five_parasail_aliases():
     assert set(TEACHER_MODELS) == {
         "kimi-k3",
         "glm-5.2",
         "qwen3.5-397b-a17b",
         "deepseek-v4-pro",
+        "qwen3-vl-235b",
     }
     assert resolve_teacher("").alias == "glm-5.2"
     assert {model.model_id for model in TEACHER_MODELS.values()} == {
@@ -111,6 +183,21 @@ def test_catalog_contains_exactly_four_parasail_aliases():
         "parasail-glm-52",
         "parasail-qwen35-397b-a17b",
         "parasail-deepseek-v4-pro",
+        "parasail-qwen3-vl-235b-a22b-instruct",
+    }
+    # qwen3.5 is a vision model despite the alias carrying no "-vl": the checkpoint is a
+    # ForConditionalGeneration with a vision_config, and the served route tokenizes an image and
+    # answers questions about it. asserting the exact set keeps a text-only teacher from being
+    # marked image-capable, which would not fail loudly -- a text route accepts the request and
+    # drops the image.
+    assert {alias for alias, model in TEACHER_MODELS.items() if model.supports_images} == {
+        "qwen3-vl-235b",
+        "qwen3.5-397b-a17b",
+    }
+    assert {alias for alias, model in TEACHER_MODELS.items() if not model.supports_images} == {
+        "kimi-k3",
+        "glm-5.2",
+        "deepseek-v4-pro",
     }
     for rejected in (
         "kimi-k2.6",
@@ -126,6 +213,39 @@ def test_catalog_contains_exactly_four_parasail_aliases():
             resolve_teacher(rejected)
 
 
+def test_removed_qwen3_vl_8b_alias_is_not_resolvable():
+    with pytest.raises(ValueError, match="not a supported teacher"):
+        resolve_teacher("qwen3-vl-8b")
+
+
+def test_image_capable_aliases_come_from_the_catalog_in_order():
+    """The image-teacher list a user is shown must be derived, not written out beside the check."""
+    from flash.engine.plan.recipe import image_capable_teacher_aliases
+
+    aliases = image_capable_teacher_aliases()
+    assert aliases == ("qwen3.5-397b-a17b", "qwen3-vl-235b"), aliases
+    # catalog order, so the message is stable rather than set-iteration order.
+    assert list(aliases) == [a for a in TEACHER_MODELS if TEACHER_MODELS[a].supports_images]
+
+
+def test_image_capable_teachers_declare_the_image_pad_token():
+    """A teacher may only be flagged image-capable if its own tokenizer can express an image.
+
+    `_score_one_multimodal` raises a permanent error unless the teacher tokenizer encodes
+    `<|image_pad|>` as exactly one token, so flagging a teacher whose pinned tokenizer lacks that
+    marker would fail every image rollout after the gpu is already rented. This reads the pinned
+    tokenizer contract in the catalog rather than the network.
+    """
+    for alias, teacher in TEACHER_MODELS.items():
+        if not teacher.supports_images:
+            continue
+        assert teacher.tokenizer_kind == "tokenizer_json", (
+            f"{alias} is flagged image-capable but pins a {teacher.tokenizer_kind} tokenizer; the "
+            "multimodal scoring path needs the image-pad marker as a single token."
+        )
+        assert "vl" in teacher.tokenizer_repo.lower() or "qwen3.5" in teacher.tokenizer_repo.lower()
+
+
 def test_pinned_tokenizer_hashes_are_complete():
     assert dict(TEACHER_MODELS["kimi-k3"].tokenizer_files) == {
         "tokenizer_config.json": "5d0803c94db9cd78763499e0956c95fd5a225c14a727e5a6cf5db3f96f010a6e",
@@ -139,6 +259,12 @@ def test_pinned_tokenizer_hashes_are_complete():
     )
     assert dict(TEACHER_MODELS["deepseek-v4-pro"].tokenizer_files)["tokenizer.json"] == (
         "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf"
+    )
+    assert TEACHER_MODELS["qwen3-vl-235b"].tokenizer_revision == (
+        "710c13861be6c466e66de3f484069440b8f31389"
+    )
+    assert dict(TEACHER_MODELS["qwen3-vl-235b"].tokenizer_files)["tokenizer.json"] == (
+        "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7"
     )
 
 
@@ -236,8 +362,434 @@ def test_response_contract_rejects_nonfinite_scores(score):
         _client(response).score("P: ", "hi!")
 
 
-def test_multimodal_scoring_surface_is_removed():
-    assert not hasattr(_client(_token_keyed_response()), "score_many_multimodal")
+def test_multimodal_scoring_builds_chat_body_and_reads_top_level_prompt_scores():
+    capture = {}
+    image_uri = "data:image/png;base64,aW1hZ2U="
+    scored = _multimodal_client(_multimodal_response(), capture).score_many_multimodal(
+        [
+            (
+                [
+                    {"role": "system", "content": "rules"},
+                    {
+                        "role": "user",
+                        "content": "before<|media_pad|>after",
+                    },
+                ],
+                "red",
+                [image_uri],
+            )
+        ]
+    )[0]
+
+    assert capture == {
+        "path": "/v1/teacher/chat_completions",
+        "body": {
+            "model": "parasail-qwen3-vl-235b-a22b-instruct",
+            "messages": [
+                {"role": "system", "content": "rules"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "before"},
+                        {"type": "image_url", "image_url": {"url": image_uri}},
+                        {"type": "text", "text": "after"},
+                    ],
+                },
+                {"role": "assistant", "content": "red"},
+            ],
+            "max_tokens": 1,
+            "temperature": 0,
+            "seed": 0,
+            "prompt_logprobs": 1,
+            "return_token_ids": True,
+        },
+    }
+    assert [(token.text, token.start, token.end, token.logprob) for token in scored.tokens] == [
+        ("r", 0, 1, -0.30000000000000004),
+        ("ed", 1, 3, -0.4),
+    ]
+    assert (scored.input_tokens, scored.output_tokens) == (7, 1)
+
+
+def test_multimodal_scoring_rejects_prompt_ids_unchanged_by_image():
+    response = _multimodal_response([10, 11, 201, 202, 151645, 198])
+
+    with pytest.raises(TeacherError, match="silently dropped") as error:
+        _multimodal_client(response).score_many_multimodal(
+            [
+                (
+                    [{"role": "user", "content": "<|media_pad|>"}],
+                    "red",
+                    ["data:image/png;base64,aW1hZ2U="],
+                )
+            ]
+        )
+
+    assert error.value.permanent is True
+
+
+def test_multimodal_completion_ids_must_be_present():
+    response = _multimodal_response([10, 151655, 11, 203, 204, 151645, 198])
+
+    with pytest.raises(TeacherError, match="does not end the supplied assistant turn") as error:
+        _multimodal_client(response).score_many_multimodal(
+            [
+                (
+                    [{"role": "user", "content": "<|media_pad|>"}],
+                    "red",
+                    ["data:image/png;base64,aW1hZ2U="],
+                )
+            ]
+        )
+
+    assert error.value.permanent is True
+
+
+def test_multimodal_scoring_anchors_to_the_supplied_turn_not_a_quoting_prompt():
+    # a valid rollout whose PROMPT quotes the answer: the completion ids appear twice. requiring
+    # global uniqueness would permanently fail it, so anchor to the turn the completion closes.
+    # the scored logprobs must come from that occurrence, not the earlier quote.
+    prompt_ids = [10, 151655, 201, 202, 11, 201, 202, 151645, 198]
+    scored = _multimodal_client(_multimodal_response(prompt_ids)).score_many_multimodal(
+        [
+            (
+                [{"role": "user", "content": "<|media_pad|>"}],
+                "red",
+                ["data:image/png;base64,aW1hZ2U="],
+            )
+        ]
+    )[0]
+
+    # logprob is -0.1 * index, so the trailing pair (indices 5, 6) is distinguishable from the
+    # leading one (indices 2, 3). asserting the VALUES is what proves which run was scored.
+    assert [round(token.logprob, 4) for token in scored.tokens] == [-0.5, -0.6]
+
+
+def test_multimodal_scoring_ignores_the_trailing_generation_header():
+    # the defect this anchoring exists for. the chat route appends its own
+    # "<|im_start|>assistant\n" after our supplied turn, and a completion can collide with those
+    # template ids -- confirmed live, where a completion of "assistant" returned
+    # [..., 77091, 151645, 198, 151644, 77091, 198]. picking the LAST matching run scores fixed
+    # template tokens as the model's answer, and every structural check still passes, so the
+    # corruption is silent. the completion here is a single id (77091) that appears both where the
+    # student answered (index 3) and inside the trailing header (index 6).
+    class _CollidingTokenizer:
+        def encode(self, text):
+            table = {
+                "<|image_pad|>": [EncodedTeacherToken(151655, 0, len(text))],
+                "<|im_end|>": [EncodedTeacherToken(151645, 0, len(text))],
+                "\n": [EncodedTeacherToken(198, 0, 1)],
+                "assistant": [EncodedTeacherToken(77091, 0, len("assistant"))],
+                # no merge across the header boundary here, so the tail is just 77091
+                "\nassistant": [
+                    EncodedTeacherToken(198, 0, 1),
+                    EncodedTeacherToken(77091, 1, 10),
+                ],
+            }
+            if text in table:
+                return list(table[text])
+            raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+    prompt_ids = [10, 151655, 11, 77091, 151645, 198, 151644, 77091, 198]
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3-vl-235b-a22b-instruct",
+        tokenizer=_CollidingTokenizer(),
+    )
+    client._post = lambda path, body: _multimodal_response(prompt_ids)
+
+    scored = client.score_many_multimodal(
+        [
+            (
+                [{"role": "user", "content": "<|media_pad|>"}],
+                "assistant",
+                ["data:image/png;base64,aW1hZ2U="],
+                False,
+            )
+        ]
+    )[0]
+
+    # logprob is -0.1 * index: the real answer sits at index 3 (-0.3), the header's copy at
+    # index 7 (-0.7). asserting the VALUE is what distinguishes the two.
+    assert [round(token.logprob, 4) for token in scored.tokens] == [-0.3]
+
+
+def test_multimodal_scoring_rejects_a_partially_dropped_image():
+    # two images supplied, one expanded. a raw pad COUNT cannot catch this -- the surviving image
+    # alone contributes more pads than the image count -- so this is the case that proves the
+    # guard counts per-image runs.
+    prompt_ids = [10, 151655, 151655, 151655, 11, 201, 202, 151645, 198]
+    response = _multimodal_response(prompt_ids)
+
+    with pytest.raises(TeacherError, match="fewer images") as error:
+        _multimodal_client(response).score_many_multimodal(
+            [
+                (
+                    [{"role": "user", "content": "<|media_pad|><|media_pad|>"}],
+                    "red",
+                    ["data:image/png;base64,aW1hZ2U=", "data:image/png;base64,aW1hZ2Uy"],
+                )
+            ]
+        )
+
+    assert error.value.permanent is True
+
+
+def test_multimodal_scoring_admits_two_genuinely_expanded_images():
+    # the paired control: the same two-image request, both expanded, must be ADMITTED. a guard
+    # that rejects valid traffic is as broken as one that never fires.
+    prompt_ids = [10, 151655, 151655, 11, 151655, 151655, 12, 201, 202, 151645, 198]
+    scored = _multimodal_client(_multimodal_response(prompt_ids)).score_many_multimodal(
+        [
+            (
+                [{"role": "user", "content": "<|media_pad|><|media_pad|>"}],
+                "red",
+                ["data:image/png;base64,aW1hZ2U=", "data:image/png;base64,aW1hZ2Uy"],
+            )
+        ]
+    )[0]
+
+    assert len(scored.tokens) == 2
+
+
+def test_multimodal_drop_guard_ignores_pads_inside_the_completion():
+    # the completion is SAMPLED by the student, and a vision student can emit the literal
+    # image-pad token. counting pads over the whole prompt lets that token stand in for an image
+    # the provider actually dropped: two supplied, one expanded, and the completion's own pad
+    # supplies the second run. the guard passes and the OPD target is image-unconditioned.
+    # rejecting the marker in prompt text does not cover it -- the completion is appended after
+    # that check. so pads are counted over the prompt region only.
+    class _PadInCompletionTokenizer:
+        def encode(self, text):
+            table = {
+                "<|image_pad|>": [EncodedTeacherToken(151655, 0, len("<|image_pad|>"))],
+                "<|im_end|>": [EncodedTeacherToken(151645, 0, len("<|im_end|>"))],
+                "\n": [EncodedTeacherToken(198, 0, 1)],
+                "\n<|image_pad|>x": [
+                    EncodedTeacherToken(198, 0, 1),
+                    EncodedTeacherToken(151655, 1, 14),
+                    EncodedTeacherToken(120, 14, 15),
+                ],
+            }
+            if text in table:
+                return list(table[text])
+            raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3-vl-235b-a22b-instruct",
+        tokenizer=_PadInCompletionTokenizer(),
+    )
+    # one real image expanded (index 1-2), then the completion's own pad at index 4. counting the
+    # whole list yields 2 runs and admits a request that dropped an image.
+    prompt_ids = [10, 151655, 151655, 11, 151655, 120, 151645, 198]
+    client._post = lambda path, body: _multimodal_response(prompt_ids)
+
+    with pytest.raises(TeacherError, match="fewer images") as error:
+        client.score_many_multimodal(
+            [
+                (
+                    [{"role": "user", "content": "<|media_pad|><|media_pad|>"}],
+                    "<|image_pad|>x",
+                    [
+                        "data:image/png;base64,aW1hZ2U=",
+                        "data:image/png;base64,aW1hZ2Uy",
+                    ],
+                    False,
+                )
+            ]
+        )
+
+    assert error.value.permanent is True
+
+
+def test_multimodal_completion_opens_a_new_assistant_turn():
+    # the student froze its prompt with add_generation_prompt=True, so the sampled tokens follow a
+    # NEW assistant boundary. gluing them onto an assistant turn from the environment's own history
+    # would score them as a continuation of that turn -- a silently different conditioning prefix,
+    # which produces plausible logprobs against the wrong context rather than an error.
+    messages = _chat_messages(
+        [
+            {"role": "user", "content": "<|media_pad|>"},
+            {"role": "assistant", "content": "Earlier reply."},
+        ],
+        "NEW",
+        ["data:image/png;base64,aW1hZ2U="],
+    )
+
+    assert messages[-2] == {"role": "assistant", "content": "Earlier reply."}
+    assert messages[-1] == {"role": "assistant", "content": "NEW"}
+
+
+def test_multimodal_thinking_prefill_continues_the_same_assistant_turn():
+    # the ONE case that legitimately continues the trailing turn: the student sampled AFTER the
+    # synthetic prefill inside that same assistant turn, so the teacher must condition identically.
+    messages = _chat_messages(
+        [
+            {"role": "user", "content": "<|media_pad|>"},
+            {"role": "assistant", "content": "<think>\n"},
+        ],
+        "NEW",
+        ["data:image/png;base64,aW1hZ2U="],
+        continue_final_assistant=True,
+    )
+
+    assert [m["role"] for m in messages].count("assistant") == 1
+    assert messages[-1] == {"role": "assistant", "content": "<think>\nNEW"}
+
+
+def test_multimodal_completion_is_encoded_after_its_assistant_prefix():
+    # BPE merges across the prefix/completion boundary: a completion starting with "\n" placed
+    # after a thinking prefill ending in "\n" becomes ONE token. encoding the completion alone then
+    # yields ids that never occur in the provider's rendered prompt, so the contiguous-run lookup
+    # either rejects a valid rollout or matches the standalone ids somewhere earlier and silently
+    # scores the wrong text. this stub reproduces the merge: 198 + 198 -> 271.
+    class _MergingTokenizer:
+        def encode(self, text):
+            if text == "<|image_pad|>":
+                return [EncodedTeacherToken(151655, 0, len(text))]
+            if text == "<|im_end|>":
+                return [EncodedTeacherToken(151645, 0, len(text))]
+            table = {
+                "<think>\n": [EncodedTeacherToken(151667, 0, 7), EncodedTeacherToken(198, 7, 8)],
+                "\nred": [EncodedTeacherToken(198, 0, 1), EncodedTeacherToken(1151, 1, 4)],
+                # the merged rendering: the two newlines collapse into 271
+                "<think>\n\nred": [
+                    EncodedTeacherToken(151667, 0, 7),
+                    EncodedTeacherToken(271, 7, 9),
+                    EncodedTeacherToken(1151, 9, 12),
+                ],
+            }
+            if text in table:
+                return list(table[text])
+            raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3-vl-235b-a22b-instruct",
+        tokenizer=_MergingTokenizer(),
+    )
+    # the provider's rendered prompt contains the MERGED ids [271, 1151]; the standalone encoding
+    # [198, 1151] does not occur anywhere in it. scoring must still find the completion, so this
+    # only passes if the request path encodes in context rather than in isolation.
+    prompt_ids = [10, 151655, 11, 271, 1151, 151645, 198]
+    client._post = lambda path, body: _multimodal_response(prompt_ids)
+
+    scored = client.score_many_multimodal(
+        [
+            (
+                [
+                    {"role": "user", "content": "<|media_pad|>"},
+                    {"role": "assistant", "content": "<think>\n"},
+                ],
+                "\nred",
+                ["data:image/png;base64,aW1hZ2U="],
+                True,
+            )
+        ]
+    )[0]
+
+    # two scored tokens means the merged run was located; standalone encoding would raise instead.
+    assert len(scored.tokens) == 2
+
+
+def test_multimodal_new_turn_completion_merges_with_the_assistant_header():
+    # the same merge happens with NO thinking prefill. the chat template renders
+    # "<|im_start|>assistant\n", so a completion starting with "\n" merges against the header's
+    # own newline exactly as it would against a prefill. measured on the pinned Qwen3-VL
+    # tokenizer, isolated encoding loses 5 of 8 whitespace-leading completions: "\nred" encodes
+    # to [198, 1151] while the render contains [..., 77091, 271, 1151]. encoding a new turn in
+    # isolation therefore rejects those rollouts permanently.
+    class _HeaderMergingTokenizer:
+        def encode(self, text):
+            table = {
+                "<|image_pad|>": [EncodedTeacherToken(151655, 0, len(text))],
+                "<|im_end|>": [EncodedTeacherToken(151645, 0, len(text))],
+                "\n": [EncodedTeacherToken(198, 0, 1)],
+                "\nred": [EncodedTeacherToken(198, 0, 1), EncodedTeacherToken(1151, 1, 4)],
+                # header newline + completion newline collapse into 271, exactly as BPE does
+                "\n\nred": [
+                    EncodedTeacherToken(271, 0, 2),
+                    EncodedTeacherToken(1151, 2, 5),
+                ],
+            }
+            if text in table:
+                return list(table[text])
+            raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3-vl-235b-a22b-instruct",
+        tokenizer=_HeaderMergingTokenizer(),
+    )
+    # what the provider really returns: the merged [271, 1151]. the isolated encoding [198, 1151]
+    # never occurs, so this only passes if a new turn is encoded after the header's newline.
+    prompt_ids = [10, 151655, 11, 271, 1151, 151645, 198]
+    client._post = lambda path, body: _multimodal_response(prompt_ids)
+
+    scored = client.score_many_multimodal(
+        [
+            (
+                [{"role": "user", "content": "<|media_pad|>"}],
+                "\nred",
+                ["data:image/png;base64,aW1hZ2U="],
+                False,
+            )
+        ]
+    )[0]
+
+    # two scored tokens means the MERGED run [271, 1151] was located. the isolated encoding
+    # [198, 1151] does not occur in prompt_ids at all, so this raises without the header prefix.
+    assert len(scored.tokens) == 2
+    # the spans still address the COMPLETION, not the header: the merged token clamps to 0 and the
+    # last token ends at len("\nred"), so the caller's slice of completion_text stays exact.
+    assert (scored.tokens[0].start, scored.tokens[-1].end) == (0, 4)
+
+
+def test_multimodal_encoding_rejects_a_boundary_that_eats_multiple_prefix_tokens():
+    # real BPE only merges the token straddling the seam, so the tail starts at most one token
+    # inside the prefix. a tokenizer that rewrote MORE would return tokens whose text is largely
+    # prefill, and scoring those as the completion would attribute the prefill's logprobs to
+    # sampled tokens -- wrong in the silent direction, so fail closed instead.
+    class _OvermergingTokenizer:
+        def encode(self, text):
+            table = {
+                "AB": [
+                    EncodedTeacherToken(1, 0, 1),
+                    EncodedTeacherToken(2, 1, 2),
+                    EncodedTeacherToken(3, 2, 3),
+                ],
+                # one shared token, then a single token swallowing the rest of the prefix plus C
+                "ABC": [
+                    EncodedTeacherToken(1, 0, 1),
+                    EncodedTeacherToken(9, 1, 3),
+                    EncodedTeacherToken(4, 3, 4),
+                ],
+            }
+            if text in table:
+                return list(table[text])
+            raise AssertionError(f"unexpected tokenizer input: {text!r}")
+
+    client = TeacherClient(
+        "capability",
+        "https://broker.example",
+        "parasail-qwen3-vl-235b-a22b-instruct",
+        tokenizer=_OvermergingTokenizer(),
+    )
+
+    with pytest.raises(TeacherError, match="rewrote more than one prefix token"):
+        client._encode_completion_in_context(
+            [
+                {"role": "user", "content": "<|media_pad|>"},
+                {"role": "assistant", "content": "AB"},
+            ],
+            "C",
+            continue_final_assistant=True,
+        )
 
 
 def test_score_many_caps_in_flight_requests_at_the_measured_ceiling():

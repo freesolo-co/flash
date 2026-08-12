@@ -371,13 +371,16 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "tqdm" in install
     assert "pyarrow" in install
     # venv, the resolve above, the prebuilt flash_attn wheel on its own --no-build-isolation line,
-    # then causal_conv1d (also its own line: it source-builds against the venv's torch), and last
-    # the import probe that proves the conv extension actually loaded. nothing else: another INSTALL
-    # would be unbudgeted work on a paid pod.
-    assert len(calls) == 5
+    # then causal_conv1d (also its own line: it source-builds against the venv's torch), the import
+    # probe that proves the conv extension actually loaded, and last the libcudart stub repair that
+    # keeps vLLM importable in this venv. nothing else: another INSTALL would be unbudgeted work on
+    # a paid pod (the repair and the probe are local `python -c` calls, not installs).
+    assert len(calls) == 6
     assert calls[2][:3] == ["uv", "pip", "install"]
     assert vc.CAUSAL_CONV1D_REQUIREMENT in calls[3]
     assert calls[4][-1] == "import causal_conv1d"
+    assert calls[5][1] == "-c"
+    assert "libcudart_stub" in calls[5][2]
     assert [c for c in calls if c[:3] == ["uv", "pip", "install"]] == calls[1:4], (
         "the probe must be a check, not an install"
     )
@@ -1236,12 +1239,16 @@ class _Completed:
         self.returncode = returncode
 
 
-def _record_run_with_conv_exit(calls, conv_exit, *, import_exit=0):
+def _record_run_with_conv_exit(calls, conv_exit, *, import_exit=0, cudart_exit=0):
     """``_record_run``, but the causal-conv1d install exits with ``conv_exit``.
 
     ``import_exit`` drives the separate ``import causal_conv1d`` probe, because a compiled cuda
     extension can install cleanly (exit 0) and still fail to import on an ABI mismatch.
+    ``cudart_exit`` drives the child libcudart stub repair, which exits nonzero when it leaves the
+    stub shadowing libcudart.
     """
+    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+
     inner = _record_run(calls)
 
     def fake_run(command, check, env=None, capture_output=False):
@@ -1250,6 +1257,8 @@ def _record_run_with_conv_exit(calls, conv_exit, *, import_exit=0):
             return _Completed(conv_exit)
         if command[-1] == "import causal_conv1d":
             return _Completed(import_exit)
+        if command[-1] == _CHILD_CUDART_FIX:
+            return _Completed(cudart_exit)
         return _Completed(0)
 
     return fake_run
@@ -1279,6 +1288,42 @@ def test_a_successful_conv_build_still_stamps_the_venv(monkeypatch, tmp_path):
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
     monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
+    assert stamp.read_text() == vc.VERL_VENV_STAMP
+
+
+def test_an_unrepaired_child_cudart_stub_leaves_the_venv_unstamped(monkeypatch, tmp_path):
+    """A stub still shadowing libcudart must not be recorded as a complete provisioning.
+
+    The repair runs only on the rebuild path, so stamping here freezes the failure in: every later
+    attempt on this pod reuses a venv whose stamp asserts it is provisioned while its child still
+    aborts on vLLM import, and the repair is never attempted again.
+    """
+    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0, cudart_exit=1))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
+    assert not stamp.exists(), (
+        "a venv whose child libcudart stub was left shadowing was stamped as fully provisioned, so "
+        "every later attempt on this pod reuses an interpreter where vLLM aborts its import"
+    )
+    # still fails open within this launch: provisioning returned an interpreter rather than raising.
+    assert any(command[-1] == _CHILD_CUDART_FIX for command in calls)
+
+
+def test_a_repaired_child_cudart_stub_still_stamps_the_venv(monkeypatch, tmp_path):
+    """The guard keys on the repair outcome; it must not stop stamping altogether."""
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0, cudart_exit=0))
 
     vc.resolve_verl_python(str(tmp_path))
 
@@ -1318,6 +1363,21 @@ def test_the_venv_stamp_covers_the_conv_kernel_so_an_older_venv_is_rebuilt():
     failing `require_gdn_boundary_resets`.
     """
     assert vc.CAUSAL_CONV1D_REQUIREMENT in vc.VERL_VENV_STAMP
+
+
+def test_the_venv_stamp_covers_build_time_repairs_so_a_pre_fix_venv_is_rebuilt():
+    """The same argument for a repair rather than a package.
+
+    The libcudart repair runs only on the rebuild path, so a venv stamped by a release that predates
+    it matches the stamp, is reused unrepaired, and keeps tilelang's stub -- vLLM then aborts its
+    import in the child AFTER the gpu is rented. The stamp has to change when the repair set does,
+    or the fix never reaches the venvs that need it most (retries and upgraded workers that preserve
+    the workdir).
+    """
+    assert vc.VERL_VENV_BUILD_REPAIRS in vc.VERL_VENV_STAMP
+    # and it must be the LAST field: appending keeps the earlier fields' offsets stable, so a stamp
+    # written by this release is still diffable against one from before the repairs existed.
+    assert vc.VERL_VENV_STAMP.endswith(vc.VERL_VENV_BUILD_REPAIRS)
 
 
 def test_the_fallback_pins_transformers_like_the_image_does(monkeypatch, tmp_path):
@@ -1461,12 +1521,14 @@ def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(
 
     vc.resolve_verl_python(str(tmp_path))
 
-    # three installs, then the conv import probe (which runs the venv's python, not uv).
+    # three installs, then the conv import probe and the libcudart stub repair (both run the venv's
+    # python, not uv).
     assert [c[:2] for c in calls] == [
         ["uv", "venv"],
         ["uv", "pip"],
         ["uv", "pip"],
         ["uv", "pip"],
+        [str(venv / "bin" / "python"), "-c"],
         [str(venv / "bin" / "python"), "-c"],
     ]
     assert not (venv / "marker").exists()
@@ -1491,6 +1553,7 @@ def test_resolve_verl_python_clears_a_venv_whose_creation_was_interrupted(monkey
         ["uv", "pip"],
         ["uv", "pip"],
         ["uv", "pip"],
+        [str(venv / "bin" / "python"), "-c"],
         [str(venv / "bin" / "python"), "-c"],
     ]
 

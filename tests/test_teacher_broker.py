@@ -117,6 +117,44 @@ def _response(*, token="questionanswer"):
     ).encode()
 
 
+def _chat_body(*, model="parasail-glm-52", messages=None, **extra):
+    value = {
+        "model": model,
+        "messages": messages
+        or [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+                    },
+                    {"type": "text", "text": "question"},
+                ],
+            },
+            {"role": "assistant", "content": "answer"},
+        ],
+        "max_tokens": 1,
+        "temperature": 0,
+        "seed": 0,
+        "prompt_logprobs": 1,
+        "return_token_ids": True,
+    }
+    value.update(extra)
+    return json.dumps(value, separators=(",", ":")).encode()
+
+
+def _chat_response():
+    return json.dumps(
+        {
+            "choices": [{"index": 0, "token_ids": [8], "message": {"role": "assistant"}}],
+            "prompt_token_ids": [151655, 7],
+            "prompt_logprobs": [None, {"7": {"logprob": -0.1}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        }
+    ).encode()
+
+
 def _service_ready(monkeypatch):
     monkeypatch.setattr(teacher_broker, "_require_current_attempt", lambda _capability: None)
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
@@ -486,6 +524,52 @@ def test_closed_parasail_contract_rejects_extra_fields_model_changes_and_batches
     assert request.score_items == 1
 
 
+def test_chat_scoring_contract_accepts_exact_shape_and_rejects_unknown_input(broker_db):
+    token = _issue()
+    capability = db.teacher_capability_binding(token)
+
+    request = teacher_broker.validate_chat_completion_request(
+        teacher_broker.parse_strict_json(_chat_body()),
+        capability,
+    )
+    assert request.score_items == 1
+
+    with pytest.raises(teacher_broker.TeacherBrokerError, match="extra_request_fields"):
+        teacher_broker.validate_chat_completion_request(
+            teacher_broker.parse_strict_json(_chat_body(echo=True)),
+            capability,
+        )
+    with pytest.raises(
+        teacher_broker.TeacherBrokerError,
+        match="unknown_chat_content_block_type",
+    ):
+        teacher_broker.validate_chat_completion_request(
+            teacher_broker.parse_strict_json(
+                _chat_body(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [{"type": "audio", "audio": "data:audio/wav;base64,YQ=="}],
+                        }
+                    ]
+                )
+            ),
+            capability,
+        )
+
+
+def test_chat_scoring_contract_enforces_capability_request_bytes(broker_db):
+    token = _issue()
+    capability = dict(db.teacher_capability_binding(token))
+    capability["max_request_bytes"] = 64
+
+    with pytest.raises(teacher_broker.TeacherBrokerError, match="request_too_large"):
+        teacher_broker.validate_chat_completion_request(
+            teacher_broker.parse_strict_json(_chat_body()),
+            capability,
+        )
+
+
 def test_strict_json_rejects_duplicate_keys_and_nonfinite_numbers():
     with pytest.raises(teacher_broker.TeacherBrokerError, match="duplicate_json_key"):
         teacher_broker.parse_strict_json(b'{"model":"a","model":"b"}')
@@ -505,6 +589,57 @@ def test_request_fingerprint_is_capability_keyed_hmac(broker_db):
 
     assert fingerprint == hmac.new(token.encode(), canonical, hashlib.sha256).hexdigest()
     assert fingerprint != hashlib.sha256(canonical).hexdigest()
+
+
+def test_chat_request_forwards_to_parasail_chat_route_and_preserves_top_level_scores(
+    broker_db, monkeypatch
+):
+    _service_ready(monkeypatch)
+    token = _issue()
+    captured = {}
+
+    def dispatch(body, api_key, timeout):
+        captured.update(
+            {
+                "body": json.loads(body),
+                "api_key": api_key,
+                "timeout": timeout,
+            }
+        )
+        return 200, _chat_response()
+
+    monkeypatch.setattr(teacher_broker, "_provider_chat_post", dispatch)
+
+    response = teacher_broker.complete_teacher_chat_request(
+        capability_token=token,
+        request_id="request-chat-00000001",
+        raw_body=_chat_body(),
+    )
+
+    assert captured["body"] == json.loads(_chat_body())
+    assert captured["api_key"] == "control-plane-only-canary"
+    assert captured["timeout"] > 0
+    assert response["prompt_token_ids"] == [151655, 7]
+    assert response["prompt_logprobs"][1]["7"]["logprob"] == -0.1
+    assert "prompt_token_ids" not in response["choices"][0]
+
+
+def test_provider_chat_post_uses_parasail_chat_completions_path(monkeypatch):
+    captured = {}
+
+    def post(path, body, api_key, timeout):
+        captured.update({"path": path, "body": body, "api_key": api_key, "timeout": timeout})
+        return 200, b"{}"
+
+    monkeypatch.setattr(teacher_broker, "_provider_post_path", post)
+
+    assert teacher_broker._provider_chat_post(b"body", "key", 3.0) == (200, b"{}")
+    assert captured == {
+        "path": "/v1/chat/completions",
+        "body": b"body",
+        "api_key": "key",
+        "timeout": 3.0,
+    }
 
 
 def test_concurrent_duplicate_request_id_dispatches_upstream_once(broker_db, monkeypatch):
@@ -981,6 +1116,50 @@ def test_operation_specific_route_requires_bearer_json_and_request_id(monkeypatc
         "raw_body": bytearray(b"{}"),
     }
     assert isinstance(captured["raw_body"], bytearray)
+
+
+def test_chat_route_mirrors_completion_route_auth_and_request_binding(monkeypatch):
+    fastapi = pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from flash.server.routes import teacher as teacher_route
+
+    captured = {}
+
+    monkeypatch.setattr(
+        teacher_route,
+        "authenticate_teacher_capability",
+        lambda **kwargs: (
+            kwargs["request_id"],
+            kwargs["capability_token"],
+            {"expires_at": time.time() + 60},
+        ),
+    )
+    monkeypatch.setattr(
+        teacher_route,
+        "complete_teacher_chat_request",
+        lambda **kwargs: captured.update(kwargs) or {"choices": []},
+    )
+    app = fastapi.FastAPI()
+    app.include_router(teacher_route.router)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/teacher/chat_completions",
+        content=b"{}",
+        headers={
+            "Authorization": "Bearer capability-value",
+            "Content-Type": "application/json",
+            "X-Flash-Teacher-Request-Id": "request-chat-route-0001",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "capability_token": "capability-value",
+        "request_id": "request-chat-route-0001",
+        "raw_body": bytearray(b"{}"),
+    }
 
 
 def test_bounded_body_accepts_exact_limit_without_copy_and_rejects_next_chunk(monkeypatch):

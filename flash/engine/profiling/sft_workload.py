@@ -608,7 +608,11 @@ def prepare_sft_workload(
     )
     processor = None
     if multimodal:
-        validate_multimodal_training(spec.model, "sft")
+        validate_multimodal_training(
+            spec.model,
+            "sft",
+            getattr(spec.train, "teacher_model", None),
+        )
         processor = (processor_loader or _default_processor_loader)(
             spec.model,
             spec.model_revision,

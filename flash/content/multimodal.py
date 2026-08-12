@@ -22,6 +22,9 @@ MAX_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 _IMAGE_BLOCK_TYPES = frozenset({"image", "image_url", "input_image"})
 IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
+# the model's real image-expansion token, as opposed to the placeholder above. one definition so
+# the renderer's rejection and the teacher client's drop guard cannot drift apart.
+IMAGE_PAD_TOKEN = "<|image_pad|>"
 
 
 @dataclass(frozen=True)
@@ -272,6 +275,29 @@ def text_only_prompt_messages(messages: list[dict]) -> list[dict]:
     return stripped
 
 
+def _reject_literal_image_placeholder(text: str, message_index: int) -> None:
+    """Reject prompt text that already contains a reserved image marker.
+
+    two distinct markers, one reason. the rendered prompt marks image positions with
+    ``IMAGE_TEACHER_PLACEHOLDER`` and the teacher client splits on every occurrence to pair each
+    one with an image, so a placeholder in the USER'S OWN text is indistinguishable from one this
+    renderer inserted and would be paired with an image that does not exist.
+
+    ``IMAGE_PAD_TOKEN`` is the model's real special token: whatever the provider expands an image
+    into. the silent-drop guard counts its runs in the returned prompt ids and requires at least
+    one run per supplied image. text containing the literal token encodes to that same id, so it
+    contributes a run the renderer never produced -- and a run from text can make up for an image
+    the provider silently dropped, which is exactly the failure the guard exists to catch. keeping
+    it out of the source text is what makes "one run per image" mean what it says.
+    """
+    for marker in (IMAGE_TEACHER_PLACEHOLDER, IMAGE_PAD_TOKEN):
+        if marker in text:
+            raise ValueError(
+                f"message {message_index} text contains the reserved image marker "
+                f"{marker!r}; remove it from the prompt"
+            )
+
+
 def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -> list[dict]:
     """Render normalized image blocks as Kimi media placeholders without changing text order."""
     rendered: list[dict] = []
@@ -281,6 +307,12 @@ def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -
         content = copied.get("content")
         if isinstance(content, list):
             parts: list[str] = []
+            # text blocks since the last image, joined and checked as one run. a marker split
+            # across adjacent text blocks ("<|media_" then "pad|>") is invisible per block and
+            # only becomes literal once concatenated, so the run is the unit that has to be
+            # validated. an image block ends a run: the renderer's own placeholder goes there,
+            # and user text on either side of it cannot reach across to form a marker.
+            text_run: list[str] = []
             for block_index, block in enumerate(content):
                 if not isinstance(block, dict):
                     raise ValueError(
@@ -289,8 +321,12 @@ def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -
                     )
                 block_type = block.get("type")
                 if block_type == "text" and isinstance(block.get("text"), str):
+                    _reject_literal_image_placeholder(block["text"], message_index)
+                    text_run.append(block["text"])
                     parts.append(block["text"])
                 elif block_type in _IMAGE_BLOCK_TYPES:
+                    _reject_literal_image_placeholder("".join(text_run), message_index)
+                    text_run = []
                     parts.append(IMAGE_TEACHER_PLACEHOLDER)
                     image_count += 1
                 else:
@@ -298,10 +334,13 @@ def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -
                         f"unsupported content block type {block_type!r} at message "
                         f"{message_index}, index {block_index}"
                     )
+            _reject_literal_image_placeholder("".join(text_run), message_index)
             copied["content"] = "".join(parts)
         elif content is None:
             copied["content"] = ""
-        elif not isinstance(content, str):
+        elif isinstance(content, str):
+            _reject_literal_image_placeholder(content, message_index)
+        else:
             raise ValueError(f"message {message_index} content must be text or content blocks")
         rendered.append(copied)
     if image_count != descriptor_count:
@@ -574,13 +613,22 @@ def resolve_image_pad_token_id(processor, tok) -> int:
     raise ValueError("could not resolve a valid image-pad token id from the processor or tokenizer")
 
 
-def validate_multimodal_training(model_id: str, algorithm: str) -> None:
+def validate_multimodal_training(model_id: str, algorithm: str, teacher_model: str | None) -> None:
     from flash.core.catalog import supports_image_training
+    from flash.engine.plan.recipe import resolve_teacher, teacher_supports_images
 
     if not supports_image_training(model_id):
         raise ValueError(f"{model_id} does not support image-bearing training records")
     if algorithm == "opd":
-        raise ValueError("image-bearing opd is not supported")
+        teacher = resolve_teacher(teacher_model)
+        if not teacher_supports_images(teacher.alias):
+            from flash.engine.plan.recipe import image_capable_teacher_aliases
+
+            choices = " or ".join(f'"{alias}"' for alias in image_capable_teacher_aliases())
+            raise ValueError(
+                f"image-bearing opd requires [train] teacher_model = {choices}; "
+                f"the selected teacher {teacher.alias!r} cannot see images"
+            )
 
 
 def message_content_text(content: object) -> str:
@@ -689,5 +737,18 @@ def preflight_validate_image_opd(spec) -> None:
         records = records[:max_examples]
     for record in records:
         if record_has_images(record, _record_messages(record)):
-            validate_multimodal_training(str(getattr(spec, "model", "")), "opd")
+            validate_multimodal_training(
+                str(getattr(spec, "model", "")),
+                "opd",
+                getattr(train, "teacher_model", None),
+            )
+            # only `multi_turn` is a preflight signal. the authoritative source is the env CLASS
+            # (adapter.py sets multi_turn from isinstance(sdk_env, EnvironmentMultiTurn)), which
+            # this path deliberately cannot see: it reads the dataset file rather than importing
+            # user environment code before allocation. so a class-based multi-turn env is caught
+            # by the worker's fail-closed guard instead. `max_turns` must NOT reject here -- it is
+            # a turn CAP that single-turn envs may legitimately carry, and rejecting on it fails
+            # jobs the worker would happily run.
+            if params.get("multi_turn") is True:
+                raise ValueError("multi-turn image-bearing opd is not supported")
             return
