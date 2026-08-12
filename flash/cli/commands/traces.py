@@ -28,6 +28,11 @@ RECORDS_FORMAT = "records"
 PROMPTS_FORMAT = "prompts"
 RAW_FORMAT = "raw"
 EXPORT_FORMATS = (RECORDS_FORMAT, PROMPTS_FORMAT, RAW_FORMAT)
+# stated here rather than imported from flash.server: the CLI installs without the server's
+# dependencies, so importing the plane's module to read one integer would break `flash traces
+# export` on a plain install. the backend is authoritative and rejects anything above its own cap;
+# this bound only lets the CLI say so before spending a round trip.
+MAX_EXPORT_TRACES = 1000
 
 
 def default_output_path(export_format: str) -> Path:
@@ -91,6 +96,7 @@ def fetch_records(
     api_key: str | None = None,
     export_format: str = RECORDS_FORMAT,
     base_url: str | None = None,
+    limit: int | None = None,
 ) -> dict:
     """A project's traces in the requested shape, converted server-side.
 
@@ -104,7 +110,7 @@ def fetch_records(
             base_url = trace_store_url(api_url)
     else:
         key = _require_api_key(api_key)
-    return export_trace_records(project_id, key, base_url, export_format=export_format)
+    return export_trace_records(project_id, key, base_url, export_format=export_format, limit=limit)
 
 
 def fetch_projects(api_key: str, base_url: str | None = None) -> list[dict]:
@@ -175,11 +181,15 @@ def cmd_traces_export(args) -> int:
     project_id = _resolve_project_id(args, api_key, trace_base_url)
     export_format = getattr(args, "format", None) or RECORDS_FORMAT
 
+    limit = getattr(args, "limit", None)
+    if limit is not None and not 1 <= limit <= MAX_EXPORT_TRACES:
+        raise ClientError(f"--limit must be between 1 and {MAX_EXPORT_TRACES}")
+
     output = Path(getattr(args, "output", None) or default_output_path(export_format))
     if output.exists() and not getattr(args, "force", False):
         raise ClientError(f"{output} already exists; pass --force to overwrite it")
 
-    exported = fetch_records(project_id, api_key, export_format, trace_base_url)
+    exported = fetch_records(project_id, api_key, export_format, trace_base_url, limit=limit)
 
     # old backends omit the format label and can only mean records. when a label is present it must
     # match the request, or rows could be mislabeled and later fed to an incompatible env/train path.

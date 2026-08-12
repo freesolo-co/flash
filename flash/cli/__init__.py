@@ -53,6 +53,7 @@ from flash.cli.commands.env.test import cmd_env_test
 from flash.cli.commands.traces import (
     DEFAULT_EXPORT_PATH,
     EXPORT_FORMATS,
+    MAX_EXPORT_TRACES,
     RAW_EXPORT_PATH,
     RECORDS_FORMAT,
     cmd_traces_export,
@@ -610,6 +611,15 @@ def _add_traces_commands(sub: argparse._SubParsersAction) -> None:
     )
     traces_export.add_argument(
         "-f", "--force", action="store_true", help="overwrite existing output"
+    )
+    traces_export.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            f"how many of the newest traces to read (1-{MAX_EXPORT_TRACES}); "
+            "defaults to as many as the export can return"
+        ),
     )
     traces_export.add_argument(
         "--format",

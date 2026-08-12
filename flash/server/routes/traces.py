@@ -292,8 +292,12 @@ def _decoded_payload(response: httpx.Response) -> Any:
         return response.text
 
 
+def _is_error_status(status_code: int) -> bool:
+    return not 200 <= status_code < 300
+
+
 def _error_for_status(status_code: int) -> str | None:
-    return None if 200 <= status_code < 300 else f"upstream returned status {status_code}"
+    return f"upstream returned status {status_code}" if _is_error_status(status_code) else None
 
 
 async def _record_trace(
@@ -428,10 +432,82 @@ def _merge_fragment_dict(target: dict[str, Any], fragment: dict[str, Any]) -> No
             target[key] = value
 
 
+class _SseDoneGate:
+    def __init__(self) -> None:
+        self._buffer = b""
+        self._done = bytearray()
+        self.done_event: bytes | None = None
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        self._buffer += chunk
+        if self._done:
+            self._consume_done_suffix()
+            return []
+
+        cursor = 0
+        while True:
+            newline = self._buffer.find(b"\n", cursor)
+            if newline < 0:
+                break
+            content = self._buffer[cursor:newline].rstrip(b"\r")
+            if content.startswith(b"data:") and content[len(b"data:") :].strip() == b"[DONE]":
+                forwarded = self._buffer[:cursor]
+                self._done.extend(self._buffer[cursor : newline + 1])
+                self._buffer = self._buffer[newline + 1 :]
+                self._consume_done_suffix()
+                return [forwarded] if forwarded else []
+            cursor = newline + 1
+
+        trailing = self._buffer[cursor:]
+        if _could_be_done_line(trailing):
+            forwarded = self._buffer[:cursor]
+            self._buffer = trailing
+        else:
+            forwarded = self._buffer
+            self._buffer = b""
+        return [forwarded] if forwarded else []
+
+    def finish(self) -> list[bytes]:
+        if self._done:
+            self._done.extend(self._buffer)
+            self._buffer = b""
+            self.done_event = bytes(self._done)
+            self._done.clear()
+            return []
+        forwarded = self._buffer
+        self._buffer = b""
+        return [forwarded] if forwarded else []
+
+    def _consume_done_suffix(self) -> None:
+        newline = self._buffer.find(b"\n")
+        if newline < 0:
+            return
+        if self._buffer[:newline].rstrip(b"\r"):
+            return
+        self._done.extend(self._buffer[: newline + 1])
+        self._buffer = self._buffer[newline + 1 :]
+        self.done_event = bytes(self._done)
+        self._done.clear()
+
+
+def _could_be_done_line(line: bytes) -> bool:
+    prefix = b"data:"
+    if len(line) < len(prefix):
+        return prefix.startswith(line)
+    if not line.startswith(prefix):
+        return False
+    data = line[len(prefix) :].lstrip()
+    target = b"[DONE]"
+    return target.startswith(data) or (
+        data.startswith(target) and not data[len(target) :].strip(b" \t\r")
+    )
+
+
 class _SseAccumulator:
     def __init__(self) -> None:
         self._buffer = b""
         self._choices: dict[int, dict[str, Any]] = {}
+        self._envelope: dict[str, Any] = {}
         self._done = False
         self.usage: Any = None
 
@@ -482,7 +558,7 @@ class _SseAccumulator:
             if state["logprobs"]:
                 choice["logprobs"] = _materialize_fragments(state["logprobs"])
             choices.append(choice)
-        return {"choices": choices, "usage": self.usage}
+        return {**self._envelope, "choices": choices, "usage": self.usage}
 
     def _choice_state(self, index: int) -> dict[str, Any]:
         return self._choices.setdefault(
@@ -510,6 +586,9 @@ class _SseAccumulator:
             return
         if not isinstance(payload, dict):
             return
+        self._envelope.update(
+            {key: value for key, value in payload.items() if key not in {"choices", "usage"}}
+        )
         if isinstance(payload.get("usage"), dict):
             self.usage = payload["usage"]
         choices = payload.get("choices")
@@ -586,7 +665,8 @@ async def _stream_response(
 ) -> AsyncIterator[bytes]:
     accumulator = _SseAccumulator()
     raw_output = bytearray()
-    is_error = upstream_response.status_code >= 400
+    is_error = _is_error_status(upstream_response.status_code)
+    done_gate = _SseDoneGate() if context.record_trace and not is_error else None
     error = _error_for_status(upstream_response.status_code)
     client_disconnected = False
     try:
@@ -600,13 +680,23 @@ async def _stream_response(
                         raw_output.extend(chunk[: _MAX_RECORDED_ERROR_BYTES - len(raw_output)])
                 else:
                     accumulator.feed(chunk)
-            yield chunk
+            if done_gate is None:
+                yield chunk
+            else:
+                for forwarded in done_gate.feed(chunk):
+                    yield forwarded
+        if done_gate is not None:
+            for forwarded in done_gate.finish():
+                yield forwarded
     except (asyncio.CancelledError, GeneratorExit):
         client_disconnected = True
         error = "client disconnected"
         raise
     except Exception:
         error = "upstream stream interrupted"
+        if done_gate is not None:
+            for forwarded in done_gate.finish():
+                yield forwarded
         raise
     finally:
         with anyio.CancelScope(shield=True):
@@ -633,8 +723,11 @@ async def _stream_response(
                         if error is None and accumulator.received and not accumulator.terminal:
                             error = "upstream stream ended before completion"
                     await _record_trace(context, output_payload=output_payload, error=error)
-    if context.record_trace and context.record_failed and not client_disconnected and not is_error:
-        yield b": freesolo-record-failed\n\n"
+    if not client_disconnected and done_gate is not None:
+        if context.record_failed:
+            yield b": freesolo-record-failed\n\n"
+        if done_gate.done_event is not None:
+            yield done_gate.done_event
 
 
 def _request_context(
@@ -767,7 +860,7 @@ async def chat_completions(
         response_headers = _safe_provider_response_headers(upstream_response.headers)
         response_headers.update({"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
         media_type: str | None = "text/event-stream"
-        if upstream_response.status_code >= 400:
+        if _is_error_status(upstream_response.status_code):
             content_type = upstream_response.headers.get("content-type")
             if content_type:
                 response_headers["content-type"] = content_type

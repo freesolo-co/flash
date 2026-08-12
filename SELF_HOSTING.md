@@ -162,9 +162,10 @@ is never rewritten on the way out.
 Each request records one `chat.completions` span after a normal response, a streamed response,
 a client disconnect, or an upstream failure. The request and response payloads land in the
 plane's own SQLite database under the authenticated single-tenant owner. If a streamed provider
-call succeeds but persistence fails after headers were sent, a successful event stream ends with
-`: freesolo-record-failed`; conforming SSE clients ignore comments, while collection clients can
-watch for it and report the missing trace. Provider error bodies keep their original content type and
+call succeeds but persistence fails after headers were sent, the plane emits
+`: freesolo-record-failed` immediately before the provider's `data: [DONE]` terminator; conforming
+SSE clients ignore comments, while collection clients can watch for it and report the missing trace.
+Provider error bodies keep their original content type and
 bytes, so a JSON error remains parseable even if recording that failure also fails. Export stored
 traces with:
 

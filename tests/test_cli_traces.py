@@ -226,7 +226,7 @@ def test_traces_export_sends_the_key_from_the_url_it_decided_on(monkeypatch, tmp
 
     sent: list[str] = []
 
-    def _record(project_id, api_key, base_url=None, export_format=None):
+    def _record(project_id, api_key, base_url=None, export_format=None, limit=None):
         sent.append(api_key)
         assert base_url == "https://api.freesolo.co"
         return {"format": "records", "records": [{"input": "a", "output": "b"}]}
@@ -243,7 +243,7 @@ def test_traces_export_reads_from_the_self_hosted_plane(monkeypatch, tmp_path) -
     monkeypatch.setattr(traces, "load_credentials", lambda: (_SELF_HOSTED_URL, "operator-key"))
     calls: list[tuple[str, str | None]] = []
 
-    def _record(project_id, api_key, base_url=None, export_format=None):
+    def _record(project_id, api_key, base_url=None, export_format=None, limit=None):
         assert api_key == "operator-key"
         calls.append((project_id, base_url))
         return {"format": "records", "records": [{"input": "a", "output": "b"}]}
@@ -339,7 +339,7 @@ def test_fetch_records_without_explicit_key_snapshots_self_hosted_credentials(mo
     monkeypatch.setattr(traces, "load_credentials", lambda: (_SELF_HOSTED_URL, "operator-key"))
     calls: list[tuple[str, str, str | None]] = []
 
-    def _record(project_id, api_key, base_url=None, export_format=None):
+    def _record(project_id, api_key, base_url=None, export_format=None, limit=None):
         calls.append((project_id, api_key, base_url))
         return {"format": "records", "records": []}
 

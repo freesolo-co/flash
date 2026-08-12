@@ -15,7 +15,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from flash.server.platform import db
-from flash.server.platform.traces import TraceSpan, export_traces, list_projects, store_trace
+from flash.server.platform import traces as platform_traces
+from flash.server.platform.traces import (
+    TraceSpan,
+    export_traces,
+    list_projects,
+    sanitize_json_value,
+    store_trace,
+)
 from flash.server.routes import traces
 
 _PROJECT_ID = "11111111-1111-4111-8111-111111111111"
@@ -38,6 +45,11 @@ _RESPONSE = {
     "choices": [{"message": {"role": "assistant", "content": "world"}}],
     "usage": {"prompt_tokens": 3, "completion_tokens": 4},
 }
+
+
+def _reply_envelope(content: str) -> dict:
+    """A chat-completions response carrying `content`, the shape the proxy actually stores."""
+    return {"choices": [{"message": {"role": "assistant", "content": content}}]}
 
 
 @pytest.fixture
@@ -282,6 +294,34 @@ def test_a_cleanly_truncated_stream_is_not_a_training_target(trace_api, monkeypa
     ).json()
     assert records["records"] == []
     assert records["skipped"] == 1
+
+
+def test_a_streamed_trace_keeps_response_envelope_fields(trace_api, monkeypatch) -> None:
+    """A streamed reply carries the same response identity and provider extensions as a non-streamed
+    reply. Dropping every top-level field except choices and usage makes raw traces unable to identify
+    the paid response, its model revision, or provider-specific metadata."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"id":"chatcmpl-x","model":"gpt-old","created":123,"system_fingerprint":"fp_1","provider_extension":{"region":"west"},"choices":[{"index":0,"delta":{"content":"wor"}}]}\n\n',
+            b'data: {"model":"gpt-new","choices":[{"index":0,"delta":{"content":"ld"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4}}\n\ndata: [DONE]\n\n',
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    output = _raw(trace_api)["records"][0]["spans"][0]["output_payload"]
+    assert output["id"] == "chatcmpl-x"
+    assert output["model"] == "gpt-new"
+    assert output["created"] == 123
+    assert output["system_fingerprint"] == "fp_1"
+    assert output["provider_extension"] == {"region": "west"}
+    assert output["choices"][0]["message"]["content"] == "world"
 
 
 def test_streaming_records_accumulated_response(trace_api, monkeypatch) -> None:
@@ -561,14 +601,19 @@ def test_export_formats_convert_and_count_skips(trace_api) -> None:
         project_id=_PROJECT_ID,
         trace_title="complete",
         metadata={"source": "test"},
-        spans=[TraceSpan(input_payload={"prompt": "hello"}, output_payload="world")],
+        spans=[
+            TraceSpan(
+                input_payload={"messages": [{"role": "user", "content": "hello"}]},
+                output_payload=_reply_envelope("world"),
+            )
+        ],
     )
     store_trace(
         key_id=owner["id"],
         project_id=_PROJECT_ID,
         trace_title="prompt-only",
         metadata=None,
-        spans=[TraceSpan(input_payload="sample me")],
+        spans=[TraceSpan(input_payload={"messages": [{"role": "user", "content": "sample me"}]})],
     )
     store_trace(
         key_id=owner["id"],
@@ -596,14 +641,14 @@ def test_export_formats_convert_and_count_skips(trace_api) -> None:
     ).json()
 
     assert records == {
-        "records": [{"input": {"prompt": "hello"}, "output": "world"}],
+        "records": [{"input": "hello", "output": "world"}],
         "traces": 3,
         "skipped": 2,
         "format": "records",
         "truncated": False,
     }
     assert prompts == {
-        "records": [{"input": "sample me"}, {"input": {"prompt": "hello"}}],
+        "records": [{"input": "sample me"}, {"input": "hello"}],
         "traces": 3,
         "skipped": 1,
         "format": "prompts",
@@ -664,20 +709,24 @@ def test_chat_envelopes_export_as_trainable_text(trace_api) -> None:
     assert span["output_payload"] == response
 
 
-def test_a_half_chat_shaped_span_keeps_the_half_that_is_not_an_envelope(trace_api) -> None:
-    """Envelope reduction is per half. A span pairing a chat request with a plain-text reply is not
-    this proxy's shape, and reducing only the half that IS an envelope discarded the other half --
-    a usable reply became an empty string, and the row was then skipped as unusable."""
+def test_a_non_chat_response_body_is_skipped_not_exported_as_the_target(trace_api) -> None:
+    """A body that is not a chat envelope is malformed, not an alternative encoding of a reply.
+
+    Every stored span comes from the proxy's chat.completions route, so the only way an output is
+    not an envelope is that it never was one -- here a gateway's HTTP 200 login interstitial, which
+    records as OK because the status said so. Falling back to the raw payload exported that JSON
+    error object whole, as the exact text `records` trains the model to produce."""
     owner = db.ensure_standalone_owner()
     store_trace(
         key_id=owner["id"],
         project_id=_PROJECT_ID,
-        trace_title="mixed",
+        trace_title="interstitial",
         metadata=None,
         spans=[
             TraceSpan(
                 input_payload={"messages": [{"role": "user", "content": "q"}]},
-                output_payload="scalar reply",
+                output_payload={"error": {"message": "upstream gateway: login required"}},
+                status_code="OK",
             )
         ],
     )
@@ -686,8 +735,33 @@ def test_a_half_chat_shaped_span_keeps_the_half_that_is_not_an_envelope(trace_ap
         key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
     )
 
-    assert records["records"] == [{"input": "q", "output": "scalar reply"}]
-    assert records["skipped"] == 0
+    assert records["records"] == []
+    assert records["skipped"] == 1
+
+
+def test_a_non_chat_request_body_is_skipped_on_the_prompt_half_too(trace_api) -> None:
+    """The same rule on the input half. A decode failure stores the provider's raw text, and
+    exporting it as the prompt would train the model to answer an error page."""
+    owner = db.ensure_standalone_owner()
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="scalar-request",
+        metadata=None,
+        spans=[
+            TraceSpan(
+                input_payload="<html>gateway timeout</html>",
+                output_payload={"choices": [{"message": {"role": "assistant", "content": "hi"}}]},
+            )
+        ],
+    )
+
+    prompts = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="prompts", limit=1000
+    )
+
+    assert prompts["records"] == []
+    assert prompts["skipped"] == 1
 
 
 def test_a_capped_export_reports_that_it_is_incomplete(trace_api) -> None:
@@ -701,7 +775,12 @@ def test_a_capped_export_reports_that_it_is_incomplete(trace_api) -> None:
             project_id=_PROJECT_ID,
             trace_title=f"trace-{index}",
             metadata=None,
-            spans=[TraceSpan(input_payload={"prompt": index}, output_payload="reply")],
+            spans=[
+                TraceSpan(
+                    input_payload={"messages": [{"role": "user", "content": str(index)}]},
+                    output_payload=_reply_envelope("reply"),
+                )
+            ],
         )
 
     auth = {"Authorization": f"Bearer {_KEY}"}
@@ -720,6 +799,43 @@ def test_a_capped_export_reports_that_it_is_incomplete(trace_api) -> None:
     assert capped["traces"] == 2
     assert whole["truncated"] is False
     assert whole["traces"] == 3
+
+
+def test_an_export_stops_at_the_byte_budget_and_says_it_is_truncated(
+    trace_api, monkeypatch
+) -> None:
+    """The trace cap bounds rows, not bytes. Payload strings may legitimately reach 1 MB, so the
+    row cap alone permits a multi-gigabyte body -- built in memory on the plane, serialized again
+    by the framework, then held whole by the CLI. The byte budget has to stop it, and stopping
+    early has to report `truncated` or the export looks like it read the project whole."""
+    monkeypatch.setattr(platform_traces, "MAX_EXPORT_BYTES", 4_000)
+    owner = db.ensure_standalone_owner()
+    for index in range(4):
+        store_trace(
+            key_id=owner["id"],
+            project_id=_PROJECT_ID,
+            trace_title=f"bulky-{index}",
+            metadata=None,
+            spans=[
+                TraceSpan(
+                    input_payload={"messages": [{"role": "user", "content": "q"}]},
+                    output_payload=_reply_envelope("y" * 2_000),
+                )
+            ],
+        )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    # one row overshoots the budget by design: the first record is always emitted whole, so an
+    # export can never come back empty merely because its newest trace is large.
+    assert len(export["records"]) == 2
+    assert export["truncated"] is True
+    # `traces` counts what was examined, so `skipped` stays the count of unusable rows rather than
+    # silently absorbing the ones the budget cut.
+    assert export["traces"] == 2
+    assert export["skipped"] == 0
 
 
 def test_errored_spans_are_not_exported_as_training_targets(trace_api) -> None:
@@ -766,7 +882,12 @@ def test_a_long_completion_is_stored_whole(trace_api) -> None:
         project_id=_PROJECT_ID,
         trace_title="long",
         metadata=None,
-        spans=[TraceSpan(input_payload={"prompt": "hi"}, output_payload=long_reply)],
+        spans=[
+            TraceSpan(
+                input_payload={"messages": [{"role": "user", "content": "hi"}]},
+                output_payload=_reply_envelope(long_reply),
+            )
+        ],
     )
 
     records = trace_api.get(
@@ -775,7 +896,7 @@ def test_a_long_completion_is_stored_whole(trace_api) -> None:
         params={"project_id": _PROJECT_ID, "format": "records"},
     ).json()
 
-    assert records["records"] == [{"input": {"prompt": "hi"}, "output": long_reply}]
+    assert records["records"] == [{"input": "hi", "output": long_reply}]
 
 
 def test_an_empty_schema_under_a_secret_name_survives_redaction(trace_api, monkeypatch) -> None:
@@ -955,25 +1076,22 @@ def test_a_list_delta_keeps_every_streamed_fragment(trace_api, monkeypatch) -> N
     assert message["reasoning_details"] == [{"a": 1}, {"b": 2}]
 
 
-def test_many_stream_fragments_are_accumulated_linearly() -> None:
+def test_many_stream_fragments_stay_unjoined_until_output() -> None:
     """Each streamed fragment runs on the async response iterator. Rebuilding the whole reply per
-    chunk blocks every other request for over a second on ordinary long completions."""
-    small = traces._SseAccumulator()
-    large = traces._SseAccumulator()
+    chunk makes total work quadratic, while retaining one part per chunk keeps ingestion linear
+    regardless of scheduler timing."""
+    accumulator = traces._SseAccumulator()
+    fragment = "x" * 40
 
-    def _feed(accumulator, count: int) -> float:
-        started = traces.time.perf_counter()
-        for _ in range(count):
-            accumulator.feed(
-                b'data: {"choices":[{"index":0,"delta":{"content":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}]}\n\n'
-            )
-        return traces.time.perf_counter() - started
+    for _ in range(32_000):
+        accumulator.feed(
+            b'data: {"choices":[{"index":0,"delta":{"content":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}]}\n\n'
+        )
 
-    small_elapsed = _feed(small, 8_000)
-    large_elapsed = _feed(large, 32_000)
-
-    assert large.output()["choices"][0]["message"]["content"] == "x" * 1_280_000
-    assert large_elapsed < small_elapsed * 8
+    content = accumulator._choices[0]["message"]["content"]
+    assert isinstance(content, traces._StringFragments)
+    assert content.parts == [fragment] * 32_000
+    assert accumulator.output()["choices"][0]["message"]["content"] == fragment * 32_000
 
 
 def test_a_mapping_delta_keeps_every_nested_fragment(trace_api, monkeypatch) -> None:
@@ -996,6 +1114,31 @@ def test_a_mapping_delta_keeps_every_nested_fragment(trace_api, monkeypatch) -> 
     assert response.status_code == 200
     message = _raw(trace_api)["records"][0]["spans"][0]["output_payload"]["choices"][0]["message"]
     assert message["audio"] == {"transcript": "hello"}
+
+
+def test_an_oversized_collection_is_bounded_before_it_is_copied() -> None:
+    """The payload width cap protects the trace writer only if work stops at the cap. Copying an
+    entire multi-million-item request before slicing it lets one oversized call allocate and iterate
+    in proportion to attacker-controlled input despite storing only the bounded prefix."""
+
+    class _BoundedList(list):
+        def __iter__(self):
+            for index, item in enumerate(super().__iter__()):
+                if index >= 3:
+                    raise AssertionError("read beyond the collection bound")
+                yield item
+
+    class _BoundedDict(dict):
+        def items(self):
+            for index, item in enumerate(super().items()):
+                if index >= 3:
+                    raise AssertionError("read beyond the collection bound")
+                yield item
+
+    assert sanitize_json_value(_BoundedList(range(10)), max_collection=3) == [0, 1, 2]
+    assert sanitize_json_value(
+        _BoundedDict({str(index): index for index in range(10)}), max_collection=3
+    ) == {"0": 0, "1": 1, "2": 2}
 
 
 def test_a_long_conversation_is_stored_whole(trace_api) -> None:
@@ -1038,6 +1181,53 @@ def test_an_unrecorded_call_says_so_in_its_response(trace_api, monkeypatch) -> N
     assert _raw(trace_api)["traces"] == 0
 
 
+def test_a_streamed_redirect_stays_raw_even_when_recording_fails(trace_api, monkeypatch) -> None:
+    """A redirect is a non-success provider body, not an SSE completion. Treating only 4xx and 5xx as
+    errors relabels its HTML as an event stream, drops the body from the trace, and can append an SSE
+    comment that corrupts what the caller needs to inspect."""
+    redirect_body = b'<html><a href="https://provider.example/login">continue</a></html>'
+
+    class _RedirectStreamingClient(_StreamingAsyncClient):
+        requests: ClassVar[list[dict]] = []
+        body = _StreamingBody([redirect_body])
+
+        async def send(self, request, *, stream) -> httpx.Response:
+            assert stream is True
+            return httpx.Response(
+                307,
+                headers={
+                    "content-type": "text/html; charset=utf-8",
+                    "location": "https://provider.example/login",
+                },
+                stream=type(self).body,
+                request=request,
+            )
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _RedirectStreamingClient)
+
+    stored: list[dict] = []
+
+    def _capture(**kwargs) -> str:
+        stored.append(kwargs)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(traces, "store_trace", _capture)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 307
+    assert response.headers["content-type"].startswith("text/html")
+    assert response.content == redirect_body
+    assert b"freesolo-record-failed" not in response.content
+    span = stored[0]["spans"][0]
+    assert span.output_payload == redirect_body.decode()
+    assert span.status_code == "ERROR"
+    assert span.error == "upstream returned status 307"
+    assert _raw(trace_api)["traces"] == 0
+
+
 def test_a_failed_recording_does_not_corrupt_a_streamed_json_error(trace_api, monkeypatch) -> None:
     """A caller may request streaming and still receive a provider's ordinary JSON error body.
     Appending an SSE comment after persistence fails makes that 4xx body invalid JSON, hiding the
@@ -1075,17 +1265,19 @@ def test_a_failed_recording_does_not_corrupt_a_streamed_json_error(trace_api, mo
     assert _raw(trace_api)["traces"] == 0
 
 
-def test_a_streamed_recording_failure_is_visible_in_band(trace_api, monkeypatch) -> None:
-    """Streaming headers are already sent when persistence runs. Without an SSE signal, a caller can
-    finish an unrepeatable collection run believing every paid completion was recorded when none was."""
+def test_a_streamed_recording_failure_arrives_before_the_split_terminator(
+    trace_api, monkeypatch
+) -> None:
+    """OpenAI stream consumers stop reading at `[DONE]`, so a recording-failure signal after it is
+    invisible and may never run once the client closes. Hold back only that terminator even when its
+    line is split across chunks, then put the signal before the one byte-exact terminator."""
     _StreamingAsyncClient.requests = []
     _StreamingAsyncClient.status_code = 200
-    _StreamingAsyncClient.body = _StreamingBody(
-        [
-            b'data: {"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}\n\n',
-            b"data: [DONE]\n\n",
-        ]
+    completion = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}\n\n'
     )
+    terminator = b"data: [DONE]\n\n"
+    _StreamingAsyncClient.body = _StreamingBody([completion + terminator[:9], terminator[9:]])
     monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
 
     def _explode(**kwargs) -> str:
@@ -1098,7 +1290,8 @@ def test_a_streamed_recording_failure_is_visible_in_band(trace_api, monkeypatch)
     )
 
     assert response.status_code == 200
-    assert response.content.endswith(b": freesolo-record-failed\n\n")
+    assert response.content == completion + b": freesolo-record-failed\n\n" + terminator
+    assert response.content.count(terminator) == 1
     assert "x-freesolo-record-failed" not in response.headers
     assert _raw(trace_api)["traces"] == 0
 
@@ -1149,7 +1342,12 @@ def test_standalone_transition_adopts_existing_traces(tmp_path, monkeypatch) -> 
         project_id=_PROJECT_ID,
         trace_title="before transition",
         metadata=None,
-        spans=[TraceSpan(input_payload="hello", output_payload="world")],
+        spans=[
+            TraceSpan(
+                input_payload={"messages": [{"role": "user", "content": "hello"}]},
+                output_payload=_reply_envelope("world"),
+            )
+        ],
     )
 
     owner = db.ensure_standalone_owner()

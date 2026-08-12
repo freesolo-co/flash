@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import time
@@ -14,6 +15,11 @@ from flash.server.platform import db
 
 EXPORT_FORMATS = {"records", "prompts", "raw"}
 MAX_EXPORT_TRACES = 1000
+# a second cap, on the response rather than the row count. `MAX_EXPORT_TRACES` bounds traces, not
+# bytes, and a payload string may legitimately reach 1 MB, so the trace cap alone permits a
+# multi-gigabyte body that the plane builds in memory and the CLI holds whole. 64 MB is far above
+# any ordinary project's export and far below what exhausts a self-hoster's box.
+MAX_EXPORT_BYTES = 64 * 1024 * 1024
 
 _MAX_ATTRIBUTE_COUNT = 128
 _MAX_ATTRIBUTE_VALUE_LENGTH = 8_192
@@ -85,7 +91,7 @@ def sanitize_json_value(
                 max_depth=max_depth,
                 max_collection=max_collection,
             )
-            for key, item in list(value.items())[:keys]
+            for key, item in itertools.islice(value.items(), keys)
         }
     if isinstance(value, list | tuple):
         return [
@@ -96,7 +102,7 @@ def sanitize_json_value(
                 max_depth=max_depth,
                 max_collection=max_collection,
             )
-            for item in list(value)[:items]
+            for item in itertools.islice(value, items)
         ]
     return _truncate(repr(value), limit)
 
@@ -219,34 +225,55 @@ def export_traces(
         truncated = len(probe_rows) > limit
         trace_rows = probe_rows[:limit]
         records: list[dict[str, Any]] = []
+        # the trace cap alone does not bound the RESPONSE. payload strings are capped at 1 MB each
+        # by design, so 1000 traces holding a request and a reply is a 2 GB JSON body -- built in
+        # memory here, serialized again by the framework, then held whole by the client. cap the
+        # bytes as well, and report the export truncated so the CLI says older traces are missing
+        # instead of looking like it read the project whole.
+        remaining_bytes = MAX_EXPORT_BYTES
+        examined = 0
         for trace_row in trace_rows:
             span_rows = conn.execute(
                 "SELECT * FROM llm_trace_spans WHERE llm_trace_id = ? ORDER BY created_at, rowid",
                 (trace_row["id"],),
             ).fetchall()
-            raw = _raw_trace(trace_row, span_rows)
-            if export_format == "raw":
-                records.append(raw)
+            examined += 1
+            record = _export_record(_raw_trace(trace_row, span_rows), export_format)
+            if record is None:
                 continue
-            input_payload, output_payload = _training_pair(raw["spans"])
-            if not _usable_payload(input_payload):
-                continue
-            if export_format == "prompts":
-                records.append({"input": input_payload})
-                continue
-            if _usable_payload(output_payload):
-                records.append({"input": input_payload, "output": output_payload})
+            records.append(record)
+            # measured after appending, so the first record is always emitted whole and the budget
+            # can only overshoot by one row. a record is bounded by the payload caps, so that
+            # overshoot is bounded too -- whereas refusing a too-large first record would return an
+            # empty export the CLI reports as "no exportable traces".
+            remaining_bytes -= len(json.dumps(record, ensure_ascii=False))
+            if remaining_bytes <= 0:
+                truncated = True
+                break
 
-    trace_count = len(trace_rows)
     return {
         "records": records,
-        "traces": trace_count,
-        "skipped": 0 if export_format == "raw" else trace_count - len(records),
+        "traces": examined,
+        "skipped": 0 if export_format == "raw" else examined - len(records),
         "format": export_format,
         # the read is capped, so a project past the cap has older traces this response does not
         # contain. reporting the truncated count alone would read as "that is all of them".
         "truncated": truncated,
     }
+
+
+def _export_record(raw: dict[str, Any], export_format: str) -> dict[str, Any] | None:
+    """One export row in the requested shape, or None when the trace has nothing usable in it."""
+    if export_format == "raw":
+        return raw
+    input_payload, output_payload = _training_pair(raw["spans"])
+    if not _usable_payload(input_payload):
+        return None
+    if export_format == "prompts":
+        return {"input": input_payload}
+    if not _usable_payload(output_payload):
+        return None
+    return {"input": input_payload, "output": output_payload}
 
 
 def _raw_trace(trace_row: Any, span_rows: list[Any]) -> dict[str, Any]:
@@ -295,15 +322,14 @@ def _training_pair(spans: list[dict[str, Any]]) -> tuple[Any, Any]:
         ),
         None,
     )
-    # each half falls back on its own. a span pairing a chat request with a non-chat response (or
-    # the reverse) is not this proxy's shape, and reducing the half that IS an envelope while
-    # dropping the half that is not would silently discard a usable reply and skip the row.
-    prompt = _chat_prompt(input_payload)
-    reply = _chat_reply(output_payload)
-    return (
-        input_payload if prompt is None else prompt,
-        output_payload if reply is None else reply,
-    )
+    # no fallback to the raw payload on either half. every stored span comes from the recording
+    # proxy's chat.completions route, so a payload without the chat shape is not an alternative
+    # encoding of a completion -- it is a malformed request, or a body that never was one: a
+    # gateway's HTTP 200 login interstitial, an error object a provider returned without an error
+    # status. those record as OK and would otherwise export whole, as the exact text `records`
+    # trains the model to produce. `_chat_prompt`/`_chat_reply` return None there, and the row is
+    # skipped as unusable.
+    return _chat_prompt(input_payload), _chat_reply(output_payload)
 
 
 def _chat_prompt(payload: Any) -> str | None:
@@ -318,20 +344,26 @@ def _chat_prompt(payload: Any) -> str | None:
         return None
     for message in reversed(payload["messages"]):
         if isinstance(message, dict) and message.get("role") == "user":
-            return _message_text(message.get("content")) or ""
-    return ""
+            return _message_text(message.get("content"))
+    return None
 
 
 def _chat_reply(payload: Any) -> str | None:
-    """The assistant text of a chat-completions response, or None when it is not one."""
+    """The assistant text of a chat-completions response, or None when it is not one.
+
+    None rather than "" for an envelope carrying no assistant text -- an empty `choices` list, a
+    choice without a message. The caller skips the row either way, but "" would also be the reply
+    of a model that legitimately returned empty text, and the two want the same treatment here:
+    neither is a completion worth training toward.
+    """
     if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
         return None
     if not payload["choices"]:
-        return ""
+        return None
     choice = payload["choices"][0]
     if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
-        return ""
-    return _message_text(choice["message"].get("content")) or ""
+        return None
+    return _message_text(choice["message"].get("content"))
 
 
 def _message_text(content: Any) -> str | None:
