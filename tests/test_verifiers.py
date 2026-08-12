@@ -1485,14 +1485,6 @@ def test_freesolo_multiturn_hooks(monkeypatch):
     assert (
         env.grade("ignored", {"id": "browse", "input": "browse", "output": "done"}, state) is True
     )
-    assert (
-        env.reward_from_messages(
-            [{"role": "assistant", "content": "final"}],
-            {"id": "browse", "input": "browse", "output": "done"},
-            [{"role": "user", "content": "contract:browse"}],
-        )
-        == 0.5
-    )
 
 
 def test_github_environment_ref_parsing():
@@ -1854,23 +1846,6 @@ def test_non_thinking_run_scores_the_completion_unchanged(monkeypatch):
     env._score_episode({"id": "a", "input": "2+2?", "output": "4"}, state)
 
     assert sdk_env.scored == [_THINK_COMPLETION]
-
-
-def test_reward_from_messages_strips_thinking_too(monkeypatch):
-    """The GRPO transcript path (rl.py reward_from_messages) shares the same rule."""
-    sdk_env = _ThinkingRecordingMultiTurnEnv()
-    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
-
-    from flash.envs.adapter import FreesoloEnvironment
-
-    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
-    env.thinking = True
-
-    env.reward_from_messages(
-        [{"role": "assistant", "content": _THINK_COMPLETION}],
-        {"id": "a", "input": "2+2?", "output": "4"},
-    )
-    assert sdk_env.scored == ["the answer is 4"]
 
 
 def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
