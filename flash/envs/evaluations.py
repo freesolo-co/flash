@@ -410,9 +410,31 @@ class _ScopedSuite:
         with _sidecar_scope(self._module_dir):
             return self._suite.cases()
 
-    def score(self, case: EvalCase, response: str) -> EvalResult | float | bool:
-        with _sidecar_scope(self._module_dir):
-            return self._suite.score(case, response)
+    @property
+    def score(self):
+        """The suite's own scorer, run inside the sidecar scope and reporting its own signature.
+
+        A fixed `(case, response)` method here erased the episode state an episode-grading suite
+        is meant to receive. The caller inspects THIS object's `score` to decide whether and how
+        to pass state, so a real sidecar -- always wrapped by the loader -- looked like a
+        two-argument scorer and was never handed the transcript, while `grades_episodes` still
+        forwarded through `__getattr__` and promised otherwise.
+
+        Forwarding `*args`/`**kwargs` alone is not enough: that signature reports as accepting
+        state for EVERY suite, so a genuine two-argument scorer would be called with a third
+        argument it cannot take. Copying `__signature__` from the inner scorer keeps inspection
+        honest in both directions.
+        """
+        inner = self._suite.score
+        module_dir = self._module_dir
+
+        def scoped_score(*args, **kwargs):
+            with _sidecar_scope(module_dir):
+                return inner(*args, **kwargs)
+
+        with suppress(TypeError, ValueError):
+            scoped_score.__signature__ = inspect.signature(inner)
+        return scoped_score
 
     def __getattr__(self, name: str):
         # tests and callers reach through to suite attributes (`suite.environment`), and an
