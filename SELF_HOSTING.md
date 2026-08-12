@@ -36,6 +36,18 @@ export RUNPOD_API_KEY=...              # or LAMBDA_API_KEY, or VAST_API_KEY
 flash-server --host 0.0.0.0 --port 8080
 ```
 
+Neither install pulls the `freesolo` SDK, and `[server]` does not imply it. The commands that run
+an environment **locally** - `flash env test` and `flash env eval` - import it at the point of use,
+so validating a scaffolded environment fails with `ModuleNotFoundError: No module named 'freesolo'`
+until you add it:
+
+```bash
+pip install freesolo   # only needed where you run `flash env test` / `flash env eval`
+```
+
+The plane host does not need it: environments are executed on the GPU worker, whose image already
+carries the SDK. Install it wherever you author and test environments.
+
 The `server` extra pulls in `runpod-flash`, which declares its own `flash` console script.
 Whichever distribution installs last wins, so on a plane host the bare `flash` command may launch
 RunPod's CLI instead of this one - it exits 0 and does nothing, which is easy to miss. Use
