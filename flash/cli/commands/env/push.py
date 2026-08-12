@@ -100,7 +100,7 @@ def _normalize_managed_hub_id(raw: object) -> tuple[str | None, _ManagedHubIdErr
 def cmd_env_pull(args) -> int:
     """Download a published Freesolo environment (or a single file from it) to local disk.
 
-    Environments are addressed by their managed hub slug ``namespace/name`` and pulled as package
+    Environments are addressed by their managed hub slug ``namespace/project/name`` and pulled as package
     tarballs through the authenticated Flash control plane.
     """
     from flash.client import ClientError, client_from_config
@@ -115,11 +115,11 @@ def cmd_env_pull(args) -> int:
     managed_env_id, managed_error = _normalize_managed_hub_id(env_id)
     if managed_error == "not-canonical":
         return _err(
-            f'env id must be lowercase "namespace/name" with no spaces (got {args.env_id!r})'
+            f'env id must be lowercase "namespace/project/name" with no spaces (got {args.env_id!r})'
         )
     if managed_env_id is None:
         print(
-            'env id must be a managed Freesolo hub slug "your-name/your-env" '
+            'env id must be a managed Freesolo hub slug "your-org/your-project/your-env" '
             f"(got {args.env_id!r})",
             file=sys.stderr,
         )
@@ -248,19 +248,19 @@ def cmd_env_delete(args) -> int:
         detail = str(exc).replace("project", "project id", 1)
         return _err(f"{detail}: pass `--project <project-uuid>`")
 
-    # Delete only targets MANAGED hub ids ("namespace/name") — not github: refs or local paths, which
+    # Delete only targets MANAGED hub ids ("namespace/project/name") — not github: refs or local paths, which
     # don't live on the hub. And enforce the hub's canonical form (lowercase, no surrounding
     # whitespace) BEFORE the network call: the server's slug validator is lowercase-only, so a
     # mixed-case / padded id would otherwise make a pointless request and return a confusing 400.
     env_id, validation_error = _normalize_managed_hub_id(args.env_id)
     if validation_error == "not-managed":
         return _err(
-            f'env id must be a managed Freesolo hub id "namespace/name" (got {args.env_id!r}); '
+            f'env id must be a managed Freesolo hub id "namespace/project/name" (got {args.env_id!r}); '
             "github refs and local paths can't be deleted from the hub"
         )
     if validation_error == "not-canonical" or env_id is None:
         return _err(
-            f'env id must be lowercase "namespace/name" with no spaces (got {args.env_id!r})'
+            f'env id must be lowercase "namespace/project/name" with no spaces (got {args.env_id!r})'
         )
     if not getattr(args, "yes", False):
         prompt = f"delete environment {env_id}? this removes it from the hub [y/N] "
@@ -343,10 +343,10 @@ except ImportError:
 
 
 def _normalize_env_name(raw: str) -> str | None:
-    """Normalize only the NAME segment; a namespace prefix is passed through verbatim.
+    """Normalize only the NAME segment; a ``<namespace>/<project>`` prefix passes through verbatim.
 
-    The server is the sole authority on namespace grammar and ownership — rewriting the
-    namespace client-side would silently target a different (possibly forbidden) slug.
+    The server is the sole authority on namespace and project grammar and ownership — rewriting
+    either client-side would silently target a different (possibly forbidden) slug.
     """
     from flash.schema import normalize_env_name_segment
 
@@ -354,12 +354,12 @@ def _normalize_env_name(raw: str) -> str | None:
     if "/" not in text:
         return normalize_env_name_segment(text)
     parts = [part.strip() for part in text.split("/")]
-    if len(parts) != 2 or not all(parts):
+    if len(parts) != 3 or not all(parts):
         return None
-    name = normalize_env_name_segment(parts[1])
+    name = normalize_env_name_segment(parts[2])
     if name is None:
         return None
-    return f"{parts[0]}/{name}"
+    return f"{parts[0]}/{parts[1]}/{name}"
 
 
 def _with_syspath_bootstrap(env_source: str) -> str:
