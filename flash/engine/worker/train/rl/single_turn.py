@@ -15,7 +15,6 @@ import math
 import time
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.score_batcher import ScoreBatcher
 
 
 def _rl_train():
@@ -330,39 +329,3 @@ def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_
     except Exception as exc:
         print(f"[rl-verl] reward profiling skipped: {exc}", flush=True)
         return None
-
-
-# --------------------------------------------------------------------------------------------
-# reward rpc bridge: verl subprocess -> flash live env.
-# --------------------------------------------------------------------------------------------
-class _ScoreBatcher(ScoreBatcher):
-    """coalesce concurrent verl requests into one ordered env scoring call.
-
-    the env still receives one top-level call at a time; concurrency lives inside its own batched
-    scorer. errors propagate as raised, since classifying an env scoring failure belongs to the
-    caller and the reward routes already translate it for the child.
-
-    ``recheck_closed_after_wait`` stays off: an env batch assembled during the flush window costs
-    nothing external to finish, so scoring it lets the last requests of a run answer normally
-    instead of failing on a shutdown that arrived while they were queued.
-    """
-
-    def __init__(
-        self,
-        score_batch,
-        *,
-        max_batch_size: int,
-        flush_wait_s: float,
-        label: str,
-        thread_name: str,
-    ) -> None:
-        super().__init__(
-            score_batch,
-            max_batch_size=max_batch_size,
-            flush_wait_s=flush_wait_s,
-            label=f"{label} score batcher",
-            thread_name=thread_name,
-        )
-
-    def score(self, request):
-        return self.submit(request)

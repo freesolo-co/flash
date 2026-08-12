@@ -702,5 +702,3 @@ def cmd_env_push(args) -> int:
             )
         finally:
             bar.clear()
-
-

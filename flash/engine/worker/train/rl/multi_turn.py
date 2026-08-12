@@ -20,8 +20,8 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler
 
 from flash.engine.worker.backend_common import BoundedThreadingHTTPServer
+from flash.engine.worker.score_batcher import ScoreBatcher
 from flash.engine.worker.train.rl.scoring import RolloutScoreRequest, score_rollouts
-from flash.engine.worker.train.rl.single_turn import _ScoreBatcher
 
 # how many concurrently-finished episodes the multi-turn bridge scores in ONE env call. a whole
 # generation is prompts_per_step * group_size episodes and they finish at different turn counts,
@@ -87,11 +87,14 @@ class MultiTurnBridge:
         # score many episodes under one lock-held env call so judge work can use the env's own
         # max_score_concurrency. keep the lock: reward_thread_safe permits scorer/scorer concurrency,
         # not racing scoring against env_reply.
-        self._scorer = _ScoreBatcher(
+        # recheck_closed_after_wait stays off (the default): an env batch assembled during the flush
+        # window costs nothing external to finish, so scoring it lets the last requests of a run
+        # answer normally instead of failing on a shutdown that arrived while they were queued.
+        self._scorer = ScoreBatcher(
             self._score_batch,
             max_batch_size=int(score_batch_size),
             flush_wait_s=float(score_flush_wait_s),
-            label="multi-turn episode",
+            label="multi-turn episode score batcher",
             thread_name="flash-grpo-episode-scorer",
         )
 
@@ -220,7 +223,7 @@ class MultiTurnBridge:
         # batcher thread reacquires it to do the scoring. safe to read this session's state
         # unlocked because the episode is terminal -- the child sends /score only after its turn
         # loop has ended, so nothing else mutates this session.
-        reward = self._scorer.score(
+        reward = self._scorer.submit(
             RolloutScoreRequest(
                 example=session["example"],
                 state=state,
@@ -341,11 +344,11 @@ def start_reward_server(
     # the env's own batched scorer.
     score_lock = threading.Lock()
     score_batcher = (
-        _ScoreBatcher(
+        ScoreBatcher(
             score_batch,
             max_batch_size=_SINGLE_TURN_SCORE_BATCH_SIZE,
             flush_wait_s=_SINGLE_TURN_SCORE_FLUSH_WAIT_S,
-            label="single-turn reward",
+            label="single-turn reward score batcher",
             thread_name="flash-grpo-reward-scorer",
         )
         if callable(score_batch)
@@ -358,7 +361,7 @@ def start_reward_server(
             raise IndexError(f"reward example index {index} is outside [0, {example_count})")
         solution_str = payload.get("solution_str", "")
         if score_batcher is not None:
-            return {"score": float(score_batcher.score((index, solution_str)))}
+            return {"score": float(score_batcher.submit((index, solution_str)))}
         with score_lock:
             return {"score": float(score_by_index(index, solution_str))}
 

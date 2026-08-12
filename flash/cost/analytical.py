@@ -725,20 +725,14 @@ def _offline_profile_shape(config: RunConfig) -> tuple[str, int, int, str, float
     return gpu, need, 1, provider, hourly
 
 
-def _quote_shape(
-    config: RunConfig, allocation, market_wall_s: float, *, profile: bool = False
-) -> tuple[str, int, int, str, float]:
-    """The (gpu, need, count, provider, per-card rate) a quote bills against.
+def _profile_quote_shape(config: RunConfig, allocation) -> tuple[str, int, int, str, float]:
+    """The (gpu, need, count, provider, per-card rate) a profile quote bills against.
 
     ``allocation`` is the exact live candidate the lifecycle selected; without one the shape is the
-    offline structural pick, which must never touch a live market (see ``_offline_gpu_shape``).
+    offline structural pick, which must never touch a live market (see ``_offline_profile_shape``).
     """
     if allocation is None:
-        return (
-            _offline_profile_shape(config)
-            if profile
-            else _offline_gpu_shape(config, max_wall_seconds=market_wall_s)
-        )
+        return _offline_profile_shape(config)
     need = int(
         getattr(allocation, "min_vram_gb", 0)
         or required_vram_gb(
@@ -765,9 +759,7 @@ def estimate_profile_cost(config: RunConfig, *, allocation=None) -> CostEstimate
     charge only the rented shape held up to the cap.
     """
     wall_s = max(60.0, float(config.max_wall_seconds or 0.0))
-    gpu, need, billed_gpu_count, quote_provider, hourly = _quote_shape(
-        config, allocation, wall_s, profile=True
-    )
+    gpu, need, billed_gpu_count, quote_provider, hourly = _profile_quote_shape(config, allocation)
     return CostEstimate(
         model_id=config.model_id,
         method=config.method,
