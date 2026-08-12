@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from flash.engine.worker import opd_train as _opd_train
-from flash.engine.worker.backend_common import ULYSSES_SEQUENCE_PARALLEL_SIZE
+from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 
 @dataclass(frozen=True)

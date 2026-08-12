@@ -215,7 +215,7 @@ def test_sft_pins_ulysses_off_because_sequence_parallelism_breaks_gdn():
     import inspect
 
     from flash.engine.worker import sft_train_runner
-    from flash.engine.worker.backend_common import ULYSSES_SEQUENCE_PARALLEL_SIZE
+    from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
     src = inspect.getsource(sft_train_runner._prepare_sft_child)
     line = next(ln.strip() for ln in src.splitlines() if ln.strip().startswith('"ulysses_sp_size"'))

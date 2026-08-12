@@ -307,8 +307,8 @@ def geometry_safe_gpu_cap(
     Scope, stated precisely: this certifies QUERY-head divisibility only. vLLM also constrains kv
     heads and the GDN linear dimensions under tensor parallelism, and Flash records both
     (``num_key_value_heads``, ``linear_num_value_heads``) without gating on them. Every current row
-    divides 1/2/4/8 on all three axes, so nothing is mis-admitted today; ALLOC-004 covers widening
-    the check.
+    divides 1/2/4/8 on all three axes, so nothing is mis-admitted today. Widening the check to those
+    two axes is a separate invariant and deliberately not in this change.
 
     The head count is READ from the row (``num_attention_heads``), never derived: ``hidden_size //
     head_dim`` is a different number on four of the six rows -- see ``_query_attention_heads``.

@@ -757,8 +757,8 @@ def wider_shape_remedy(
     The width is SEARCHED with ``combined_vram_gb``, the same fit model that rejected the run, so
     a suggested N is one this function proved rather than one inferred from total VRAM. ``ceiling``
     must be the caller's ``geometry_safe_gpu_cap`` so the suggestion is never a width the rollout
-    engine rejects at init after the box is rented, and ``above`` excludes the counts already tried. The
-    smallest fitting count wins: the cheapest shape that works, not the widest on offer.
+    engine rejects at init after the box is rented, and ``above`` excludes the counts already tried.
+    The smallest fitting count wins: the cheapest shape that works, not the widest on offer.
 
     ``vram_options`` carries only classes a provider in play will actually rent at a wider count
     (see ``rents_arbitrary_card_counts``); passing none leaves the failure a bare dead end, which

@@ -16,6 +16,7 @@ import time
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
+from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
 _SFT_LORAPLUS_RATIO = 16.0
@@ -347,7 +348,6 @@ from flash.engine.profiling.sft_workload import (  # noqa: E402,F401
 )
 from flash.engine.worker.backend_common import (  # noqa: E402,F401
     SHIM_FRAGMENT_FAILED_EXIT_CODE,
-    ULYSSES_SEQUENCE_PARALLEL_SIZE,
     fused_ce_backend,
     gdn_probe_module,
     gdn_reset_arch_from_caps,

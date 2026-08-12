@@ -15,7 +15,7 @@ from math import gcd
 
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_sft_width
 from flash.engine.worker import sft_train as _sft_train
-from flash.engine.worker.backend_common import ULYSSES_SEQUENCE_PARALLEL_SIZE
+from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 from flash.providers.base import rentable_gpu_counts
 
 RECIPE = _sft_train.RECIPE

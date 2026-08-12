@@ -17,7 +17,6 @@ import statistics
 from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.profiling.sft_workload import _multimodal_messages_with_images
 from flash.engine.worker.backend_common import (
-    ULYSSES_SEQUENCE_PARALLEL_SIZE,
     agent_loop_workers,
     ray_num_cpus,
     rollout_resident_overrides,
@@ -26,6 +25,7 @@ from flash.engine.worker.backend_common import (
 )
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.sft_train import _hydra_val, _verl_image_message_content
+from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 # the data_source every flash-generated row carries. verl routes scoring by this key, so it must
 # match what the reward shim registers under.
