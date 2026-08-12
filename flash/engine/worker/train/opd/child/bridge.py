@@ -273,9 +273,11 @@ def _post_no_signal_resample(url: str, token: str) -> None:
         raise
 
 
-def _post_no_signal_abandoned(url: str, token: str) -> None:
+def _post_no_signal_abandoned(url: str, token: str) -> dict:
+    """Tell the bridge this step is abandoned; return its per-reason skip tally for the error text."""
     try:
-        _plugin()._post_json(url, token, "/no-signal/abandoned", {})
+        response = _plugin()._post_json(url, token, "/no-signal/abandoned", {})
+        return dict((response or {}).get("skip_counts") or {})
     except FlashTeacherBridgeError as error:
         _write_abandonment_failure_fallback(
             _fallback_classification(error),

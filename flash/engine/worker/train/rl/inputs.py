@@ -501,7 +501,11 @@ def _resolve_grpo_inputs():
 
         # the model must actually support image training; this raises for a text-only checkpoint
         # rather than letting the processor silently drop the pixels.
-        validate_multimodal_training(model_id, "grpo")
+        validate_multimodal_training(
+            model_id,
+            "grpo",
+            getattr(_t, "teacher_model", None),
+        )
         from transformers import AutoProcessor
 
         processor = AutoProcessor.from_pretrained(

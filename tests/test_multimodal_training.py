@@ -435,6 +435,111 @@ def test_image_teacher_prompt_uses_one_media_pad_per_descriptor_in_order():
         mm.image_teacher_prompt_messages(messages, 1)
 
 
+def test_image_teacher_prompt_rejects_the_placeholder_in_user_text():
+    # the placeholder marks image positions and the client splits on EVERY occurrence, so one
+    # sitting in the user's own text would be paired with an image that does not exist. reject it
+    # here, naming the offending message, rather than failing downstream as a count mismatch that
+    # reads like an internal bug. covers both the block-list and plain-string content shapes.
+    blocks = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"what is {mm.IMAGE_TEACHER_PLACEHOLDER} here?"},
+                {"type": "image"},
+            ],
+        }
+    ]
+    with pytest.raises(ValueError, match="reserved image marker"):
+        mm.image_teacher_prompt_messages(blocks, 1)
+
+    plain = [
+        {"role": "system", "content": f"never emit {mm.IMAGE_TEACHER_PLACEHOLDER}"},
+        {"role": "user", "content": [{"type": "image"}]},
+    ]
+    with pytest.raises(ValueError, match="reserved image marker"):
+        mm.image_teacher_prompt_messages(plain, 1)
+
+
+def test_image_teacher_prompt_rejects_the_image_pad_token_in_user_text():
+    # <|image_pad|> is the model's REAL expansion token, and the silent-drop guard counts its runs
+    # in the returned prompt ids, requiring at least one run per supplied image. text containing the
+    # literal token encodes to that same id, so it contributes a run the renderer never produced --
+    # and that run can cover for an image the provider silently dropped, defeating the exact guard
+    # the image path depends on. keeping it out of source text is what makes the count meaningful.
+    blocks = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"the marker is {mm.IMAGE_PAD_TOKEN} ok"},
+                {"type": "image"},
+            ],
+        }
+    ]
+    with pytest.raises(ValueError, match="reserved image marker"):
+        mm.image_teacher_prompt_messages(blocks, 1)
+
+    plain = [
+        {"role": "system", "content": f"never emit {mm.IMAGE_PAD_TOKEN}"},
+        {"role": "user", "content": [{"type": "image"}]},
+    ]
+    with pytest.raises(ValueError, match="reserved image marker"):
+        mm.image_teacher_prompt_messages(plain, 1)
+
+
+def test_image_teacher_prompt_rejects_a_marker_split_across_adjacent_text_blocks():
+    """A marker assembled from fragments is still a marker once the blocks are joined.
+
+    Per-block validation cannot see this: "<|media_" and "pad|>" are each harmless text, and the
+    reserved marker exists only in the concatenation. That is why the check runs over each RUN of
+    consecutive text blocks rather than over one block at a time.
+
+    The last case is the reason the unit is a run and not the whole joined string: an image block
+    between the fragments puts the renderer's own placeholder there, so the user's text never
+    forms a marker and the prompt is legitimate. A whole-string check would reject it, and a
+    count-based check would accept the split-after-image case above it.
+    """
+    for fragments in (
+        ["<|media_", "pad|>"],
+        ["<|image_", "pad|>"],
+        ["<|med", "ia_p", "ad|>"],
+    ):
+        split = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": piece} for piece in fragments]
+                + [{"type": "image"}],
+            }
+        ]
+        with pytest.raises(ValueError, match="reserved image marker"):
+            mm.image_teacher_prompt_messages(split, 1)
+
+    after_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": "<|media_"},
+                {"type": "text", "text": "pad|>"},
+            ],
+        }
+    ]
+    with pytest.raises(ValueError, match="reserved image marker"):
+        mm.image_teacher_prompt_messages(after_image, 1)
+
+    around_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<|media_"},
+                {"type": "image"},
+                {"type": "text", "text": "pad|>"},
+            ],
+        }
+    ]
+    rendered = mm.image_teacher_prompt_messages(around_image, 1)
+    assert rendered[0]["content"] == f"<|media_{mm.IMAGE_TEACHER_PLACEHOLDER}pad|>"
+
+
 def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
     image_module = pytest.importorskip("PIL.Image")
     pil = image_module.new("RGB", (1, 1), "red")
@@ -464,13 +569,21 @@ def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
     assert messages[1]["content"][1]["image"] is pil
 
 
-def test_multimodal_algorithm_validation_rejects_all_image_opd_after_model_validation():
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft")
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo")
-    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
-        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd")
+def test_multimodal_algorithm_validation_requires_a_vision_teacher_after_model_validation():
+    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft", None)
+    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", None)
+    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", "qwen3-vl-235b")
+    with pytest.raises(
+        ValueError,
+        match=r"requires.*qwen3-vl-235b.*selected teacher \'glm-5\.2\' cannot see images",
+    ):
+        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", "glm-5.2")
     with pytest.raises(ValueError, match="does not support"):
-        mm.validate_multimodal_training("meta-llama/Llama-3.2-1B", "opd")
+        mm.validate_multimodal_training(
+            "meta-llama/Llama-3.2-1B",
+            "opd",
+            "glm-5.2",
+        )
 
 
 def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
@@ -501,19 +614,79 @@ def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         environment=environment,
+        train=SimpleNamespace(teacher_model="qwen3-vl-235b"),
+    )
+    mm.preflight_validate_image_opd(supported)
+
+    text_teacher = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=environment,
         train=SimpleNamespace(teacher_model="kimi-k3"),
     )
-    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
-        mm.preflight_validate_image_opd(supported)
+    with pytest.raises(ValueError, match="selected teacher 'kimi-k3' cannot see images"):
+        mm.preflight_validate_image_opd(text_teacher)
 
     unsupported = SimpleNamespace(
         model="meta-llama/Llama-3.2-1B",
         algorithm="opd",
         environment=environment,
-        train=SimpleNamespace(teacher_model="kimi-k3"),
+        train=SimpleNamespace(teacher_model="qwen3-vl-235b"),
     )
     with pytest.raises(ValueError, match="does not support image-bearing"):
         mm.preflight_validate_image_opd(unsupported)
+
+
+def test_image_opd_preflight_rejects_multi_turn_with_a_vision_teacher():
+    spec = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=SimpleNamespace(
+            id="local",
+            params={
+                "multi_turn": True,
+                "records": [
+                    {
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [{"type": "image"}],
+                            }
+                        ],
+                        "image": _data_uri(_png_bytes()),
+                    }
+                ],
+            },
+        ),
+        train=SimpleNamespace(teacher_model="qwen3-vl-235b"),
+    )
+
+    with pytest.raises(ValueError, match="multi-turn image-bearing opd is not supported"):
+        mm.preflight_validate_image_opd(spec)
+
+
+def test_image_opd_preflight_allows_max_turns_on_a_single_turn_env():
+    # max_turns is a turn CAP, not a multi-turn declaration: the worker derives multi_turn from the
+    # env CLASS, never from params. rejecting on max_turns here would fail a job the worker runs.
+    spec = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=SimpleNamespace(
+            id="local",
+            params={
+                "max_turns": 4,
+                "records": [
+                    {
+                        "input": [{"role": "user", "content": [{"type": "image"}]}],
+                        "image": _data_uri(_png_bytes()),
+                    }
+                ],
+            },
+        ),
+        train=SimpleNamespace(teacher_model="qwen3-vl-235b"),
+    )
+
+    mm.preflight_validate_image_opd(spec)
 
 
 @pytest.mark.parametrize("record_source", ["inline", "packaged"])
@@ -548,7 +721,7 @@ def test_image_opd_preflight_limits_scan_to_max_examples(tmp_path, record_source
 
 
 @pytest.mark.parametrize("background", [False, True])
-def test_image_opd_submit_preflight_rejects_supported_single_turn_records(
+def test_image_opd_submit_preflight_rejects_text_teacher_before_state_mutation(
     monkeypatch, tmp_path, background
 ):
     from flash import runner
@@ -580,7 +753,7 @@ def test_image_opd_submit_preflight_rejects_supported_single_turn_records(
         }
     )
 
-    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
+    with pytest.raises(ValueError, match="selected teacher 'kimi-k3' cannot see images"):
         runner.submit_job(spec, background=background)
     with pytest.raises(FileNotFoundError):
         runner.get_status(spec.run_id)
