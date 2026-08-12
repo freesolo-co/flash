@@ -519,6 +519,30 @@ def test_bootstrap_extra_pip_retries_a_vcs_clone_rejected_by_an_http_blip(monkey
     assert len(calls) == 2
 
 
+def test_bootstrap_extra_pip_retries_a_vcs_clone_that_cannot_resolve_the_host(monkeypatch):
+    # the other half of git's own vocabulary: urllib says "temporary failure in name resolution",
+    # git says "could not resolve host". A DNS blip is the same infra failure either way, and
+    # matching only urllib's wording fails a paid run on a VCS pin during a resolver outage.
+    lb, calls = _wire_pip(
+        monkeypatch,
+        [
+            (
+                (
+                    "  Running command git clone --filter=blob:none -q "
+                    "https://github.com/org/repo\n"
+                    "  fatal: unable to access 'https://github.com/org/repo/': "
+                    "Could not resolve host: github.com\n"
+                    "  error: subprocess-exited-with-error\n"
+                ),
+                1,
+            ),
+            ("Successfully installed some-pkg\n", 0),
+        ],
+    )
+    lb.install_extra_pip(_pip_payload())
+    assert len(calls) == 2
+
+
 def test_bootstrap_extra_pip_vcs_clone_rejected_by_a_404_still_fails_fast(monkeypatch):
     # the counterpart bound: git reports a missing repo or an unauthorized private pin in the same
     # sentence as the blip above. Only 429/5xx may retry, or a typo'd pin re-rents a box three

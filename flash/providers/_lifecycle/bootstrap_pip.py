@@ -33,9 +33,11 @@ _PIP_TRANSIENT_RE = re.compile(
     r"|ssleoferror|service unavailable|bad gateway|gateway time-?out|too many requests"
     r"|retrying \(retry\(|\b(?:429|5\d\d) (?:client|server) error"
     # a VCS pin fails through git, not urllib, so its blips carry git's own phrasing and none of
-    # the shapes above. Only 429/5xx: a 404 or 403 is a bad pin or a missing token and must still
-    # fail fast rather than burn three backoffs on a paid box.
-    r"|returned error: (?:429|5\d\d)"
+    # the shapes above: git says "could not resolve host" where urllib says "temporary failure in
+    # name resolution", and reports an http status as "returned error: NNN". On the status form,
+    # only 429/5xx: a 404 or 403 is a bad pin or a missing token and must still fail fast rather
+    # than burn three backoffs on a paid box.
+    r"|returned error: (?:429|5\d\d)|could not resolve (?:host|proxy)"
 )
 _PIP_TERMINAL_RE = re.compile(
     r"(?i)failed building wheel|could not build wheels|metadata-generation-failed"

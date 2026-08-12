@@ -765,6 +765,17 @@ def test_train_body_extra_pip_matches_the_bootstrap_on_git_http_blips(monkeypatc
         endpoints._train_body(_extra_pip_input())
     assert len(calls) == 2
 
+    # git's DNS wording, which urllib never emits, must retry here too.
+    dns = blip.replace(
+        "The requested URL returned error: 502", "Could not resolve host: github.com"
+    )
+    calls = _wire_train_body_pip(
+        monkeypatch, [(dns, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 2
+
     missing = blip.replace("returned error: 502", "returned error: 404")
     calls = _wire_train_body_pip(monkeypatch, [(missing, 1)])
     with pytest.raises(RuntimeError, match="extra_pip install failed"):
