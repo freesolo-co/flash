@@ -234,7 +234,6 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",
-        "model_revision",
         "algorithm",
         "thinking",
         "seed",
@@ -322,6 +321,14 @@ def _validate_top_level(
     raw: dict[str, Any], project_required: bool
 ) -> tuple[str, str, str, str, bool]:
     """Validate the top-level config section."""
+    if "model_revision" in raw:
+        raise ConfigError(
+            "config key `model_revision` was removed because Flash-managed serving loads a "
+            "pre-quantized FP8 checkpoint resolved per base model, so it cannot honor an arbitrary "
+            "upstream commit and an authored pin made the run undeployable. If you need a fixed "
+            f"upstream base, use `{CLI_NAME} models export`; the exported adapter records Flash's "
+            "resolved base revision for Hugging Face loading."
+        )
     unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
@@ -343,10 +350,7 @@ def _validate_top_level(
     # escaping the callers' configerror/valueerror guards -> 500; type-check like the other scalars.
     if not isinstance(model, str) or not model.strip():
         raise ConfigError('config `model` must be a model id string (e.g. "Qwen/Qwen3.5-4B")')
-    model_revision_raw = raw.get("model_revision", "")
-    if not isinstance(model_revision_raw, str):
-        raise ConfigError("model_revision must be a string")
-    model_revision = model_revision_raw.strip()
+    model_revision = ""
     project_raw = raw.get("project", "")
     try:
         if project_required:

@@ -248,6 +248,7 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
             "run_id": "source-run",
             "model": "Qwen/Qwen3.5-4B",
             "model_revision": "source-revision",
+            "model_revision_auto": True,
             "algorithm": "sft",
             "train": {"hf_repo": "owner/source-runs"},
         }

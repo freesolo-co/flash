@@ -436,14 +436,15 @@ def _preparation_digest(
     # pre-upgrade snapshot hashed `model_policy` in (to_internal_dict was asdict, so it emitted the
     # defaulted value), and the field no longer exists -- so rehashing without it mismatches and a
     # still-valid warm-start or workload-profile run fails integrity validation on recovery. Only
-    # keys the spec itself has dropped are honoured; anything the dataclass still defines comes from
-    # worker_spec, so this cannot be used to forge a field.
+    # keys registered as historical public removals are honoured. Any field the dataclass still
+    # defines already comes from worker_spec, so replaying its identical stored value cannot forge it.
     for key, value in (legacy_keys or {}).items():
         if key in _runner()._DROPPED_TOP_LEVEL_KEYS:
             worker_payload[key] = value
     # a dropped key that was USER-AUTHORABLE was hashed on the public side too, not just the worker
-    # side. model_policy never was, so restoring only the worker payload was enough for it; worker_env
-    # was, so a pre-upgrade public_spec carried it and the digest cannot reproduce without it.
+    # side. model_policy never was, so restoring only the worker payload was enough for it;
+    # model_revision and worker_env were, so a pre-upgrade public_spec carried them and the digest
+    # cannot reproduce without them.
     for key, value in (legacy_public_keys or {}).items():
         if key in _runner()._DROPPED_TOP_LEVEL_KEYS:
             public_payload[key] = value

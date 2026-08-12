@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from jsonschema.validators import validator_for  # noqa: F401
 
+from flash._internal.channel import CLI_NAME
 from flash.core.spec import JobSpec, require_project_id
 from flash.runner import (
     _internal_spec_from_status,
@@ -246,27 +247,27 @@ def _validate_deploy_request(
 
     Returns the effective spec and the current deployment record for the caller to work from.
     """
-    # A pin the AUTHOR wrote is a request serving cannot honour, so it stays refused.
+    # A pin the AUTHOR wrote before the config key was removed is a request serving cannot honour, so
+    # it stays refused for persisted runs.
     #
     # A pin the RUNNER assigned is different. SFT is force-pinned by
     # `runner.submit.prepare_job` -> `_resolve_model_revision(required=True)` so workload profiling
-    # keys on an immutable commit; the user never asked for it and cannot opt out. Rejecting those
-    # made every SFT run, and every adapter warm-started from one, permanently undeployable --
-    # which also blocks `flash models chat` and `flash env eval`, since both require a deployment.
-    # The advice below ("train without model_revision") was impossible to follow for SFT.
+    # keys on an immutable commit. Rejecting those made every SFT run, and every adapter warm-started
+    # from one, permanently undeployable, which also blocks `flash models chat` and `flash env eval`,
+    # since both require a deployment.
     #
-    # provenance is read from the INTERNAL worker spec, not `spec`: to_dict() strips the marker so
-    # the public spec stays re-parseable by the submission schema, so the public `spec` argument
-    # always reports False. `_internal_spec_from_status` prefers the persisted worker spec and
-    # falls back to the public one, which reads False for pre-upgrade runs -- correctly, since
-    # those carry no provenance and must keep failing closed.
+    # provenance is read from the INTERNAL worker spec, not `spec`: to_dict() strips the marker and
+    # revision from new public specs. `_internal_spec_from_status` prefers the persisted worker spec
+    # and falls back to the public one, which reads False for pre-upgrade runs without provenance.
+    # Those historical authored pins must keep failing closed.
     auto_pinned = _internal_spec_from_status(status).model_revision_auto
     if spec.model_revision and not auto_pinned:
         raise HTTPException(
             status_code=400,
             detail=(
-                "deployment does not support revision-pinned base models; "
-                "train without model_revision to deploy this run"
+                "deployment does not support this run's legacy revision-pinned base model; "
+                f"submit a new run without the removed model_revision key, or use `{CLI_NAME} "
+                "models export` to load the adapter from Hugging Face"
             ),
         )
     try:

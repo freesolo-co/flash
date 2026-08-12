@@ -18,6 +18,7 @@ def _spec() -> JobSpec:
     return JobSpec(
         model="Qwen/Qwen3.5-0.8B",
         model_revision="a" * 40,
+        model_revision_auto=True,
         algorithm="sft",
         environment=EnvironmentSpec(
             id="team/example",
@@ -601,7 +602,6 @@ def test_profile_free_run_compares_lora_topology_structurally(tmp_path, monkeypa
     runner = fresh_runner(tmp_path, monkeypatch)
     worker = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        model_revision="a" * 40,
         algorithm="grpo",
         environment=EnvironmentSpec(id="team/example", resolved_sha="b" * 40),
         train=TrainSpec(lora_rank=20, lora_alpha=40, epochs=1),
@@ -641,7 +641,6 @@ def test_warm_start_topology_may_differ_between_the_halves(tmp_path, monkeypatch
     runner = fresh_runner(tmp_path, monkeypatch)
     public = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        model_revision="a" * 40,
         algorithm="grpo",
         environment=EnvironmentSpec(id="team/example", resolved_sha="b" * 40),
         train=TrainSpec(init_from_adapter="parent-run", lora_rank=32, lora_alpha=64, epochs=1),
