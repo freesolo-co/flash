@@ -4039,6 +4039,456 @@ def test_every_verl_backend_enables_tf32_in_the_child(backend, monkeypatch):
     assert fake.backends.cudnn.allow_tf32 is True
 
 
+# --------------------- tilelang libcudart stub, in the verl CHILD interpreter ---------------------
+
+
+def _fake_child_tilelang(tmp_path):
+    """materialize a tilelang package holding the stub, as the verl venv ships it."""
+    pkg = tmp_path / "tilelang"
+    (pkg / "lib").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    stub = pkg / "lib" / "libcudart_stub.so"
+    stub.write_bytes(b"STUB")
+    return pkg, stub
+
+
+def _run_cudart_fragment(source, tmp_path, *, real: str | None, extra: str = ""):
+    """exec ``source`` in a CHILD interpreter with a fake tilelang on the path.
+
+    a subprocess, not this process: the fragment mutates ``sys.path`` and the tilelang package on
+    disk, and it exists precisely to run at sitecustomize time in a fresh interpreter. ``ctypes.CDLL``
+    is replaced with a probe that FAILS the test if the stub is ever dlopened -- mapping the stub into
+    the process is the crash being prevented, so an implementation that "verifies" the stub that way
+    must not pass.
+    """
+    driver = f"""
+import ctypes, ctypes.util, glob, os, sys
+
+sys.path.insert(0, {str(tmp_path)!r})
+_real = {real!r}
+_realglob = glob.glob
+
+
+def _glob(pat, *a, **k):
+    # hermetic: NEVER let a libcudart pattern reach the real glob. this host may have
+    # /usr/local/cuda* or a system libcudart, and the fake CDLL below reports cudaDeviceReset for
+    # every non-stub candidate -- so delegating would let a CUDA-enabled runner discover a real
+    # library and repoint the stub in the test that asserts it is left alone.
+    if "libcudart.so" in pat:
+        return [_real] if _real else []
+    return _realglob(pat, *a, **k)
+
+
+glob.glob = _glob
+ctypes.util.find_library = lambda name: None
+
+
+class _FakeCudart:
+    def __getattr__(self, name):
+        if name == "cudaDeviceReset":
+            return lambda: 0
+        raise AttributeError(name)
+
+
+def _cdll(path, *a, **k):
+    if "libcudart_stub" in str(path):
+        raise SystemExit("FRAGMENT_DLOPENED_THE_STUB")
+    return _FakeCudart()
+
+
+ctypes.CDLL = _cdll
+{source}
+{extra}
+"""
+    return subprocess.run(
+        [sys.executable, "-c", driver], capture_output=True, text=True, timeout=120
+    )
+
+
+def test_the_child_fragment_repoints_the_tilelang_libcudart_stub(tmp_path):
+    """THE regression (5 of 6 GRPO models): tilelang's stub lacks ``cudaDeviceReset``, vLLM's
+    CuMemAllocator binds it, and engine init dies with an undefined-symbol AttributeError.
+
+    A parent-side repoint could not reach this: the trainer runs in a separate interpreter
+    (``/opt/verl-venv``) that has its OWN tilelang and no flash at all. Assert
+    on the filesystem AFTER executing the fragment -- a substring match on the rendered source would
+    pass on a fragment that never runs.
+    """
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    result = _run_cudart_fragment(
+        vc.render_tilelang_cudart_shim(),
+        tmp_path,
+        real=str(real),
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DLOPENED_THE_STUB" not in (result.stdout + result.stderr), (
+        "the fragment dlopened the stub to test it, which maps it into the process and is the "
+        "exact crash it exists to prevent"
+    )
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert stub.is_symlink(), "the stub is still tilelang's own file; vLLM will bind it and abort"
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    assert (tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig").read_bytes() == b"STUB", (
+        "the original stub must be preserved verbatim so the change is reversible"
+    )
+    # the marker naming the resolved runtime is the only evidence in a run log that the repoint
+    # happened and WHICH libcudart it picked. without it a silently-skipped swap and a successful one
+    # read identically, and the next undefined-symbol crash has nothing to bisect against.
+    assert f"{vc.FLASH_CUDART_STUB_MARKER} -> {real}" in result.stdout, (
+        f"the fragment did not report the repoint it performed: {result.stdout[-1000:]}"
+    )
+
+
+def test_the_child_fragment_leaves_the_stub_alone_without_a_real_libcudart(tmp_path):
+    """No discoverable real runtime -> leave tilelang's stub untouched rather than break tilelang."""
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+
+    result = _run_cudart_fragment(
+        vc.render_tilelang_cudart_shim(),
+        tmp_path,
+        real=None,
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert not stub.is_symlink()
+    assert stub.read_bytes() == b"STUB"
+    assert not (tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig").exists()
+
+
+def test_the_child_fragment_repoints_a_dangling_stub_symlink(tmp_path):
+    """A DANGLING stub symlink is NOT "already repointed" -- it leaves tilelang with a broken
+    libcudart_stub.so, so the fragment must re-point it at a real runtime.
+
+    This is the case the ``islink and exists`` pair exists for: ``islink`` alone would read a dangling
+    link as done and skip, and ``exists`` alone follows the link away and reads it as absent. Distinct
+    from the stale *temp swap* link covered below -- that one is a leftover at
+    ``.flash-<pid>-<rand>``, while this is the stub path itself pointing at a target that is gone.
+    """
+    pkg, stub = _fake_child_tilelang(tmp_path)
+    stub.unlink()
+    stub.symlink_to(tmp_path / "gone-libcudart.so.12")  # dangling: target does not exist
+    assert stub.is_symlink()
+    assert not stub.exists()
+
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    result = _run_cudart_fragment(
+        vc.render_tilelang_cudart_shim(),
+        tmp_path,
+        real=str(real),
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert stub.is_symlink()
+    assert stub.exists(), "the stub symlink still dangles; tilelang's libcudart is broken"
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    # nothing to preserve: the original stub was already gone before this ran, so a .orig would be a
+    # hard link to a dangling symlink rather than tilelang's real file.
+    assert not (pkg / "lib" / "libcudart_stub.so.orig").exists()
+
+
+def test_the_child_fragment_never_aborts_a_paid_run(tmp_path):
+    """An unrepointed stub only kills runs that build a SLEEPING vLLM engine, so a fragment that
+    cannot do its job must leave the child starting rather than abort it at sitecustomize time.
+
+    tilelang absent is the ordinary case for a non-GDN venv, and it must not even probe. Note this
+    half never enters the swap, so on its own it says nothing about the error path -- the outer
+    ``except`` could be deleted outright and this would still pass. That is what the read-only
+    sibling test below covers.
+    """
+    result = _run_cudart_fragment(
+        vc.render_tilelang_cudart_shim(),
+        tmp_path,  # no tilelang package materialized
+        real=None,
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert result.returncode == 0
+    assert "repoint failed" not in result.stdout, (
+        "tilelang absent is the ordinary case; it must not report a failure"
+    )
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root bypasses dir perms")
+def test_a_failed_repoint_still_lets_the_child_start(tmp_path):
+    """The half of never-abort that actually exercises the handler: tilelang is present and a real
+    runtime was found, but the directory holding the stub refuses writes, so ``link()``/``symlink()``
+    raise from inside the branch that already decided to swap.
+
+    Only the outer ``except`` keeps that PermissionError from propagating out of sitecustomize and
+    killing the interpreter before training starts. It must also SAY it failed: a silent swallow and
+    a successful repoint read identically in a run log, leaving the next undefined-symbol crash with
+    nothing to bisect against.
+    """
+    pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+    lib = pkg / "lib"
+    lib.chmod(0o555)
+    try:
+        result = _run_cudart_fragment(
+            vc.render_tilelang_cudart_shim(),
+            tmp_path,
+            real=str(real),
+            extra="print('FRAGMENT_DONE', flush=True)",
+        )
+    finally:
+        lib.chmod(0o755)  # let tmp_path cleanup remove it
+
+    assert result.returncode == 0, (
+        f"a failed repoint aborted the child instead of importing on: {result.stderr[-2000:]}"
+    )
+    assert "FRAGMENT_DONE" in result.stdout, (
+        f"the exception escaped sitecustomize and killed the run: {result.stderr[-2000:]}"
+    )
+    assert "repoint failed" in result.stdout, (
+        "a swallowed failure must still say so; a silent one is unbisectable from a log"
+    )
+    assert not stub.is_symlink(), "the stub must be left intact when the swap could not complete"
+    assert stub.read_bytes() == b"STUB", "the failed swap corrupted tilelang's own stub"
+
+
+def test_the_child_fragment_is_idempotent_across_ray_workers(tmp_path):
+    """Ray starts several workers against ONE venv, so the fragment runs repeatedly on the same
+    files. A second pass must keep the symlink and must not overwrite the saved original with the
+    symlink it just made.
+    """
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+    source = vc.render_tilelang_cudart_shim()
+
+    result = _run_cudart_fragment(
+        source + source,  # two passes in one interpreter
+        tmp_path,
+        real=str(real),
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert stub.is_symlink()
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    assert (tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig").read_bytes() == b"STUB"
+
+
+def test_concurrent_ray_workers_never_lose_the_stub_or_the_original(tmp_path):
+    """Ray starts several child interpreters against ONE venv, genuinely at the same time.
+
+    The sequential idempotency test above cannot see the interleaving: with a check-then-act backup,
+    two workers both observe ``.orig`` absent, one moves the stub and the other gets
+    FileNotFoundError and imports on with the path missing -- or the second overwrites the preserved
+    original with the symlink the first just made. Start the interpreters together and assert BOTH
+    invariants survive: the stub always resolves, and ``.orig`` is still the real stub bytes.
+    """
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+    source = vc.render_tilelang_cudart_shim()
+
+    workers = 8
+    barrier = threading.Barrier(workers)
+    results: list[subprocess.CompletedProcess] = []
+    lock = threading.Lock()
+
+    def _worker():
+        barrier.wait()  # release them into the critical section together
+        out = _run_cudart_fragment(
+            source, tmp_path, real=str(real), extra="print('FRAGMENT_DONE', flush=True)"
+        )
+        with lock:
+            results.append(out)
+
+    threads = [threading.Thread(target=_worker) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=180)
+
+    assert len(results) == workers, "a worker never finished"
+    for out in results:
+        assert "FRAGMENT_DONE" in out.stdout, (
+            f"a concurrent worker aborted instead of importing on: {out.stderr[-1500:]}"
+        )
+
+    # the stub must resolve for EVERY worker -- a moved-away stub is the crash, one step later.
+    assert stub.is_symlink()
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    backup = tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig"
+    assert backup.exists(), "the preserved original went missing under concurrent workers"
+    assert not backup.is_symlink(), (
+        "the preserved original was overwritten by a racing worker's symlink"
+    )
+    assert backup.read_bytes() == b"STUB"
+    # no temp links left behind by a worker that died mid-swap.
+    leftovers = list((tmp_path / "tilelang" / "lib").glob("libcudart_stub.so.flash-*"))
+    assert not leftovers, f"temporary swap links leaked: {leftovers}"
+
+
+def test_a_stale_swap_link_does_not_block_the_repoint(tmp_path):
+    """A worker killed between symlink() and replace() leaves its temp link on disk.
+
+    With a pid-only temp name, the next worker to reuse that pid would hit FileExistsError,
+    skip the swap, and leave the stub in place -- a silently unrepointed stub, which is the
+    original crash one step later. Plant a stale link for THIS interpreter's pid and assert the
+    repoint still lands.
+    """
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    # the child's pid is not knowable from here, so it plants the stale link on ITSELF: a dangling
+    # symlink at exactly the pid-only name the old scheme would have chosen, created before the
+    # fragment runs. that is precisely the post-crash state a reused pid inherits.
+    plant = (
+        "import os as _p_os\n"
+        f"_p_stale = {str(tmp_path / 'tilelang' / 'lib' / 'libcudart_stub.so')!r}"
+        ' + ".flash-" + str(_p_os.getpid())\n'
+        '_p_os.symlink("/nonexistent/stale", _p_stale)\n'
+    )
+    result = _run_cudart_fragment(
+        plant + vc.render_tilelang_cudart_shim(),
+        tmp_path,
+        real=str(real),
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert stub.is_symlink(), (
+        "a stale temp swap link blocked the repoint; the stub is still tilelang's own file"
+    )
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+
+
+@pytest.mark.parametrize("backend", ["grpo", "opd", "sft"])
+def test_every_verl_backend_repoints_the_stub_in_its_child(backend, tmp_path):
+    """The stub lives in the interpreter that builds the vLLM engine, and all three backends launch
+    that interpreter. Execute each backend's rendered sitecustomize and assert the symlink landed --
+    rendering unreachable code, or fixing it in the Flash parent, does not help the trainer.
+    """
+    from flash.engine.worker import opd_train, sft_train
+
+    if backend == "grpo":
+        # grpo assembles shim_source inside _write_rl_shim, past the subprocess launch, so there is
+        # no renderer to call. rebuild the join from the ast: calling the renderer here would test
+        # the renderer the tests above already cover and stay green if _write_rl_shim stopped
+        # joining it in -- the exact regression, with 5 of 6 models back to a dead engine init.
+        assign = next(
+            node
+            for node in ast.walk(
+                ast.parse(textwrap.dedent(inspect.getsource(rl_train._write_rl_shim)))
+            )
+            if isinstance(node, ast.Assign)
+            and any(getattr(t, "id", "") == "shim_source" for t in node.targets)
+        )
+        rendered = [
+            ast.unparse(node.func)
+            for node in ast.walk(assign.value)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert "render_tilelang_cudart_shim" in rendered, (
+            "_write_rl_shim no longer joins render_tilelang_cudart_shim() into shim_source; the "
+            f"grpo child keeps tilelang's stub and dies at engine init. joined: {rendered!r}"
+        )
+        source = vc.render_tilelang_cudart_shim()
+        # unconditional: `part for part in (...) if part` filters empties, so a renderer that
+        # returned "" for some config would be indistinguishable from an absent one at runtime.
+        assert source.strip(), "render_tilelang_cudart_shim() returned nothing to join"
+    elif backend == "opd":
+        source = opd_train._render_opd_sitecustomize(save_at_steps=(3,), total_steps=3)
+    else:
+        source = sft_train._render_sft_sitecustomize(
+            seed=1,
+            loraplus_ratio=16.0,
+            save_at_steps=(3,),
+            total_steps=3,
+            reentrant_gradient_checkpointing=False,
+        )
+
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    # the fragment sits ABOVE each backend's verl imports on purpose; this test has no real
+    # verl/transformers stack, so the exec is expected to die once it reaches them. that the symlink
+    # already landed by then is the assertion -- and it is only true while the ordering holds.
+    result = _run_cudart_fragment(source, tmp_path, real=str(real))
+
+    assert "FRAGMENT_DLOPENED_THE_STUB" not in (result.stdout + result.stderr)
+    assert stub.is_symlink(), (
+        f"{backend}'s child shim never reached the cudart fragment before importing verl; its "
+        "trainer keeps tilelang's stub and a sleeping vLLM engine aborts init"
+    )
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+
+
+def test_the_child_probe_is_the_parents_own_source_not_a_copy():
+    """The child fragment must SHIP ``perf._find_real_libcudart``, never restate it.
+
+    The bug this whole fragment fixes was parent/child skew: the parent knew how to find libcudart
+    and the child did not. A hand-copied probe recreates that skew on a delay -- the next cuda
+    release moves a wheel path, someone fixes the parent, CI stays green, and the child silently
+    keeps probing the old layout. So assert the rendered fragment carries the parent's real body,
+    and that editing the parent moves the child with it.
+    """
+    from flash.engine.worker.perf import _find_real_libcudart
+
+    rendered = vc.render_tilelang_cudart_shim()
+    parent_body = textwrap.dedent(inspect.getsource(_find_real_libcudart))
+
+    # every non-trivial line of the parent's probe must appear in what the child executes.
+    missing = [
+        line.strip()
+        for line in parent_body.splitlines()
+        if len(line.strip()) > 12 and line.strip() not in rendered
+    ]
+    assert not missing, (
+        "the child fragment no longer ships perf._find_real_libcudart's own source, so the probe "
+        f"can drift from the parent's. lines absent from the fragment: {missing[:5]!r}"
+    )
+
+    # and the fragment must CALL it under its canonical name rather than a local re-implementation.
+    assert "_find_real_libcudart()" in rendered, (
+        "the fragment does not call _find_real_libcudart(); a second probe implementation has crept "
+        "back into the child"
+    )
+
+
+def test_rendering_the_probe_ignores_a_monkeypatched_parent(monkeypatch):
+    """Rendering must ship the REAL probe body even while ``perf._find_real_libcudart`` is patched.
+
+    ``perf``'s own docstring says tests monkeypatch that name and its callers resolve it through the
+    patched module globals. This caller is the exception: it needs the function's SOURCE, so if it
+    ever resolved through ``perf.<attr>`` a test double's body would be rendered into the child and
+    the shipped shim would be whatever the last test stubbed. Pin the immunity.
+    """
+    from flash.engine.worker import perf
+
+    before = vc.render_tilelang_cudart_shim()
+    monkeypatch.setattr(perf, "_find_real_libcudart", lambda: "/fake/libcudart.so")
+    after = vc.render_tilelang_cudart_shim()
+
+    assert before == after, (
+        "the rendered fragment changed while perf._find_real_libcudart was monkeypatched; the "
+        "renderer is resolving through the patched module global and can ship a test double"
+    )
+    assert "cudaDeviceReset" in after, (
+        "the rendered probe lost its cudaDeviceReset check under a patched parent"
+    )
+    # asserted as a fragment, not the full path: this file's platform-guard meta-test scans function
+    # bodies for the proc-filesystem prefix and would demand @_needs_process_teardown. this test only
+    # inspects rendered TEXT and opens nothing, so it needs no process-teardown capability.
+    assert "self/maps" in after, (
+        "the rendered probe lost its soname resolution under a patched parent"
+    )
+
+
 def test_grpo_does_not_enable_tf32_in_the_parent():
     """the grpo parent holds a cuda context (wait_for_gpu touches the device) but runs no matmuls --
     verl does, out of process. a setup_perf_backends() call here sets flags on the wrong process and

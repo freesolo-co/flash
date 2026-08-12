@@ -26,6 +26,7 @@ from flash.engine.worker.backend_common import (
     parse_wandb_link,
     render_shim_marker_prologue,
     render_tf32_shim,
+    render_tilelang_cudart_shim,
     render_wandb_link_shim,
     shim_marker_file,
     verify_applied_shim_markers,
@@ -227,10 +228,15 @@ def _write_rl_shim(inp, files) -> list[str]:
         for part in (
             # first: torch's matmul flags are process-wide state, and reading them back is how the
             # rest of the child sees the choice. nothing below depends on it, but a later fragment
-            # that raised would otherwise cost the whole run its tensor-core throughput. tf32 and
-            # the wandb link stay unwrapped on purpose: both swallow their own failures by design
-            # and neither may abort a paid run.
+            # that raised would otherwise cost the whole run its tensor-core throughput. tf32, the
+            # tilelang cudart repoint and the wandb link stay unwrapped on purpose: all three
+            # swallow their own failures by design and none may abort a paid run.
             render_tf32_shim(),
+            # before anything that can import vllm -- so above the wrapped fragments too. the
+            # fragment repoints tilelang's libcudart stub on disk, and vllm's CuMemAllocator binds
+            # libcudart the first time a sleeping engine is built. after the stub is already mapped
+            # into this process there is nothing left to fix.
+            render_tilelang_cudart_shim(),
             render_shim_marker_prologue(files["shim_markers"]),
             *(wrap_shim_fragment(name, source) for name, source in required_fragments),
             # gated on the key rather than the resolved logger list: that list needs python_bin,
