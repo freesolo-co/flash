@@ -19,7 +19,17 @@ uv run ruff format --check .
 uv run pytest -q
 ```
 
-That is the same set of checks CI runs (`.github/workflows/ci.yml`), so a green local run
+CI (`.github/workflows/ci.yml`) additionally enforces two size gates and runs the
+timing-sensitive tests in their own serial pass:
+
+```bash
+uv run python scripts/check_file_size.py      # no module in flash/ over 1000 lines
+uv run python scripts/check_function_size.py  # no function in flash/ over 150 lines
+uv run pytest -q -m wallclock                 # asserts on real elapsed time; runs alone
+```
+
+The size gates fail on the _whole_ file or function, so the fix is always to extract a
+cohesive piece into a sibling, never to reflow lines. A green local run of all six commands
 usually means a green CI run. CI runs them on both supported interpreters (3.11 and 3.12);
 locally, whichever one `uv` picks is normally enough.
 
@@ -52,7 +62,8 @@ So the flow is: your branch → `dev` → `main`.
 Before opening a pull request:
 
 1. Rebase onto the current `dev`.
-2. Make sure `uv run pytest` and `uv run ruff check .` pass.
+2. Make sure the checks above pass — `ruff check`, `ruff format --check`, `pytest`, and both
+   size gates.
 3. Add tests for the behavior you changed. The suite is large and treated as the
    specification for existing behavior; a change in behavior should show up as a change in
    tests.
