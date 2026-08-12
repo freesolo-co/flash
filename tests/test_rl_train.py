@@ -719,19 +719,32 @@ def test_build_verl_overrides_single_gpu_is_the_unchanged_default():
 
 
 @pytest.mark.parametrize("n_gpus", [2, 4, 8])
-def test_build_verl_overrides_shards_every_card_along_the_sequence(n_gpus):
-    # verl builds mesh_shape=(dp, sp), so sp == n_gpus pins dp == 1: the optimizer keeps seeing one
-    # global batch of prompts_per_step * group_size. sharding the BATCH instead would change the
-    # gradient, which is why sp/tp track the card count rather than leaving dp to absorb it.
+def test_build_verl_overrides_shards_every_card_by_data(n_gpus):
+    # ulysses is pinned OFF at every width, so verl's mesh leaves every rank a DATA-parallel rank.
+    # sequence parallelism would slice the sequence at fixed offsets and hand each rank's slice
+    # straight to the GatedDeltaNet linear-attention and conv layers, whose state runs ALONG the
+    # sequence -- every rank but rank 0 would start its recurrence from zero state. the global batch
+    # survives anyway because use_dynamic_bsz token-balances it across the dp ranks.
     o = rl_train.build_verl_overrides(_overrides_cfg(n_gpus=n_gpus))
     assert f"+ray_kwargs.ray_init.num_gpus={n_gpus}" in o
     assert f"trainer.n_gpus_per_node={n_gpus}" in o
-    assert f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={n_gpus}" in o
+    assert "actor_rollout_ref.actor.ulysses_sequence_parallel_size=1" in o
+    # no card-count-dependent sp override may survive anywhere in the command.
+    assert not [
+        s
+        for s in o
+        if "ulysses_sequence_parallel_size" in s
+        and not s.endswith("ulysses_sequence_parallel_size=1")
+    ]
+    # rollout TENSOR parallelism is a separate width and still tracks the cards: tp splits attention
+    # heads, not the sequence, so it has no recurrent-state problem. this is also why the allocator's
+    # head-divisibility cap outlives ulysses -- vllm raises at engine init when heads % tp != 0.
     assert f"actor_rollout_ref.rollout.tensor_model_parallel_size={n_gpus}" in o
     # one worker, many cards: nnodes stays 1 so verl's replica_rank offset (and the rollout seed)
     # is unaffected by the card count.
     assert "trainer.nnodes=1" in o
-    # sequence parallelism is only legal with padding removed; verl raises otherwise.
+    # remove-padding is independent of sp and still required: the no_padding loss reads log_prob
+    # values off the flattened batch.
     assert "actor_rollout_ref.model.use_remove_padding=True" in o
 
 
@@ -742,8 +755,8 @@ def test_build_verl_overrides_batch_shape_is_identical_across_gpu_counts():
         "data.train_batch_size=",
         "actor_rollout_ref.rollout.n=",
         "actor_rollout_ref.actor.ppo_mini_batch_size=",
-        # the per-gpu token budget is part of the shape too: verl scales it by sp_size itself, so
-        # emitting a card-dependent value would shrink each micro-batch as cards are added.
+        # the per-gpu token budget is part of the shape too: it is PER-GPU, so emitting a
+        # card-dependent value would change each rank's micro-batch as cards are added.
         "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=",
     )
     one = rl_train.build_verl_overrides(_overrides_cfg(n_gpus=1))
@@ -3768,7 +3781,8 @@ def test_train_notes_record_the_batch_shape_one_step_consumed():
     notes = rl_train._build_verl_train_notes(_notes_inp(), **_notes_common())
     assert notes["max_completion_len"] == 512
     assert notes["prompts_per_step"] == 8
-    # ulysses shards along the sequence, so dp stays 1 and one optimizer step sees the whole batch.
+    # one optimizer step still sees the whole batch under data parallelism: use_dynamic_bsz
+    # token-balances the same global batch across the dp ranks instead of dropping a remainder.
     assert notes["generations_per_step"] == 8 * 4
 
 

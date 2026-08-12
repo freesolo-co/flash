@@ -272,17 +272,32 @@ def _actor_overrides(cfg: dict) -> list[str]:
         "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={cfg['prompts_per_step']}",
         # bound backward by tokens, not sequences: fixed sequence counts are unsafe at 32k and
-        # waste capacity on short rows. verl multiplies this per-gpu budget by sp_size, so do not
-        # pre-divide it by the ulysses width.
+        # waste capacity on short rows. this is a PER-GPU budget and ulysses is pinned off below, so
+        # verl's `max_token_len_per_gpu * sp_size` (engine/utils.py) is the budget itself. one
+        # full-length sequence is the floor -- see `max_token_len_per_gpu` in the caller -- which
+        # satisfies verl's `max_token_len >= max_seq_len` assert without a sequence-parallel
+        # multiplier. token balancing across the dp ranks is what `use_dynamic_bsz` does, and it
+        # also skips verl's strict batch-divisibility validation, so no rank can be starved to zero.
         "actor_rollout_ref.actor.use_dynamic_bsz=true",
         f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={cfg['max_token_len_per_gpu']}",
         # ppo_epochs multiplies verl's update loop, so its default of 1 preserves the requested update
         # count and on-policy baseline: verl samples a fresh rollout for every update, with no reuse.
         f"actor_rollout_ref.actor.ppo_epochs={cfg['ppo_epochs']}",
-        # shard sequence, not batch, so sp == n_gpus keeps dp == 1 and preserves the exact global
-        # batch and gradient. vllm uses the same width for tensor parallelism; activations then divide
-        # across cards. ref inherits this via dp_ref.yaml, and use_remove_padding is required.
-        f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={cfg['n_gpus']}",
+        # shard by DATA, not by sequence: ulysses is pinned OFF and fsdp splits the batch across the
+        # ranks. every catalog model is a GatedDeltaNet hybrid whose linear-attention and causal-conv
+        # layers carry state ALONG the sequence, and verl gathers the full sequence only inside
+        # `_ulysses_flash_attention_forward` -- it patches `_flash_attention_forward` and nothing
+        # else, so at sp > 1 the decoder hands each rank's SLICE straight to `self.linear_attn` with
+        # no gather and every rank but rank 0 starts its recurrence mid-sequence from zero state.
+        # measured 21% relative divergence on a 4-layer text model at sp=2, rank 0 bit-identical. the
+        # packed cu_seqlens/seq_idx resets cannot save it either: ulysses slices at fixed
+        # `seqlen // sp_size` offsets, blind to example boundaries, so a slice can begin mid-example.
+        # this is not a capacity tradeoff -- fsdp's mesh is built from world_size alone
+        # (`create_device_mesh`), independent of sp, so weights, grads and optimizer state still
+        # shard across every card and multi-card 32k is unaffected. ref inherits this via
+        # dp_ref.yaml, and use_remove_padding is required. rollout tensor parallelism is a SEPARATE
+        # width and stays at n_gpus -- tensor parallelism has no sequence-state problem.
+        "actor_rollout_ref.actor.ulysses_sequence_parallel_size=1",
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the opd driver.
         *trainer_dtype_overrides(),
     ]
@@ -732,8 +747,9 @@ def _build_verl_train_notes(
         "vllm_max_num_batched_tokens": None,
         "max_completion_len": inp["max_completion"],
         "prompts_per_step": inp["prompts_per_step"],
-        # one optimizer step consumes exactly this many completions: ulysses shards along the
-        # sequence, so dp stays 1 and the global batch is not split across cards.
+        # one optimizer step consumes exactly this many completions. still exact under data
+        # parallelism: `use_dynamic_bsz` token-balances the SAME global batch across the dp ranks
+        # rather than dropping a remainder, so splitting it across cards does not change the count.
         "generations_per_step": inp["prompts_per_step"] * inp["group_size"],
         # the retired trl path fixed a per-device SEQUENCE count and carried the rest in grad accumulation. verl
         # bounds the backward pass by TOKENS instead (use_dynamic_bsz + ppo_max_token_len_per_gpu),

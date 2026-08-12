@@ -1392,12 +1392,16 @@ not a reliable place to look either: the mid-run heartbeats
 `gpu_status` wholesale, so the field is usually absent while a run is live and reappears only on the
 terminal heartbeat.
 
-GRPO, SFT and OPD all shard across the selected count with no backend key to set. GRPO and OPD
-launch one rank per card with Ulysses sequence parallelism, which keeps the global batch whole. SFT
-shards by data instead — sequence parallelism is wrong for the catalog's GatedDeltaNet models, whose
-linear attention and causal conv carry state along the sequence — so its batch is split across ranks.
+GRPO, SFT and OPD all shard across the selected count with no backend key to set, and all three shard
+by **data**: one rank per card, with each rank holding whole sequences. Sequence parallelism is not
+used, because it is wrong for the catalog's GatedDeltaNet models, whose linear attention and causal
+conv carry state along the sequence and so cannot be split mid-sequence across cards. Weights,
+gradients and optimizer state still shard across every card, so multi-card capacity is unchanged.
 
-That gives SFT two things to watch, and the card count has to divide **both** or some cards go
+How the batch reaches those ranks differs. GRPO and OPD bound work by tokens, so the scheduler
+balances the same global batch across the ranks and any card count is usable. SFT splits a fixed
+batch instead, which gives it two things to watch, and the card count has to divide **both** or some
+cards go
 unused: `[train] batch_size`, because a batch verl cannot split evenly would starve a rank, and the
 number of rows the profile retains, because verl's sampler drops the remainder from every epoch
 rather than padding it. The worker trains on the largest number of cards that divides both and

@@ -359,8 +359,10 @@ def test_sft_quote_credits_only_the_ranks_that_will_execute():
 
     `gpu_count` at the quote boundary is the BILLED shape. SFT shards by data, so the executed
     width is bounded by the batch: an unpacked run on 2 cards trains on one rank. Crediting the
-    billed width there understates wall time against the run's own cap. GRPO and OPD keep Ulysses
-    and do use every card, so the clamp must be SFT-only.
+    billed width there understates wall time against the run's own cap. GRPO and OPD also shard by
+    data, but they bound work by TOKENS (`use_dynamic_bsz`), so the scheduler balances the batch
+    across every rank instead of leaving one unfed -- their executed width is the allocation, and the
+    clamp must stay SFT-only.
     """
     from flash.cost import analytical
     from flash.cost.types import RunConfig
@@ -374,7 +376,7 @@ def test_sft_quote_credits_only_the_ranks_that_will_execute():
     assert speedup("sft", 1, 2) == one_card
     # a batch that divides the allocation keeps the full multi-card credit.
     assert speedup("sft", 8, 2) > one_card
-    # grpo shards by data with ulysses across every card, so it is untouched by the batch.
+    # grpo shards by data too, but token-balanced across every card, so it is untouched by the batch.
     assert speedup("grpo", 1, 2) > speedup("grpo", 1, 1)
 
 

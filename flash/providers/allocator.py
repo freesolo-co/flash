@@ -288,13 +288,27 @@ _UNCERTIFIED_CAP = 4
 def geometry_safe_gpu_cap(
     model_id: str, max_gpu_count: int, *, model_revision: str = "", certify: bool = False
 ) -> int:
-    """Rentable ceiling whose sequence-parallel divisibility is known before paid allocation.
+    """Rentable ceiling whose head divisibility is known before paid allocation.
 
-    The width becomes ``ulysses_sequence_parallel_size``, and verl requires
-    ``num_attention_heads % sp_size == 0``, so a catalog row is only safe at the counts that divide
-    its OWN head count. Curated membership is not uniform geometry: catalog head counts are 8, 8,
-    16, 16, 24, and 16, so trusting membership alone accepted an 8-card width for the 27B (24 heads)
-    that verl rejects at Ulysses init, after the box was already rented.
+    The width becomes vLLM's ``tensor_model_parallel_size`` for the rollout engine (grpo
+    ``train/rl/verl_config.py``, opd ``train/opd/overrides.py``), and vLLM requires
+    ``num_attention_heads % tp_size == 0`` -- it raises at engine init otherwise -- so a catalog row
+    is only safe at the counts that divide its OWN head count. Curated membership is not uniform
+    geometry: catalog head counts are 8, 8, 16, 16, 24, and 16, so trusting membership alone
+    accepted an 8-card width for the 27B (24 heads) that the engine rejects at init, after the box
+    was already rented.
+
+    This cap OUTLIVED ulysses. It was written when the width was also
+    ``ulysses_sequence_parallel_size``; sequence parallelism is now pinned off on all three
+    algorithms (it corrupts GatedDeltaNet state), but rollout tensor parallelism still consumes the
+    same width, so the same divisibility gate is still what stands between a rented box and a
+    post-payment engine failure.
+
+    Scope, stated precisely: this certifies QUERY-head divisibility only. vLLM also constrains kv
+    heads and the GDN linear dimensions under tensor parallelism, and Flash records both
+    (``num_key_value_heads``, ``linear_num_value_heads``) without gating on them. Every current row
+    divides 1/2/4/8 on all three axes, so nothing is mis-admitted today; ALLOC-004 covers widening
+    the check.
 
     The head count is READ from the row (``num_attention_heads``), never derived: ``hidden_size //
     head_dim`` is a different number on four of the six rows -- see ``_query_attention_heads``.

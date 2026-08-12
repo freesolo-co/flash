@@ -150,8 +150,8 @@ def test_provider_only_offers_counts_it_can_rent(all_providers_configured, provi
     Each provider reaches a count differently (runpod passes it at launch, lambda names it in the
     instance type, vast has it baked into the offer), so the allocator cannot synthesise n-card
     combinations on its own -- it must take what the provider reports. Counts are powers of two
-    because verl asserts ``num_attention_heads % sp_size == 0``, and every managed model's head
-    count is a power of two: a 3-card box would abort at step 0.
+    because vllm asserts ``num_attention_heads % tp_size == 0`` for the rollout engine, and every
+    managed model's head count is a power of two: a 3-card box would abort at engine init.
     """
     from flash.providers import get_provider
     from flash.providers.base import AllocationConstraints, rentable_gpu_counts
@@ -166,8 +166,8 @@ def test_provider_only_offers_counts_it_can_rent(all_providers_configured, provi
     counts = {c.gpu_count for c in candidates}
 
     assert counts <= {1, 2, 4, 8}, (
-        f"{provider} offered {sorted(counts - {1, 2, 4, 8})} cards, a shape verl cannot shard over "
-        f"(num_attention_heads % sp_size != 0 aborts at step 0)"
+        f"{provider} offered {sorted(counts - {1, 2, 4, 8})} cards, a shape the rollout engine "
+        f"cannot shard heads over (num_attention_heads % tp_size != 0 aborts at engine init)"
     )
     # the load-bearing half: the public maximum must reach every provider. A provider that quietly
     # capped itself at 4 would satisfy the subset check while leaving its live 8-card SKUs unreachable.

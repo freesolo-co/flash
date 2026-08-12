@@ -512,8 +512,9 @@ def _config_geometry(config: dict) -> tuple[int, int, int, int]:
         int(text.get("vocab_size") or config.get("vocab_size") or 0),
         int(text.get("hidden_size") or config.get("hidden_size") or 0),
         int(text.get("num_hidden_layers") or config.get("num_hidden_layers") or 0),
-        # QUERY heads. verl's ulysses sequence parallelism requires this to divide the card count,
-        # so it decides how wide a pinned run may be -- see `allocator.geometry_safe_gpu_cap`.
+        # QUERY heads. vllm tensor parallelism requires this to divide the card count handed to the
+        # rollout engine, so it decides how wide a pinned run may be -- see
+        # `allocator.geometry_safe_gpu_cap`.
         int(text.get("num_attention_heads") or config.get("num_attention_heads") or 0),
     )
 

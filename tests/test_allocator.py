@@ -1832,8 +1832,9 @@ def test_combo_single_kept_when_cheaper_than_combination(monkeypatch):
 def test_combo_uses_smallest_fitting_count_and_shard_margin(monkeypatch):
     """The smallest RENTABLE count that fits, with the shard margin actually deciding the boundary.
 
-    Counts are powers of two (verl shards over them: num_attention_heads % sp_size != 0 aborts at
-    step 0), so on 80 GB cards with the replicated-floor model, usable = n*(80-8)*0.85 + 8:
+    Counts are powers of two (the rollout engine shards heads over them: num_attention_heads %
+    tp_size != 0 aborts at init), so on 80 GB cards with the replicated-floor model,
+    usable = n*(80-8)*0.85 + 8:
     2 cards = 130.4 GB, 4 cards = 252.8 GB.
 
     Both needs are asserted because they pin different halves of the rule. 200 GB pins
@@ -1978,9 +1979,11 @@ def test_pinned_gpu_fit_failure_stays_a_dead_end_when_no_width_fits():
 def test_wider_shape_remedy_is_bounded_by_the_geometry_cap():
     """A suggested width must be one the model's head geometry allows.
 
-    `geometry_safe_gpu_cap` exists because verl rejects `num_attention_heads % sp_size != 0` at
-    Ulysses init -- AFTER the box is rented. A remedy that ignored it would bill the user for a
-    box that cannot start.
+    `geometry_safe_gpu_cap` exists because vllm rejects `num_attention_heads % tp_size != 0` at
+    rollout-engine init -- AFTER the box is rented. A remedy that ignored it would bill the user for
+    a box that cannot start. (This gate outlived Ulysses: sequence parallelism is pinned off on all
+    three algorithms now, but grpo and opd still hand the rented width to the rollout engine as
+    `tensor_model_parallel_size`, so head divisibility is still load-bearing.)
     """
     from flash.providers.base import GPU_INFO, wider_shape_remedy
 

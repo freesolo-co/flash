@@ -5372,7 +5372,8 @@ def _config(**overrides):
         "local_dir": "/w/checkpoints",
         "save_freq": 20,
         "n_gpus_per_node": 4,
-        "ulysses_sequence_parallel_size": 4,
+        # opd shards by data: ulysses is pinned off while all 4 cards stay in play as dp ranks.
+        "ulysses_sequence_parallel_size": 1,
         "seed": 42,
         "project_name": "flash",
         "experiment_name": "opd-test",
@@ -5431,8 +5432,10 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     # the distillation loss reads model_output["log_probs"], which the fused path emits exactly.
     assert overrides["actor_rollout_ref.model.use_fused_kernels"] == "true"
     assert overrides["actor_rollout_ref.model.fused_kernel_options.impl_backend"] == "torch"
+    # rollout TENSOR parallelism still uses every card (tp splits heads, no sequence state), while
+    # ulysses is off: the two widths are independent and only one of them is unsafe on GDN.
     assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == "4"
-    assert overrides["actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size"] == "4"
+    assert overrides["actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size"] == "1"
     assert overrides["+ray_kwargs.ray_init.num_gpus"] == "4"
     # the engine is sized to the job's own sequence length, never a hardcoded context.
     assert overrides["actor_rollout_ref.rollout.max_model_len"] == "1536"
@@ -5462,6 +5465,93 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     )
     assert multi_turn_overrides["actor_rollout_ref.rollout.prompt_length"] == "1536"
     assert multi_turn_overrides["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"] == "1536"
+
+
+@pytest.mark.parametrize("gpu_count", [1, 2, 4, 8])
+def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
+    # drives the REAL producer, not a hand-built config: the contract test above supplies its own
+    # dict, so it proves the renderer and would keep passing if the runner regressed to
+    # `ulysses_sequence_parallel_size = runtime.gpu_count`. sequence parallelism corrupts
+    # GatedDeltaNet state (ranks past 0 begin their recurrence from zero), and every catalog model is
+    # a GDN hybrid, so this must hold at every width flash can rent.
+    from flash.engine.worker import opd_train_runner as _runner
+
+    config = _runner._build_base_config(
+        request=_runner._OpdRequest(
+            spec=SimpleNamespace(),
+            env=None,
+            multi_turn=False,
+            max_turns=1,
+            knobs=SimpleNamespace(
+                max_completion=512,
+                learning_rate=1e-5,
+                group_size=2,
+                kl_coef=0.5,
+                temperature=1.0,
+                top_p=1.0,
+            ),
+            model_id="Qwen/Qwen3.5-4B",
+            model_revision="",
+        ),
+        prompt_state=_runner._PromptState(
+            teacher=None,
+            tokenizer=None,
+            thinking_prefill="",
+            max_model_len=1536,
+            prompt_budget=1024,
+            prompts=[],
+            dropped_long=0,
+        ),
+        workload=_runner._WorkloadState(
+            prompts_per_step=8,
+            update_horizon=10,
+            prompt_pool_fingerprint="f",
+            workdir="/w",
+            shim_dir="/w/shim",
+            local_dir="/w/checkpoints",
+            export_root="/w/export",
+            mutation_failure_path="/w/mutation",
+            score_delivery_failure_path="/w/score",
+            abandonment_failure_path="/w/abandon",
+            resample_failure_path="/w/resample",
+            cycle_commit_failure_path="/w/cycle",
+            train_file="/w/train.parquet",
+            val_file="/w/val.parquet",
+            lora_rank=32,
+            lora_alpha=64,
+            target_modules="all-linear",
+            warmstart_adapter=None,
+        ),
+        runtime=_runner._RuntimeState(
+            python_bin="python",
+            model_path="/models/student",
+            gpu_count=gpu_count,
+            save_freq=20,
+            loggers=[],
+            project_name="flash",
+            experiment_name="opd-test",
+            gdn_reset_arch=None,
+            entry_path="/w/shim/entry.py",
+            reward_path="/w/shim/flash_opd_reward.py",
+            resume_step=0,
+            resume_state=None,
+            bridge=SimpleNamespace(url="http://127.0.0.1:1234", token="token"),
+        ),
+        eos_token_ids=(151645,),
+    )
+
+    assert config["ulysses_sequence_parallel_size"] == 1
+    # every allocated card still trains: the cards move from sequence ranks to dp ranks, so capacity
+    # is unchanged and 32k multi-card survives.
+    assert config["n_gpus_per_node"] == gpu_count
+
+    # and the rendered child command agrees, so the pin is not lost between producer and renderer.
+    overrides = dict(
+        value.split("=", 1)
+        for value in build_opd_overrides(_config(**config, fused_ce_backend="torch"))
+    )
+    assert overrides["actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size"] == "1"
+    assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == str(gpu_count)
 
 
 def test_overrides_carry_fused_expert_target_parameters():
