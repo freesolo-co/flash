@@ -13,7 +13,7 @@ name: auto-rebake per-arch kernel cache
 #     the fresh base (docker/Dockerfile.kernelcache.relayer), no GPU.
 #   * both same -> skip (this is the pure-flash-code case the old reminder over-fired on).
 #
-# The gate READS the published labels (authoritative for what was actually built, incl. a manual FA3
+# The gate READS the published labels (authoritative for what was actually built, incl. a manual FA2
 # override) rather than recomputing from the checkout, and aborts unless the base's revision label ==
 # the build's head_sha (so a superseded base build or a `tag=...` dispatch that never touched :cu128
 # can't trigger a stale rebake).
