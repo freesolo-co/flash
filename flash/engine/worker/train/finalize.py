@@ -10,6 +10,24 @@ from flash.engine.worker.perf import gpu_diagnostics
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 
 
+def _train_meta_job_spec():
+    """the run's spec for the uploaded metrics artifact, with the base revision it trained on.
+
+    to_dict() is the PUBLIC spec and no longer emits model_revision, but this artifact records what
+    the worker actually trained against -- a run reproduced without its base revision is not the
+    same run. to_internal_dict() is the wrong fix: it would publish train.hf_repo and
+    train.init_from_adapter_revision, internal storage locators, into an artifact users download.
+    so add back the one field, and only when it is set.
+    """
+    spec = _w.JOB_SPEC
+    if not spec:
+        return None
+    data = spec.to_dict()
+    if spec.model_revision:
+        data["model_revision"] = spec.model_revision
+    return data
+
+
 def write_train_meta(
     phase,
     adapter_dir,
@@ -73,7 +91,7 @@ def write_train_meta(
             "train_wall": train_wall,
             "model_id": model_id,
             "environment": env.id,
-            "job_spec": _w.JOB_SPEC.to_dict() if _w.JOB_SPEC else None,
+            "job_spec": _train_meta_job_spec(),
         },
     )
     _w._finalize(m, heartbeat_fields=_heartbeat_fields)

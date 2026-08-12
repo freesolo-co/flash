@@ -238,7 +238,6 @@ contract should be identical — and hash the dataset files for the data half.
 ```toml
 model = "Qwen/Qwen3.5-4B"   # see `flash models list`
 project = "PROJECT_UUID"  # required UUID from `flash projects create`
-# model_revision = "main"   # optional ref resolved to an immutable hugging face commit before submit
 algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-policy distillation)
 # thinking = true           # opt-in reasoning mode, for models that support it
 # seed = 42                 # reproducible per-run seed; omitted defaults to 42

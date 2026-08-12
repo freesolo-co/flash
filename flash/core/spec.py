@@ -400,15 +400,17 @@ MANAGED_GPU_KEYS = frozenset(
     {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
 )
 
-# Removed top-level fields that a PERSISTED record can still carry. Stored run records are never
-# rewritten, and effective_preparation.worker_spec is written with to_internal_dict() (asdict), which
-# emitted every field including the defaulted ones -- so every record written before a field was
-# dropped still names it. from_dict is strict, so without this the first reload after the upgrade
-# raises and a still-running job loses its recovery, deploy, and serving paths.
+# Removed public top-level fields that a PERSISTED record can still carry. Stored run records are
+# never rewritten, and effective_preparation.worker_spec is written with to_internal_dict() (asdict),
+# which emitted every field including the defaulted ones -- so every record written before a field
+# was dropped still names it. This registry also drives historical public-digest replay for
+# model_revision, which remains an internal field. Without it a still-running job can lose its
+# recovery, deploy, and serving paths after the upgrade.
 #
-# Ignored on READ only: nothing here is a JobSpec field, so an authored config naming one is still
-# rejected as unknown by the schema layer's own key check (see schema._TOP_LEVEL_KEYS).
-_DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy", "worker_env"})
+# Ignored on READ only. Most keys here no longer exist as JobSpec fields; model_revision remains an
+# internal runner field, but the public schema rejects it and to_dict omits it. Keeping it in this set
+# lets digest recovery identify the historical public key without weakening JobSpec.from_dict.
+_DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy", "model_revision", "worker_env"})
 
 # Tolerating a dropped key keeps a pre-upgrade run's recovery path, but the values behind it stop
 # being applied -- so a run that authored them now trains on managed defaults instead of what was
@@ -463,16 +465,18 @@ class JobSpec:
     seed: int = FIXED_SEED
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
+    # internal base-model revision resolved by the runner. the public schema rejects this key, while
+    # persisted and worker specs keep it for exact model loading, profiling, geometry validation, and
+    # warm-start equality checks.
     model_revision: str = ""
-    # platform-managed marker: True when the runner resolved model_revision for a spec whose
-    # author left it blank (SFT, where `_resolve_model_revision(required=True)` pins the base so
-    # workload profiling keys on an immutable commit). An AUTHORED pin stays rejected at deploy;
-    # rejecting the auto-assigned one made every SFT run -- and every adapter warm-started from one
-    # -- permanently undeployable, unservable, and unscoreable by `flash env eval`.
+    # platform-managed marker: True when the runner resolved model_revision for a spec whose public
+    # input carried no pin (SFT, where `_resolve_model_revision(required=True)` pins the base so
+    # workload profiling keys on an immutable commit). An AUTHORED pin can still exist on a persisted
+    # pre-removal run and stays rejected at deploy; rejecting the auto-assigned one made every SFT run
+    # and every adapter warm-started from one permanently undeployable, unservable, and unscoreable by
+    # `flash env eval`.
     #
-    # stripped by to_dict() like the other platform-managed carriers: the public spec must stay
-    # re-parseable by the submission schema, which rejects every key outside `_TOP_LEVEL_KEYS`, so
-    # emitting it would break the public-spec resubmission round trip. Deploy reads the provenance
+    # stripped by to_dict() like the other platform-managed carriers. Deploy reads the provenance
     # from the internal worker spec under `effective_preparation` instead (see
     # `_internal_spec_from_status`), which carries it verbatim.
     model_revision_auto: bool = False
@@ -550,20 +554,12 @@ class JobSpec:
         data = asdict(self)
         # server-assigned identity — never authored in a config.
         data.pop("run_id", None)
-        # a runner-assigned pin leaves with its marker: emitting the SHA without the provenance
-        # that labels it would advertise a revision the author never wrote, and resubmitting that
-        # spec reads the bare SHA back as authored (`_resolve_model_revision` derives `authored`
-        # from the marker), so the re-run is stamped user-authored and deploy refuses it -- the
-        # exact rejection this pin marker exists to prevent. dropping both keeps the public spec a
-        # faithful record of what the user asked for, and the re-run gets a fresh runner pin.
-        # cleared, not popped: an unpinned spec emits `model_revision: ""`, and a spec rebuilt from
-        # this output has no marker left to re-trigger the branch -- so popping would make the key
-        # absent at create and present at re-persist, and `_preparation_digest` hashes to_dict()
-        # output. That drift breaks the integrity check on the re-persist path
-        # (`runner.submit` rebuilds public_spec from the stored dict) for the exact runs this PR
-        # exists to keep deployable. "" is also the honest value: nothing was authored.
-        if data.pop("model_revision_auto", None):
-            data["model_revision"] = ""
+        # model_revision is runner-managed and no longer part of the public config or status spec.
+        # Internal round trips keep the value and marker through to_internal_dict(). Historical public
+        # specs that emitted this key are replayed only while verifying their stored preparation
+        # digest, using the exact value from the persisted bytes.
+        data.pop("model_revision", None)
+        data.pop("model_revision_auto", None)
         # keep gpu.count=1 in the public gpu object for preparation-digest stability. only the
         # platform-managed provenance marker is stripped; internal round trips carry it verbatim.
         data.pop("gpu_count_auto", None)

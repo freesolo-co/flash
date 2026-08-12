@@ -248,6 +248,7 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
             "run_id": "source-run",
             "model": "Qwen/Qwen3.5-4B",
             "model_revision": "source-revision",
+            "model_revision_auto": True,
             "algorithm": "sft",
             "train": {"hf_repo": "owner/source-runs"},
         }
@@ -272,6 +273,80 @@ class _ReachedArtifactResolution(Exception):
     """Sentinel: execution got past the warm-start revision check."""
 
 
+def test_warm_start_inherits_a_legacy_authored_source_revision(monkeypatch):
+    """A child inherits an authored source pin without laundering its deploy provenance."""
+    from fastapi import HTTPException
+
+    import flash.runner as R
+    import flash.server.routes.serving as serving
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": _REVISION,
+            "algorithm": "grpo",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    stored_public = {**source.to_dict(), "model_revision": _REVISION}
+    source_status = R.RunStatus(
+        state="done",
+        run_id=source.run_id,
+        spec=stored_public,
+        effective_preparation={
+            "worker_spec": source.to_internal_dict(),
+            "preparation_digest": R._preparation_digest(
+                JobSpec.from_dict(stored_public),
+                source,
+                None,
+                legacy_public_keys={"model_revision": _REVISION},
+            ),
+        },
+    )
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": source.model,
+            "algorithm": "opd",
+            "train": {"init_from_adapter": source.run_id},
+        }
+    )
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+
+    inherited = R._inherit_warmstart_revision(child)
+    assert inherited.model_revision == _REVISION
+    assert inherited.model_revision_auto is False
+
+    monkeypatch.setattr(
+        "flash.adapters.lora_rank.resolve_hf_dataset_revision",
+        lambda *_a, **_kw: "rev",
+    )
+    monkeypatch.setattr(
+        "flash.runner.results.checkpoints.adapter_artifact_exists",
+        lambda *_a, **_kw: (_ for _ in ()).throw(_ReachedArtifactResolution()),
+        raising=False,
+    )
+    with pytest.raises(_ReachedArtifactResolution):
+        R._prepare_init_from_adapter_inner(child, token="token")
+
+    deploy_status = R.RunStatus(
+        state="done",
+        run_id=inherited.run_id,
+        spec=inherited.to_dict(),
+        effective_preparation={"worker_spec": inherited.to_internal_dict()},
+    )
+    with pytest.raises(HTTPException, match="legacy revision-pinned base model"):
+        serving._validate_deploy_request(
+            inherited.run_id,
+            deploy_status,
+            JobSpec.from_dict(deploy_status.spec),
+            {},
+            True,
+        )
+
+
 def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
     """A GRPO child warm-starting off SFT inherits the parent's auto pin AND its provenance.
 
@@ -280,9 +355,8 @@ def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
     the child's pin author-supplied, which deploy refuses. So a warm start off SFT could pass this
     check or be deployable, never both.
 
-    The paired control is `test_prepare_init_adapter_requires_exact_model_revision_match` above: its
-    source pin carries no marker (author-supplied), so nothing is inherited and the mismatch still
-    raises. Only the provenance differs between the two.
+    The paired mismatch control is `test_prepare_init_adapter_requires_exact_model_revision_match`
+    above: an already-pinned child is never overwritten, so a different target revision still raises.
     """
     import flash.runner as R
     from flash.core.spec import JobSpec
