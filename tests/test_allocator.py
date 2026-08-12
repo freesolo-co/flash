@@ -2198,6 +2198,48 @@ def test_exact_pin_on_a_fixed_count_provider_still_names_a_width_to_check():
     assert "`--gpus 4`" in str(combo.value)
 
 
+def test_catalog_check_is_withheld_when_no_configured_provider_carries_the_class():
+    """A width cannot rescue a class nobody in the fleet sells.
+
+    The catalog-check tier answers "this provider may sell a wider SKU". When NO configured
+    provider carries the class at all, the obstacle is the class rather than the width, and
+    `--gpus N` cannot succeed at any N -- that run belongs to the `no configured active provider`
+    rejection, which names the real problem instead of sending the user to retry a dead end.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import UnsupportedGpuError, providers_for
+
+    # H200 is runpod-only, so a lambda-only plane cannot rent it at any width.
+    assert "lambda" not in providers_for("H200")
+
+    with pytest.raises(UnsupportedGpuError) as unreachable:
+        _resolve_exact_gpu(
+            "H200",
+            need=300.0,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("lambda",),
+            widest_cap=8,
+            unpinned=("lambda",),
+        )
+    assert "--gpus" not in str(unreachable.value)
+
+    # the same class on a plane that DOES carry it keeps its remedy: the gate is reachability,
+    # not a blanket suppression.
+    with pytest.raises(UnsupportedGpuError, match=r"--gpus"):
+        _resolve_exact_gpu(
+            "H200",
+            need=300.0,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("runpod",),
+            widest_cap=8,
+            unpinned=("runpod",),
+        )
+
+
 def test_rents_arbitrary_card_counts_splits_providers_by_how_counts_are_sold():
     """The predicate must track how a count is PURCHASED, not whether the provider is configured."""
     from flash.providers.fit_errors import rents_arbitrary_card_counts

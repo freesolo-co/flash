@@ -311,8 +311,12 @@ def _resolve_exact_gpu(
         shape it does not sell with its own precise error, so naming the width to try beats a bare
         shortfall the user cannot act on. Withheld once the class is oversized at every rentable
         width, where no count would help and the honest answer is the shortfall alone.
+
+        Also withheld when NO configured provider carries this class at all: the obstacle is then
+        the class, not the width, and `--gpus N` cannot succeed at any N. That run belongs to the
+        `no configured active provider` rejection below, which names the real problem.
         """
-        if widths or unpinned_widths:
+        if widths or unpinned_widths or not (reachable or unpinned_reachable):
             return ""
         width = smallest_fitting_gpu_count(
             need, max_gpu_count=widest_cap, gpu_names=(exact,) if exact_info.validated else ()
