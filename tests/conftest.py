@@ -31,12 +31,16 @@ def _untrusted_tmpdir_ancestor(base):
     """The first ancestor of ``base`` that the env cache's trust checks will refuse, if any.
 
     Mirrors the group/other-writable-without-sticky-bit rule in
-    ``flash.envs.cache_security.validate_cache_root_ancestors``. Kept as a plain predicate so the
-    diagnostic below can name the offending path rather than restating the rule.
+    ``flash.envs.cache_security.validate_cache_root_ancestors``, including the chain it walks:
+    raw parents AND resolved ones. A symlinked temp root makes those two different sets, and the
+    exception names whichever one it found -- so walking only the raw chain returns a path that
+    never appears in the message, and the caller's causality check silently drops the diagnostic
+    on exactly the setup that most needs it.
     """
     import stat
 
-    for ancestor in (base, *base.parents):
+    chain = (base, *base.parents, base.resolve(), *base.resolve().parents)
+    for ancestor in dict.fromkeys(chain):
         try:
             info = ancestor.stat()
         except OSError:
@@ -80,7 +84,15 @@ def pytest_runtest_makereport(item, call):
     text = str(excinfo.value)
     if "env cache root ancestor" not in text or "sticky bit" not in text:
         return
-    base = item.config._tmp_path_factory.getbasetemp()
+    # a diagnostic must never be able to replace the failure it is explaining. `getbasetemp()`
+    # CREATES the root on first call, so a failure that happened before any `tmp_path` fixture ran
+    # -- a cache under HOME, say -- would create it here during reporting, and an unwritable
+    # `--basetemp` parent would then raise inside the hook and surface as an INTERNALERROR that
+    # buries the original traceback.
+    try:
+        base = item.config._tmp_path_factory.getbasetemp()
+    except Exception:
+        return
     ancestor, mode = _untrusted_tmpdir_ancestor(base)
     if ancestor is None:
         return
