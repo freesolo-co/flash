@@ -422,10 +422,12 @@ def test_sft_launches_the_resolved_width_not_the_allocated_cards():
 
     assert line == 'f"--nproc-per-node={world_size}",', line
     assert '"n_gpus_per_node": world_size,' in src
-    # and the width is the RESOLVED one, not the raw allocation.
-    assert (
-        "world_size = _resolve_sft_world_size("
-        "options.gpu_count, model.train_batch_size, len(data.rows))" in src
+    # and the width is the RESOLVED one, not the raw allocation. the resolution lives in
+    # `_resolve_sft_width_and_micro_batch` (it also caps the micro-batch, which needs the width),
+    # so follow it there rather than pinning a call that moved.
+    assert "_resolve_sft_width_and_micro_batch(options, data, model)" in src
+    assert "options.gpu_count" in inspect.getsource(
+        sft_train_runner._resolve_sft_width_and_micro_batch
     )
 
 
@@ -2651,7 +2653,9 @@ def test_sft_resume_guard_checks_the_launched_width_not_the_allocation():
     assert "world_size=options.gpu_count" not in src
 
     # and the resolved width must be established before the resume call that consumes it.
-    assert src.index("world_size = _resolve_sft_world_size(") < src.index("_restore_verl_resume(")
+    assert src.index("world_size, micro_batch = _resolve_sft_width_and_micro_batch(") < src.index(
+        "_restore_verl_resume("
+    )
 
 
 def test_publish_does_not_leave_every_step_adapter_on_the_container_disk(monkeypatch, tmp_path):
@@ -3392,3 +3396,40 @@ def test_the_worker_disables_xet_as_its_very_first_action():
         f"_run_worker_mode starts by calling {name!r}, not _disable_xet_upload_staging; "
         "uploads would stage a second copy of every checkpoint through the xet cache"
     )
+
+
+def test_sft_micro_batch_never_exceeds_a_ranks_share_of_the_batch():
+    """The micro-batch is sized against the GLOBAL batch, but each rank only sees its slice.
+
+    Pinning ulysses off makes SFT shard by DATA, so verl hands each rank
+    `train_batch_size // world_size` and rejects a micro-batch larger than that before the first
+    optimizer step. Batch 8 on 4 ranks is a per-rank batch of 2, so a micro-batch of 4 -- correct
+    for the global batch -- is an incompatible geometry the run dies on.
+
+    Asserted on the config the child actually receives, because the micro-batch is computed long
+    before `world_size` is resolved; a test that only exercised the sizing helper would keep passing
+    while the call site shipped the uncapped value.
+    """
+    from types import SimpleNamespace
+
+    from flash.engine.worker import sft_train_runner as runner
+
+    def capped(train_batch_size, micro_batch, gpu_count, rows):
+        _world, mb = runner._resolve_sft_width_and_micro_batch(
+            SimpleNamespace(gpu_count=gpu_count),
+            SimpleNamespace(rows=[{}] * rows),
+            SimpleNamespace(train_batch_size=train_batch_size, micro_batch=micro_batch),
+        )
+        return mb
+
+    # codex's case: batch 8 across 4 ranks -> per-rank 2, so a global-derived 4 must come down
+    assert capped(8, 4, 4, 64) == 2
+    # and the token budget must follow the same number, not the uncapped one
+    assert capped(8, 4, 8, 64) == 1
+    # a micro-batch already within the rank's share is untouched
+    assert capped(8, 2, 4, 64) == 2
+    assert capped(8, 1, 4, 64) == 1
+    # single card: the rank owns the whole batch, so nothing is capped away
+    assert capped(8, 4, 1, 64) == 4
+    # never zero -- a DataLoader with batch_size=0 raises
+    assert capped(1, 4, 8, 64) >= 1

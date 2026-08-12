@@ -473,6 +473,34 @@ def _resolve_sft_world_size(gpu_count: int, train_batch_size: int, row_count: in
     return world_size
 
 
+def _resolve_sft_width_and_micro_batch(
+    options: _SftOptions, data: _SftData, model: _SftModelSetup
+) -> tuple[int, int]:
+    """The data-parallel width and the micro-batch that fits one rank's share of the batch.
+
+    Resolved together because the second depends on the first: the micro-batch was sized against
+    the GLOBAL batch, but each rank only ever receives ``train_batch_size // world_size``. verl
+    rejects a micro-batch larger than the per-rank batch before the first optimizer step, so batch
+    8 across 4 ranks -- per-rank 2 -- cannot keep a micro-batch of 4. The token budget derives from
+    the capped value too, or it reserves for rows the rank never receives.
+    """
+    world_size = _resolve_sft_world_size(options.gpu_count, model.train_batch_size, len(data.rows))
+    micro_batch = max(1, min(model.micro_batch, model.train_batch_size // max(1, world_size)))
+    return world_size, micro_batch
+
+
+def _resolve_sft_run_identity(
+    options: _SftOptions, capabilities: _SftCapabilities
+) -> tuple[list[str], str, str]:
+    """The child's ``(loggers, project_name, experiment_name)``."""
+    # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
+    loggers = _sft_train.resolve_verl_loggers(capabilities.caps)
+    project_name = (
+        options.spec.wandb.project if options.spec and options.spec.wandb else None
+    ) or "flash"
+    return loggers, project_name, _w.wandb_run_name()
+
+
 def _prepare_sft_child(
     options: _SftOptions,
     data: _SftData,
@@ -482,12 +510,7 @@ def _prepare_sft_child(
     gdn_reset_arch: str | None,
 ) -> _SftChild:
     model_path = _sft_train._cached_model_path(options.model_id, options.model_revision)
-    # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
-    loggers = _sft_train.resolve_verl_loggers(capabilities.caps)
-    project_name = (
-        options.spec.wandb.project if options.spec and options.spec.wandb else None
-    ) or "flash"
-    experiment_name = _w.wandb_run_name()
+    loggers, project_name, experiment_name = _resolve_sft_run_identity(options, capabilities)
     shim_dir = os.path.join(options.paths.workdir, "shim")
     os.makedirs(shim_dir, exist_ok=True)
     custom_dataset_path = os.path.join(shim_dir, "flash_verl_sft_dataset.py")
@@ -498,13 +521,13 @@ def _prepare_sft_child(
     # `gdn_reset_arch` is resolved by the caller, inside the configuring liveness wrap, because the
     # probe is part of the setup silence that wrap exists to cover, and because a packed run must
     # take the RAISING gate there rather than the soft form.
-    world_size = _resolve_sft_world_size(options.gpu_count, model.train_batch_size, len(data.rows))
+    world_size, micro_batch = _resolve_sft_width_and_micro_batch(options, data, model)
     config = {
         "train_files": data.train_file,
         "train_batch_size": model.train_batch_size,
         "max_length": data.max_length,
-        "micro_batch": model.micro_batch,
-        "max_token_len_per_gpu": data.realized_max_length * model.micro_batch,
+        "micro_batch": micro_batch,
+        "max_token_len_per_gpu": data.realized_max_length * micro_batch,
         "custom_dataset_path": custom_dataset_path,
         "model_path": model_path,
         "lora_rank": model.lora_rank,
