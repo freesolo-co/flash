@@ -47,13 +47,12 @@ class _RawRecordEnvironment:
         return list(self.rows)
 
     def prompt_messages(self, row: dict[str, Any]) -> list[dict[str, Any]]:
-        value = row.get(_CANONICAL_INPUT_KEY)
-        if _is_message_list(value):
-            messages = _copied_messages(value, field="input")
-        elif isinstance(value, dict) and set(value) == {"messages"}:
-            messages = _copied_messages(value["messages"], field="input")
-        else:
-            messages = [{"role": "user", "content": "" if value is None else str(value)}]
+        # the worker never reads the raw input itself: it builds a TaskExample, whose .input the sdk
+        # has already rendered to text, and the scaffolded env puts exactly that string in one user
+        # turn (flash/envs/adapter.py:_task_example). so render it through the sdk here too. str()
+        # would tokenize a python repr, and reading a message-shaped input as a transcript would
+        # quote a prompt the sdk never produces.
+        messages = [{"role": "user", "content": _task_example_input(row)}]
         return _with_system_prompt(messages, self.contract_text)
 
     def sft_completion_with_provenance(
@@ -70,11 +69,25 @@ class _RawRecordEnvironment:
                     f"{sibling_keys}; expected exactly {{'messages': [...]}}"
                 )
             return _copied_messages(value["messages"], field="output"), False
+        # the adapter coerces a scalar output with str(), not serialize_value: unlike input, the
+        # gold completion never passes through the sdk's record normalization.
         return [{"role": "assistant", "content": "" if value is None else str(value)}], True
 
 
 def _is_message_list(value: object) -> bool:
     return isinstance(value, list) and any(isinstance(message, dict) for message in value)
+
+
+def _task_example_input(row: dict[str, Any]) -> str:
+    """the prompt text the sdk would hand the environment for ``row``.
+
+    ``task_example_from_record`` is what the worker calls, and it renders ``input`` through
+    ``serialize_value``: a string is stripped and anything else becomes sorted-key json. calling the
+    sdk rather than restating its rules keeps the quote on the worker's exact token stream.
+    """
+    from freesolo.datasets.records import task_example_from_record
+
+    return str(task_example_from_record(row).input)
 
 
 def _with_system_prompt(messages: list[dict[str, Any]], contract_text: str) -> list[dict[str, Any]]:

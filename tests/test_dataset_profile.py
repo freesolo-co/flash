@@ -197,6 +197,50 @@ def test_profile_uses_explicit_records_instead_of_a_packaged_dataset_file(
     assert seen["rows"] == [{"input": "explicit", "output": "yes"}]
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"question": "what is 2+2?"},
+        {"a": 1, "messages": [{"role": "user", "content": "hi"}]},
+        {"messages": [{"role": "user", "content": "hi"}]},
+        [{"role": "user", "content": "hi"}],
+        [1, 2, 3],
+        "  padded  ",
+        42,
+    ],
+)
+def test_profile_builds_the_prompt_text_the_worker_would_build(value, tmp_path) -> None:
+    # the worker reaches the environment through a TaskExample, so the sdk has already rendered
+    # .input to text by the time any prompt is built. quoting a python repr, or reading a
+    # message-shaped input as a transcript, prices a prompt training never sees. assert against the
+    # sdk call the worker makes rather than a restatement of its rules.
+    from freesolo.datasets.records import task_example_from_record
+
+    from flash.engine.profiling.dataset_profile import _RawRecordEnvironment
+
+    row = {"input": value, "output": "gold"}
+    env = _RawRecordEnvironment(rows=[row], package_root=tmp_path)
+
+    prompt = env.prompt_messages(row)
+
+    assert prompt == [{"role": "user", "content": task_example_from_record(row).input}]
+
+
+def test_profile_coerces_a_scalar_output_the_way_the_worker_adapter_does(tmp_path) -> None:
+    # the gold completion does NOT pass through record normalization: the adapter coerces a scalar
+    # output with str(). matching serialize_value here instead would re-introduce the divergence in
+    # the other direction.
+    from flash.engine.profiling.dataset_profile import _RawRecordEnvironment
+
+    row = {"input": "q", "output": {"answer": 4}}
+    env = _RawRecordEnvironment(rows=[row], package_root=tmp_path)
+
+    completion, inferred = env.sft_completion_with_provenance(row)
+
+    assert inferred is True
+    assert completion == [{"role": "assistant", "content": str({"answer": 4})}]
+
+
 def test_profile_uses_explicit_records_when_the_package_has_no_dataset_file(tmp_path) -> None:
     entrypoint = _package(tmp_path, {})
 
@@ -296,22 +340,20 @@ def test_training_contract_participates_in_retention_and_truncation(tmp_path) ->
         _profile(entrypoint)
 
 
-def test_profile_does_not_override_an_existing_nonblank_system_message(tmp_path) -> None:
+def test_profile_prices_the_training_contract_as_the_system_prompt(tmp_path) -> None:
+    # a raw record cannot carry its own system turn: the sdk renders input to text, so the contract
+    # is always the system message and its size is part of every quoted row.
     entrypoint = _package(
         tmp_path,
-        {
-            "dataset/train.jsonl": (
-                '{"input":[{"role":"system","content":"record system"},'
-                '{"role":"user","content":"prompt"}],"output":"answer"}\n'
-            ),
-            "TRAINING_CONTRACT.md": "package contract that must not replace the record system",
-        },
+        {"dataset/train.jsonl": '{"input":"prompt","output":"answer"}\n'},
     )
 
-    _spec_value, contracted = _profile(entrypoint)
-    _spec_value, same_record = _profile(entrypoint, params={"contract_text": "other contract"})
+    _spec_value, short = _profile(entrypoint, params={"contract_text": "short"})
+    _spec_value, long_contract = _profile(
+        entrypoint, params={"contract_text": "a slightly longer training contract"}
+    )
 
-    assert contracted.real_tokens_per_epoch == same_record.real_tokens_per_epoch
+    assert long_contract.real_tokens_per_epoch > short.real_tokens_per_epoch
 
 
 def test_profile_rejects_dataset_path_outside_the_package(tmp_path) -> None:
@@ -354,11 +396,13 @@ def test_profile_tokenizes_raw_record_fields_and_message_shapes_only(tmp_path) -
 
 
 def test_profile_rejects_mixed_message_lists(tmp_path) -> None:
+    # only the gold completion is read as a message list; the adapter validates that shape and the
+    # profile has to refuse the same rows rather than quote a run the worker will reject.
     entrypoint = _package(
         tmp_path,
         {
             "dataset/train.jsonl": (
-                '{"input":[{"role":"user","content":"prompt"},"invalid"],"output":"answer"}\n'
+                '{"input":"prompt","output":[{"role":"assistant","content":"a"},"invalid"]}\n'
             )
         },
     )
