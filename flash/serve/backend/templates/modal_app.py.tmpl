@@ -166,6 +166,14 @@ def _lora_id_key(int_id: int) -> str:
     return f"loraid:{{int_id}}"
 
 
+# How many times to re-contest a LoRA id whose holder vanished mid-claim. See `_claim_lora_int_id`.
+_CLAIM_ATTEMPTS = 3
+
+# How many times undeploy re-reads a run's membership before answering. Each extra pass costs one
+# indexed read and only happens when a registration landed during the previous one. See `remove`.
+_UNDEPLOY_PASSES = 3
+
+
 async def _claim_lora_int_id(int_id: int, adapter_id: str) -> str:
     """Claim ``int_id`` for ``adapter_id``, returning whichever adapter actually holds it.
 
@@ -178,12 +186,25 @@ async def _claim_lora_int_id(int_id: int, adapter_id: str) -> str:
     ``put(skip_if_exists=True)`` is an atomic insert-if-absent, so exactly one adapter wins. A
     re-registration of the same adapter re-reads its own claim and proceeds, which keeps a retried
     load from being refused by its own earlier attempt.
+
+    Looped, because insert and read are two calls and the owner can vanish between them: if the
+    holder is undeployed in that gap the read returns None, and answering with the caller's own id
+    would report a claim that was never recorded -- leaving the slot free for the old owner to
+    re-register into while this adapter downloads, so both end up resident under one vLLM id. So a
+    vacated slot is re-contested rather than assumed. Bounded rather than `while True`: each pass
+    needs another adapter to have been undeployed in a specific window, so an unbounded loop could
+    only ever spin on a Dict that is misbehaving. Exhausting the attempts answers with the caller's
+    own id, which is the conservative direction -- it lets the load proceed rather than refusing a
+    legitimate adapter over a slot nobody holds.
     """
     key = _lora_id_key(int_id)
-    if await adapter_records.put.aio(key, adapter_id, skip_if_exists=True):
-        return adapter_id
-    owner = await adapter_records.get.aio(key)
-    return str(owner) if owner is not None else adapter_id
+    for _ in range(_CLAIM_ATTEMPTS):
+        if await adapter_records.put.aio(key, adapter_id, skip_if_exists=True):
+            return adapter_id
+        owner = await adapter_records.get.aio(key)
+        if owner is not None:
+            return str(owner)
+    return adapter_id
 
 
 async def _release_lora_int_id(int_id: int, adapter_id: str) -> bool:
@@ -707,17 +728,50 @@ def api():
             return False
         return bool(getattr(stats, "num_total_runners", 0))
 
+    async def _spawn_settle(record: dict[str, Any]) -> None:
+        """Hand the load to a worker, marking the record `failed` if the handoff itself fails.
+
+        A raise here would otherwise return 500 over a durable record still reading `registered` --
+        and the client's ambiguous-registration recovery re-reads that record, sees a matching
+        identity, concludes the registration DID land, and polls it for the full five-minute
+        readiness budget instead of repeating the idempotent POST. The deploy then fails as a
+        timeout, which reads as a slow GPU rather than as a queue that never accepted the work.
+
+        `failed` is the honest terminal state and the useful one: it is what the client treats as a
+        real failure, and re-registering is what clears it, so the operator's natural next move is
+        the one that fixes it.
+        """
+        try:
+            settle_adapter.spawn(record)
+        except Exception as exc:
+            record["status"] = "failed"
+            record["metadata"] = {{
+                **(record.get("metadata") or {{}}),
+                "lifecycle_state": "failed",
+                "failure": f"could not enqueue the adapter load: {{exc}}",
+            }}
+            await _write(record)
+            raise
+
     def _require_key(request: Request) -> None:
         """Authenticate the caller when a key is configured.
 
         FLASH_SERVING_KEY is optional but strongly recommended: without it, anyone who finds this
         URL can register adapters and spend your GPU budget. flash sends the value of
         FREESOLO_INTERNAL_KEY in this header.
+
+        Both sides are STRIPPED, and they have to agree on that. The client strips before building
+        the header (`flash/serve/urls.py:internal_key_header`), so a secret stored with surrounding
+        whitespace -- which is easy to produce, since a shell heredoc or a copied line carries a
+        trailing newline -- makes the operator supply the identical raw value on both sides and get
+        a 401 on every request, while `/healthz` cheerfully reports `requires_key: true`. Stripping
+        here is not a weakening: a key that differs only in surrounding whitespace is the same key,
+        and the comparison stays constant-time over the normalized values.
         """
-        expected = os.environ.get("FLASH_SERVING_KEY") or ""
+        expected = (os.environ.get("FLASH_SERVING_KEY") or "").strip()
         if not expected:
             return
-        presented = request.headers.get("X-Freesolo-Internal-Key") or ""
+        presented = (request.headers.get("X-Freesolo-Internal-Key") or "").strip()
         # constant time, so a wrong key cannot be discovered one character at a time
         if not hmac.compare_digest(presented, expected):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid serving key")
@@ -762,7 +816,10 @@ def api():
             # Whether this app authenticates writes at all. Deliberately not the key itself, and
             # not a per-request answer: `flash serve setup` reads it once after deploying to warn
             # about a URL that anyone could register adapters against.
-            "requires_key": bool(os.environ.get("FLASH_SERVING_KEY")),
+            # Stripped, matching `_require_key`: a whitespace-only value authenticates nothing, so
+            # reporting `true` for it would tell `flash serve setup` the URL is guarded when it is
+            # wide open -- suppressing the one warning that would have caught it.
+            "requires_key": bool((os.environ.get("FLASH_SERVING_KEY") or "").strip()),
             # Only what this backend genuinely implements. `revision_provenance` is advertised
             # because the records below echo the run/checkpoint/hf_revision metadata back.
             # thinking_structured_outputs_deferred_v1 is NOT advertised: deferring a grammar until
@@ -854,7 +911,7 @@ def api():
                 # only by a new artifact.
                 await _ensure_run_alias(run_id, adapter_id)
                 if state != "ready":
-                    settle_adapter.spawn(existing)
+                    await _spawn_settle(existing)
                 return {{"ok": True, "adapter": existing}}
             record["metadata"]["settle_attempt"] = uuid.uuid4().hex
             await _write(record)
@@ -865,7 +922,7 @@ def api():
         # next poll is load balanced to a different replica, nothing is left to notice. The record
         # then sits in `registered` forever and the deploy times out with the GPU perfectly healthy.
         # `spawn` hands the work to Modal, which runs it server-side and survives the response.
-        settle_adapter.spawn(record)
+        await _spawn_settle(record)
         return {{"ok": True, "adapter": record}}
 
     @web.get("/adapters/{{adapter_id:path}}")
@@ -980,20 +1037,34 @@ def api():
             # pass overwrites the alias afterwards, so the run ends fully disabled either way. And
             # an activation landing after the alias write cannot resurrect it: `activate` re-reads
             # its revision under the lock and 409s because this pass already disabled it.
-            for member_id in sorted(members, key=lambda m: m == run_id):
-                candidate = await _read(member_id)
-                if not isinstance(candidate, dict):
-                    continue
-                metadata = candidate.get("metadata") or {{}}
-                if metadata.get("run_id") != run_id or candidate.get("status") == "disabled":
-                    continue
-                candidate["status"] = "disabled"
-                candidate["metadata"] = {{**metadata, "lifecycle_state": "disabled"}}
-                await _write(candidate)
-                if metadata.get("record_type") == "alias":
-                    disabled_aliases.append(candidate["adapter_id"])
-                else:
-                    disabled_revisions.append(candidate["adapter_id"])
+            #
+            # And re-read between passes, because alias-last bounds the DAMAGE of a lost lease but
+            # not the omission: a registration landing after this read appends to `members:`, and a
+            # pass working from the stale list never reaches that revision -- it settles to `ready`
+            # and stays callable by its immutable id while undeploy reports 200. Looping until the
+            # membership stops growing closes it, and the loop terminates because each extra pass
+            # requires another registration to have landed inside it.
+            seen: set[str] = set()
+            for _ in range(_UNDEPLOY_PASSES):
+                pending = [member for member in members if member not in seen]
+                if not pending:
+                    break
+                seen.update(pending)
+                for member_id in sorted(pending, key=lambda m: m == run_id):
+                    candidate = await _read(member_id)
+                    if not isinstance(candidate, dict):
+                        continue
+                    metadata = candidate.get("metadata") or {{}}
+                    if metadata.get("run_id") != run_id or candidate.get("status") == "disabled":
+                        continue
+                    candidate["status"] = "disabled"
+                    candidate["metadata"] = {{**metadata, "lifecycle_state": "disabled"}}
+                    await _write(candidate)
+                    if metadata.get("record_type") == "alias":
+                        disabled_aliases.append(candidate["adapter_id"])
+                    else:
+                        disabled_revisions.append(candidate["adapter_id"])
+                members = list(dict.fromkeys([*members, *await _run_members(run_id)]))
         # Outside the lock: evicting from the GPU is slow and best effort, and the records are
         # already durably disabled, so holding the lock across it would only block other deploys.
         #

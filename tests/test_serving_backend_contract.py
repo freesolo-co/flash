@@ -1182,6 +1182,65 @@ def test_undeploy_works_when_the_member_index_is_missing(client):
     assert response.json()["disabled_revisions"] == [REVISION]
 
 
+def test_a_registration_landing_during_the_disable_pass_is_still_undeployed(client):
+    """Membership must be re-read between passes, not snapshotted once inside the lock.
+
+    Alias-last bounds the DAMAGE of losing the lease mid-pass, but not the omission: a registration
+    that lands after the membership read appends to `members:`, and a pass working from the stale
+    list never reaches that revision. It settles to `ready`, stays resident, and stays callable by
+    its immutable id while undeploy answers 200 -- the same "success over a live run" this endpoint
+    exists to rule out, arriving one step later.
+
+    Driven by appending a member during the first pass's writes, which is exactly where a
+    concurrent registration lands.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    late = "run-abc@step-30." + "c" * 40
+    records = module.adapter_records
+    landed: list[str] = []
+
+    class _RegisterDuringPass(type(records)):
+        def _put(self, key, value, skip_if_exists=False):
+            result = super()._put(key, value, skip_if_exists=skip_if_exists)
+            # after the first record is disabled, a registration completes and indexes itself.
+            if not landed and isinstance(value, dict) and value.get("status") == "disabled":
+                landed.append(late)
+                dict.__setitem__(
+                    self,
+                    module._record_key(late),
+                    {
+                        "adapter_id": late,
+                        "status": "ready",
+                        "base_model": BASE_MODEL,
+                        "metadata": {
+                            "record_type": "revision",
+                            "run_id": RUN_ID,
+                            "lifecycle_state": "ready",
+                        },
+                    },
+                )
+                members = dict.get(self, module._members_key(RUN_ID)) or []
+                dict.__setitem__(self, module._members_key(RUN_ID), [*members, late])
+            return result
+
+    hooked = _RegisterDuringPass()
+    hooked.update(records)
+    module.adapter_records = hooked
+    try:
+        response = client.delete(f"/adapters/{RUN_ID}")
+        after = hooked[module._record_key(late)]
+    finally:
+        module.adapter_records = records
+
+    assert response.status_code == 200
+    assert landed, "no registration landed during the pass, so this test did not exercise the race"
+    assert after["status"] == "disabled", (
+        "a revision registered during the disable pass was never revisited, so it is still ready, "
+        "still resident, and still callable after undeploy reported success"
+    )
+
+
 def test_undeploying_an_idle_run_does_not_cold_start_the_gpu(client):
     """Eviction must be skipped when every container is scaled to zero.
 
@@ -1507,6 +1566,124 @@ def test_two_adapters_sharing_one_lora_int_id_are_refused_not_aliased(client, mo
     result = _run_awaitable_result(engine_class.register(instance, second))
     assert result["ok"] is False
     assert "collision" in result["failure"]
+
+
+def test_a_lora_claim_whose_owner_vanishes_is_recontested(client):
+    """A vacated claim must be re-contested, not assumed.
+
+    `put(skip_if_exists=True)` and the follow-up `get` are two calls, so the holder can be
+    undeployed between them and the read returns None. Answering with the caller's own id there
+    reports a claim that was never RECORDED -- the slot stays free, the old owner can re-register
+    into it while this adapter downloads, and both end up resident under one vLLM id, which is the
+    aliasing the collision guard exists to prevent.
+
+    Driven by emptying the slot between the insert and the read, which is exactly that window.
+    """
+    module = client.app.state.generated_module
+    records = module.adapter_records
+    key = module._lora_id_key(777)
+    dict.__setitem__(records, key, "run-old@final." + "a" * 40)
+    mine = "run-new@final." + "b" * 40
+    vacated: list[str] = []
+
+    class _OwnerVanishes(type(records)):
+        @property
+        def get(self):
+            async def _read(k, default=None):
+                value = dict.get(self, k, default)
+                if k == key and not vacated:
+                    vacated.append(k)
+                    dict.pop(self, k, None)
+                    return None
+                return value
+
+            gated = _Aio(lambda k, default=None: dict.get(self, k, default))
+            gated.aio = _read
+            return gated
+
+    hooked = _OwnerVanishes()
+    hooked.update(records)
+    module.adapter_records = hooked
+    try:
+        owner = _run_awaitable_result(module._claim_lora_int_id(777, mine))
+    finally:
+        module.adapter_records = records
+
+    assert vacated, "the owner never vanished, so this test did not exercise the window"
+    assert owner == mine, "a vacated slot must be claimable"
+    assert dict.get(hooked, key) == mine, (
+        "the claim was reported without being recorded, so the slot is still free for another "
+        "adapter to take while this one downloads"
+    )
+
+
+def test_a_failed_settle_handoff_is_recorded_as_failed(client):
+    """A spawn that never queues must not leave a durable `registered` record.
+
+    The client's ambiguous-registration recovery re-reads the record after a 5xx: a matching
+    identity in `registered` reads as "the registration landed, settling is in progress", so it
+    polls for the full readiness budget instead of repeating the idempotent POST. The deploy then
+    fails as a timeout, which points at a slow GPU rather than at a queue that refused the work.
+    """
+    module = client.app.state.generated_module
+    original = module.settle_adapter
+
+    def _refuse(record):
+        raise RuntimeError("queue unavailable")
+
+    module.settle_adapter = types.SimpleNamespace(spawn=_refuse)
+    try:
+        # TestClient re-raises rather than rendering the 500 a deployed app would return; the
+        # failure surfacing at all is the point, and what it leaves behind is what is asserted.
+        with pytest.raises(RuntimeError, match="queue unavailable"):
+            client.post("/adapters", json=REGISTRATION)
+    finally:
+        module.settle_adapter = original
+
+    record = module.adapter_records[module._record_key(REVISION)]
+    assert record["metadata"]["lifecycle_state"] == "failed", (
+        "the record was left `registered` with nothing to advance it, so the client polls it to "
+        "timeout instead of re-registering"
+    )
+    assert "enqueue" in record["metadata"]["failure"]
+
+
+@pytest.mark.parametrize(
+    ("configured", "presented"),
+    [("sekrit\n", "sekrit"), (" sekrit ", "sekrit"), ("sekrit", "sekrit\n")],
+    ids=["trailing-newline-in-secret", "padded-secret", "padded-header"],
+)
+def test_the_serving_key_is_compared_after_stripping(client, monkeypatch, configured, presented):
+    """Both sides must normalize the same way, or an identical key 401s.
+
+    The client strips before building the header (`flash/serve/urls.py:internal_key_header`), so a
+    secret stored with surrounding whitespace -- a heredoc or a copied line carries a trailing
+    newline -- makes an operator who supplied the same raw value on both sides get a 401 on every
+    request, while `/healthz` reports `requires_key: true`.
+    """
+    monkeypatch.setenv("FLASH_SERVING_KEY", configured)
+    response = client.get("/healthz", headers={"X-Freesolo-Internal-Key": presented})
+    assert response.status_code == 200
+    ready = client.post(
+        "/adapters", json=REGISTRATION, headers={"X-Freesolo-Internal-Key": presented}
+    )
+    assert ready.status_code != 401, (
+        f"a key configured as {configured!r} rejected the same key presented as {presented!r}"
+    )
+
+
+def test_a_whitespace_only_serving_key_is_not_advertised_as_authentication(client, monkeypatch):
+    """`requires_key` must report what `_require_key` actually enforces.
+
+    A whitespace-only value authenticates nothing, so advertising `true` for it tells
+    `flash serve setup` the URL is guarded when it is wide open -- suppressing the one warning
+    that would have caught an unauthenticated public endpoint.
+    """
+    monkeypatch.setenv("FLASH_SERVING_KEY", "   ")
+    assert client.get("/healthz").json()["requires_key"] is False
+    assert client.post("/adapters", json=REGISTRATION).status_code != 401, (
+        "requires_key and _require_key disagree about whether this app authenticates"
+    )
 
 
 def test_two_adapters_do_not_share_one_download_directory(client):
