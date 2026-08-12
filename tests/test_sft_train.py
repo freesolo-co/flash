@@ -1946,6 +1946,65 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     assert [step for _adapter, step in captured["published"]] == [2]
 
 
+def test_worker_uses_the_accepted_unpacked_quote_when_its_stack_can_pack(monkeypatch):
+    """worker capability must not replace the packing contract the user accepted.
+
+    the control plane lacks the gdn packing stack and freezes an exact-unpacked quote, while the gpu
+    worker has that stack and would independently choose packed execution. rows still come from the
+    worker recomputation, but the child batch and update horizon must remain the quoted shape.
+    """
+    from flash.engine.profiling import sft_workload
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    monkeypatch.setattr(sft_workload, "probe_is_gdn_hybrid", lambda _m, revision="": True)
+    monkeypatch.setattr(
+        sft_workload, "gdn_packing_contract_available", lambda _m, revision="": True
+    )
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+    recomputed_profiles = []
+    prepare = sft_train.prepare_sft_workload
+
+    def capture_recomputed_profile(*args, **kwargs):
+        prepared = prepare(*args, **kwargs)
+        recomputed_profiles.append(prepared.profile)
+        return prepared
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", capture_recomputed_profile)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    data = sft_train_runner._prepare_sft_data(options)
+    model = sft_train_runner._prepare_sft_model(options, data)
+
+    assert recomputed_profiles[0].packing_mode == "packed"
+    assert recomputed_profiles[0].examples_per_update == 2
+    assert data.profile.packing_mode == "exact-unpacked"
+    assert data.profile.examples_per_update == 1
+    assert model.train_batch_size == 1
+    assert model.update_horizon == data.profile.authoritative_steps
+
+
+def test_a_packed_quote_fails_closed_when_the_worker_cannot_pack_safely(monkeypatch):
+    """a worker without boundary resets must never execute a packed accepted quote."""
+    from flash.engine.profiling.workload_profile import SftWorkloadProfile
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    quoted = SftWorkloadProfile.from_dict(spec.workload_profile)
+    spec.workload_profile = replace(
+        quoted,
+        packing_mode="packed",
+        architecture_mode="gdn-hybrid",
+        examples_per_update=2,
+        packed_blocks=1,
+    ).to_dict()
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    with pytest.raises(RuntimeError, match="cannot reproduce its boundary-safe packing contract"):
+        sft_train_runner._prepare_sft_data(options)
+
+
 def test_environment_processing_may_change_the_static_estimate_without_repricing(
     monkeypatch, capsys
 ):

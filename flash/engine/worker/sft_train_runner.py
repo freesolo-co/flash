@@ -236,19 +236,25 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
         tokenizer_revision=options.model_revision,
     )
     rows = prepared_workload.rows
-    profile = prepared_workload.profile
+    realized_profile = prepared_workload.profile
     # the control-plane profile uses raw packaged record fields and deliberately does not execute
     # environment.py. training does execute the environment, so filtering and prompt construction may
-    # change token totals. keep the quote profile as the cost contract and use the recomputed profile
-    # only for the rows training actually consumes.
-    if prepared_workload.profile != expected_profile:
+    # change token totals. keep the quote profile as the packing and step contract while using the
+    # recomputed measurements and rows for the environment-produced training data.
+    if expected_profile.packing_mode == "packed" and realized_profile.packing_mode != "packed":
+        raise RuntimeError(
+            "the accepted sft quote requires packed execution, but this worker cannot reproduce its "
+            "boundary-safe packing contract"
+        )
+    if realized_profile != expected_profile:
         print(
             "[sft][warn] environment processing changed the packaged-dataset token estimate; "
             "training continues on the environment-produced rows, and the accepted quote is unchanged"
         )
-    max_length = _sft_train._sft_profile_max_length(profile)
-    dropped = profile.dropped_examples
-    selected_count = profile.selected_examples
+    profile = expected_profile
+    max_length = _sft_train._sft_profile_max_length(realized_profile)
+    dropped = realized_profile.dropped_examples
+    selected_count = realized_profile.selected_examples
     sampled_texts = prepared_workload.sampled_texts
     multiturn_targets = prepared_workload.multiturn_targets
     coerced_singleturn_targets = prepared_workload.coerced_singleturn_targets
@@ -279,9 +285,9 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
             "training on non-reasoning targets teaches the model to skip thinking"
         )
 
-    total_tokens_per_epoch = profile.real_tokens_per_epoch
-    realized_max_length = profile.realized_max_length
-    masked_tokens = total_tokens_per_epoch - profile.supervised_tokens_per_epoch
+    total_tokens_per_epoch = realized_profile.real_tokens_per_epoch
+    realized_max_length = realized_profile.realized_max_length
+    masked_tokens = total_tokens_per_epoch - realized_profile.supervised_tokens_per_epoch
     print(
         f"[sft] completion-only loss: masking {masked_tokens}/{total_tokens_per_epoch} "
         f"({masked_tokens / total_tokens_per_epoch:.0%}) prompt tokens"
