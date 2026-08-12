@@ -209,7 +209,10 @@ def test_batch_bound_sft_is_rejected_at_parse_time():
                 "max_context_tokens": 32768,
                 "max_completion_tokens": 512,
                 "group_size": 1,
-                "prompts_per_step": 1,
+                # 2, not 1: rl is bound by the sequences one step holds, so a single-sequence step
+                # launches ONE rank whatever it rents (`rl_data_parallel_cards`) and this case would
+                # assert the width clamp instead of the parse-time sizing it is here to cover.
+                "prompts_per_step": 2,
             },
             2,
         ),
@@ -222,6 +225,43 @@ def test_non_sft_provisional_count_is_unchanged(algorithm, train, expected_count
     count = provisional_gpu_count("Qwen/Qwen3.6-27B", algorithm, train=train)
     assert count == expected_count
     assert _executed_width(algorithm, train, None)(count) == count
+
+
+def test_width_bound_rl_is_told_to_raise_its_step_not_shrink_it():
+    """A rank-bound rl run fits by RAISING prompts_per_step, so the message must not say lower.
+
+    The clamp that pins grpo/opd to the sequences one step holds created this case: 27B opd at 32k
+    with one sequence needs 233 GB and launches one rank (180 GB max), so it is now rejected at parse
+    instead of aborting at step 0. But `vram_knob_advice` says to LOWER prompts_per_step, and at one
+    prompt there is nothing below to lower -- while two sequences need 278 GB against 300 GB pooled
+    and fit. MEASURED across the catalog: every width-bound row fits by widening the step, none by
+    shrinking it.
+    """
+    from flash.schema import ConfigError, spec_from_dict
+
+    raw = {
+        "model": "Qwen/Qwen3.6-27B",
+        "algorithm": "opd",
+        "environment": {"id": "freesolo/example/example"},
+        "train": {
+            "max_context_tokens": 32768,
+            "max_completion_tokens": 512,
+            "prompts_per_step": 1,
+            "group_size": 1,
+            "lora_rank": 32,
+        },
+    }
+    with pytest.raises(ConfigError) as exc:
+        spec_from_dict(raw, run_id="parse-rl-width")
+    message = str(exc.value)
+    assert "1 of which joins this run" in message
+    assert "prompts_per_step x group_size bounds the rank count" in message
+    assert "RAISE it to buy ranks" in message
+    # the same knobs widened must actually be admitted, or the advice is still a dead end. asserted
+    # as acceptance rather than on `gpu.count`, which stays at the authored ceiling here (unset = 1)
+    # because parse gates the shape and the allocator sizes it later.
+    raw["train"]["prompts_per_step"] = 2
+    assert spec_from_dict(raw, run_id="parse-rl-width-ok").algorithm == "opd"
 
 
 @pytest.mark.parametrize(("sequence", "accepted"), [(131072, True), (262144, False)])

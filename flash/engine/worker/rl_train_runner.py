@@ -13,7 +13,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from flash.core.spec import gpu_count_of
 from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.result.rollout_samples import sample_completion_text, sanitize_rollout_text
 from flash.engine.worker.backend_common import (
@@ -142,9 +141,11 @@ def _prepare_rl_files(inp, prompts):
     # restore after the wipe, never before: the wipe is what makes a stale local dir safe, and the
     # resume checkpoint is the one global_step_N this attempt is entitled to start from.
     os.makedirs(local_dir, exist_ok=True)
-    # the same spec field `_build_verl_training_cfg` turns into n_gpus, so the width compared here
-    # is the width this attempt actually launches verl at.
-    resume_step = _rl_train()._restore_verl_resume(local_dir, world_size=gpu_count_of(_w.JOB_SPEC))
+    # the same value `_build_verl_training_cfg` turns into n_gpus, so the width compared here is the
+    # width this attempt actually launches verl at. NOT the rented card count: the clamp that bounds
+    # the launch by the step's sequences can make those differ, and a mismatch here silently discards
+    # a loadable checkpoint and restarts the run from step 0.
+    resume_step = _rl_train()._restore_verl_resume(local_dir, world_size=int(inp["dp_cards"]))
     train_pq = os.path.join(workdir, "train.parquet")
     val_pq = os.path.join(workdir, "val.parquet")
     reward_py = os.path.join(workdir, "reward.py")

@@ -23,7 +23,7 @@ from flash.cost.facts import (
     total_params_b,
 )
 from flash.cost.types import CostEstimate, RunConfig
-from flash.engine.plan.steps import sft_data_parallel_cards
+from flash.engine.plan.steps import rl_data_parallel_cards, sft_data_parallel_cards
 from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY, opd_teacher_request_multiplier
 
@@ -295,18 +295,23 @@ def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str, provider: s
 
 
 def executed_gpu_count(config: RunConfig, gpu_count: int) -> int:
-    """Ranks this run launches on ``gpu_count`` cards, which is all of them except for sft.
+    """Ranks this run launches on ``gpu_count`` cards, which a small batch can bound below it.
 
     THE definition of "how wide does this actually run", shared by the throughput model above and
     the offline shape search below. They must not answer it separately: the quote reporting a shape
     the allocator then rejects tells a user a run is feasible and priced, and then refuses it at
-    submit. sft shards by data, so its width is bounded by the batch and the retained rows; every
-    other algorithm runs the shape it rents.
+    submit. Every algorithm shards by data, so every width is bounded by the work one step holds --
+    rows for sft, sequences (prompts times group) for grpo and opd. Mirrors
+    ``allocator._executed_gpu_count``; the two are one rule stated on each side of the quote.
     """
     n = config.normalized()
-    if n.method != "sft":
+    if n.method == "sft":
+        return sft_data_parallel_cards(gpu_count, n.batch_size or 1, n.sft_retained_examples or 0)
+    prompts = int(n.batch_size or 0)
+    if prompts <= 0:
+        # unknown batch does not narrow: see `_executed_rl_gpu_count`.
         return gpu_count
-    return sft_data_parallel_cards(gpu_count, n.batch_size or 1, n.sft_retained_examples or 0)
+    return rl_data_parallel_cards(gpu_count, prompts * int(n.group_size or 1))
 
 
 def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int, provider: str = "") -> float:

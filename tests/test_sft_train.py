@@ -206,15 +206,22 @@ def test_sft_pins_ulysses_off_because_sequence_parallelism_breaks_gdn():
 
     Read the source: `build_sft_overrides` renders whatever it is given, so a test driving a cfg
     dict would assert on its own fixture and stay green if the caller went back to `gpu_count`.
+    `_prepare_sft_child` itself downloads weights, so the source is what is reachable offline.
+
+    Two assertions, because the site names a shared constant rather than a literal: the grep proves
+    the WIRING (this site did not regress to the card count), and the constant proves the VALUE.
+    Either alone would pass while the contract was broken.
     """
     import inspect
 
     from flash.engine.worker import sft_train_runner
+    from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
     src = inspect.getsource(sft_train_runner._prepare_sft_child)
     line = next(ln.strip() for ln in src.splitlines() if ln.strip().startswith('"ulysses_sp_size"'))
 
-    assert line == '"ulysses_sp_size": 1,', line
+    assert line == '"ulysses_sp_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,', line
+    assert ULYSSES_SEQUENCE_PARALLEL_SIZE == 1
 
 
 def test_sft_card_count_never_starves_a_rank_of_its_batch():
@@ -359,8 +366,10 @@ def test_sft_quote_credits_only_the_ranks_that_will_execute():
 
     `gpu_count` at the quote boundary is the BILLED shape. SFT shards by data, so the executed
     width is bounded by the batch: an unpacked run on 2 cards trains on one rank. Crediting the
-    billed width there understates wall time against the run's own cap. GRPO and OPD keep Ulysses
-    and do use every card, so the clamp must be SFT-only.
+    billed width there understates wall time against the run's own cap. GRPO and OPD also shard by
+    data, but they bound work by TOKENS (`use_dynamic_bsz`), so the scheduler balances the batch
+    across every rank instead of leaving one unfed -- their executed width is the allocation, and the
+    clamp must stay SFT-only.
     """
     from flash.cost import analytical
     from flash.cost.types import RunConfig
@@ -374,7 +383,7 @@ def test_sft_quote_credits_only_the_ranks_that_will_execute():
     assert speedup("sft", 1, 2) == one_card
     # a batch that divides the allocation keeps the full multi-card credit.
     assert speedup("sft", 8, 2) > one_card
-    # grpo shards by data with ulysses across every card, so it is untouched by the batch.
+    # grpo shards by data too, but token-balanced across every card, so it is untouched by the batch.
     assert speedup("grpo", 1, 2) > speedup("grpo", 1, 1)
 
 

@@ -16,6 +16,7 @@ import time
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
+from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
 _SFT_LORAPLUS_RATIO = 16.0
@@ -467,10 +468,10 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "loraplus_optim": _VERL_OPTIMIZER_NAME,
             "loraplus_applied": progress.loraplus_applied,
             "verl_backend": "fsdp2",
-            # sft shards by DATA: ulysses is pinned off and fsdp splits the batch across the ranks
-            # actually launched, which is the allocated card count only when the batch divides by
-            # it. report both, and report the executed width rather than the allocation ceiling.
-            "ulysses_sequence_parallel_size": 1,
+            # sft shards by DATA -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why. fsdp splits the batch
+            # across the ranks actually LAUNCHED, which is the allocated card count only when the
+            # batch divides by it, so report the executed width rather than the allocation ceiling.
+            "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
             "data_parallel_size": child.world_size,
             "wandb_project": child.project_name if "wandb" in child.loggers else None,
             "wandb_run_name": child.experiment_name if "wandb" in child.loggers else None,

@@ -1,4 +1,5 @@
-"""Flash's side of the verl integration: capability probing, checkpoints, child io, diagnostics.
+"""Flash's side of the verl integration: capability probing, checkpoints, child io, diagnostics,
+parallelism.
 
 This package shares a name with the `verl` distribution the training child imports, and that is
 deliberate -- `flash.engine.worker.verl.capabilities` reads as what it is. It cannot shadow the real
