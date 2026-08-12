@@ -1315,8 +1315,6 @@ def test_an_uncertified_pin_still_narrows_below_the_four_card_ceiling():
         monkey.undo()
 
 
-
-
 def test_unpinned_sold_out_live_market_stays_retryable():
     """An unpinned run on a live-market provider must not die terminally when stock runs out.
 

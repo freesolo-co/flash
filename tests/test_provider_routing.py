@@ -600,9 +600,7 @@ def test_sft_submission_fails_closed_when_the_environment_cannot_be_pinned(orch,
     monkeypatch.setattr(
         orch,
         "_resolve_model_revision",
-        lambda spec, **_kw: replace(
-            spec, model_revision="b" * 40, model_revision_auto=True
-        ),
+        lambda spec, **_kw: replace(spec, model_revision="b" * 40, model_revision_auto=True),
     )
     monkeypatch.setattr(orch, "_save_status", lambda *a, **k: persisted.append(a))
     monkeypatch.setattr(
@@ -655,9 +653,7 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     monkeypatch.setattr(
         orch,
         "_resolve_model_revision",
-        lambda spec, **_kw: replace(
-            spec, model_revision="b" * 40, model_revision_auto=True
-        ),
+        lambda spec, **_kw: replace(spec, model_revision="b" * 40, model_revision_auto=True),
     )
     monkeypatch.setattr(orch, "resolve_model", lambda model, *a, **k: catalog.MODELS[model])
 

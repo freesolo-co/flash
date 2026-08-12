@@ -1342,6 +1342,7 @@ def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() ->
 def test_pre_removal_public_model_revision_keeps_its_preparation_digest(revision) -> None:
     """A stored public revision key must rehash under the exact pre-removal payload."""
     import flash.runner as runner
+
     stored_public_spec = {
         **spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft")).to_dict(),
         "model_revision": revision,
@@ -1738,7 +1739,9 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
 
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        orch, "_resolve_model_revision", lambda s, **_kw: replace(s, model_revision="a" * 40, model_revision_auto=True)
+        orch,
+        "_resolve_model_revision",
+        lambda s, **_kw: replace(s, model_revision="a" * 40, model_revision_auto=True),
     )
     spec = JobSpec(
         run_id="sft-no-environment",
@@ -1760,7 +1763,9 @@ def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypa
     # the same way the sibling test above does, so the adapter-continuation rejection this test is
     # about is what fails -- not an unrelated network lookup on a disconnected runner.
     monkeypatch.setattr(
-        orch, "_resolve_model_revision", lambda s, **_kw: replace(s, model_revision="a" * 40, model_revision_auto=True)
+        orch,
+        "_resolve_model_revision",
+        lambda s, **_kw: replace(s, model_revision="a" * 40, model_revision_auto=True),
     )
     spec = JobSpec(
         run_id="sft-warmstart",
