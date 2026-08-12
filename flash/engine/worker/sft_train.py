@@ -249,21 +249,7 @@ print("FLASH_GPU_PROBE=" + json.dumps({
     if output:
         print(output, end="" if output.endswith("\n") else "\n", flush=True)
     if result.returncode != 0:
-        # a dirty card is diagnosed INSIDE the probe, and an exit status cannot carry that. the run
-        # retries either way (both are RetriableInfraError), but "exited with status 1" sends the
-        # reader to the probe while the actual finding -- somebody else is on this GPU -- is sitting
-        # in the output that was just printed above. carry the sentence, not just the status.
-        detail = next(
-            (
-                line
-                for line in output.splitlines()
-                if "held by processes outside this container" in line
-            ),
-            "",
-        )
-        raise _w.RetriableInfraError(
-            detail.strip() or f"gpu readiness probe exited with status {result.returncode}"
-        )
+        raise _w.RetriableInfraError(f"gpu readiness probe exited with status {result.returncode}")
     for line in result.stdout.splitlines():
         if line.startswith("FLASH_GPU_PROBE="):
             return json.loads(line.split("=", 1)[1])

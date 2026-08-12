@@ -229,11 +229,12 @@ def _preflight_free_vram_for_spec() -> None:
     and wrong in both directions -- see ``preflight_free_vram``. Occupancy needs no requirement, so
     it runs on any shape without reimplementing ``combined_vram_gb``'s non-linear multi-card fit.
 
-    It samples the current device only. On a multi-card node that leaves a tenant sitting on device
-    3 alone undetected, which is a gap and not a false alarm -- device 0 occupancy is still evidence
-    of a shared host. Probing every device would mean creating a CUDA context on each one at boot,
-    in a process that is not the one that trains, and the cost of that on the training path is not
-    something this can measure from here.
+    It samples device 0 only. On a multi-card node that leaves a tenant sitting on device 3 alone
+    undetected, which is a gap and not a false alarm -- device 0 occupancy is still evidence of a
+    shared host.
+
+    Must stay the first CUDA-adjacent call in boot: the reading is only trustworthy while this
+    process has no context of its own, and ``_force_fla_triton_gdn_on_sm100`` below creates one.
     """
     preflight_free_vram()
 
@@ -343,15 +344,19 @@ def _run_worker_mode() -> None:
     # monkeypatch are interpreter-local and must not be treated as child configuration. the tilelang
     # libcudart repoint is NOT here: it is interpreter-local too, and the interpreter that needs it is
     # the verl child, so it ships as a sitecustomize fragment (verl.child_io).
+    # FIRST, and specifically before `_force_fla_triton_gdn_on_sm100`: that reads
+    # `get_device_capability`, which initializes CUDA in this process, and from that moment the
+    # driver's "used" includes our own context with no sound way to subtract it -- the occupancy
+    # check declines to run rather than guess (see `preflight_free_vram`), so calling it later means
+    # never calling it at all. This is also before `_ensure_fla_fastpath_on_hopper`, whose repair
+    # path runs pip installs with 600s timeouts: a card handed over with a co-tenant's ~18GB still
+    # resident fails the run either way, and the only question is whether that happens now or after
+    # dependency repair, the model download and FSDP init have spent paid GPU on the same
+    # conclusion. NVML answers without a context, so nothing here dirties the reading for the code
+    # below.
+    _preflight_free_vram_for_spec()
     # run before model imports: sm100 tilelang GDN computes wrong gradients, so use Triton.
     _force_fla_triton_gdn_on_sm100()
-    # before `_ensure_fla_fastpath_on_hopper`, whose repair path runs pip installs with 600s
-    # timeouts: a card handed over with a co-tenant's ~18GB still resident fails the run either
-    # way, and the only question is whether that happens now or after dependency repair, the model
-    # download and FSDP init have spent paid GPU reaching the same conclusion. nothing above this
-    # point touches CUDA, so the reading is as clean as it gets. `wait_for_gpu` checks again later
-    # for the case where CUDA was not yet answering here.
-    _preflight_free_vram_for_spec()
     _ensure_fla_fastpath_on_hopper()
     # AFTER the fla fast path (which may (re)install fla), BEFORE any model import / GDN
     # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).

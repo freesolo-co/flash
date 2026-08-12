@@ -9,17 +9,16 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _no_nvidia_smi(monkeypatch):
-    """Attribute nothing to our own processes unless a test says otherwise.
+def _cuda_untouched(monkeypatch):
+    """Assert the boot condition unless a test says otherwise: no CUDA context in this process.
 
-    `_own_vram_gb` shells out to `nvidia-smi`, which on a CI box is absent (0, harmless) and on a
-    developer's GPU box answers about THEIR card -- so the same test would measure different things
-    in the two places. Pinning it makes every occupancy assertion below read the numbers the test
-    actually set, and tests about attribution override it explicitly.
+    `preflight_free_vram` declines to run once one exists, so without this every occupancy assertion
+    below would pass for the wrong reason -- silently, and identically on a CI box with no torch and
+    a developer box with a live one.
     """
     from flash.engine.worker.perf import lifecycle as lc
 
-    monkeypatch.setattr(lc, "_own_vram_gb", lambda: 0.0)
+    monkeypatch.setattr(lc, "cuda_is_initialized", lambda: False)
 
 
 def test_is_cuda_oom_is_structured(monkeypatch):
@@ -405,12 +404,13 @@ def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
     import flash.engine.worker as worker
     from flash.engine.worker.perf import lifecycle as lc
 
-    monkeypatch.setattr(lc, "free_vram_gb", lambda: 3.4)
-    monkeypatch.setattr(lc, "total_vram_gb", lambda: 22.5)
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (3.4, 22.5))
     with pytest.raises(lc.DirtyGpuError) as excinfo:
         lc.preflight_free_vram()
 
-    assert "19.1 GB of 22.5 GB (85%) held by processes outside this container" in str(excinfo.value)
+    assert "19.1 GB of 22.5 GB (85%) already in use before this run has touched it" in str(
+        excinfo.value
+    )
     # the whole point: infra retry, NOT an oom escalation onto a bigger (equally dirty) card.
     monkeypatch.setattr(worker, "is_cuda_oom", lambda _exc: False)
     assert worker._worker_failure_flags(excinfo.value) == {"retriable": True, "oom": False}
@@ -435,8 +435,7 @@ def test_preflight_accepts_a_card_nobody_else_is_using(monkeypatch, free_gb, tot
     """
     from flash.engine.worker.perf import lifecycle as lc
 
-    monkeypatch.setattr(lc, "free_vram_gb", lambda: free_gb)
-    monkeypatch.setattr(lc, "total_vram_gb", lambda: total_gb)
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (free_gb, total_gb))
     lc.preflight_free_vram()
 
 
@@ -444,75 +443,52 @@ def test_preflight_is_inert_when_the_driver_will_not_answer(monkeypatch):
     """No CUDA, or a driver that will not answer, is not evidence of a dirty card."""
     from flash.engine.worker.perf import lifecycle as lc
 
-    monkeypatch.setattr(lc, "free_vram_gb", lambda: None)
-    monkeypatch.setattr(lc, "total_vram_gb", lambda: None)
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: None)
     lc.preflight_free_vram()
 
     # a total of 0 is a nonsense reading, not a 100%-occupied card. dividing by it would raise.
-    monkeypatch.setattr(lc, "free_vram_gb", lambda: 0.0)
-    monkeypatch.setattr(lc, "total_vram_gb", lambda: 0.0)
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (0.0, 0.0))
     lc.preflight_free_vram()
 
 
-def test_our_own_cuda_contexts_are_not_counted_as_a_co_tenant(monkeypatch):
-    """Reading the driver creates a context, so `total - free` is never purely somebody else's.
+def test_the_check_declines_once_this_process_holds_a_cuda_context(monkeypatch):
+    """Our own context is indistinguishable from a co-tenant's, so a late reading is not usable.
 
-    Two of ours can be live at once: SFT probes readiness in a subprocess while the parent already
-    holds a context. On a 22.5 GB card 1.3 GB of context is 6%, over the threshold -- so counting
-    it would reject every clean card and burn the infra budget, which is the opposite of the point.
-    Padding the threshold to cover it stops catching the 5 GB tenant that kills a close-fitting run.
+    Attribution cannot rescue it. `nvidia-smi --query-compute-apps` reports HOST pids while the
+    worker container has a PRIVATE pid namespace (`docker run` in providers/_lifecycle/instance
+    passes no `--pid=host`), so a `/proc/<pid>` test inside the container fails in both directions:
+    our own rows do not resolve and get counted as a stranger's (false reject on a clean card), and
+    under `--pid=host` a real co-tenant's row DOES resolve and gets credited to us (silently waving
+    through the dirty card this exists to refuse).
+
+    So the guarantee is temporal, not analytical: read the card before we have touched it, and
+    decline afterwards. 18.6 GB of somebody else's work on the card is not enough to raise here.
     """
     from flash.engine.worker.perf import lifecycle as lc
 
-    # driver: 20.5 of 22.5 GB free. the 2 GB gone is two of our own contexts, nothing foreign.
-    monkeypatch.setattr(lc, "free_vram_gb", lambda: 20.5)
-    monkeypatch.setattr(lc, "total_vram_gb", lambda: 22.5)
-    monkeypatch.setattr(lc, "_own_vram_gb", lambda: 2.0)
-    lc.preflight_free_vram()
-
-    # same card, but only half of that is ours: the other 1 GB is unattributable, still under 5%.
-    monkeypatch.setattr(lc, "_own_vram_gb", lambda: 1.0)
-    lc.preflight_free_vram()
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (3.4, 22.5))
+    monkeypatch.setattr(lc, "cuda_is_initialized", lambda: True)
+    lc.preflight_free_vram()  # no raise: the reading would include our own context
 
 
-def test_a_co_tenant_row_is_not_credited_to_us(monkeypatch):
-    """`nvidia-smi` listing a pid does not make it ours, and crediting it hides the dirty card.
+def test_boot_reads_the_card_before_anything_initializes_cuda():
+    """The check must run before `_force_fla_triton_gdn_on_sm100`, which creates a context.
 
-    On the observed host the container's pid namespace hid the co-tenant, but that is one host's
-    behaviour, not a guarantee -- `--pid=host` or a privileged container can surface a co-tenant's
-    row. Subtracting it would silently defeat the entire check, so ownership is proved rather than
-    assumed: the pid has to resolve in THIS namespace.
+    That function calls `torch.cuda.get_device_capability`, and from that moment `preflight_free_vram`
+    correctly declines to judge the card -- so ordering it after would not weaken the check, it would
+    silently disable it. Asserted on the source because the alternative is booting a worker.
     """
-    import subprocess
+    import inspect
 
-    from flash.engine.worker.perf import lifecycle as lc
+    import flash.engine.worker as worker
 
-    monkeypatch.undo()  # this test is about _own_vram_gb itself, not its stub
-
-    # pid 1 exists in every namespace; the huge pid does not. only the first may be counted.
-    fake = "1, 512\n4000999, 18300\n"
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *_a, **_k: types.SimpleNamespace(returncode=0, stdout=fake, stderr=""),
-    )
-    assert lc._own_vram_gb() == pytest.approx(0.5, abs=0.01)
-
-
-def test_unattributable_memory_counts_as_foreign(monkeypatch):
-    """`nvidia-smi` failing must not turn into a clean bill of health for a dirty card.
-
-    A container sees its own pids and not a co-tenant's -- that asymmetry is what makes attribution
-    safe here. When the query fails it returns 0, so everything unexplained stays foreign and the
-    check errs toward refusing, which costs one reallocation rather than a delayed OOM.
-    """
-    from flash.engine.worker.perf import lifecycle as lc
-
-    monkeypatch.setattr(lc, "free_vram_gb", lambda: 3.4)
-    monkeypatch.setattr(lc, "total_vram_gb", lambda: 22.5)
-    monkeypatch.setattr(lc, "_own_vram_gb", lambda: 0.0)
-    with pytest.raises(lc.DirtyGpuError, match="outside this container"):
-        lc.preflight_free_vram()
+    # the boot function specifically, not the module: at module scope the DEFINITION of
+    # `_preflight_free_vram_for_spec` precedes everything, so the ordering assertion would hold no
+    # matter how the calls were arranged and the test would pass while the check was disabled.
+    body = inspect.getsource(worker._run_worker_mode)
+    preflight = body.index("_preflight_free_vram_for_spec()")
+    forcer = body.index("_force_fla_triton_gdn_on_sm100()")
+    assert preflight < forcer, "the occupancy read must precede the first CUDA context"
 
 
 def test_a_small_co_tenant_that_still_breaks_a_close_fitting_run_is_refused(monkeypatch):
@@ -525,41 +501,43 @@ def test_a_small_co_tenant_that_still_breaks_a_close_fitting_run_is_refused(monk
     """
     from flash.engine.worker.perf import lifecycle as lc
 
-    monkeypatch.setattr(lc, "free_vram_gb", lambda: 17.5)
-    monkeypatch.setattr(lc, "total_vram_gb", lambda: 22.5)
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (17.5, 22.5))
     with pytest.raises(lc.DirtyGpuError):
         lc.preflight_free_vram()
 
 
-def test_occupancy_is_rechecked_once_cuda_is_provably_up(monkeypatch):
-    """CUDA missing at boot reads as "no evidence", so the check must run again when it is up.
+def test_cuda_is_initialized_is_false_before_any_cuda_call(monkeypatch):
+    """The gate that decides whether the reading is usable must not itself import or start torch.
 
-    Both probes answer None when CUDA is unavailable, and treating that as a clean card is the only
-    honest reading -- but `wait_for_gpu` polls for up to 12 attempts, so a card that readies during
-    that wait would otherwise never be looked at, and the co-tenant reaches training unexamined.
+    Reading `sys.modules` rather than importing means a boot where torch has not loaded yet answers
+    "untouched" instead of loading torch to find out -- and an unimportable torch does not silently
+    flip the answer to "clean card".
     """
     import sys
     import types
 
     from flash.engine.worker.perf import lifecycle as lc
 
-    class _Tensor:
-        def __add__(self, _other):
-            return self
+    monkeypatch.undo()  # this test is about `cuda_is_initialized` itself, not its stub
+
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    assert lc.cuda_is_initialized() is False  # torch not even imported: nothing of ours on the card
 
     torch = types.ModuleType("torch")
-    torch.zeros = lambda *_a, **_k: _Tensor()
-    torch.cuda = types.SimpleNamespace(
-        is_available=lambda: True,
-        synchronize=lambda: None,
-        get_device_name=lambda _i: "NVIDIA GeForce RTX 4090",
-        mem_get_info=lambda: (int(3.4 * 1024**3), int(22.5 * 1024**3)),
-    )
+    torch.cuda = types.SimpleNamespace(is_initialized=lambda: False)
     monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setattr(lc, "verify_gpu", lambda *_a, **_k: None)
+    assert lc.cuda_is_initialized() is False  # imported, but no context yet
 
-    with pytest.raises(lc.DirtyGpuError):
-        lc.wait_for_gpu("RTX 4090", gpu_type="RTX 4090")
+    torch.cuda = types.SimpleNamespace(is_initialized=lambda: True)
+    assert lc.cuda_is_initialized() is True
+
+    # unanswerable -> assume touched, so the check declines rather than judging a reading it cannot
+    # trust. the conservative direction here is silence, not a DirtyGpuError.
+    def _boom():
+        raise RuntimeError("no")
+
+    torch.cuda = types.SimpleNamespace(is_initialized=_boom)
+    assert lc.cuda_is_initialized() is True
 
 
 def test_preflight_never_re_derives_what_the_run_needs(monkeypatch):
@@ -578,16 +556,17 @@ def test_preflight_never_re_derives_what_the_run_needs(monkeypatch):
         raise AssertionError("the free-vram preflight must not re-size the run")
 
     monkeypatch.setattr(allocator, "required_vram_gb", _fail)
-    monkeypatch.setattr(lc, "free_vram_gb", lambda: 22.1)
-    monkeypatch.setattr(lc, "total_vram_gb", lambda: 22.5)
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (22.1, 22.5))
     _preflight_free_vram_for_spec()
 
 
-def test_free_vram_reads_the_driver_not_the_torch_allocator(monkeypatch):
-    """The co-tenant's memory is invisible to the torch allocator, so it must not be the source.
+def test_free_vram_reads_nvml_and_never_starts_cuda(monkeypatch):
+    """The source must be the driver, and reading it must not create the context it would then count.
 
-    `memory_allocated`/`memory_reserved` only count what THIS process reserved. A card holding 18 GB
-    of another container's work reports 0 reserved here, which would read as entirely free.
+    Two failures in one: `memory_allocated`/`memory_reserved` only count what THIS process reserved,
+    so a card holding 18 GB of another container's work reads as entirely free; and
+    `torch.cuda.mem_get_info` needs a context and CREATES one, so measuring with it adds our own
+    memory to the number being measured and trips `cuda_is_initialized` for everything after.
     """
     import sys
     import types
@@ -595,13 +574,27 @@ def test_free_vram_reads_the_driver_not_the_torch_allocator(monkeypatch):
     from flash.engine.worker.perf import lifecycle as lc
 
     torch = types.ModuleType("torch")
+
+    def _forbidden(*_a, **_k):
+        raise AssertionError("the vram reading must not go through torch")
+
     torch.cuda = types.SimpleNamespace(
         is_available=lambda: True,
-        # driver: 3.4 GB free of 22.5 GB. allocator: this process has reserved nothing.
-        mem_get_info=lambda: (int(3.4 * 1024**3), int(22.5 * 1024**3)),
-        memory_allocated=lambda: 0,
-        memory_reserved=lambda: 0,
+        mem_get_info=_forbidden,
+        memory_allocated=_forbidden,
+        memory_reserved=_forbidden,
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
 
+    pynvml = types.ModuleType("pynvml")
+    pynvml.nvmlInit = lambda: None
+    pynvml.nvmlShutdown = lambda: None
+    pynvml.nvmlDeviceGetHandleByIndex = lambda _i: object()
+    # driver: 3.4 GB free of 22.5 GB, which the torch allocator would have reported as 0 reserved.
+    pynvml.nvmlDeviceGetMemoryInfo = lambda _h: types.SimpleNamespace(
+        free=int(3.4 * 1024**3), total=int(22.5 * 1024**3)
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", pynvml)
+
     assert lc.free_vram_gb() == pytest.approx(3.4, abs=0.05)
+    assert lc.total_vram_gb() == pytest.approx(22.5, abs=0.05)

@@ -39,75 +39,54 @@ class DirtyGpuError(RetriableInfraError):
     """
 
 
-def free_vram_gb() -> float | None:
-    """Free VRAM on device 0 in GB, or None if it cannot be determined.
+def _nvml_memory_gb() -> tuple[float, float] | None:
+    """``(free, total)`` on device 0 in GB straight from NVML, or None if NVML will not answer.
 
-    Reads the DRIVER's number (via torch's ``mem_get_info``), not the torch allocator's. The
-    allocator only knows about memory this process reserved, and the memory at issue here belongs to
-    somebody else -- a co-tenant sharing the physical card from another container, which the
-    allocator cannot see and would report as entirely free.
+    NVML, not ``torch.cuda.mem_get_info``: the torch call needs a CUDA context and CREATES one if the
+    process has none, so the act of measuring adds our own few hundred MB to the number being
+    measured. NVML queries the driver without initializing CUDA in this process, which is what lets
+    the boot reading be taken while the card is still provably untouched by us.
     """
     try:
-        import torch
+        import pynvml
 
-        if not torch.cuda.is_available():
-            return None
-        free, _total = torch.cuda.mem_get_info()
-        return float(free) / (1024**3)
+        pynvml.nvmlInit()
+        try:
+            info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0))
+            return float(info.free) / (1024**3), float(info.total) / (1024**3)
+        finally:
+            with contextlib.suppress(Exception):
+                pynvml.nvmlShutdown()
     except Exception:
         return None
 
 
-def _own_vram_gb() -> float:
-    """VRAM on device 0 held by processes in THIS container, in GB.
+def free_vram_gb() -> float | None:
+    """Free VRAM on device 0 in GB, or None if it cannot be determined.
 
-    ``mem_get_info`` reports the driver's total, which includes our own CUDA contexts -- and simply
-    calling it creates one. So "used" is never purely somebody else's, and the gap is not a constant
-    to subtract: a context is a few hundred MB, but SFT probes readiness in a subprocess while the
-    parent already holds one, so two of ours can be live at once.
-
-    ``nvidia-smi --query-compute-apps`` attributes used memory per pid. On the observed dirty card it
-    listed only our own (0.486 GB against 18.6 GB used), because a container's pid namespace hides the
-    co-tenant -- but that is an OBSERVATION of one host, not a guarantee. With `--pid=host`, a
-    privileged container, or a driver that reports host pids, a co-tenant's row can appear, and
-    subtracting it would credit the tenant's memory to us and wave the dirty card through. That
-    failure is silent and defeats the whole check, so each row is proved ours before it counts:
-    ``/proc/<pid>`` must exist in THIS namespace.
-
-    Zero on any failure, which makes the caller's occupancy reading conservative rather than
-    permissive: unattributed memory counts as foreign.
+    Reads the DRIVER's number, not the torch allocator's. The allocator only knows about memory this
+    process reserved, and the memory at issue here belongs to somebody else -- a co-tenant sharing
+    the physical card from another container, which the allocator cannot see and would report as
+    entirely free.
     """
-    import os
-    import subprocess
+    reading = _nvml_memory_gb()
+    return None if reading is None else reading[0]
 
+
+def cuda_is_initialized() -> bool:
+    """True once THIS process has a live CUDA context, so a driver reading includes our own memory.
+
+    ``torch.cuda.is_initialized()`` is false until the first real CUDA call, and importing torch does
+    not make it true -- so this distinguishes "nothing of ours is on the card yet" from "some of what
+    the driver reports is ours", which is the only thing that decides whether occupancy is readable.
+    """
     try:
-        out = subprocess.run(
-            [
-                "nvidia-smi",
-                "--id=0",  # the device free/total were read from; ours on device 1 are not ours here
-                "--query-compute-apps=pid,used_memory",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=8.0,
-        )
-        if out.returncode != 0:
-            return 0.0
-        total = 0.0
-        for line in out.stdout.splitlines():
-            pid, _, used = line.partition(",")
-            # proving the pid resolves HERE is what makes this an ownership test rather than a
-            # restatement of what nvidia-smi chose to show us.
-            if not pid.strip().isdigit() or not os.path.isdir(f"/proc/{pid.strip()}"):
-                continue
-            try:
-                total += float(used.strip()) / 1024.0  # MiB -> GiB
-            except ValueError:
-                continue
-        return total
+        import sys
+
+        torch = sys.modules.get("torch")
+        return bool(torch is not None and torch.cuda.is_initialized())
     except Exception:
-        return 0.0
+        return True  # cannot prove the card is untouched -> treat the reading as unusable
 
 
 def total_vram_gb() -> float | None:
@@ -116,15 +95,8 @@ def total_vram_gb() -> float | None:
     The driver's usable total, not the catalog's nominal tier: a "24 GB" RTX 4090 reports ~22.5 GB.
     Comparing against the nominal number is what makes an exact-fit run unschedulable.
     """
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return None
-        _free, total = torch.cuda.mem_get_info()
-        return float(total) / (1024**3)
-    except Exception:
-        return None
+    reading = _nvml_memory_gb()
+    return None if reading is None else reading[1]
 
 
 def preflight_free_vram(*, max_occupied_fraction: float = 0.05) -> None:
@@ -156,25 +128,42 @@ def preflight_free_vram(*, max_occupied_fraction: float = 0.05) -> None:
     a 22.5 GB card is 22% occupied and fatal. Sizing the threshold to survive that means re-deriving
     the requirement, which is the failure above. Refusing every card with a stranger on it needs no
     requirement and covers the close-fitting case too.
+
+    A threshold that low only works if none of the used memory is OURS, and that is established by
+    WHEN the reading is taken, not by trying to attribute it afterwards. Attribution was tried and
+    cannot work here: ``nvidia-smi --query-compute-apps`` reports HOST pids, while the worker
+    container runs with a private pid namespace (``docker run`` in ``providers/_lifecycle/instance``
+    passes no ``--pid=host``), so testing ``/proc/<pid>`` inside the container is not an ownership
+    test in either direction -- our own rows fail it and get counted as a stranger's, and under
+    ``--pid=host`` a real co-tenant passes it and gets credited to us, silently waving through the
+    exact card this exists to refuse.
+
+    So the check simply declines to run once this process has a CUDA context. At boot that is
+    guaranteed: nothing above ``_preflight_free_vram_for_spec`` touches CUDA except a capability
+    probe. ``wait_for_gpu`` calls this again, and by then a context exists -- that later call is a
+    no-op by design, and the boot reading is the one that counts.
     """
-    free = free_vram_gb()
-    total = total_vram_gb()
-    if free is None or total is None or total <= 0:
-        # no CUDA, or the driver would not answer. both are somebody else's failure to report, and
-        # neither is evidence of a dirty card -- training fails soon enough with a better message.
+    if cuda_is_initialized():
+        # some of `used` would be ours and there is no sound way to tell how much. a check that
+        # cannot distinguish our context from a co-tenant would either false-reject clean cards or
+        # need a threshold too loose to catch the tenant it exists for. staying silent is correct:
+        # the boot call already read this card while it was provably untouched.
         return
-    # only memory we cannot account for. reading the driver at all creates a context, and the SFT
-    # readiness probe runs in a subprocess while the parent holds one, so `total - free` always
-    # includes some of ours. subtracting a constant for that is what forces the threshold up until
-    # it stops catching the co-tenants it exists for -- 1.3 GB of context on a 22.5 GB card is 6%,
-    # and the 5 GB tenant that kills a close-fitting run is 22%. attribute instead of pad.
-    foreign = max(0.0, total - free - _own_vram_gb())
-    if foreign <= total * max_occupied_fraction:
+    reading = _nvml_memory_gb()
+    if reading is None:
+        # NVML would not answer. somebody else's failure to report, not evidence of a dirty card --
+        # training fails soon enough with a better message.
+        return
+    free, total = reading
+    if total <= 0:
+        return
+    used = max(0.0, total - free)
+    if used <= total * max_occupied_fraction:
         return
     raise DirtyGpuError(
-        f"allocated GPU has {foreign:.1f} GB of {total:.1f} GB ({foreign / total:.0%}) held by "
-        "processes outside this container before this run has done anything; the card is occupied "
-        "by another tenant or a previous tenant's leak, so retrying on a freshly allocated instance"
+        f"allocated GPU has {used:.1f} GB of {total:.1f} GB ({used / total:.0%}) already in use "
+        "before this run has touched it; the card is occupied by another tenant or a previous "
+        "tenant's leak, so retrying on a freshly allocated instance"
     )
 
 
@@ -376,12 +365,6 @@ def wait_for_gpu(requested_gpu: str | None = None, *, gpu_type: str = ""):
                 torch.cuda.synchronize()
                 print(f"GPU ready after {i} retries: {torch.cuda.get_device_name(0)}")
                 verify_gpu(requested_gpu, gpu_type=gpu_type)
-                # here, not only at boot: CUDA can be unavailable when the boot probe runs, and
-                # `free_vram_gb`/`total_vram_gb` answer None for that, which is correctly treated as
-                # "no evidence" rather than as a dirty card. this is the first moment the driver is
-                # provably answering, so it is the first moment absence of evidence stops being the
-                # honest reading. cheap enough to repeat: two mem_get_info calls.
-                preflight_free_vram()
                 return True
             last = "cuda not available"
         except RetriableInfraError:
