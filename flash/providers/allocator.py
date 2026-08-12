@@ -68,22 +68,22 @@ def profile_required_vram_gb() -> int:
     return 1
 
 
-def _profile_gpu_ceiling(gpu_type: str, max_gpu_count: int | None) -> int | None:
-    """Card ceiling for a profile allocation: one card, unless a pin needs a wider shape to exist.
+def _profile_gpu_ceiling(max_gpu_count: int | None) -> int | None:
+    """Card ceiling for a profile allocation: the author's ceiling, else one card.
 
-    One card is what this job USES, not a shape it requires. But providers sell a card count as a
+    One card is what this job USES, not a shape it requires. Providers sell a card count as a
     distinct product rather than a divisible pool -- vast filters offers on ``num_gpus`` equality
     and lambda names the count in the instance type -- so a class whose 4-card shape is live while
     its 1-card shape is sold out yields NO candidate for a hard ceiling of one. A pinned run in that
     state is allocatable while its mandatory profile is not, which reinstates the exact deadlock
     inheriting the pin exists to break (see ``preparation._prepared_sft_profile_job``).
 
-    So one card is a preference, not a constraint: keep it when the caller authored neither a class
-    nor a count, and otherwise let the profile reach the same widths its own run may rent. The
-    unpinned common case is unchanged -- a wider shape costs more and loses on rate -- and the
-    cheapest fitting shape still wins, which a 1 GB job finds in every one of them.
+    So one card is the default rather than a constraint: an authored ceiling passes through, letting
+    the profile reach the same widths its own run may rent. Ranking is unchanged, so the cheapest
+    fitting shape still wins -- and a 1 GB job fits every one of them, which is why widening the
+    ceiling never widens the bill on a provider that has the narrow shape.
     """
-    return 1 if max_gpu_count is None and not gpu_type else max_gpu_count
+    return 1 if max_gpu_count is None else max_gpu_count
 
 
 def _profile_cost_ranker():
@@ -485,7 +485,7 @@ def allocate(
     """
     if workload_profile:
         need = profile_required_vram_gb()
-        max_gpu_count = _profile_gpu_ceiling(gpu_type, max_gpu_count)
+        max_gpu_count = _profile_gpu_ceiling(max_gpu_count)
     else:
         need = required_vram_gb(
             model_id,

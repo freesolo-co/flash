@@ -447,51 +447,45 @@ def test_profile_allocates_the_cheapest_card_not_the_training_shape(monkeypatch)
     assert profile_alloc.min_vram_gb < training_alloc.min_vram_gb
 
 
-def test_a_pinned_profile_reaches_a_class_sold_only_in_multi_card_shapes(monkeypatch) -> None:
-    """A pin whose 1-card shape is sold out must not strand the profile that gates its own run.
+def test_a_pinned_profile_does_not_forge_a_one_card_ceiling(tmp_path, monkeypatch) -> None:
+    """The profile's one card must not overwrite the run's authored ceiling.
 
-    Providers sell a card count as a distinct product (vast filters offers on ``num_gpus``
-    equality, lambda names the count in the instance type), so a hard ceiling of one returns NO
-    candidate for a class whose only live shape is wider. The training run stays allocatable, its
-    mandatory profile does not, and the sft path deadlocks again -- which is what inheriting the
-    pin exists to prevent.
+    ``gpu.count`` and ``gpu_count_auto`` are one value split across two fields (see
+    ``JobSpec.authored_gpu_count``), and ``seed_submission`` passes ``authored_gpu_count`` -- not
+    ``gpu.count`` -- to ``allocate``. So writing the count alone turned a run's authored ceiling of
+    2 into an authored ceiling of exactly 1 for its profile.
+
+    That is unsatisfiable rather than merely narrow: providers sell each card count as its own
+    product (vast filters offers on ``num_gpus`` equality, lambda names the count in the instance
+    type), so a class whose only live shape is wider yields NO candidate at a hard ceiling of one.
+    The run stays allocatable while its mandatory profile cannot allocate, which is the deadlock
+    inheriting the pin exists to break.
+
+    Asserted on the ceiling the allocator is HANDED rather than on a mocked allocation: the bug is
+    that the wrong number reaches allocate, so a test that passed its own number would pass whether
+    or not preparation forged one.
     """
-    from flash.providers import allocator
-    from flash.providers.base import Candidate
+    runner = fresh_runner(tmp_path, monkeypatch)
+    unpinned = _spec()
+    spec = replace(unpinned, gpu=replace(unpinned.gpu, type="H100", provider="lambda", count=2))
+    monkeypatch.setattr(runner, "_profile_producer_version", lambda: "1.2.3")
+    monkeypatch.setattr(runner, "_resolve_model_revision", lambda spec, **_kwargs: spec)
+    assert spec.authored_gpu_count == 2  # the run really did author a 2-card ceiling
 
-    # the pinned class exists ONLY as a 2-card shape, the state this regression is about.
-    def fake_live_candidates(_need, constraints):
-        if int(getattr(constraints, "max_gpu_count", 1) or 1) < 2:
-            return []
-        return [Candidate(provider="lambda", gpu="H100", hourly_usd=3.29, vram_gb=80, gpu_count=2)]
+    with pytest.raises(runner.WorkloadProfilePending) as raised:
+        runner._require_sft_workload_profile(spec)
 
-    provider = type(
-        "P",
-        (),
-        {"live_candidates": staticmethod(fake_live_candidates), "live_capacity": False},
-    )
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda",))
-    monkeypatch.setattr(allocator, "get_provider", lambda _name: provider)
-
-    alloc = allocator.allocate(
-        "Qwen/Qwen3.5-0.8B",
-        "sft",
-        train=_spec().train,
-        provider="lambda",
-        gpu_type="H100",
-        max_gpu_count=2,
-        workload_profile=True,
-    )
-
-    assert alloc.gpu == "H100"
-    assert alloc.gpu_count == 2  # the profile rides the shape that actually has capacity
+    worker = raised.value.prepared_job.worker_spec
+    assert worker.gpu.count == 1  # still one card of actual work
+    # ...but no AUTHORED ceiling, so allocation may reach whatever shape the class is sold in.
+    assert worker.authored_gpu_count is None
 
 
-def test_an_unpinned_profile_still_takes_a_single_cheap_card(monkeypatch) -> None:
-    """The paired control: widening is for pinned runs only, never a licence to rent two cards.
+def test_an_unpinned_profile_still_allocates_a_single_card(monkeypatch) -> None:
+    """The paired control: the default with nothing authored is still exactly one card.
 
-    Without this, the fix above could quietly let every profile allocate a multi-card shape and the
-    test above would pass just as well.
+    Without this, widening every profile to a multi-card shape would satisfy the test above just as
+    well, and the cheap single card the unpinned common case depends on could regress unnoticed.
     """
     from flash.providers import allocator
     from flash.providers.base import Candidate

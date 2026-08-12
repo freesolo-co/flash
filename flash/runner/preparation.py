@@ -565,12 +565,20 @@ def _prepared_sft_profile_job(spec: JobSpec, *, input_digest: str) -> PreparedJo
     The pins are deliberately absent from ``sft_profile_input_payload``, so a profile stays keyed on
     the workload alone: pinning changes where the tokenizing happens, never what it measures, and
     keying on placement would fragment one shared profile into a copy per provider.
+
+    ``count`` becomes the one card the job uses, and ``gpu_count_auto`` is set with it so the pair
+    still reads as "no authored ceiling". They are one value split across two fields (see
+    ``JobSpec.authored_gpu_count``), so writing the count alone would forge an authored ceiling of
+    exactly one out of the run's own wider ceiling -- and a hard ceiling of one is unsatisfiable on
+    a class whose only live shape is wider, since providers sell each card count as its own product.
+    That would stall the profile on capacity while the run it gates remains allocatable.
     """
     from flash.engine.profiling.workload_profile import SFT_PROFILE_KIND, sft_profile_run_id
 
     profile_spec = replace(
         spec,
         run_id=sft_profile_run_id(input_digest),
+        gpu_count_auto=True,
         gpu=replace(
             spec.gpu,
             count=1,
