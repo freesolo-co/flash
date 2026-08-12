@@ -420,7 +420,7 @@ def test_sft_fit_credits_only_the_ranks_that_will_launch():
         candidate = Candidate(
             provider="runpod", gpu="A10", hourly_usd=1.0, vram_gb=24, gpu_count=cards
         )
-        width = _executed_gpu_count(algorithm, train, overrides, candidate)
+        width = _executed_gpu_count(algorithm, train, overrides, candidate.gpu_count)
         return _fits(candidate, need, width)
 
     unpacked = {"batch_size": 1}
@@ -447,7 +447,9 @@ def test_sft_fit_credits_only_the_ranks_that_will_launch():
         candidate = Candidate(
             provider="runpod", gpu="A10", hourly_usd=1.0, vram_gb=24, gpu_count=cards
         )
-        width = _executed_gpu_count("sft", packed, {"sft_retained_examples": rows}, candidate)
+        width = _executed_gpu_count(
+            "sft", packed, {"sft_retained_examples": rows}, candidate.gpu_count
+        )
         return _fits(candidate, need_gb, width)
 
     between = 50.0  # 2 cards credit 35.2, 4 credit 62.4

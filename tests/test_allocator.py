@@ -306,6 +306,50 @@ def test_exact_dynamic_provider_empty_capacity_is_retryable(monkeypatch, provide
         )
 
 
+@pytest.mark.parametrize("gpu_type", ["", "H100"])
+def test_sft_width_that_never_fits_is_terminal_not_a_capacity_retry(monkeypatch, gpu_type):
+    """Regression: a width the fit filter always rejects was reported as sold-out capacity.
+
+    The filter credits only the ranks an sft run launches, and an unpacked batch of 1 launches ONE
+    however many cards are rented. When that empties the candidate set, the classification has to
+    agree: it asked whether any offered class fits at the RENTED count, so it still found a shape,
+    called the miss retryable, and `_allocate_attempt` turned it into a `poll_error`. On a
+    Lambda/Vast-only fleet that re-polls a live market for capacity that cannot help -- no lookup
+    makes a batch of 1 use more ranks -- burning the infra budget instead of failing with the reason.
+
+    Parametrized over both branches because a pin and an unpinned search classify separately.
+    """
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import Candidate, CapacityLookupError, UnsupportedGpuError
+
+    # 200 GB does not fit one H100 card, and the clamp means one card is all that ever launches.
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda",))
+    # capacity is HEALTHY: the provider offers the shape, so nothing here is a stock or outage
+    # artifact. only the executed-width clamp removes it, which is exactly the terminal case.
+    monkeypatch.setattr(
+        get_provider("lambda"),
+        "live_candidates",
+        lambda need, constraints: [
+            Candidate(provider="lambda", gpu="H100", hourly_usd=2.0, vram_gb=80, gpu_count=n)
+            for n in (1, 2, 4, 8)
+        ],
+    )
+
+    with pytest.raises(UnsupportedGpuError) as ei:
+        allocator.allocate(
+            "Qwen/Qwen3.5-0.8B",
+            "sft",
+            train={"batch_size": 1},
+            gpu_type=gpu_type,
+            max_gpu_count=8,
+        )
+    assert not isinstance(ei.value, CapacityLookupError), (
+        "an unpacked sft run launches one rank, so no market lookup can widen it -- classifying "
+        "this as capacity makes the runner retry a deterministic rejection until the budget dies"
+    )
+
+
 def test_exact_runpod_empty_capacity_stays_terminal(monkeypatch):
     from flash.providers import allocator, get_provider
     from flash.providers.base import UnsupportedGpuError
