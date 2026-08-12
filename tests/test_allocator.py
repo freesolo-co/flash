@@ -374,9 +374,7 @@ def test_lookup_blip_is_only_retryable_when_a_launchable_shape_exists(monkeypatc
     # 200 GB against an sft run clamped to one rank: no advertised class holds it at any count.
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
     with pytest.raises(UnsupportedGpuError) as ei:
-        allocator.allocate(
-            "Qwen/Qwen3.5-0.8B", "sft", train={"batch_size": 1}, max_gpu_count=8
-        )
+        allocator.allocate("Qwen/Qwen3.5-0.8B", "sft", train={"batch_size": 1}, max_gpu_count=8)
     assert not isinstance(ei.value, CapacityLookupError), (
         "the blip did not cause this and cannot cure it -- no lookup makes a batch of 1 use more "
         "ranks, so retrying spends the infra budget on a shape that will never exist"
@@ -2013,7 +2011,9 @@ def test_remedy_never_names_a_width_the_run_will_not_launch_on():
     from flash.providers.base import wider_shape_remedy
 
     need, card = 28.0, 24
-    assert wider_shape_remedy((card,), need, ceiling=8, above=1, executed_width=lambda _n: 1) == "", (
+    assert (
+        wider_shape_remedy((card,), need, ceiling=8, above=1, executed_width=lambda _n: 1) == ""
+    ), (
         "an sft run pinned to one rank gains nothing from more cards, so no width is a remedy -- "
         "naming one sends the user to pay twice for the same failure"
     )
