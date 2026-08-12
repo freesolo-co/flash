@@ -436,6 +436,8 @@ async def _stream_response(
             else:
                 for forwarded in done_gate.feed(chunk):
                     yield forwarded
+                if done_gate.terminated:
+                    break
         if done_gate is not None:
             for forwarded in done_gate.finish():
                 yield forwarded
@@ -662,6 +664,13 @@ async def chat_completions(
                 "POST", context.url, headers=context.headers, json=forwarded_body
             )
             upstream_response = await client.send(upstream_request, stream=True)
+        except asyncio.CancelledError:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await client.aclose()
+                finally:
+                    await _record_trace(context, output_payload=None, error="client disconnected")
+            raise
         except httpx.HTTPError:
             await client.aclose()
             return await _upstream_failure_response(context)

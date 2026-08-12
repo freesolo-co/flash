@@ -394,6 +394,35 @@ def test_an_oversized_sse_stream_forwards_every_byte_and_marks_output_truncated(
     assert prompts["skipped"] == 0
 
 
+def test_repeated_sse_envelope_fields_do_not_consume_the_stream_budget() -> None:
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=700)
+    fragment = "x"
+    event = (
+        b'data: {"id":"chatcmpl-x","model":"gpt-test","object":"chat.completion.chunk",'
+        b'"created":123,"choices":[{"index":0,"delta":{"content":"x"}}]}\n\n'
+    )
+
+    for _ in range(512):
+        accumulator.feed(event)
+    accumulator.feed(
+        b'data: {"id":"chatcmpl-x","model":"gpt-test","object":"chat.completion.chunk",'
+        b'"created":123,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+    )
+
+    assert accumulator.truncated is False
+    assert accumulator.output()["choices"][0]["message"]["content"] == fragment * 512
+
+
+def test_unterminated_sse_line_is_bounded_by_the_accumulation_budget() -> None:
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=128)
+
+    for _ in range(20):
+        accumulator.feed(b"x" * 16)
+
+    assert accumulator.truncated is True
+    assert accumulator._buffer == b""
+
+
 def test_streaming_client_disconnect_before_any_event_records_no_output(
     trace_api, monkeypatch
 ) -> None:
@@ -562,6 +591,59 @@ async def test_streaming_client_disconnect_stores_partial_trace(tmp_path, monkey
 
 
 @pytest.mark.anyio
+async def test_stream_stops_reading_after_done_event(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+    owner = db.ensure_internal_key(_KEY)
+    context = traces._UpstreamRequestContext(
+        url="https://api.openai.com/v1/chat/completions",
+        headers={},
+        body={**_REQUEST, "stream": True},
+        provider="openai",
+        model="gpt-test",
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        metadata=None,
+        secrets=(_KEY, _PROVIDER_KEY),
+        started_at=traces.time.perf_counter(),
+        record_trace=True,
+    )
+
+    class _PostDoneBlockingBody(_BlockingStreamingBody):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield self.first
+            self.blocked.set()
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=0.1)
+
+    body = _PostDoneBlockingBody(
+        b'data: {"choices":[{"index":0,"delta":{"content":"world"},'
+        b'"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    )
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=body,
+        request=httpx.Request("POST", context.url),
+    )
+    client = _StaticAsyncClient()
+
+    chunks = [
+        chunk
+        async for chunk in traces._stream_response(
+            client=client, upstream_response=response, context=context
+        )
+    ]
+
+    assert b"".join(chunks) == body.first
+    assert body.blocked.is_set() is False
+    assert body.closed is True
+    assert client.closed is True
+    exported = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+    assert exported["records"] == [{"input": "hello", "output": "world"}]
+
+
+@pytest.mark.anyio
 async def test_streaming_upstream_interruption_records_partial_trace(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
     owner = db.ensure_internal_key(_KEY)
@@ -670,6 +752,71 @@ def test_a_redirect_is_recorded_but_not_exported_as_a_training_target(
     ).json()
     assert records["records"] == []
     assert records["skipped"] == 1
+
+
+@pytest.mark.anyio
+async def test_streaming_header_wait_cancellation_closes_client_and_propagates(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+    monkeypatch.setenv("FLASH_STANDALONE", "1")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", _KEY)
+    owner = db.ensure_internal_key(_KEY)
+    body = json.dumps({**_REQUEST, "stream": True}).encode()
+    sent_body = False
+
+    async def receive() -> dict:
+        nonlocal sent_body
+        if sent_body:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        sent_body = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = traces.Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [
+                (name.lower().encode(), value.encode()) for name, value in _HEADERS.items()
+            ],
+        },
+        receive,
+    )
+
+    class _HeaderBlockingClient(_StaticAsyncClient):
+        instance: ClassVar[_HeaderBlockingClient | None] = None
+        send_started = asyncio.Event()
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            type(self).instance = self
+
+        def build_request(self, method, url, *, headers, json) -> httpx.Request:
+            return httpx.Request(method, url, headers=headers, json=json)
+
+        async def send(self, request, *, stream) -> httpx.Response:
+            assert stream is True
+            type(self).send_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _HeaderBlockingClient)
+    task = asyncio.create_task(traces.chat_completions(request, owner))
+    await _HeaderBlockingClient.send_started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert _HeaderBlockingClient.instance is not None
+    assert _HeaderBlockingClient.instance.closed is True
+    exported = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000
+    )
+    span = exported["records"][0]["spans"][0]
+    assert span["error"] == "client disconnected"
+    assert span["output_payload"] is None
 
 
 def test_upstream_transport_failure_returns_502_and_records(trace_api, monkeypatch) -> None:
@@ -1376,6 +1523,61 @@ def test_an_output_only_truncation_keeps_the_intact_prompt(trace_api) -> None:
     assert records["records"] == []
     assert records["skipped"] == 1
     assert raw["records"][0]["spans"][0]["attributes"] == {"payload_truncated": ["output"]}
+
+
+def test_caller_output_marker_unions_with_detected_input_truncation(trace_api) -> None:
+    owner = db.ensure_standalone_owner()
+    oversized_prompt = "x" * (platform_traces.MAX_PAYLOAD_VALUE_LENGTH + 1)
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="both sides truncated",
+        metadata=None,
+        spans=[
+            TraceSpan(
+                input_payload={"messages": [{"role": "user", "content": oversized_prompt}]},
+                output_payload=_reply_envelope("partial reply"),
+                attributes={"payload_truncated": ["output"]},
+            )
+        ],
+    )
+
+    raw = export_traces(key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000)
+    records = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+    prompts = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="prompts", limit=1000
+    )
+
+    assert raw["records"][0]["spans"][0]["attributes"] == {"payload_truncated": ["input", "output"]}
+    assert records["records"] == []
+    assert records["skipped"] == 1
+    assert prompts["records"] == []
+    assert prompts["skipped"] == 1
+
+
+@pytest.mark.parametrize("caller_value", ["output", ["bogus"]])
+def test_bogus_caller_truncation_marker_is_discarded(trace_api, caller_value: object) -> None:
+    owner = db.ensure_standalone_owner()
+    oversized_prompt = "x" * (platform_traces.MAX_PAYLOAD_VALUE_LENGTH + 1)
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="invalid marker",
+        metadata=None,
+        spans=[
+            TraceSpan(
+                input_payload={"messages": [{"role": "user", "content": oversized_prompt}]},
+                output_payload=_reply_envelope("reply"),
+                attributes={"payload_truncated": caller_value},
+            )
+        ],
+    )
+
+    raw = export_traces(key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000)
+
+    assert raw["records"][0]["spans"][0]["attributes"] == {"payload_truncated": ["input"]}
 
 
 def test_an_input_truncation_disqualifies_records_and_prompts(trace_api) -> None:
@@ -2572,6 +2774,38 @@ def test_a_non_object_delta_marks_the_stream_errored(trace_api, monkeypatch) -> 
     assert records["records"] == []
 
 
+def test_a_present_malformed_choices_container_marks_the_stream_errored(
+    trace_api, monkeypatch
+) -> None:
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n',
+            b'data: {"choices":{"missing":"fragment"}}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == "stream contained non-list choices"
+    records = export_traces(
+        key_id=db.ensure_standalone_owner()["id"],
+        project_id=_PROJECT_ID,
+        export_format="records",
+        limit=1000,
+    )
+    assert records["records"] == []
+
+
 def test_null_logprobs_on_every_stream_chunk_is_not_a_defect(trace_api, monkeypatch) -> None:
     """OpenAI routinely sends `logprobs: null` when logprobs were not requested. Null means no scored
     fragment, not corruption, so an ordinary successful stream must remain exportable by `records`."""
@@ -2691,6 +2925,36 @@ def test_a_present_malformed_delta_list_still_marks_the_stream_errored(
     span = _raw(trace_api)["records"][0]["spans"][0]
     assert span["status_code"] == "ERROR"
     assert span["error"] == "stream choice contained a non-object delta"
+    records = export_traces(
+        key_id=db.ensure_standalone_owner()["id"],
+        project_id=_PROJECT_ID,
+        export_format="records",
+        limit=1000,
+    )
+    assert records["records"] == []
+
+
+def test_a_wrong_typed_tool_calls_container_marks_the_stream_errored(
+    trace_api, monkeypatch
+) -> None:
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial","tool_calls":{"id":"call-1"}},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == "stream tool_calls was not a list"
     records = export_traces(
         key_id=db.ensure_standalone_owner()["id"],
         project_id=_PROJECT_ID,

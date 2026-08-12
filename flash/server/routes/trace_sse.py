@@ -12,6 +12,10 @@ class SseDoneGate:
         self._done = bytearray()
         self.done_event: bytes | None = None
 
+    @property
+    def terminated(self) -> bool:
+        return bool(self._done) or self.done_event is not None
+
     def feed(self, chunk: bytes) -> list[bytes]:
         self._buffer += chunk
         if self._done:
@@ -165,6 +169,7 @@ class SseAccumulator:
         self._done = False
         self._max_accumulated_bytes = max_accumulated_bytes
         self._accumulated_bytes = 0
+        self._overwriting_sizes: dict[str, int] = {}
         self.truncated = False
         self.usage: Any = None
         # why this stream cannot be trusted as a complete reply, if anything went wrong in it. a
@@ -175,10 +180,27 @@ class SseAccumulator:
         self.defect: str | None = None
 
     def feed(self, chunk: bytes) -> None:
-        self._buffer += chunk
-        while b"\n" in self._buffer:
-            line, self._buffer = self._buffer.split(b"\n", 1)
+        if self.truncated:
+            return
+        cursor = 0
+        while cursor < len(chunk):
+            newline = chunk.find(b"\n", cursor)
+            end = len(chunk) if newline < 0 else newline
+            fragment = chunk[cursor:end]
+            if self._max_accumulated_bytes is not None and len(
+                fragment
+            ) > self._max_accumulated_bytes - len(self._buffer):
+                self._buffer = b""
+                self.truncated = True
+                return
+            self._buffer += fragment
+            if newline < 0:
+                return
+            line, self._buffer = self._buffer, b""
             self._consume_line(line.rstrip(b"\r"))
+            if self.truncated:
+                return
+            cursor = newline + 1
 
     def finish(self) -> None:
         if self._buffer:
@@ -190,22 +212,37 @@ class SseAccumulator:
         if self.defect is None:
             self.defect = reason
 
+    def _value_size(self, value: Any) -> int:
+        if isinstance(value, str):
+            return len(value.encode("utf-8"))
+        if isinstance(value, bytes):
+            return len(value)
+        # measuring fragments instead of serializing the whole accumulated envelope keeps each
+        # chunk constant-time. json overhead only makes this an approximate storage budget, so
+        # the explicit truncation marker remains the authoritative export signal.
+        return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
     def _reserve(self, value: Any) -> bool:
         if self.truncated or self._max_accumulated_bytes is None:
             return not self.truncated
-        if isinstance(value, str):
-            size = len(value.encode("utf-8"))
-        elif isinstance(value, bytes):
-            size = len(value)
-        else:
-            # measuring fragments instead of serializing the whole accumulated envelope keeps each
-            # chunk constant-time. json overhead only makes this an approximate storage budget, so
-            # the explicit truncation marker remains the authoritative export signal.
-            size = len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+        size = self._value_size(value)
         if size > self._max_accumulated_bytes - self._accumulated_bytes:
             self.truncated = True
             return False
         self._accumulated_bytes += size
+        return True
+
+    def _reserve_overwriting(self, key: str, value: Any) -> bool:
+        if self.truncated or self._max_accumulated_bytes is None:
+            return not self.truncated
+        previous_size = self._overwriting_sizes.get(key, 0)
+        size = self._value_size(value)
+        retained_bytes = self._accumulated_bytes - previous_size
+        if size > self._max_accumulated_bytes - retained_bytes:
+            self.truncated = True
+            return False
+        self._accumulated_bytes = retained_bytes + size
+        self._overwriting_sizes[key] = size
         return True
 
     @property
@@ -283,12 +320,16 @@ class SseAccumulator:
             # sometimes after real deltas have already arrived. the partial text is not a reply.
             self._note_defect("upstream reported an error mid-stream")
         for key, value in payload.items():
-            if key not in {"choices", "usage"} and self._reserve(value):
+            if key not in {"choices", "usage"} and self._reserve_overwriting(key, value):
                 self._envelope[key] = value
-        if isinstance(payload.get("usage"), dict) and self._reserve(payload["usage"]):
+        if isinstance(payload.get("usage"), dict) and self._reserve_overwriting(
+            "usage", payload["usage"]
+        ):
             self.usage = payload["usage"]
         choices = payload.get("choices")
         if not isinstance(choices, list):
+            if choices is not None:
+                self._note_defect("stream contained non-list choices")
             return
         for position, choice in enumerate(choices):
             if not isinstance(choice, dict):
@@ -349,7 +390,11 @@ class SseAccumulator:
             if isinstance(target, dict):
                 _merge_fragment_dict(target, function_call)
         tool_calls = delta.get("tool_calls")
-        if not isinstance(tool_calls, list) or not self._reserve(tool_calls):
+        if not isinstance(tool_calls, list):
+            if tool_calls is not None:
+                self._note_defect("stream tool_calls was not a list")
+            return
+        if not self._reserve(tool_calls):
             return
         accumulated_calls: dict[int, dict[str, Any]] = state["tool_calls"]
         for position, tool_call in enumerate(tool_calls):

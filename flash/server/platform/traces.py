@@ -193,13 +193,23 @@ def store_trace(
             max_bytes=MAX_PAYLOAD_TOTAL_BYTES,
         )
         attributes = dict(span.attributes) if span.attributes is not None else None
-        truncated_sides = [
+        supplied_sides: set[str] = set()
+        if attributes is not None:
+            supplied_value = attributes.pop(_PAYLOAD_TRUNCATED_ATTRIBUTE, None)
+            if isinstance(supplied_value, list) and all(
+                isinstance(side, str) for side in supplied_value
+            ):
+                supplied_sides = {side for side in supplied_value if side in {"input", "output"}}
+        detected_sides = {
             side
             for side, flag in (("input", input_truncation), ("output", output_truncation))
             if flag.hit
+        }
+        truncated_sides = [
+            side for side in ("input", "output") if side in supplied_sides | detected_sides
         ]
         if truncated_sides:
-            # the marker last, so a caller-supplied attribute of the same name cannot overwrite it.
+            # the marker last, so a caller-supplied attribute cannot remove a detected side.
             # converted exports can now reject only the payload side their row actually requires.
             attributes = {
                 **(attributes or {}),
