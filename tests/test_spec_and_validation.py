@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
 
 import pytest
@@ -1382,6 +1383,30 @@ def test_stripping_an_auto_pin_keeps_the_preparation_digest_stable() -> None:
         assert at_create == at_repersist
 
 
+@contextmanager
+def _serializing_without_prompts_per_step():
+    """Serialize `JobSpec` the way 1.1.40 did: with no ``prompts_per_step`` key at all.
+
+    That build predates the field, so its payload carried no such key -- which hashes differently
+    from the explicit null today's dataclass always emits. A digest meant to stand in for a real
+    persisted snapshot has to be taken over those historical bytes, or the test asserts against a
+    shape production never wrote.
+    """
+    original_internal, original_public = JobSpec.to_internal_dict, JobSpec.to_dict
+
+    def _drop(emit):
+        return lambda self: {
+            **emit(self),
+            "train": {k: v for k, v in emit(self)["train"].items() if k != "prompts_per_step"},
+        }
+
+    JobSpec.to_internal_dict, JobSpec.to_dict = _drop(original_internal), _drop(original_public)
+    try:
+        yield
+    finally:
+        JobSpec.to_internal_dict, JobSpec.to_dict = original_internal, original_public
+
+
 def test_migrating_a_legacy_rollout_batch_keeps_its_preparation_digest_valid() -> None:
     """Recovering a persisted rollout snapshot must not fail integrity validation.
 
@@ -1435,29 +1460,8 @@ def test_migrating_a_legacy_rollout_batch_keeps_its_preparation_digest_valid() -
         if key_absent:
             worker["train"].pop("prompts_per_step", None)
             public["train"].pop("prompts_per_step", None)
-        original_internal, original_public = JobSpec.to_internal_dict, JobSpec.to_dict
-        if key_absent:
-            JobSpec.to_internal_dict = lambda self: {
-                **original_internal(self),
-                "train": {
-                    k: v
-                    for k, v in original_internal(self)["train"].items()
-                    if k != "prompts_per_step"
-                },
-            }
-            JobSpec.to_dict = lambda self: {
-                **original_public(self),
-                "train": {
-                    k: v
-                    for k, v in original_public(self)["train"].items()
-                    if k != "prompts_per_step"
-                },
-            }
-        try:
+        with _serializing_without_prompts_per_step() if key_absent else nullcontext():
             digest = runner._preparation_digest(spec, spec, None)
-        finally:
-            JobSpec.to_internal_dict = original_internal
-            JobSpec.to_dict = original_public
         return worker, public, digest
 
     def _recover(worker, public, digest):
@@ -1525,13 +1529,89 @@ def test_migrating_a_legacy_rollout_batch_keeps_its_preparation_digest_valid() -
         {
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "sft",
-            "run_id": "sft",
+            "run_id": "sft-digest",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "gpu": {"type": "H100", "count": 1},
             "train": {"epochs": 1, "batch_size": 4},
         }
     )
     assert runner._stored_rollout_batch_spelling(sft.to_internal_dict()) is None
+
+
+def test_re_persisting_a_legacy_rollout_run_keeps_it_recoverable(tmp_path, monkeypatch) -> None:
+    """A quote refresh or realloc must not write a digest the next read cannot reproduce.
+
+    `status.spec` is never rewritten, so a legacy rollout run keeps the old batch spelling for life
+    and every READ replays it. The re-persist path rewrites the worker half and rehashes -- so if it
+    hashes without that replay, the run recovers until its first quote refresh and fails afterwards,
+    which is worse than failing outright because it passes every check at submission time.
+
+    Repeated because re-persist has to be idempotent: the second one hashes bytes the first wrote.
+    """
+    import importlib
+
+    import flash.runner as runner
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    from flash.runner.submit import _persist_effective_worker_spec
+
+    for index, (batch_size, prompts_per_step, key_absent) in enumerate(
+        (
+            (32, None, True),  # 1.1.40: old name only, new key absent
+            (None, None, True),  # 1.1.40: nothing authored
+            (32, None, False),  # 1.1.43+: old name, new key null
+            (32, 16, False),  # mid-upgrade: both names stored
+            (None, 16, False),  # modern
+        )
+    ):
+        run_id = f"repersist-{index}"
+        spec = replace(
+            JobSpec.from_dict(
+                {
+                    "model": "Qwen/Qwen3.5-4B",
+                    "algorithm": "grpo",
+                    "run_id": run_id,
+                    "project": "11111111-1111-4111-8111-111111111111",
+                    "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                    "gpu": {"type": "H100", "count": 1},
+                    "train": {"epochs": 1, "group_size": 4, "lora_rank": 16},
+                }
+            ),
+            model_revision="a" * 40,
+            model_revision_auto=True,  # trips the digest gate
+        )
+        spec = replace(
+            spec,
+            train=replace(spec.train, batch_size=batch_size, prompts_per_step=prompts_per_step),
+        )
+        worker, public = spec.to_internal_dict(), spec.to_dict()
+        if key_absent:
+            worker["train"].pop("prompts_per_step", None)
+            public["train"].pop("prompts_per_step", None)
+        with _serializing_without_prompts_per_step() if key_absent else nullcontext():
+            digest = runner._preparation_digest(spec, spec, None)
+        runner._save_status(
+            runner.RunStatus(
+                state="queued",
+                run_id=run_id,
+                spec=public,
+                effective_preparation={"worker_spec": worker, "preparation_digest": digest},
+            )
+        )
+
+        before = runner.effective_spec_from_status(runner.get_status(run_id))
+        for _ in range(2):
+            stored = runner.get_status(run_id).effective_preparation["worker_spec"]
+            _persist_effective_worker_spec(JobSpec.from_dict(stored))
+            after = runner.effective_spec_from_status(runner.get_status(run_id))
+            # recoverable AND unchanged: a digest that merely validates is not enough if the batch
+            # it certifies drifted.
+            assert (after.train.prompts_per_step, after.train.batch_size) == (
+                before.train.prompts_per_step,
+                None,
+            ), (run_id, batch_size, prompts_per_step)
 
 
 def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> None:

@@ -83,17 +83,6 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     # which would leave a tampered public batch neither bound nor compared.
     stored_rollout_batch = runner._stored_rollout_batch_spelling(raw_worker)
     stored_public_rollout_batch = runner._stored_rollout_batch_spelling(raw_public)
-    # 1.1.40 predates `prompts_per_step`, so its payload carried no such key -- which hashes
-    # differently from the explicit null every later release wrote. The discriminator is carrying
-    # the OLD name while lacking the new one: a payload omitting BOTH says nothing about when it
-    # was written, and every digest is taken over a serialized JobSpec, which emits both names for
-    # every run. Treating a merely-absent key as 1.1.40 would drop a key that WAS hashed.
-    _raw_train = raw_worker.get("train") if isinstance(raw_worker.get("train"), dict) else {}
-    stored_rollout_batch_key_absent = (
-        stored_rollout_batch is not None
-        and "batch_size" in _raw_train
-        and "prompts_per_step" not in _raw_train
-    )
     has_workload_profile = bool(
         worker_spec.workload_profile_kind
         or worker_spec.workload_profile_input_digest
@@ -133,7 +122,6 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             legacy_public_alpha=legacy_public_alpha,
             stored_rollout_batch=stored_rollout_batch,
             stored_public_rollout_batch=stored_public_rollout_batch,
-            stored_rollout_batch_key_absent=stored_rollout_batch_key_absent,
         )
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
@@ -152,7 +140,6 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             legacy_public_alpha=legacy_public_alpha,
             stored_rollout_batch=stored_rollout_batch,
             stored_public_rollout_batch=stored_public_rollout_batch,
-            stored_rollout_batch_key_absent=stored_rollout_batch_key_absent,
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:
