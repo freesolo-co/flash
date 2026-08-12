@@ -440,6 +440,18 @@ def cmd_serve_status(args) -> int:
         # deploy would fail on this, so say it here rather than at deploy time.
         print(f"\nmissing required capabilities: {', '.join(missing)}", file=sys.stderr)
         return 1
+    # An explicit `ok: false` is the backend declaring itself unhealthy while still answering with
+    # 200 and the right capabilities -- a model still loading, or an engine that failed to start.
+    # Reporting `ready` over that sends the operator to a deploy that cannot work, and this command
+    # exists to tell them the opposite. `is False`, not falsiness: a backend that omits the field
+    # entirely (the contract does not require it) is not making a claim either way.
+    if payload.get("ok") is False:
+        print(
+            "\nthe backend reports itself unhealthy (ok: false). its capabilities are right, so "
+            "this is a runtime problem -- check the app's logs before deploying.",
+            file=sys.stderr,
+        )
+        return 1
     print(f"\nready. deploy a run with: {CLI_NAME} models deploy <run-id>")
     return 0
 

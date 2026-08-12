@@ -162,6 +162,50 @@ def _members_key(run_id: str) -> str:
     return f"members:{{run_id}}"
 
 
+def _lora_id_key(int_id: int) -> str:
+    return f"loraid:{{int_id}}"
+
+
+async def _claim_lora_int_id(int_id: int, adapter_id: str) -> str:
+    """Claim ``int_id`` for ``adapter_id``, returning whichever adapter actually holds it.
+
+    Shared rather than process-local because ``Engine`` scales horizontally: two colliding adapters
+    settling on different containers would each find an empty local map and both load. And claimed
+    before the download rather than after it, because the per-adapter lock does not serialize two
+    DIFFERENT adapters -- checking first and recording minutes later leaves the entire download
+    window open for the other one to pass the same check.
+
+    ``put(skip_if_exists=True)`` is an atomic insert-if-absent, so exactly one adapter wins. A
+    re-registration of the same adapter re-reads its own claim and proceeds, which keeps a retried
+    load from being refused by its own earlier attempt.
+    """
+    key = _lora_id_key(int_id)
+    if await adapter_records.put.aio(key, adapter_id, skip_if_exists=True):
+        return adapter_id
+    owner = await adapter_records.get.aio(key)
+    return str(owner) if owner is not None else adapter_id
+
+
+async def _release_lora_int_id(int_id: int, adapter_id: str) -> bool:
+    """Drop ``adapter_id``'s claim on ``int_id``. False only when somebody ELSE holds it.
+
+    `pop`-then-restore rather than read-then-delete, for the same reason as the run lock: `pop`
+    returns what it removed, so what came back is proof of what was taken. An unconditional delete
+    would let an undeploy of a REFUSED colliding adapter release the resident peer's claim.
+
+    An ABSENT claim answers True, not False. The question this guard exists to ask is "would
+    evicting kick a peer off the GPU", and with no claim recorded there is no peer -- a claim is
+    taken before the download and released only by its owner, so a resident adapter always has one.
+    Answering False there would skip the eviction for every adapter loaded before this app carried
+    claims at all, leaving them resident against `max_loras` until the container restarts.
+    """
+    removed = await adapter_records.pop.aio(_lora_id_key(int_id), None)
+    if removed is not None and removed != adapter_id:
+        await adapter_records.put.aio(_lora_id_key(int_id), removed, skip_if_exists=True)
+        return False
+    return True
+
+
 async def _run_members(run_id: str) -> list[str]:
     """Every adapter id belonging to one run: its alias plus each revision registered under it.
 
@@ -389,8 +433,17 @@ class Engine:
             # from the wrong run's weights. There is no safe way to serve the second one, so the
             # registration fails loudly with the pair named -- deploying under a new run id is the
             # fix, and settle turns this into `failed` with this reason attached.
-            owner = self._int_ids.get(int_id)
-            if owner is not None and owner != adapter_id:
+            #
+            # Claimed in the shared Dict BEFORE the download, not in a local dict afterwards. Two
+            # separate races made the local-and-late version unable to refuse anything:
+            #   - the per-adapter lock does not serialize two DIFFERENT adapters, so both colliding
+            #     loads passed the check, awaited their downloads, and both recorded ownership.
+            #   - `Engine` scales horizontally, so two settles land on different containers whose
+            #     process-local maps are both empty and both loads succeed.
+            # `put(skip_if_exists=True)` is atomic across containers, so exactly one adapter wins
+            # the id, and it wins before either has spent minutes downloading.
+            owner = await _claim_lora_int_id(int_id, adapter_id)
+            if owner != adapter_id:
                 raise RuntimeError(
                     f"lora id collision: {{adapter_id}} and {{owner}} both hash to {{int_id}}, and "
                     f"vllm cannot tell them apart. redeploy under a different run id."
@@ -420,16 +473,20 @@ class Engine:
         async with self._locks.setdefault(adapter_id, asyncio.Lock()):
             self._loaded.pop(adapter_id, None)
             int_id = _lora_int_id(adapter_id)
-            # Only if THIS adapter still owns the int id. Releasing it unconditionally would let an
-            # undeploy hand the slot to a colliding adapter that the guard above had refused, which
-            # is the collision reintroduced through the back door.
-            if self._int_ids.get(int_id) == adapter_id:
+            # Both the map entry and the eviction are conditional on THIS adapter owning the int
+            # id, and they must stay that way together. vLLM addresses a LoRA only by the int, so
+            # evicting unconditionally would drop whichever adapter currently holds it -- and for a
+            # colliding revision that was REFUSED and never loaded, that means undeploying it kicks
+            # the resident peer off the GPU while `_loaded` still reports the peer as present, so
+            # it silently stops answering. Leaving the map entry alone matters for the same reason
+            # in reverse: releasing it would hand the slot to the adapter the guard just refused.
+            if await _release_lora_int_id(int_id, adapter_id):
                 self._int_ids.pop(int_id, None)
-            # Drop it from vLLM too, not just from this dict. The LoRA cache is bounded by
-            # max_loras, so repeated deploy/undeploy cycles would otherwise keep disabled adapters
-            # resident until the container restarts and start evicting live ones.
-            with contextlib.suppress(Exception):  # eviction is best effort, never fails an undeploy
-                await self.engine.remove_lora(int_id)
+                # Drop it from vLLM too, not just from this dict. The LoRA cache is bounded by
+                # max_loras, so repeated deploy/undeploy cycles would otherwise keep disabled
+                # adapters resident until the container restarts and start evicting live ones.
+                with contextlib.suppress(Exception):  # best effort, never fails an undeploy
+                    await self.engine.remove_lora(int_id)
         return {{"ok": True}}
 
     async def _prepare(self, payload: dict[str, Any], record: dict[str, Any]):
@@ -853,7 +910,21 @@ def api():
             # left one incomplete. Without this, `_run_members` returns [] and the loop below does
             # nothing -- undeploy answers 200 with empty lists while the adapter keeps serving.
             members = list(dict.fromkeys([*await _run_members(run_id), adapter_id, run_id]))
-            for member_id in members:
+            # The alias goes LAST, which is what makes this loop safe to lose halfway through. Its
+            # cost grows with the run's member count while the lock's lease does not renew -- the
+            # TTL cannot be extended atomically on modal.Dict (see `_run_lock`) -- so a long enough
+            # run can hand the lock to a concurrent `activate` mid-pass. Disabling the alias FIRST
+            # makes that expiry corrupting: the activation writes the alias back to `ready` at a
+            # revision this pass has not reached yet, then the pass disables that revision and
+            # never revisits the alias, and undeploy returns success with a `ready` alias pointing
+            # at a disabled, evicted revision -- a run that answers 404 to every request while its
+            # records claim it is serving.
+            #
+            # Alias last inverts that. Whatever an interleaved activation points the alias at, this
+            # pass overwrites the alias afterwards, so the run ends fully disabled either way. And
+            # an activation landing after the alias write cannot resurrect it: `activate` re-reads
+            # its revision under the lock and 409s because this pass already disabled it.
+            for member_id in sorted(members, key=lambda m: m == run_id):
                 candidate = await _read(member_id)
                 if not isinstance(candidate, dict):
                     continue

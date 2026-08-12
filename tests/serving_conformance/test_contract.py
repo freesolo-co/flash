@@ -148,6 +148,32 @@ def test_readback_echoes_the_identity_the_client_cross_checks(http, deployed):
         )
 
 
+def test_a_constrained_registration_is_echoed_back_unchanged(http, adapter_source, run_id):
+    """`structured_outputs` must survive the round trip byte for byte.
+
+    The client compares it exactly (`flash/serve/deploy.py`, alongside the scalar identity fields),
+    and it is the one identity-bearing field that is OPTIONAL -- so a backend can accept the
+    registration, drop the constraint, and look completely healthy. Every other test here registers
+    without one, which means a suite that stops at those would certify a backend that fails every
+    constrained deploy: `_wait_revision_ready` reads the constraint back as `None`, calls that a
+    different artifact, and refuses. Constrained runs are ordinary, not an edge case.
+    """
+    body = {
+        **_registration(run_id, adapter_source),
+        "structured_outputs": {"regex": r"[ab]+"},
+    }
+    try:
+        _register(http, body)
+        record = _record(http.get(f"/adapters/{body['adapter_id']}").json())
+        assert record.get("structured_outputs") == body["structured_outputs"], (
+            f"read-back structured_outputs={record.get('structured_outputs')!r}, registered "
+            f"{body['structured_outputs']!r}. The client compares this exactly, so every "
+            f"constrained deploy against this backend will be refused as a different artifact."
+        )
+    finally:
+        http.delete(f"/adapters/{run_id}")
+
+
 def test_reregistering_identical_content_is_idempotent(http, deployed):
     """The client retries registration after an ambiguous 5xx; a retry must not fail."""
     _register(http, deployed)

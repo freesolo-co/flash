@@ -1118,6 +1118,77 @@ def test_undeploy_works_when_the_member_index_is_missing(client):
     assert response.json()["disabled_revisions"] == [REVISION]
 
 
+def test_an_activation_racing_an_expired_undeploy_lease_cannot_leave_a_ready_alias(client):
+    """Undeploy must disable the run alias LAST, so losing the lock mid-pass is not corrupting.
+
+    The disable loop costs a Modal round trip per member while the lock's lease does not renew --
+    it cannot be renewed atomically on modal.Dict -- so a run with enough members can hand the lock
+    to a concurrent `activate` before the pass finishes. Disabling the alias first makes that
+    handover corrupting: the activation writes the alias back to `ready` at a revision the pass has
+    not reached, the pass then disables that revision and never revisits the alias, and undeploy
+    returns 200 leaving a `ready` alias pointing at a disabled, evicted revision. Every request to
+    the run 404s while its records claim it is serving.
+
+    Driven by expiring the lease at the moment the alias is written and landing a real activation
+    through the app's own endpoint. Alias-last puts that activation BEFORE the alias write, so the
+    pass overwrites whatever it pointed at; alias-first puts it after, and nothing revisits it.
+    """
+    _register_and_ready(client)
+    # the alias has to be live for undeploy to write it at all: a never-activated alias is already
+    # `disabled` and the loop skips it, which would make this test vacuous in both orderings.
+    client.post(f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None})
+    module = client.app.state.generated_module
+    second = "run-abc@step-20." + "b" * 40
+    module.adapter_records[module._record_key(second)] = {
+        "adapter_id": second,
+        "status": "ready",
+        "base_model": BASE_MODEL,
+        "checkpoint": "step-20",
+        "metadata": {
+            "record_type": "revision",
+            "run_id": RUN_ID,
+            "lifecycle_state": "ready",
+        },
+    }
+    members = module.adapter_records.get(module._members_key(RUN_ID)) or []
+    module.adapter_records[module._members_key(RUN_ID)] = [*members, second]
+    alias_key = module._record_key(RUN_ID)
+    lock_key = module._lock_key(RUN_ID)
+    records = module.adapter_records
+    landed: list[str] = []
+
+    class _ActivateOnAliasWrite(type(records)):
+        def _put(self, key, value, skip_if_exists=False):
+            # the moment the pass reaches the alias, drop its lease and let a real activation in --
+            # exactly what a member loop that outruns its TTL hands the next waiter.
+            if key == alias_key and not landed:
+                landed.append(key)
+                dict.pop(self, lock_key, None)
+                client.post(
+                    f"/adapters/{second}/activate",
+                    json={"expected_adapter_revision": None},
+                )
+            return super()._put(key, value, skip_if_exists=skip_if_exists)
+
+    hooked = _ActivateOnAliasWrite()
+    hooked.update(records)
+    module.adapter_records = hooked
+    try:
+        response = client.delete(f"/adapters/{REVISION}")
+        alias = hooked[alias_key]
+        other = hooked[module._record_key(second)]
+    finally:
+        module.adapter_records = records
+
+    assert response.status_code == 200
+    assert landed, "the alias was never written, so this test did not exercise the race"
+    assert other["status"] == "disabled", "a member revision survived undeploy as `ready`"
+    assert alias["status"] == "disabled", (
+        "an activation landed after undeploy released the alias, and undeploy never revisited "
+        "it -- the run reports `ready` while pointing at a disabled, evicted revision"
+    )
+
+
 def test_an_interrupted_first_registration_can_still_be_activated(client):
     """A revision whose alias write never landed must be repairable by re-registering.
 
