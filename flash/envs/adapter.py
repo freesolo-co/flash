@@ -21,6 +21,8 @@ from flash.envs.base import (
 from flash.envs.loader import (
     GitHubEnvironmentRef,
     GitHubRateLimitError,
+    GitHubTransientError,
+    GitHubUnavailableError,
     _import_freesolo_environment_tools,
     canonical_managed_environment_slug,
     env_dataset_rows,
@@ -678,6 +680,8 @@ __all__ = [
     "FreesoloEnvironment",
     "GitHubEnvironmentRef",
     "GitHubRateLimitError",
+    "GitHubTransientError",
+    "GitHubUnavailableError",
     "canonical_managed_environment_slug",
     "is_freesolo_environment_id",
     "is_github_environment_ref",

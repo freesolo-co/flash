@@ -676,6 +676,13 @@ def list_namespace_slugs(*, key: dict) -> list[str]:
         raise EnvPublishError(
             f"Freesolo environment list is rate limited: {exc}", status=429
         ) from exc
+    except loader.GitHubUnavailableError as exc:
+        # 503, not 429: a 5xx or a connection failure is GitHub being unreachable, and telling the
+        # caller they exceeded a quota is both wrong and unactionable -- there is no quota to wait
+        # out, and the real cause never reaches them.
+        raise EnvPublishError(
+            f"Freesolo environment list is temporarily unavailable: {exc}", status=503
+        ) from exc
     except RuntimeError as exc:
         raise EnvPublishError(f"Freesolo environment list failed: {exc}", status=502) from exc
 
