@@ -10,6 +10,58 @@ import contextlib
 
 import pytest
 
+# The synthetic adapter commit the serving conformance suite falls back to, for a backend that
+# resolves the subfolder at the repo tip. 40 hex chars because that is the revision grammar flash's
+# own immutable adapter ids are built from.
+PLACEHOLDER_HF_REVISION = "0" * 40
+
+
+def pytest_addoption(parser):
+    """Register the serving-conformance flags.
+
+    Here rather than in `tests/serving_conformance/conftest.py` because pytest only calls this hook
+    on INITIAL conftests -- the ones on the invocation's own path. Registered in the subdirectory,
+    `--serving-url` is an unrecognized-argument ERROR for every invocation that does not name that
+    directory explicitly, including a bare `pytest`.
+    """
+    group = parser.getgroup("serving conformance")
+    group.addoption(
+        "--serving-url",
+        default=None,
+        help="serving backend control root to run the contract against; skips the suite when unset",
+    )
+    group.addoption(
+        "--conformance-repo",
+        default=None,
+        help="HuggingFace repo holding the adapter to register (default: $FLASH_CONFORMANCE_REPO)",
+    )
+    group.addoption(
+        "--conformance-subfolder",
+        default=None,
+        help="path to the adapter inside the repo",
+    )
+    group.addoption(
+        "--conformance-base-model",
+        default=None,
+        help="base model the adapter was trained on; must match what the backend serves",
+    )
+    group.addoption(
+        "--conformance-hf-revision",
+        default=None,
+        help=f"commit the adapter is pinned to (default: {PLACEHOLDER_HF_REVISION})",
+    )
+    group.addoption(
+        "--conformance-repo-type",
+        default="dataset",
+        help="repo_type sent at registration (default: dataset, matching flash)",
+    )
+    group.addoption(
+        "--conformance-ready-timeout",
+        type=float,
+        default=600.0,
+        help="seconds to wait for a revision to reach ready (default: 600, covers a cold start)",
+    )
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _close_status_reporter_after_suite():

@@ -345,6 +345,24 @@ depend on it. Your trained adapters land in your own HuggingFace repos and can b
 by any stack that loads LoRA adapters - vLLM, TGI, or your own. Point `FREESOLO_SERVING_URL`
 at a compatible deployment if you want `flash deploy` and `flash chat` to work end to end.
 
+### Standing one up
+
+`flash serve setup` builds you one. It generates a Modal app implementing the same contract,
+deploys it to your own Modal account, and prints the `FREESOLO_SERVING_URL` to export:
+
+```bash
+pip install 'freesolo-flash[serve-modal]'
+flash serve gpus --model Qwen/Qwen3.5-4B   # what fits where, and what it costs
+flash serve setup --model Qwen/Qwen3.5-4B  # generate, then ask before deploying
+```
+
+The generated file is yours to read and edit - it is written into your working directory,
+not hidden inside the package. Its engine settings come from the catalog's own
+production-validated serving config for that model.
+
+Writing your own instead is fully supported: [docs/serving-contract.md](docs/serving-contract.md)
+documents every endpoint, and its conformance suite checks an implementation in one command.
+
 On a standalone plane those three commands **error out** until you point it at a backend
 you operate. Every serving request carries `FREESOLO_INTERNAL_KEY`, and on your plane that
 key is what grants full control of it - so reaching Freesolo's serving app would hand your

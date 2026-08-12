@@ -36,10 +36,10 @@ hardware budget with no Freesolo backend involved. See
 
 Two components stay Freesolo-operated and are not in this repository:
 
-| Component             | Where it lives                                        | Self-hosted equivalent                                                          |
-| --------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------- |
-| Multi-tenant identity | `api.freesolo.co` - verifies keys, owns projects/orgs | `FLASH_STANDALONE=1` runs single-tenant on your own operator key                |
-| Multi-LoRA serving    | `serve.freesolo.co` - `flash/serve/` is a thin client | adapters land in your HuggingFace repos; serve them with any LoRA-capable stack |
+| Component             | Where it lives                                        | Self-hosted equivalent                                                      |
+| --------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------- |
+| Multi-tenant identity | `api.freesolo.co` - verifies keys, owns projects/orgs | `FLASH_STANDALONE=1` runs single-tenant on your own operator key            |
+| Multi-LoRA serving    | `serve.freesolo.co` - `flash/serve/` is a thin client | `flash serve setup` deploys an equivalent backend to your own Modal account |
 
 So there are three honest ways to use Flash: **against the hosted service**, **self-hosted
 against your own GPU accounts**, or as **training and provider code to read and modify**,
@@ -272,9 +272,11 @@ Two seams remain Freesolo-operated and are not part of this repository:
    the `/api/auth/verify` contract in `flash/server/platform/auth.py`, pointed at by
    `FREESOLO_BASE_URL`. Standalone mode is single-tenant instead.
 2. **Serving.** `flash/serve/` is a client for a multi-LoRA serving app; point it elsewhere
-   with `FREESOLO_SERVING_URL`. Training, checkpoint streaming, and adapter export are
-   fully self-hostable - adapters land in your own HuggingFace repos and can be served by
-   any stack that loads LoRA adapters.
+   with `FREESOLO_SERVING_URL`. `flash serve setup` generates and deploys an equivalent
+   backend to your own Modal account, or write one against
+   [docs/serving-contract.md](docs/serving-contract.md). Training, checkpoint streaming,
+   and adapter export are fully self-hostable either way - adapters land in your own
+   HuggingFace repos and can be served by any stack that loads LoRA adapters.
 
 The GPU worker image is public and can be pulled directly. It is published under an
 explicit CUDA tag, not `latest`:
