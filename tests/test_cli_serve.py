@@ -288,6 +288,37 @@ def test_a_keyless_deploy_warns_that_anyone_can_spend_the_gpu_budget(
     assert ("no FLASH_SERVING_KEY" in err) is warns
 
 
+def test_status_asks_the_backend_the_way_deploy_does(monkeypatch, capsys):
+    """`serve status` must use the client's authenticated request path.
+
+    The contract permits a backend to authenticate /healthz. A bare unauthenticated GET then 401s
+    and status reports the backend as unreachable while every deploy against it works fine.
+    """
+    from flash.serve import deploy as deploy_mod
+
+    seen: list[tuple[str, str]] = []
+
+    class _Response:
+        @staticmethod
+        def json():
+            return {
+                "ok": True,
+                "base_models": ["Qwen/Qwen3.5-4B"],
+                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
+            }
+
+    def _fake_request(method, url, **kwargs):
+        seen.append((method, url))
+        return _Response()
+
+    monkeypatch.setattr(deploy_mod, "serving_base_url", lambda: "https://acme.modal.run")
+    monkeypatch.setattr(deploy_mod, "_serving_request", _fake_request)
+    assert serve_cmd.cmd_serve_status(_args()) == 0
+    assert seen == [("GET", "https://acme.modal.run/healthz")], (
+        "status did not go through the authenticated serving request path"
+    )
+
+
 def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, capsys):
     """Both key-setup paths must generate into a variable, not inline into `modal secret create`.
 
@@ -301,6 +332,30 @@ def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, ca
         assert "export FREESOLO_INTERNAL_KEY=$(" in text
         assert 'FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"' in text
         assert "FLASH_SERVING_KEY=$(python" not in text, "the generated key is discarded inline"
+
+
+def test_the_deploy_output_points_at_the_control_plane_process(tmp_path, monkeypatch, capsys):
+    """The serving variables belong to `flash-server`, not to the shell that ran `serve setup`.
+
+    `models deploy`/`chat`/`undeploy` are control-plane routes: the SERVER reads
+    FREESOLO_SERVING_URL and contacts the backend. An instruction to export it here reaches the
+    CLI and not the server, so an operator who follows it exactly still has every deploy fail on
+    an unset serving URL.
+    """
+
+    def _fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="https://acme--flash-serve-api.modal.run\n", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr(serve_cmd, "_healthz", lambda url: {"ok": True, "requires_key": True})
+    assert serve_cmd._deploy(tmp_path / "app.py") == 0
+    out = capsys.readouterr().out
+    assert serve_cmd.SERVER_NAME in out, "the output never names the control-plane process"
+    assert "FREESOLO_SERVING_URL=https://acme--flash-serve-api.modal.run" in out
+    assert "FREESOLO_INTERNAL_KEY" in out, "the matching key was not mentioned"
+    assert "restart" in out.lower(), "an already-running server needs a restart to see them"
 
 
 def test_a_failed_deploy_is_reported_as_a_failure(tmp_path, monkeypatch, capsys):

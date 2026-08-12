@@ -63,6 +63,16 @@ SCALEDOWN_WINDOW_SECONDS = {scaledown_window}
 # Cold start on a large model is minutes, not seconds; the default startup timeout is too short.
 STARTUP_TIMEOUT_SECONDS = 20 * 60
 TIMEOUT_SECONDS = 30 * 60
+# COLD STARTS AND THE DEPLOY BUDGET. flash's client waits 5 minutes for a revision to reach
+# `ready` (REVISION_READY_BUDGET_SECONDS in flash/serve/deploy.py). A cold start plus a first
+# adapter load can exceed that with NOTHING wrong, and `models deploy` then reports a timeout
+# while the engine is healthy and still loading. That is the tradeoff of scale-to-zero: whichever
+# deploy follows an idle period pays for the container start.
+#
+# It is recoverable rather than fatal, because registration is idempotent AND re-drives a load
+# that never reached a terminal state -- re-running `flash models deploy` after such a timeout
+# succeeds against the now-warm container. To never pay it, set `min_containers=1` below, which
+# keeps the GPU resident and billed continuously.
 
 CACHE_MOUNT = "/vol/flash-serving"
 ADAPTER_DIR = f"{{CACHE_MOUNT}}/adapters"
@@ -180,7 +190,13 @@ async def _run_lock(run_id: str):
             await _drop_if(holder)
             continue
         if time.monotonic() > deadline:
-            raise TimeoutError(f"timed out waiting for the {{run_id}} lock")
+            # 409, not a 500: another operation on this run holds the lock, so this is contention
+            # the caller can retry -- the same answer a stale compare-and-swap gets. A 5xx would
+            # instead put the client on its ambiguous-failure path and make it retry a write it
+            # cannot tell succeeded.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, f"another operation on {{run_id}} is in progress"
+            )
         await asyncio.sleep(0.1)
     try:
         yield
@@ -300,6 +316,11 @@ class Engine:
     async def unregister(self, adapter_id: str) -> dict[str, Any]:
         async with self._lock:
             self._loaded.pop(adapter_id, None)
+            # Drop it from vLLM too, not just from this dict. The LoRA cache is bounded by
+            # max_loras, so repeated deploy/undeploy cycles would otherwise keep disabled adapters
+            # resident until the container restarts and start evicting live ones.
+            with contextlib.suppress(Exception):  # eviction is best effort, never fails an undeploy
+                await self.engine.remove_lora(_lora_int_id(adapter_id))
         return {{"ok": True}}
 
     @modal.method()
@@ -589,22 +610,29 @@ def api():
         run_id = (record.get("metadata") or {{}}).get("run_id") or adapter_id
         disabled_aliases: list[str] = []
         disabled_revisions: list[str] = []
-        for key in [k async for k in adapter_records.keys.aio()]:
-            candidate = await adapter_records.get.aio(key)
-            if not isinstance(candidate, dict):
-                continue
-            metadata = candidate.get("metadata") or {{}}
-            if metadata.get("run_id") != run_id or candidate.get("status") == "disabled":
-                continue
-            candidate["status"] = "disabled"
-            candidate["metadata"] = {{**metadata, "lifecycle_state": "disabled"}}
-            await _write(candidate)
-            if metadata.get("record_type") == "alias":
-                disabled_aliases.append(candidate["adapter_id"])
-            else:
-                disabled_revisions.append(candidate["adapter_id"])
-                with contextlib.suppress(Exception):  # gpu eviction is best effort
-                    await engine.unregister.remote.aio(candidate["adapter_id"])
+        # Under the SAME per-run lock `activate` takes. Without it, an in-flight activation can
+        # write the alias back to `ready` after this loop disabled it, and undeploy returns success
+        # while the run stays callable -- the lost update `alias_compare_and_swap` rules out.
+        async with _run_lock(run_id):
+            for key in [k async for k in adapter_records.keys.aio()]:
+                candidate = await adapter_records.get.aio(key)
+                if not isinstance(candidate, dict):
+                    continue
+                metadata = candidate.get("metadata") or {{}}
+                if metadata.get("run_id") != run_id or candidate.get("status") == "disabled":
+                    continue
+                candidate["status"] = "disabled"
+                candidate["metadata"] = {{**metadata, "lifecycle_state": "disabled"}}
+                await _write(candidate)
+                if metadata.get("record_type") == "alias":
+                    disabled_aliases.append(candidate["adapter_id"])
+                else:
+                    disabled_revisions.append(candidate["adapter_id"])
+        # Outside the lock: evicting from the GPU is slow and best effort, and the records are
+        # already durably disabled, so holding the lock across it would only block other deploys.
+        for revision_id in disabled_revisions:
+            with contextlib.suppress(Exception):  # gpu eviction is best effort
+                await engine.unregister.remote.aio(revision_id)
         return {{
             "ok": True,
             "run_id": run_id,

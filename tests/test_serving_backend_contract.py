@@ -610,6 +610,64 @@ def test_releasing_the_run_lock_removes_only_this_holders_lease(client):
     assert module.adapter_records.get(key) == newer, "release deleted a lease it did not hold"
 
 
+def test_undeploy_cannot_be_undone_by_a_concurrent_activation(client):
+    """Undeploy must disable the alias under the SAME per-run lock `activate` takes.
+
+    Outside it, an in-flight activation writes the alias back to `ready` after the delete disabled
+    it, so undeploy returns success while the run stays callable by its alias. Driven by holding
+    the run lock and observing that the DELETE waits for it rather than walking straight through.
+    """
+    _register_and_ready(client)
+    # Activate first, so `ready` is the state a lock-less delete would visibly destroy. An alias
+    # is created disabled, so asserting on `disabled` alone would pass without the delete running.
+    assert (
+        client.post(
+            f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None}
+        ).status_code
+        == 200
+    )
+    module = client.app.state.generated_module
+    key = module._lock_key(RUN_ID)
+    # A live lease held by someone else. If remove takes the lock it cannot proceed while this is
+    # here; if it does not, it disables the alias regardless.
+    module.adapter_records[key] = {"token": "activation-in-flight", "expires_at": time.time() + 30}
+    module.LOCK_TTL_SECONDS = 0.5
+
+    response = client.delete(f"/adapters/{REVISION}")
+    assert response.status_code == 409, (
+        f"undeploy did not take the run lock (got {response.status_code}); a concurrent "
+        f"activation could write the alias back to ready after this disabled it"
+    )
+    alias = client.get(f"/adapters/{RUN_ID}").json()["adapter"]
+    assert alias["status"] == "ready", "the alias was mutated without holding the run lock"
+
+
+def test_a_disabled_revision_is_dropped_from_the_engine(client):
+    """Undeploy must remove the LoRA from vLLM, not just from the app's own dict.
+
+    The engine's LoRA cache is bounded by max_loras, so adapters left resident across repeated
+    deploy/undeploy cycles eventually evict live ones or fail new loads until the container
+    restarts.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    removed: list[int] = []
+
+    instance = engine_class.__new__(engine_class)
+    instance._lock = asyncio.Lock()
+    instance._loaded = {REVISION: object()}
+
+    async def _remove_lora(lora_id):
+        removed.append(lora_id)
+        return True
+
+    instance.engine = types.SimpleNamespace(remove_lora=_remove_lora)
+    _run_awaitable(engine_class.unregister(instance, REVISION))
+    assert removed == [module._lora_int_id(REVISION)], "the LoRA was never removed from vLLM"
+    assert REVISION not in instance._loaded
+
+
 def test_a_run_lock_is_released_by_its_owner(client):
     """The guard above must not leave the lock held forever, which would wedge every later deploy.
 

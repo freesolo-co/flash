@@ -366,8 +366,22 @@ flash serve gpus --model Qwen/Qwen3.5-4B   # what fits where, and what it costs
 flash serve setup --model Qwen/Qwen3.5-4B  # generate, then ask before deploying
 ```
 
-Keep `FREESOLO_INTERNAL_KEY` exported wherever you run flash, so it sends the key the app
-expects. `flash serve setup` checks after deploying and warns if the app came up without one.
+Then put both variables in the **`flash-server` process environment** - not just the shell you
+ran setup in:
+
+```bash
+export FREESOLO_SERVING_URL=https://<your-app>.modal.run   # printed by serve setup
+export FREESOLO_INTERNAL_KEY=...                           # same value as FLASH_SERVING_KEY
+flash-server --host 0.0.0.0 --port 8080                    # restart to pick them up
+```
+
+`models deploy`, `chat`, and `undeploy` are control-plane operations: the CLI calls your server,
+and the server's routes are what read `FREESOLO_SERVING_URL` and contact serving. Exporting it
+only where you run the CLI leaves every deploy failing on an unset serving URL. As with every
+other setting here, `flash-server` reads its **process** environment, so an already-running
+server needs a restart.
+
+`flash serve setup` checks after deploying and warns if the app came up without a key.
 
 The generated file is yours to read and edit - it is written into your working directory,
 not hidden inside the package. Its engine settings come from the catalog's own

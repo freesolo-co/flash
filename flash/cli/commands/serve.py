@@ -27,6 +27,9 @@ from flash.serve.backend.gpus import MODAL_GPUS, cheapest_fitting, default_gpu, 
 
 DEFAULT_APP_FILE = "flash_serving_app.py"
 SECRET_NAME = "flash-serving"
+# The console script that runs the control plane (pyproject `[project.scripts]`). Deploy, chat and
+# undeploy are its routes, so it -- not this CLI -- is what has to see the serving variables.
+SERVER_NAME = "flash-server"
 # Modal prints the deployed web endpoint on stdout; this is the prefix we look for.
 _URL_MARKER = "https://"
 
@@ -248,14 +251,35 @@ def _deploy(app_file: Path) -> int:
     if not url:
         print(
             "\ndeployed, but the web endpoint URL was not found in modal's output. "
-            "find it with `modal app list` and export FREESOLO_SERVING_URL yourself.",
+            "find it with `modal app list` and set FREESOLO_SERVING_URL yourself, in the "
+            f"environment of the {SERVER_NAME} process (see below).",
             file=sys.stderr,
         )
         return 0
-    print(f"\ndeployed. point flash at it:\n  export FREESOLO_SERVING_URL={url}")
-    print(f"then: {CLI_NAME} models deploy <run-id> && {CLI_NAME} models chat <run-id> -m 'hi'")
+    print(f"\ndeployed at {url}")
+    print(_control_plane_instructions(url))
     _warn_if_unauthenticated(url)
     return 0
+
+
+def _control_plane_instructions(url: str) -> str:
+    """Where the serving variables have to be set.
+
+    `models deploy`/`chat`/`undeploy` are CONTROL PLANE operations: the CLI calls the server, and
+    the server's routes are what read FREESOLO_SERVING_URL and contact the backend. Exporting it
+    in the shell that ran `serve setup` reaches the CLI and not the server, so following that
+    instruction leaves every deploy failing on an unset serving URL -- with a setup transcript
+    that looked complete.
+    """
+    return (
+        f"Set these in the environment of your {SERVER_NAME} process -- not just this shell. "
+        f"{SERVER_NAME} reads its process environment, so an already-running server needs a "
+        f"restart to pick them up:\n"
+        f"  export FREESOLO_SERVING_URL={url}\n"
+        f"  export FREESOLO_INTERNAL_KEY=<the FLASH_SERVING_KEY you put in the modal secret>\n"
+        f"  {SERVER_NAME} --host 0.0.0.0 --port 8080   # restart it\n"
+        f"then: {CLI_NAME} models deploy <run-id> && {CLI_NAME} models chat <run-id> -m 'hi'"
+    )
 
 
 def _healthz(url: str) -> dict | None:
@@ -310,20 +334,17 @@ def _deployed_url(output: str) -> str:
 
 def cmd_serve_status(args) -> int:
     """Check the configured serving backend and report what it supports."""
-    from flash.serve.deploy import ServingError, serving_base_url
+    from flash.serve.deploy import ServingError, _serving_request, serving_base_url
 
     try:
         base = serving_base_url()
     except ServingError as exc:
         return _err(str(exc))
     try:
-        import httpx
-    except ImportError:
-        return _err("httpx is required. install with: pip install 'freesolo-flash[serve-modal]'")
-    try:
-        response = httpx.get(f"{base}/healthz", timeout=30)
-        response.raise_for_status()
-        payload = response.json()
+        # The client's own request path, not a bare GET: it carries the internal key and scopes it
+        # to the configured origin. A backend that authenticates /healthz -- which the contract
+        # permits -- would otherwise 401 here and be reported as down while deploys work fine.
+        payload = _serving_request("GET", f"{base}/healthz").json()
     except Exception as exc:  # any transport or decode failure is the same answer to the user
         return _err(f"serving backend at {base} did not answer /healthz: {exc}")
 
