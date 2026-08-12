@@ -363,7 +363,13 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
         "verl @ git+https://github.com/freesolo-co/verl@32d6200de81dc484893baf8b9cf30297ebe7fa49"
     )
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
-    assert "liger-kernel" in install
+    # liger-kernel is deliberately NOT installed. a matched qwen3.5-9b a/b differing only in
+    # model.use_liger measured train/grad_norm 0.0 with liger on versus 7.02 off, at a loss
+    # identical to four decimal places: liger silently severed the gradient to the lora params
+    # under verl's fsdp2 + peft + gradient-checkpointing composition, so sft trained nothing while
+    # looking healthy. with the package absent, use_liger=true raises ImportError at verl's lazy
+    # import (transformer_impl.py) instead of silently producing a zero-delta adapter.
+    assert "liger-kernel" not in install
     assert "bitsandbytes>=0.49" in install
     assert "qwen-vl-utils" in install
     assert "torchvision" in install
