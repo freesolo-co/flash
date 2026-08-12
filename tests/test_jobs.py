@@ -142,6 +142,39 @@ def test_decode_output_client_mode_error_includes_stdout_tail():
     assert "STDOUT-END" in msg
 
 
+def test_decode_output_error_redacts_credentials(monkeypatch):
+    """The decoded error reaches the user-readable run log, so it is sanitized like the
+    instance providers' failure details are."""
+    from flash.providers.runpod.jobs import decode_output
+
+    secret = "hf_ZZZdecodeoutputsecret0123456789"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    with pytest.raises(RuntimeError) as ei:
+        decode_output({"error": f"vllm crashed using {secret}", "stdout": f"401 for {secret}"})
+    msg = str(ei.value)
+    assert secret not in msg
+    assert "vllm crashed using <redacted>" in msg
+    assert "--- worker stdout tail ---\n401 for <redacted>" in msg
+
+
+def test_decode_output_tail_is_sanitized_before_the_bound(monkeypatch):
+    """slicing the raw text first can cut a credential at the boundary, leaving a suffix that no
+    longer value-matches; the complete text is sanitized before the tail is selected."""
+    from flash.providers.runpod.jobs import decode_output
+
+    secret = "hf_ZZZboundarystraddler0123456789abcdef"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    # non-json output whose 200-char boundary lands inside the secret.
+    raw = "x" * 500 + f"auth {secret}" + "y" * 180
+    with pytest.raises(RuntimeError) as ei:
+        decode_output(raw)
+    msg = str(ei.value)
+    assert secret not in msg
+    for fragment_length in range(6, len(secret)):
+        assert secret[-fragment_length:] not in msg
+    assert "<redacted>" in msg
+
+
 # ---------------------------------------------------------------------------
 # poll_job state machine (mocked runpod_api)
 # ---------------------------------------------------------------------------
@@ -273,6 +306,37 @@ def test_poll_job_failure(monkeypatch):
     assert not res.ok
     assert res.failure == "job_failed"
     assert "worker exploded" in res.detail
+
+
+def test_poll_job_failure_detail_redacts_secrets_in_provider_error_and_stdout(monkeypatch):
+    """A control-plane secret echoed by the worker must not reach the run log (Vast/Lambda
+    sanitize every part of their failure detail; RunPod has to match)."""
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    secret = "hf_ZZZterminaldetailsecret0123456789"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda eid, jid, **_kw: {
+            "status": "FAILED",
+            "error": f"worker exploded while authenticating with {secret}",
+            "output": {"stdout": f"HTTPError: 401 Unauthorized (used {secret})"},
+        },
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda force=False: None,
+    )
+
+    assert not res.ok
+    assert secret not in res.detail
+    assert "worker exploded while authenticating with <redacted>" in res.detail
+    assert "--- worker stdout tail ---\nHTTPError: 401 Unauthorized (used <redacted>)" in res.detail
 
 
 def test_poll_job_failure_surfaces_forced_heartbeat(monkeypatch):
@@ -3141,12 +3205,20 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         # Three attempts, three distinct classes, each at least as expensive as the last.
         assert len(gpus_seen) == 3
         assert len(set(gpus_seen)) == 3
-        from flash.providers.runpod.pricing import hourly_rate
+        # Escalation is ordered by what the allocator ranks on -- dollars per optimizer step, not
+        # the hourly rate. The two agree only when the step is compute-bound. This spec retains one
+        # prompt, so the step is latency-bound and a faster card can finish it for less despite a
+        # higher hourly rate; asserting sorted hourly rates would pin the wrong invariant.
+        from flash.cost.facts import gpu_hourly_usd
+        from flash.providers.base import _run_cost_key
 
-        rates = [hourly_rate(g) for g in gpus_seen]
-        assert rates == sorted(rates)
-        # cheapest validated class with >= 24 GB
-        assert gpus_seen[0] == "RTX 4090"
+        cost_key = _run_cost_key(
+            "Qwen/Qwen3.5-0.8B", "grpo", train={"epochs": 1, "max_examples": 1}
+        )
+        step_costs = [cost_key(g, gpu_hourly_usd(g)) for g in gpus_seen]
+        assert step_costs == sorted(step_costs)
+        # and the first attempt is the cheapest per step among the classes that fit.
+        assert step_costs[0] == min(step_costs)
 
 
 def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
@@ -3230,6 +3302,9 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
                 return types.SimpleNamespace(sha="private-pinned-sha")
 
             def get_paths_info(self, **_kwargs):
+                return []
+
+            def list_repo_tree(self, **_kwargs):
                 return []
 
         fake_private_hf = FakePrivateHf()
@@ -3484,9 +3559,10 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         orch.submit_job(spec, dry_run=False, background=False)
 
         assert orch.get_status("alloc-blip").state == "done"
-        # First allocation failed (no provision); the retry provisioned the cheapest class
-        # (RTX 4090, the cheapest validated RunPod class that fits 24 GB).
-        assert gpus_seen == ["RTX 4090"]
+        # First allocation failed (no provision); the retry provisioned the cheapest class rather
+        # than skipping it. Cheapest is per optimizer step, which is what the allocator ranks on --
+        # with `max_examples = 1` the step is latency-bound, so that is not the lowest hourly rate.
+        assert gpus_seen == ["RTX 5090"]
 
 
 def test_selected_quote_increase_rechecks_affordability(monkeypatch):
@@ -3569,10 +3645,12 @@ def test_selected_quote_refresh_failure_retries_without_skipping_the_candidate(m
         orch.submit_job(spec, dry_run=False, background=False)
 
         assert orch.get_status(spec.run_id).state == "done"
-        assert submitted == [("RTX 4090", 1)]
+        # the candidate is retried, not skipped -- same class on the retry, one attempt later.
+        # (cheapest per optimizer step for a one-prompt pool, which the allocator ranks on.)
+        assert submitted == [("RTX 5090", 1)]
         assert len(selected_quote_calls) == 2
         assert affordability_rechecks == [1.0]
-        assert all(allocation.gpu == "RTX 4090" for allocation in selected_quote_calls)
+        assert all(allocation.gpu == "RTX 5090" for allocation in selected_quote_calls)
         assert all(allocation.min_vram_gb > 0 for allocation in selected_quote_calls)
 
 
@@ -3687,7 +3765,7 @@ def test_cancel_prices_and_cleans_up_with_effective_warmstart_spec(monkeypatch):
         priced = []
         cleaned = []
 
-        def fake_charge(spec, *, steps=None, fallback=0.0):
+        def fake_charge(spec, *, steps=None, fallback=0.0, provider=None, gpu_type="", gpu_count=0):
             priced.append((spec.train.lora_rank, spec.train.init_from_adapter, steps))
             return 3.25
 

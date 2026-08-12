@@ -7,10 +7,9 @@ import os
 import sys
 import time
 import uuid
-from pathlib import Path
 
 from flash import __version__
-from flash._internal.channel import CLI_NAME
+from flash._internal.channel import BRAND_NAME, CLI_NAME
 from flash._internal.logging import get_logger
 from flash.cli.ui import render
 from flash.cli.ui.tty import TtyStatusLine
@@ -90,7 +89,7 @@ def cmd_version(args) -> int:
     if render.styled():
         print(render.version(__version__))
     else:
-        print(f"{CLI_NAME} {__version__}")
+        print(f"{BRAND_NAME} {__version__}")
     return 0
 
 
@@ -278,7 +277,7 @@ def cmd_projects_create(args) -> int:
         project_id = str(uuid.uuid4())
     else:
         if not api_key:
-            raise ClientError("not logged in. Run `flash login` before creating a project")
+            raise ClientError(f"not logged in. Run `{CLI_NAME} login` before creating a project")
         project_id = create_project(args.name, getattr(args, "description", None), api_key)["id"]
 
     # both ids are reported the same way: where it came from is the only difference above.
@@ -303,7 +302,7 @@ def cmd_projects_list(args) -> int:
             ),
         )
     if not api_key:
-        raise ClientError("not logged in. Run `flash login` before listing projects")
+        raise ClientError(f"not logged in. Run `{CLI_NAME} login` before listing projects")
     projects = list_projects(api_key)
     if render.styled():
         print(render.projects_table(projects))
@@ -355,38 +354,6 @@ def cmd_gpus(args) -> int:
     return 0
 
 
-def cmd_env_list(args) -> int:
-    paths: list[str] = []
-    if Path("environment.py").is_file():
-        paths.append(".")
-    local = Path("environments")
-    if local.is_dir():
-        for p in local.iterdir():
-            if p.name.startswith("__"):
-                continue
-            if p.is_dir():
-                stem = p.name.replace("-", "_")
-                module = p / f"{stem}.py"
-                canonical = p / "environment.py"
-                if canonical.is_file() or module.is_file():
-                    paths.append(f"environments/{p.name}")
-            elif p.suffix == ".py":
-                paths.append(f"environments/{p.name}")
-    if render.styled():
-        print(render.env_list(sorted(paths)))
-        return 0
-    if paths:
-        print(
-            "local env sources (publish with `flash env push --project <project-uuid> "
-            "--name <name> <path>`):"
-        )
-        for path in sorted(paths):
-            print(f"  {path}")
-    else:
-        print("no environments yet - scaffold one with `flash env setup`")
-    return 0
-
-
 def cmd_train(args) -> int:
     if getattr(args, "cost", False):
         return _cmd_train_cost(args)
@@ -406,9 +373,8 @@ def cmd_train(args) -> int:
     _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
     if args.dry_run:
         # dry-run runs submit-time server preflights without allocating a training gpu or charging
-        # for training. a rejection surfaces as the server's error with exit status 1. for sft it
-        # also requires an exact workload profile, so a miss starts a separate billed profile run
-        # (see _raise_if_workload_profile_pending) instead of previewing anything.
+        # for training. a rejection surfaces as the server's error with exit status 1. for sft the
+        # server reads the packaged dataset file and builds the quote without executing environment.py.
         try:
             status = client.create_run(
                 payload,
@@ -417,7 +383,6 @@ def cmd_train(args) -> int:
                 client_train_schema=client_train_schema,
             )
         except ApiError as exc:
-            _raise_if_workload_profile_pending(client, exc)
             detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
             if detail is None:
                 raise
@@ -429,13 +394,11 @@ def cmd_train(args) -> int:
         # equally not a verification -- so treat anything but an explicit True as unverified.
         affordability_verified = status.pop("affordability_verified", None) is True
         cost = "and cost" if affordability_verified else "but NOT cost"
-        # sft additionally required a matching workload profile to get this far, and that profile
-        # run already imported environment.py and tokenized the dataset. claiming otherwise here
-        # would understate what has been checked -- and what has already been billed.
         environment = (
-            "your environment.py and the exact dataset were already loaded and tokenized by the "
-            "workload profile this quote is built on; model load and gpu/training are first "
-            "exercised on the worker after cold-start."
+            "it did NOT import or run your environment.py. packaged input/output fields and the "
+            "statically readable training contract were tokenized together; tokens, retention, "
+            "truncation, and steps can still miss other environment transformations. environment "
+            "execution, model load, and gpu/training are first exercised on the worker after cold-start."
             if spec.algorithm == "sft"
             else "it did NOT import or run your environment.py; dataset loading, "
             "start_episode/episode shapes, reward/scorer, worker imports, model load, and "
@@ -461,20 +424,15 @@ def cmd_train(args) -> int:
             )
         else:
             print(json.dumps(status, indent=2))
+        _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
         return 0
-    try:
-        status = client.create_run(
-            payload,
-            runtime_secrets=runtime_secrets,
-            client_train_schema=client_train_schema,
-        )
-    except ApiError as exc:
-        # a real submit misses the profile cache the same way a preview does, and the miss starts a
-        # separately billed profile run. without this the user sees a bare 409 for a charge they
-        # were never told about (see _raise_if_workload_profile_pending).
-        _raise_if_workload_profile_pending(client, exc)
-        raise
+    status = client.create_run(
+        payload,
+        runtime_secrets=runtime_secrets,
+        client_train_schema=client_train_schema,
+    )
     run_id = status["run_id"]
+    _print_unpacked_batch_warning(status, spec)  # a real submit overrides batch_size the same way
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
@@ -529,10 +487,10 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         # relaunch window, and the ping is just as superseded there: the worker that produced it has
         # already been torn down. `heartbeat_is_current_attempt` answers True because it cannot
         # prove otherwise from the identity alone, so the qualifier has to come from the clear
-        # itself or `step=455` reads as the replacement's progress.
-        stale_heartbeat = remote_cleared or not render.heartbeat_is_current_attempt(
-            status, heartbeat
-        )
+        # itself or `step=455` reads as the replacement's progress. `heartbeat_is_superseded` is
+        # exactly that pair of conditions, shared with the status panel so the two surfaces cannot
+        # disagree about whether a run is between attempts.
+        stale_heartbeat = render.heartbeat_is_superseded(status, heartbeat)
         stage = heartbeat.get("stage")
         if stage:
             parts.append(f"stage={stage}")
@@ -777,7 +735,9 @@ def cmd_runs(args) -> int:
     runs = client_from_config().list_runs()
     if not runs:
         if render.styled():
-            print(render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"))
+            print(
+                render.empty("runs", "0 runs", f"no runs yet — submit one with `{CLI_NAME} train`")
+            )
         else:
             print("no runs yet")
         return 0
@@ -829,10 +789,10 @@ def cmd_cancel(args) -> int:
         out = sys.stdout if render.styled() else sys.stderr
         base = (
             f"{len(checkpoints)} deployable checkpoint(s) survive this cancel — list with "
-            f"`flash runs checkpoint {args.run_id}`"
+            f"`{CLI_NAME} runs checkpoint {args.run_id}`"
         )
         msg = (
-            f"{base}, deploy one with `flash models deploy {args.run_id}/step-{max(steps)}`."
+            f"{base}, deploy one with `{CLI_NAME} models deploy {args.run_id}/step-{max(steps)}`."
             if steps
             else f"{base}."
         )
@@ -862,7 +822,7 @@ def cmd_checkpoints(args) -> int:
         # the canonical short form, paste-able into train.init_from_adapter.
         print(f"step {c['step']} {format_checkpoint_ref(args.run_id, c['step'])}")
     print(
-        f"\ndeploy one with `flash models deploy {args.run_id}/step-<STEP>`.",
+        f"\ndeploy one with `{CLI_NAME} models deploy {args.run_id}/step-<STEP>`.",
         file=sys.stderr,
     )
     return 0
@@ -987,11 +947,10 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _cmd_train_cost,
     _cmd_train_cost_offline,
     _cmd_train_cost_sft,
-    _exact_sft_cost_rows,
     _legacy_train_key_rejection_detail,
-    _print_exact_sft_cost,
+    _print_sft_cost,
     _print_train_schema_compatibility,
-    _profile_charge,
-    _raise_if_workload_profile_pending,
+    _print_unpacked_batch_warning,
+    _sft_cost_rows,
     _warn_if_wandb_requested_without_key,
 )

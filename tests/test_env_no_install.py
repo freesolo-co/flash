@@ -1,7 +1,7 @@
 """`flash env install` (and its local manifest) was removed.
 
-Only setup/list/push remain under `flash env`, and `flash env list` now reports local
-environment sources only (no "installed" manifest section).
+Only setup/list/push remain under `flash env`. The list reports published environments and local
+sources, with no "installed" manifest section.
 """
 
 from __future__ import annotations
@@ -10,8 +10,14 @@ import argparse
 
 import pytest
 
+import flash.cli.commands.env.list as env_list_commands
+from flash._internal.channel import CLI_NAME
 from flash.cli import _build_parser
-from flash.cli.commands import cmd_env_list
+from flash.cli.commands.env.list import cmd_env_list
+
+
+def _no_published(monkeypatch):
+    monkeypatch.setattr(env_list_commands, "_published_envs", lambda: ([], None))
 
 
 def test_env_install_subcommand_is_gone():
@@ -57,13 +63,14 @@ def test_env_list_reports_local_only(tmp_path, monkeypatch, capsys):
         "FLASH_STYLE", "0"
     )  # force the plain renderer so substring asserts are stable
     monkeypatch.chdir(tmp_path)
+    _no_published(monkeypatch)
     (tmp_path / "environment.py").write_text("# env\n")
     rc = cmd_env_list(argparse.Namespace())
     assert rc == 0
     out = capsys.readouterr().out
     assert "local env sources" in out
     assert "." in out
-    assert "flash env push --project <project-uuid> --name <name> <path>" in out
+    assert f"{CLI_NAME} env push --project <project-uuid> --name <name> <path>" in out
     assert "installed environments" not in out  # the removed manifest section
 
 
@@ -72,6 +79,7 @@ def test_env_list_empty_hint(tmp_path, monkeypatch, capsys):
         "FLASH_STYLE", "0"
     )  # force the plain renderer so substring asserts are stable
     monkeypatch.chdir(tmp_path)
+    _no_published(monkeypatch)
     rc = cmd_env_list(argparse.Namespace())
     assert rc == 0
     assert "no environments yet" in capsys.readouterr().out

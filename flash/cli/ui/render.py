@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 
-from flash._internal.channel import CLI_NAME
+from flash._internal.channel import BRAND_NAME, CLI_NAME
+
+# Cost selection lives in `flash.cli.ui.cost` (split out to keep this module under the file-size
+# limit). Imported at the TOP rather than the bottom like `tables` below, because that module
+# depends on nothing here -- it decides a number, it renders nothing -- so there is no cycle to
+# order around. Re-exported so `render.run_cost` / `render.SETTLED_COST_STATES` keep resolving.
+from flash.cli.ui.cost import (  # noqa: F401
+    SETTLED_COST_STATES,
+    cost_estimate_reason,
+    run_cost,
+)
 
 _ROWS = (
     ("email", "account"),
@@ -125,7 +134,7 @@ def login_ok(me: dict | None) -> str:
     head = f"{_paint(_glyph('✓', 'ok:'), _GREEN, '1')} {_bold('logged in to flash')}"
     if not me:
         return _safe(
-            f"{head}\n{_dim('  account details unavailable right now — run `flash whoami` later')}"
+            f"{head}\n{_dim(f'  account details unavailable right now — run `{CLI_NAME} whoami` later')}"
         )
     return _safe(f"{head}\n\n{format_identity(me)}")
 
@@ -138,7 +147,7 @@ def login_failed(reason: str) -> str:
     return _safe(
         f"{_paint(_glyph('✗', 'x:'), _RED, '1')} {_bold('login failed')}\n"
         f"  {reason}\n"
-        f"  {_dim('then run `flash login --api-key <key>` to try again')}\n"
+        f"  {_dim(f'then run `{CLI_NAME} login --api-key <key>` to try again')}\n"
         f"  {_dim('if it keeps failing, email founders@freesolo.co')}"
     )
 
@@ -269,7 +278,7 @@ def _rule(width: int | None = None) -> str:
 
 def header(cmd: str, desc: str | None = None) -> str:
     """Brand header line + a faint rule: the wordmark, the command, and an optional descriptor."""
-    mark = _paint(CLI_NAME, _ACCENT, "1")
+    mark = _paint(BRAND_NAME, _ACCENT, "1")
     sep = _paint(_glyph("›", ">"), _FAINT)  # noqa: RUF001 (the glyph is the point)
     line = f"{mark} {sep} {_bold(cmd)}"
     if desc:
@@ -350,33 +359,6 @@ def select_required(title: str, options: list[tuple[str, str, str]]) -> str:
 
 def money(value: float, decimals: int = 4) -> str:
     return _paint(f"${value:.{decimals}f}", _TEAL)
-
-
-# the states after which `cost_usd` is the settled charge. before one of these the field is still
-# 0.0, because the server only writes it on the terminal transition. kept here rather than imported
-# from flash.runner so this module stays stdlib-only; the set is asserted against the runner's
-# TERMINAL_STATES in the test suite so the two cannot drift.
-SETTLED_COST_STATES = frozenset({"done", "failed", "cancelled", "dry_run", "deployed"})
-
-
-def run_cost(obj: dict) -> tuple[float, bool]:
-    """The cost to show for a run, and whether it is a pre-settlement estimate.
-
-    ``cost_usd`` is only written when a run reaches a terminal state, so a run that is queued or
-    training reports 0.0 -- which reads as "this has cost nothing", exactly when the GPU is billing.
-    The submit-time quote is already on the record as ``estimated_cost_usd``; prefer it while the
-    run is live so current spend is never understated as free.
-    """
-    settled = float(obj.get("cost_usd") or 0.0)
-    if str(obj.get("state") or "") in SETTLED_COST_STATES:
-        return settled, False
-    if settled:
-        # a live run that has already accrued a measured cost: that number beats the submit quote.
-        return settled, True
-    quote = obj.get("estimated_cost_usd")
-    if isinstance(quote, (int, float)):
-        return float(quote), True
-    return settled, False
 
 
 def _kv(pairs: list[tuple[str, str | None]], indent: int = 2) -> str:
@@ -478,7 +460,7 @@ def _hide_provider_metadata(obj):
 
 def version(value: str) -> str:
     """The wordmark + version."""
-    mark = _paint(CLI_NAME, _ACCENT, "1")
+    mark = _paint(BRAND_NAME, _ACCENT, "1")
     return _safe(f"{mark} {_dim('v' + value)}")
 
 
@@ -510,183 +492,15 @@ def _humanize_ts(value) -> str | None:
     return datetime.datetime.fromtimestamp(value, datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _heartbeat_age_seconds(value: object) -> float | None:
-    """Return heartbeat age in seconds, or None for an unusable timestamp."""
-    if not isinstance(value, (int, float)) or value <= 0:
-        return None
-    return max(0.0, time.time() - value)
-
-
-def _humanize_age_seconds(seconds: float | None) -> str | None:
-    if seconds is None:
-        return None
-    if seconds < 90:
-        return f"{int(seconds)}s ago"
-    if seconds < 5400:
-        return f"{int(seconds // 60)}m ago"
-    return f"{seconds / 3600:.1f}h ago"
-
-
-# heartbeat age past which the panel reminds that quiet is normal: worker uploads are throttled
-# (240s quiet phases, up to 900s mid-training), so a frozen ts is usually not a dead worker.
-_HB_QUIET_HINT_AFTER_S = 300.0
-_WARMUP_HEARTBEAT_FRESH_FOR_S = 1200.0
-_WARMUP_STAGES = frozenset({"rl_train_start", "rl_initializing"})
-
-
-def heartbeat_is_current_attempt(obj: dict, heartbeat: dict) -> bool:
-    """False only when the heartbeat provably belongs to a superseded retry attempt.
-
-    Retries reuse the seed's heartbeat path, so a recovered run flips back to ``running`` for the
-    replacement worker while ``last_heartbeat`` can still be the previous attempt's setup ping until
-    the new worker publishes one. ``remote.attempt`` is the live attempt; ``last_heartbeat.attempt``
-    is the one that produced the ping. When the live attempt is known, keep the reassurance only for a
-    heartbeat whose attempt matches it. When it is unknown (e.g. a managed status payload that omits
-    ``remote``), fall back to ``warmup_message``'s age gating rather than suppress, so warmup still
-    reassures on planes that do not surface a live attempt.
-    """
-    # reuse the poller's attempt-identity contract (a bounded nonnegative int, never a bool, string,
-    # or float) so the status display and stall detection agree on what a valid attempt is.
-    from flash.providers._lifecycle.poll import _attempt_int
-
-    remote = obj.get("remote")
-    current_attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
-    if current_attempt is None:
-        return True
-    return _attempt_int(heartbeat.get("attempt")) == current_attempt
-
-
-def warmup_message(
-    stage: object,
-    heartbeat_age_seconds: float | None,
-    from_current_attempt: bool = True,
-) -> str | None:
-    """Explain healthy RL setup stages only while the heartbeat is fresh and from the live attempt."""
-    stage_name = str(stage)
-    if stage_name not in _WARMUP_STAGES:
-        return None
-    if not from_current_attempt:
-        return None
-    if heartbeat_age_seconds is None:
-        return None
-    if heartbeat_age_seconds > _WARMUP_HEARTBEAT_FRESH_FOR_S:
-        return None
-    return (
-        f"warming up (stage={stage_name}): initializing model, vLLM, and training kernels - "
-        "typically several minutes, sometimes 15-20 min; setup is not billed; do not cancel"
-    )
-
-
-# the throttle hint points at `runs log`, which reads the SAME uploaded heartbeats -- so when the
-# step counter itself is what has gone stale, that advice sends you to an equally frozen surface.
-_QUIET_HEARTBEAT_HINT = (
-    "heartbeat uploads are throttled; quiet is not dead - check flash runs log <run-id> -f"
-)
-# a throttled training step is never guaranteed current: the worker holds mid-training commits for
-# up to _HB_MIN_INTERVAL_S (900s), so from upload until the next commit the displayed step lags by
-# an unknown amount. gate on the same age at which the panel already flags the quiet (300s) rather
-# than on 900s -- the incident that motivated this reported 559s and 687s, squarely inside that
-# window, where a 900s gate would stay silent and leave only the dead-end quiet hint.
-_STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
-# only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
-# post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older
-# than 900s means a long step, failed uploads, or a real stall -- not reporting lag.
-_TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step"})
-
-
-def _stale_step_hint(
-    heartbeat: dict,
-    heartbeat_age_seconds: float | None,
-    *,
-    running: bool,
-    current_attempt: bool = True,
-) -> str | None:
-    """Say a frozen training step is stale reporting, not a stalled trainer.
-
-    A throttled worker can leave ``step`` pinned at its first training heartbeat for many minutes
-    while the trainer is genuinely progressing. Through the CLI alone that is indistinguishable from
-    a hung run, and the obvious reaction -- cancel and relaunch -- throws away a healthy paid GPU.
-    Only fires for a *training* stage carrying a step, since a setup stage has no step to be stale.
-
-    Supersedes the generic quiet hint at the same age: both explain the same silence, but that one
-    sends you to ``runs log``, which reads the very heartbeats that went stale.
-    """
-    if not running or heartbeat_age_seconds is None:
-        return None
-    # a heartbeat from a superseded attempt describes a dead worker's step; calling that ordinary
-    # throttled progress hides that the replacement has published nothing.
-    if not current_attempt:
-        return None
-    if heartbeat_age_seconds <= _STALE_STEP_AFTER_S:
-        return None
-    if str(heartbeat.get("stage") or "") not in _TRAINING_STEP_STAGES:
-        return None
-    # step 0 is the cold, still-running first step: no optimizer update has landed, so there is no
-    # later hidden step for the reassurance to point at. reuse the shared step-gated predicate
-    # rather than a bare presence check.
-    from flash.providers._lifecycle.poll import is_training_heartbeat
-
-    if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
-        return None
-    # do not suggest `runs log -f`: it shows control-plane logs, and worker output arrives only after
-    # termination (flash/cli/commands/__init__.py cmd_log) on a 3600s upload interval. use heartbeat age against
-    # the 900s throttle, with w&b as the optional live signal.
-    return (
-        "the step above is the last one UPLOADED, not necessarily the one training is on; "
-        "a throttled worker can hold it for many minutes while the trainer advances normally. "
-        "uploads are held up to 15 min, so compare the age above against that "
-        "(and your [wandb] run, if configured) "
-        "before treating this as a stall"
-    )
-
-
-def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
-    """Worker heartbeat rows for the status panel: stage, step, age, and a quiet-is-normal hint."""
-    hb = obj.get("last_heartbeat")
-    if not isinstance(hb, dict) or not hb.get("stage"):
-        return []
-    worker = str(hb["stage"])
-    step = hb.get("step")
-    if step is not None:
-        worker += f" · step {step}"
-    if hb.get("liveness"):
-        worker += " · alive ping"
-    pairs = [("worker", worker)]
-    heartbeat_age_seconds = _heartbeat_age_seconds(hb.get("ts"))
-    running = str(obj.get("state") or "") == "running"
-    if running:
-        warmup = warmup_message(
-            hb.get("stage"),
-            heartbeat_age_seconds,
-            heartbeat_is_current_attempt(obj, hb),
-        )
-        if warmup:
-            pairs.append(("warmup", warmup))
-    stale_step = _stale_step_hint(
-        hb,
-        heartbeat_age_seconds,
-        running=running,
-        current_attempt=heartbeat_is_current_attempt(obj, hb),
-    )
-    age = _humanize_age_seconds(heartbeat_age_seconds)
-    if age:
-        # the progress row already explains this silence, and does it better: the quiet hint sends you
-        # to `runs log`, which reads the same frozen heartbeats. show one or the other, never both.
-        if running and not stale_step and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
-            age += _dim(f"  ({_QUIET_HEARTBEAT_HINT})")
-        pairs.append(("heartbeat", age))
-    if stale_step:
-        pairs.append(("progress", stale_step))
-    return pairs
-
-
 def run_status(obj: dict) -> str:
     """A curated status panel for `flash runs status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
     where = gpu_label(spec, obj.get("remote") or {}) or None
     amount, is_estimate = run_cost(obj)
     cost = (
-        f"{money(amount)} {_dim('(estimate, run in progress)')}" if is_estimate else money(amount)
+        f"{money(amount)} {_dim(f'({cost_estimate_reason(obj)})')}"
+        if is_estimate
+        else money(amount)
     )
     pairs = [
         ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
@@ -804,14 +618,18 @@ def cost_panel(est) -> str:
         ),
         (
             "gpu",
-            f"{est.gpu}  "
-            f"{_dim(f'({est.gpu_vram_gb} GB; needs >= {est.required_vram_gb} GB)')}  "
-            f"@ {money(est.gpu_hourly_usd, 2)}/hr",
+            (
+                f"{est.gpu}  "
+                f"{_dim(f'({est.gpu_vram_gb} GB; needs >= {est.required_vram_gb} GB)')}  "
+                f"@ {money(est.gpu_hourly_usd, 2)}/hr"
+            ),
         ),
         (
             "setup",
-            f"{est.setup_seconds / 60:.1f} min  "
-            f"{_dim(f'(cold start: boot + deps + model load{setup_extra}; not billed)')}",
+            (
+                f"{est.setup_seconds / 60:.1f} min  "
+                f"{_dim(f'(cold start: boot + deps + model load{setup_extra}; not billed)')}"
+            ),
         ),
         ("per step", f"{est.seconds_per_step:.2f} s"),
         (
@@ -828,8 +646,10 @@ def cost_panel(est) -> str:
         pairs.append(
             (
                 "teacher api",
-                f"{money(est.teacher_api_usd, 2)}  "
-                f"{_dim('(Parasail teacher token spend on the managed key; billed by Parasail, NOT in TOTAL)')}",
+                (
+                    f"{money(est.teacher_api_usd, 2)}  "
+                    f"{_dim('(Parasail teacher token spend on the managed key; billed by Parasail, NOT in TOTAL)')}"
+                ),
             )
         )
     panel = _kv(pairs)
@@ -841,7 +661,7 @@ def cost_panel(est) -> str:
     return _safe(out)
 
 
-def exact_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
+def sft_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
     """Profile-backed cost estimate (sft), whose inputs are measured rather than modelled.
 
     Deliberately not cost_panel(): that panel's gpu/per-step/wall rows come from a local
@@ -853,7 +673,7 @@ def exact_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> st
         f"  {_paint('TOTAL'.ljust(8), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} "
         f"{_paint(f'${total_usd:.2f}', _TEAL, '1')}"
     )
-    head = header("train", "exact cost estimate (measured workload)")
+    head = header("train", "cost estimate (packaged dataset rows)")
     return _safe(f"{head}\n{panel}\n{_rule()}\n{total}")
 
 
@@ -865,7 +685,7 @@ def project_created(project_id: str, name: str) -> str:
     )
 
 
-def env_setup(paths: list[str], project_id: str) -> str:
+def env_setup(paths: list[str], project_id: str, *, can_publish: bool = True) -> str:
     """Confirmation + file tree for `flash env setup`."""
     labels = {
         "environment.py": "env entrypoint — edit the reward + prompt",
@@ -880,21 +700,17 @@ def env_setup(paths: list[str], project_id: str) -> str:
         f"  {_paint(p.ljust(keyw), _ACCENT2)}  {_dim(labels.get(p, ''))}" for p in paths
     )
     head = f"{header('env setup', 'starter Freesolo environment')}\n{ok('scaffold ready')}\n"
-    next_step = arrow(f"publish it: flash env push --project {project_id} --name my-env .")
-    return _safe(f"{head}\n{tree}\n\n{next_step}")
-
-
-def env_list(local: list[str]) -> str:
-    parts = [header("env list", "local environments")]
-    if local:
-        parts.append(
-            _paint("local sources", _GRAY, "1")
-            + _dim("  (publish with flash env push --project <project-uuid> --name <name> <path>)")
-        )
-        parts.extend(f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(p, _ACCENT2)}" for p in local)
+    if can_publish:
+        next_step = arrow(f"publish it: {CLI_NAME} env push --project {project_id} --name my-env .")
     else:
-        parts.append(_dim("  no environments yet — scaffold one with `flash env setup`"))
-    return _safe("\n".join(parts))
+        # `env push` targets the managed hub, which a self-hosted plane cannot write to. The
+        # standalone caveat is part of the wording: a github: id is accepted only by a plane
+        # running FLASH_STANDALONE=1, and setup classifies on the API URL, which cannot see it.
+        next_step = arrow(
+            "publish it: push to a git repo, then set [environment] id = "
+            "github:OWNER/REPO@main:environment.py (needs FLASH_STANDALONE=1 on the plane)"
+        )
+    return _safe(f"{head}\n{tree}\n\n{next_step}")
 
 
 def chat_label() -> str:
@@ -941,7 +757,7 @@ def help_page(
     here. Only ever called on the styled path; piped/scripted ``--help`` keeps argparse's
     plain text (see ``flash.cli._FlashParser``), so existing greps stay byte-for-byte.
     """
-    mark = _paint(CLI_NAME, _ACCENT, "1")
+    mark = _paint(BRAND_NAME, _ACCENT, "1")
     banner = f"{mark}  {_paint(tagline, _GRAY)}"
     usage_line = f"{_dim('usage:')} {_paint(usage, _GRAY)}"
     # one name-column width across every group AND the options block, so every summary lines up
@@ -969,6 +785,30 @@ def help_page(
 # Table layouts live in `flash.cli.ui.tables`, which imports the primitives above. Re-exported
 # here (at the bottom, so those primitives are defined first) because every call site and the
 # render monkeypatches in the CLI tests reach them as `render.<name>`.
+# Heartbeat interpretation lives in `flash.cli.ui.heartbeat` for the same reason and on the same
+# terms: `run_status` above calls `_heartbeat_pairs`, and the CLI tests address every one of these
+# as `render.<name>`, so they have to stay resolvable here.
+# The env list renderer in `flash.cli.ui.env_panels` is re-exported on the same terms.
+from flash.cli.ui.env_panels import env_list as env_list  # noqa: E402
+from flash.cli.ui.heartbeat import (  # noqa: E402,F401
+    _HB_QUIET_HINT_AFTER_S,
+    _LIVENESS_SETUP_STAGES,
+    _QUIET_HEARTBEAT_HINT,
+    _SETUP_SILENT_AFTER_S,
+    _STALE_STEP_AFTER_S,
+    _TRAINING_STEP_STAGES,
+    _WARMUP_HEARTBEAT_FRESH_FOR_S,
+    _WARMUP_STAGES,
+    _heartbeat_age_seconds,
+    _heartbeat_pairs,
+    _humanize_age_seconds,
+    _stale_setup_hint,
+    _stale_step_hint,
+    _superseded_hint,
+    heartbeat_is_current_attempt,
+    heartbeat_is_superseded,
+    warmup_message,
+)
 from flash.cli.ui.tables import (  # noqa: E402,F401
     checkpoints_table,
     deployments_table,

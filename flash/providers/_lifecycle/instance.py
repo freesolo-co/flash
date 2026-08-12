@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import io
@@ -19,8 +20,25 @@ _MAX_NAME = 60
 _SUFFIX_BUDGET = 12
 _PREFIX_BUDGET = _MAX_NAME - _SUFFIX_BUDGET
 
-# Above this, the job spec is spilled to HF so a large inline spec can't overflow the user_data cap.
-_SPEC_SPILL_THRESHOLD = 16_000
+# The provider-aligned user_data ceiling (cloud-init limits run ~16KB on AWS to 64KB elsewhere) less
+# a stated margin for provider-side framing. This budget is the BINDING spill check: build_user_data
+# measures the COMPLETE encoded user_data against it, so nothing riding along with the spec (runtime
+# secrets, env, cache fields) can push a launch over the cap.
+_USER_DATA_CAP = 64_000
+_USER_DATA_MARGIN = 2_000
+_USER_DATA_BUDGET = _USER_DATA_CAP - _USER_DATA_MARGIN
+
+# Fast path only: above this, the spec is spilled to HF without first rendering a payload that
+# cannot fit. What is left of the ~64,000-byte cap after the fixed framing -- this module's template
+# plus every source it heredocs in (bootstrap.py, bootstrap_secrets.py, bootstrap_pip.py) -- is
+# ~5,800 bytes, and base64 + json escaping inflate the spec ~1.35x on the way in. Shrink this again
+# whenever those sources grow; docstrings are stripped on the way in, so only code and COMMENTS
+# count, and prose belongs in a docstring rather than a comment for exactly that reason.
+# test_build_user_data_spills_large_spec_out_of_cloud_init pins the worst inline case against the
+# cap so the two cannot drift apart silently. Sized for a REAL payload, which carries ~760 bytes of
+# env, deadline, and cache fields that the test's minimal one does not: at 4_000 the worst case
+# cleared the test but a production launch would re-render and force-spill anyway.
+_SPEC_SPILL_THRESHOLD = 3_000
 
 
 def run_label_prefix(run_id: str) -> str:
@@ -176,7 +194,7 @@ def build_payload(
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
     ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name)."""
     from flash.core.spec import require_matching_seed
-    from flash.envs.base import worker_pip_for_env
+    from flash.envs.base import worker_pip_with_extras
     from flash.providers._lifecycle.worker import (
         build_worker_env,
         strip_runpod_volume_env,
@@ -207,8 +225,9 @@ def build_payload(
         "seed": spec.seed,
         "flash_arm": arm,
         "env": env,
-        # per-run env wheel; the bootstrap pip-installs extra_pip for every job.
-        "extra_pip": list(spec.environment.pip) or worker_pip_for_env(spec.environment.id),
+        # per-run env wheel; the bootstrap pip-installs extra_pip for every job. the author's
+        # [environment] pip is appended to the worker requirement, never substituted for it.
+        "extra_pip": worker_pip_with_extras(spec.environment.id, spec.environment.pip),
         "hf_prefix": f"{spec.phase}/{spec.run_id}",
         "code_prefix": code_prefix or flash_code_prefix(),
         "deadline_at": absolute_deadline,
@@ -361,10 +380,11 @@ except Exception:
 """
 
 
-def _spill_large_spec_to_hf(payload: dict) -> dict:
-    """Keep a large ``job_spec_json`` OUT of the inline cloud-init user_data."""
+def _spill_large_spec_to_hf(payload: dict, *, force: bool = False) -> dict:
+    """Keep a large ``job_spec_json`` OUT of the inline cloud-init user_data. ``force`` spills a spec
+    that is under the fast-path threshold, for when the COMPLETE payload is what overflows the cap."""
     spec_json = payload.get("job_spec_json") or ""
-    if len(spec_json) <= _SPEC_SPILL_THRESHOLD:
+    if not spec_json or (not force and len(spec_json) <= _SPEC_SPILL_THRESHOLD):
         return payload
     if "deadline_at" in payload and remaining_seconds(payload["deadline_at"]) <= 0:
         raise TimeoutError("run wall deadline exceeded before job spec upload")
@@ -384,10 +404,105 @@ def _spill_large_spec_to_hf(payload: dict) -> dict:
 
 
 def build_user_data(payload: dict, *, image: str) -> str:
-    """Cloud-init ``user_data``: run the worker ``image`` via Docker on the host."""
+    """Cloud-init ``user_data``: run the worker ``image`` via Docker on the host.
+
+    The spill decision is BINDING on the final encoded bytes, not on the spec alone: the spec shares
+    user_data with runtime secrets (a multiline PEM is a valid one), so a spec under the fast-path
+    threshold plus big secrets could otherwise still overflow the provider cap. Render, measure, and
+    spill the spec out whenever the total exceeds the budget.
+
+    Spilling only moves the spec, so a non-spec payload (large runtime secrets) that is oversized on
+    its own stays oversized. Re-measure after spilling and fail HERE, naming the component, instead
+    of handing the provider a payload it rejects opaquely after the launch call."""
     payload = _spill_large_spec_to_hf(payload)
+    user_data = _render_user_data(payload, image=image)
+    if len(user_data.encode()) > _USER_DATA_BUDGET and (payload.get("job_spec_json") or ""):
+        payload = _spill_large_spec_to_hf(payload, force=True)
+        user_data = _render_user_data(payload, image=image)
+    size = len(user_data.encode())
+    if size > _USER_DATA_BUDGET:
+        env_bytes = len(json.dumps(payload.get("env") or {}).encode())
+        raise ValueError(
+            f"instance user_data is {size} bytes after spilling the job spec, over the "
+            f"{_USER_DATA_BUDGET}-byte budget ({_USER_DATA_CAP}-byte provider cap less "
+            f"{_USER_DATA_MARGIN} bytes of framing); the runtime secrets and env alone are "
+            f"{env_bytes} bytes. Shrink the run's [environment].secrets values."
+        )
+    return user_data
+
+
+def _strip_docstrings(source: str) -> str:
+    """``source`` with every module/class/function docstring replaced by ``pass``.
+
+    Only docstrings go: comments stay, since a comment sits next to the line it explains and is
+    what a reader debugging ON the box needs. Docstrings are the bulk of the prose and none of the
+    behaviour, so dropping them buys user_data budget at no cost to the shipped module.
+
+    What is replaced is the docstring's exact character span, never the LINES it sits on. A
+    docstring can share its line with the ``def`` that owns it (``def f(): "doc"``) or with a
+    statement that follows it (``"doc"; x = 1``), and dropping whole lines in those positions
+    either strands the body's indentation or silently deletes real code -- silently, because what
+    is left still parses. ``pass`` is valid wherever a docstring was, including a body it was the
+    only statement of, so one rule covers every case without a line-position special case.
+
+    The MODULE docstring is the one exception: it is deleted rather than substituted, because
+    ``from __future__ import annotations`` must be the first statement in a file and a ``pass``
+    standing where the docstring was would displace it.
+    """
+    # ast reports col_offset in utf-8 BYTES, and this source is not ascii, so the spans are cut in
+    # bytes; slicing the str by those numbers would drift on the first non-ascii character.
+    data = source.encode()
+    starts: list[int] = []
+    offset = 0
+    for line in data.splitlines(keepends=True):
+        starts.append(offset)
+        offset += len(line)
+    spans: list[tuple[int, int, bytes]] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", None)
+        if (
+            body
+            and isinstance(first := body[0], ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+            and first.end_lineno is not None
+            and first.end_col_offset is not None
+        ):
+            start = starts[first.lineno - 1] + first.col_offset
+            end = starts[first.end_lineno - 1] + first.end_col_offset
+            if isinstance(node, ast.Module):
+                # deleted outright rather than replaced: `from __future__` must be the file's first
+                # statement, and a `pass` standing where the docstring was would displace it. a
+                # statement sharing its line (`"doc"; VALUE = 7`) would then be left behind a bare
+                # separator, so the separator goes with it.
+                trailing = len(data[end:]) - len(data[end:].lstrip(b" \t;"))
+                spans.append((start, end + trailing, b""))
+            else:
+                spans.append((start, end, b"pass"))
+    # latest first, so replacing one span cannot move the offsets of those not yet applied.
+    for start, end, replacement in sorted(spans, reverse=True):
+        data = data[:start] + replacement + data[end:]
+    stripped = data.decode()
+    ast.parse(stripped)  # never ship something that will not import on the box
+    return stripped
+
+
+def _render_user_data(payload: dict, *, image: str) -> str:
+    """The user_data text for an already-spill-decided ``payload``."""
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
-    bootstrap_src = (Path(__file__).parent / "bootstrap.py").read_text()
+    # Both shipped modules are stripped of docstrings on the way in. They are for the reader of the
+    # repo, not the box, and user_data is a hard-capped budget shared with the payload's runtime
+    # secrets -- prose explaining WHY a module is shaped a certain way must not be what pushes a
+    # launch over the cap. Comments survive: those sit next to the line they explain and are what a
+    # reader debugging ON the box needs.
+    bootstrap_src = _strip_docstrings((Path(__file__).parent / "bootstrap.py").read_text())
+    # shipped next to bootstrap.py: the bootstrap imports each as a bare sibling module on the box.
+    bootstrap_secrets_src = _strip_docstrings(
+        (Path(__file__).parent / "bootstrap_secrets.py").read_text()
+    )
+    bootstrap_pip_src = _strip_docstrings((Path(__file__).parent / "bootstrap_pip.py").read_text())
     # Bind the host cache mount into the container at the fixed /weight-cache so prefetch persists; absent -> cold.
     cache_host_mount = payload.get("cache_host_mount")
     cache_bind = (
@@ -406,6 +521,10 @@ cat > /opt/flash/payload.b64 <<'FLASH_PAYLOAD_EOF'
 base64 -d /opt/flash/payload.b64 > /opt/flash/payload.json
 cat > /opt/flash/bootstrap.py <<'FLASH_BOOTSTRAP_EOF'
 {bootstrap_src}FLASH_BOOTSTRAP_EOF
+cat > /opt/flash/bootstrap_secrets.py <<'FLASH_BOOTSTRAP_SECRETS_EOF'
+{bootstrap_secrets_src}FLASH_BOOTSTRAP_SECRETS_EOF
+cat > /opt/flash/bootstrap_pip.py <<'FLASH_BOOTSTRAP_PIP_EOF'
+{bootstrap_pip_src}FLASH_BOOTSTRAP_PIP_EOF
 cat > /opt/flash/deadline_sleep.py <<'FLASH_DEADLINE_SLEEP_EOF'
 {_DEADLINE_SLEEP_PY}FLASH_DEADLINE_SLEEP_EOF
 cat > /opt/flash/hostlog.py <<'FLASH_HOSTLOG_EOF'

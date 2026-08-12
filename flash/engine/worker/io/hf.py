@@ -11,9 +11,14 @@ import os
 import shutil
 import threading
 import time
+from collections.abc import Callable
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES, attempt_scoped_artifact_name
+from flash.adapters.artifacts import attempt_scoped_artifact_name, has_loadable_adapter_weights
+from flash.engine.profiling.tokenizer import (  # noqa: F401
+    load_tokenizer,
+    model_revision_kwargs,
+)
 
 # `gpu_diagnostics` has no call site here since prefetch moved to `.prefetch`, but it is kept
 # imported on purpose: the prefetch tests patch `hf.gpu_diagnostics` and the prefetcher reads it
@@ -48,26 +53,38 @@ def ray_log_artifact_name(mode: str, attempt: int = 0) -> str:
     return attempt_scoped_artifact_name("raylogs", mode, attempt)
 
 
+def _disable_xet_upload_staging() -> None:
+    """Route this process's hf uploads through the streaming lfs path instead of xet.
+
+    `hf_xet` is an unconditional dependency of `huggingface-hub` on every arch flash runs on, and
+    `is_xet_available()` turns it on merely because it imports (utils/_runtime.py) -- so the xet
+    path is the default for `upload_folder`. Xet chunks and dedups through a local cache rooted at
+    `HF_XET_CACHE` (default `$HF_HOME/xet`), i.e. the SAME container disk holding the checkpoint
+    being uploaded. The legacy lfs path streams from the source file handle instead
+    (`CommitOperationAdd.as_file` -> `http_backoff(data=fileobj)`), so it adds no second on-disk
+    copy of a ~60 GB fsdp save.
+
+    The verl child, the rl child, and the model-merger subprocess already pin this. The parent is
+    the process that actually uploads checkpoints, and it was the one left reading the default --
+    which is where a real 35b run hit `No space left on device` under
+    `.../huggingface/xet/.../staging/`.
+
+    How much that staging holds at peak is not knowable from source (it lives in the compiled
+    `hf_xet` extension), which is the point: the streaming path needs no such assumption. The
+    checkpoint is already on this disk, so uploading it should not require room for a second copy
+    of unknown size.
+
+    `HF_HUB_DISABLE_XET` is captured into a module constant when `huggingface_hub.constants` is
+    imported, so this must run before the first import. Every `huggingface_hub` import in the
+    worker is function-local, so calling this during worker startup is early enough.
+    """
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+
 def hf_api():
     from huggingface_hub import HfApi
 
     return HfApi(token=os.environ.get("HF_TOKEN"))
-
-
-def model_revision_kwargs(revision: str = "") -> dict[str, str]:
-    """return the hf revision keyword only for a nonempty pinned revision."""
-    return {"revision": revision} if revision else {}
-
-
-def load_tokenizer(model_id: str, revision: str = ""):
-    """load the student tokenizer under the run's optional model revision."""
-    from transformers import AutoTokenizer
-
-    return AutoTokenizer.from_pretrained(
-        model_id,
-        trust_remote_code=True,
-        **model_revision_kwargs(revision),
-    )
 
 
 def hf_prefix() -> str:
@@ -203,8 +220,35 @@ def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) 
     )
 
 
-def hf_resume_checkpoint(fail_closed: bool = False, revision: str | None = None) -> str | None:
-    """Download the latest streamed verl checkpoint for this run, or return none."""
+def _highest_resume_candidate(
+    base: str, candidates: list[tuple[int, str]], prefer: Callable[[str], bool] | None
+) -> str:
+    """the candidate name hf_resume_checkpoint stages, given the caller's optional ``prefer``.
+
+    every candidate is already staged on local disk by the snapshot_download above, so evaluating
+    ``prefer`` per candidate costs no extra fetch. picks the highest step ``prefer`` accepts and
+    falls back to the highest step overall when none do -- the same answer this returned before
+    ``prefer`` existed, so a caller with nothing to prefer sees no behaviour change, and the caller's
+    own discard log (not this function) is left to explain a restart from zero.
+    """
+    if prefer is not None:
+        for _step, name in sorted(candidates, reverse=True):
+            if prefer(os.path.join(base, name)):
+                return name
+    return max(candidates)[1]
+
+
+def hf_resume_checkpoint(
+    fail_closed: bool = False,
+    revision: str | None = None,
+    *,
+    prefer: Callable[[str], bool] | None = None,
+) -> str | None:
+    """Download the latest streamed verl checkpoint for this run, or return none.
+
+    ``prefer`` selects the highest downloaded candidate it accepts instead of the highest overall;
+    see ``_highest_resume_candidate``. Left unset, behaviour is unchanged from before it existed.
+    """
     required = bool(revision)
     strict = bool(fail_closed or required)
     if not _w.HF_REPO:
@@ -250,7 +294,7 @@ def hf_resume_checkpoint(fail_closed: bool = False, revision: str | None = None)
                 detail = f" at revision {revision}" if revision else ""
                 raise RetriableInfraError(f"required resume checkpoint is missing{detail}")
             return None
-        _, latest = max(candidates)
+        latest = _highest_resume_candidate(base, candidates, prefer)
         path = os.path.join(base, latest)
         print(f"[resume] found streamed checkpoint: {path}")
         return path
@@ -280,10 +324,20 @@ _CHECKPOINT_TRAINER_STATE = (
 
 
 def _has_deployable_adapter(ckpt_dir: str) -> bool:
-    """Return True if ckpt_dir has a loadable LoRA adapter (config + weights)."""
-    return os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json")) and any(
-        os.path.isfile(os.path.join(ckpt_dir, w)) for w in ADAPTER_WEIGHT_FILES
-    )
+    """Return True if ckpt_dir has a loadable LoRA adapter (config + weights).
+
+    Weights via the shared rule rather than the two single-file names, because a save past peft's
+    shard size writes ``adapter_model-0000N-of-0000M.<ext>`` plus an index instead. Spelling only the
+    single-file names here made this the strict side of a disagreement: serving and export accept the
+    sharded save, so a sharded per-step adapter was silently skipped -- or failed a required save --
+    for an artifact the rest of the pipeline would have deployed.
+    """
+    if not os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json")):
+        return False
+    try:
+        return has_loadable_adapter_weights(os.listdir(ckpt_dir))
+    except OSError:
+        return False
 
 
 def _write_deployable_provenance(ckpt_dir: str) -> None:

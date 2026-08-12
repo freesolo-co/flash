@@ -51,9 +51,9 @@ def test_sft_preprocessing_reads_max_context_tokens_not_max_length():
 def test_sft_context_length_resolves_the_authored_window_or_the_mode_cap():
     """The measured window is the authored cap when set, else the recipe cap for the mode.
 
-    This is the resolution the 1024-cap regression got wrong. It now happens once, inside the
-    preprocessing both the profile run and the training run call, so asserting it here asserts it
-    for the quote too: the quote reads ``profile.max_length``, which is this value.
+    this is the resolution the 1024-cap regression got wrong. it now happens once, inside the
+    preprocessing used by both control-plane estimation and training, so asserting it here covers
+    the quote too: the quote reads ``profile.max_length``, which is this value.
     """
     for thinking in (False, True):
         recipe_cap = RECIPE.sft.max_seq_len_thinking if thinking else RECIPE.sft.max_seq_len

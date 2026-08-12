@@ -26,12 +26,12 @@ def publish_env(
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
     from flash.server.domain import envs
-    from flash.server.domain.projects import require_project_access
+    from flash.server.domain.projects import require_project_access_slug
 
     project_raw = payload.get("project_id")
     if not isinstance(project_raw, str):
         raise HTTPException(status_code=400, detail="project_id is required and must be a string")
-    project_id = require_project_access(
+    project_id, project_slug = require_project_access_slug(
         project_id=project_raw,
         key=key,
         authorization=authorization,
@@ -41,21 +41,25 @@ def publish_env(
     # Use `if x is None` not `x or ""` so non-string falsy values reach publish_package's type checks.
     _pkg = payload.get("package_b64")
     _name = payload.get("name")
+    from flash.server.domain.environment_registry import record_published_environment
+
+    resolved_key = {**key, "org_id": key.get("org_id") or x_freesolo_org_id}
+
     try:
         slug = envs.publish_package(
             package_b64="" if _pkg is None else _pkg,
             name="" if _name is None else _name,
             key=key,
+            project_slug=project_slug,
         )
     except envs.EnvPublishError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-    from flash.server.domain.environment_registry import record_published_environment
 
     try:
         recorded = record_published_environment(
             slug=slug,
             name="" if _name is None else _name,
-            key={**key, "org_id": key.get("org_id") or x_freesolo_org_id},
+            key=resolved_key,
             project_id=project_id,
         )
     except Exception as exc:
@@ -66,6 +70,27 @@ def publish_env(
     if recorded is not True:
         raise HTTPException(status_code=502, detail=_PUBLISH_ASSOCIATION_FAILURE)
     return {"id": slug}
+
+
+@router.get("/v1/envs")
+def list_envs(key: Annotated[dict, Depends(require_key)]):
+    """List the published environments the caller's org owns.
+
+    The hub is the source of truth that ``publish_env`` writes and ``download_env_package`` reads,
+    so it is what this enumerates -- not the platform metadata mirror, which is best-effort on both
+    publish and delete and would under-report a package that is genuinely there.
+
+    No project filter: the hub slug is ``<org-slug>/<name>`` and carries no project, so filtering
+    here would require trusting the mirror this deliberately does not read. A caller that wants one
+    project's environments should read the mirror through the web UI.
+    """
+    from flash.server.domain import envs
+
+    try:
+        slugs = envs.list_namespace_slugs(key=key)
+    except envs.EnvPublishError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    return {"environments": [{"id": slug} for slug in slugs]}
 
 
 @router.get("/v1/envs/{env_id:path}/package")
@@ -101,7 +126,7 @@ def delete_env(
     x_freesolo_project_id: Annotated[str | None, Header()] = None,
 ):
     # Delete a published Freesolo environment package from the managed hub. ``env_id`` is the
-    # ``namespace/name`` slug and carries a slash, so the route uses the ``:path`` converter.
+    # ``namespace/project/name`` slug and carries a slash, so the route uses the ``:path`` converter.
     # Authorization (own-namespace for user keys, any for the internal key) lives in
     # ``delete_package`` so it can't be bypassed.
     from flash.core.spec import require_project_id

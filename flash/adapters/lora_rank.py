@@ -189,8 +189,17 @@ def adapter_artifact_identity(
     token: str | None = None,
     revision: str | None = None,
 ) -> AdapterArtifactIdentity:
-    """Bind adapter config semantics and one required weight object's immutable metadata."""
-    from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES
+    """Bind adapter config semantics and the required weight objects' immutable metadata.
+
+    Binds whatever peft would load, which for a save past its shard size is the complete
+    index-referenced shard set rather than a single file. Asking for the two single-file names by
+    path could not see a sharded adapter at all, so warm-starting from one failed here -- at
+    submission, before the worker that would have loaded it ever ran.
+
+    A single-file adapter's digest is unchanged by that: it still binds exactly its one name and
+    identity, so an in-flight run's stored identity still compares equal.
+    """
+    from flash.adapters.artifacts import loadable_adapter_weight_files
 
     resolved = resolve_adapter_ref(adapter_ref)
     if resolved is None:
@@ -198,26 +207,37 @@ def adapter_artifact_identity(
     repo, prefix = resolved
     config_bytes = _canonical_config_bytes(config)
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
-    paths = [f"{prefix}/adapter/{name}" for name in ADAPTER_WEIGHT_FILES]
+    folder = f"{prefix}/adapter"
     try:
         from huggingface_hub import HfApi
 
-        infos = HfApi(token=token).get_paths_info(
-            repo, paths=paths, repo_type="dataset", revision=revision
+        infos = list(
+            HfApi(token=token).list_repo_tree(
+                repo_id=repo,
+                path_in_repo=folder,
+                repo_type="dataset",
+                recursive=False,
+                revision=revision,
+            )
         )
     except Exception as exc:
         raise ValueError("could not verify source adapter weight identity") from exc
     by_name = {str(getattr(info, "path", "")).rsplit("/", 1)[-1]: info for info in infos}
-    selected = next((name for name in ADAPTER_WEIGHT_FILES if name in by_name), None)
-    if selected is None:
+    selected = loadable_adapter_weight_files(by_name)
+    if not selected:
         raise ValueError("source adapter has no required weight file")
-    weight_identity = _file_identity(by_name[selected])
-    payload = f"v1\0{config_sha256}\0{selected}\0{weight_identity}".encode()
+    identities = [_file_identity(by_name[name]) for name in selected]
+    # every selected object, because a sharded adapter's content is the union of its shards: binding
+    # only the first would let a later attempt rewrite the rest and still compare equal.
+    bound = "\0".join(
+        f"{name}\0{identity}" for name, identity in zip(selected, identities, strict=True)
+    )
+    payload = f"v1\0{config_sha256}\0{bound}".encode()
     return AdapterArtifactIdentity(
         digest=hashlib.sha256(payload).hexdigest(),
         config_sha256=config_sha256,
-        weight_filename=selected,
-        weight_identity=weight_identity,
+        weight_filename=",".join(selected),
+        weight_identity=",".join(identities),
     )
 
 
@@ -378,8 +398,10 @@ def _effective_train_context(
                 max_completion_tokens,
                 spec.thinking,
             ),
-            "train.max_context_tokens / train.max_completion_tokens "
-            "(GRPO rollout prompt+completion)",
+            (
+                "train.max_context_tokens / train.max_completion_tokens "
+                "(GRPO rollout prompt+completion)"
+            ),
         )
     if spec.algorithm == "opd":
         return (
@@ -388,8 +410,10 @@ def _effective_train_context(
                 max_completion_tokens,
                 spec.thinking,
             ),
-            "train.max_context_tokens / train.max_completion_tokens "
-            "(OPD rollout prompt+completion)",
+            (
+                "train.max_context_tokens / train.max_completion_tokens "
+                "(OPD rollout prompt+completion)"
+            ),
         )
     effective = int(spec.train.max_context_tokens or 0)
     return (effective, "train.max_context_tokens") if effective > 0 else None

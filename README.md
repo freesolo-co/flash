@@ -77,7 +77,7 @@ model = "Qwen/Qwen3.5-4B"
 algorithm = "sft"
 
 [environment]
-id = "your-name/my-env"
+id = "your-org/your-project/my-env"
 
 [train]
 epochs = 1
@@ -92,47 +92,24 @@ flash models deploy RUN_ID             # serve the trained adapter
 flash models chat RUN_ID -m "hello"    # talk to it
 ```
 
-### Workload profiles (SFT)
+### Workload estimates (SFT)
 
-The first `flash train` or `flash train --cost` on a new SFT config does not print a quote.
-It reports that no workload profile exists yet and starts one:
+`flash train`, `flash train --dry-run`, and `flash train --cost` resolve the pinned environment
+package on the control plane and read its dataset file without importing `environment.py`. The
+package must contain a readable JSON or JSONL dataset. `dataset/train.jsonl` is the canonical
+default; `dataset/train.json` is also accepted, and `[environment.params] split` or `dataset_path`
+can select another packaged file.
 
-```
-no exact workload profile exists for this config yet, so there is no training quote to
-print. the server started a separate profile run that loads your environment and tokenizes
-the exact dataset this training would consume.
-that profile run is real work and is billed on its own (estimated $0.03); no training run
-was created, no training gpu was allocated, and nothing was charged for training.
-follow it with `flash runs status profile-sft-...`, then re-run this command once it
-reports done.
-```
+The control plane tokenizes raw `input` and `output` fields plus the statically readable training
+contract, using the same precedence as the environment loader: explicit `contract_text`, then
+`contract_path`, then the packaged `TRAINING_CONTRACT.md`. Token totals, retained rows, truncation,
+and optimizer steps all come from that same token stream. Other environment-added prompts, few-shot
+examples, tool schemas, filters, and transformations are not executed, so actual training can retain
+fewer rows, truncate more often, and cost more than the estimate. The training worker still executes
+the environment and trains on the rows it produces.
 
-A profile run loads your environment at its pinned SHA, renders and tokenizes every example
-this config would train on, and records aggregates: retained and dropped examples, tokens per
-epoch, supervised tokens, realized max length, packed blocks, and the update horizon. The SFT
-quote is then computed from those measured tokens rather than from an assumed average example
-length, and the same profile is what the training worker trains from.
-
-Consequences worth knowing before you submit:
-
-- **Profiles are separate runs and separate charges.** A profile appears in `flash runs list`
-  under its own id and is billed for its own (CPU-only, short) work. It is never rolled into
-  the training charge, and a failed profile cannot become training spend.
-- **Quoting fails closed.** If no trustworthy matching profile exists, no training run is
-  created, no GPU is allocated, and no quote is persisted. There is no fallback estimate.
-- **The cache key is the workload, not the run.** Profile ids are derived from environment id,
-  resolved SHA and params; model, revision and tokenizer revision; `seed`; `thinking`; worker
-  env; and the `[train]` fields `epochs`, `batch_size`, `max_context_tokens`, `max_steps` and
-  `max_examples`. Change any of them and it is a different workload needing its own profile.
-  Everything else about a run, including which GPU it lands on, is outside the key.
-- **Profiles are shared across users.** The id is a hash of that workload, not of your account,
-  so if someone else already measured your exact config you wait for their profile and are not
-  charged for a second one. Their run is not readable by your key, so the CLI tells you to
-  wait rather than pointing you at a run id that would answer 404.
-- **A failed profile is retried, not final.** If a profile fails or is cancelled, the next
-  submission of that config starts a replacement rather than reporting the workload as
-  permanently unquotable. Because the id is shared, exactly one of the waiting submitters
-  launches the replacement and the rest wait on it.
+If no readable packaged dataset exists, cost, dry-run, and submit all fail before GPU allocation and
+name `dataset/train.jsonl` as the remediation. No separate profiling run is created or billed.
 
 Run management lives under `flash runs` (`status`, `log`, `cancel`, `checkpoint`) and
 serving under `flash models` (`deploy`, `chat`, `deployments`, `undeploy`, `export`).
@@ -200,7 +177,11 @@ uv run python -m flash.cli --help
 
 The `--dev` group installs `runpod-flash`, which also declares a `flash` console script,
 so `uv run flash` in this environment may launch RunPod's CLI instead of this one.
-`python -m flash.cli` is unambiguous. Installed users are unaffected.
+`python -m flash.cli` is unambiguous.
+
+This is not only a dev-checkout problem: the `server` extra installs `runpod-flash` too, so
+`pip install 'freesolo-flash[server]'` can leave `flash` pointing at RunPod's CLI on a plane
+host. Use `flash-cli`, which is the same entry point under a name nothing else claims.
 
 Formatting is not enforced repo-wide yet, so run `ruff format` on the files you touched
 rather than the whole tree. See [CONTRIBUTING.md](CONTRIBUTING.md) for the branching
@@ -239,6 +220,8 @@ involved. **[SELF_HOSTING.md](SELF_HOSTING.md) is the full guide**; the short ve
 
 ```bash
 pip install 'freesolo-flash[server]'   # the base install is client-only
+# The server extra pulls in runpod-flash, which declares its own `flash` command and may take
+# precedence. On a plane host use `flash-cli` — same CLI, name nothing else claims.
 
 export FLASH_STANDALONE=1
 export FREESOLO_INTERNAL_KEY=$(openssl rand -hex 32)

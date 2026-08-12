@@ -160,6 +160,153 @@ def test_cheapest_gpu_policy(monkeypatch):
     assert set(rates) == {name for name, info in gpus.GPU_INFO.items() if info.enum_member}
 
 
+def test_sft_provisional_count_credits_only_the_batch_bound_width():
+    from flash.providers.allocator import _executed_width, required_vram_gb
+    from flash.providers.base import provisional_gpu_count
+
+    model_id = "Qwen/Qwen3.6-27B"
+    expected_needs = {131072: 159, 262144: 247, 400000: 339, 600000: 473}
+    for sequence, expected_need in expected_needs.items():
+        train = {"batch_size": 1, "lora_rank": 32, "max_context_tokens": sequence}
+        count = provisional_gpu_count(model_id, "sft", train=train)
+        executed = _executed_width("sft", train, None)(count)
+        assert required_vram_gb(model_id, "sft", train=train) == expected_need
+        assert count == executed == 1, (sequence, expected_need, count, executed)
+
+
+def test_batch_bound_sft_is_rejected_at_parse_time():
+    from flash.schema import ConfigError, spec_from_dict
+
+    raw = {
+        "model": "Qwen/Qwen3.6-27B",
+        "algorithm": "sft",
+        "environment": {"id": "freesolo/example/example"},
+        "train": {
+            "batch_size": 1,
+            "lora_rank": 32,
+            "max_context_tokens": 262144,
+        },
+    }
+    with pytest.raises(ConfigError) as exc:
+        spec_from_dict(raw, run_id="parse-width")
+    message = str(exc.value)
+    assert "sft needs >= 247 GB VRAM" in message
+    assert "1 of which joins this run" in message
+    assert "batch and retained rows bound the rank count" in message
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "train", "expected_count"),
+    [
+        (
+            "grpo",
+            {"max_context_tokens": 32768, "max_completion_tokens": 512},
+            4,
+        ),
+        (
+            "opd",
+            {
+                "max_context_tokens": 32768,
+                "max_completion_tokens": 512,
+                "group_size": 1,
+                # 2, not 1: rl is bound by the sequences one step holds, so a single-sequence step
+                # launches ONE rank whatever it rents (`rl_data_parallel_cards`) and this case would
+                # assert the width clamp instead of the parse-time sizing it is here to cover.
+                "prompts_per_step": 2,
+            },
+            2,
+        ),
+    ],
+)
+def test_non_sft_provisional_count_is_unchanged(algorithm, train, expected_count):
+    from flash.providers.allocator import _executed_width
+    from flash.providers.base import provisional_gpu_count
+
+    count = provisional_gpu_count("Qwen/Qwen3.6-27B", algorithm, train=train)
+    assert count == expected_count
+    assert _executed_width(algorithm, train, None)(count) == count
+
+
+def test_width_bound_rl_is_told_to_raise_its_step_not_shrink_it():
+    """A rank-bound rl run fits by RAISING prompts_per_step, so the message must not say lower.
+
+    The clamp that pins grpo/opd to the sequences one step holds created this case: 27B opd at 32k
+    with one sequence needs 233 GB and launches one rank (180 GB max), so it is now rejected at parse
+    instead of aborting at step 0. But `vram_knob_advice` says to LOWER prompts_per_step, and at one
+    prompt there is nothing below to lower -- while two sequences need 278 GB against 300 GB pooled
+    and fit. MEASURED across the catalog: every width-bound row fits by widening the step, none by
+    shrinking it.
+    """
+    from flash.schema import ConfigError, spec_from_dict
+
+    raw = {
+        "model": "Qwen/Qwen3.6-27B",
+        "algorithm": "opd",
+        "environment": {"id": "freesolo/example/example"},
+        "train": {
+            "max_context_tokens": 32768,
+            "max_completion_tokens": 512,
+            "prompts_per_step": 1,
+            "group_size": 1,
+            "lora_rank": 32,
+        },
+    }
+    with pytest.raises(ConfigError) as exc:
+        spec_from_dict(raw, run_id="parse-rl-width")
+    message = str(exc.value)
+    assert "1 of which joins this run" in message
+    assert "prompts_per_step x group_size bounds the rank count" in message
+    assert "RAISE it to buy ranks" in message
+    # the same knobs widened must actually be admitted, or the advice is still a dead end. asserted
+    # as acceptance rather than on `gpu.count`, which stays at the authored ceiling here (unset = 1)
+    # because parse gates the shape and the allocator sizes it later.
+    raw["train"]["prompts_per_step"] = 2
+    assert spec_from_dict(raw, run_id="parse-rl-width-ok").algorithm == "opd"
+
+
+@pytest.mark.parametrize(("sequence", "accepted"), [(131072, True), (262144, False)])
+def test_parse_and_allocator_agree_on_batch_bound_sft(sequence, accepted):
+    from flash.providers.allocator import _executed_width, _resolved_gpu_count, required_vram_gb
+    from flash.providers.base import UnsupportedGpuError
+    from flash.schema import ConfigError, spec_from_dict
+
+    model_id = "Qwen/Qwen3.6-27B"
+    train = {"batch_size": 1, "lora_rank": 32, "max_context_tokens": sequence}
+    raw = {
+        "model": model_id,
+        "algorithm": "sft",
+        "environment": {"id": "freesolo/example/example"},
+        "train": train,
+    }
+
+    parse_error = None
+    try:
+        spec_from_dict(raw, run_id=f"parse-allocator-{sequence}")
+    except ConfigError as exc:
+        parse_error = exc
+
+    allocation_error = None
+    try:
+        _resolved_gpu_count(
+            model_id,
+            "sft",
+            need=required_vram_gb(model_id, "sft", train=train),
+            requested_gpu_count=None,
+            model_revision="",
+            available=("runpod",),
+            exact="",
+            executed_width=_executed_width("sft", train, None),
+        )
+    except UnsupportedGpuError as exc:
+        allocation_error = exc
+
+    assert (parse_error is None) is accepted
+    assert (allocation_error is None) is accepted
+    if not accepted:
+        for error in (parse_error, allocation_error):
+            assert "batch and retained rows bound the rank count" in str(error)
+
+
 def test_provisional_gpu_cheapest_for_model(monkeypatch):
     from flash.providers.base import provisional_gpu
 
@@ -387,6 +534,20 @@ def test_35b_expert_lora_shapes_and_multicard_sizing():
     assert provisional_gpu(model_id, "grpo", train={"lora_rank": 32}, gpu_count=2) == "H200"
     assert provisional_gpu(model_id, "opd", train={"lora_rank": 32}, gpu_count=2) == "H200"
     assert provisional_gpu(model_id, "opd", train={"lora_rank": 64}, gpu_count=2) == "B200"
+
+
+def test_grpo_terminal_vram_error_names_only_effective_knobs(monkeypatch):
+    from flash.providers.base import UnsupportedGpuError, provisional_gpu
+
+    monkeypatch.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 2000)
+    with pytest.raises(UnsupportedGpuError) as exc:
+        provisional_gpu("Qwen/Qwen3.6-35B-A3B", "grpo")
+    message = str(exc.value)
+    assert "max_context_tokens" in message
+    assert "max_completion_tokens" in message
+    assert "lora_rank" in message
+    assert "batch_size" not in message
+    assert "group_size" not in message
 
 
 def test_pinned_revision_retains_calibrated_vram_floors(monkeypatch):

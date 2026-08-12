@@ -236,6 +236,130 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     assert "UNDECLARED_API_KEY" not in env
 
 
+def test_build_worker_env_lists_declared_secret_names_for_the_redactors():
+    """declared runtime secrets can carry any name (AWS_SECRET_ACCESS_KEY, ...), so the redactors
+    cannot rely on the name-shape heuristic; the env carries the applied names explicitly."""
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="owner/env", secrets=("AWS_SECRET_ACCESS_KEY",)),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+    )
+
+    env = build_worker_env(
+        spec,
+        0,
+        runtime_secrets={"AWS_SECRET_ACCESS_KEY": "aws-user", "WANDB_API_KEY": "user-wb"},
+    )
+
+    listed = set(env[SECRET_ENV_KEYS_ENV].split(","))
+    assert listed == {"AWS_SECRET_ACCESS_KEY", "WANDB_API_KEY"}
+    # a run with no applied secrets carries no list at all.
+    assert SECRET_ENV_KEYS_ENV not in build_worker_env(_spec(), 0)
+
+
+def test_the_redactor_metadata_name_is_reserved_from_declared_secrets():
+    """build_worker_env sets FLASH_SECRET_ENV_KEYS last, so a job declaring that exact name would
+    have its credential silently overwritten by the generated name list and fail at runtime. it is
+    control-plane-owned, so the declaration is rejected loudly instead."""
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+    from flash.core.spec import CONTROL_PLANE_OWNED_ENV_KEYS
+    from flash.schema.fields import ConfigError, _environment_secrets
+
+    assert SECRET_ENV_KEYS_ENV in CONTROL_PLANE_OWNED_ENV_KEYS
+    with pytest.raises(ConfigError, match="platform-managed key"):
+        _environment_secrets([SECRET_ENV_KEYS_ENV])
+    # a case variant is a distinct linux env name but not a distinct DECLARATION: build_worker_env
+    # tests ownership on the uppercased name, so accepting it here would drop the secret from the
+    # worker env without a word and launch the job missing a credential it declared as required.
+    # every reserved name is refused across its whole case-space for that reason.
+    for variant in (SECRET_ENV_KEYS_ENV.lower(), "Hf_Token", "runpod_api_key"):
+        with pytest.raises(ConfigError, match="platform-managed key"):
+            _environment_secrets([variant])
+
+
+def test_declared_secret_names_cannot_contain_the_metadata_delimiter():
+    """the name list travels to every redactor comma-joined, so a name containing a comma arrives
+    as two unrelated names, the real key goes unrecognized, and its value reaches diagnostics
+    verbatim. rejecting the delimiter at declaration keeps that channel unambiguous."""
+    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.providers.runpod.serverless import build_worker_env
+    from flash.schema.fields import ConfigError, _environment_secrets
+
+    with pytest.raises(ConfigError, match="invalid environment variable name"):
+        _environment_secrets(["FOO,BAR"])
+    # a name-shaped secret is still fine; only the delimiter is refused.
+    assert _environment_secrets(["AWS_SECRET_ACCESS_KEY"]) == ("AWS_SECRET_ACCESS_KEY",)
+
+    # and the metadata builder fails closed rather than emitting an ambiguous list, for a spec
+    # constructed around the parser.
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="owner/env", secrets=("FOO,BAR",)),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
+    )
+    with pytest.raises(RuntimeError, match="delimiter"):
+        build_worker_env(spec, 0, runtime_secrets={"FOO,BAR": "leaky"})
+
+
+def test_the_handlers_inline_redactor_covers_multiline_secret_components():
+    """the handler is source-shipped, so it carries its OWN copy of the redactor rather than
+    importing the shared one. the child's stdout is sanitized one line at a time, so a PEM key
+    never appears whole in any single call and only its component lines can match. extract that
+    copy and exercise it directly, since drift here leaks a credential nothing else catches."""
+    import ast
+    import inspect
+    import os
+    import re
+    import textwrap
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    # os/re come from _train_body's own local imports, which the handler makes at the top of its
+    # body; urllib.parse it imports itself.
+    namespace: dict = {"os": os, "re": re}
+    for name in ("_needles", "_safe_detail"):
+        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    safe_detail = namespace["_safe_detail"]
+
+    pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
+    # DEPLOY_KEY matches no suffix heuristic, so this also covers the declared-name channel.
+    secrets = {"DEPLOY_KEY": pem, "FLASH_SECRET_ENV_KEYS": "DEPLOY_KEY"}
+
+    assert (
+        safe_detail("ssh auth: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", secrets) == "ssh auth: <redacted>"
+    )
+    assert safe_detail(pem, secrets) == "<redacted>"
+    # the length floor keeps short structural fragments of a MULTILINE value readable: a short
+    # component is punctuation, not a credential.
+    assert safe_detail("near }", {"B": "{\n}\nlongenoughcomponent"}) == "near }"
+    # a whole declared value below the floor is a credential, though, and must not leak. it is
+    # redacted where it stands alone, and only there: as a global needle `ati` would rewrite
+    # `authentication`.
+    short = {"PIN": "ati", "FLASH_SECRET_ENV_KEYS": "PIN"}
+    assert safe_detail("worker rejected pin ati", short) == "worker rejected pin <redacted>"
+    assert safe_detail("trainer crashed after validation", short) == (
+        "trainer crashed after validation"
+    )
+    long = {"PIN": "sk-live-abc123456", "FLASH_SECRET_ENV_KEYS": "PIN"}
+    assert safe_detail("trainer crashed holding sk-live-abc123456", long) == (
+        "trainer crashed holding <redacted>"
+    )
+    # the word guard is per EDGE: a value whose own edge is punctuation already separates itself,
+    # and requiring a non-word character beyond it would leak "/a" out of "https://host/a/repo".
+    path_like = {"S": "/a", "FLASH_SECRET_ENV_KEYS": "S"}
+    assert safe_detail("https://host/a/repo", path_like) == "https://host<redacted>/repo"
+
+
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
     """The worker console is ALWAYS uploaded — live (periodic) while the worker runs and once more
     when it exits — so every print reaches `flash runs log`, not just a post-mortem tail on
@@ -457,6 +581,33 @@ def test_train_body_has_no_prime_install_path():
     assert 'shutil.which("prime")' not in src
 
 
+class _FakePipProc:
+    """Popen stand-in for the extra_pip tee: an output stream plus one exit code."""
+
+    def __init__(self, output: str = "", returncode: int = 0):
+        import io
+
+        self.stdout = io.StringIO(output)
+        self._returncode = returncode
+
+    def wait(self) -> int:
+        return self._returncode
+
+
+def _extra_pip_input() -> dict:
+    return {
+        "phase": "sft",
+        "seed": 0,
+        "hf_repo": "owner/runs",
+        "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
+        "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
+        "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
+        # an invalid prefix stops the handler right after the pip step, which is what is under test
+        "code_prefix": "../code/flash",
+        **_run_deadline_fields(),
+    }
+
+
 def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     import os
     from pathlib import Path
@@ -466,29 +617,19 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     calls = []
     askpass_paths = []
 
-    def fake_run(cmd, *, check, env=None):
+    def fake_popen(cmd, *, env=None, **_kwargs):
         askpass = Path(env["GIT_ASKPASS"])
         assert askpass.exists()
         assert os.access(askpass, os.X_OK)
         assert "ghp-secret" not in askpass.read_text()
         askpass_paths.append(askpass)
-        calls.append({"cmd": cmd, "check": check, "env": env})
+        calls.append({"cmd": cmd, "env": env})
+        return _FakePipProc()
 
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
 
     with pytest.raises(ValueError, match="invalid code_prefix"):
-        endpoints._train_body(
-            {
-                "phase": "sft",
-                "seed": 0,
-                "hf_repo": "owner/runs",
-                "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
-                "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
-                "code_prefix": "../code/flash",
-                **_run_deadline_fields(),
-            }
-        )
+        endpoints._train_body(_extra_pip_input())
 
     assert len(calls) == 1
     env = calls[0]["env"]
@@ -506,8 +647,9 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
 
     askpass_paths = []
 
-    def fake_run(cmd, *, check, env=None):
+    def fake_popen(_cmd, *, env=None, **_kwargs):
         askpass_paths.append(Path(env["GIT_ASKPASS"]))
+        return _FakePipProc()
 
     original_remove = os.remove
 
@@ -516,29 +658,166 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
             raise PermissionError("locked askpass helper")
         return original_remove(path)
 
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
     monkeypatch.setattr(os, "remove", fake_remove)
 
     try:
         with pytest.raises(ValueError, match="invalid code_prefix"):
-            endpoints._train_body(
-                {
-                    "phase": "sft",
-                    "seed": 0,
-                    "hf_repo": "owner/runs",
-                    "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
-                    "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
-                    "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
-                    "code_prefix": "../code/flash",
-                    **_run_deadline_fields(),
-                }
-            )
+            endpoints._train_body(_extra_pip_input())
     finally:
         for askpass in askpass_paths:
             if askpass.exists():
                 original_remove(askpass)
 
     assert askpass_paths
+
+
+def _wire_train_body_pip(monkeypatch, results):
+    """Patch Popen to replay ``results`` (output, rc) in order; returns the recorded calls."""
+    calls = []
+    queue = list(results)
+
+    def fake_popen(cmd, *, env=None, **_kwargs):
+        calls.append(cmd)
+        output, rc = queue.pop(0) if queue else ("", 0)
+        return _FakePipProc(output, rc)
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    return calls
+
+
+def test_train_body_extra_pip_retries_a_transient_index_failure(monkeypatch):
+    # Same contract as the instance bootstrap: a PyPI blip is infra, not a bad requirement, so the
+    # handler retries in place instead of failing the paid run on the first connection error.
+    from flash.providers.runpod.serverless import endpoints
+
+    calls = _wire_train_body_pip(
+        monkeypatch,
+        [
+            (
+                "WARNING: Retrying (Retry(total=4)) after connection broken by NewConnectionError\n",
+                1,
+            ),
+            ("Successfully installed some-env-pkg-1.0\n", 0),
+        ],
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 2
+
+
+def test_train_body_extra_pip_resolution_error_stays_terminal(monkeypatch):
+    # A bad package spec reached the index fine; retrying it would just burn another attempt.
+    from flash.providers.runpod.serverless import endpoints
+
+    calls = _wire_train_body_pip(
+        monkeypatch,
+        [("ERROR: No matching distribution found for definitely-not-a-package\n", 1)],
+    )
+    with pytest.raises(RuntimeError, match="extra_pip install failed"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 1  # fails fast, never walks the retry ladder
+
+
+def test_train_body_extra_pip_build_failure_outranks_earlier_transient_text(monkeypatch):
+    # pip warns "Retrying (Retry(" on an index blip, recovers, then fails compiling a wheel. Both
+    # lines sit in the same captured tail, so matching transient text alone would call a
+    # deterministic failure infra and repeat it three more times for nothing.
+    from flash.providers.runpod.serverless import endpoints
+
+    calls = _wire_train_body_pip(
+        monkeypatch,
+        [
+            (
+                (
+                    "WARNING: Retrying (Retry(total=4)) after connection broken by "
+                    "NewConnectionError\n"
+                    "Collecting some-env-pkg\n"
+                    "  error: subprocess-exited-with-error\n"
+                    "ERROR: Failed building wheel for some-env-pkg\n"
+                ),
+                1,
+            )
+        ],
+    )
+    with pytest.raises(RuntimeError, match="extra_pip install failed"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 1  # the build failure names the cause, so no retry ladder
+
+
+def test_train_body_extra_pip_matches_the_bootstrap_on_git_http_blips(monkeypatch):
+    # the two classifiers must agree on what is retriable. A VCS pin fails through git, whose
+    # phrasing carries none of the urllib shapes, so a 502 must retry here exactly as it does on
+    # the instance bootstrap; a 404 is a bad pin and must still fail fast in both.
+    from flash.providers.runpod.serverless import endpoints
+
+    blip = (
+        "  Running command git clone --filter=blob:none -q https://github.com/org/repo\n"
+        "  fatal: unable to access 'https://github.com/org/repo/': "
+        "The requested URL returned error: 502\n"
+        "  error: subprocess-exited-with-error\n"
+    )
+    calls = _wire_train_body_pip(
+        monkeypatch, [(blip, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 2
+
+    # git's DNS wording, which urllib never emits, must retry here too.
+    dns = blip.replace(
+        "The requested URL returned error: 502", "Could not resolve host: github.com"
+    )
+    calls = _wire_train_body_pip(
+        monkeypatch, [(dns, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 2
+
+    missing = blip.replace("returned error: 502", "returned error: 404")
+    calls = _wire_train_body_pip(monkeypatch, [(missing, 1)])
+    with pytest.raises(RuntimeError, match="extra_pip install failed"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 1
+
+
+def test_train_body_extra_pip_matches_the_bootstrap_on_an_index_outage_footer(monkeypatch):
+    # an unreachable index prints the same no-candidate footer a typo'd name does, so that footer
+    # alone must not be terminal when the tail also carries a transient marker. A build failure in
+    # the same tail still decides it, since pip only reaches one with real content in hand. Both
+    # classifiers must agree on this, so the RunPod copy is pinned exactly as the bootstrap is.
+    from flash.providers.runpod.serverless import endpoints
+
+    outage = (
+        "WARNING: Retrying (Retry(total=4, connect=None)) after connection broken by "
+        "NewConnectionError\n"
+        "ERROR: Could not find a version that satisfies the requirement requests "
+        "(from versions: none)\n"
+        "ERROR: No matching distribution found for requests\n"
+    )
+    calls = _wire_train_body_pip(
+        monkeypatch, [(outage, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 2
+
+    built = outage + "ERROR: Failed building wheel for requests\n"
+    calls = _wire_train_body_pip(monkeypatch, [(built, 1)])
+    with pytest.raises(RuntimeError, match="extra_pip install failed"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 1
+
+
+def test_train_body_extra_pip_stops_after_the_bounded_retries(monkeypatch):
+    from flash.providers.runpod.serverless import endpoints
+
+    calls = _wire_train_body_pip(monkeypatch, [("read timed out\n", 1)] * 4)
+    with pytest.raises(RuntimeError, match="could not reach the package index"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 4  # one attempt plus the three bounded retries
 
 
 def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
@@ -550,9 +829,9 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     installation, LoRA+ B-matrix ratio plumbing, and the chunked_nll loss_type -- because they were
     properties of trl's SFTTrainer call, and verl owns its own loss and kernel path.
 
-    The optimizations now live in two modules rather than one. Dataset preprocessing moved to
-    flash.engine.profiling.sft_workload so the profile run and the training run share one implementation, and
-    the sizing/memory choices stayed with the trainer that makes them. Each assertion reads the
+    the optimizations now live in two modules rather than one. dataset preprocessing moved to
+    flash.engine.profiling.sft_workload so estimate construction and training share one implementation,
+    and the sizing/memory choices stayed with the trainer that makes them. each assertion reads the
     module that actually owns its behaviour: pointing them all at one module would let a symbol
     disappear from the other and still pass.
     """
@@ -589,7 +868,22 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     assert "create_loraplus_optimizer" in train_src
 
 
-def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("console_lines", "terminated"),
+    [
+        (
+            ["worker booting\n", ("x" * 70_000) + "\n", "torch.cuda.OutOfMemoryError: CUDA OOM\n"],
+            True,
+        ),
+        # the same crash with NO newline anywhere: one huge unterminated line, which is what a json
+        # blob, a native stack or a stream of progress output actually looks like.
+        (["q" * 70_000 + "torch.cuda.OutOfMemoryError: CUDA OOM"], False),
+    ],
+    ids=["oversized-line-then-rootcause", "single-unterminated-line"],
+)
+def test_train_body_uploads_console_on_missing_metrics(
+    monkeypatch, tmp_path, console_lines, terminated
+):
     """The 'crashed before finishing' path (no /tmp/metrics.json) MUST upload the captured console
     even when the worker exited 0 — run_mode only uploads on a non-zero exit, so an OOM/segfault or
     silent early-exit otherwise leaves the failure undebuggable (no metrics, often no error_<phase>,
@@ -652,13 +946,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
             assert k["cwd"] == "/runcode/code/0123456789abcdef0123456789abcdef"
-            self.stdout = iter(
-                [
-                    "worker booting\n",
-                    ("x" * 70_000) + "\n",
-                    "torch.cuda.OutOfMemoryError: CUDA OOM\n",
-                ]
-            )
+            self.stdout = iter(console_lines)
             self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
 
         def wait(self):
@@ -691,9 +979,21 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
         with open(console_uploads[0]["path_or_fileobj"], encoding="utf-8") as f:
             uploaded_console = f.read()
-        assert not uploaded_console.startswith("worker booting\n")
-        assert uploaded_console.endswith("torch.cuda.OutOfMemoryError: CUDA OOM\n")
-        assert len(uploaded_console) == 64_000
+        if terminated:
+            assert not uploaded_console.startswith("worker booting\n")
+            # the 64k byte boundary fell inside the giant x-line, so that truncated line is dropped
+            # whole before redaction: a partial line could hold a credential suffix that no longer
+            # value-matches.
+            assert "x" not in uploaded_console
+            assert uploaded_console == "torch.cuda.OutOfMemoryError: CUDA OOM\n"
+        else:
+            # a tail that is ONE unterminated line is dropped whole, so this uploads nothing. that
+            # costs the root cause on exactly the crash that emits one huge line, and keeping it was
+            # tried and reverted: every bound that would let the line through is measured against
+            # the credentials this process KNOWS, and a value minted at runtime contributes no
+            # needle -- so a margin sized from an unrelated secret leaves a long fragment of it
+            # behind. the empty console never leaked.
+            assert uploaded_console == ""
         assert [call["path_in_repo"] for call in list_calls] == [code_prefix, code_prefix]
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",
@@ -744,50 +1044,25 @@ def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
     assert steady_state_commits_per_hour <= 5.0
 
 
-def test_worker_image_override_carries_its_registry_credential(monkeypatch):
-    # a private override image needs its provider-side pull credential; that cannot be derived
-    # from the image ref, so it rides alongside it.
-    from flash.providers._lifecycle import worker as _worker
-
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/private-worker:cu13")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-123")
-    o = _worker.worker_image_override()
-    assert o.image == "ghcr.io/example/private-worker:cu13"
-    assert o.registry_auth_id == "auth-123"
-    assert _worker.worker_image_for_gpu("H200") == o.image
-
-
-def test_worker_image_override_absent_is_none(monkeypatch):
-    from flash.providers._lifecycle import worker as _worker
-
-    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
-    assert _worker.worker_image_override() is None
-
-
-def test_min_cuda_for_uses_the_gpu_class_floor(monkeypatch):
-    # the CUDA floor is a property of the GPU class, not of an operator-supplied image tag
+def test_min_cuda_for_uses_the_gpu_class_floor():
+    # the CUDA floor is a property of the GPU class, not of the image tag
     from flash.providers.runpod.serverless.endpoints import min_cuda_for
 
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:cu13")
     assert min_cuda_for("B200") == "13.0"  # blackwell needs cu13 drivers
     assert min_cuda_for("H200") == "12.8"
 
 
-def test_apply_disk_raises_to_the_requested_floor(monkeypatch):
+def test_apply_disk_raises_to_the_requested_floor():
     from types import SimpleNamespace
 
-    from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
+    from flash.providers.runpod.jobs import apply_disk_gb
 
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:big")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-xyz")
-    tpl = SimpleNamespace(containerDiskInGb=64, containerRegistryAuthId=None)
+    tpl = SimpleNamespace(containerDiskInGb=64)
     cfg = SimpleNamespace(template=tpl)
     apply_disk_gb(cfg, 80)
     assert tpl.containerDiskInGb == 80  # raise-only: the request wins over the smaller default
     apply_disk_gb(cfg, 32)
     assert tpl.containerDiskInGb == 80  # never lowers an already-larger disk
-    apply_image_override_constraints(cfg)
-    assert tpl.containerRegistryAuthId == "auth-xyz"
 
 
 def test_snapshot_weight_validation(tmp_path):
@@ -799,36 +1074,3 @@ def test_snapshot_weight_validation(tmp_path):
     assert not _snapshot_has_weights(str(d))  # configs only = stale partial snapshot
     (d / "model.safetensors-00001-of-00001.safetensors").write_text("x")
     assert _snapshot_has_weights(str(d))
-
-
-def test_private_worker_image_is_refused_by_providers_that_cannot_authenticate(monkeypatch):
-    """Lambda and Vast must offer NO capacity while a credential-backed private image is set.
-
-    ``FLASH_WORKER_IMAGE_REGISTRY_AUTH`` is a RunPod provider-side credential id and only RunPod
-    attaches it; these substrates pull the image on the rented instance with no registry login. The
-    image override reaches every provider, so an automatic allocation onto either one rented a box
-    whose pull could not succeed -- and a never-started worker is retriable, so the paid attempt
-    could repeat.
-    """
-    from flash.providers.base import AllocationConstraints, UnsupportedGpuError
-    from flash.providers.lambda_ import LambdaProvider
-    from flash.providers.vast import VastProvider
-
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/private-worker:cu13")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-123")
-
-    for provider in (LambdaProvider(), VastProvider()):
-        with pytest.raises(UnsupportedGpuError, match="private FLASH_WORKER_IMAGE"):
-            provider.live_candidates(24, AllocationConstraints())
-
-
-def test_a_public_override_image_still_allocates_on_those_providers(monkeypatch):
-    """The guard keys on the CREDENTIAL, not on the override: a public image pulls fine anywhere."""
-    from flash.providers.lambda_ import LambdaProvider
-    from flash.providers.vast import VastProvider
-
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/public-worker:cu13")
-    monkeypatch.delenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", raising=False)
-
-    for provider in (LambdaProvider(), VastProvider()):
-        assert provider._private_image_problem() == ""

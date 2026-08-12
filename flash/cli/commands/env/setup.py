@@ -7,7 +7,12 @@ import sys
 import tomllib
 from pathlib import Path
 
+from flash._internal.channel import CLI_NAME
 from flash.cli.commands import traces
+from flash.cli.commands.env.retained import (
+    _warn_if_environment_form_disagrees,
+    _warn_if_retained_starter_files_describe_another_plane,
+)
 from flash.cli.scaffold import TRAINING_MD
 from flash.cli.ui import render
 from flash.envs.evaluations import _DEFAULT_EVALUATIONS_PATH
@@ -15,11 +20,7 @@ from flash.envs.evaluations import _DEFAULT_EVALUATIONS_PATH
 _STARTER_ENV_PY = '''\
 """Starter Freesolo environment.
 
-Edit dataset/train.jsonl and the reward code, then upload with
-`flash env push --project PROJECT_UUID --name my-env .`.
-
-A managed run should use the returned [environment] id from
-`flash env push --project PROJECT_UUID --name my-env .`.
+Edit dataset/train.jsonl and the reward code, then ENVIRONMENT_GUIDANCE
 
 This starter keeps a tiny smoke-test dataset in dataset/train.jsonl. Replace it
 with your real training rows before a real run.
@@ -54,6 +55,13 @@ def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult
 
 
 class StarterEnv(EnvironmentSingleTurn):
+    # Each dataset row's `output` does double duty: the scorer's expected answer, AND the gold
+    # assistant turn SFT trains on. With no `sft_completion` hook defined, `flash env test` and
+    # SFT both replay `output` verbatim as the model's response. So write it as the full text
+    # the model should emit -- if `score_response` requires a wrapper (\\boxed{}, a JSON object,
+    # a tag), the wrapper belongs in `output` too, or SFT trains the model to emit exactly what
+    # the reward punishes. Per-row state the scorer needs but the model must not see goes in
+    # `metadata`, never in `output`.
     dataset = load_jsonl(DEFAULT_DATASET_PATH)
 
     def build_prompt_messages(self, example: TaskExample, prompt_text: str):
@@ -78,10 +86,7 @@ _STARTER_DATASET_JSONL = """\
 _STARTER_EVALUATIONS_PY = '''\
 """Held-out checks for this environment.
 
-Publish this file beside environment.py with
-`flash env push --project PROJECT_UUID --name my-env .`, then run the suites against a
-model trained on it with `flash env eval TARGET`. The run names the published
-environment, so `env eval` takes no local path.
+EVALUATIONS_GUIDANCE
 """
 
 from __future__ import annotations
@@ -125,17 +130,20 @@ def load_evaluations(environment=None):
 _STARTER_EVALUATIONS_MULTITURN_PY = '''\
 """Held-out checks for this multi-turn environment.
 
-Publish this file beside environment.py with
-`flash env push --project PROJECT_UUID --name my-env .`, then run the suites against a
-model trained on it with `flash env eval TARGET`. The run names the published
-environment, so `env eval` takes no local path.
+EVALUATIONS_GUIDANCE
 
-`env eval` sends one prompt and grades one reply, so these cases check the FIRST
-assistant action rather than a finished episode: given the opening prompt, does the
-model emit the single integer `step_episode` needs to advance the game? That is a real
-held-out check of the action format the episode depends on, and it is the honest scope
-of a single-shot evaluation. Episode-level reward is what GRPO optimizes through
-`score_episode`; validate it offline with `flash env test`.
+By default `env eval` sends one prompt and grades one reply, which is what this suite
+wants: these cases check the FIRST assistant action rather than a finished episode.
+Given the opening prompt, does the model emit the single integer `step_episode` needs
+to advance the game? That is a real held-out check of the action format the episode
+depends on, and it is the honest scope of a single-shot evaluation.
+
+To grade a finished transcript instead, set `grades_episodes = True` on the suite.
+`env eval` then plays each case out against the deployed model -- generating, stepping
+the environment, and repeating to `max_episode_turns` -- and scores the resulting
+transcript. Such a suite needs cases the environment can actually advance (the cases
+below carry no `output`, so `step_episode` has no secret to compare against), and each
+case then costs one generation per turn rather than one in total.
 
 Do NOT grade these by calling `environment.reward(response, example)`: with no episode
 state that call scores an empty transcript, so an unrelated answer can score 1.0 and
@@ -203,11 +211,7 @@ action, `step_episode` advances the world (optionally appending an observation
 message), and the loop repeats until `done` or `max_episode_turns`. The finished
 transcript is graded by `score_episode`.
 
-Edit dataset/train.jsonl and the episode logic, then upload with
-`flash env push --project PROJECT_UUID --name my-env .`.
-
-A managed run should use the returned [environment] id from
-`flash env push --project PROJECT_UUID --name my-env .`.
+Edit dataset/train.jsonl and the episode logic, then ENVIRONMENT_GUIDANCE
 
 This starter implements a tiny "guess the secret number" game so you can see the
 episode hooks wired end-to-end. Replace it with your real task before a real run.
@@ -358,7 +362,8 @@ def _require_setup_project(args) -> str:
     api_url, api_key = load_credentials()
     if not api_key:
         raise ClientError(
-            "not logged in. Run `flash login` before `flash env setup` so the project can be validated"
+            f"not logged in. Run `{CLI_NAME} login` before `{CLI_NAME} env setup` "
+            "so the project can be validated"
         )
 
     supplied = str(getattr(args, "project", "") or "").strip()
@@ -381,10 +386,101 @@ def _require_setup_project(args) -> str:
     options = traces.project_options(projects)
     if not options:
         raise ClientError(
-            "no Freesolo projects are available for this organization; create one with `flash projects create NAME`"
+            f"no Freesolo projects are available for this organization; create one with "
+            f"`{CLI_NAME} projects create NAME`"
         )
     selected = render.select_required("Choose the Freesolo project for this environment", options)
     return resolve_project_id(selected, api_key, api_url)
+
+
+# Guidance the starter .py docstrings carry, per plane kind. The templates hold placeholders
+# rather than one plane's wording plus a rewrite pass: matching prose back out after rendering
+# breaks silently the moment a template is reworded.
+# `CLI_NAME`, not a literal `flash`: the executable is `flash-cli` (or `python -m flash.cli`) when
+# `flash` on PATH belongs to RunPod, and the terminal-facing output below already renders it that
+# way. A generated file that says `flash env push` sends the user to the shadowing binary, which
+# exits 0 without publishing anything -- so the instructions look followed and nothing happened.
+_HOSTED_GUIDANCE = {
+    "ENVIRONMENT_GUIDANCE": (
+        "upload with\n"
+        f"`{CLI_NAME} env push --project PROJECT_UUID --name my-env .`.\n"
+        "\n"
+        "A managed run should use the returned [environment] id from\n"
+        f"`{CLI_NAME} env push --project PROJECT_UUID --name my-env .`."
+    ),
+    "EVALUATIONS_GUIDANCE": (
+        "Publish this file beside environment.py with\n"
+        f"`{CLI_NAME} env push --project PROJECT_UUID --name my-env .`, then run the suites\n"
+        f"against a model trained on it with `{CLI_NAME} env eval TARGET`. The run names the\n"
+        "published environment, so `env eval` takes no local path."
+    ),
+}
+
+_SELF_HOSTED_GUIDANCE = {
+    "ENVIRONMENT_GUIDANCE": (
+        "commit it to a git repo your plane can read.\n"
+        "\n"
+        "A managed run names that repo in [environment] id, as\n"
+        "`github:OWNER/REPO@main:environment.py` -- this plane is self-hosted, so publishing\n"
+        "to Freesolo's managed environment hub does not apply."
+    ),
+    "EVALUATIONS_GUIDANCE": (
+        "Keep this file beside environment.py in the git repo named by [environment] id."
+    ),
+}
+
+
+def _render_starter(template: str, project_id: str, *, can_publish: bool) -> str:
+    """Fill a starter .py template's placeholders for this plane, then its project uuid.
+
+    Guidance first, because the hosted wording itself contains PROJECT_UUID -- substituting the
+    uuid first would leave the placeholder text unrendered in the guidance that replaces it.
+    """
+    for placeholder, text in (_HOSTED_GUIDANCE if can_publish else _SELF_HOSTED_GUIDANCE).items():
+        template = template.replace(placeholder, text)
+    return template.replace("PROJECT_UUID", project_id)
+
+
+def _plane_can_publish_environments() -> bool:
+    """Whether `flash env push` can actually publish for the logged-in plane.
+
+    Publishing uploads to the plane, which commits into the managed environment hub
+    (`freesolo-co/environment-hub`, hardcoded in flash/server/domain/envs.py). A self-hosted
+    operator cannot write there whatever GITHUB_TOKEN they set, so scaffolding `flash env push`
+    at them leaves an unusable empty `id` that fails config validation.
+
+    Classified on the PLANE, not on `has_freesolo_backend`: a self-hosted plane pointed at an
+    operator-run Freesolo-compatible backend has a project directory (which is what that helper
+    answers) but still cannot publish to the hub.
+    """
+    from flash.client.config import load_credentials
+    from flash.serve.urls import is_freesolo_hosted_url
+
+    api_url, _ = load_credentials()
+    # Unset means the built-in default, which is the managed plane.
+    return api_url is None or is_freesolo_hosted_url(api_url)
+
+
+def _environment_comment(project_id: str, *, can_publish: bool, extra: str = "") -> str:
+    """The `[environment]` block for a generated config."""
+    if can_publish:
+        head = (
+            "# Environment: upload this project folder with\n"
+            f"# `{CLI_NAME} env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
+        )
+        placeholder = 'id = ""\n\n'
+    else:
+        head = (
+            f"# Environment: this plane is self-hosted, so `{CLI_NAME} env push` does not apply -- it\n"
+            "# publishes to Freesolo's managed environment hub. Name a git repo instead:\n"
+            "#   github:OWNER/REPO@REF:PATH   (PATH is the file, or the directory holding environment.py)\n"
+            "# Push this folder to a repo your plane can read, then fill in the id below.\n"
+            "# A github: id needs a plane running with FLASH_STANDALONE=1; an identity-backed plane\n"
+            "# accepts managed hub ids only. Setup classifies on the API URL and cannot see that\n"
+            "# server-side setting, so if submit returns a 400 naming this id, that is the cause.\n"
+        )
+        placeholder = 'id = "github:OWNER/REPO@main:environment.py"\n\n'
+    return f"{head}{extra}[environment]\n{placeholder}"
 
 
 def _validate_existing_config_projects(project_id: str) -> None:
@@ -397,7 +493,7 @@ def _validate_existing_config_projects(project_id: str) -> None:
             continue
         try:
             raw = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise ClientError(f"cannot read existing {path}: {exc}") from exc
         try:
             existing = require_project_id(raw.get("project"))
@@ -423,7 +519,7 @@ def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
             continue
         try:
             raw = tomllib.loads(cfg.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise ClientError(f"cannot read existing {cfg}: {exc}") from exc
         found[cfg] = raw.get("thinking") is True
     if len(set(found.values())) > 1:
@@ -436,7 +532,7 @@ def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
         raise ClientError(
             f"existing configs disagree about reasoning: {on} set `thinking = true`, "
             f"{off} do not. Delete {', '.join(str(cfg) for cfg in found)} and re-run "
-            "`flash env setup` with --reasoning or --no-reasoning to scaffold them together."
+            f"`{CLI_NAME} env setup` with --reasoning or --no-reasoning to scaffold them together."
         )
     return next(iter(found.values()), None)
 
@@ -488,6 +584,21 @@ def _setup_interactive(args) -> bool:
     return render.can_prompt()
 
 
+def _marker_present(path: Path, marker: str) -> bool | None:
+    """Whether `path` carries `marker`, or None when the file cannot be read as UTF-8.
+
+    Probing for a marker is a best-effort read of a file the operator owns: `# -*- coding:
+    latin-1 -*-` is valid Python, and reading strictly here aborted `env setup` before it did
+    anything. But "cannot read" is NOT "marker absent": collapsing the two would classify an
+    undecodable multi-turn environment.py as single-turn and then override an explicit
+    --multi-turn with that guess. Three states, so an unreadable anchor can defer to the flag.
+    """
+    try:
+        return marker in path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def _resolve_turn_mode(args, starter_env: Path, dataset: Path) -> tuple[bool, bool]:
     """resolve the turn-mode reconciliation phase."""
     # An existing environment.py is the authoritative signal for which turn mode this
@@ -498,11 +609,13 @@ def _resolve_turn_mode(args, starter_env: Path, dataset: Path) -> tuple[bool, bo
     anchor = "environment.py"
     starter_env_exists = starter_env.exists()
     if starter_env_exists:
-        existing_multi = "EnvironmentMultiTurn" in starter_env.read_text(encoding="utf-8")
+        # None (unreadable) stays None: an anchor we cannot read decides nothing, so the flag or
+        # the prompt below resolves the mode instead of an unreadable file silently forcing one.
+        existing_multi = _marker_present(starter_env, "EnvironmentMultiTurn")
     elif dataset.exists():
         # No env.py to anchor on, but the starter multi-turn dataset carries a
         # distinctive prompt; use it so we don't drop a single-turn env beside it.
-        existing_multi = "secret whole number" in dataset.read_text(encoding="utf-8")
+        existing_multi = _marker_present(dataset, "secret whole number")
         anchor = "dataset/train.jsonl"
 
     # Resolve the turn mode. An existing scaffold wins (warn if a flag disagrees); otherwise an
@@ -616,6 +729,21 @@ def _write_sft_config(
         )
 
 
+_OPD_MANAGED_TEACHER_NOTE = (
+    "# the teacher and its parasail key are platform-managed; nothing to set up or export.\n"
+)
+
+# Only the managed plane manages the key. `require_teacher_broker_configuration` reads
+# PARASAIL_API_KEY and FLASH_PUBLIC_URL from the CONTROL PLANE's environment, so on a self-hosted
+# plane the operator sets both -- and the failure lands at submit, after the scaffold has already
+# claimed there was nothing to do.
+_OPD_SELF_HOSTED_TEACHER_NOTE = (
+    "# opd uses a managed parasail teacher, which this plane brokers itself: set PARASAIL_API_KEY\n"
+    "# and FLASH_PUBLIC_URL in the CONTROL PLANE's environment (not your shell) before submitting.\n"
+    "# FLASH_PUBLIC_URL must be an origin the rented worker can reach, not localhost or a tunnel.\n"
+)
+
+
 def _write_opd_config(
     opd: Path,
     multi_turn: bool,
@@ -623,6 +751,8 @@ def _write_opd_config(
     project_id: str,
     thinking_line: str,
     max_examples_line: str,
+    *,
+    can_publish: bool = True,
 ) -> None:
     """write the opd config-file phase."""
     if not opd.exists():
@@ -642,17 +772,18 @@ def _write_opd_config(
             'algorithm = "opd"   # on-policy distillation from a managed parasail teacher (default glm 5.2)\n'
             f"{thinking_line}"
             "\n"
-            "# Environment: upload this project folder with\n"
-            f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
-            "# the teacher and its parasail key are platform-managed; nothing to set up or export.\n"
-            "[environment]\n"
-            'id = ""\n\n'
-            "[train]\n"
+            + _environment_comment(
+                project_id,
+                can_publish=can_publish,
+                extra=(_OPD_MANAGED_TEACHER_NOTE if can_publish else _OPD_SELF_HOSTED_TEACHER_NOTE),
+            )
+            + "[train]\n"
             "epochs = 1\n"
             f"{max_examples_line}"
             "lora_rank = 32\n"
             '# teacher_model = "glm-5.2"   # teacher: glm-5.2 (default) | kimi-k3 |\n'
-            "#                             # qwen3.5-397b-a17b | deepseek-v4-pro\n"
+            "#                             # qwen3.5-397b-a17b | deepseek-v4-pro |\n"
+            "#                             # qwen3-vl-235b\n"
             "#                             # (key stays managed)\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
@@ -690,8 +821,12 @@ def cmd_env_setup(args) -> int:
     reasoning_configs = (rl, opd, sft)
     reasoning = _resolve_reasoning_mode(args, reasoning_configs)
 
-    env_py = (_STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY).replace(
-        "PROJECT_UUID", project_id
+    can_publish = _plane_can_publish_environments()
+    _warn_if_environment_form_disagrees(reasoning_configs, can_publish=can_publish, warn=_warn)
+    env_py = _render_starter(
+        _STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY,
+        project_id,
+        can_publish=can_publish,
     )
     dataset_jsonl = traces_jsonl or (
         _STARTER_DATASET_MULTITURN_JSONL if multi_turn else _STARTER_DATASET_JSONL
@@ -708,25 +843,35 @@ def cmd_env_setup(args) -> int:
         f"{'exported from your traces' if traces_jsonl else 'the starter dataset has 2'}"
         f"{'' if traces_jsonl else ' (raise as your dataset grows)'}\n"
     )
+    _warn_if_retained_starter_files_describe_another_plane(
+        (starter_env, starter_evaluations),
+        can_publish=can_publish,
+        warn=_warn,
+    )
     if not starter_env_exists:
         starter_env.write_text(env_py)
         # install starter suites only for the starter environment created in this run. multi-turn
         # uses a first-action format check because single-shot eval cannot grade a completed
         # episode.
         if not starter_evaluations.exists():
-            evaluations_py = (
-                _STARTER_EVALUATIONS_MULTITURN_PY if multi_turn else _STARTER_EVALUATIONS_PY
+            starter_evaluations.write_text(
+                _render_starter(
+                    _STARTER_EVALUATIONS_MULTITURN_PY if multi_turn else _STARTER_EVALUATIONS_PY,
+                    project_id,
+                    can_publish=can_publish,
+                )
             )
-            starter_evaluations.write_text(evaluations_py.replace("PROJECT_UUID", project_id))
     project_line = f"project = {json.dumps(project_id)}\n"
     env_comment = (
-        "# Environment: upload this project folder with\n"
-        f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
-        "# If the environment reads secrets with os.environ, list only the env var names here.\n"
-        "# Values are read from your shell or .env at submit time and are not stored in the spec.\n"
-        "[environment]\n"
-        'id = ""\n\n'
-        '# secrets = ["SERPAPI_API_KEY"]\n\n'
+        _environment_comment(
+            project_id,
+            can_publish=can_publish,
+            extra=(
+                "# If the environment reads secrets with os.environ, list only the env var names here.\n"
+                "# Values are read from your shell or .env at submit time and are not stored in the spec.\n"
+            ),
+        )
+        + '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
     # `thinking=true` is algorithm-agnostic. only GRPO needs a generated completion increase;
     # OPD raises its own via `opd_completion_len`, and SFT does not generate. empty strings preserve
@@ -760,7 +905,15 @@ def cmd_env_setup(args) -> int:
         sft_reasoning_note,
     )
     opd = Path("configs/opd.toml")
-    _write_opd_config(opd, multi_turn, project_line, project_id, thinking_line, max_examples_line)
+    _write_opd_config(
+        opd,
+        multi_turn,
+        project_line,
+        project_id,
+        thinking_line,
+        max_examples_line,
+        can_publish=can_publish,
+    )
     training = Path("TRAINING.md")
     _write_training_guide(training, project_id)
     scaffolded = [
@@ -773,8 +926,17 @@ def cmd_env_setup(args) -> int:
         "TRAINING.md",
     ]
     if render.styled():
-        print(render.env_setup(scaffolded, project_id))
+        print(render.env_setup(scaffolded, project_id, can_publish=can_publish))
         return 0
     print(f"ensured {', '.join(scaffolded)}")
-    print(f"next: flash env push --project {project_id} --name my-env .")
+    if can_publish:
+        print(f"next: {CLI_NAME} env push --project {project_id} --name my-env .")
+    else:
+        # `env push` targets the managed hub, which a self-hosted plane cannot write to. Same
+        # wording as the styled path in `render.env_setup`, which is what a TTY actually shows --
+        # including the standalone caveat, so the two paths cannot drift apart again.
+        print(
+            "next: push this folder to a git repo, then set [environment] id = "
+            "github:OWNER/REPO@main:environment.py (needs FLASH_STANDALONE=1 on the plane)"
+        )
     return 0

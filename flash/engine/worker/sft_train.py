@@ -15,6 +15,8 @@ import threading
 import time
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
+from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
 _SFT_LORAPLUS_RATIO = 16.0
@@ -95,11 +97,20 @@ def _verl_image_message_content(content) -> str:
     return "".join(parts)
 
 
-def _restore_verl_resume(local_dir: str) -> int:
-    resume = _w.hf_resume_checkpoint()
+def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
+    """stage this run's streamed resume checkpoint; 0 when there is nothing usable to resume from.
+
+    ``world_size`` is the rank count this attempt launches verl at; a checkpoint written at a
+    different one is discarded rather than staged (see ``resume_topology_matches``). the fetch itself
+    prefers a lower loadable checkpoint over a higher incompatible one, so a repeated discard cannot
+    starve a compatible checkpoint uploaded after the one this attempt already rejected.
+    """
+    resume = _w.hf_resume_checkpoint(
+        prefer=lambda path: resume_checkpoint_is_loadable(path, world_size=world_size)
+    )
     if not resume:
         return 0
-    return stage_verl_resume(resume, local_dir, job_label="SFT")
+    return stage_verl_resume(resume, local_dir, job_label="SFT", world_size=world_size)
 
 
 def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
@@ -124,6 +135,22 @@ def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: i
         if exists:
             durable.add(step)
     return durable
+
+
+def _processed_resume_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
+    """steps a resumed watcher must not publish again, for seeding ``processed_steps``.
+
+    the staged resume checkpoint lands in local_dir as ``global_step_N`` with the tracker pointing
+    at it, so an unseeded watcher sees it as pending on its first sweep and re-runs the merger and
+    the multi-GB resume upload for state hf already holds. the resume artifact only exists because a
+    previous attempt published its deployable first (``before_upload``), so the step's deployable is
+    already on hf. a resume step that IS a required save is credited only when
+    ``_durable_required_save_steps`` finds its adapter on hf, leaving it to be staged otherwise.
+    """
+    processed = _durable_required_save_steps(required_steps, resume_step)
+    if resume_step and resume_step not in required_steps:
+        processed.add(resume_step)
+    return processed
 
 
 _CHILD_ENV_EXACT = frozenset(
@@ -320,6 +347,7 @@ from flash.engine.profiling.sft_workload import (  # noqa: E402,F401
     sft_tokens_for_updates,
 )
 from flash.engine.worker.backend_common import (  # noqa: E402,F401
+    SHIM_FRAGMENT_FAILED_EXIT_CODE,
     fused_ce_backend,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
@@ -328,14 +356,18 @@ from flash.engine.worker.backend_common import (  # noqa: E402,F401
     parse_wandb_link,
     probe_verl_capabilities,
     render_gdn_varlen_shim,
+    render_shim_marker_prologue,
     render_wandb_link_shim,
     require_gdn_boundary_resets,
     resolve_verl_loggers,
     resolve_verl_python,
     run_verl_training,
+    shim_marker_file,
     stage_verl_resume,
     strict_gdn_probe_module,
+    verify_applied_shim_markers,
     verl_step_number,
+    wrap_shim_fragment,
 )
 from flash.engine.worker.entry.sft import _model_arch_dims, sft_under_ran  # noqa: E402,F401
 from flash.engine.worker.io.heartbeat import liveness_heartbeat  # noqa: E402
@@ -412,8 +444,19 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "configured_max_length": data.max_length,
             "realized_max_length": data.realized_max_length,
             "runtime_max_length": data.realized_max_length,
-            "per_device_train_batch_size": model.micro_batch,
-            "gradient_accumulation_steps": math.ceil(model.train_batch_size / model.micro_batch),
+            # the EXECUTED micro-batch, not the requested one: data parallelism caps it to a rank's
+            # share of the batch, so a reader reconstructing the token budget off the request would
+            # believe each rank held rows it never received.
+            "per_device_train_batch_size": child.micro_batch,
+            # over one RANK'S share of the batch, not the global batch. `micro_batch` is already
+            # capped to `train_batch_size // world_size` (see `_resolve_sft_width_and_micro_batch`),
+            # so dividing the global batch by it was the sequence-parallel formula, where every rank
+            # sees the whole batch. under data parallelism it over-counts by the world size, and a
+            # reader reconstructing tokens as micro-batch x grad-accum x DP size lands world_size
+            # times too high.
+            "gradient_accumulation_steps": math.ceil(
+                (model.train_batch_size / max(1, child.world_size)) / child.micro_batch
+            ),
             # verl concatenates either way; the profile's mode records whether more than one
             # example was allowed to share a concatenated batch, which is what a reader of these
             # metrics needs in order to compare a run's step count against its row count.
@@ -433,7 +476,11 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "loraplus_optim": _VERL_OPTIMIZER_NAME,
             "loraplus_applied": progress.loraplus_applied,
             "verl_backend": "fsdp2",
-            "ulysses_sequence_parallel_size": options.gpu_count,
+            # sft shards by DATA -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why. fsdp splits the batch
+            # across the ranks actually LAUNCHED, which is the allocated card count only when the
+            # batch divides by it, so report the executed width rather than the allocation ceiling.
+            "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
+            "data_parallel_size": child.world_size,
             "wandb_project": child.project_name if "wandb" in child.loggers else None,
             "wandb_run_name": child.experiment_name if "wandb" in child.loggers else None,
             # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the parent's live
@@ -499,8 +546,8 @@ def run_sft_train(spec=None) -> None:
             gdn_module=gdn_module,
         )
 
-    # the quote-side gate cannot answer whether resets actually run: it is device-independent by
-    # construction (the cpu-only profile job freezes it), so it can prove the kernels are installed
+    # the control-plane gate cannot answer whether resets actually run: it is device-independent by
+    # construction, so it can prove the kernels are installed
     # but not that the conv kernel runs on THIS card. the child probe is the only place that
     # question can be answered, and continuing without resets would train across packed example
     # boundaries while looking patched. an exact-unpacked run keeps the soft form:
@@ -525,7 +572,7 @@ def run_sft_train(spec=None) -> None:
     child = _prepare_sft_child(
         options, data, model, capabilities, use_remove_padding, gdn_reset_arch
     )
-    child_progress = _prepare_sft_progress(data, model, child.resume_step)
+    child_progress = _prepare_sft_progress(data, model, child)
     progress = child_progress.values
 
     def on_line(line: str) -> None:
@@ -580,9 +627,12 @@ def run_sft_train(spec=None) -> None:
             python_bin=child.python_bin,
         )
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        if (
-            final_save_due(final_step, options.save_at_steps)
-            and final_step not in child.watcher.processed_steps
+        # only a step this session's watcher actually published may suppress the final publish.
+        # the seeded resume step is excluded: the prior attempt's deployable publish is best-effort
+        # (`required=False`) while its resume upload is not, so hf can hold the resumable state
+        # without the servable adapter. re-publishing is an idempotent upload to the same path.
+        if final_save_due(final_step, options.save_at_steps) and final_step not in (
+            child.watcher.processed_steps - {child.resume_step}
         ):
             _w.publish_deployable_checkpoint(adapter_dir, final_step)
         outputs = _SftOutputs(adapter_dir, train_wall, device_peak_gpu_gb)

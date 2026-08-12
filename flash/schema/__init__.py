@@ -5,10 +5,11 @@ from __future__ import annotations
 import re
 import sys
 import tomllib
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
+from flash._internal.channel import CLI_NAME
 from flash.core.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
 from flash.core.spec import (
     FIXED_SEED,
@@ -25,14 +26,17 @@ from flash.providers import PROVIDER_NAMES
 from flash.providers.base import (
     GPU_INFO,
     UnsupportedGpuError,
+    authored_gpu_ceiling,
     canonical_gpu,
     get_gpu_info,
     providers_for,
     provisional_gpu,
+    provisional_gpu_count,
 )
 from flash.schema.fields import (
     ConfigError,
     _coerce_scalar,
+    _environment_pip,
     _environment_secrets,
     _require_environment_ref,
     _section_int,
@@ -135,7 +139,7 @@ def load_toml(path: str) -> dict[str, Any]:
             return tomllib.load(f)
     except FileNotFoundError as exc:
         raise ConfigError(
-            f"config file not found: {path} (run `flash env setup` to scaffold configs/sft.toml)"
+            f"config file not found: {path} (run `{CLI_NAME} env setup` to scaffold configs/sft.toml)"
         ) from exc
     except IsADirectoryError as exc:
         raise ConfigError(
@@ -219,7 +223,7 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
         return ref
     raise ConfigError(
         "train.init_from_adapter must be `<run_id>` (continue that run's trained adapter) or "
-        "`<run_id>/step-N` (warm-start from a checkpoint listed by `flash runs checkpoint`)"
+        f"`<run_id>/step-N` (warm-start from a checkpoint listed by `{CLI_NAME} runs checkpoint`)"
     )
 
 
@@ -230,7 +234,6 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",
-        "model_revision",
         "algorithm",
         "thinking",
         "seed",
@@ -241,16 +244,22 @@ _TOP_LEVEL_KEYS = frozenset(
         "project",
     }
 )
+# keys that WERE user-authorable and are now rejected with their own targeted error. they are absent
+# from _TOP_LEVEL_KEYS, so the unknown-key check below would otherwise report them as a typo and bury
+# the explanation of why they went away. distinct from core.spec._DROPPED_TOP_LEVEL_KEYS, which is
+# about tolerating removed keys on READ so persisted records still parse and rehash.
+_REMOVED_TOP_LEVEL_KEYS = frozenset({"model_revision"})
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
 _GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - MANAGED_GPU_KEYS
 # [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
 # is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
-# pip is platform-managed: worker_pip_for_env ignores the env id and returns one constant worker
-# requirement, so an override only ever selected the same list or a broken one. EnvironmentSpec still
-# carries the field, and spec_payload/provider submit keep populating it from worker_pip_for_env.
-_ENV_MANAGED_KEYS = frozenset({"resolved_sha", "pip"})
+# pip is authorable: worker_pip_for_env returns only Flash's own worker requirement, so a scorer that
+# imports a third-party dependency has no other way to get it onto the worker, and the missing import
+# surfaces as a zero reward at training time. The submit paths append these to worker_pip_for_env
+# rather than replacing it, so the worker requirement cannot be displaced by an override.
+_ENV_MANAGED_KEYS = frozenset({"resolved_sha"})
 _ENVIRONMENT_KEYS = (
     frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - _ENV_MANAGED_KEYS
 )
@@ -277,11 +286,58 @@ def validate_train_keys(keys: Collection[str]) -> None:
         )
 
 
+# the optimizer batch has a different name per algorithm because it is a different quantity, and one
+# name for both was a silent trap: under sft the packaged-dataset estimate turns `batch_size` into
+# examples_per_update, while under grpo/opd the key IS prompts-per-step. so the standard sft
+# out-of-memory workaround, `batch_size = 1`, copied into an rl config meant one prompt per optimizer
+# update -- the run trained, logged and billed, and nothing errored. rejecting the wrong name makes
+# that copy a parse error naming the right key instead of a quiet, expensive misconfiguration.
+_ALGORITHM_ONLY_TRAIN_KEYS = {
+    "batch_size": ("sft",),
+    "prompts_per_step": ("grpo", "opd"),
+}
+
+
+def validate_train_keys_for_algorithm(train_raw: Mapping[str, Any], algorithm: str) -> None:
+    """reject [train] keys that carry an AUTHORED value not applicable to this algorithm.
+
+    Keyed on the value, not the key's presence. ``to_dict()`` emits the full field surface, so a
+    grpo spec round-trips carrying ``batch_size: null``; rejecting on presence alone would make
+    every spec fail to reparse its own output and break resubmit, warm-start and server reparse.
+    A null is the absence of an authored value, which is exactly what the user is being asked for.
+    """
+    for key, allowed in _ALGORITHM_ONLY_TRAIN_KEYS.items():
+        if train_raw.get(key) is None or algorithm in allowed:
+            continue
+        counterpart = next(
+            other
+            for other, other_allowed in _ALGORITHM_ONLY_TRAIN_KEYS.items()
+            if algorithm in other_allowed
+        )
+        raise ConfigError(
+            f"[train] {key} does not apply to {algorithm}: use {counterpart} instead. "
+            f"{key} is {'/'.join(allowed)}-only, and the two are different quantities -- "
+            f"{counterpart} is the optimizer batch itself, so copying an sft batch_size here "
+            "would change how many prompts each update trains on."
+        )
+
+
 def _validate_top_level(
     raw: dict[str, Any], project_required: bool
 ) -> tuple[str, str, str, str, bool]:
     """Validate the top-level config section."""
-    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
+    revision_raw = raw.get("model_revision")
+    # released clients serialize an unpinned spec as model_revision="". tolerate that legacy wire
+    # artifact, including whitespace-only strings, while continuing to reject every authored pin.
+    if "model_revision" in raw and (not isinstance(revision_raw, str) or revision_raw.strip()):
+        raise ConfigError(
+            "config key `model_revision` was removed because Flash-managed serving loads a "
+            "pre-quantized FP8 checkpoint resolved per base model, so it cannot honor an arbitrary "
+            "upstream commit and an authored pin made the run undeployable. Remove the key. "
+            f"`{CLI_NAME} models export` publishes the adapter, but for a fresh GRPO or OPD run it "
+            "does not turn the moving upstream default into a fixed base revision."
+        )
+    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS - _REMOVED_TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
         if {"grpo", "sft", "opd"} & set(unknown):
@@ -302,10 +358,7 @@ def _validate_top_level(
     # escaping the callers' configerror/valueerror guards -> 500; type-check like the other scalars.
     if not isinstance(model, str) or not model.strip():
         raise ConfigError('config `model` must be a model id string (e.g. "Qwen/Qwen3.5-4B")')
-    model_revision_raw = raw.get("model_revision", "")
-    if not isinstance(model_revision_raw, str):
-        raise ConfigError("model_revision must be a string")
-    model_revision = model_revision_raw.strip()
+    model_revision = ""
     project_raw = raw.get("project", "")
     try:
         if project_required:
@@ -333,8 +386,8 @@ def _validate_top_level(
 
 def _validate_environment_section(
     raw: dict[str, Any],
-) -> tuple[dict[str, Any], tuple[str, ...]]:
-    """Validate the environment section."""
+) -> tuple[dict[str, Any], tuple[str, ...], tuple[str, ...]]:
+    """Validate the environment section, returning it with the parsed pip and secrets tuples."""
     # use `is none` not `or {}`: a present-but-non-dict value (e.g. `environment = false`) must hit the type check.
     env_raw = raw.get("environment")
     if env_raw is None:
@@ -352,11 +405,12 @@ def _validate_environment_section(
     # input fails clearly instead of becoming {} or an opaque dict conversion error.
     if env_raw.get("params") is not None and not isinstance(env_raw["params"], dict):
         raise ConfigError("[environment] params must be a table")
+    environment_pip = _environment_pip(env_raw.get("pip"))
     environment_secrets = _environment_secrets(env_raw.get("secrets"))
-    return env_raw, environment_secrets
+    return env_raw, environment_pip, environment_secrets
 
 
-def _validate_train_section(raw: dict[str, Any]) -> dict[str, Any]:
+def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, Any]:
     """Validate the train section."""
     train_raw = raw.get("train")
     if train_raw is None:
@@ -364,6 +418,7 @@ def _validate_train_section(raw: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(train_raw, dict):
         raise ConfigError("[train] must be a table")
     validate_train_keys(train_raw)
+    validate_train_keys_for_algorithm(train_raw, algorithm)
     return train_raw
 
 
@@ -420,26 +475,17 @@ def _validate_gpu_section(
                 f"gpu.provider {gpu_provider!r} cannot provision gpu.type {gpu_type!r}"
             )
 
-    from flash.providers.allocator import geometry_safe_gpu_cap
-
-    preflight_gpu_count = geometry_safe_gpu_cap(
-        model, gpu_count or 1, model_revision=model_revision
+    requested_gpu_count = authored_gpu_ceiling(gpu_type, gpu_count)
+    preflight_gpu_count = provisional_gpu_count(
+        model,
+        algorithm,
+        train=train_raw,
+        thinking=thinking,
+        geometry_model_revision=model_revision,
+        gpu_count=requested_gpu_count,
     )
     try:
-        # called for its rejection, not its return: it raises when no validated class can hold the
-        # run, which is the parse-time "this is unplaceable" gate. the class it picks is offline
-        # sizing/display only -- the allocator re-resolves auto runs at submit time.
-        provisional_gpu(
-            model,
-            algorithm=algorithm,
-            train=train_raw,
-            thinking=thinking,
-            # sized against the shape the allocator may actually rent. sizing a --gpus n run
-            # against one card rejected it here before sharding was ever considered, which made
-            # the flag inert for exactly the large runs it exists to serve.
-            gpu_count=preflight_gpu_count,
-        )
-        if gpu_type and not model_revision:
+        if gpu_type and preflight_gpu_count <= 1 and not model_revision:
             from flash.providers.allocator import required_vram_gb
 
             required_vram = required_vram_gb(
@@ -448,17 +494,23 @@ def _validate_gpu_section(
                 train=train_raw,
                 thinking=thinking,
             )
-            # required_vram is the whole-run floor, so it may only be compared against a single
-            # card's vram when the run is confined to a single card. above that the allocator
-            # shards the run across a combination and applies its own multi-card fit test
-            # (allocator.py:181), which this gate must not pre-empt: a pinned 141 gb class with
-            # gpu.count=2 holds 282 gb and is rejected here on a 180 gb floor it clears.
-            single_card = gpu_count is None or gpu_count <= 1
-            if single_card and get_gpu_info(gpu_type).vram_gb < required_vram:
+            if get_gpu_info(gpu_type).vram_gb < required_vram:
                 raise ConfigError(
                     f"gpu.type {gpu_type!r} has {get_gpu_info(gpu_type).vram_gb} GB VRAM, "
                     f"but this run requires at least {required_vram} GB"
                 )
+        # called for its rejection, not its return: it raises when no validated class can hold the
+        # run, which is the parse-time "this is unplaceable" gate. every count reaches this boundary
+        # after the geometry cap, so an unsafe eight-card width cannot leak into sizing.
+        provisional_gpu(
+            model,
+            algorithm=algorithm,
+            train=train_raw,
+            thinking=thinking,
+            geometry_model_revision=model_revision,
+            gpu_count=preflight_gpu_count,
+            authored_gpu_ceiling=requested_gpu_count,
+        )
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
     return gpu_type, gpu_provider, gpu_options
@@ -475,7 +527,7 @@ def _validate_algorithm_model_consistency(
     if thinking and info.thinking == "none":
         raise ConfigError(
             f"{model} does not support thinking mode (its chat template has no "
-            f"<think> support); pick a thinking-capable model — `flash models list` lists "
+            f"<think> support); pick a thinking-capable model — `{CLI_NAME} models list` lists "
             f"each model's thinking capability"
         )
     if not thinking and info.thinking == "always":
@@ -521,8 +573,8 @@ def spec_from_dict(
     raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
 ) -> JobSpec:
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
-    env_raw, environment_secrets = _validate_environment_section(raw)
-    train_raw = _validate_train_section(raw)
+    env_raw, environment_pip, environment_secrets = _validate_environment_section(raw)
+    train_raw = _validate_train_section(raw, algorithm)
     gpu_type, gpu_provider, gpu_options = _validate_gpu_section(
         raw,
         model=model,
@@ -545,6 +597,7 @@ def spec_from_dict(
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
+            prompts_per_step=_train_int(train_raw, "prompts_per_step", minimum=1),
             max_context_tokens=_train_int(train_raw, "max_context_tokens", minimum=1),
             save_every=_train_int(train_raw, "save_every", minimum=1),
             group_size=_train_int(train_raw, "group_size", minimum=1),
@@ -571,11 +624,12 @@ def spec_from_dict(
     spec = JobSpec(
         model=model,
         model_revision=model_revision,
+        gpu_count_auto=authored_gpu_ceiling(gpu_type, gpu_options.get("count")) is None,
         algorithm=algorithm,
         environment=EnvironmentSpec(
             id=str(env_raw.get("id") or ""),
             params=dict(env_raw.get("params") or {}),
-            pip=tuple(str(p) for p in env_raw.get("pip") or ()),
+            pip=environment_pip,
             secrets=environment_secrets,
         ),
         train=train_spec,
@@ -689,20 +743,30 @@ def _reject_inapplicable_train_knobs(spec: JobSpec) -> None:
 
 
 def _validate_grpo(spec: JobSpec) -> None:
-    """validate the grpo group-size constraint."""
+    """validate the grpo group-size and prompt-budget constraints."""
     if spec.train.group_size is not None and spec.train.group_size < 2:
         raise ConfigError(
             "train.group_size must be >= 2 for GRPO (advantages are group-relative, so a "
             "prompt needs at least two generations to compare against)"
         )
+    _validate_on_policy_prompt_budget(spec, "grpo")
 
 
 def _validate_on_policy_prompt_budget(spec: JobSpec, algorithm: str) -> None:
+    """reject a context that leaves no prompt room once the completion budget is reserved.
+
+    each algorithm resolves its completion length off its own recipe, so read it through the same
+    helper its worker does, since a shared number would reject runs the worker accepts. the worker
+    clamps the requested context down to the model architecture before subtracting
+    (`train/rl/inputs.py`, `opd_train_runner`), and clamping can only shrink the budget, so
+    checking the unclamped value here is never stricter than the worker's own enforcement.
+    """
     if not spec.train.max_context_tokens:
         return
-    from flash.engine.plan.vram import opd_completion_len
+    from flash.engine.plan.vram import grpo_completion_len, opd_completion_len
 
-    max_completion = opd_completion_len(spec.train.max_completion_tokens, spec.thinking)
+    resolve = grpo_completion_len if algorithm == "grpo" else opd_completion_len
+    max_completion = resolve(spec.train.max_completion_tokens, spec.thinking)
     if spec.train.max_context_tokens - max_completion < 1:
         raise ConfigError(
             f"[train] max_context_tokens ({spec.train.max_context_tokens}) leaves no prompt budget "
@@ -754,10 +818,10 @@ def _validate_spec(spec: JobSpec) -> None:
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "
-            '`flash env push --project <project-uuid> --name <name>` and paste the returned id, e.g. "your-name/your-env"); '
+            f'`{CLI_NAME} env push --project <project-uuid> --name <name>` and paste the returned id, e.g. "your-org/your-project/your-env"); '
             "there is no local path mode"
         )
     _require_environment_ref(
         spec.environment.id,
-        '[environment] id must be a Freesolo environment id (for example "your-name/your-env")',
+        '[environment] id must be a Freesolo environment id (for example "your-org/your-project/your-env")',
     )

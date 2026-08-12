@@ -36,6 +36,13 @@ export RUNPOD_API_KEY=...              # or LAMBDA_API_KEY, or VAST_API_KEY
 flash-server --host 0.0.0.0 --port 8080
 ```
 
+The `server` extra pulls in `runpod-flash`, which declares its own `flash` console script.
+Whichever distribution installs last wins, so on a plane host the bare `flash` command may launch
+RunPod's CLI instead of this one - it exits 0 and does nothing, which is easy to miss. Use
+**`flash-cli`**: the same CLI under a name nothing else claims. Check with `flash --help`; if it
+does not mention `train`, use `flash-cli` (or `python -m flash.cli`) wherever this guide says
+`flash`. A client-only machine that never installs the `server` extra is unaffected.
+
 `flash-server` speaks plain HTTP. For anything but loopback, put a TLS-terminating reverse proxy
 (nginx, Caddy, a cloud load balancer) in front of it and point DNS for your hostname at the proxy -
 the plane itself never terminates TLS. On the same machine, skip the proxy and use
@@ -50,6 +57,8 @@ flash login --api-url https://your-plane.example --api-key "$FREESOLO_INTERNAL_K
 # flash login --api-url http://127.0.0.1:8080 --api-key "$FREESOLO_INTERNAL_KEY"
 flash train run.toml
 ```
+
+(On a host that has the `server` extra installed, run these as `flash-cli` - see the note above.)
 
 Because `--api-url` points at your own plane, `flash login` stores the key and checks it
 against that plane. It does **not** send it to `api.freesolo.co` for verification: your
@@ -148,24 +157,33 @@ sink.
 An environment is the Python package defining your task - dataset, rollout, reward. Point
 `[environment] id` at any GitHub repository you control:
 
-| Form                                          | Resolves to                                                  |
-| --------------------------------------------- | ------------------------------------------------------------ |
-| `github:owner/repo@ref:path/to/env`           | that repo at that ref. **Use this when self-hosting.**       |
-| `https://github.com/owner/repo/tree/ref/path` | the same thing, in browser-URL form.                         |
-| `namespace/name`                              | Freesolo's managed hub (`freesolo-co/environment-hub`) only. |
+| Form                                          | Resolves to                                                   |
+| --------------------------------------------- | ------------------------------------------------------------- |
+| `github:owner/repo@ref:path/to/env`           | that repo at that ref. **Use this when self-hosting.**        |
+| `https://github.com/owner/repo/tree/ref/path` | the same thing, in browser-URL form.                          |
+| `namespace/project/name`                      | Freesolo's managed hub only - **rejected when self-hosting.** |
 
-A bare `namespace/name` slug is **not** a generic shorthand - it always resolves against
-Freesolo's hub, so a self-hosted plane should use the explicit `github:` form. `ref` may be
-a branch, tag, or commit sha; pin a sha if you want runs to be reproducible.
+A bare `namespace/project/name` slug is **not** a generic shorthand - it always resolves
+against `freesolo-co/environment-hub`, which is private. `ref` may be a branch, tag, or
+commit sha; pin a sha if you want runs to be reproducible.
 
-**The two GitHub forms are self-hosted-only.** Freesolo's managed service accepts
-`namespace/name` and nothing else: the hub is the only repo it can vouch for, being the one
-`flash env push` writes to and the one whose packages carry a validated project association.
-Submitting a `github:` or browser-URL ref there is rejected at submit with a `400`. A
-standalone plane (`FLASH_STANDALONE=1`) accepts all three forms, which is what makes
-self-hosting possible at all - it cannot publish to Freesolo's hub, and a local directory is
-not a supported source either (see below). The check reads `FLASH_STANDALONE` on the server,
-so it is the plane you submit to, not the CLI you submit from, that decides.
+**Each plane accepts only the form it can actually fetch, and the two do not overlap.**
+Freesolo's managed service accepts `namespace/project/name` and nothing else: the hub is the
+only repo it can vouch for, being the one `flash env push` writes to and the one whose
+packages carry a validated project association. Submitting a `github:` or browser-URL ref
+there is rejected at submit with a `400`.
+
+A standalone plane (`FLASH_STANDALONE=1`) is the exact inverse: the two GitHub forms are its
+only environment source, and a `namespace/project/name` slug is **rejected at submit with a
+`400`**. Every slug maps onto Freesolo's private hub, so such an id names the one repository
+your plane certainly cannot read - left to run it would fail on a rented GPU with a bare
+GitHub `404`, after the run had already cost you money. The refusal names the repo and the
+form to use instead. This applies to every spelling of the hub, including an explicit
+`github:freesolo-co/environment-hub@main:...` ref and its browser-URL form.
+
+A local directory is not a supported source either (see below). The check reads
+`FLASH_STANDALONE` on the server, so it is the plane you submit to, not the CLI you submit
+from, that decides.
 
 Public repos work without credentials, subject to GitHub's unauthenticated rate limit. Set
 `GITHUB_TOKEN` for private repos. `flash env push` publishes to the managed hub and is not
@@ -216,6 +234,10 @@ With it set:
   directory that does not exist here.
 - **Environment mirror validation is skipped.** The environment package itself is still
   resolved and authorized normally.
+- **Managed hub environment ids are refused at submit.** Every `namespace/project/name` slug resolves
+  to Freesolo's private hub, which this plane cannot read, so it is rejected with a `400`
+  naming the repo instead of failing later on a rented GPU. Use the `github:` form
+  ([environments](#environments)).
 - **Backend reporting is off** - billing precheck and charge, realized-cost
   reconciliation, checkpoint registration, and the hosted artifact GC sweep. Otherwise these would send your operator key to `api.freesolo.co`
   (and, for the GC, `serve.freesolo.co`) and log a warning per run or per startup.

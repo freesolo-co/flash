@@ -6,9 +6,10 @@ Split out of ``flash.runner.supervise.lifecycle`` to keep that module under the 
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-from flash.core.spec import JobSpec, gpu_count_of
+from flash._internal.diagnostics import sanitize_diagnostic
+from flash.core.spec import JobSpec
 from flash.runner.supervise import lifecycle as _lifecycle
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
@@ -145,6 +146,11 @@ class _PreparedAttempt:
     attempt: int
     attempt_spec: JobSpec
     runtime_secrets: dict[str, str]
+    # the rank count a pinned opd resume checkpoint was written at, or None when this attempt
+    # resumes from nothing. allocation is pinned to it: the worker refuses a pinned checkpoint
+    # whose fsdp width differs from the attempt's, so re-ranking onto another shape would strand
+    # the run on the only checkpoint it is authorized to continue from.
+    resume_world_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -329,9 +335,11 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
         ctx.gc_seen_endpoints()
         raise
     if ctx.spec.algorithm == "opd":
-        expected_next_attempt, opd_resume_revision = _verified_opd_retry_state(ctx.spec.run_id)
+        expected_next_attempt, opd_resume_revision, resume_world_size = _verified_opd_retry_state(
+            ctx.spec.run_id
+        )
     else:
-        expected_next_attempt, opd_resume_revision = None, None
+        expected_next_attempt, opd_resume_revision, resume_world_size = None, None, None
     attempt = _reserve_attempt(
         ctx.spec.run_id,
         minimum_attempt=ctx.attempt_start if local_attempt == 0 else 0,
@@ -343,7 +351,14 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
     if opd_resume_revision is not None:
         attempt_runtime_secrets[OPD_RESUME_REVISION_ENV] = opd_resume_revision
     return _PreparationOutcome(
-        prepared=_PreparedAttempt(local_attempt, attempt, attempt_spec, attempt_runtime_secrets)
+        prepared=_PreparedAttempt(
+            local_attempt,
+            attempt,
+            attempt_spec,
+            attempt_runtime_secrets,
+            # only a pinned resume constrains the shape; without one the retry re-ranks freely.
+            resume_world_size=resume_world_size if opd_resume_revision is not None else None,
+        )
     )
 
 
@@ -360,11 +375,16 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
     with contextlib.suppress(FileNotFoundError):
         if get_status(ctx.spec.run_id).state == "cancelled":
             raise ctx.cancel()
+    from flash.cost.spec import sft_ranking_overrides
+
     try:
         allocation = allocate(
             prepared.attempt_spec.model,
             prepared.attempt_spec.algorithm,
             train=prepared.attempt_spec.train,
+            # profile-derived knobs (executed batch, row count, measured length): ranking must price
+            # the work that will run, not the authored request. see `sft_ranking_overrides`.
+            overrides=sft_ranking_overrides(prepared.attempt_spec),
             thinking=prepared.attempt_spec.thinking,
             # the run's requested disk, so the vast capacity check searches at the same effective
             # floor submit provisions with — else a high-disk run is advertised vast capacity that
@@ -383,14 +403,10 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
             provider=getattr(prepared.attempt_spec.gpu, "provider", ""),
             gpu_type=getattr(prepared.attempt_spec.gpu, "type", ""),
             model_revision=prepared.attempt_spec.model_revision,
-            # the run's own gpu.count is the ceiling on cards the allocator may combine. at the
-            # default 1 this is exactly the historical cheapest-single-class search; above 1 the
-            # gate has already confirmed a sharding backend on a provider that rents n cards, so
-            # combinations of smaller classes become fair game when they price below one big card.
-            max_gpu_count=gpu_count_of(prepared.attempt_spec),
-            # a profile job tokenizes on cpu and exits before weights load, so it allocates the
-            # cheapest rentable card rather than the training shape it is measuring.
-            workload_profile=bool(prepared.attempt_spec.workload_profile_kind),
+            # an authored gpu.count is a hard ceiling. the digest-stable integer 1 on an unpinned
+            # spec is only a placeholder, so the marker must reach allocation as none or auto-sizing
+            # silently collapses back to one card after the preparation round trips.
+            max_gpu_count=prepared.attempt_spec.authored_gpu_count,
         )
     except Exception as exc:
         if isinstance(exc, UnsupportedGpuError):
@@ -400,7 +416,48 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
             failure="poll_error",
             detail=f"allocation failed ({type(exc).__name__})",
         )
-    return allocation, None
+    return _pinned_to_resume_width(allocation, prepared.resume_world_size), None
+
+
+def _pinned_to_resume_width(allocation, resume_world_size: int | None):
+    """Drop shapes a pinned OPD resume checkpoint cannot be loaded on.
+
+    The worker fails closed when a pinned resume's fsdp shards were written at a width other than
+    the one the attempt runs at: it refuses to train rather than restart from step 0, because the
+    control-plane gate authorized this replacement only to continue from exactly that checkpoint.
+    Allocation, though, re-ranks every retry from scratch -- capacity and live pricing move, and
+    2x/4x of a class are distinct rentable shapes -- so a 2-card attempt can legitimately be
+    re-ranked onto 4 cards and then permanently reject the only checkpoint it may resume from.
+
+    Narrowing the candidates is what closes that gap, and it is done HERE rather than by passing a
+    count into ``allocate()``: ``max_gpu_count`` is a ceiling, not an exact width, so a ceiling of 2
+    still admits a 1-card shape. Every candidate already carries its own ``gpu_count``, so the
+    exact-width rule is one filter over the ranked list, leaving the ranking itself untouched.
+
+    An empty result is left empty deliberately: the caller reports no-capacity and retries, which is
+    the truthful outcome when the only loadable shape is unavailable. Restarting from step 0 instead
+    would repeat already-billed teacher work and optimizer steps outside what the gate approved.
+    """
+    if not resume_world_size:
+        return allocation
+    loadable = tuple(
+        candidate
+        for candidate in allocation.candidates
+        if int(getattr(candidate, "gpu_count", 1)) == resume_world_size
+    )
+    if loadable == allocation.candidates:
+        return allocation
+    if not loadable:
+        return replace(allocation, candidates=())
+    best = loadable[0]
+    return replace(
+        allocation,
+        candidates=loadable,
+        provider=best.provider,
+        gpu=best.gpu,
+        hourly_usd=best.hourly_usd,
+        gpu_count=best.gpu_count,
+    )
 
 
 def _build_candidate_plan(
@@ -412,6 +469,22 @@ def _build_candidate_plan(
 
     candidates = tuple(_lifecycle._oom_escalated(allocation.candidates, ctx.oom_vram_floor))
     if not candidates:
+        # an exhausted list has two causes and they need different words. attributing the pinned-
+        # width one to OOM would send an operator to raise VRAM when the run is not out of memory
+        # at all: no fitting shape has the card count its resume checkpoint can be loaded on.
+        if prepared.resume_world_size and not allocation.candidates:
+            width = prepared.resume_world_size
+            ctx.last_detail = (
+                f"no fitting {width}-card shape is available, and this retry must resume from a "
+                f"checkpoint written at {width} cards"
+            )
+            print(
+                f"seed={ctx.seed} no {width}-card candidate for the pinned OPD resume checkpoint; "
+                "not retrying",
+                file=ctx.log,
+                flush=True,
+            )
+            return None
         ctx.last_detail = f"oom: exceeded the largest available GPU ({ctx.oom_vram_floor:g} GB)"
         print(
             f"seed={ctx.seed} OOM on the largest GPU class ({ctx.oom_vram_floor:g} GB); not retrying",
@@ -512,7 +585,11 @@ def _submit_provider(
     plan: _CandidatePlan,
 ):
     from flash.providers import get_provider
-    from flash.providers.base import PollResult, UnreconciledCreateError
+    from flash.providers.base import (
+        PollResult,
+        RunExhaustedProviderPoolError,
+        UnreconciledCreateError,
+    )
     from flash.runner import (
         _load_run_deadline_at,
         _TerminalHandleRace,
@@ -555,6 +632,23 @@ def _submit_provider(
                 ),
                 False,
             )
+        if isinstance(exc, RunExhaustedProviderPoolError):
+            # the one submit-side message worth reading, and the only one safe to read: Flash
+            # authors this string, so unlike a provider response body it cannot quote a request
+            # that carried a credential. without this the class name alone would make "this run
+            # burned the whole pool" indistinguishable from "the market is dry", which is exactly
+            # the distinction the error exists to draw. still sanitized and bounded, because the
+            # gpu class it interpolates comes from the spec.
+            return (
+                PollResult(
+                    False,
+                    failure="no_capacity",
+                    detail=sanitize_diagnostic(str(exc), limit=1000),
+                ),
+                True,
+            )
+        # every other provider exception keeps its class name only. the text can quote a request
+        # body, and this detail is persisted into the run record.
         return (
             PollResult(
                 False,
@@ -570,6 +664,7 @@ def _submit_candidate(
     prepared: _PreparedAttempt,
     plan: _CandidatePlan,
 ):
+    from flash.cost.spec import UnknownPromptPoolSize
     from flash.engine.profiling.workload_profile import WorkloadProfileMismatch
     from flash.providers.base import PollResult
     from flash.runner import (
@@ -597,11 +692,16 @@ def _submit_candidate(
             selected_quote = _estimate_selected_quote(ctx, plan, latest)
         except _lifecycle._SelectedQuoteUnaffordable:
             raise
-        except WorkloadProfileMismatch:
-            # the quote is backed by a workload profile whose identity is derived from this
-            # spec, so a mismatch here is a defect in the run's own inputs, not a market or
-            # metadata blip. retrying re-derives the same identity and fails the same way,
-            # spending the run's remaining deadline in backoff sleeps to get there.
+        except (WorkloadProfileMismatch, UnknownPromptPoolSize):
+            # both are defects in the run's own inputs rather than a market or metadata blip, so
+            # retrying re-derives the same answer and fails the same way, spending the run's
+            # remaining deadline in backoff sleeps to get there.
+            #
+            # the profile mismatch is an identity derived from this spec. the missing pool size is
+            # the same shape: grpo/opd price their horizon from a stated prompt-pool size, and a
+            # spec that states none states none on every attempt. this refresh asks for a
+            # PREDICTED horizon (no steps to prorate from), which is exactly the question the
+            # refusal exists to answer -- so it must fail closed once, not once per attempt.
             raise
         except Exception as exc:
             # revision-aware quote inputs can depend on remote metadata. a transient refresh
@@ -721,9 +821,40 @@ def _retry_target(
         _lifecycle._shape_key(candidate) in retry_tried for candidate in outcome.candidates
     )
     no_escalation = ", no untried GPU class fits this run" if exhausted else ""
+    # a projected provider this run has ALREADY marked failed is not a failover, it is a clamp back
+    # onto the pool that is failing. `_select_candidate` sorts on `provider in failed_providers`
+    # first, so once every candidate's provider has failed that key is True for all of them and the
+    # escape degrades to the plain cheapest-first order. the line then reads like recovery while the
+    # run loops on the same substrate, which is what made a 46-attempt loop look like progress.
+    # naming it is the difference between "waiting" and "unpin gpu.provider / add another provider".
+    retry_failed_providers = (
+        ctx.failed_providers
+        if first_cache_drop
+        else ctx.failed_providers | {outcome.chosen.provider}
+    )
+    # what landing on a failed provider actually proves is that no UNFAILED one is left, not that
+    # this is the only provider with a fitting class. with fitting candidates on two providers that
+    # have both failed, sort key 1 is True for either, so "no other provider offers a fitting class"
+    # would deny a provider sitting right there in the list. read the list instead of inferring from
+    # the sort, and distinguish the two cases: another failed provider is still somewhere to go
+    # (unpin, or wait for it to recover), whereas a single-provider candidate list is not.
+    other_providers = {candidate.provider for candidate in outcome.candidates} - {
+        projected.provider
+    }
+    no_escape = (
+        (
+            ", which this run has already lost an attempt on -- every provider offering a fitting "
+            f"class ({', '.join(sorted(other_providers | {projected.provider}))}) has now failed"
+            if other_providers
+            else ", which this run has already lost an attempt on -- no other provider offers a "
+            "fitting class"
+        )
+        if projected.provider in retry_failed_providers
+        else ""
+    )
     return (
         f"expecting to retry on {projected.gpu} @ {projected.provider}"
-        f"{' again' if same else ''}{no_escalation} (resume from last checkpoint; "
+        f"{' again' if same else ''}{no_escalation}{no_escape} (resume from last checkpoint; "
         "reallocated against live capacity, so the class may change)"
     )
 

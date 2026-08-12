@@ -46,6 +46,17 @@ FLASH_ATTN_SPEC = (
     "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/"
     "v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl"
 )
+# sha256 of the wheel above, kept in lockstep with Dockerfile.worker's ARG FLASH_ATTN_SHA256.
+# the wheel is a community rebuild published by an individual, not Dao-AILab, and a github release
+# asset can be deleted and re-uploaded at the same url by whoever holds the account, so the url
+# alone pins nothing, and this interpreter is the one that TRAINS. bump it together with the url.
+FLASH_ATTN_SHA256 = "a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12e36a0f"
+# what the install actually asks for. uv hashes the downloaded artifact and refuses to install it
+# when the fragment does not match (verified against uv 0.11), so the check happens after the
+# download and before anything is unpacked into the venv, the same order as the sha256sum -c on
+# the infisical .deb in Dockerfile. the spec above stays bare so it keeps matching Dockerfile.worker's
+# ARG default and worker-image.yml's FA2_SPEC, which fetch and verify in two separate steps.
+FLASH_ATTN_INSTALL_SPEC = f"{FLASH_ATTN_SPEC}#sha256={FLASH_ATTN_SHA256}"
 # the wheel above is cp312-ONLY, and flash itself supports 3.11 (pyproject requires-python >=3.11),
 # so a bare `uv venv` on a 3.11 host builds an interpreter the wheel cannot install into -- and that
 # install is required, so the run dies during provisioning instead of training. name the interpreter
@@ -84,9 +95,20 @@ TRANSFORMERS_REQUIREMENT = "transformers>=5.6,<5.13"
 # fla, causal_conv1d, or the transformers range lets an older partial venv match forever; conv1d
 # leaves GRPO/OPD failing ``require_gdn_boundary_resets`` with no rebuild path, and a stale venv
 # resolved before the transformers pin keeps training on an out-of-range transformers indefinitely.
+# bump when a repair applied at build time changes what a fully provisioned venv looks like. the
+# libcudart repair runs only on the rebuild path, so a venv stamped by a release that predates it
+# matches, is reused, and keeps tilelang's original stub -- vLLM then aborts its import in the child
+# after the gpu is already rented. carrying it in the stamp identity forces exactly one rebuild of
+# those venvs instead of re-running the repair on every reuse.
+VERL_VENV_BUILD_REPAIRS = "libcudart-stub-neutralized-v1"
+
+# carries FLASH_ATTN_INSTALL_SPEC (the sha256-fragmented spec), not the bare FLASH_ATTN_SPEC: the
+# digest is part of the venv's identity, not just how it got installed, so bumping or rotating the
+# checksum while the mutable release url stays constant must invalidate a venv stamped under the old
+# digest instead of letting it match forever and reuse an install that was never re-verified.
 VERL_VENV_STAMP = (
-    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
-    f"{TRANSFORMERS_REQUIREMENT}"
+    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_INSTALL_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
+    f"{TRANSFORMERS_REQUIREMENT}\n{VERL_VENV_BUILD_REPAIRS}"
 )
 
 
@@ -104,10 +126,23 @@ def _install_flash_attn(py: str) -> None:
     cannot fail soft. Measured: an arm died on `error sending request ... operation timed out` for
     this exact url, and the identical url served 200 on retry moments later, so "cannot succeed on
     another worker" was simply false.
+
+    The spec carries FLASH_ATTN_SHA256, so a wheel that is not the pinned one is rejected between
+    download and install rather than baked into the training interpreter. A mismatch exits nonzero
+    like any other install failure, so it costs the retry budget and then terminates: noisy, but
+    never silent.
     """
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
 
-    command = ["uv", "pip", "install", "--python", py, "--no-build-isolation", FLASH_ATTN_SPEC]
+    command = [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        py,
+        "--no-build-isolation",
+        FLASH_ATTN_INSTALL_SPEC,
+    ]
     for attempt in range(FLASH_ATTN_INSTALL_ATTEMPTS):
         try:
             subprocess.run(command, check=True)
@@ -890,8 +925,6 @@ def kill_process_group(proc: subprocess.Popen, *, process_group_id: int | None =
     _reap_group_zombies(pgid, skip=proc.pid)
 
 
-# re-exported so the shim renderers and metric parsers stay reachable as
-# `backend_common.<name>`: all three trainers and the tests import them from here.
 # re-exported so the capability probe and the checkpoint exporter stay reachable as
 # `backend_common.<name>`: the trainers and the tests both import them from here.
 from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
@@ -924,17 +957,25 @@ from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
 )
 from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     _VERL_METRIC_FIELDS,
+    FLASH_CUDART_STUB_MARKER,
     FLASH_GDN_VARLEN_MARKER,
     FLASH_TF32_MARKER,
     FLASH_WANDB_LINK_MARKER,
+    SHIM_FRAGMENT_FAILED_EXIT_CODE,
     append_step_metrics,
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
+    read_applied_shim_markers,
     render_gdn_varlen_shim,
+    render_shim_marker_prologue,
     render_tf32_shim,
+    render_tilelang_cudart_shim,
     render_wandb_link_shim,
+    shim_marker_file,
+    verify_applied_shim_markers,
     verl_step_number,
+    wrap_shim_fragment,
 )
 
 # re-exported so the child-tail and ray-log diagnostics stay reachable as

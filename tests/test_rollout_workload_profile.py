@@ -14,7 +14,6 @@ from flash.engine.profiling.workload_profile import (
     require_matching_rollout_profile,
     rollout_profile_input_digest,
     rollout_profile_input_payload,
-    sft_profile_run_id,
 )
 
 NOW = 1_700_000_000.0
@@ -75,6 +74,7 @@ class _Env:
     id = "freesolo-co/autoslm-bench"
     resolved_sha = "env-sha"
     params: ClassVar[dict] = {}
+    pip: ClassVar[tuple[str, ...]] = ()
 
 
 class _Spec:
@@ -83,6 +83,9 @@ class _Spec:
     model_revision = "main"
     seed = 0
     thinking = False
+    # mirrors JobSpec's default: this fake stands in for an authored spec, and an authored gpu.count
+    # is exactly what `count = 1` below represents.
+    gpu_count_auto = False
     train = _Train()
     environment = _Env()
 
@@ -316,15 +319,6 @@ def test_two_explicit_temperatures_do_not_share_a_profile():
     assert digest_at(0.7) == digest_at(0.7)
 
 
-def test_run_id_requires_a_real_digest():
-    # the shared minter is what every profile kind derives its run id from, so the digest
-    # validation is asserted through the live caller rather than a kind-specific wrapper.
-    assert sft_profile_run_id(DIGEST) == f"profile-sft-{DIGEST}"
-    for bad in ("", "z" * 64, "abc", DIGEST.upper()):
-        with pytest.raises(ValueError, match="sha256 hex digest"):
-            sft_profile_run_id(bad)
-
-
 # --- require_matching_rollout_profile: identity AND trust, in one place ------------------------
 
 
@@ -411,7 +405,12 @@ class _QuotableTrain(_Train):
     """`_Train` plus the fields the quote path reads. Kept separate so the digest tests above keep
     exercising the minimal spec surface they were written against."""
 
-    batch_size = 8
+    # `_Spec.algorithm` is grpo, and the quote path reads the optimizer batch of a rollout
+    # algorithm from `prompts_per_step`; `batch_size` is sft-only and would never be consulted.
+    # pinned to None rather than left absent, so a spec that reaches the sft branch by mistake fails
+    # loudly instead of quoting off an rl number.
+    batch_size = None
+    prompts_per_step = 8
     lora_rank = 32
     save_at_steps: ClassVar[list] = []
 
@@ -422,7 +421,6 @@ def _spec_with_profile(**profile_overrides):
 
     class _WithProfile(_Spec):
         train = _QuotableTrain()
-        workload_profile_kind = ""
         gpu = type(
             "G",
             (),
@@ -484,18 +482,7 @@ def test_a_profile_with_no_reward_samples_does_not_claim_reward_is_free(monkeypa
     assert sampled.reward_seconds_per_completion == pytest.approx(0.0003)
 
 
-def test_the_reward_fallback_costs_a_whole_legacy_wall(monkeypatch):
-    """Quantifies what the guard above chooses, end to end, so the tradeoff cannot be silently
-    reversed: an unsampled profile pays 1.0s per completion that a sampled one does not."""
-    from flash.cost.analytical import seconds_per_step
-    from flash.cost.facts import AVG_REWARD_SECONDS_PER_COMPLETION
-    from flash.cost.spec import runconfig_from_spec
-
-    monkeypatch.setattr("time.time", lambda: NOW)
-    none_sampled = runconfig_from_spec(_spec_with_profile(reward_samples=0, reward_failures=0))
-    sampled = runconfig_from_spec(_spec_with_profile(reward_seconds_per_completion=0.0))
-    completions = _Train.group_size * (none_sampled.batch_size or 1)
-
-    extra = seconds_per_step(none_sampled, "H200") - seconds_per_step(sampled, "H200")
-    assert extra == pytest.approx(completions * AVG_REWARD_SECONDS_PER_COMPLETION)
-    assert extra > 0.0
+# the companion test that quantified the 1.0s fallback wall is gone with the double-count fix: it
+# asserted an unsampled profile pays `completions x 1.0s` more than a sampled one, which is exactly
+# the charge AVG_REWARD_SECONDS_PER_COMPLETION = 0.0 removes. test_cost_rewards.py pins the new
+# behavior.

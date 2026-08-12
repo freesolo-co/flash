@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shlex
+import shutil
 import stat
 import tarfile
 import urllib.parse
@@ -68,7 +70,7 @@ def _patch_client(monkeypatch, package: bytes) -> None:
 
 def _margs(**kw) -> Namespace:
     base = {
-        "env_id": "david-freesolo-co/stuff",
+        "env_id": "david-freesolo-co/my-project/stuff",
         "path": None,
         "output": None,
         "force": False,
@@ -101,7 +103,7 @@ def test_cmd_env_pull_rejects_non_managed_ref(capsys):
 
 
 def test_cmd_env_pull_rejects_noncanonical_slug(capsys):
-    rc = cmd_env_pull(_margs(env_id="David-Freesolo-Co/Stuff"))
+    rc = cmd_env_pull(_margs(env_id="David-Freesolo-Co/My-Project/Stuff"))
 
     assert rc == 1
     assert "lowercase" in capsys.readouterr().err
@@ -167,7 +169,7 @@ def test_cmd_env_pull_positional_dir_names_the_destination_form(monkeypatch, tmp
     assert rc == 1
     err = capsys.readouterr().err
     assert "--output=into-here" in err
-    assert "david-freesolo-co/stuff" in err
+    assert "david-freesolo-co/my-project/stuff" in err
 
 
 def test_cmd_env_pull_explicit_output_dir_keeps_the_single_file_diagnostic(
@@ -525,7 +527,7 @@ def test_cmd_env_pull_whole_env_refuses_nonempty_dest_without_force(monkeypatch,
 
 
 def test_environment_local_dirname():
-    assert environment_local_dirname("david-freesolo-co/stuff") == "stuff"
+    assert environment_local_dirname("david-freesolo-co/my-project/stuff") == "stuff"
     with pytest.raises(ValueError, match="managed Freesolo environment slug"):
         environment_local_dirname("github:freesolo-co/environment-hub@main:a/b/environment.py")
 
@@ -558,7 +560,7 @@ def test_download_github_tarball_uses_whole_repo_ceiling(monkeypatch):
     monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
     monkeypatch.setattr(adapter, "_github_token", lambda: None)
     ref = adapter._parse_github_environment_ref(
-        adapter.managed_slug_to_github_ref("david-freesolo-co/stuff")
+        adapter.managed_slug_to_github_ref("david-freesolo-co/my-project/stuff")
     )
 
     tarball = adapter._download_github_tarball(ref)
@@ -577,6 +579,9 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
 
     monkeypatch.setattr(adapter, "_download_github_tarball", fail_tarball)
 
+    # the walk descends one non-recursive tree per slug segment, then lists the package root
+    # recursively. the recursive listing is rooted at the ENVIRONMENT, so a sibling environment
+    # in the same project is never enumerated -- `sibling-env` below must stay unvisited.
     trees = {
         ("a" * 40, False): {
             "truncated": False,
@@ -584,9 +589,16 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
         },
         ("namespace-sha", False): {
             "truncated": False,
-            "tree": [{"type": "tree", "path": "stuff", "sha": "package-sha"}],
+            "tree": [{"type": "tree", "path": "my-project", "sha": "project-sha"}],
         },
-        ("package-sha", True): {
+        ("project-sha", False): {
+            "truncated": False,
+            "tree": [
+                {"type": "tree", "path": "stuff", "sha": "env-sha"},
+                {"type": "tree", "path": "sibling-env", "sha": "sibling-sha"},
+            ],
+        },
+        ("env-sha", True): {
             "truncated": False,
             "tree": [
                 {
@@ -613,9 +625,9 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
         },
     }
     files = {
-        "david-freesolo-co/stuff/environment.py": b"# env\n",
-        "david-freesolo-co/stuff/datasets/train.jsonl": b'{"a":1}\n',
-        "david-freesolo-co/stuff/bin/run-helper": b"#!/bin/sh\n",
+        "david-freesolo-co/my-project/stuff/environment.py": b"# env\n",
+        "david-freesolo-co/my-project/stuff/datasets/train.jsonl": b'{"a":1}\n',
+        "david-freesolo-co/my-project/stuff/bin/run-helper": b"#!/bin/sh\n",
     }
     seen_urls: list[str] = []
 
@@ -639,13 +651,17 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
 
     monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
 
-    env_file = Path(adapter._resolve_environment_reference("david-freesolo-co/stuff"))
+    env_file = Path(adapter._resolve_environment_reference("david-freesolo-co/my-project/stuff"))
 
     assert env_file.read_bytes() == b"# env\n"
     assert (env_file.parent / "datasets" / "train.jsonl").read_bytes() == b'{"a":1}\n'
     assert stat.S_IMODE((env_file.parent / "bin" / "run-helper").stat().st_mode) == 0o755
     assert not (env_file.parents[2] / "other-org").exists()
     assert all("other-org" not in url for url in seen_urls)
+    # a sibling environment in the same project is neither fetched nor written: the package root
+    # is the environment directory, not the project directory holding every environment.
+    assert not (env_file.parent.parent / "sibling-env").exists()
+    assert all("sibling" not in url for url in seen_urls)
 
 
 def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
@@ -665,9 +681,13 @@ def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
         },
         ("namespace-sha", False): {
             "truncated": False,
-            "tree": [{"type": "tree", "path": "stuff", "sha": "package-sha"}],
+            "tree": [{"type": "tree", "path": "my-project", "sha": "project-sha"}],
         },
-        ("package-sha", True): {
+        ("project-sha", False): {
+            "truncated": False,
+            "tree": [{"type": "tree", "path": "stuff", "sha": "env-sha"}],
+        },
+        ("env-sha", True): {
             "truncated": False,
             "tree": [
                 {
@@ -686,8 +706,8 @@ def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
         },
     }
     files = {
-        "david-freesolo-co/stuff/environment.py": b"# env\n",
-        "david-freesolo-co/stuff/datasets/train.jsonl": b'{"a":1}\n',
+        "david-freesolo-co/my-project/stuff/environment.py": b"# env\n",
+        "david-freesolo-co/my-project/stuff/datasets/train.jsonl": b'{"a":1}\n',
     }
 
     def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
@@ -708,7 +728,7 @@ def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
 
     env_file = Path(
         adapter._resolve_environment_reference(
-            "github:freesolo-co/environment-hub@main:david-freesolo-co/stuff/environment.py"
+            "github:freesolo-co/environment-hub@main:david-freesolo-co/my-project/stuff/environment.py"
         )
     )
 
@@ -720,7 +740,7 @@ def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
 def test_environment_hub_github_ref_requires_package_path(monkeypatch):
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
 
-    with pytest.raises(ValueError, match="namespace/name"):
+    with pytest.raises(ValueError, match="namespace/project/name"):
         adapter._resolve_environment_reference("github:freesolo-co/environment-hub@main")
 
 
@@ -729,12 +749,14 @@ def test_github_tree_url_encodes_treeish_path_segment():
         "freesolo-co",
         "environment-hub",
         "a" * 40,
-        "david-freesolo-co/stuff/environment.py",
+        "david-freesolo-co/my-project/stuff/environment.py",
     )
 
-    url = adapter._github_tree_url(ref, "a" * 40 + ":david-freesolo-co/stuff", recursive=True)
+    url = adapter._github_tree_url(
+        ref, "a" * 40 + ":david-freesolo-co/my-project/stuff", recursive=True
+    )
 
-    assert url.endswith("a" * 40 + "%3Adavid-freesolo-co%2Fstuff?recursive=1")
+    assert url.endswith("a" * 40 + "%3Adavid-freesolo-co%2Fmy-project%2Fstuff?recursive=1")
     assert "/stuff" not in url.split("/git/trees/", 1)[1]
 
 
@@ -743,7 +765,7 @@ def test_download_github_directory_handles_large_tree_listing(monkeypatch, tmp_p
         "freesolo-co",
         "environment-hub",
         "b" * 40,
-        "david-freesolo-co/big/environment.py",
+        "david-freesolo-co/my-project/big/environment.py",
     )
     shard_count = 1001
     trees = {
@@ -752,6 +774,10 @@ def test_download_github_directory_handles_large_tree_listing(monkeypatch, tmp_p
             "tree": [{"type": "tree", "path": "david-freesolo-co", "sha": "namespace-sha"}],
         },
         ("namespace-sha", False): {
+            "truncated": False,
+            "tree": [{"type": "tree", "path": "my-project", "sha": "project-sha"}],
+        },
+        ("project-sha", False): {
             "truncated": False,
             "tree": [{"type": "tree", "path": "big", "sha": "package-sha"}],
         },
@@ -793,10 +819,14 @@ def test_download_github_directory_handles_large_tree_listing(monkeypatch, tmp_p
 
     monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
 
-    repo_root = adapter._download_github_directory(ref, "david-freesolo-co/big", tmp_path)
+    repo_root = adapter._download_github_directory(
+        ref, "david-freesolo-co/my-project/big", tmp_path
+    )
 
-    assert (repo_root / "david-freesolo-co/big/environment.py").read_bytes() == b"# env\n"
-    assert (repo_root / "david-freesolo-co/big/shard-1000.jsonl").read_bytes() == b"x"
+    assert (
+        repo_root / "david-freesolo-co/my-project/big/environment.py"
+    ).read_bytes() == b"# env\n"
+    assert (repo_root / "david-freesolo-co/my-project/big/shard-1000.jsonl").read_bytes() == b"x"
 
 
 def test_download_github_directory_surfaces_tree_error_message(monkeypatch, tmp_path):
@@ -804,7 +834,7 @@ def test_download_github_directory_surfaces_tree_error_message(monkeypatch, tmp_
         "freesolo-co",
         "environment-hub",
         "c" * 40,
-        "david-freesolo-co/missing/environment.py",
+        "david-freesolo-co/my-project/missing/environment.py",
     )
 
     def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
@@ -813,7 +843,7 @@ def test_download_github_directory_surfaces_tree_error_message(monkeypatch, tmp_
     monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
 
     with pytest.raises(RuntimeError, match="Not Found"):
-        adapter._download_github_directory(ref, "david-freesolo-co/missing", tmp_path)
+        adapter._download_github_directory(ref, "david-freesolo-co/my-project/missing", tmp_path)
 
 
 def test_urlopen_streams_and_aborts_over_max_bytes(monkeypatch):
@@ -911,6 +941,254 @@ def test_resolve_github_env_extracts_repo_level_siblings(monkeypatch, tmp_path):
 
     assert env_file.is_file()
     assert (env_file.parents[1] / "datasets" / "train.jsonl").is_file()
+
+
+def _github_env_tarball(content: bytes) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo(name="repo-sha/environment.py")
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def test_resolve_github_env_ignores_symlinked_cache_entry(monkeypatch, tmp_path):
+    # a cache root that was previously group/other-writable can still hold a symlink planted
+    # by another local account at this guessable cache key (a sha of the ref) even after the
+    # root's own permissions are repaired; the cache-hit path must never follow it.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    assert first.read_bytes() == b"# original\n"
+    cache_dir = first.parent
+
+    # plant a symlink at the now-known cache_dir, standing in for another account's foreign
+    # content (this run's own uid would never have written a symlink there).
+    shutil.rmtree(cache_dir)
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / "environment.py").write_bytes(b"evil\n")
+    cache_dir.symlink_to(evil, target_is_directory=True)
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# refreshed\n")
+    )
+    second = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert second.read_bytes() == b"# refreshed\n"
+
+
+def test_resolve_github_env_replaces_a_file_squatting_at_the_cache_key(monkeypatch, tmp_path):
+    # a cache entry is a directory. a regular FILE at the key (manual corruption, an interrupted
+    # write) is owned by us, so the ownership check trusts it and leaves it in place; the
+    # download path's rmtree(ignore_errors=True) then swallows NotADirectoryError and copytree
+    # dies with FileExistsError on this key on every run.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    shutil.rmtree(cache_dir)
+    cache_dir.write_bytes(b"not a directory")
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# refreshed\n")
+    )
+    second = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert second.read_bytes() == b"# refreshed\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_ignores_foreign_owned_cache_entry(monkeypatch, tmp_path):
+    # same guessable-cache-key hazard as the symlink case, but the planted entry is a real
+    # directory under a different owner rather than a symlink.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) in (cache_dir, first):
+            result = os.stat_result(
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    result.st_uid + 1,
+                    result.st_gid,
+                    result.st_size,
+                    result.st_atime,
+                    result.st_mtime,
+                    result.st_ctime,
+                )
+            )
+        return result
+
+    monkeypatch.setattr(adapter.os, "lstat", fake_lstat)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# refreshed\n")
+    )
+
+    second = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert second.read_bytes() == b"# refreshed\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_refuses_unremovable_foreign_cache_entry(monkeypatch, tmp_path):
+    # the planted entry is foreign-owned AND cannot be deleted by us -- its contents are
+    # readable but not writable, so rmtree fails partway. best-effort removal would swallow
+    # that, download the environment anyway, and then die in copytree on the entry still
+    # sitting there, every single run. refuse the key before the download, and never fall
+    # back to importing what the ownership check just rejected.
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) in (cache_dir, first):
+            fields = list(result)
+            fields[4] = result.st_uid + 1
+            return os.stat_result(tuple(fields))
+        return result
+
+    real_rmtree = shutil.rmtree
+
+    def refuse_rmtree(path, *args, **kwargs):
+        # honours ignore_errors, so the stub reproduces the pre-fix shape too: best-effort
+        # removal returns quietly and leaves the entry behind, rather than reporting failure.
+        if Path(path) == cache_dir:
+            if kwargs.get("ignore_errors"):
+                return None
+            raise PermissionError(13, "Permission denied", str(cache_dir))
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(adapter.os, "lstat", fake_lstat)
+    monkeypatch.setattr(adapter.shutil, "rmtree", refuse_rmtree)
+    downloaded = []
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: downloaded.append(ref) or _github_env_tarball(b"# refreshed\n"),
+    )
+
+    with pytest.raises(RuntimeError, match="could not be removed"):
+        adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert downloaded == []
+    # refused, not trusted: the rejected entry is still there and still never imported.
+    assert (cache_dir / "environment.py").read_bytes() == b"# original\n"
+
+
+def _report_foreign_lstat(monkeypatch, paths):
+    """make os.lstat report `paths` as owned by another uid, leaving every other field alone."""
+    targets = {Path(p) for p in paths}
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) in targets:
+            fields = list(result)
+            fields[4] = result.st_uid + 1
+            return os.stat_result(tuple(fields))
+        return result
+
+    monkeypatch.setattr(adapter.os, "lstat", fake_lstat)
+
+
+def _seed_cache_dir_without_entrypoint(monkeypatch, tmp_path):
+    """resolve once to learn the cache dir, then strip the entrypoint out of it."""
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+    monkeypatch.setattr(
+        adapter, "_download_github_tarball", lambda ref: _github_env_tarball(b"# original\n")
+    )
+    first = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+    cache_dir = first.parent
+    (cache_dir / "environment.py").unlink()
+    return cache_dir
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_refuses_unremovable_foreign_cache_entry_without_entrypoint(
+    monkeypatch, tmp_path
+):
+    # gating the ownership checks on the entrypoint being present left the worst case unchecked:
+    # a foreign-owned, unremovable directory at this key with no environment.py inside skipped
+    # trust entirely, so the resolver downloaded and then wrote INTO another account's
+    # directory. an entry is vetted because it exists, not because it looks complete.
+    cache_dir = _seed_cache_dir_without_entrypoint(monkeypatch, tmp_path)
+    _report_foreign_lstat(monkeypatch, [cache_dir])
+    real_rmtree = shutil.rmtree
+
+    def refuse_rmtree(path, *args, **kwargs):
+        if Path(path) == cache_dir:
+            if kwargs.get("ignore_errors"):
+                return None
+            raise PermissionError(13, "Permission denied", str(cache_dir))
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(adapter.shutil, "rmtree", refuse_rmtree)
+    downloaded = []
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: downloaded.append(ref) or _github_env_tarball(b"# refreshed\n"),
+    )
+
+    # the same actionable error the unremovable-with-entrypoint case raises, before any download.
+    with pytest.raises(RuntimeError, match="could not be removed"):
+        adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert downloaded == []
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="posix-only uid check")
+def test_resolve_github_env_discards_removable_foreign_cache_entry_without_entrypoint(
+    monkeypatch, tmp_path
+):
+    # the other half of the same gap: when the foreign entry CAN be removed, the recoverable
+    # path must still work -- and the removal has to happen BEFORE the download, not as the
+    # best-effort rmtree that used to sit after it. that ordering is the whole point: it is what
+    # turns "download into a directory another account owns" into a clean refusal or a clean
+    # refetch, and it is the only observable difference here from the unvetted behavior.
+    cache_dir = _seed_cache_dir_without_entrypoint(monkeypatch, tmp_path)
+    (cache_dir / "planted.py").write_bytes(b"# planted\n")
+    _report_foreign_lstat(monkeypatch, [cache_dir])
+    existed_at_download = []
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: (
+            existed_at_download.append(cache_dir.exists()) or _github_env_tarball(b"# refreshed\n")
+        ),
+    )
+
+    resolved = adapter._resolve_github_environment_file("github:owner/repo@main:environment.py")
+
+    assert existed_at_download == [False]
+    assert resolved.read_bytes() == b"# refreshed\n"
+    assert not (cache_dir / "planted.py").exists()
 
 
 def test_cmd_env_pull_multi_component_in_env_path_is_not_a_destination(

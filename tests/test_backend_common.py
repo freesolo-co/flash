@@ -12,6 +12,7 @@ import inspect
 import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -57,16 +58,19 @@ def test_agent_loop_workers_rejects_a_nonpositive_batch():
 def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
     # the exact failure that killed both real-gpu arms: a 1x4090 pod on a 48-core host. the quota is
     # the container's truth, so a large affinity mask must NOT win over it.
+    #
+    # os.sched_getaffinity is linux-only, so every patch of it in this file needs create=True to
+    # run on a mac. only the worker (linux) ever reaches the real syscall.
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=12),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() == 12
     # a quota BELOW verl's placement-group demand is the one case the quota must not win outright:
     # honouring it exactly would schedule nothing and hang. see the floor test below.
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=4),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() == vc.verl_cpu_demand(1)
 
@@ -74,7 +78,7 @@ def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
 def test_ray_num_cpus_falls_back_to_affinity_when_no_quota_is_set():
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(6))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(6)), create=True),
     ):
         assert vc.ray_num_cpus() == 6
 
@@ -84,7 +88,7 @@ def test_ray_num_cpus_caps_an_unconstrained_host():
     # is exactly the case that forked 48 idle workers. the cap is what makes that survivable.
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() == 16
         # the cap tightens the pool but cannot push it under verl's placement-group demand, which
@@ -99,7 +103,7 @@ def test_ray_num_cpus_never_returns_zero():
             assert vc.ray_num_cpus() >= 1
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", side_effect=OSError("boom")),
+        mock.patch.object(os, "sched_getaffinity", side_effect=OSError("boom"), create=True),
         mock.patch.object(os, "cpu_count", return_value=None),
     ):
         assert vc.ray_num_cpus() >= 1
@@ -154,7 +158,7 @@ def test_ray_cpu_floor_clears_what_verl_actually_reserves():
     assert vc.verl_cpu_demand(1) == verl_peak_cpu_demand
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         assert vc.ray_num_cpus() >= verl_peak_cpu_demand
 
@@ -176,7 +180,7 @@ def test_the_cpu_pool_scales_with_gpu_count():
     assert vc.verl_cpu_demand(8) == 8 * 3 + 2
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48))),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
     ):
         for gpus in range(1, 9):
             assert vc.ray_num_cpus(gpus) >= vc.verl_cpu_demand(gpus), gpus
@@ -359,7 +363,13 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
         "verl @ git+https://github.com/freesolo-co/verl@32d6200de81dc484893baf8b9cf30297ebe7fa49"
     )
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
-    assert "liger-kernel" in install
+    # liger-kernel is deliberately NOT installed. a matched qwen3.5-9b a/b differing only in
+    # model.use_liger measured train/grad_norm 0.0 with liger on versus 7.02 off, at a loss
+    # identical to four decimal places: liger silently severed the gradient to the lora params
+    # under verl's fsdp2 + peft + gradient-checkpointing composition, so sft trained nothing while
+    # looking healthy. with the package absent, use_liger=true raises ImportError at verl's lazy
+    # import (transformer_impl.py) instead of silently producing a zero-delta adapter.
+    assert "liger-kernel" not in install
     assert "bitsandbytes>=0.49" in install
     assert "qwen-vl-utils" in install
     assert "torchvision" in install
@@ -367,13 +377,16 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "tqdm" in install
     assert "pyarrow" in install
     # venv, the resolve above, the prebuilt flash_attn wheel on its own --no-build-isolation line,
-    # then causal_conv1d (also its own line: it source-builds against the venv's torch), and last
-    # the import probe that proves the conv extension actually loaded. nothing else: another INSTALL
-    # would be unbudgeted work on a paid pod.
-    assert len(calls) == 5
+    # then causal_conv1d (also its own line: it source-builds against the venv's torch), the import
+    # probe that proves the conv extension actually loaded, and last the libcudart stub repair that
+    # keeps vLLM importable in this venv. nothing else: another INSTALL would be unbudgeted work on
+    # a paid pod (the repair and the probe are local `python -c` calls, not installs).
+    assert len(calls) == 6
     assert calls[2][:3] == ["uv", "pip", "install"]
     assert vc.CAUSAL_CONV1D_REQUIREMENT in calls[3]
     assert calls[4][-1] == "import causal_conv1d"
+    assert calls[5][1] == "-c"
+    assert "libcudart_stub" in calls[5][2]
     assert [c for c in calls if c[:3] == ["uv", "pip", "install"]] == calls[1:4], (
         "the probe must be a check, not an install"
     )
@@ -393,7 +406,7 @@ def _flaky_wheel_install(calls, sleeps, *, failures: int):
             return
         # key on the SPEC, not on --no-build-isolation: causal_conv1d passes that flag too, and this
         # helper models a flaky flash-attn download specifically.
-        if vc.FLASH_ATTN_SPEC not in command:
+        if vc.FLASH_ATTN_INSTALL_SPEC not in command:
             return
         attempts["n"] += 1
         if attempts["n"] <= failures:
@@ -513,12 +526,12 @@ def test_provisioned_venv_gets_flash_attn_for_the_remove_padding_path(monkeypatc
     vc.resolve_verl_python(str(tmp_path))
 
     flat = [arg for command in calls for arg in command]
-    assert vc.FLASH_ATTN_SPEC in flat, (
+    assert vc.FLASH_ATTN_INSTALL_SPEC in flat, (
         "verl's remove-padding path imports flash_attn unguarded; the provisioned venv must hold it"
     )
     # the wheel is prebuilt, so it must skip build isolation exactly as the image install does --
     # a source build here would compile for minutes on a paid pod.
-    install = next(c for c in calls if vc.FLASH_ATTN_SPEC in c)
+    install = next(c for c in calls if vc.FLASH_ATTN_INSTALL_SPEC in c)
     assert "--no-build-isolation" in install
 
 
@@ -526,8 +539,38 @@ def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
     # the fallback venv and /opt/verl-venv must resolve the same wheel: a run that lands on the
     # no-image path otherwise trains against a different flash_attn than every baked-image run.
     dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
-    assert f"ARG FLASH_ATTN_SPEC={vc.FLASH_ATTN_SPEC}" in dockerfile.read_text(), (
+    text = dockerfile.read_text()
+    assert f"ARG FLASH_ATTN_SPEC={vc.FLASH_ATTN_SPEC}" in text, (
         "Dockerfile.worker's FLASH_ATTN_SPEC default drifted from backend_common.FLASH_ATTN_SPEC"
+    )
+    # and so must the checksum: the wheel comes from an individual's github release repo, where the
+    # asset behind a fixed url can be replaced. two fetch sites verifying different digests would
+    # mean the no-image path and the image no longer agree on which bytes are the pinned wheel.
+    assert f"ARG FLASH_ATTN_SHA256={vc.FLASH_ATTN_SHA256}" in text, (
+        "Dockerfile.worker's FLASH_ATTN_SHA256 default drifted from backend_common.FLASH_ATTN_SHA256"
+    )
+    # the install must actually ask for the digest: a pinned constant nothing hands to uv leaves
+    # the fetch as unverified as it was without one.
+    assert f"{vc.FLASH_ATTN_SPEC}#sha256={vc.FLASH_ATTN_SHA256}" == vc.FLASH_ATTN_INSTALL_SPEC
+    # and the verl-venv layer must build that fragment CONDITIONALLY. `#sha256=` is url syntax, so
+    # gluing it onto the documented non-url override (FLASH_ATTN_SPEC=flash-attn==X) hands uv a
+    # requirement it cannot parse and fails this REQUIRED layer. pin both halves: the install takes
+    # a shell-resolved spec, and the fragment is added only inside the http* case.
+    install_line = (
+        'uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${spec}"'
+    )
+    assert install_line in text, (
+        "the verl-venv flash-attn install must install a shell-resolved spec, not the raw ARG"
+    )
+    block = text[text.rindex("\nRUN ", 0, text.index(install_line)) : text.index(install_line)]
+    assert "http*)" in block, (
+        "the verl-venv install must append the sha256 fragment only for an http(s) wheel url"
+    )
+    assert 'spec="${spec}#sha256=${FLASH_ATTN_SHA256}"' in block, (
+        "the verl-venv install must still hash-verify a wheel url"
+    )
+    assert '"${FLASH_ATTN_SPEC}#sha256=' not in text, (
+        "appending the fragment straight onto FLASH_ATTN_SPEC breaks the non-url override"
     )
 
 
@@ -784,6 +827,147 @@ def test_the_shim_patches_the_moe_arch_not_the_dense_one():
     ast.parse(dense)
     assert "transformers.models.qwen3_5.modeling_qwen3_5" in dense
     assert dense != moe
+
+
+def test_the_shim_imports_nothing_heavy_at_interpreter_startup():
+    # THE multi-card bug: sitecustomize runs at interpreter startup, and ray starts each actor's
+    # interpreter BEFORE narrowing that actor's CUDA_VISIBLE_DEVICES to its own card. importing the
+    # modeling module here transitively calls transformers' is_flash_linear_attention_available /
+    # is_causal_conv1d_available -> torch.cuda.is_available(), initializing cuda against every gpu.
+    # a later env-only change cannot rebuild that device map, so every rank keeps device 0 and nccl
+    # aborts with "Duplicate GPU detected". assert on the executed shim, not on its source text.
+    # record import ATTEMPTS rather than sys.modules: python swallows a sitecustomize traceback, so
+    # on a machine without torch the eager version this replaced fails silently and leaves sys.modules
+    # exactly as empty as a correct lazy shim would. the attempt is the observable that separates them.
+    shim = vc.render_gdn_varlen_shim("qwen3_5")
+    with tempfile.TemporaryDirectory() as shim_dir:
+        recorder = textwrap.dedent(
+            """
+            import sys
+            _flash_seen = []
+
+            class _Recorder:
+                def find_spec(self, fullname, path=None, target=None):
+                    _flash_seen.append(fullname)
+                    return None
+
+            sys.meta_path.insert(0, _Recorder())
+            """
+        )
+        # write the record from an atexit hook so it survives even when the shim raises: python
+        # swallows a sitecustomize traceback, and a lost record must not masquerade as a pass.
+        tail = textwrap.dedent(
+            """
+
+            import atexit as _flash_atexit
+            import json as _flash_json
+
+            def _flash_dump(_path=__file__ + ".seen"):
+                with open(_path, "w") as _fh:
+                    _fh.write(_flash_json.dumps(_flash_seen))
+
+            _flash_atexit.register(_flash_dump)
+            """
+        )
+        site = pathlib.Path(shim_dir, "sitecustomize.py")
+        # the recorder and the dump bracket the shim: the dump registration has to run even if the
+        # shim body raises, so it goes FIRST and the shim body last.
+        site.write_text(recorder + tail + shim)
+        out = subprocess.run(
+            [sys.executable, "-c", ""],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "PYTHONPATH": shim_dir},
+        )
+        assert out.returncode == 0, out.stderr
+        attempted = json.loads(pathlib.Path(str(site) + ".seen").read_text())
+    # the shim itself may import stdlib; what it must never reach for is the cuda-initializing stack.
+    assert not [name for name in attempted if name.split(".")[0] in {"torch", "transformers"}], (
+        f"gdn shim imported the cuda stack at interpreter startup: {attempted}"
+    )
+
+
+def test_the_shim_patches_the_module_the_caller_actually_receives():
+    # patching from find_spec would run against a half-built module the real import then replaces:
+    # the marker still prints while the caller's class stays unpatched. drive the rendered shim
+    # against a stand-in module so the assertion needs no transformers install.
+    # the patch pulls transformers' packing helpers, which import torch at module scope.
+    pytest.importorskip("torch", reason="the gdn patch imports transformers' torch-backed helpers")
+    pytest.importorskip("transformers", reason="the patch imports transformers' packing helpers")
+    shim = vc.render_gdn_varlen_shim("qwen3_5")
+    namespace: dict = {}
+    # executing the shim arms its meta_path finder against THIS interpreter, so restore the list
+    # afterwards: leaving it installed would patch the real modeling module for whichever later
+    # test imports it first, which is an order-dependent failure rather than an honest one.
+    saved_meta_path = sys.meta_path[:]
+    try:
+        # the shim is our own render, not external input
+        exec(compile(shim, "<gdn-shim>", "exec"), namespace)
+    finally:
+        sys.meta_path[:] = saved_meta_path
+    patch = namespace["_flash_patch_gdn_varlen"]
+
+    class Stand:
+        def forward(self, *args, **kwargs):
+            return kwargs
+
+    module = SimpleNamespace(StandTextModel=Stand)
+    patch(module)
+    assert getattr(Stand.forward, "_flash_gdn_varlen_patched", False) is True
+    once = Stand.forward
+    patch(module)  # a second import must not double-wrap
+    assert Stand.forward is once
+    # fail closed: the gate promised a TextModel, so a module without one must refuse to start
+    # rather than train packed examples through an unpatched forward.
+    with pytest.raises(StopIteration):
+        patch(SimpleNamespace())
+
+
+def test_the_armed_finder_patches_the_module_on_a_real_import(tmp_path, monkeypatch):
+    # the test above calls the patch directly, so the finder and the loader that carry it are the
+    # one part of the fix nothing exercises: if the delegation loop stopped resolving the target,
+    # or wrapped a spec whose loader never ran, every other assertion here still passes while the
+    # shim silently patches nothing. drive a genuine `import` through the armed finder instead.
+    # stand-in modules keep this off transformers, so it runs wherever the suite runs.
+    import importlib
+
+    root = tmp_path / "site"
+    package = root / "transformers" / "models" / "qwen3_5"
+    package.mkdir(parents=True)
+    for parent in (root / "transformers", root / "transformers" / "models", package):
+        (parent / "__init__.py").write_text("")
+    (package / "modeling_qwen3_5.py").write_text(
+        "class Qwen3TextModel:\n    def forward(self, *args, **kwargs):\n        return kwargs\n"
+    )
+    # the patch imports these two names at patch time; supply them so no torch install is needed.
+    (root / "transformers" / "modeling_flash_attention_utils.py").write_text(
+        "def _is_packed_sequence(*args, **kwargs):\n    return False\n\n\n"
+        "def prepare_fa_kwargs_from_position_ids(*args, **kwargs):\n"
+        "    return ((None, None), (None, None))\n"
+    )
+    monkeypatch.syspath_prepend(str(root))
+    # snapshot the whole `transformers` subtree rather than deleting the keys that happen to exist
+    # now: the import below CREATES stand-in entries, and a rollback that only restores pre-existing
+    # keys leaves an empty stub `transformers` package shadowing the real one for every later test.
+    saved_modules = {n: m for n, m in sys.modules.items() if n.split(".")[0] == "transformers"}
+    saved_meta_path = sys.meta_path[:]
+    try:
+        for name in saved_modules:
+            del sys.modules[name]
+        # the shim is our own render, not external input
+        exec(compile(vc.render_gdn_varlen_shim("qwen3_5"), "<gdn-shim>", "exec"), {})
+        assert type(sys.meta_path[0]).__name__ == "_FlashGdnFinder", "the shim must arm its finder"
+        module = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        assert getattr(module.Qwen3TextModel.forward, "_flash_gdn_varlen_patched", False) is True
+        # and it must step back off meta_path once it has fired: leaving it armed would re-wrap
+        # every later import of the same name for the rest of the process.
+        assert not [f for f in sys.meta_path if type(f).__name__ == "_FlashGdnFinder"]
+    finally:
+        sys.meta_path[:] = saved_meta_path
+        for name in [n for n in sys.modules if n.split(".")[0] == "transformers"]:
+            del sys.modules[name]
+        sys.modules.update(saved_modules)
 
 
 def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
@@ -1061,12 +1245,16 @@ class _Completed:
         self.returncode = returncode
 
 
-def _record_run_with_conv_exit(calls, conv_exit, *, import_exit=0):
+def _record_run_with_conv_exit(calls, conv_exit, *, import_exit=0, cudart_exit=0):
     """``_record_run``, but the causal-conv1d install exits with ``conv_exit``.
 
     ``import_exit`` drives the separate ``import causal_conv1d`` probe, because a compiled cuda
     extension can install cleanly (exit 0) and still fail to import on an ABI mismatch.
+    ``cudart_exit`` drives the child libcudart stub repair, which exits nonzero when it leaves the
+    stub shadowing libcudart.
     """
+    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+
     inner = _record_run(calls)
 
     def fake_run(command, check, env=None, capture_output=False):
@@ -1075,6 +1263,8 @@ def _record_run_with_conv_exit(calls, conv_exit, *, import_exit=0):
             return _Completed(conv_exit)
         if command[-1] == "import causal_conv1d":
             return _Completed(import_exit)
+        if command[-1] == _CHILD_CUDART_FIX:
+            return _Completed(cudart_exit)
         return _Completed(0)
 
     return fake_run
@@ -1104,6 +1294,42 @@ def test_a_successful_conv_build_still_stamps_the_venv(monkeypatch, tmp_path):
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
     monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
+    assert stamp.read_text() == vc.VERL_VENV_STAMP
+
+
+def test_an_unrepaired_child_cudart_stub_leaves_the_venv_unstamped(monkeypatch, tmp_path):
+    """A stub still shadowing libcudart must not be recorded as a complete provisioning.
+
+    The repair runs only on the rebuild path, so stamping here freezes the failure in: every later
+    attempt on this pod reuses a venv whose stamp asserts it is provisioned while its child still
+    aborts on vLLM import, and the repair is never attempted again.
+    """
+    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0, cudart_exit=1))
+
+    vc.resolve_verl_python(str(tmp_path))
+
+    stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
+    assert not stamp.exists(), (
+        "a venv whose child libcudart stub was left shadowing was stamped as fully provisioned, so "
+        "every later attempt on this pod reuses an interpreter where vLLM aborts its import"
+    )
+    # still fails open within this launch: provisioning returned an interpreter rather than raising.
+    assert any(command[-1] == _CHILD_CUDART_FIX for command in calls)
+
+
+def test_a_repaired_child_cudart_stub_still_stamps_the_venv(monkeypatch, tmp_path):
+    """The guard keys on the repair outcome; it must not stop stamping altogether."""
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0, cudart_exit=0))
 
     vc.resolve_verl_python(str(tmp_path))
 
@@ -1145,6 +1371,21 @@ def test_the_venv_stamp_covers_the_conv_kernel_so_an_older_venv_is_rebuilt():
     assert vc.CAUSAL_CONV1D_REQUIREMENT in vc.VERL_VENV_STAMP
 
 
+def test_the_venv_stamp_covers_build_time_repairs_so_a_pre_fix_venv_is_rebuilt():
+    """The same argument for a repair rather than a package.
+
+    The libcudart repair runs only on the rebuild path, so a venv stamped by a release that predates
+    it matches the stamp, is reused unrepaired, and keeps tilelang's stub -- vLLM then aborts its
+    import in the child AFTER the gpu is rented. The stamp has to change when the repair set does,
+    or the fix never reaches the venvs that need it most (retries and upgraded workers that preserve
+    the workdir).
+    """
+    assert vc.VERL_VENV_BUILD_REPAIRS in vc.VERL_VENV_STAMP
+    # and it must be the LAST field: appending keeps the earlier fields' offsets stable, so a stamp
+    # written by this release is still diffable against one from before the repairs existed.
+    assert vc.VERL_VENV_STAMP.endswith(vc.VERL_VENV_BUILD_REPAIRS)
+
+
 def test_the_fallback_pins_transformers_like_the_image_does(monkeypatch, tmp_path):
     """The fallback venv must carry the same transformers ceiling as /opt/verl-venv.
 
@@ -1173,7 +1414,8 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     # same argument as VERL_SPEC lockstep: the image bakes its own pin, this path resolves its own.
     # if they drift, the interpreter that TRAINS runs a different transformers depending on whether
     # an image supplied it -- and transformers owns the gdn modelling code the shim patches.
-    dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
+    root = pathlib.Path(__file__).resolve().parents[1]
+    dockerfile = root / "Dockerfile.worker"
     text = dockerfile.read_text()
     quoted = f'"{vc.TRANSFORMERS_REQUIREMENT}"'
     assert quoted in text, (
@@ -1181,6 +1423,21 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     )
     # and specifically in the verl venv's override file, not only the main interpreter's install.
     assert f'"{vc.TRANSFORMERS_REQUIREMENT}" > /tmp/verl-overrides.txt' in text
+
+    # pyproject declares the same range for the gpu/server/dev extras, and a lower ceiling there
+    # puts anyone installing the package (local worker, self-hosted plane) on a transformers line
+    # the image never runs.
+    pyproject = (root / "pyproject.toml").read_text()
+    declared = set(re.findall(r'"(transformers>=[^"]+)"', pyproject))
+    assert declared == {vc.TRANSFORMERS_REQUIREMENT}, (
+        f"pyproject.toml transformers ranges {sorted(declared)} drifted from "
+        f"backend_common.TRANSFORMERS_REQUIREMENT ({vc.TRANSFORMERS_REQUIREMENT!r}); every extra "
+        "must declare the range the worker image is built and tested against"
+    )
+    # and every extra that names transformers at all must name it (three today: gpu, server, dev).
+    assert pyproject.count(f'"{vc.TRANSFORMERS_REQUIREMENT}"') == 3, (
+        "expected the transformers range in exactly the gpu, server and dev extras"
+    )
 
 
 def test_the_venv_stamp_covers_the_transformers_pin_so_a_prepin_venv_is_rebuilt():
@@ -1239,7 +1496,7 @@ def test_the_stamp_identifies_flash_attn_so_a_prefix_venv_is_not_reused(monkeypa
     vc.resolve_verl_python(str(tmp_path))
 
     assert calls, "a venv stamped before flash-attn was installed must be rebuilt"
-    assert any(vc.FLASH_ATTN_SPEC in call for call in calls)
+    assert any(vc.FLASH_ATTN_INSTALL_SPEC in call for call in calls)
 
 
 def test_resolve_verl_python_reuses_a_venv_built_from_the_current_pin(monkeypatch, tmp_path):
@@ -1270,12 +1527,14 @@ def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(
 
     vc.resolve_verl_python(str(tmp_path))
 
-    # three installs, then the conv import probe (which runs the venv's python, not uv).
+    # three installs, then the conv import probe and the libcudart stub repair (both run the venv's
+    # python, not uv).
     assert [c[:2] for c in calls] == [
         ["uv", "venv"],
         ["uv", "pip"],
         ["uv", "pip"],
         ["uv", "pip"],
+        [str(venv / "bin" / "python"), "-c"],
         [str(venv / "bin" / "python"), "-c"],
     ]
     assert not (venv / "marker").exists()
@@ -1300,6 +1559,7 @@ def test_resolve_verl_python_clears_a_venv_whose_creation_was_interrupted(monkey
         ["uv", "pip"],
         ["uv", "pip"],
         ["uv", "pip"],
+        [str(venv / "bin" / "python"), "-c"],
         [str(venv / "bin" / "python"), "-c"],
     ]
 
@@ -1692,9 +1952,11 @@ def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     command = [
         "bash",
         "-c",
-        'printf \'%s\\n\' "$FIRST" "$SECOND"; '
-        "for i in $(seq 1 70); do echo filler-$i; done; "
-        "exit 1",
+        (
+            'printf \'%s\\n\' "$FIRST" "$SECOND"; '
+            "for i in $(seq 1 70); do echo filler-$i; done; "
+            "exit 1"
+        ),
     ]
     tail = vc.ChildOutputTail(limit=3)
 
@@ -1793,6 +2055,80 @@ def test_stall_tail_fields_narrows_to_the_most_recent_lines():
     assert carried[-1] == f"line{vc.STALL_TAIL_LINES + 24}"
 
 
+def test_child_tail_redacts_credentials_before_they_reach_a_heartbeat(monkeypatch):
+    """the retained tail rides to heartbeat.json, the streamed run log and persisted status.
+
+    the worker is the only side that knows the run's secret values, so redaction has to happen
+    here; the plane-side formatter only neutralizes control characters.
+    """
+    secret = "hf_ZZZchildtailsecretvalue0123456789"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    tail = vc.ChildOutputTail()
+    tail.record(f"requests.HTTPError: 401 Unauthorized for hf.co (token {secret})\n")
+
+    carried = vc.stall_tail_fields(0, tail)["child_tail"]
+
+    assert secret not in carried[0]
+    assert "<redacted>" in carried[0]
+    # the diagnostic itself is what a setup stall is read from; only the credential goes.
+    assert carried[0] == "requests.HTTPError: 401 Unauthorized for hf.co (token <redacted>)"
+
+
+def test_child_tail_redaction_precedes_the_per_line_cap(monkeypatch):
+    """sanitizing after truncation would split a credential across the cut and leak the prefix."""
+    secret = "hf_ZZZstraddlesthelinecap0123456789"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    tail = vc.ChildOutputTail()
+    # the token starts inside the retained window and ends past it.
+    tail.record("x" * (vc._CHILD_TAIL_LINE_CHARS - 10) + secret + "\n")
+
+    kept = tail.tail()[0]
+
+    assert secret[:10] not in kept
+    assert len(kept) <= vc._CHILD_TAIL_LINE_CHARS
+
+
+def test_child_tail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):
+    """[environment] secrets accepts any env name; FLASH_SECRET_ENV_KEYS is what lets the worker
+    redact values whose names the suffix heuristic misses."""
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+
+    secret = "aws-declared-childtail-0123456789abcdef"
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "AWS_SECRET_ACCESS_KEY")
+    tail = vc.ChildOutputTail()
+    tail.record(f"botocore.exceptions.ClientError: SignatureDoesNotMatch using {secret}\n")
+
+    kept = tail.tail()[0]
+
+    assert secret not in kept
+    assert kept == "botocore.exceptions.ClientError: SignatureDoesNotMatch using <redacted>"
+
+
+def test_sanitize_diagnostic_redacts_a_very_short_declared_secret_at_word_boundaries(monkeypatch):
+    """a declared secret can carry any value, including a 3-char one, and it must not leak.
+
+    the length floor used to drop such a value from the needle set entirely, so it printed
+    verbatim. it cannot become an unconstrained global needle either -- the value `ati` would
+    rewrite `authentication` -- so it is redacted only where it stands alone.
+    """
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
+
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PIN")
+    monkeypatch.setenv("PIN", "ati")
+    # the standalone value is the leak the floor used to allow.
+    assert sanitize_diagnostic("worker rejected pin ati") == "worker rejected pin <redacted>"
+    # ... while the same letters inside a word stay readable.
+    assert sanitize_diagnostic("trainer crashed after validation") == (
+        "trainer crashed after validation"
+    )
+
+    monkeypatch.setenv("PIN", "sk-live-abc123456")
+    assert sanitize_diagnostic("trainer crashed holding sk-live-abc123456") == (
+        "trainer crashed holding <redacted>"
+    )
+
+
 # ---------------------- child teardown escalates to SIGKILL ----------------------
 # these real-process tests require fork, /proc group membership, and libc subreaper support.
 # guard on those capabilities rather than platform names.
@@ -1868,10 +2204,12 @@ def test_kill_process_group_escalates_to_sigkill_when_sigterm_is_ignored(quick_t
         [
             sys.executable,
             "-c",
-            "import signal, sys, time\n"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            "print('ready', flush=True)\n"
-            "time.sleep(300)\n",
+            (
+                "import signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(300)\n"
+            ),
         ],
         stdout=subprocess.PIPE,
         text=True,
@@ -3770,6 +4108,456 @@ def test_every_verl_backend_enables_tf32_in_the_child(backend, monkeypatch):
     assert fake.backends.cudnn.allow_tf32 is True
 
 
+# --------------------- tilelang libcudart stub, in the verl CHILD interpreter ---------------------
+
+
+def _fake_child_tilelang(tmp_path):
+    """materialize a tilelang package holding the stub, as the verl venv ships it."""
+    pkg = tmp_path / "tilelang"
+    (pkg / "lib").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    stub = pkg / "lib" / "libcudart_stub.so"
+    stub.write_bytes(b"STUB")
+    return pkg, stub
+
+
+def _run_cudart_fragment(source, tmp_path, *, real: str | None, extra: str = ""):
+    """exec ``source`` in a CHILD interpreter with a fake tilelang on the path.
+
+    a subprocess, not this process: the fragment mutates ``sys.path`` and the tilelang package on
+    disk, and it exists precisely to run at sitecustomize time in a fresh interpreter. ``ctypes.CDLL``
+    is replaced with a probe that FAILS the test if the stub is ever dlopened -- mapping the stub into
+    the process is the crash being prevented, so an implementation that "verifies" the stub that way
+    must not pass.
+    """
+    driver = f"""
+import ctypes, ctypes.util, glob, os, sys
+
+sys.path.insert(0, {str(tmp_path)!r})
+_real = {real!r}
+_realglob = glob.glob
+
+
+def _glob(pat, *a, **k):
+    # hermetic: NEVER let a libcudart pattern reach the real glob. this host may have
+    # /usr/local/cuda* or a system libcudart, and the fake CDLL below reports cudaDeviceReset for
+    # every non-stub candidate -- so delegating would let a CUDA-enabled runner discover a real
+    # library and repoint the stub in the test that asserts it is left alone.
+    if "libcudart.so" in pat:
+        return [_real] if _real else []
+    return _realglob(pat, *a, **k)
+
+
+glob.glob = _glob
+ctypes.util.find_library = lambda name: None
+
+
+class _FakeCudart:
+    def __getattr__(self, name):
+        if name == "cudaDeviceReset":
+            return lambda: 0
+        raise AttributeError(name)
+
+
+def _cdll(path, *a, **k):
+    if "libcudart_stub" in str(path):
+        raise SystemExit("FRAGMENT_DLOPENED_THE_STUB")
+    return _FakeCudart()
+
+
+ctypes.CDLL = _cdll
+{source}
+{extra}
+"""
+    return subprocess.run(
+        [sys.executable, "-c", driver], capture_output=True, text=True, timeout=120
+    )
+
+
+def test_the_child_fragment_repoints_the_tilelang_libcudart_stub(tmp_path):
+    """THE regression (5 of 6 GRPO models): tilelang's stub lacks ``cudaDeviceReset``, vLLM's
+    CuMemAllocator binds it, and engine init dies with an undefined-symbol AttributeError.
+
+    A parent-side repoint could not reach this: the trainer runs in a separate interpreter
+    (``/opt/verl-venv``) that has its OWN tilelang and no flash at all. Assert
+    on the filesystem AFTER executing the fragment -- a substring match on the rendered source would
+    pass on a fragment that never runs.
+    """
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    result = _run_cudart_fragment(
+        vc.render_tilelang_cudart_shim(),
+        tmp_path,
+        real=str(real),
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DLOPENED_THE_STUB" not in (result.stdout + result.stderr), (
+        "the fragment dlopened the stub to test it, which maps it into the process and is the "
+        "exact crash it exists to prevent"
+    )
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert stub.is_symlink(), "the stub is still tilelang's own file; vLLM will bind it and abort"
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    assert (tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig").read_bytes() == b"STUB", (
+        "the original stub must be preserved verbatim so the change is reversible"
+    )
+    # the marker naming the resolved runtime is the only evidence in a run log that the repoint
+    # happened and WHICH libcudart it picked. without it a silently-skipped swap and a successful one
+    # read identically, and the next undefined-symbol crash has nothing to bisect against.
+    assert f"{vc.FLASH_CUDART_STUB_MARKER} -> {real}" in result.stdout, (
+        f"the fragment did not report the repoint it performed: {result.stdout[-1000:]}"
+    )
+
+
+def test_the_child_fragment_leaves_the_stub_alone_without_a_real_libcudart(tmp_path):
+    """No discoverable real runtime -> leave tilelang's stub untouched rather than break tilelang."""
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+
+    result = _run_cudart_fragment(
+        vc.render_tilelang_cudart_shim(),
+        tmp_path,
+        real=None,
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert not stub.is_symlink()
+    assert stub.read_bytes() == b"STUB"
+    assert not (tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig").exists()
+
+
+def test_the_child_fragment_repoints_a_dangling_stub_symlink(tmp_path):
+    """A DANGLING stub symlink is NOT "already repointed" -- it leaves tilelang with a broken
+    libcudart_stub.so, so the fragment must re-point it at a real runtime.
+
+    This is the case the ``islink and exists`` pair exists for: ``islink`` alone would read a dangling
+    link as done and skip, and ``exists`` alone follows the link away and reads it as absent. Distinct
+    from the stale *temp swap* link covered below -- that one is a leftover at
+    ``.flash-<pid>-<rand>``, while this is the stub path itself pointing at a target that is gone.
+    """
+    pkg, stub = _fake_child_tilelang(tmp_path)
+    stub.unlink()
+    stub.symlink_to(tmp_path / "gone-libcudart.so.12")  # dangling: target does not exist
+    assert stub.is_symlink()
+    assert not stub.exists()
+
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    result = _run_cudart_fragment(
+        vc.render_tilelang_cudart_shim(),
+        tmp_path,
+        real=str(real),
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert stub.is_symlink()
+    assert stub.exists(), "the stub symlink still dangles; tilelang's libcudart is broken"
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    # nothing to preserve: the original stub was already gone before this ran, so a .orig would be a
+    # hard link to a dangling symlink rather than tilelang's real file.
+    assert not (pkg / "lib" / "libcudart_stub.so.orig").exists()
+
+
+def test_the_child_fragment_never_aborts_a_paid_run(tmp_path):
+    """An unrepointed stub only kills runs that build a SLEEPING vLLM engine, so a fragment that
+    cannot do its job must leave the child starting rather than abort it at sitecustomize time.
+
+    tilelang absent is the ordinary case for a non-GDN venv, and it must not even probe. Note this
+    half never enters the swap, so on its own it says nothing about the error path -- the outer
+    ``except`` could be deleted outright and this would still pass. That is what the read-only
+    sibling test below covers.
+    """
+    result = _run_cudart_fragment(
+        vc.render_tilelang_cudart_shim(),
+        tmp_path,  # no tilelang package materialized
+        real=None,
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert result.returncode == 0
+    assert "repoint failed" not in result.stdout, (
+        "tilelang absent is the ordinary case; it must not report a failure"
+    )
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root bypasses dir perms")
+def test_a_failed_repoint_still_lets_the_child_start(tmp_path):
+    """The half of never-abort that actually exercises the handler: tilelang is present and a real
+    runtime was found, but the directory holding the stub refuses writes, so ``link()``/``symlink()``
+    raise from inside the branch that already decided to swap.
+
+    Only the outer ``except`` keeps that PermissionError from propagating out of sitecustomize and
+    killing the interpreter before training starts. It must also SAY it failed: a silent swallow and
+    a successful repoint read identically in a run log, leaving the next undefined-symbol crash with
+    nothing to bisect against.
+    """
+    pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+    lib = pkg / "lib"
+    lib.chmod(0o555)
+    try:
+        result = _run_cudart_fragment(
+            vc.render_tilelang_cudart_shim(),
+            tmp_path,
+            real=str(real),
+            extra="print('FRAGMENT_DONE', flush=True)",
+        )
+    finally:
+        lib.chmod(0o755)  # let tmp_path cleanup remove it
+
+    assert result.returncode == 0, (
+        f"a failed repoint aborted the child instead of importing on: {result.stderr[-2000:]}"
+    )
+    assert "FRAGMENT_DONE" in result.stdout, (
+        f"the exception escaped sitecustomize and killed the run: {result.stderr[-2000:]}"
+    )
+    assert "repoint failed" in result.stdout, (
+        "a swallowed failure must still say so; a silent one is unbisectable from a log"
+    )
+    assert not stub.is_symlink(), "the stub must be left intact when the swap could not complete"
+    assert stub.read_bytes() == b"STUB", "the failed swap corrupted tilelang's own stub"
+
+
+def test_the_child_fragment_is_idempotent_across_ray_workers(tmp_path):
+    """Ray starts several workers against ONE venv, so the fragment runs repeatedly on the same
+    files. A second pass must keep the symlink and must not overwrite the saved original with the
+    symlink it just made.
+    """
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+    source = vc.render_tilelang_cudart_shim()
+
+    result = _run_cudart_fragment(
+        source + source,  # two passes in one interpreter
+        tmp_path,
+        real=str(real),
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert stub.is_symlink()
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    assert (tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig").read_bytes() == b"STUB"
+
+
+def test_concurrent_ray_workers_never_lose_the_stub_or_the_original(tmp_path):
+    """Ray starts several child interpreters against ONE venv, genuinely at the same time.
+
+    The sequential idempotency test above cannot see the interleaving: with a check-then-act backup,
+    two workers both observe ``.orig`` absent, one moves the stub and the other gets
+    FileNotFoundError and imports on with the path missing -- or the second overwrites the preserved
+    original with the symlink the first just made. Start the interpreters together and assert BOTH
+    invariants survive: the stub always resolves, and ``.orig`` is still the real stub bytes.
+    """
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+    source = vc.render_tilelang_cudart_shim()
+
+    workers = 8
+    barrier = threading.Barrier(workers)
+    results: list[subprocess.CompletedProcess] = []
+    lock = threading.Lock()
+
+    def _worker():
+        barrier.wait()  # release them into the critical section together
+        out = _run_cudart_fragment(
+            source, tmp_path, real=str(real), extra="print('FRAGMENT_DONE', flush=True)"
+        )
+        with lock:
+            results.append(out)
+
+    threads = [threading.Thread(target=_worker) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=180)
+
+    assert len(results) == workers, "a worker never finished"
+    for out in results:
+        assert "FRAGMENT_DONE" in out.stdout, (
+            f"a concurrent worker aborted instead of importing on: {out.stderr[-1500:]}"
+        )
+
+    # the stub must resolve for EVERY worker -- a moved-away stub is the crash, one step later.
+    assert stub.is_symlink()
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    backup = tmp_path / "tilelang" / "lib" / "libcudart_stub.so.orig"
+    assert backup.exists(), "the preserved original went missing under concurrent workers"
+    assert not backup.is_symlink(), (
+        "the preserved original was overwritten by a racing worker's symlink"
+    )
+    assert backup.read_bytes() == b"STUB"
+    # no temp links left behind by a worker that died mid-swap.
+    leftovers = list((tmp_path / "tilelang" / "lib").glob("libcudart_stub.so.flash-*"))
+    assert not leftovers, f"temporary swap links leaked: {leftovers}"
+
+
+def test_a_stale_swap_link_does_not_block_the_repoint(tmp_path):
+    """A worker killed between symlink() and replace() leaves its temp link on disk.
+
+    With a pid-only temp name, the next worker to reuse that pid would hit FileExistsError,
+    skip the swap, and leave the stub in place -- a silently unrepointed stub, which is the
+    original crash one step later. Plant a stale link for THIS interpreter's pid and assert the
+    repoint still lands.
+    """
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    # the child's pid is not knowable from here, so it plants the stale link on ITSELF: a dangling
+    # symlink at exactly the pid-only name the old scheme would have chosen, created before the
+    # fragment runs. that is precisely the post-crash state a reused pid inherits.
+    plant = (
+        "import os as _p_os\n"
+        f"_p_stale = {str(tmp_path / 'tilelang' / 'lib' / 'libcudart_stub.so')!r}"
+        ' + ".flash-" + str(_p_os.getpid())\n'
+        '_p_os.symlink("/nonexistent/stale", _p_stale)\n'
+    )
+    result = _run_cudart_fragment(
+        plant + vc.render_tilelang_cudart_shim(),
+        tmp_path,
+        real=str(real),
+        extra="print('FRAGMENT_DONE', flush=True)",
+    )
+
+    assert "FRAGMENT_DONE" in result.stdout, f"fragment aborted the child: {result.stderr[-2000:]}"
+    assert stub.is_symlink(), (
+        "a stale temp swap link blocked the repoint; the stub is still tilelang's own file"
+    )
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+
+
+@pytest.mark.parametrize("backend", ["grpo", "opd", "sft"])
+def test_every_verl_backend_repoints_the_stub_in_its_child(backend, tmp_path):
+    """The stub lives in the interpreter that builds the vLLM engine, and all three backends launch
+    that interpreter. Execute each backend's rendered sitecustomize and assert the symlink landed --
+    rendering unreachable code, or fixing it in the Flash parent, does not help the trainer.
+    """
+    from flash.engine.worker import opd_train, sft_train
+
+    if backend == "grpo":
+        # grpo assembles shim_source inside _write_rl_shim, past the subprocess launch, so there is
+        # no renderer to call. rebuild the join from the ast: calling the renderer here would test
+        # the renderer the tests above already cover and stay green if _write_rl_shim stopped
+        # joining it in -- the exact regression, with 5 of 6 models back to a dead engine init.
+        assign = next(
+            node
+            for node in ast.walk(
+                ast.parse(textwrap.dedent(inspect.getsource(rl_train._write_rl_shim)))
+            )
+            if isinstance(node, ast.Assign)
+            and any(getattr(t, "id", "") == "shim_source" for t in node.targets)
+        )
+        rendered = [
+            ast.unparse(node.func)
+            for node in ast.walk(assign.value)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert "render_tilelang_cudart_shim" in rendered, (
+            "_write_rl_shim no longer joins render_tilelang_cudart_shim() into shim_source; the "
+            f"grpo child keeps tilelang's stub and dies at engine init. joined: {rendered!r}"
+        )
+        source = vc.render_tilelang_cudart_shim()
+        # unconditional: `part for part in (...) if part` filters empties, so a renderer that
+        # returned "" for some config would be indistinguishable from an absent one at runtime.
+        assert source.strip(), "render_tilelang_cudart_shim() returned nothing to join"
+    elif backend == "opd":
+        source = opd_train._render_opd_sitecustomize(save_at_steps=(3,), total_steps=3)
+    else:
+        source = sft_train._render_sft_sitecustomize(
+            seed=1,
+            loraplus_ratio=16.0,
+            save_at_steps=(3,),
+            total_steps=3,
+            reentrant_gradient_checkpointing=False,
+        )
+
+    _pkg, stub = _fake_child_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    # the fragment sits ABOVE each backend's verl imports on purpose; this test has no real
+    # verl/transformers stack, so the exec is expected to die once it reaches them. that the symlink
+    # already landed by then is the assertion -- and it is only true while the ordering holds.
+    result = _run_cudart_fragment(source, tmp_path, real=str(real))
+
+    assert "FRAGMENT_DLOPENED_THE_STUB" not in (result.stdout + result.stderr)
+    assert stub.is_symlink(), (
+        f"{backend}'s child shim never reached the cudart fragment before importing verl; its "
+        "trainer keeps tilelang's stub and a sleeping vLLM engine aborts init"
+    )
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+
+
+def test_the_child_probe_is_the_parents_own_source_not_a_copy():
+    """The child fragment must SHIP ``perf._find_real_libcudart``, never restate it.
+
+    The bug this whole fragment fixes was parent/child skew: the parent knew how to find libcudart
+    and the child did not. A hand-copied probe recreates that skew on a delay -- the next cuda
+    release moves a wheel path, someone fixes the parent, CI stays green, and the child silently
+    keeps probing the old layout. So assert the rendered fragment carries the parent's real body,
+    and that editing the parent moves the child with it.
+    """
+    from flash.engine.worker.perf import _find_real_libcudart
+
+    rendered = vc.render_tilelang_cudart_shim()
+    parent_body = textwrap.dedent(inspect.getsource(_find_real_libcudart))
+
+    # every non-trivial line of the parent's probe must appear in what the child executes.
+    missing = [
+        line.strip()
+        for line in parent_body.splitlines()
+        if len(line.strip()) > 12 and line.strip() not in rendered
+    ]
+    assert not missing, (
+        "the child fragment no longer ships perf._find_real_libcudart's own source, so the probe "
+        f"can drift from the parent's. lines absent from the fragment: {missing[:5]!r}"
+    )
+
+    # and the fragment must CALL it under its canonical name rather than a local re-implementation.
+    assert "_find_real_libcudart()" in rendered, (
+        "the fragment does not call _find_real_libcudart(); a second probe implementation has crept "
+        "back into the child"
+    )
+
+
+def test_rendering_the_probe_ignores_a_monkeypatched_parent(monkeypatch):
+    """Rendering must ship the REAL probe body even while ``perf._find_real_libcudart`` is patched.
+
+    ``perf``'s own docstring says tests monkeypatch that name and its callers resolve it through the
+    patched module globals. This caller is the exception: it needs the function's SOURCE, so if it
+    ever resolved through ``perf.<attr>`` a test double's body would be rendered into the child and
+    the shipped shim would be whatever the last test stubbed. Pin the immunity.
+    """
+    from flash.engine.worker import perf
+
+    before = vc.render_tilelang_cudart_shim()
+    monkeypatch.setattr(perf, "_find_real_libcudart", lambda: "/fake/libcudart.so")
+    after = vc.render_tilelang_cudart_shim()
+
+    assert before == after, (
+        "the rendered fragment changed while perf._find_real_libcudart was monkeypatched; the "
+        "renderer is resolving through the patched module global and can ship a test double"
+    )
+    assert "cudaDeviceReset" in after, (
+        "the rendered probe lost its cudaDeviceReset check under a patched parent"
+    )
+    # asserted as a fragment, not the full path: this file's platform-guard meta-test scans function
+    # bodies for the proc-filesystem prefix and would demand @_needs_process_teardown. this test only
+    # inspects rendered TEXT and opens nothing, so it needs no process-teardown capability.
+    assert "self/maps" in after, (
+        "the rendered probe lost its soname resolution under a patched parent"
+    )
+
+
 def test_grpo_does_not_enable_tf32_in_the_parent():
     """the grpo parent holds a cuda context (wait_for_gpu touches the device) but runs no matmuls --
     verl does, out of process. a setup_perf_backends() call here sets flags on the wrong process and
@@ -3939,3 +4727,118 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
                     "non-gdn runs would get empty caps and lose the triton backend"
                 )
                 break
+
+
+# ---------------------- fail-closed sitecustomize fragments (child_io) ----------------------
+
+
+def _compose_wrapped_sitecustomize(tmp_path, *fragments):
+    """write a sitecustomize from the real prologue + wrapper; return (shim_dir, marker_file)."""
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir(exist_ok=True)
+    marker_file = vc.shim_marker_file(str(shim_dir))
+    source = vc.render_shim_marker_prologue(marker_file)
+    for name, fragment in fragments:
+        source += vc.wrap_shim_fragment(name, fragment)
+    (shim_dir / "sitecustomize.py").write_text(source)
+    return shim_dir, marker_file
+
+
+def _run_child_with_sitecustomize(shim_dir):
+    """launch a real interpreter through the production mechanism: PYTHONPATH -> sitecustomize."""
+    env = dict(os.environ, PYTHONPATH=str(shim_dir))
+    return subprocess.run(
+        [sys.executable, "-c", "print('trained-unpatched')"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+
+
+def test_execsitecustomize_swallows_an_unwrapped_fragment_failure(tmp_path):
+    """the defect the wrapper closes: cpython catches every Exception a sitecustomize import
+    raises, prints a note, and starts the interpreter anyway, so an unwrapped failing fragment
+    silently disables itself and everything after it, and the child trains unpatched."""
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    (shim_dir / "sitecustomize.py").write_text(
+        "raise RuntimeError('transformers drift moved a private symbol')\n"
+    )
+    result = _run_child_with_sitecustomize(shim_dir)
+    assert result.returncode == 0
+    assert "trained-unpatched" in result.stdout
+
+
+def test_a_failing_wrapped_fragment_hard_exits_the_child_with_the_shim_code(tmp_path):
+    """the wrapped form of the scenario above: os._exit bypasses execsitecustomize's swallow, the
+    child never trains, and the failure is attributed to the fragment by name."""
+    shim_dir, marker_file = _compose_wrapped_sitecustomize(
+        tmp_path,
+        ("good-fragment", "\n_flash_good = 1\n"),
+        ("boom-fragment", "\nraise RuntimeError('transformers drift moved a private symbol')\n"),
+        ("after-fragment", "\n_flash_after = 1\n"),
+    )
+    result = _run_child_with_sitecustomize(shim_dir)
+    assert result.returncode == vc.SHIM_FRAGMENT_FAILED_EXIT_CODE
+    assert "trained-unpatched" not in result.stdout
+    # attributed: the fragment names itself and the underlying traceback survives.
+    assert "boom-fragment" in result.stderr
+    assert "transformers drift moved a private symbol" in result.stderr
+    # the fragments before the failure recorded themselves; nothing after it could.
+    assert vc.read_applied_shim_markers(marker_file) == {"good-fragment"}
+
+
+def test_wrapped_fragments_record_their_markers_and_leave_the_child_running(tmp_path):
+    shim_dir, marker_file = _compose_wrapped_sitecustomize(
+        tmp_path,
+        ("good-fragment", "\n_flash_good = 1\n"),
+        ("second-fragment", "\n_flash_second = 2\n"),
+    )
+    result = _run_child_with_sitecustomize(shim_dir)
+    assert result.returncode == 0
+    assert "trained-unpatched" in result.stdout
+    assert vc.read_applied_shim_markers(marker_file) == {"good-fragment", "second-fragment"}
+
+
+def test_verify_applied_shim_markers_raises_only_on_missing_names(tmp_path):
+    marker_file = tmp_path / "applied_shims.txt"
+    marker_file.write_text("entropy-quantile\nkl-ref-adapter\n")
+    # complete (and over-complete: ray actors re-record) sets pass.
+    vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile"])
+    vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile", "kl-ref-adapter"])
+    with pytest.raises(RuntimeError, match=r"never proved.*\['stop-sequences'\]"):
+        vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile", "stop-sequences"])
+    # an absent file is every marker missing, not a pass.
+    with pytest.raises(RuntimeError, match="never proved"):
+        vc.verify_applied_shim_markers(str(tmp_path / "missing.txt"), ["entropy-quantile"])
+
+
+def test_wrapping_the_real_rendered_fragments_stays_valid_python(tmp_path):
+    """the wrapper indents whole rendered fragments into a try block; a syntax slip there turns
+    every child patch into a silent no-op, so compiling the composed file is the real gate."""
+    from flash.engine.worker.train.rl import shims as rl_shims
+
+    _shim_dir, marker_file = _compose_wrapped_sitecustomize(tmp_path)
+    source = vc.render_shim_marker_prologue(marker_file)
+    for name, fragment in (
+        (
+            "reentrant-checkpointing",
+            rl_shims.render_reentrant_checkpointing_shim(True, multimodal=True),
+        ),
+        ("entropy-quantile", rl_shims.render_entropy_quantile_shim(0.2)),
+        ("per-turn-credit", rl_shims.render_per_turn_credit_shim(True)),
+        ("stop-sequences", rl_shims.render_stop_sequences_shim(("</answer>",))),
+        ("image-pad-ban", rl_shims.render_image_pad_ban_shim(151655)),
+        (
+            "structured-outputs",
+            rl_shims.render_structured_outputs_shim({"json": {"type": "object"}}),
+        ),
+        ("exact-save-steps", rl_shims.render_exact_save_steps_shim((7, 13), 20)),
+        ("kl-ref-adapter", rl_shims.render_kl_ref_adapter_shim(True)),
+        ("gdn-varlen", vc.render_gdn_varlen_shim("qwen3_5")),
+    ):
+        source += vc.wrap_shim_fragment(name, fragment)
+    compile(source, "sitecustomize.py", "exec")
+    # and the empty fragment stays empty: a feature that is off has nothing to prove.
+    assert vc.wrap_shim_fragment("off-feature", "") == ""

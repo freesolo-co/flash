@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# `_run` launches the child with sys.executable, an absolute path, so the CLI names that
+# interpreter back rather than a bare `python` -- which is absent entirely on a python3-only host.
+# Derived from the same value the subprocess uses, so the two cannot drift apart.
+INVOKED_CLI_NAME = f"{sys.executable} -m flash.cli"
 
 
 def _run(args, env=None):
@@ -36,7 +43,7 @@ def test_logged_out_status_is_friendly():
         proc = _run(["runs", "status", "does-not-exist"], env=_logged_out_env(tmp))
     assert proc.returncode == 1
     assert proc.stderr.startswith("error:")
-    assert "flash login" in proc.stderr
+    assert f"{INVOKED_CLI_NAME} login" in proc.stderr
     # No raw traceback on stderr.
     assert "Traceback (most recent call last)" not in proc.stderr
 
@@ -64,6 +71,7 @@ def test_missing_config_is_friendly():
     assert proc.returncode == 1
     assert proc.stderr.startswith("error:")
     assert "config file not found" in proc.stderr
+    assert f"{INVOKED_CLI_NAME} env setup" in proc.stderr
     # a bare [Errno 2] string and a traceback are both the wrong UX for a mistyped path.
     assert "Errno" not in proc.stderr
     assert "Traceback (most recent call last)" not in proc.stderr
@@ -99,7 +107,7 @@ def test_train_without_login_fails_fast():
     assert proc.returncode == 1, proc.stdout + proc.stderr
     # It must fail *before* contacting anything, with the fix spelled out.
     assert "not logged in" in proc.stderr
-    assert "flash login" in proc.stderr
+    assert f"{INVOKED_CLI_NAME} login" in proc.stderr
 
 
 def test_missing_env_id_rejected_client_side():
@@ -114,6 +122,7 @@ def test_missing_env_id_rejected_client_side():
         submit = _run(["train", cfg], env=_logged_out_env(tmp))
         assert submit.returncode == 1
         assert "[environment] id" in submit.stderr
+        assert f"{INVOKED_CLI_NAME} env push" in submit.stderr
 
 
 def test_dry_run_without_login_fails_fast():
@@ -130,7 +139,7 @@ def test_dry_run_without_login_fails_fast():
         proc = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "not logged in" in proc.stderr
-    assert "flash login" in proc.stderr
+    assert f"{INVOKED_CLI_NAME} login" in proc.stderr
     assert "Traceback (most recent call last)" not in proc.stderr
 
 
@@ -147,3 +156,69 @@ def test_cost_needs_no_live_pricing():
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "TOTAL" in proc.stdout
     assert "live GPU pricing unavailable" not in proc.stderr
+
+
+@contextlib.contextmanager
+def _stub_plane(content_type: str, body: bytes):
+    """Stand in for the control plane, answering every GET 200 with one fixed body.
+
+    `--api-url` is a supported path, so "a reverse proxy or an older plane answered" is a real
+    user state. Neither body below is something the CLI can use.
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wrong_shape_plane_response_is_friendly():
+    with (
+        _stub_plane("application/json", b'{"hello": "world"}') as url,
+        tempfile.TemporaryDirectory() as tmp,
+    ):
+        proc = _run(
+            ["runs", "list"],
+            env={
+                **_logged_out_env(tmp),
+                "FLASH_API_URL": url,
+                "FREESOLO_API_KEY": "fslo-user-test",
+            },
+        )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert proc.stderr.startswith("error:")
+    assert f"{url}/v1/runs returned an unexpected response shape" in proc.stderr
+    assert "'runs'" in proc.stderr
+    assert "rather than at a proxy or another service" in proc.stderr
+    assert "Traceback (most recent call last)" not in proc.stderr
+
+
+def test_non_json_login_response_is_friendly():
+    with (
+        _stub_plane("text/html", b"<html>hi</html>") as url,
+        tempfile.TemporaryDirectory() as tmp,
+    ):
+        env = _logged_out_env(tmp)
+        proc = _run(["login", "--api-key", "fslo-user-bogus", "--api-url", url], env=env)
+        saved = os.path.join(env["HOME"], ".flash", "config.json")
+        assert not os.path.exists(saved), "an unverified key must not be saved"
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "login failed" in proc.stderr
+    assert f"{url}/v1/me did not return JSON (Content-Type: text/html)" in proc.stderr
+    assert "rather than at a proxy or another service" in proc.stderr
+    assert "Expecting value" not in proc.stderr
+    assert "Traceback (most recent call last)" not in proc.stderr

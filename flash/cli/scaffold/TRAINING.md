@@ -119,8 +119,9 @@ point Flash calls:
 from freesolo.datasets.types import TaskExample
 from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
+
 class MyEnv(EnvironmentSingleTurn):
-    dataset = load_jsonl("dataset/train.jsonl")   # rows -> TaskExample(input=..., output=...)
+    dataset = load_jsonl("dataset/train.jsonl")  # rows -> TaskExample(input=..., output=...)
 
     def build_prompt_messages(self, example: TaskExample, prompt_text: str):
         return [{"role": "user", "content": example.input}]
@@ -129,6 +130,7 @@ class MyEnv(EnvironmentSingleTurn):
         expected = str(example.output or "").strip()
         score = 1.0 if expected and expected in response_text else 0.0
         return RewardResult(score=score, threshold=1.0)
+
 
 def load_environment(**kwargs) -> MyEnv:
     return MyEnv()
@@ -142,7 +144,7 @@ conversation across turns. The reward is the same `RewardResult` contract either
 A managed run references a **published** environment by id — so push your folder first:
 
 ```bash
-flash env push --project <project-uuid> --name my-env .       # uploads this project; prints an env id like "your-org/my-env"
+flash env push --project <project-uuid> --name my-env .       # uploads this project; prints an env id like "your-org/your-project/my-env"
 flash env list                       # local env sources you can push
 ```
 
@@ -151,12 +153,42 @@ no separate step is needed. Paste the returned id into `[environment] id` in **b
 Re-push after any
 edit to `environment.py` or `dataset/` so the managed run uses your change.
 
+**Self-hosted plane?** `flash env push` publishes to Freesolo's managed environment hub, which
+your plane cannot write to, and a bare `your-org/your-project/my-env` slug resolves against that same hub. Use
+the git form instead — commit this folder to a repo your plane can read, then name it directly:
+
+```toml
+[environment]
+id = "github:OWNER/REPO@main:environment.py"   # REF is a branch/tag name without `/`, or a commit
+                                               # sha; the path is the file, or a directory holding
+                                               # environment.py
+```
+
+The ref is resolved at submit time, so re-pushing the repo and re-submitting picks up your edits
+the same way `flash env push` does on the managed plane. Pin a commit sha instead of a branch when
+you want a run to stay reproducible.
+
+A `github:` id is accepted only by a plane running with `FLASH_STANDALONE=1`. An identity-backed
+plane takes managed hub ids only and answers this form with a 400 naming the id.
+
+**A private repository needs `GITHUB_TOKEN` on the plane, not in your shell.** The ref is fetched by
+the control plane, which authenticates with its own `GITHUB_TOKEN` and forwards no credential of
+yours — so a private repo that you can clone locally still resolves as missing unless the plane
+itself holds a token that can read it. Either keep the environment repo public, or export a
+`GITHUB_TOKEN` with read access in the control plane's environment.
+
+`flash env eval` does not accept a `github:` id. It grades against a _published_ environment so the
+report can be filed under that identity, and refuses any reference that names no hub page — so on a
+standalone plane, the two commands below that mention it (`env eval` with `--split`/`--param`, and
+the held-out-suite workflow) are unavailable. `flash env test` is unaffected and remains the local
+gate.
+
 **Validate locally before you push** — but know what the local gate does and does not
 cover:
 
 ```bash
 flash env test .                     # imports environment.py, loads the dataset, runs the scorer
-flash env pull your-org/my-env -o ./pulled   # -o must be a FILE for a single file, a DIR for a
+flash env pull your-org/your-project/my-env -o ./pulled   # -o must be a FILE for a single file, a DIR for a
                                              # whole env; a new path is created for you, but an
                                              # existing non-empty dir is refused
 ```
@@ -206,18 +238,20 @@ contract should be identical — and hash the dataset files for the data half.
 ```toml
 model = "Qwen/Qwen3.5-4B"   # see `flash models list`
 project = "PROJECT_UUID"  # required UUID from `flash projects create`
-# model_revision = "main"   # optional ref resolved to an immutable hugging face commit before submit
 algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-policy distillation)
 # thinking = true           # opt-in reasoning mode, for models that support it
 # seed = 42                 # reproducible per-run seed; omitted defaults to 42
 
 [environment]
-id = "your-org/my-env"      # the id printed by `flash env push`
+id = "your-org/your-project/my-env"      # the id printed by `flash env push`
+                            # self-hosted plane: "github:OWNER/REPO@main:environment.py" (see above)
 # params = { split = "train" }    # kwargs passed to load_environment(); the table is
                                    # `params` — NOT `args`
 # secrets = ["SERPAPI_API_KEY"]   # only the NAMES of env vars your environment reads;
                                    # values are pulled from your shell/.env at submit time,
                                    # never stored in the spec
+# pip = ["pymongo>=4.6"]          # third-party packages your scorer imports, installed on the
+                                   # worker alongside Flash's own requirement (never instead of it)
 
 [train]
 epochs = 1                  # one pass over the retained train rows
@@ -235,14 +269,24 @@ lora_rank = 32              # lora_alpha defaults to 2 x lora_rank; set it to ov
 **Knobs are scoped by algorithm.** `[train]` is one flat table shared by all three algorithms,
 but a knob the run's algorithm cannot consume is REJECTED at parse time rather than silently
 ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `save_every`,
-`save_at_steps`, `lora_rank`, `lora_alpha`, `learning_rate`, `batch_size`, `max_context_tokens`,
+`save_at_steps`, `lora_rank`, `lora_alpha`, `learning_rate`, `max_context_tokens`,
 `init_from_adapter`) applies everywhere. These do not:
 
 | knob                                                                                                            | sft      | grpo     | opd      |
 | --------------------------------------------------------------------------------------------------------------- | -------- | -------- | -------- |
+| `batch_size`                                                                                                    | yes      | rejected | rejected |
+| `prompts_per_step`                                                                                              | rejected | yes      | yes      |
 | `group_size`, `temperature`, `max_completion_tokens`, `kl_penalty_coef`, `stop_sequences`, `structured_outputs` | rejected | yes      | yes      |
 | `entropy_quantile`, `thinking_length_penalty_coef`, `credit_assignment`                                         | rejected | yes      | rejected |
 | `teacher_model`                                                                                                 | rejected | rejected | yes      |
+
+**The optimizer batch has a different name per algorithm because it is a different quantity.**
+Under SFT, `batch_size` is an input to the packaged-dataset estimate, which resolves it against the
+selected row count into the optimizer batch (and pins it to 1 when packing is off). Under
+GRPO/OPD there is no profile: `prompts_per_step` IS the optimizer batch, straight through to verl's
+`data.train_batch_size` and `ppo_mini_batch_size`. They were one key once, which meant the standard
+SFT out-of-memory workaround `batch_size = 1`, copied into an RL config, silently trained one prompt
+per update. Now it is a parse error naming the key you want.
 
 So `credit_assignment` (multi-turn GRPO defaults to one reward per rollout; `"per_turn"` gives
 turn-level credit, needs `per_turn_rewards` metadata, and is unsupported for tool-calling envs —
@@ -376,9 +420,26 @@ So treat age as a threshold, not a verdict, and pick the threshold for the algor
   — are liveness-driven and legitimately quieter; the tight threshold is for stepping.)
 - _Otherwise, under ~15 min:_ tells you nothing is wrong. Do not act.
 - _Otherwise, well past ~15 min:_ suspicious, still not conclusive. Corroborate before deciding —
-  check the provider/attempt state and follow `flash runs log <run-id> -f`, which streams
-  independently of the heartbeat upload cycle. A retry that has already started will show a
-  new attempt.
+  check the provider/attempt state, and your `[wandb]` run if you configured one. A retry that has
+  already started will show a new attempt.
+
+**`flash runs log` is not a live feed of worker stdout, and it is not the whole log.** The
+orchestration lines stream as they happen, but the worker's own console output is snapshotted to
+the artifact repo about **once an hour**, plus a final flush when the run ends. Each snapshot
+uploads only the **last 64 KB** of console and overwrites the previous one, so a chatty run loses
+its earlier output permanently, including setup.
+
+Two consequences worth knowing before you read a quiet log as a broken run:
+
+- A run shorter than the upload interval shows almost no worker output until it finishes, then
+  delivers a batch at the end. A healthy short run can legitimately produce a couple of dozen
+  lines that jump straight from `sft_model_load` to a late step. That is the upload cadence, not
+  a resumed or skipped run.
+- On a long or verbose run, early lines are simply gone. Their absence is the 64 KB window, not
+  evidence the stage never ran.
+
+For progress _while_ a run is live, use the `status` panel's heartbeat age and W&B. Use
+`runs log` for the most recent console tail and a terminating traceback.
 
 **Exception — startup is exempt from all of the above.** While the run is warming up
 (`status` shows a `warmup` row: initializing the model, vLLM, and training kernels) a long
@@ -386,7 +447,9 @@ quiet stretch at 0% GPU is the normal case, not a stall. `status` itself calls t
 says _"setup is not billed; do not cancel"_. It can run far longer than the panel's
 "typically several minutes, sometimes 15-20 min" — 40+ minutes before the first step is
 something we have measured on a real run. Do not start the ~15 min clock until you have seen
-step 0 advance to step 1; before that, the only thing worth watching is `flash runs log -f`.
+step 0 advance to step 1; before that, the only thing worth watching is the `status` panel's
+heartbeat age (and W&B, if configured) — not worker stdout, which lands only on the hourly snapshot
+described above.
 
 Never derive seconds-per-step from total elapsed time (early steps include one-time warmup
 that can dominate a short run).
@@ -593,11 +656,12 @@ spending another GPU run:
 
 | Issue                                                        | Symptom                                                                                                                                                                                  | Mitigation                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Environment id is blank or stale                             | A blank id fails config validation. A stale published id can pass `flash train --dry-run` because dry-run does not import or run `environment.py`; the worker then uses old reward/data. | Run `flash env push --project <project-uuid> --name my-env .` after every environment/data edit and paste the returned id into every config you submit.                                                                                                                                                                                                                                                                         |
+| Environment id is blank or stale                             | A blank id fails config validation. A stale published id can pass `flash train --dry-run` because dry-run does not import or run `environment.py`; the worker then uses old reward/data. | Run `flash env push --project <project-uuid> --name my-env .` after every environment/data edit and paste the returned id into every config you submit. **Self-hosted:** `env push` targets the managed hub, so instead commit the edit and re-point `[environment] id` at the new ref -- see "Publish the environment" above.                                                                                                  |
 | Local-only env path in config                                | Config validation says there is no local path mode                                                                                                                                       | Publish first, then use the returned slug in `[environment] id`. `flash train` only runs published env ids, not local paths.                                                                                                                                                                                                                                                                                                    |
 | Config knobs are in the wrong table                          | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys                                                                                                                          | Put `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`.                                                                                                                                                                                                                                                                                       |
 | GPU selection is not what you expected                       | Leaving `[gpu] type` unset may select a different fitting class as prices or capacity change                                                                                             | Set `[gpu] type` to an active validated class to hard-pin it, or leave it unset for managed cheapest-fit allocation. `train.hf_repo` remains platform-managed.                                                                                                                                                                                                                                                                  |
 | Secrets are not available on the worker                      | Reward code works locally but remote logs show missing API keys or auth failures                                                                                                         | List secret names under `[environment] secrets = [...]`, export those env vars locally before submit, or put them in local `.env` / `.env.local`. Never hard-code secret values in the config.                                                                                                                                                                                                                                  |
+| Scorer dependency is missing on the worker                   | Reward code works locally but every reward is `0.0` remotely; the import your scorer needs is installed in your venv, not the worker's                                                   | List the packages your scorer imports under `[environment] pip = ["pymongo>=4.6"]`. They are installed alongside Flash's own worker requirement. `flash env test` names the failing import locally before you spend a GPU on it. Entries name packages only: pip options and URLs with inline credentials are rejected, because the spec is stored and uploaded in plaintext (put the credential in `[environment] secrets`).   |
 | Wrong model / thinking setting                               | Config validation fails, or chat behavior does not match the run                                                                                                                         | Config validation is authoritative for model and thinking compatibility. Thinking is a run-level choice, and `flash models chat` does not expose an override flag.                                                                                                                                                                                                                                                              |
 | Thinking reward grades the wrong text                        | Rewards accidentally score hidden reasoning, or ignore reasoning you meant to inspect                                                                                                    | By default, score the answer text. In thinking mode the response object is still string-compatible, but also exposes `.completion`, `.thinking`, and `.raw` when a reward intentionally needs those fields.                                                                                                                                                                                                                     |
 | All-zero or flat GRPO reward                                 | `reward` stays near 0 and outputs do not improve                                                                                                                                         | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward.                                                                                                                                                                                                                                                   |
@@ -701,11 +765,12 @@ used for grading but is _not_ logged on its own, so it gives you nothing to judg
 ```python
 from freesolo.environments import RewardResult, RewardMetric
 
+
 def score_response(self, example, response_text) -> RewardResult:
-    score = graded_score(example, response_text)         # shaped 0-1 — what GRPO optimizes
+    score = graded_score(example, response_text)  # shaped 0-1 — what GRPO optimizes
     return RewardResult(
         score=score,
-        threshold=1.0,                                   # success = score >= threshold
+        threshold=1.0,  # success = score >= threshold
         metrics=(RewardMetric(name="success", score=float(score >= 1.0)),),  # logged: judge on this
     )
 ```
@@ -862,12 +927,16 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
 
 - **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
   the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
-  `glm-5.2` (default), `kimi-k3`, `qwen3.5-397b-a17b`, or `deepseek-v4-pro`. Every option is
-  a Parasail-hosted model reached through the control-plane broker, so there is nothing to export or
-  declare. An opd run submits like any other, and a `PARASAIL_API_KEY` in your shell is ignored.
-  Arbitrary bring-your-own teacher models or keys are not supported (the allow-list is curated to
-  teachers verified to echo-score the student's tokens). The key is never stored in the spec or needed
-  at serving time; teacher token cost varies by model and is shown in the pre-flight estimate.
+  `glm-5.2` (default), `kimi-k3`, `qwen3.5-397b-a17b`, `deepseek-v4-pro`, or `qwen3-vl-235b`.
+  Every option is a Parasail-hosted model reached through the control-plane broker, so there is
+  nothing to export or declare. An opd run submits like any other, and a `PARASAIL_API_KEY` in your
+  shell is ignored. Arbitrary bring-your-own teacher models or keys are not supported (the allow-list
+  is curated to teachers verified to score the student's tokens). Image-bearing opd requires
+  `qwen3-vl-235b` or `qwen3.5-397b-a17b` (Qwen3.5 unifies text and vision in one checkpoint, so it
+  sees images despite the name carrying no `-vl`) and is single-turn only. The other teachers are
+  text-only: they accept an image-bearing request and silently ignore the image rather than failing,
+  which is why the allow-list is enforced. The key is never stored in the spec or needed at serving time;
+  teacher token cost varies by model and is shown in the pre-flight estimate.
 - **The student (Qwen) and the teacher have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai _spider_ / Tinker
   method): it aligns the two tokenizations by shared source-text spans and applies per-span reverse
@@ -890,7 +959,7 @@ model = "Qwen/Qwen3.5-4B"
 algorithm = "opd"
 
 [environment]
-id = "your-org/my-env"
+id = "your-org/your-project/my-env"
 
 [train]
 epochs = 1
@@ -898,7 +967,8 @@ max_examples = 2
 lora_rank = 32
 # teacher_model = "glm-5.2"                             # managed teacher to distil from; one of
 #                                                       # glm-5.2 (default) | kimi-k3 |
-#                                                       # qwen3.5-397b-a17b | deepseek-v4-pro
+#                                                       # qwen3.5-397b-a17b | deepseek-v4-pro |
+#                                                       # qwen3-vl-235b
 #                                                       # (key stays managed)
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
 ```
@@ -1003,7 +1073,7 @@ in a sensible value, so only override with a reason.
 | `kl_penalty_coef`              | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move.                                                                                                                                                                                                                                                                      |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy.                                                                                                                                                                                                                                                                                              |
 | `learning_rate`                | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it.                                                                                                                                                                                                                                                                                             |
-| `batch_size`                   | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
+| `prompts_per_step`             | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
 | `structured_outputs`           | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
 
 For thinking models, `max_completion_tokens` is shared between `<think>` reasoning and the final
@@ -1011,12 +1081,12 @@ answer or action, so undersizing it can truncate the action and teach the model 
 watch `truncation_rate`, which counts completions not ending in EOS and is not strictly
 `finish_reason=length` when stop sequences or multi-turn rollouts are involved.
 
-> **On a derived horizon, `batch_size` buys optimizer steps cheaply.** `batch_size`
+> **On a derived horizon, `prompts_per_step` buys optimizer steps cheaply.** `prompts_per_step`
 > overrides the tuned prompts-per-step. Total generated tokens are
 > `steps x prompts_per_step x group_size x max_completion_tokens`, so when the step count
-> is _derived_ from the data, lowering `batch_size` raises it and leaves the token bill
+> is _derived_ from the data, lowering `prompts_per_step` raises it and leaves the token bill
 > roughly flat — the spend that buys 5 steps at the default batching buys ~80 at
-> `batch_size = 4`. A single-digit-step run is weak evidence either way: usually too few
+> `prompts_per_step = 4`. A single-digit-step run is weak evidence either way: usually too few
 > updates to show that a setup works, but — as the `temperature` row above notes — not too
 > few to destabilize one. Read a flat result at 5 steps as "not measured yet" rather than
 > "no effect," and check your batching before concluding you are under-funded. When you do
@@ -1026,7 +1096,7 @@ watch `truncation_rate`, which counts completions not ending in EOS and is not s
 >
 > Two things break the flat-cost approximation, so treat it as a hypothesis to check, not a
 > rule. **`[train] max_steps` overrides the derived horizon**: with it set the step count is
-> exactly what you asked for, lowering `batch_size` does not add steps at all, and you
+> exactly what you asked for, lowering `prompts_per_step` does not add steps at all, and you
 > simply train on fewer prompts. And per-step cost is not purely token-proportional —
 > GRPO reward waves and OPD teacher calls add latency per step, so multiplying steps can
 > multiply that overhead into a materially larger GPU bill. Smaller batches also mean
@@ -1083,7 +1153,7 @@ assert len(turn_scores) == assistant_turns, (len(turn_scores), assistant_turns)
 assert all(math.isfinite(s) for s in turn_scores)
 
 return RewardResult(
-    score=episode_score,                                  # unchanged episode scalar
+    score=episode_score,  # unchanged episode scalar
     metadata={"per_turn_rewards": [float(s) for s in turn_scores]},
 )
 ```
@@ -1279,34 +1349,34 @@ kind because the run itself looks fine.
 
 ---
 
-## Multi-GPU training (`gpu.count > 1`)
+## Multi-GPU training and `gpu.count` pins
 
-Flash trains on one card by default. Raising `gpu.count` shards the job with nothing else to
-select:
+When both `gpu.type` and `gpu.count` are omitted, Flash auto-sizes to the smallest geometry-safe card
+ceiling that can hold the run. Fitting shapes within that ceiling still compete on dollars per
+optimizer step, so no extra multi-GPU setting is required. A pinned `gpu.type` without a count keeps
+the historical single-card constraint; set `gpu.count` too when that exact class should shard.
+
+Set a count only when you want to pin the maximum:
 
 ```toml
 [gpu]
 type = "B200"
 count = 4
-# provider is optional: allocation compares multi-card shapes across every configured provider
-# and picks the cheapest that can rent n cards on one machine. pin one only to force a choice.
+# provider is optional: allocation compares fitting shapes across every configured provider.
 ```
 
-`flash train configs/grpo.toml --gpus 4` sets the same key from the command line, so a config can
-stay at its authored count while one submit asks for more. The flag is exactly `--set
-gpu.count=4`, and the same 1..8 bound rejects a bad value.
+`flash train configs/grpo.toml --gpus 4` sets the same key from the command line. The flag is exactly
+`--set gpu.count=4`, and the same 1..8 bound rejects a bad value.
 
-`gpu.count` is a **ceiling, not an exact count** — by either spelling. Allocation treats it as the
-most cards it may use, and it stops at the first count that fits: a class that fits the run on one
-card is allocated as one card, and a class that needs sharding gets the _smallest_ fitting
-combination, not the count you asked for. `--gpus 4` on a 9B **SFT** run pinned to a 24 GB class
-allocates 2. Eight cards is the public and allocatable maximum; ceilings between powers of two round
+An authored `gpu.count` is a **ceiling, not an exact count**. Allocation never escalates past it, but
+a class that fits with fewer cards may still use fewer. An explicit `count = 1` is therefore a real
+pin: if the run needs two cards, Flash rejects it and names the smallest count that would fit rather
+than silently escalating. Eight cards is the public maximum; ceilings between powers of two round
 down to the next rentable count.
 
-That example is SFT-specific on purpose. The fit test is per algorithm, and the same 9B pinned to
-the same 24 GB class may need a wider combination under GRPO or OPD because rollout memory raises
-the whole-run floor. Raising `--gpus` still cannot rescue a pin the algorithm does not fit on even
-as an 8-card combination.
+The fit test is per algorithm. GRPO and OPD can need a wider combination than SFT because rollout
+memory raises the whole-run floor. Raising `--gpus` still cannot rescue a pin the algorithm does not
+fit on even as an 8-card combination.
 
 **There is no exact-count mechanism.** Pinning a small `[gpu] type` raises the floor above one card
 but still does not pin n — it only moves which combination is smallest. To see what a submit
@@ -1314,15 +1384,42 @@ actually chose, read the `allocated 2x <class> on <provider> at $N/hr` line at t
 log`: the runner writes it when it places the run, so it is there before a worker exists and stays
 there for the life of the run. A single card is spelled without the `Nx` prefix.
 
-Do **not** read the count off `spec.gpu.count` in `flash runs status` — that echoes the ceiling you
-submitted, so it shows 4 even on a run allocated 1 card. `gpu_status.device_count` is a genuine
-worker-side observation, but it is not a reliable place to look either: the mid-run heartbeats
+Do **not** read the allocated count off `spec.gpu.count` in `flash runs status`. It echoes an
+authored ceiling, and an auto-sized public spec retains the digest-stable integer placeholder rather
+than the selected shape. `gpu_status.device_count` is a genuine worker-side observation, but it is
+not a reliable place to look either: the mid-run heartbeats
 (`sft_train`, `opd_step`, `rl_step`) collect diagnostics without torch, and each heartbeat _replaces_
 `gpu_status` wholesale, so the field is usually absent while a run is live and reappears only on the
 terminal heartbeat.
 
-GRPO, SFT and OPD all shard across `gpu.count` with no backend key to set: the worker launches one
-rank per card with Ulysses sequence parallelism.
+GRPO, SFT and OPD all shard across the selected count with no backend key to set, and all three shard
+by **data**: one rank per card, with each rank holding whole sequences. Sequence parallelism is not
+used, because it is wrong for the catalog's GatedDeltaNet models, whose linear attention and causal
+conv carry state along the sequence and so cannot be split mid-sequence across cards. Weights,
+gradients and optimizer state still shard across every card, so multi-card capacity is unchanged.
+
+How the batch reaches those ranks differs. GRPO and OPD bound work by tokens, so the scheduler
+balances the same global batch across the ranks and any card count is usable. SFT splits a fixed
+batch instead, which gives it two things to watch, and the card count has to divide **both** or some
+cards go
+unused: `[train] batch_size`, because a batch verl cannot split evenly would starve a rank, and the
+number of rows the profile retains, because verl's sampler drops the remainder from every epoch
+rather than padding it. The worker trains on the largest number of cards that divides both and
+prints `[sft][warn] training on N of M allocated cards` when that is fewer than you allocated.
+
+The unused cards are still billed, so if you see that line, act on whichever input the warning
+names. Raising `batch_size` only helps when the rows already divide the card count — batch 8 on 4
+cards uses all four at 12 retained rows, but only two at 10, and no batch value fixes that. When
+the rows are the limit, allocate the card count the warning suggests instead; it is always a
+power of two, since those are the shapes providers rent. Batch 2 on 4 cards uses two either way.
+An unpacked run trains one example per update, so it always resolves to a single card whatever
+`batch_size` says — there, allocate one card rather than raising the batch.
+
+One caveat on shrinking the allocation: the cards that joined the run are the ones holding the
+model, so fewer cards can mean less memory, not just a smaller bill. When the suggested count is
+below the ranks you are training on, the warning says "if the run still fits" — check it before
+acting, because a large model can run on the ranks it launched and be rejected on the narrower
+shape. Raising `batch_size` never has this problem: it uses cards you are already paying for.
 
 OPD has one unsupported combination, and because there is no other backend to fall back to it
 raises at startup: a multi-turn env together with `[train] structured_outputs`. Multi-turn OPD
@@ -1349,12 +1446,14 @@ flash whoami                          # confirm which identity/org you are about
 flash env setup                       # scaffold environment.py, dataset/, configs/, this file
 flash env test .                      # load + run the environment locally, before any GPU spend
 flash env push --project <project-uuid> --name my-env .        # publish the environment; paste the returned id into [environment]
-flash env pull your-org/my-env        # download a published environment into the current folder
-flash env delete --project <project-uuid> your-org/my-env -y   # delete a published environment
+flash env pull your-org/your-project/my-env        # download a published environment into the current folder
+flash env delete --project <project-uuid> your-org/your-project/my-env -y   # delete a published environment
+# ^ push/pull/delete act on Freesolo's managed hub. On a self-hosted plane they do not apply:
+#   your environment lives in your own git repo, named directly by [environment] id.
 flash train configs/sft.toml --dry-run # validate the config on the server (no GPU, no charge)
 flash train configs/sft.toml --cost    # pre-flight USD estimate, then exit
 flash train configs/sft.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
-flash train configs/grpo.toml --gpus 4 # shorthand for --set gpu.count=4; a CEILING (needs a multi-card provider)
+flash train configs/grpo.toml --gpus 4 # shorthand for --set gpu.count=4; pins the ceiling
 flash runs status <run-id>                 # state + accrued cost
 flash runs log <run-id>                    # reward/loss trend + worker console/error logs
 flash runs log <run-id> --follow           # stream a live run to completion

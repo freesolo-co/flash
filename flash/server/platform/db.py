@@ -374,81 +374,13 @@ def lookup_key(api_key: str) -> dict | None:
 
 
 def record_run(run_id: str, key_id: int, *, kind: str = "train") -> None:
-    if kind not in {"train", "profile"}:
-        raise ValueError("run kind must be 'train' or 'profile'")
+    if kind != "train":
+        raise ValueError("run kind must be 'train'")
     with _connect() as conn:
         conn.execute(
             "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, ?, ?)",
             (run_id, key_id, kind, time.time()),
         )
-
-
-def claim_profile_run(run_id: str, key_id: int) -> bool:
-    """Take ownership of a profile run, or report that someone already has it.
-
-    Profile run ids are deterministic in the workload, so two owners submitting the same config
-    arrive at the same id by design: that is the reuse the deterministic id exists for. Only the
-    first one records it. The insert has to decide that atomically rather than the caller reading
-    run_owner first, because two concurrent submissions would both read "absent" and the loser
-    would raise on a primary-key that is not actually a defect.
-
-    Returns True when this key now owns the row and is therefore the one that must launch the run.
-    Ownership never transfers on a conflict: run reads are owner-scoped, so the second submitter
-    waits for a run it cannot read, which is what the pending response tells it to do.
-    """
-    with _connect() as conn:
-        cursor = conn.execute(
-            "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, 'profile', ?) "
-            "ON CONFLICT(run_id) DO NOTHING",
-            (run_id, key_id, time.time()),
-        )
-        return cursor.rowcount == 1
-
-
-def reclaim_spent_profile_run(run_id: str, key_id: int, *, spent_at: float) -> bool:
-    """Take over a profile id whose previous run is spent, or report that someone else got there.
-
-    A profile that failed or was cancelled leaves its row behind, and the id is derived from the
-    workload rather than the account, so without a takeover the config becomes permanently
-    unquotable for every user with nothing in the system able to clear it.
-
-    The takeover is a compare-and-swap, not a plain update: an update matching only ``run_id``
-    succeeds for every caller, so two submitters watching the same failed profile would both be
-    told to launch and the workload would be profiled (and billed) twice. Deleting and re-claiming
-    has the mirror problem, since the loser's delete would remove the row the winner just took.
-
-    ``spent_at`` is the ``created_at`` of the spent run the caller actually observed, read from the
-    status store rather than from this table. That distinction is the whole mechanism: this table
-    holds no record of which attempt is spent, so a token re-read from here would be the *winner's*
-    fresh stamp and the next caller's swap would match it just as happily. Anchoring on the spent
-    run means the first takeover moves the row past it and every later attempt misses.
-
-    That comparison rests on one ordering, which the caller must preserve: a claim is always taken
-    before the run it authorizes is created, both here and on the relaunch below. So the claim
-    backing a spent run precedes it, and a claim taken to replace it follows it. Creating a profile
-    run without claiming it first would break the takeover for that id in both directions.
-
-    An unclaimed id is claimed outright rather than reported lost. A previous takeover whose launch
-    failed released its row, leaving the status store still showing the spent run: without the
-    insert every later submitter would keep arriving here, keep matching nothing, and the workload
-    would be wedged by the very path that exists to unwedge it.
-    """
-    with _connect() as conn:
-        cursor = conn.execute(
-            "UPDATE runs SET key_id = ?, created_at = ? "
-            "WHERE run_id = ? AND kind = 'profile' AND created_at <= ?",
-            (key_id, time.time(), run_id, spent_at),
-        )
-        if cursor.rowcount == 1:
-            return True
-        # inline rather than delegating to claim_profile_run: that would open a nested transaction
-        # on this same pooled connection and commit the update above out from under this block.
-        inserted = conn.execute(
-            "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, 'profile', ?) "
-            "ON CONFLICT(run_id) DO NOTHING",
-            (run_id, key_id, time.time()),
-        )
-        return inserted.rowcount == 1
 
 
 def delete_run(run_id: str) -> None:
@@ -604,6 +536,83 @@ def revoke_teacher_capabilities_for_run(run_id: str, *, now: float | None = None
         raise
 
 
+def _readmit_teacher_request(conn, capability, existing, *, admitted_at, charge_tokens) -> dict:
+    """Re-open one existing ledger row as 'reserved' inside the caller's transaction.
+
+    ``charge_tokens`` is True only for 'retryable' rows, whose token reservation was released
+    before dispatch. Transient terminal rows completed after dispatch, so their reservation is
+    still held and only in_flight is re-acquired.
+    """
+    if existing["upstream_attempt_count"] >= capability["max_upstream_attempts"]:
+        # the upstream budget is spent, so readmission is refused before any counter moves: a
+        # readmitted-then-refused row would be bounced back through 'retryable' by the dispatch
+        # path, releasing its held reservation and staying readmissible forever.
+        raise TeacherLedgerError("upstream_attempt_quota_exhausted")
+    if capability["in_flight"] >= capability["max_concurrency"]:
+        raise TeacherLedgerError("broker_busy", retryable=True)
+    token_delta = 0
+    if charge_tokens:
+        token_delta = existing["score_items"] * capability["max_request_tokens"]
+        if capability["token_count"] + token_delta > capability["max_total_tokens"]:
+            raise TeacherLedgerError("token_quota_exhausted")
+    conn.execute(
+        "UPDATE teacher_score_requests SET state = 'reserved', updated_at = ?, "
+        "provider_status = NULL, error_class = NULL WHERE id = ?",
+        (admitted_at, existing["id"]),
+    )
+    conn.execute(
+        "UPDATE teacher_capabilities SET in_flight = in_flight + 1, "
+        "token_count = token_count + ? WHERE id = ?",
+        (token_delta, capability["id"]),
+    )
+    conn.commit()
+    return {
+        "capability": dict(capability),
+        "request": {
+            **dict(existing),
+            "state": "reserved",
+            "updated_at": admitted_at,
+        },
+    }
+
+
+def _resume_existing_teacher_request(conn, capability, existing, *, admitted_at) -> dict:
+    """Resolve one already-known request_id: readmit, replay, or refuse."""
+    state = existing["state"]
+    if state == "retryable":
+        return _readmit_teacher_request(
+            conn, capability, existing, admitted_at=admitted_at, charge_tokens=True
+        )
+    if state in {"reserved", "started"}:
+        raise TeacherLedgerError("request_in_progress", retryable=True)
+    # transient terminal rows readmit for another upstream attempt, bounded by
+    # mark_teacher_request_started. 'provider_rejected' readmits only with the broker's
+    # error_class 'transient' (429/5xx); genuine 4xx stays terminal. 'outcome_unknown'
+    # always readmits, and billed usage lands only on the terminal 'succeeded'
+    # completion, so readmission cannot double-bill.
+    if state == "outcome_unknown" or (
+        state == "provider_rejected" and existing["error_class"] == "transient"
+    ):
+        return _readmit_teacher_request(
+            conn, capability, existing, admitted_at=admitted_at, charge_tokens=False
+        )
+    if state == "succeeded":
+        response_body = existing["response_body"]
+        if (
+            not isinstance(response_body, bytes)
+            or not response_body
+            or len(response_body) > capability["max_response_bytes"]
+        ):
+            raise TeacherLedgerError("replay_unavailable")
+        conn.commit()
+        return {
+            "capability": dict(capability),
+            "request": dict(existing),
+            "response_body": response_body,
+        }
+    raise TeacherLedgerError(state)
+
+
 def reserve_teacher_request(
     *,
     token: str,
@@ -638,49 +647,9 @@ def reserve_teacher_request(
         if existing is not None:
             if existing["request_fingerprint"] != request_fingerprint:
                 raise TeacherLedgerError("request_body_changed")
-            state = existing["state"]
-            if state == "retryable":
-                if capability["in_flight"] >= capability["max_concurrency"]:
-                    raise TeacherLedgerError("broker_busy", retryable=True)
-                request_token_limit = existing["score_items"] * capability["max_request_tokens"]
-                if capability["token_count"] + request_token_limit > capability["max_total_tokens"]:
-                    raise TeacherLedgerError("token_quota_exhausted")
-                conn.execute(
-                    "UPDATE teacher_score_requests SET state = 'reserved', updated_at = ?, "
-                    "provider_status = NULL, error_class = NULL WHERE id = ?",
-                    (admitted_at, existing["id"]),
-                )
-                conn.execute(
-                    "UPDATE teacher_capabilities SET in_flight = in_flight + 1, "
-                    "token_count = token_count + ? WHERE id = ?",
-                    (request_token_limit, capability["id"]),
-                )
-                conn.commit()
-                return {
-                    "capability": dict(capability),
-                    "request": {
-                        **dict(existing),
-                        "state": "reserved",
-                        "updated_at": admitted_at,
-                    },
-                }
-            if state in {"reserved", "started"}:
-                raise TeacherLedgerError("request_in_progress", retryable=True)
-            if state == "succeeded":
-                response_body = existing["response_body"]
-                if (
-                    not isinstance(response_body, bytes)
-                    or not response_body
-                    or len(response_body) > capability["max_response_bytes"]
-                ):
-                    raise TeacherLedgerError("replay_unavailable")
-                conn.commit()
-                return {
-                    "capability": dict(capability),
-                    "request": dict(existing),
-                    "response_body": response_body,
-                }
-            raise TeacherLedgerError(state)
+            return _resume_existing_teacher_request(
+                conn, capability, existing, admitted_at=admitted_at
+            )
         if request_bytes > capability["max_request_bytes"]:
             raise TeacherLedgerError("request_too_large")
         request_token_limit = int(score_items) * capability["max_request_tokens"]

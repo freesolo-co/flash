@@ -19,8 +19,8 @@ SPEC = {
     "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
     # A hub slug, because this fixture drives the HOSTED api: the managed plane accepts
-    # `namespace/name` only, and a `github:` ref is refused at submit (see test_server_standalone).
-    "environment": {"id": "acme/gsm8k"},
+    # `namespace/project/name` only, and a `github:` ref is refused at submit (see test_server_standalone).
+    "environment": {"id": "acme/example-project/gsm8k"},
     "train": {"epochs": 1, "max_examples": 1},
     "gpu": {},
 }
@@ -544,6 +544,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
         # image-bearing OPD is single-turn only, so a multi-turn environment carrying an image
         # record can never launch regardless of the org's balance.
         "algorithm": "opd",
+        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
         "environment": {
             **SPEC["environment"],
             "params": {
@@ -572,7 +573,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     )
 
     assert res.status_code == 400, res.text
-    assert "image-bearing opd is not supported" in res.text
+    assert "multi-turn image-bearing opd is not supported" in res.text
     assert "insufficient" not in res.text
 
 
@@ -668,171 +669,7 @@ def test_record_run_failure_does_not_submit(api, monkeypatch):
     assert "database is locked" in res.json()["detail"]
 
 
-def _pending_profile(monkeypatch, *, profile_run_id: str, estimate_usd: float = 0.25):
-    """Make every submission miss its profile, so the route takes the pending branch.
-
-    Returns the list every ``submit_job`` call is appended to, so a test can prove what was
-    launched and what was not.
-    """
-    from dataclasses import replace as _replace
-
-    import flash.runner as runner
-    import flash.server.app as app_mod
-
-    submitted: list = []
-
-    def prepare(spec, **_kwargs):
-        profile_spec = _replace(
-            spec,
-            run_id=profile_run_id,
-            workload_profile_kind="sft",
-            workload_profile_input_digest="c" * 64,
-            workload_profile_producer_version="1.2.3",
-        )
-        raise runner.WorkloadProfilePending(
-            profile_run_id,
-            "required",
-            prepared_job=runner.PreparedJob(
-                public_spec=profile_spec,
-                worker_spec=profile_spec,
-                estimated_cost_usd=estimate_usd,
-            ),
-        )
-
-    monkeypatch.setattr(app_mod, "prepare_job", prepare)
-    monkeypatch.setattr(app_mod, "submit_job", lambda spec, **kw: submitted.append((spec, kw)))
-    return submitted
-
-
 _SFT_SPEC = {**SPEC, "algorithm": "sft", "train": {"epochs": 1, "max_examples": 8}}
-
-
-def test_a_profile_is_prechecked_and_persisted_as_its_own_charge(api, monkeypatch):
-    """The profile is a separate job, so it gets its own affordability check at its own estimate.
-
-    Charging it against the training estimate would gate a $0.25 cpu job on whether the org can
-    afford the gpu run it has not been quoted for yet -- and would bill the two as one.
-    """
-    import flash.server.billing.charges as billing_mod
-    from flash.server.platform import db
-
-    profile_run_id = "profile-sft-" + "c" * 64
-    submitted = _pending_profile(monkeypatch, profile_run_id=profile_run_id)
-    prechecked = []
-    monkeypatch.setattr(
-        billing_mod,
-        "precheck_training_run",
-        lambda **kw: prechecked.append(kw["estimate_usd"]) or {"ok": True},
-    )
-
-    res = api.post("/v1/runs", json={"spec": _SFT_SPEC}, headers=_bearer("fslo-user-1"))
-
-    assert res.status_code == 409, res.text
-    # exactly one precheck, at the profile's own quote -- not the training run's.
-    assert prechecked == [0.25]
-    assert [r["run_id"] for r in db.all_runs()] == [profile_run_id]
-    assert [r["kind"] for r in db.all_runs()] == ["profile"]
-    assert len(submitted) == 1
-
-
-def test_an_unaffordable_profile_leaves_no_run_and_no_launch(api, monkeypatch):
-    """402 on the profile must not leave the deterministic id claimed by a run that never started.
-
-    The id is global to the workload, so a stranded row is not one user's problem: every later
-    submitter of this config would be told to wait for a profile nobody is running.
-    """
-    import flash.server.billing.charges as billing_mod
-    from flash.server.platform import db
-
-    profile_run_id = "profile-sft-" + "c" * 64
-    submitted = _pending_profile(monkeypatch, profile_run_id=profile_run_id)
-
-    def _block(**_kw):
-        raise billing_mod.BillingError(402, "insufficient balance")
-
-    monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
-
-    res = api.post("/v1/runs", json={"spec": _SFT_SPEC}, headers=_bearer("fslo-user-1"))
-
-    assert res.status_code == 402, res.text
-    assert db.all_runs() == []
-    assert submitted == []
-
-
-def test_a_profile_that_cannot_be_launched_releases_its_claim(api, monkeypatch):
-    """Same invariant on the other failure: the claim is released when the launch does not happen."""
-    import flash.server.app as app_mod
-    from flash.server.platform import db
-
-    profile_run_id = "profile-sft-" + "c" * 64
-    _pending_profile(monkeypatch, profile_run_id=profile_run_id)
-    monkeypatch.setattr(
-        app_mod,
-        "submit_job",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("provider out of capacity")),
-    )
-
-    res = api.post("/v1/runs", json={"spec": _SFT_SPEC}, headers=_bearer("fslo-user-1"))
-
-    assert res.status_code == 400, res.text
-    assert db.all_runs() == []
-
-
-def test_a_profile_that_failed_after_persisting_its_run_keeps_its_claim(api, monkeypatch, tmp_path):
-    """Keep the claim when launch already persisted its queued run.
-
-    Deleting it makes the owner read 404 while later submitters wait on the live deterministic id,
-    which has no terminal-state takeover path.
-    """
-    import os
-
-    import flash.server.app as app_mod
-    from flash.runner import runs_file_path
-    from flash.server.platform import db
-
-    profile_run_id = "profile-sft-" + "c" * 64
-    _pending_profile(monkeypatch, profile_run_id=profile_run_id)
-
-    def submit_then_fail(*_a, **_k):
-        # stand in for submit_job's real ordering: status on disk, then a raise from _report_status
-        # or the thread start below it.
-        path = runs_file_path(profile_run_id, ".json")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump({"run_id": profile_run_id, "state": "queued"}, f)
-        raise RuntimeError("status reporter unreachable")
-
-    monkeypatch.setattr(app_mod, "submit_job", submit_then_fail)
-
-    res = api.post("/v1/runs", json={"spec": _SFT_SPEC}, headers=_bearer("fslo-user-1"))
-
-    assert res.status_code == 400, res.text
-    assert [r["run_id"] for r in db.all_runs()] == [profile_run_id], (
-        "the claim was deleted for a run that exists, so its owner reads 404 while later "
-        "submitters wait on it forever"
-    )
-
-
-def test_a_profile_miss_creates_no_training_run_and_no_training_charge(api, monkeypatch):
-    """The user asked to train and was not charged for training: no run, no billing context.
-
-    This is the invariant that makes a separate profile charge defensible. If a miss also recorded
-    a training run, the profile would be a surcharge on top of the run rather than its own job.
-    """
-    from flash.server.platform import db
-
-    profile_run_id = "profile-sft-" + "c" * 64
-    _pending_profile(monkeypatch, profile_run_id=profile_run_id)
-
-    res = api.post("/v1/runs", json={"spec": _SFT_SPEC}, headers=_bearer("fslo-user-1"))
-
-    assert res.status_code == 409, res.text
-    assert res.json()["detail"]["code"] == "workload_profile_pending"
-    # every persisted row, not just this user's: the one record is the profile, under the kind that
-    # separates it. a training row here would mean the profile became a surcharge on a run the
-    # user was never quoted. the run LISTING is not the instrument -- it reads the status store,
-    # which the stubbed submit never writes, so it would read empty either way.
-    assert [(r["run_id"], r["kind"]) for r in db.all_runs()] == [(profile_run_id, "profile")]
 
 
 def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):

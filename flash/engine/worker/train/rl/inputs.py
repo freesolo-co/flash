@@ -20,11 +20,12 @@ from flash.content.structured_outputs import (
     describe_structured_outputs,
     parse_structured_outputs,
 )
-from flash.core.spec import DEFAULT_CREDIT_ASSIGNMENT
+from flash.core.spec import DEFAULT_CREDIT_ASSIGNMENT, gpu_count_of
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import (
     on_policy_steps,
     resolve_update_horizon,
+    rl_data_parallel_cards,
     validate_save_steps,
 )
 from flash.engine.worker.backend_common import clamp_engine_len
@@ -127,8 +128,8 @@ def _resolve_grpo_options(train_spec, rl, multi_turn):
         )
     gcfg = _w.grpo_overrides()
     prompts_per_step = int(
-        train_spec.batch_size
-        if train_spec and train_spec.batch_size is not None
+        train_spec.prompts_per_step
+        if train_spec and train_spec.prompts_per_step is not None
         else rl.prompts_per_step
     )
     group_size = int(gcfg.get("group_size") or rl.group_size)
@@ -207,10 +208,11 @@ def _grpo_is_multimodal(train, message_prompts):
 
 
 def _resolve_sequence_lengths(model_id, model_revision, train_spec, rl, gcfg, tok, multi_turn):
-    max_completion = int(
-        gcfg.get("max_tokens")
-        or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
-    )
+    # same resolver the spec-parse prompt-budget guard uses, so a run rejected at submit is exactly
+    # the run this would have failed here after the gpu was already paid for.
+    from flash.engine.plan.vram import grpo_completion_len
+
+    max_completion = grpo_completion_len(gcfg.get("max_tokens"), bool(_w.THINKING))
     train_ctx = (
         train_spec.max_context_tokens if (train_spec and train_spec.max_context_tokens) else 0
     )
@@ -407,6 +409,16 @@ def _assemble_grpo_inputs(
         "prompts": prompts,
         "prompts_per_step": schedule["prompts_per_step"],
         "group_size": options["group_size"],
+        # the ranks this attempt launches verl at, resolved ONCE here because two phases ask: the
+        # child config (`_configure_rl_child`) and the resume probe, which discards a checkpoint whose
+        # shard count disagrees with the width it is handed. deriving it twice from the raw knobs let
+        # them drift -- resume compared the RENTED count while the child launched the clamped one, so
+        # a checkpoint written at the executed width read as the wrong topology and every retry
+        # restarted from step 0. opd binds one value for both phases; this is grpo's.
+        "dp_cards": rl_data_parallel_cards(
+            gpu_count_of(_w.JOB_SPEC),
+            int(schedule["prompts_per_step"]) * int(options["group_size"]),
+        ),
         "mask_truncated_completions": options["mask_truncated_completions"],
         "temperature": options["temperature"],
         "top_p": float(RECIPE.rl.sampling_top_p),
@@ -500,7 +512,11 @@ def _resolve_grpo_inputs():
 
         # the model must actually support image training; this raises for a text-only checkpoint
         # rather than letting the processor silently drop the pixels.
-        validate_multimodal_training(model_id, "grpo")
+        validate_multimodal_training(
+            model_id,
+            "grpo",
+            getattr(_t, "teacher_model", None),
+        )
         from transformers import AutoProcessor
 
         processor = AutoProcessor.from_pretrained(

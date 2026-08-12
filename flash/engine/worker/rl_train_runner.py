@@ -16,14 +16,21 @@ from dataclasses import dataclass, field
 from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.result.rollout_samples import sample_completion_text, sanitize_rollout_text
 from flash.engine.worker.backend_common import (
+    SHIM_FRAGMENT_FAILED_EXIT_CODE,
     adopt_orphaned_descendants,
     append_step_metrics,
     latest_global_step_dir,
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
+    render_shim_marker_prologue,
     render_tf32_shim,
+    render_tilelang_cudart_shim,
     render_wandb_link_shim,
+    shim_marker_file,
+    verify_applied_shim_markers,
+    verl_device_capability,
+    wrap_shim_fragment,
 )
 from flash.engine.worker.io.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
@@ -134,7 +141,11 @@ def _prepare_rl_files(inp, prompts):
     # restore after the wipe, never before: the wipe is what makes a stale local dir safe, and the
     # resume checkpoint is the one global_step_N this attempt is entitled to start from.
     os.makedirs(local_dir, exist_ok=True)
-    resume_step = _rl_train()._restore_verl_resume(local_dir)
+    # the same value `_build_verl_training_cfg` turns into n_gpus, so the width compared here is the
+    # width this attempt actually launches verl at. NOT the rented card count: the clamp that bounds
+    # the launch by the step's sequences can make those differ, and a mismatch here silently discards
+    # a loadable checkpoint and restarts the run from step 0.
+    resume_step = _rl_train()._restore_verl_resume(local_dir, world_size=int(inp["dp_cards"]))
     train_pq = os.path.join(workdir, "train.parquet")
     val_pq = os.path.join(workdir, "val.parquet")
     reward_py = os.path.join(workdir, "reward.py")
@@ -163,6 +174,11 @@ def _prepare_rl_files(inp, prompts):
     # keep patching this one, so the file is rewritten every time.
     shim_dir = os.path.join(workdir, "shim")
     os.makedirs(shim_dir, exist_ok=True)
+    # the marker file the child's wrapped fragments append to. a stale one from a prior attempt
+    # would prove patches this attempt never applied, so it is removed alongside the rewrite.
+    shim_markers = shim_marker_file(shim_dir)
+    if os.path.exists(shim_markers):
+        os.remove(shim_markers)
     return {
         "rollout_examples": rollout_examples,
         "message_prompts": message_prompts,
@@ -174,32 +190,56 @@ def _prepare_rl_files(inp, prompts):
         "reward_py": reward_py,
         "shim_dir": shim_dir,
         "shim_py": os.path.join(shim_dir, "sitecustomize.py"),
+        "shim_markers": shim_markers,
     }
 
 
-def _write_rl_shim(inp, files) -> None:
+def _write_rl_shim(inp, files) -> list[str]:
+    """write the child sitecustomize; return the marker names it must prove applied.
+
+    every correctness-critical fragment is wrapped fail-closed (see wrap_shim_fragment): cpython's
+    execsitecustomize would otherwise swallow a fragment's exception and let the child train
+    unpatched, with every fragment after the failing one silently skipped too.
+    """
     # one sitecustomize holds every patch: python imports it once, so a second file would never be
     # loaded. each feature renderer returns "" when its feature is off; the tf32 fragment is
     # unconditional, so this source is never empty.
+    required_fragments = [
+        (
+            "reentrant-checkpointing",
+            render_reentrant_checkpointing_shim(
+                inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"])
+            ),
+        ),
+        ("entropy-quantile", render_entropy_quantile_shim(inp["entropy_quantile"])),
+        ("per-turn-credit", render_per_turn_credit_shim(inp["per_turn_credit"])),
+        ("stop-sequences", render_stop_sequences_shim(inp["stop_sequences"])),
+        ("image-pad-ban", render_image_pad_ban_shim(inp["image_pad_token_id"])),
+        ("structured-outputs", render_structured_outputs_shim(inp["structured_outputs"])),
+        ("exact-save-steps", render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"])),
+        (
+            "kl-ref-adapter",
+            render_kl_ref_adapter_shim(
+                bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0
+            ),
+        ),
+    ]
     shim_source = "".join(
         part
         for part in (
             # first: torch's matmul flags are process-wide state, and reading them back is how the
             # rest of the child sees the choice. nothing below depends on it, but a later fragment
-            # that raised would otherwise cost the whole run its tensor-core throughput.
+            # that raised would otherwise cost the whole run its tensor-core throughput. tf32, the
+            # tilelang cudart repoint and the wandb link stay unwrapped on purpose: all three
+            # swallow their own failures by design and none may abort a paid run.
             render_tf32_shim(),
-            render_reentrant_checkpointing_shim(
-                inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"])
-            ),
-            render_entropy_quantile_shim(inp["entropy_quantile"]),
-            render_per_turn_credit_shim(inp["per_turn_credit"]),
-            render_stop_sequences_shim(inp["stop_sequences"]),
-            render_image_pad_ban_shim(inp["image_pad_token_id"]),
-            render_structured_outputs_shim(inp["structured_outputs"]),
-            render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"]),
-            render_kl_ref_adapter_shim(
-                bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0
-            ),
+            # before anything that can import vllm -- so above the wrapped fragments too. the
+            # fragment repoints tilelang's libcudart stub on disk, and vllm's CuMemAllocator binds
+            # libcudart the first time a sleeping engine is built. after the stub is already mapped
+            # into this process there is nothing left to fix.
+            render_tilelang_cudart_shim(),
+            render_shim_marker_prologue(files["shim_markers"]),
+            *(wrap_shim_fragment(name, source) for name, source in required_fragments),
             # gated on the key rather than the resolved logger list: that list needs python_bin,
             # which is resolved after this file is written. the shim is inert either way -- it only
             # fires when verl actually calls wandb.init, which requires wandb in the logger list.
@@ -214,11 +254,12 @@ def _write_rl_shim(inp, files) -> None:
     # import it (see copy_multi_turn_child_modules for why it is a copy and not an import).
     if inp["multi_turn"]:
         copy_multi_turn_child_modules(files["shim_dir"])
+    return [name for name, source in required_fragments if source]
 
 
 def _prepare_rl_runtime(inp, env, tok, prompts):
     files = _prepare_rl_files(inp, prompts)
-    _write_rl_shim(inp, files)
+    files["expected_shims"] = _write_rl_shim(inp, files)
     return files, _start_reward_runtime(inp, env, tok, prompts, files)
 
 
@@ -320,14 +361,12 @@ def _resolve_training_settings(inp, caps):
     # fp8 kv cache on ada/hopper+ (cc>=8.9), matching the sizing math in engine/vram.py. NOT for
     # hybrid linear-attention (GDN) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a
     # plain kv tensor and crashes on the hybrid cache ('list' has no zero_) under verl sleep/wake.
-    try:
-        import torch as torch_cc
-
-        cc_ok = bool(
-            torch_cc.cuda.is_available() and torch_cc.cuda.get_device_capability() >= (8, 9)
-        )
-    except Exception:  # no cuda / probe failure -> conservative bf16 kv
-        cc_ok = False
+    # resolved from the out-of-process capability probe, never by opening cuda in this parent:
+    # a context initialized here to answer one question is retained for the process lifetime, on
+    # the same devices the verl child is about to own, which is unbudgeted vram against a reserve
+    # sized without it (see fused_ce_backend). an unanswerable probe means conservative bf16 kv.
+    verl_cc = verl_device_capability(caps)
+    cc_ok = verl_cc is not None and verl_cc >= (8, 9)
     return expected_steps, loggers, project_name, experiment_name, cc_ok
 
 
@@ -454,7 +493,15 @@ def _ingest_step_metrics(
 
 
 def _execute_rl_child(
-    *, python_bin, overrides, env_for_verl, inp, state, reward_runtime, _reward_observability
+    *,
+    python_bin,
+    overrides,
+    env_for_verl,
+    inp,
+    state,
+    reward_runtime,
+    _reward_observability,
+    files=None,
 ) -> int:
     # claimed before the child exists, so a grandchild it orphans reparents here and can be
     # reaped at teardown. this process is not pid 1 (the runpod handler is), so without it
@@ -471,6 +518,9 @@ def _execute_rl_child(
     child_stream = _rl_train()._GrpoSubprocessStream(proc)
     step_re = re.compile(r"step:\s*(\d+)")
     progress, last_dump_step = state.progress, state.last_dump_step
+    shim_markers = (files or {}).get("shim_markers")
+    expected_shims = (files or {}).get("expected_shims", ())
+    shims_verified = shim_markers is None
     try:
         for line in child_stream:
             print(f"[verl] {line}", end="", flush=True)
@@ -480,6 +530,13 @@ def _execute_rl_child(
             m = step_re.search(line)
             if m:
                 progress["step"] = int(m.group(1))
+                # the first step line is the training-start boundary: sitecustomize import is long
+                # finished by then, so a marker still missing means this child is training with no
+                # flash patch at all, so fail now rather than after the whole run is paid for. not
+                # on the first output line: fragments print while later ones are still applying.
+                if not shims_verified:
+                    verify_applied_shim_markers(shim_markers, expected_shims)
+                    shims_verified = True
                 # dump one sample completion per new step to the flash log (#607).
                 if progress["step"] != last_dump_step[0]:
                     # the generation boundary: verl logs this line once its step is scored, so
@@ -513,11 +570,26 @@ def _execute_rl_child(
         raise
 
 
-def _validate_rl_child(rc, state, resume_step, expected_steps, resume_uploader) -> None:
+def _validate_rl_child(rc, state, resume_step, expected_steps, resume_uploader, *, files=None):
+    if rc == SHIM_FRAGMENT_FAILED_EXIT_CODE:
+        # the wrapped fragment printed its traceback and named itself before exiting; classify
+        # this as permanent, not retriable infra: the same interpreter fails identically on
+        # retry. a foreign FLASH_VERL_PYTHON or a drifted verl/transformers is the usual cause.
+        raise RuntimeError(
+            f"verl.trainer.main_ppo exited {rc}: a required flash runtime patch failed to apply "
+            "in the child interpreter (its traceback names the fragment in the flash log). the "
+            "verl/transformers stack at the child python is incompatible with this flash "
+            "version; rebuild the worker image or fix FLASH_VERL_PYTHON rather than retrying."
+        )
     if rc != 0:
         raise RuntimeError(
             f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback"
         )
+    # belt and braces behind the first-step check in _execute_rl_child: a run that exits 0 without
+    # printing a step line (a resume already at the horizon) still may not pass unverified.
+    shim_markers = (files or {}).get("shim_markers")
+    if shim_markers is not None:
+        verify_applied_shim_markers(shim_markers, (files or {}).get("expected_shims", ()))
     # the gradient verdict runs here, ahead of required-save completeness, because a zero-spread
     # run withholds every required deployable BY DESIGN: checking completeness first would raise
     # on artifacts the gate is deliberately holding and report a checkpoint-publication failure

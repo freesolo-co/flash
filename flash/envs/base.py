@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
+
+from flash._internal.channel import CLI_NAME
 
 # the two units reward scoring overlaps, kept together so the difference between them is a decision
 # rather than a coincidence of where each was written.
@@ -149,12 +151,54 @@ class BaseEnvironment:
         return bool(gold) and gold in (completion or "")
 
 
-FREESOLO_WORKER_SPEC = "freesolo>=0.4.0"
+def with_system_prompt(messages: list[dict], contract_text: str) -> list[dict]:
+    """Ensure the training contract rides as the system prompt (fill blank / prepend).
+
+    Shared, not duplicated: the control-plane quote and the worker must place the contract
+    identically or they tokenize different prompts, and the frozen quote is the invoice.
+    """
+    system_text = str(contract_text or "").strip()
+    out = [dict(message) for message in messages]
+    if not system_text:
+        return out
+    first_blank_system_index: int | None = None
+    for index, message in enumerate(out):
+        if str(message.get("role") or "").strip().lower() != "system":
+            continue
+        content = message.get("content")
+        has_content = bool(content.strip()) if isinstance(content, str) else bool(content)
+        if has_content:
+            return out
+        if first_blank_system_index is None:
+            first_blank_system_index = index
+    if first_blank_system_index is not None:
+        out[first_blank_system_index]["content"] = system_text
+        return out
+    return [{"role": "system", "content": system_text}, *out]
+
+
+FREESOLO_WORKER_SPEC = "freesolo>=0.4.1"
 
 
 def worker_pip_for_env(env_id: str) -> list[str]:
     """Pip deps the GPU worker needs to run a Freesolo environment."""
     return [FREESOLO_WORKER_SPEC]
+
+
+def worker_pip_with_extras(env_id: str, extras: Iterable[str] | None) -> list[str]:
+    """Worker requirements plus the author's ``[environment] pip``, in install order.
+
+    The worker requirement stays first and is never displaced: a scorer's third-party dependency is
+    additional to what Flash's own worker needs, not a replacement for it. Exact repeats are dropped
+    so restating the worker spec cannot install it twice; a conflicting version pin is left for pip
+    to resolve and report, which it does with a clearer message than a guard here could.
+    """
+    combined = list(worker_pip_for_env(env_id))
+    for item in extras or ():
+        requirement = str(item).strip()
+        if requirement and requirement not in combined:
+            combined.append(requirement)
+    return combined
 
 
 def load_environment(
@@ -167,8 +211,8 @@ def load_environment(
     if not env_id:
         raise ValueError(
             "no environment specified: set [environment] id to the id returned by "
-            "`flash env push --project <project-uuid> --name <name>` "
-            "(for example 'your-name/your-env')"
+            f"`{CLI_NAME} env push --project <project-uuid> --name <name>` "
+            "(for example 'your-org/your-project/your-env')"
         )
     # resolved_sha is positional-only so a user param named "resolved_sha" can't shadow it.
     return load_freesolo_environment(env_id, resolved_sha or None, **params)

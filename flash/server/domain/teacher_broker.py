@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
-import hmac
 import http.client
 import json
 import math
 import os
-import re
 import sqlite3
 import time
 import urllib.parse
@@ -19,6 +16,45 @@ from typing import Any
 from flash._internal.fileio import reject_duplicate_keys
 from flash.core.spec import PUBLIC_URL_ENV, TEACHER_CAPABILITY_ENV, JobSpec
 from flash.engine.plan.recipe import RECIPE, resolve_teacher
+from flash.server.domain.teacher_errors import TeacherBrokerError, ValidatedCompletionRequest
+from flash.server.domain.teacher_requests import (
+    CAPABILITY_PATTERN,
+    REQUEST_ID_PATTERN,
+    _canonical_json,
+    _reject_nonfinite,
+    parse_strict_json,
+    request_fingerprint,
+    validate_capability_token,
+    validate_chat_completion_request,
+    validate_completion_request,
+    validate_request_id,
+)
+
+# the validation half moved to `teacher_requests`, but routes and tests reach these names through
+# THIS module (`teacher_broker.validate_completion_request`, and patch seams like
+# `teacher_broker._provider_chat_post`). re-export so the split stays invisible to callers; the
+# names below are unused in this file by design, which is what __all__ tells ruff.
+__all__ = [
+    "CAPABILITY_PATTERN",
+    "REQUEST_ID_PATTERN",
+    "TeacherBrokerError",
+    "ValidatedCompletionRequest",
+    "authenticate_teacher_capability",
+    "capability_limits_for_spec",
+    "complete_teacher_chat_request",
+    "complete_teacher_request",
+    "issue_teacher_capability",
+    "parse_strict_json",
+    "request_fingerprint",
+    "require_teacher_broker_configuration",
+    "resolve_public_url",
+    "teacher_attempt_transport",
+    "validate_capability_token",
+    "validate_chat_completion_request",
+    "validate_completion_request",
+    "validate_public_url",
+    "validate_request_id",
+]
 from flash.server.platform import db
 from flash.teacher.limits import (
     OPD_TEACHER_SCORING_CONCURRENCY,
@@ -29,53 +65,43 @@ from flash.teacher.limits import (
 PARASAIL_PROVIDER = "parasail"
 PARASAIL_ORIGIN = "https://api.parasail.io"
 PARASAIL_COMPLETIONS_PATH = "/v1/completions"
+PARASAIL_CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 PARASAIL_SCORING_MODE = "supplied_token_completion_v1"
 PARASAIL_API_KEY_ENV = "PARASAIL_API_KEY"
 
 MAX_REQUEST_BODY_BYTES = 48 * 1024 * 1024
 MAX_RESPONSE_BODY_BYTES = 32 * 1024 * 1024
 MAX_PROVIDER_ERROR_BODY_BYTES = 64 * 1024
-MAX_UPSTREAM_ATTEMPTS = 1
+# per-logical-request upstream attempt budget, enforced by mark_teacher_request_started.
+# retries reuse the request_id, so they spend this budget rather than the request/score-item
+# quotas, and the no-signal replacement multiplier composes with it instead of multiplying it.
+# kept equal to the worker client's max_retries so neither side retries past the other.
+MAX_UPSTREAM_ATTEMPTS = 4
 MAX_REQUEST_TOKENS = 131_072
 MAX_TOTAL_SCORE_ITEMS = 1_000_000
 MAX_TOTAL_REQUESTS = 1_000_000
 MAX_TOTAL_TOKENS = 2_000_000_000
 MAX_CAPABILITY_LIFETIME_S = 24 * 60 * 60
 MAX_PROVIDER_TIMEOUT_S = 90.0
-REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._~-]{16,128}\Z")
-CAPABILITY_PATTERN = re.compile(r"[A-Za-z0-9_-]{40,128}\Z")
 
 
-class TeacherBrokerError(RuntimeError):
-    def __init__(
-        self,
-        code: str,
-        *,
-        status_code: int,
-        retryable: bool = False,
-        request_id: str | None = None,
-    ) -> None:
-        super().__init__(code)
-        self.code = code
-        self.status_code = status_code
-        self.retryable = retryable
-        self.request_id = request_id
+class TeacherBrokerConfigurationError(RuntimeError):
+    """A submit-time managed-teacher gate rejection whose message is safe to show the submitter.
 
-    def payload(self) -> dict[str, Any]:
-        error: dict[str, Any] = {
-            "code": self.code,
-            "classification": "transient" if self.retryable else "permanent",
-        }
-        if self.request_id is not None:
-            error["request_id"] = self.request_id
-        return {"error": error}
+    The generic run-failure handler redacts ``str(exc)`` on purpose: an arbitrary exception can name
+    internal storage paths, provider internals, or upstream bodies. These messages are authored
+    here, contain no such detail, and are the only thing that distinguishes a plane misconfiguration
+    from a bad spec -- so this type opts them back in to being surfaced rather than swallowed.
 
+    ``plane_fault`` carries which side is at fault. The submitter cannot fix an unset plane-side
+    credential by editing their config, so reporting it as a client error would re-create the same
+    conflation one layer up: a spec the user must change and an outage they can only wait out would
+    again be indistinguishable.
+    """
 
-@dataclass(frozen=True)
-class ValidatedCompletionRequest:
-    body: dict[str, Any]
-    canonical_body: bytes
-    score_items: int
+    def __init__(self, message: str, *, plane_fault: bool = False) -> None:
+        super().__init__(message)
+        self.plane_fault = plane_fault
 
 
 @dataclass(frozen=True)
@@ -94,12 +120,15 @@ def validate_public_url(value: str) -> str:
     # the gpu is already allocated, and a zero one is in range but falsy, so the `parsed.port or
     # 443` at engine/worker/teacher/client.py silently dials 443 instead of the configured port.
     invalid_port = f"{PUBLIC_URL_ENV} must be a worker-reachable https URL with a valid port"
+    # these messages name the env var and the shape rule only -- never the configured value, which
+    # can embed credentials -- so they stay safe to surface to the submitter verbatim. every one is
+    # plane_fault: the only production caller is resolve_public_url, reading the plane's own env.
     try:
         port = parsed.port
     except ValueError as error:
-        raise RuntimeError(invalid_port) from error
+        raise TeacherBrokerConfigurationError(invalid_port, plane_fault=True) from error
     if port == 0:
-        raise RuntimeError(invalid_port)
+        raise TeacherBrokerConfigurationError(invalid_port, plane_fault=True)
     if (
         parsed.scheme != "https"
         or not parsed.hostname
@@ -108,9 +137,10 @@ def validate_public_url(value: str) -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise RuntimeError(
+        raise TeacherBrokerConfigurationError(
             f"{PUBLIC_URL_ENV} must be a worker-reachable https URL without credentials, "
-            "query parameters, or a fragment"
+            "query parameters, or a fragment",
+            plane_fault=True,
         )
     return url
 
@@ -137,26 +167,55 @@ def require_teacher_broker_configuration(
     now: float | None = None,
 ) -> str:
     if spec.algorithm != "opd":
-        raise RuntimeError("teacher broker configuration is only valid for opd runs")
+        raise TeacherBrokerConfigurationError(
+            "teacher broker configuration is only valid for opd runs"
+        )
     public_url = resolve_public_url()
     if not os.environ.get(PARASAIL_API_KEY_ENV, "").strip():
-        raise RuntimeError(
-            f"{PARASAIL_API_KEY_ENV} is required on the control plane for managed opd teachers"
+        raise TeacherBrokerConfigurationError(
+            f"{PARASAIL_API_KEY_ENV} is required on the control plane for managed opd teachers",
+            plane_fault=True,
         )
     teacher = resolve_teacher(spec.train.teacher_model)
-    if teacher.alias not in {"kimi-k3", "glm-5.2", "qwen3.5-397b-a17b", "deepseek-v4-pro"}:
-        raise RuntimeError("the selected managed teacher is not supported by the Parasail broker")
+    if teacher.alias not in {
+        "kimi-k3",
+        "glm-5.2",
+        "qwen3.5-397b-a17b",
+        "deepseek-v4-pro",
+        "qwen3-vl-235b",
+    }:
+        raise TeacherBrokerConfigurationError(
+            "the selected managed teacher is not supported by the Parasail broker"
+        )
     capability_limits_for_spec(spec)
     if deadline_at is not None:
         current = time.time() if now is None else float(now)
         deadline = float(deadline_at)
         if not math.isfinite(current) or not math.isfinite(deadline) or deadline <= current:
-            raise RuntimeError("the run deadline leaves no valid teacher capability lifetime")
+            raise TeacherBrokerConfigurationError(
+                "the run deadline leaves no valid teacher capability lifetime"
+            )
         if deadline - current > MAX_CAPABILITY_LIFETIME_S:
-            raise RuntimeError(
+            raise TeacherBrokerConfigurationError(
                 "managed opd teacher capabilities are limited to a 24-hour run deadline"
             )
     return public_url
+
+
+def preflight_validate_managed_teacher(spec: JobSpec) -> None:
+    """Validate the managed-teacher gate at submit, before a run record exists.
+
+    The same checks run again before allocation (that is what actually protects a paid worker), but
+    running them here too means a `--dry-run` reports a plane misconfiguration or an unsupported
+    teacher/shape instead of validating clean and then failing seconds after a real submit.
+
+    Deadline-dependent policy is deliberately excluded: the run deadline is derived from the status
+    record this runs ahead of. `capability_limits_for_spec` already rejects a `gpu.max_wall_seconds`
+    over the capability lifetime, so the only gap is the queue allowance, which is not knowable yet.
+    """
+    if spec.algorithm != "opd":
+        return
+    require_teacher_broker_configuration(spec)
 
 
 def capability_limits_for_spec(spec: JobSpec) -> dict[str, int]:
@@ -178,7 +237,7 @@ def capability_limits_for_spec(spec: JobSpec) -> dict[str, int]:
     from flash.engine.plan.vram import opd_completion_len
 
     steps = int(spec_steps(spec))
-    prompts_per_step = int(spec.train.batch_size or RECIPE.opd.prompts_per_step)
+    prompts_per_step = int(spec.train.prompts_per_step or RECIPE.opd.prompts_per_step)
     group_size = int(spec.train.group_size or RECIPE.opd.group_size)
     base_items = steps * max(1, prompts_per_step) * max(1, group_size)
     multi_turn, max_turns = configured_opd_turn_limit(spec.environment)
@@ -274,109 +333,6 @@ _reject_duplicate_keys = reject_duplicate_keys(
 )
 
 
-def _reject_nonfinite(_value: str) -> None:
-    raise TeacherBrokerError("non_finite_number", status_code=400)
-
-
-def parse_strict_json(raw: bytes | bytearray) -> dict[str, Any]:
-    if len(raw) > MAX_REQUEST_BODY_BYTES:
-        raise TeacherBrokerError("request_too_large", status_code=413)
-    try:
-        value = json.loads(
-            raw.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=_reject_nonfinite,
-        )
-    except TeacherBrokerError:
-        raise
-    except (TypeError, ValueError) as exc:
-        raise TeacherBrokerError("invalid_json", status_code=400) from exc
-    if not isinstance(value, dict):
-        raise TeacherBrokerError("request_must_be_object", status_code=400)
-    return value
-
-
-def _canonical_json(value: dict[str, Any]) -> bytes:
-    try:
-        return json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise TeacherBrokerError("invalid_request_value", status_code=400) from exc
-
-
-def validate_request_id(value: str) -> str:
-    request_id = str(value or "").strip()
-    if not REQUEST_ID_PATTERN.fullmatch(request_id):
-        raise TeacherBrokerError("invalid_request_id", status_code=400)
-    return request_id
-
-
-def validate_capability_token(value: str) -> str:
-    capability = str(value or "").strip()
-    if not CAPABILITY_PATTERN.fullmatch(capability):
-        raise TeacherBrokerError("invalid_capability", status_code=401)
-    return capability
-
-
-def validate_completion_request(
-    body: dict[str, Any], capability: dict[str, Any]
-) -> ValidatedCompletionRequest:
-    required = {
-        "model",
-        "prompt",
-        "max_tokens",
-        "echo",
-        "logprobs",
-        "prompt_logprobs",
-        "return_token_ids",
-        "temperature",
-        "top_p",
-        "seed",
-    }
-    if set(body) - required:
-        raise TeacherBrokerError("extra_request_fields", status_code=400)
-    if set(body) != required:
-        raise TeacherBrokerError("missing_request_fields", status_code=400)
-    if body["model"] != capability["model"]:
-        raise TeacherBrokerError("model_scope_mismatch", status_code=403)
-    if (
-        not isinstance(body["prompt"], str)
-        or not body["prompt"]
-        or isinstance(body["max_tokens"], bool)
-        or body["max_tokens"] != 1
-        or body["echo"] is not True
-        or isinstance(body["logprobs"], bool)
-        or body["logprobs"] != 1
-        or isinstance(body["prompt_logprobs"], bool)
-        or body["prompt_logprobs"] != 1
-        or body["return_token_ids"] is not True
-        or isinstance(body["temperature"], bool)
-        or body["temperature"] != 0
-        or isinstance(body["top_p"], bool)
-        or body["top_p"] != 1
-        or isinstance(body["seed"], bool)
-        or body["seed"] != 0
-    ):
-        raise TeacherBrokerError("unsupported_scoring_parameters", status_code=400)
-    canonical = _canonical_json(body)
-    if len(canonical) > capability["max_request_bytes"]:
-        raise TeacherBrokerError("request_too_large", status_code=413)
-    return ValidatedCompletionRequest(
-        body=dict(body),
-        canonical_body=canonical,
-        score_items=1,
-    )
-
-
-def request_fingerprint(capability: str, canonical_body: bytes) -> str:
-    return hmac.new(capability.encode("utf-8"), canonical_body, hashlib.sha256).hexdigest()
-
-
 def _require_current_attempt(capability: dict[str, Any]) -> None:
     from flash.runner import _internal_spec_from_status, _latest_reserved_attempt, get_status
 
@@ -462,7 +418,7 @@ def _provider_timeout(capability: dict[str, Any]) -> float:
     return min(MAX_PROVIDER_TIMEOUT_S, remaining)
 
 
-def _provider_post(body: bytes, api_key: str, timeout: float) -> tuple[int, bytes]:
+def _provider_post_path(path: str, body: bytes, api_key: str, timeout: float) -> tuple[int, bytes]:
     parsed = urllib.parse.urlsplit(PARASAIL_ORIGIN)
     if parsed.hostname is None:
         raise RuntimeError("Parasail origin is missing a hostname")
@@ -470,7 +426,7 @@ def _provider_post(body: bytes, api_key: str, timeout: float) -> tuple[int, byte
     try:
         connection.request(
             "POST",
-            PARASAIL_COMPLETIONS_PATH,
+            path,
             body=body,
             headers={
                 "Authorization": f"Bearer {api_key}",
@@ -492,6 +448,14 @@ def _provider_post(body: bytes, api_key: str, timeout: float) -> tuple[int, byte
         return int(response.status), payload
     finally:
         connection.close()
+
+
+def _provider_post(body: bytes, api_key: str, timeout: float) -> tuple[int, bytes]:
+    return _provider_post_path(PARASAIL_COMPLETIONS_PATH, body, api_key, timeout)
+
+
+def _provider_chat_post(body: bytes, api_key: str, timeout: float) -> tuple[int, bytes]:
+    return _provider_post_path(PARASAIL_CHAT_COMPLETIONS_PATH, body, api_key, timeout)
 
 
 def _validated_provider_response(
@@ -536,6 +500,69 @@ def _validated_provider_response(
     if not (
         (isinstance(prompt_logprobs, list) and len(prompt_logprobs) == len(prompt_ids))
         or (isinstance(positional_scores, list) and len(positional_scores) == len(prompt_ids) + 1)
+    ):
+        raise TeacherBrokerError("provider_contract_error", status_code=502)
+    usage = value.get("usage")
+    if not isinstance(usage, dict):
+        raise TeacherBrokerError("provider_contract_error", status_code=502)
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        count = usage.get(key)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise TeacherBrokerError("provider_contract_error", status_code=502)
+    input_tokens = int(usage["prompt_tokens"])
+    output_tokens = int(usage["completion_tokens"])
+    total_tokens = int(usage["total_tokens"])
+    if (
+        input_tokens != len(prompt_ids)
+        or output_tokens != 1
+        or total_tokens != input_tokens + output_tokens
+    ):
+        raise TeacherBrokerError("provider_contract_error", status_code=502)
+    if total_tokens > capability["max_request_tokens"]:
+        raise TeacherBrokerError("provider_token_limit_exceeded", status_code=502)
+    return ProviderResponse(
+        body=value,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
+def _validated_chat_provider_response(
+    raw: bytes, *, score_items: int, capability: dict[str, Any]
+) -> ProviderResponse:
+    if len(raw) > capability["max_response_bytes"]:
+        raise TeacherBrokerError("provider_response_too_large", status_code=502)
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
+    except TeacherBrokerError as exc:
+        raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
+    if not isinstance(value, dict) or score_items != 1:
+        raise TeacherBrokerError("provider_contract_error", status_code=502)
+    choices = value.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        raise TeacherBrokerError("provider_contract_error", status_code=502)
+    prompt_ids = value.get("prompt_token_ids")
+    prompt_logprobs = value.get("prompt_logprobs")
+    output_ids = choices[0].get("token_ids")
+    if (
+        not isinstance(prompt_ids, list)
+        or not prompt_ids
+        or any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in prompt_ids
+        )
+        or not isinstance(prompt_logprobs, list)
+        or len(prompt_logprobs) != len(prompt_ids)
+        or not isinstance(output_ids, list)
+        or len(output_ids) != 1
+        or isinstance(output_ids[0], bool)
+        or not isinstance(output_ids[0], int)
+        or output_ids[0] < 0
     ):
         raise TeacherBrokerError("provider_contract_error", status_code=502)
     usage = value.get("usage")
@@ -641,11 +668,22 @@ def _prepare_teacher_dispatch(
 
 
 def _dispatch_to_teacher_provider(
-    *, capability_id: int, request_id: str, capability: dict, api_key: str, encoded: bytes
+    *,
+    capability_id: int,
+    request_id: str,
+    capability: dict,
+    api_key: str,
+    encoded: bytes,
+    chat: bool,
 ) -> tuple[int, bytes]:
-    """Post to the provider and return ``(status, response_body)`` for a 2xx answer only."""
+    """Post to the provider and return ``(status, response_body)`` for a 2xx answer only.
+
+    ``chat`` selects the upstream endpoint: image scoring has to go to chat/completions because
+    only that route accepts image parts, while text scoring stays on the completions route.
+    """
+    provider_post = _provider_chat_post if chat else _provider_post
     try:
-        status, response_body = _provider_post(encoded, api_key, _provider_timeout(capability))
+        status, response_body = provider_post(encoded, api_key, _provider_timeout(capability))
     except TeacherBrokerError as exc:
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
@@ -660,6 +698,9 @@ def _dispatch_to_teacher_provider(
             request_id=request_id,
         ) from exc
     except (OSError, http.client.HTTPException) as exc:
+        # the connection failed mid-call, so the upstream outcome is unknown. the row stays
+        # readmissible for a re-dispatch of the same request_id; billed usage lands only on
+        # the terminal 'succeeded' completion, so re-dispatching cannot double-bill.
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,
@@ -670,23 +711,28 @@ def _dispatch_to_teacher_provider(
         raise TeacherBrokerError(
             "outcome_unknown",
             status_code=502,
+            retryable=True,
             request_id=request_id,
         ) from exc
     if status < 200 or status >= 300:
-        # every provider rejection, including 429, is terminal while `MAX_UPSTREAM_ATTEMPTS == 1`.
-        # the ledger cannot readmit completed `provider_rejected` rows; retrying requires a larger
-        # attempt budget and broker lifecycle changes.
+        # 408, 429 and 5xx are provider-side conditions a retry can outlive (a 408 is the
+        # provider timing out the request, not rejecting it), so those rows are recorded
+        # readmissible; other 4xx (400/401/403/404/422 ...) reject the request or credential
+        # itself, so a retry cannot change the outcome. the recorded error_class is the value
+        # readmission keys on.
+        transient = status in (408, 429) or 500 <= status <= 599
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,
                 request_id,
                 state="provider_rejected",
                 provider_status=status,
-                error_class="permanent",
+                error_class="transient" if transient else "permanent",
             )
         raise TeacherBrokerError(
             "provider_rejected",
             status_code=502,
+            retryable=transient,
             request_id=request_id,
         )
     return status, response_body
@@ -700,10 +746,16 @@ def _settle_teacher_response(
     request,
     status: int,
     response_body: bytes,
+    chat: bool,
 ) -> dict[str, Any]:
-    """Validate the provider answer against the capability, then close the ledger row."""
+    """Validate the provider answer against the capability, then close the ledger row.
+
+    ``chat`` picks the validator: the two routes return different shapes, and the chat one is the
+    only one that can carry an image-scored answer.
+    """
+    response_validator = _validated_chat_provider_response if chat else _validated_provider_response
     try:
-        response = _validated_provider_response(
+        response = response_validator(
             response_body,
             score_items=request.score_items,
             capability=capability,
@@ -743,22 +795,35 @@ def _settle_teacher_response(
         raise TeacherBrokerError(
             "outcome_unknown",
             status_code=503,
+            retryable=True,
             request_id=request_id,
         ) from exc
     return response.body
 
 
-def complete_teacher_request(
+def _complete_teacher_request(
     *,
     capability_token: str,
     request_id: str,
     raw_body: bytes | bytearray,
+    chat: bool,
 ) -> dict[str, Any]:
+    """Run one teacher request end to end on either upstream route.
+
+    ``chat`` is threaded rather than duplicated into two near-identical bodies: the routes differ
+    only in which request validator, provider endpoint, and response validator apply, and every
+    ledger and fencing step between them must stay identical or the two paths drift apart.
+    """
     request_id, capability_token, capability = authenticate_teacher_capability(
         capability_token=capability_token,
         request_id=request_id,
     )
-    request = validate_completion_request(parse_strict_json(raw_body), capability)
+    body = parse_strict_json(raw_body)
+    request = (
+        validate_chat_completion_request(body, capability)
+        if chat
+        else validate_completion_request(body, capability)
+    )
     reservation = _reserve_teacher_request(
         capability_token=capability_token,
         request_id=request_id,
@@ -767,8 +832,9 @@ def complete_teacher_request(
     )
     capability = reservation["capability"]
     replay_body = reservation.get("response_body")
+    response_validator = _validated_chat_provider_response if chat else _validated_provider_response
     if isinstance(replay_body, bytes):
-        return _validated_provider_response(
+        return response_validator(
             replay_body,
             score_items=request.score_items,
             capability=capability,
@@ -786,6 +852,7 @@ def complete_teacher_request(
         capability=capability,
         api_key=api_key,
         encoded=encoded,
+        chat=chat,
     )
     return _settle_teacher_response(
         capability_id=capability_id,
@@ -794,4 +861,33 @@ def complete_teacher_request(
         request=request,
         status=status,
         response_body=response_body,
+        chat=chat,
+    )
+
+
+def complete_teacher_request(
+    *,
+    capability_token: str,
+    request_id: str,
+    raw_body: bytes | bytearray,
+) -> dict[str, Any]:
+    return _complete_teacher_request(
+        capability_token=capability_token,
+        request_id=request_id,
+        raw_body=raw_body,
+        chat=False,
+    )
+
+
+def complete_teacher_chat_request(
+    *,
+    capability_token: str,
+    request_id: str,
+    raw_body: bytes | bytearray,
+) -> dict[str, Any]:
+    return _complete_teacher_request(
+        capability_token=capability_token,
+        request_id=request_id,
+        raw_body=raw_body,
+        chat=True,
     )

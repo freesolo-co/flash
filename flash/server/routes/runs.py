@@ -22,6 +22,10 @@ from flash.runner import (
 from flash.schema import train_schema_metadata
 from flash.serve.preflight import ServingPreflightError
 from flash.server import app as _app
+from flash.server.domain.teacher_broker import (
+    TeacherBrokerConfigurationError,
+    preflight_validate_managed_teacher,
+)
 from flash.server.platform import db
 from flash.server.platform.deps import (
     _parse_spec,
@@ -154,7 +158,6 @@ class _SubmissionContext:
     billable_key: bool
     bill_on_completion: bool
     billing_context: dict | None
-    profile_billing_context: dict | None
     platform_context: dict
 
 
@@ -173,12 +176,8 @@ def _submission_context(
             status_code=400,
             detail="org id is required to bill a completed training run",
         )
-    # a workload profile is a separate job that really runs, so it bills on its own completion
-    # whenever the key is billable -- including under `--dry-run`. dry-run previews the TRAINING
-    # run; it does not make work that actually executed free.
-    profile_billing_context = {"org_id": affordability_org_id} if billable_key else None
     if bill_on_completion:
-        billing_context = profile_billing_context
+        billing_context = {"org_id": affordability_org_id}
     platform_context = {
         field: value
         for field, value in {
@@ -194,7 +193,6 @@ def _submission_context(
         billable_key=billable_key,
         bill_on_completion=bill_on_completion,
         billing_context=billing_context,
-        profile_billing_context=profile_billing_context,
         platform_context=platform_context,
     )
 
@@ -225,86 +223,6 @@ def _resolve_managed_environment(spec, *, project_id: str, reporting_key: dict) 
     return environment_slug
 
 
-def _launch_pending_workload_profile(
-    exc,
-    *,
-    key: dict,
-    runtime_secrets,
-    profile_billing_context: dict | None,
-    platform_context: dict,
-    billable_key: bool,
-    affordability_org_id: str,
-) -> tuple[bool, str]:
-    """Claim and launch the pending workload profile.
-
-    Returns ``(launched, state)`` where ``launched`` says whether THIS request started and billed the
-    profile, as opposed to joining one another submitter already owns.
-    """
-    pending = exc.prepared_job
-    state = exc.state
-    # whether THIS request launched and billed the profile, as opposed to joining one that
-    # was already running. only a winning claim launches, so anything else must not be told
-    # it was charged. defaults false: a path that never reaches the claim launched nothing.
-    launched = False
-    if not isinstance(pending, _runner.PreparedJob):
-        return launched, state
-    profile_run_id = pending.public_spec.run_id
-    # claim before spending anything on it. the id is deterministic in the workload, so
-    # another key may already own this exact profile -- in which case it is already
-    # running and this submitter neither launches it again nor pays for it a second
-    # time. losing the claim is ordinary reuse, not an error; it just means waiting.
-    spent_at = getattr(exc, "spent_at", None)
-    if spent_at is None:
-        claimed = db.claim_profile_run(profile_run_id, key["id"])
-    else:
-        # the id is already claimed by a run that is spent, so a fresh claim cannot be
-        # inserted. take the existing one over against the spent run's own timestamp,
-        # so of several submitters watching the same dead profile exactly one relaunches
-        # it and the rest are told to wait on the one that is now running.
-        claimed = db.reclaim_spent_profile_run(profile_run_id, key["id"], spent_at=spent_at)
-    if claimed:
-        profile_submit_kwargs = {
-            "background": True,
-            "owner_key_id": key["id"],
-            "prepared_job": pending,
-        }
-        if runtime_secrets:
-            profile_submit_kwargs["runtime_secrets"] = runtime_secrets
-        if profile_billing_context:
-            profile_submit_kwargs["billing_context"] = profile_billing_context
-        if platform_context:
-            profile_submit_kwargs["platform_context"] = platform_context
-        try:
-            if billable_key:
-                _precheck_budget_or_block(
-                    run_id=profile_run_id,
-                    estimate_usd=pending.estimated_cost_usd,
-                    org_id=affordability_org_id,
-                )
-            _app.submit_job(pending.public_spec, **profile_submit_kwargs)
-        except Exception:
-            # delete the deterministic claim when launch creates no run, or the id wedges
-            # forever. if ``submit_job`` already persisted status, keep the claim so
-            # ownership and normal lifecycle cleanup remain intact.
-            if not os.path.exists(runs_file_path(profile_run_id, ".json")):
-                db.delete_run(profile_run_id)
-            raise
-        # set only after submit_job returns: a launch that raised deleted the row and
-        # charged nothing, so reporting it as launched would name a charge that was
-        # rolled back.
-        launched = True
-    # launched here, lost the claim to a submitter who launched it, or
-    # lost a takeover to one who is relaunching it. in every case the
-    # id now belongs to a live attempt, so the state has to name that
-    # attempt: reporting the spent state a takeover loser read would
-    # name a run that no longer exists under this id, and leaving a
-    # plain claim loser on the synthetic "required" tells a user whose
-    # profile is queued and running that it has not started --
-    # `required` is a marker this route invents, not a state any run
-    # is ever in.
-    return launched, "queued"
-
-
 def _record_environment_use(
     environment_slug: str | None, *, project_id: str, run_id: str, reporting_key: dict
 ) -> None:
@@ -322,6 +240,98 @@ def _record_environment_use(
     except Exception:
         _LOG.warning(
             "platform reporting failed for %s (run already submitted)", run_id, exc_info=True
+        )
+
+
+def _preflight_validate_spec(worker_spec) -> None:
+    """Run the read-only spec gates before the submission is charged against affordability.
+
+    submit_job runs these same gates, but it runs them after this point, so an unsupported spec
+    would be told "insufficient balance" (402) for a run it can never launch at any balance --
+    sending the user to top up instead of to the real defect. The managed-teacher gate belongs
+    with them for the same reason: running it only before allocation meant an opd run the plane
+    cannot serve was quoted, recorded, and charged first, then failed seconds later with the
+    reason discarded.
+    """
+    preflight_validate_image_opd(worker_spec)
+    preflight_validate_managed_teacher(worker_spec)
+
+
+def _submit_failure_http_error(exc: Exception) -> HTTPException:
+    """Classify a failed submission as the submitter's fault or the plane's.
+
+    Everything reaching here was a bad request by default, which is right for a spec the user must
+    change and wrong for the half of the managed-teacher gate they cannot act on: an unset
+    plane-side credential is an outage they can only wait out. Calling that a bad request would
+    re-create, one layer up, the very conflation the gate was hoisted to submit time to end.
+    """
+    if isinstance(exc, TeacherBrokerConfigurationError) and exc.plane_fault:
+        return HTTPException(status_code=503, detail=str(exc))
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+def _dispose_failed_submission(
+    run_id: str,
+    *,
+    dry_run: bool,
+    had_runtime_secrets: bool,
+    environment_slug: str | None,
+    project_id: str,
+    reporting_key: dict,
+) -> None:
+    """Settle whatever a failed create_run left behind; never raises past the failure.
+
+    drop the ownership row only when the launch left no run behind. once submit_job has persisted
+    status the run exists to the sweeps and to recovery, so deleting the row would orphan it: 404
+    on status, logs and cancel for its owner while the provider footprint lives on. keep it
+    visible instead and let the normal failure and reconcile machinery drive it to a terminal
+    state.
+    """
+    if not os.path.exists(runs_file_path(run_id, ".json")):
+        db.delete_run(run_id)
+    elif dry_run:
+        # a dry run must never be retained: submit_job persists it as `queued` before flipping
+        # the state to `dry_run`, and startup recovery resubmits every owned queued run as a
+        # real job, so a retained half-flipped dry run could provision a gpu the user never
+        # asked to rent. recovery walks the ownership rows, so dropping the row keeps the
+        # record out of it exactly as before the retain guard existed.
+        db.delete_run(run_id)
+    elif had_runtime_secrets:
+        # this run's secrets live only in the request: recovery resubmits from the persisted
+        # spec, which deliberately excludes them, so a retained secretful run would silently
+        # train without its credentials. fail it loudly instead; the owner keeps the row and
+        # the error, and recovery ignores terminal runs. the update is terminal-sticky, so a
+        # record that already reached a terminal state is left untouched.
+        terminalized = False
+        try:
+            _runner._update(
+                run_id,
+                "failed",
+                error=(
+                    "submission failed before its runtime secrets could be dispatched; "
+                    "the run was not started because recovery cannot restore them - resubmit"
+                ),
+            )
+            # returning without raising IS the proof of terminality: True applied the write, and a
+            # sticky False means the record was already terminal. no re-read - a transient status
+            # read error says nothing about the state and must never be read as failure.
+            terminalized = True
+        except Exception:
+            _LOG.warning(
+                "could not terminalize secretless-recoverable run %s", run_id, exc_info=True
+            )
+        if not terminalized:
+            # the update RAISED, and it is the ONLY write keeping recovery away from this run; a
+            # full or read-only status store can fail it. owner visibility is worth less than the
+            # guarantee: drop the ownership row so recovery, which walks those rows, can never
+            # resubmit the run without the secrets it needs.
+            with contextlib.suppress(Exception):
+                db.delete_run(run_id)
+    else:
+        # a retained run stays live and can recover into real training, so it must carry the
+        # same managed-environment association a successful submission records.
+        _record_environment_use(
+            environment_slug, project_id=project_id, run_id=run_id, reporting_key=reporting_key
         )
 
 
@@ -363,7 +373,6 @@ def create_run(
     billable_key = ctx.billable_key
     bill_on_completion = ctx.bill_on_completion
     billing_context = ctx.billing_context
-    profile_billing_context = ctx.profile_billing_context
     platform_context = ctx.platform_context
     run_id = spec.run_id
     affordability_verified = False
@@ -395,39 +404,10 @@ def create_run(
                     "verify that the source adapter is complete, compatible, and unchanged"
                 ),
             ) from exc
-        except _runner.WorkloadProfilePending as exc:
-            launched, state = _launch_pending_workload_profile(
-                exc,
-                key=key,
-                runtime_secrets=runtime_secrets,
-                profile_billing_context=profile_billing_context,
-                platform_context=platform_context,
-                billable_key=billable_key,
-                affordability_org_id=affordability_org_id,
-            )
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "workload_profile_pending",
-                    "profile_run_id": exc.profile_run_id,
-                    "state": state,
-                    # whether THIS key can read that run. the id is deterministic, so a submitter
-                    # can be waiting on a profile another key launched -- telling them to poll a
-                    # run id that answers 404 for them would read as the server inventing an id.
-                    "owned": db.run_owner(exc.profile_run_id) == key["id"],
-                    # whether this request started and billed the profile. an owner polling a
-                    # profile it launched earlier joins rather than launches, and must not be told
-                    # it was charged again.
-                    "launched": launched,
-                },
-            ) from exc
         run_id = prepared.public_spec.run_id
-        # validate the spec BEFORE charging affordability against it. submit_job runs these same
-        # read-only gates, but it runs them after this point, so an unsupported spec would be told
-        # "insufficient balance" (402) for a run it can never launch at any balance -- sending the
-        # user to top up instead of to the real defect. both are pure and raise ValueError, which the
-        # handler below turns into the 400 submit_job would have produced.
-        preflight_validate_image_opd(prepared.worker_spec)
+        # validate the spec BEFORE charging affordability against it. these gates are pure and
+        # raise ValueError, which the handler below turns into the 400 submit_job would produce.
+        _preflight_validate_spec(prepared.worker_spec)
         # run the affordability check for dry runs too. it is verify-only (moves no money), so a
         # `--dry-run` that passes now also proves the org can cover the estimate, instead of the run
         # being validated here and rejected 402 only on real submission.
@@ -452,10 +432,17 @@ def create_run(
             submit_kwargs["platform_context"] = platform_context
         status = _app.submit_job(prepared.public_spec, **submit_kwargs)
     except Exception as exc:
-        db.delete_run(run_id)
+        _dispose_failed_submission(
+            run_id,
+            dry_run=dry_run,
+            had_runtime_secrets=bool(runtime_secrets),
+            environment_slug=environment_slug,
+            project_id=project_id,
+            reporting_key=reporting_key,
+        )
         if isinstance(exc, HTTPException):
             raise
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _submit_failure_http_error(exc) from exc
     _record_environment_use(
         environment_slug, project_id=project_id, run_id=run_id, reporting_key=reporting_key
     )

@@ -11,7 +11,7 @@ import sys
 from typing import NoReturn
 
 from flash import __version__
-from flash._internal.channel import CLI_NAME
+from flash._internal.channel import BRAND_NAME, CLI_NAME
 from flash._internal.logging import configure_logging
 
 # package-level command imports remain available through flash.cli.
@@ -24,7 +24,6 @@ from flash.cli.commands import (  # noqa: F401
     cmd_checkpoints,
     cmd_deploy,
     cmd_deployments,
-    cmd_env_list,
     cmd_export,
     cmd_gpus,
     cmd_log,
@@ -47,6 +46,7 @@ from flash.cli.commands.env.eval import (
     finite_float,
     positive_int,
 )
+from flash.cli.commands.env.list import cmd_env_list
 from flash.cli.commands.env.push import cmd_env_delete, cmd_env_pull, cmd_env_push
 from flash.cli.commands.env.setup import cmd_env_setup
 from flash.cli.commands.env.test import cmd_env_test
@@ -222,8 +222,10 @@ class _FlashParser(_ThemedParser):
         usage = f"{CLI_NAME} [--debug] [-v] <command> [args]"
         footers = [
             f"new here? run `{CLI_NAME} login`, then `{CLI_NAME} env setup`",
-            f"train after publishing: `{CLI_NAME} env push --project PROJECT_UUID --name my-env .`, "
-            f"then `{CLI_NAME} train configs/sft.toml`",
+            (
+                f"train after publishing: `{CLI_NAME} env push --project PROJECT_UUID --name my-env .`, "
+                f"then `{CLI_NAME} train configs/sft.toml`"
+            ),
             f"any command in depth: `{CLI_NAME} <command> --help`",
             "docs: https://docs.freesolo.co",
         ]
@@ -268,7 +270,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _add_root_flags(parser: argparse.ArgumentParser) -> None:
     """Flags on the root parser itself, ahead of any subcommand."""
-    parser.add_argument("-V", "--version", action="version", version=f"{CLI_NAME} {__version__}")
+    parser.add_argument("-V", "--version", action="version", version=f"{BRAND_NAME} {__version__}")
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -390,7 +392,11 @@ def _add_env_setup_command(env_sub: argparse._SubParsersAction) -> None:
     setup.add_argument(
         "--project",
         metavar="PROJECT_UUID",
-        help="Freesolo project UUID for all generated configs and environment publication",
+        help=(
+            "Freesolo project UUID for all generated configs and environment publication; "
+            "required with --yes, a redirected stdin, or any other noninteractive run, where "
+            "there is no prompt to choose one"
+        ),
     )
     setup.add_argument(
         "-y",
@@ -405,8 +411,10 @@ def _add_env_setup_command(env_sub: argparse._SubParsersAction) -> None:
 
 
 def _add_env_test_commands(env_sub: argparse._SubParsersAction) -> None:
-    """`env list` and `env test`: local inspection before anything is published."""
-    env_list = env_sub.add_parser("list", help="list local environment sources")
+    """`env list` and `env test`: inspect published environments and local sources."""
+    env_list = env_sub.add_parser(
+        "list", help="list published environments and local environment sources"
+    )
     env_list.set_defaults(func=cmd_env_list)
 
     env_test = env_sub.add_parser(
@@ -543,7 +551,7 @@ def _add_env_publish_commands(env_sub: argparse._SubParsersAction) -> None:
     )
     env_pull.add_argument(
         "env_id",
-        help='the managed Freesolo environment slug "your-name/your-env"',
+        help='the managed Freesolo environment slug "your-org/your-project/your-env"',
     )
     env_pull.add_argument(
         "path",
@@ -560,7 +568,7 @@ def _add_env_publish_commands(env_sub: argparse._SubParsersAction) -> None:
 
     env_delete = env_sub.add_parser("delete", help="delete a published Freesolo environment")
     env_delete.add_argument(
-        "env_id", help="the Freesolo environment id to delete, e.g. you/your-env"
+        "env_id", help="the Freesolo environment id to delete, e.g. your-org/your-project/your-env"
     )
     env_delete.add_argument(
         "--project",
@@ -643,9 +651,9 @@ def _add_train_commands(sub: argparse._SubParsersAction) -> None:
         type=_gpu_count_override,
         metavar="N",
         help=(
-            "most cards to run the job on; sets [gpu] count (1-8). a ceiling, not an exact "
-            "count: allocation still picks one card when one fits the run alone, and only "
-            "rentable counts (1, 2, 4, 8) are ever provisioned"
+            "optional card ceiling; sets [gpu] count (1-8). omit it with an unpinned gpu type to "
+            "auto-size the smallest fitting geometry; an authored value pins the ceiling, and only "
+            "(1, 2, 4, 8) are ever provisioned"
         ),
     )
     train.add_argument("--dry-run", action="store_true")
@@ -821,8 +829,8 @@ def _warn_if_login_shadowed(args) -> None:
         return
     # `train --cost` cannot be classified here: the algorithm is only known once the config is
     # parsed, which happens inside the command. grpo/opd stay catalog-only and must not warn about
-    # an org they never reach; sft authenticates and can start a billed profile run, so it emits
-    # this warning itself (see commands._cmd_train_cost_sft).
+    # an org they never reach; sft authenticates to request the server-side dataset estimate, so it
+    # emits this warning itself (see commands._cmd_train_cost_sft).
     if getattr(args, "cost", False):
         return
     message = shadowed_login_warning()

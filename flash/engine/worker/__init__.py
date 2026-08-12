@@ -34,6 +34,7 @@ from flash.engine.worker.io.heartbeat import (
     heartbeat,
 )
 from flash.engine.worker.io.hf import (
+    _disable_xet_upload_staging,
     _hf_upload,
     error_artifact_name,
     hf_api,
@@ -73,7 +74,6 @@ from flash.engine.worker.perf import (
     _force_fla_triton_gdn_on_sm100,
     _liger_default_for_model,
     _memory_mode,
-    _neutralize_tilelang_cudart_stub,
     _remove_fla_from_disk,
     _restrict_fla_gdn_autotune_on_blackwell,
     gpu_diagnostics,
@@ -91,7 +91,7 @@ from flash.engine.worker.train.rl.config import (
     grpo_overrides,
     resolve_grpo_prompts_per_step,
 )
-from flash.envs.adapter import GitHubRateLimitError
+from flash.envs.adapter import GitHubTransientError
 from flash.envs.base import load_environment
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
@@ -127,9 +127,7 @@ JOB_SPEC = load_job_spec_from_env()
 SEED = _resolve_worker_seed(JOB_SPEC, os.environ.get("SEED"))
 PHASE = os.environ.get(
     "PHASE",
-    JOB_SPEC.phase
-    if JOB_SPEC
-    else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd", "profile") else "sft"),
+    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
 )
 OPD_RESUME_REVISION = os.environ.get(OPD_RESUME_REVISION_ENV, "").strip()
 
@@ -182,7 +180,7 @@ def _load_active_env():
     if not env_id:
         raise RuntimeError(
             "JobSpec sets no environment: provide [environment] id "
-            "(a Freesolo environment id like 'your-name/your-env', returned by "
+            "(a Freesolo environment id like 'your-org/your-project/your-env', returned by "
             "`flash env push --project <project-uuid> --name <name>`)."
         )
     env = load_environment(
@@ -208,14 +206,17 @@ def require_active_env():
             "no environment is loaded: this worker was started without a JobSpec "
             "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
             "carry a JobSpec naming [environment] id "
-            "(a Freesolo environment id like 'your-name/your-env', returned by "
+            "(a Freesolo environment id like 'your-org/your-project/your-env', returned by "
             "`flash env push --project <project-uuid> --name <name>`)."
         )
     return ACTIVE_ENV
 
 
 def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
-    retriable = isinstance(exc, (RetriableInfraError, GitHubRateLimitError))
+    # GitHubTransientError covers both the quota case and GitHub being unreachable. The worker's
+    # answer to either is the same -- reschedule -- so it catches the base; only the control plane,
+    # which has a status code to report, distinguishes them.
+    retriable = isinstance(exc, (RetriableInfraError, GitHubTransientError))
     return {"retriable": retriable, "oom": (not retriable and is_cuda_oom(exc))}
 
 
@@ -240,13 +241,15 @@ def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
 
 
 def _run_worker_mode() -> None:
-    from flash.engine.worker.entry.profile import run_sft_profile
+    # first statement in the worker, ahead of every import below it: `huggingface_hub.constants`
+    # captures HF_HUB_DISABLE_XET when it is imported, so setting it afterwards has no effect on
+    # which upload path is used. anything imported before this line could freeze the default.
+    _disable_xet_upload_staging()
 
     modes = {
         "sft": run_sft,
         "rl": run_rl,
         "opd": run_opd,
-        "profile": run_sft_profile,
     }
     handler = modes.get(RUN_MODE)
     if handler is None:
@@ -317,24 +320,14 @@ def _run_worker_mode() -> None:
                 "DONE present but metrics.json unreadable after retries "
                 f"(transient HF; {error_kind})"
             )
-    # A profile run tokenizes or samples on cpu and never imports a model, so it exits BEFORE
-    # the kernel setup below: none of it would apply, and _ensure_fla_fastpath_on_hopper would
-    # pip-install into a process that is about to leave.
-    if RUN_MODE == "profile":
-        heartbeat("boot")
-        handler()
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(0)
     # these setups run in the parent; verl trains in FLASH_VERL_PYTHON.
-    # only _force_fla_triton_gdn_on_sm100 propagates through FLA_* env vars. the install,
-    # symlink,
-    # and monkeypatch are interpreter-local and must not be treated as child configuration.
+    # only _force_fla_triton_gdn_on_sm100 propagates through FLA_* env vars. the install and the
+    # monkeypatch are interpreter-local and must not be treated as child configuration. the tilelang
+    # libcudart repoint is NOT here: it is interpreter-local too, and the interpreter that needs it is
+    # the verl child, so it ships as a sitecustomize fragment (verl.child_io).
     # run before model imports: sm100 tilelang GDN computes wrong gradients, so use Triton.
     _force_fla_triton_gdn_on_sm100()
     _ensure_fla_fastpath_on_hopper()
-    # Must run AFTER fla fast path (may reinstall tilelang) and BEFORE model/vLLM import.
-    _neutralize_tilelang_cudart_stub()
     # AFTER the fla fast path (which may (re)install fla), BEFORE any model import / GDN
     # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
     _restrict_fla_gdn_autotune_on_blackwell()
@@ -441,7 +434,6 @@ __all__ = [
     "_liger_default_for_model",
     "_load_active_env",
     "_memory_mode",
-    "_neutralize_tilelang_cudart_stub",
     "_remove_fla_from_disk",
     "_restrict_fla_gdn_autotune_on_blackwell",
     "backend_seed",

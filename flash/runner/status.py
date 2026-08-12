@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 import os
 import time
 
@@ -75,23 +74,54 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     raw_public = status.spec if isinstance(status.spec, dict) else {}
     legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
     legacy_public_alpha = runner._prepared_before_public_alpha(raw_public)
+    # the rollout optimizer batch was renamed, and `from_dict` moves it -- so a snapshot has to be
+    # rehashed under the spelling it actually stored, including a key it did not carry. Each half is
+    # read from its OWN payload, like legacy_keys/legacy_public_keys above: reusing the worker's
+    # reading for the public half would overwrite the stored public value before hashing, and the
+    # parse drops a superseded `batch_size` so `_validate_effective_spec` cannot see it either --
+    # which would leave a tampered public batch neither bound nor compared.
+    stored_rollout_batch = runner._stored_rollout_batch_spelling(raw_worker)
+    stored_public_rollout_batch = runner._stored_rollout_batch_spelling(raw_public)
     has_workload_profile = bool(
-        worker_spec.workload_profile_kind
-        or worker_spec.workload_profile_input_digest
-        or worker_spec.workload_profile
+        worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
-    if has_workload_profile:
-        if snapshot.get("workload_profile") != (worker_spec.workload_profile or None):
-            raise ValueError("persisted workload profile does not match the worker spec")
-        if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
+    # the auto-pin marker is excluded from the structural compare (the public half always reads
+    # False by construction), so nothing else here would catch a forged worker-half marker. deploy
+    # reads it to decide whether to relax the authored-pin rejection, which makes it a privilege
+    # decision taken on an otherwise unverified value: a plain grpo/opd run reaches neither branch
+    # below, so a forged marker would skip the 400 and deploy against base weights the run never
+    # trained on. binding it to the digest closes that -- the marker is hashed into the digest at
+    # persist time, so a snapshot claiming one cannot reproduce it.
+    if has_workload_profile and snapshot.get("workload_profile") != (
+        worker_spec.workload_profile or None
+    ):
+        raise ValueError("persisted workload profile does not match the worker spec")
+    # `gpu_count_auto` is deliberately NOT a trigger here, unlike `model_revision_auto`. The digest
+    # covers the whole public spec including `gpu.type`, which the allocator legitimately rewrites
+    # onto the stored status when a run is provisioned -- so gating on the marker made the digest
+    # reject ordinary provisioned runs at deploy. Measured: two specs differing only in whether
+    # gpu.count was authored deployed differently, the auto-sized one failing integrity validation
+    # (tests/test_server_api.py::test_deploy_ignores_stored_training_gpu). Since an omitted count is
+    # the DEFAULT, that is nearly every run. The marker's integrity does not need this trigger: it
+    # is bounded by `_validate_effective_spec`, which caps an auto-sized count at
+    # MAX_COMBINATION_CARDS, and unlike `model_revision_auto` it cannot relax a deploy-time
+    # rejection -- a forged marker only widens the allocator's ceiling, which the VRAM fit check and
+    # the geometry cap still constrain.
+    if (has_workload_profile or worker_spec.model_revision_auto) and (
+        not isinstance(stored_digest, str)
+        or stored_digest
+        != runner._preparation_digest(
             public_spec,
             worker_spec,
             expected,
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=legacy_public_alpha,
-        ):
-            raise ValueError("persisted effective preparation failed integrity validation")
+            stored_rollout_batch=stored_rollout_batch,
+            stored_public_rollout_batch=stored_public_rollout_batch,
+        )
+    ):
+        raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
         if not isinstance(expected, dict) or not expected.get("digest"):
             raise ValueError(
@@ -105,6 +135,8 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=legacy_public_alpha,
+            stored_rollout_batch=stored_rollout_batch,
+            stored_public_rollout_batch=stored_public_rollout_batch,
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:
@@ -160,6 +192,10 @@ def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = Fa
     """
     worker_spec = runner.effective_spec_from_status(status, verify_source=verify_source)
     public_gpu = JobSpec.from_dict(status.spec).gpu
+    # `gpu_count_auto` needs no restoring here: it is provenance, so the worker half carries it
+    # verbatim through allocation. The public half cannot supply it -- to_dict strips the marker and
+    # keeps the placeholder count=1, making an auto-sized run's public spec byte-identical to an
+    # authored single-card pin -- which is exactly why the worker half must keep it.
     if worker_spec.gpu.type == public_gpu.type and worker_spec.gpu.count == public_gpu.count:
         return worker_spec
     restored = worker_spec.to_internal_dict()
@@ -240,33 +276,6 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             status = runner.get_status(run_id)
         except FileNotFoundError:
             return
-        # atomically store a profile's first current-attempt heartbeat arm and deadline; readers reject
-        # a partial pair as tampering. reused run ids can retain an earlier lifecycle's heartbeat, so
-        # provenance must pass before the work budget starts.
-        arm_kwargs: dict[str, float] = {}
-        raw = runner._load_status_json(run_id)
-        armed_spec = runner._internal_spec_from_status(status)
-        if armed_spec.workload_profile_kind and runner._profile_wall_armed_at(raw) is None:
-            hb_ts = hb.get("ts") if isinstance(hb, dict) else None
-            fresh = (
-                not isinstance(hb_ts, bool)
-                and isinstance(hb_ts, (int, float))
-                and math.isfinite(float(hb_ts))
-                and float(hb_ts) >= runner._require_valid_deadline(status.created_at)
-                # ...and it must be THIS attempt. a timestamp test alone admits a still-live worker
-                # from a cancelled earlier lifecycle: it writes to the same workload-derived prefix
-                # and its heartbeats are genuinely recent, so they pass `>= created_at` and arm the
-                # replacement's work budget while it is still queuing for capacity.
-                and runner._heartbeat_attempt_is_current(hb, raw)
-            )
-            if fresh:
-                armed_at = time.time()
-                arm_kwargs = {
-                    "_profile_wall_armed_at": armed_at,
-                    "_run_deadline_at": runner._require_valid_deadline(
-                        armed_at + runner._require_valid_deadline(armed_spec.gpu.max_wall_seconds)
-                    ),
-                }
         # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
         # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
         # metrics-bearing heartbeat lands.
@@ -281,7 +290,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
         status.updated_at = time.time()
-        runner._save_status_unlocked(status, **arm_kwargs)
+        runner._save_status_unlocked(status)
     runner._report_status(status)
 
 
@@ -294,24 +303,6 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     from flash.engine.result.accounting import sanitize_worker_metrics
 
     metrics = sanitize_worker_metrics(metrics)
-    if spec.workload_profile_kind:
-        from flash.engine.profiling.workload_profile import require_matching_sft_profile
-
-        profile = require_matching_sft_profile(
-            metrics.get("workload_profile"),
-            input_digest=spec.workload_profile_input_digest,
-            producer_version=spec.workload_profile_producer_version,
-            tokenizer_revision=spec.model_revision,
-        )
-        metrics = {**metrics, "workload_profile": profile.to_dict()}
-        current = runner.get_status(spec.run_id)
-        if current.state in runner.TERMINAL_STATES:
-            raise ValueError("workload profile metrics arrived after the run became terminal")
-        runner._update(
-            spec.run_id,
-            current.state,
-            workload_profile=profile.to_dict(),
-        )
     dest = runner.artifacts_dir(spec)
     os.makedirs(dest, exist_ok=True)
     # Use allocated_gpu (worker-stamped) not spec.gpu.type; policy GPUs can be reallocated.

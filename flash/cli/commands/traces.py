@@ -45,7 +45,7 @@ def _require_api_key(api_key: str | None) -> str:
     """
     if not api_key:
         raise ClientError(
-            "not logged in. Run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
+            f"not logged in. Run `{CLI_NAME} login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
     return api_key
 
@@ -206,8 +206,8 @@ def cmd_traces_export(args) -> int:
         if export_format == RECORDS_FORMAT:
             print(
                 render.arrow(
-                    "train on it: flash env push --project <project-uuid> --name my-env . "
-                    "&& flash train configs/sft.toml"
+                    f"train on it: {CLI_NAME} env push --project <project-uuid> --name my-env . "
+                    f"&& {CLI_NAME} train configs/sft.toml"
                 )
             )
         elif export_format == PROMPTS_FORMAT:

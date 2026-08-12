@@ -497,7 +497,7 @@ def _overrides_cfg(**over):
         "fused_ce_backend": "torch",
         "train_files": "/w/train.parquet",
         "val_files": "/w/val.parquet",
-        "model_id": "Qwen/Qwen3-4B",
+        "model_path": "Qwen/Qwen3-4B",
         "lora_rank": 32,
         "lora_alpha": 64,
         "target_modules": "all-linear",
@@ -611,6 +611,72 @@ def test_build_verl_overrides_carries_fused_expert_target_parameters():
     ) in o
 
 
+def test_build_verl_training_cfg_resolves_expert_targets_from_the_catalog_id():
+    """The fused-expert lookup must use the catalog id, NOT the local snapshot path.
+
+    The builder is handed a snapshot dir to load weights from, and handing that same string to
+    ``lora_target_parameters`` (which matches an exact hf repo id) resolves to None: PEFT then
+    adapts only ``all-linear`` and the routed-expert parameters are never trained, on a run that
+    completes, checkpoints, and reports healthy metrics. The test above renders already-resolved
+    targets, so it cannot see that; this one goes through the real builder with a path that looks
+    like what ``_cached_model_path`` actually returns.
+    """
+    inp = {**_mem_util_inp(model_id="Qwen/Qwen3.6-35B-A3B", engine_len=8192)}
+    inp.update(
+        {
+            "lora_rank": 32,
+            "lora_alpha": 64,
+            "lr": 1e-5,
+            "prompts_per_step": 16,
+            "mask_truncated_completions": True,
+            "max_prompt_len": 1024,
+            "max_completion": 1024,
+            "max_response_len": 1024,
+            "multi_turn": False,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "kl_coef": 0.0,
+            "entropy_quantile": None,
+            "stop_sequences": (),
+            "structured_outputs": None,
+            "seed": 42,
+            "ppo_epochs": 1,
+            "steps": 60,
+            "warmstart_adapter": "",
+            "verl_total_epochs": 1,
+            "save_freq": 20,
+            "ckpt_to_keep": 1,
+        }
+    )
+    snapshot = "/cache/models--Qwen--Qwen3.6-35B-A3B/snapshots/deadbeefcafe"
+
+    cfg = rl_train._build_verl_training_cfg(
+        inp,
+        train_files="/w/t.parquet",
+        val_files="/w/v.parquet",
+        model_path=snapshot,
+        thinking=False,
+        loggers=["console"],
+        fp8_kv=False,
+        enforce_eager=False,
+        attention_backend=None,
+        mm_encoder_attn_backend=None,
+        ce_backend="torch",
+        reward_path="/w/r.py",
+        local_dir="/w/ckpt",
+        project_name="p",
+        experiment_name="e",
+    )
+
+    # the weights still load from the snapshot dir ...
+    assert cfg["model_path"] == snapshot
+    # ... but the fused expert targets resolve from the catalog id.
+    assert cfg["target_parameters"] == [
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+    ]
+
+
 def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
     # this guards only against flash emitting a misleading no-op; it does not prove verl reads the key.
     o = rl_train.build_verl_overrides(_overrides_cfg())
@@ -653,20 +719,75 @@ def test_build_verl_overrides_single_gpu_is_the_unchanged_default():
 
 
 @pytest.mark.parametrize("n_gpus", [2, 4, 8])
-def test_build_verl_overrides_shards_every_card_along_the_sequence(n_gpus):
-    # verl builds mesh_shape=(dp, sp), so sp == n_gpus pins dp == 1: the optimizer keeps seeing one
-    # global batch of prompts_per_step * group_size. sharding the BATCH instead would change the
-    # gradient, which is why sp/tp track the card count rather than leaving dp to absorb it.
+def test_build_verl_overrides_shards_every_card_by_data(n_gpus):
+    # ulysses is pinned OFF at every width, so verl's mesh leaves every rank a DATA-parallel rank.
+    # sequence parallelism would slice the sequence at fixed offsets and hand each rank's slice
+    # straight to the GatedDeltaNet linear-attention and conv layers, whose state runs ALONG the
+    # sequence -- every rank but rank 0 would start its recurrence from zero state. the global batch
+    # survives anyway because use_dynamic_bsz token-balances it across the dp ranks.
     o = rl_train.build_verl_overrides(_overrides_cfg(n_gpus=n_gpus))
     assert f"+ray_kwargs.ray_init.num_gpus={n_gpus}" in o
     assert f"trainer.n_gpus_per_node={n_gpus}" in o
-    assert f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={n_gpus}" in o
+    assert "actor_rollout_ref.actor.ulysses_sequence_parallel_size=1" in o
+    # no card-count-dependent sp override may survive anywhere in the command.
+    assert not [
+        s
+        for s in o
+        if "ulysses_sequence_parallel_size" in s
+        and not s.endswith("ulysses_sequence_parallel_size=1")
+    ]
+    # rollout TENSOR parallelism is a separate width and still tracks the cards: tp splits attention
+    # heads, not the sequence, so it has no recurrent-state problem. this is also why the allocator's
+    # head-divisibility cap outlives ulysses -- vllm raises at engine init when heads % tp != 0.
     assert f"actor_rollout_ref.rollout.tensor_model_parallel_size={n_gpus}" in o
     # one worker, many cards: nnodes stays 1 so verl's replica_rank offset (and the rollout seed)
     # is unaffected by the card count.
     assert "trainer.nnodes=1" in o
-    # sequence parallelism is only legal with padding removed; verl raises otherwise.
+    # remove-padding is independent of sp and still required: the no_padding loss reads log_prob
+    # values off the flattened batch.
     assert "actor_rollout_ref.model.use_remove_padding=True" in o
+
+
+def test_grpo_launches_the_width_the_step_can_fill():
+    """`n_gpus` handed to verl is the executed dp width, never the rented card count.
+
+    Pinning ulysses off makes every rank a dp rank, so verl now chunks the step's sequences across
+    them and asserts exact divisibility (`DataProto.chunk`, and `_balance_batch` with
+    `equal_size=True`). At sp = card count the dp width was 1 and this could not fire; that is why
+    this guard arrives with the pin rather than before it. Launching wider than the sequences divide
+    aborts at step 0 on a box already rented.
+
+    The width is resolved ONCE, in `_assemble_grpo_inputs`, because two phases consume it: the child
+    config here and the resume probe in `_prepare_rl_files`, which discards a checkpoint whose shard
+    count disagrees with the width it is handed. Deriving it separately let them drift -- resume
+    compared the RENTED count while the child launched the clamped one, so a checkpoint written at the
+    executed width read as the wrong topology and every retry restarted from step 0.
+
+    Asserted on the source: both call sites write child files or download weights, so neither is
+    drivable offline. The rule itself is covered by
+    `test_rl_width_never_exceeds_the_sequences_one_step_holds` in the opd suite, and the allocator
+    and quote agree through `executed_gpu_count`.
+    """
+    import inspect
+
+    from flash.engine.worker import rl_train_runner
+    from flash.engine.worker.train.rl import inputs as rl_inputs
+
+    # one derivation, in the builder that assembles every other resolved grpo knob.
+    resolver = inspect.getsource(rl_inputs._assemble_grpo_inputs)
+    assert '"dp_cards": rl_data_parallel_cards(' in resolver
+    assert 'int(schedule["prompts_per_step"]) * int(options["group_size"])' in resolver
+
+    # and both consumers read that one value rather than recomputing it.
+    child = inspect.getsource(rl_train._configure_rl_child)
+    line = next(ln.strip() for ln in child.splitlines() if ln.strip().startswith("n_gpus="))
+    assert line == 'n_gpus=int(inp["dp_cards"]),', line
+
+    resume = inspect.getsource(rl_train_runner._prepare_rl_files)
+    assert 'world_size=int(inp["dp_cards"])' in resume
+    # the rented count must not reach either phase, or the drift returns.
+    assert "gpu_count_of" not in child
+    assert "gpu_count_of" not in resume
 
 
 def test_build_verl_overrides_batch_shape_is_identical_across_gpu_counts():
@@ -676,8 +797,8 @@ def test_build_verl_overrides_batch_shape_is_identical_across_gpu_counts():
         "data.train_batch_size=",
         "actor_rollout_ref.rollout.n=",
         "actor_rollout_ref.actor.ppo_mini_batch_size=",
-        # the per-gpu token budget is part of the shape too: verl scales it by sp_size itself, so
-        # emitting a card-dependent value would shrink each micro-batch as cards are added.
+        # the per-gpu token budget is part of the shape too: it is PER-GPU, so emitting a
+        # card-dependent value would change each rank's micro-batch as cards are added.
         "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=",
     )
     one = rl_train.build_verl_overrides(_overrides_cfg(n_gpus=1))
@@ -883,7 +1004,7 @@ def test_gpu_mem_util_sizing_reaches_the_launch_config():
         },
         train_files="/w/t.parquet",
         val_files="/w/v.parquet",
-        model_id="Qwen/Qwen3.5-4B",
+        model_path="Qwen/Qwen3.5-4B",
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
@@ -1023,7 +1144,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
             inp,
             train_files="/w/t.parquet",
             val_files="/w/v.parquet",
-            model_id="/w/model",
+            model_path="/w/model",
             thinking=False,
             loggers=["console"],
             fp8_kv=False,
@@ -1087,7 +1208,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "ce_backend": "torch",
         "train_files": "/w/t.parquet",
         "val_files": "/w/v.parquet",
-        "model_id": "Qwen/Qwen3-4B",
+        "model_path": "Qwen/Qwen3-4B",
         "thinking": False,
         "loggers": ["console"],
         "fp8_kv": False,
@@ -1188,7 +1309,7 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
         ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
-        model_id=inp["model_id"],
+        model_path=inp["model_id"],
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
@@ -1377,7 +1498,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "train": {"batch_size": 16, "epochs": 2},
+            "train": {"prompts_per_step": 16, "epochs": 2},
         }
     )
     monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
@@ -1397,7 +1518,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
-        model_id=inp["model_id"],
+        model_path=inp["model_id"],
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
@@ -2977,9 +3098,9 @@ def test_pinned_snapshot_dir_is_what_reaches_verl_model_path():
         and n.func.id == "_build_verl_training_cfg"
     ]
     assert len(calls) == 1
-    model_id = next(k for k in calls[0].keywords if k.arg == "model_id")
-    assert isinstance(model_id.value, ast.Name)
-    assert model_id.value.id == "model_path_for_verl"
+    model_path = next(k for k in calls[0].keywords if k.arg == "model_path")
+    assert isinstance(model_path.value, ast.Name)
+    assert model_path.value.id == "model_path_for_verl"
 
 
 # ------------------------------- resume (VERL-018) -------------------------------
@@ -2991,7 +3112,7 @@ def test_build_verl_overrides_enables_resume_mode():
 
 def test_restore_verl_resume_is_a_noop_without_a_checkpoint(tmp_path, monkeypatch):
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: None)
-    assert rl_train._restore_verl_resume(str(tmp_path)) == 0
+    assert rl_train._restore_verl_resume(str(tmp_path), world_size=1) == 0
     assert not (tmp_path / "latest_checkpointed_iteration.txt").exists()
 
 
@@ -2999,11 +3120,14 @@ def test_restore_verl_resume_stages_the_checkpoint_where_verl_looks(tmp_path, mo
     src = tmp_path / "checkpoint-7"
     (src / "actor").mkdir(parents=True)
     (src / "actor" / "model.safetensors").write_text("weights")
+    # this test is about the staging mechanics, not topology matching; stamp a world_size that
+    # legitimately matches world_size=1 below rather than relying on unreadable-topology behaviour.
+    (src / "actor" / "fsdp_config.json").write_text(json.dumps({"world_size": 1}))
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(src))
 
-    assert rl_train._restore_verl_resume(str(local_dir)) == 7
+    assert rl_train._restore_verl_resume(str(local_dir), world_size=1) == 7
     # verl discovers the checkpoint through this marker plus the global_step_N layout.
     assert (local_dir / "latest_checkpointed_iteration.txt").read_text().strip() == "7"
     assert (local_dir / "global_step_7" / "actor" / "model.safetensors").read_text() == "weights"
@@ -3014,7 +3138,7 @@ def test_restore_verl_resume_rejects_an_unparseable_checkpoint_path(tmp_path, mo
     bad.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(bad))
     with pytest.raises(RuntimeError, match="invalid GRPO resume checkpoint path"):
-        rl_train._restore_verl_resume(str(tmp_path / "ckpt"))
+        rl_train._restore_verl_resume(str(tmp_path / "ckpt"), world_size=1)
 
 
 def _write_step(local_dir, step):
@@ -3699,7 +3823,8 @@ def test_train_notes_record_the_batch_shape_one_step_consumed():
     notes = rl_train._build_verl_train_notes(_notes_inp(), **_notes_common())
     assert notes["max_completion_len"] == 512
     assert notes["prompts_per_step"] == 8
-    # ulysses shards along the sequence, so dp stays 1 and one optimizer step sees the whole batch.
+    # one optimizer step still sees the whole batch under data parallelism: use_dynamic_bsz
+    # token-balances the same global batch across the dp ranks instead of dropping a remainder.
     assert notes["generations_per_step"] == 8 * 4
 
 
@@ -3853,7 +3978,7 @@ def _capability_resolve(
         {
             "model": model,
             "algorithm": "grpo",
-            "train": {"batch_size": 4, "epochs": 1, **(train or {})},
+            "train": {"prompts_per_step": 4, "epochs": 1, **(train or {})},
             "gpu": {"count": gpu_count},
         }
     )
@@ -3896,7 +4021,7 @@ def test_multi_turn_env_resolves_and_selects_the_flash_agent_loop(monkeypatch):
         ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
-        model_id=inp["model_id"],
+        model_path=inp["model_id"],
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
@@ -5052,7 +5177,7 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
         ce_backend="torch",
         train_files="/w/train.parquet",
         val_files="/w/val.parquet",
-        model_id=inp["model_id"],
+        model_path=inp["model_id"],
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
@@ -5103,7 +5228,7 @@ def _resolved_inputs_for_notes(monkeypatch):
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "train": {"batch_size": 16, "epochs": 2},
+            "train": {"prompts_per_step": 16, "epochs": 2},
         }
     )
     monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
@@ -6732,3 +6857,149 @@ def test_grpo_finalization_carries_the_completed_step():
 
     forwarding = inspect.getsource(finalize.write_train_meta)
     assert '"step": int(step)' in forwarding
+
+
+# ---------------------- fail-closed shim markers and the fp8 probe ----------------------
+
+
+def _shim_files(tmp_path):
+    return {
+        "shim_dir": str(tmp_path),
+        "shim_py": str(tmp_path / "sitecustomize.py"),
+        "shim_markers": str(tmp_path / "applied_shims.txt"),
+        "multi_turn": False,
+    }
+
+
+def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_set(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    files = _shim_files(tmp_path)
+    inp = {
+        "reentrant_checkpointing": True,
+        "multimodal": False,
+        "entropy_quantile": 0.2,
+        "per_turn_credit": False,
+        "stop_sequences": ("</answer>",),
+        "image_pad_token_id": None,
+        "structured_outputs": None,
+        "save_at_steps": (7,),
+        "steps": 20,
+        "warmstart_adapter": "adapter",
+        "kl_coef": 0.04,
+        "multi_turn": False,
+    }
+    expected = rl_train._write_rl_shim(inp, files)
+    # exactly the enabled features, in composition order; off features owe no marker.
+    assert expected == [
+        "reentrant-checkpointing",
+        "entropy-quantile",
+        "stop-sequences",
+        "exact-save-steps",
+        "kl-ref-adapter",
+    ]
+    source = Path(files["shim_py"]).read_text()
+    # the wrap indents whole fragments into try blocks; a syntax slip would turn the child's
+    # entire patch set into a silent no-op, so compiling is the only real gate.
+    compile(source, "sitecustomize.py", "exec")
+    for name in expected:
+        assert f"_flash_record_applied_shim({name!r})" in source
+    assert "per-turn-credit" not in source
+    # tf32 stays first and unwrapped: it swallows its own failures by design and a later fragment
+    # that raised must not be able to cost the run its tensor-core throughput.
+    assert source.index("tf32") < source.index("_FLASH_SHIM_MARKER_FILE")
+    assert f"_flash_shim_os._exit({backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE})" in source
+
+
+def test_the_gdn_varlen_append_is_wrapped_and_extends_the_expected_marker_set():
+    # the gdn shim is appended after python_bin resolution, so it must join the same fail-closed
+    # contract as the fragments _write_rl_shim composed: an unpatched gdn child trains across
+    # packed example boundaries, which is the silent failure the wrapper closes.
+    src = inspect.getsource(rl_train._configure_rl_child)
+    assert 'wrap_shim_fragment("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch))' in src
+    assert 'files["expected_shims"].append("gdn-varlen")' in src
+
+
+def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
+    """before/at training start: the first step line is the earliest point where sitecustomize is
+    provably finished (fragments print while later ones are still applying, so the first OUTPUT
+    line would race the file). a missing marker there means the child trains unpatched."""
+    stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
+    step_at = stdout_loop.index('progress["step"] = int(m.group(1))')
+    verify_at = stdout_loop.index("verify_applied_shim_markers(shim_markers, expected_shims)")
+    assert step_at < verify_at < stdout_loop.index("close_generation")
+    # and the entry point wires the files dict (marker path + expected set) into both the loop
+    # and the final verdict.
+    entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    assert "_reward_observability=_reward_observability, files=files," in entry
+    assert 'rc, state, files["resume_step"], expected_steps, resume_uploader, files=files' in entry
+
+
+def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
+    state = rl_train._StepMetricState()
+    state.reward_history.append(0.5)
+    state.adv_spread_history.append(1.0)
+    marker = tmp_path / "applied_shims.txt"
+    marker.write_text("entropy-quantile\n")
+    # the complete set passes and falls through to the gradient verdict.
+    rl_train._validate_rl_child(
+        0,
+        state,
+        0,
+        1,
+        None,
+        files={"shim_markers": str(marker), "expected_shims": ["entropy-quantile"]},
+    )
+    with pytest.raises(RuntimeError, match="never proved"):
+        rl_train._validate_rl_child(
+            0,
+            state,
+            0,
+            1,
+            None,
+            files={
+                "shim_markers": str(marker),
+                "expected_shims": ["entropy-quantile", "kl-ref-adapter"],
+            },
+        )
+
+
+def test_validate_rl_child_classifies_the_shim_exit_code_as_permanent():
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    with pytest.raises(RuntimeError, match="failed to apply") as err:
+        rl_train._validate_rl_child(
+            backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE, rl_train._StepMetricState(), 0, 1, None
+        )
+    # permanent by design: the same interpreter fails the same fragment on retry, so it must not
+    # be classified as retriable infra.
+    assert not isinstance(err.value, RetriableInfraError)
+    assert "FLASH_VERL_PYTHON" in str(err.value)
+
+
+def test_the_fp8_kv_probe_reads_the_child_capability_probe_not_parent_cuda(monkeypatch):
+    """backend_common.fused_ce_backend's rule applies here too: opening cuda in this long-lived
+    parent retains a context on the devices the verl child is about to own. a stub torch whose
+    cuda attribute explodes stands in for 'somebody reintroduced the live probe'."""
+
+    class _ExplodingCuda:
+        def __getattr__(self, name):
+            raise AssertionError("the fp8 probe touched torch.cuda in the parent")
+
+    exploding_torch = types.ModuleType("torch")
+    exploding_torch.cuda = _ExplodingCuda()
+    monkeypatch.setitem(sys.modules, "torch", exploding_torch)
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+
+    inp = {"steps": 4}
+    for caps, cc_ok in (
+        ({"capability": [8, 9]}, True),
+        ({"capability": [9, 0]}, True),
+        ({"capability": [8, 6]}, False),
+        ({"capability": None}, False),
+        ({}, False),
+    ):
+        settings = rl_train._resolve_training_settings(inp, caps)
+        assert settings[0] == 4
+        assert settings[-1] is cc_ok, caps

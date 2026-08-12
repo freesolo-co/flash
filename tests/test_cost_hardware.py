@@ -199,65 +199,48 @@ def test_multi_card_speedup_never_decreases_with_card_count():
         assert vals == sorted(vals), f"{name} speedup decreases: {vals}"
 
 
-def test_sft_shards_by_sequence_not_by_data(monkeypatch):
-    """sft must not borrow the fsdp data-parallel constant.
+def test_sft_shards_by_data_like_grpo_and_opd(monkeypatch):
+    """sft must read the fsdp data-parallel constant, the same one grpo/opd read.
 
-    Flash pins ulysses_sp_size to the card count and verl derives dp_size = world_size //
-    ulysses_sequence_parallel_size, so a multi-card sft run is dp_size == 1: pure sequence
-    parallelism. grpo/opd run data-parallel. The two pay different collectives (fsdp moves MODEL
-    bytes per layer, ulysses moves ACTIVATION bytes per layer, both directions) and cannot share a
-    scaling constant.
-
-    The shipped sp and dp constants are deliberately equal, so reading the returned value proves
-    nothing about which one was consulted. Perturb the sp constant: sft must move with it and
-    grpo/opd must not.
+    sft used to pin ulysses_sp_size to the card count (dp_size == 1: pure sequence parallelism) and
+    carried its own scaling pair for it. Sequence parallelism is wrong for the catalog's GDN
+    hybrids, so `sft_train_runner` pins it off and fsdp splits the batch instead. All three
+    algorithms now pay the same collective, so one constant must drive all three -- a surviving
+    sft-only constant would be a quote nothing executes.
     """
     from flash.cost import analytical
     from flash.cost.types import RunConfig
+
+    assert not hasattr(analytical, "MULTI_CARD_SCALING_SP_PCIE"), (
+        "the sequence-parallel constant outlived the strategy it priced"
+    )
+    assert not hasattr(analytical, "sequence_parallel_speedup"), (
+        "the sequence-parallel curve outlived the strategy it priced"
+    )
 
     def cfg(method: str) -> RunConfig:
         return RunConfig(model_id="Qwen/Qwen3.5-9B", method=method, steps=8)
 
     # 0.95 is well clear of the non-decreasing clamp (which pins anything at or below 0.5 to 1.0x
     # at 2 cards), so a wrong reading cannot coincidentally land on the right number.
-    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_SP_PCIE", 0.95)
-    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_SP_NVLINK", 0.95)
+    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_PCIE", 0.95)
+    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_NVLINK", 0.95)
 
     for card in ("RTX 4090", "A100 SXM"):
-        sft = analytical.method_card_speedup(cfg("sft"), 2, card)
-        assert sft == pytest.approx(2 * 0.95), f"sft on {card} ignored the sp constant: {sft}"
-        for method in ("grpo", "opd"):
-            other = analytical.method_card_speedup(cfg(method), 2, card)
-            assert other == pytest.approx(analytical.multi_card_speedup(2, card)), (
-                f"{method} on {card} was routed through the sequence-parallel constant"
+        for method in ("sft", "grpo", "opd"):
+            speedup = analytical.method_card_speedup(cfg(method), 2, card)
+            assert speedup == pytest.approx(2 * 0.95), (
+                f"{method} on {card} ignored the data-parallel constant: {speedup}"
             )
 
 
-def test_sequence_parallel_speedup_keeps_the_multi_card_invariants():
-    """The sp curve owes the same guarantees the dp curve does.
-
-    A separate constant must not become a hole in the invariants: one card is one card, pcie never
-    borrows nvlink scaling, no fabric delivers linear, and adding a card never models as slower.
-    """
-    from flash.cost.analytical import sequence_parallel_speedup
-
-    for name in ("A100 SXM", "RTX 4090", "unknown"):
-        assert sequence_parallel_speedup(1, name) == 1.0
-    for n in (2, 3, 4):
-        assert sequence_parallel_speedup(n, "RTX 4090") < sequence_parallel_speedup(n, "A100 SXM")
-        assert sequence_parallel_speedup(n, "A100 SXM") < n
-    for name in ("A100 SXM", "RTX 4090", "H100", "unlisted-class"):
-        vals = [sequence_parallel_speedup(n, name) for n in range(1, 9)]
-        assert vals == sorted(vals), f"{name} sp speedup decreases: {vals}"
-
-
-def test_multi_card_sft_quote_moves_with_the_sequence_parallel_constant(monkeypatch):
+def test_multi_card_sft_quote_moves_with_the_data_parallel_constant(monkeypatch):
     """The seam has to reach the shipped dollar figure, not just the helper.
 
     A 9B sft run pinned to 2x RTX 4090 is the reachable multi-card sft cell: one 4090 cannot hold
     it (needs 32 GB), two can, and sft has no step floor so the whole gpu-bound half is the token
-    compute term. That makes the sp constant map straight to the price -- if the quote does not
-    move when it changes, the fix never reached estimate_cost().
+    compute term. That makes the scaling constant map straight to the price -- if the quote does
+    not move when it changes, the fix never reached estimate_cost().
     """
     from flash.cost import analytical
     from flash.cost.types import RunConfig
@@ -277,15 +260,10 @@ def test_multi_card_sft_quote_moves_with_the_sequence_parallel_constant(monkeypa
 
     # degrade the realized scaling: the same work must take longer and cost more. 0.6 stays clear
     # of the non-decreasing clamp, so this exercises the constant rather than the floor under it.
-    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_SP_PCIE", 0.6)
+    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_PCIE", 0.6)
     after = analytical.estimate_cost(spec)
     assert after.train_seconds > before.train_seconds
     assert after.total_usd > before.total_usd
-
-    # and the grpo constant must not be what is moving it.
-    monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_PCIE", 0.4)
-    unchanged = analytical.estimate_cost(spec)
-    assert unchanged.train_seconds == pytest.approx(after.train_seconds)
 
 
 def test_a_vast_multi_card_run_is_not_credited_with_nvlink_scaling():
@@ -298,7 +276,7 @@ def test_a_vast_multi_card_run_is_not_credited_with_nvlink_scaling():
     real candidates, and crediting them with the measured nvlink curve prices them on bandwidth
     they may not have.
     """
-    from flash.cost.analytical import multi_card_speedup, sequence_parallel_speedup
+    from flash.cost.analytical import multi_card_speedup
     from flash.cost.facts import has_nvlink
 
     for ambiguous in ("H100", "A100 SXM 40GB"):
@@ -312,10 +290,6 @@ def test_a_vast_multi_card_run_is_not_credited_with_nvlink_scaling():
         # and the credit is large enough to change a ranking: ~24% at 2 cards, ~80% at 4.
         assert multi_card_speedup(2, ambiguous, "vast") < multi_card_speedup(2, ambiguous, "runpod")
         assert multi_card_speedup(4, ambiguous, "vast") < multi_card_speedup(4, ambiguous, "runpod")
-        # sft shards by sequence and reads the same classification, so it must narrow too.
-        assert sequence_parallel_speedup(2, ambiguous, "vast") < sequence_parallel_speedup(
-            2, ambiguous, "runpod"
-        )
 
     # an unpinned/unknown provider keeps the class answer: this narrows a known-ambiguous market,
     # it does not downgrade everything that fails to name a provider.
@@ -354,6 +328,286 @@ def test_a_vast_sharded_quote_reads_the_provider_off_the_run_config():
         assert method_card_speedup(cfg("auto", method), 2, "H100", "vast") == vast
 
 
+def test_ranking_prices_the_authored_rollout_batch_not_the_recipe_default():
+    """Regression: hardware ranking read the optimizer batch from the sft-only key.
+
+    `RunConfig.batch_size` means "examples per optimizer update", but grpo/opd author that as
+    `prompts_per_step` -- the schema rejects `batch_size` for them outright. Reading only the sft
+    name left the ranker at None for every authored rollout batch, so it priced the recipe default
+    (64) against an authored 32 and could select a costlier shape than the run needs. The persisted
+    quote already reads the new key, so the two silently disagreed.
+    """
+    from flash.engine.plan.recipe import RECIPE
+    from flash.providers.base import run_config_for_ranking
+
+    authored = int(RECIPE.rl.prompts_per_step) // 2
+    assert authored >= 1
+    # must differ from the default, or the assertions below pass on the broken read too.
+    assert authored != RECIPE.rl.prompts_per_step
+
+    for algorithm in ("grpo", "opd"):
+        train = {"epochs": 1, "group_size": 4, "prompts_per_step": authored}
+        config = run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+        assert config.batch_size == authored, algorithm
+        assert config.normalized().batch_size == authored, algorithm
+
+    # sft still authors the batch under its own name, and it is a different quantity.
+    sft = run_config_for_ranking("Qwen/Qwen3.5-4B", "sft", train={"epochs": 1, "batch_size": 4})
+    assert sft.batch_size == 4
+    # an unauthored rollout batch still falls through to the recipe default.
+    bare = run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo", train={"epochs": 1})
+    assert bare.batch_size is None
+    assert bare.normalized().batch_size == RECIPE.rl.prompts_per_step
+
+
+def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
+    """Ranking must price the batch a step can actually reach, not the authored ceiling.
+
+    Both rollout workers retain at most ``max_examples`` rows and then clamp the batch to what is
+    left, so `prompts_per_step = 128` with `max_examples = 2` trains on 2. Ranking the raw 128 sizes
+    hardware for a step that cannot happen, and disagrees with the persisted quote, which already
+    takes this minimum -- so the run is billed against one number and provisioned against another.
+
+    Only the validated ``[train] max_examples`` is a cap here. ``[environment.params] max_examples``
+    is an opaque kwarg flash never enforces, and `_on_policy_example_count` deliberately does not
+    take a min() with it; a run whose environment ignores the key would otherwise be underprovisioned.
+    """
+    from types import SimpleNamespace
+
+    from flash.cost.spec import _on_policy_prompts_per_step, _on_policy_requested_prompts_per_step
+    from flash.engine.plan.recipe import RECIPE
+    from flash.providers.base import run_config_for_ranking
+
+    for algorithm in ("grpo", "opd"):
+        default = int((RECIPE.opd if algorithm == "opd" else RECIPE.rl).prompts_per_step)
+        # (authored prompts_per_step, max_examples, expected ranked batch)
+        for authored, retained, expected in (
+            (128, 2, 2),  # the reported shape: pool far below the authored batch
+            (2, 128, 2),  # pool above the batch changes nothing
+            (8, 8, 8),  # equal
+            (8, 0, 8),  # 0 means uncapped, not "a pool of zero"
+            (8, None, 8),  # unset
+            # UNAUTHORED batch: the recipe default must be capped too, because the workers clamp
+            # whatever the batch resolved to. Leaving this to `normalized()` ranked 64/8 uncapped.
+            (None, 2, 2),
+            (None, None, None),  # nothing to cap; `normalized()` fills the default
+            (None, 0, None),  # 0 is uncapped, so there is still nothing to resolve
+            (None, 10**6, default),  # pool far above the default
+        ):
+            train = {"epochs": 1, "group_size": 4}
+            if authored is not None:
+                train["prompts_per_step"] = authored
+            if retained is not None:
+                train["max_examples"] = retained
+            config = run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+            assert config.batch_size == expected, (algorithm, authored, retained)
+            # what actually gets priced, after the recipe fills any remaining None.
+            assert config.normalized().batch_size == (
+                expected if expected is not None else default
+            ), (algorithm, authored, retained)
+
+    # sft is untouched: its `batch_size` is examples per update on a dataset it may revisit across
+    # epochs, so a small `max_examples` does not bound it the way a rollout pool bounds a step.
+    sft = run_config_for_ranking(
+        "Qwen/Qwen3.5-4B", "sft", train={"epochs": 1, "batch_size": 8, "max_examples": 2}
+    )
+    assert sft.batch_size == 8
+
+    # and it agrees with the quote that bills the run, which is the disagreement being fixed.
+    spec = SimpleNamespace(
+        algorithm="grpo", train=SimpleNamespace(prompts_per_step=128, max_examples=2)
+    )
+    assert _on_policy_requested_prompts_per_step(spec) == 128
+    assert _on_policy_prompts_per_step(spec, spec.train.max_examples) == 2
+
+
+def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for():
+    """The quote a run is BILLED from must price the batch the ranker sized the card for.
+
+    `runconfig_from_spec` fed `RunConfig.batch_size` the raw authored `prompts_per_step`, so a run
+    with `prompts_per_step = 128, max_examples = 2` was quoted for a batch of 128 while training on
+    2. The persisted quote is what a completed or cancelled run is charged against
+    (`flash/runner/costs.py`), and it also gates the pre-submit affordability check, so the gap both
+    overcharges and can reject an affordable run.
+
+    Internally inconsistent too: `spec_steps` already counted steps against the CAPPED batch, so one
+    quote mixed a capped step count with an uncapped per-step price.
+    """
+    from flash.core.spec import JobSpec
+    from flash.cost.spec import runconfig_from_spec
+    from flash.providers.base import run_config_for_ranking
+
+    base = {
+        "model": "Qwen/Qwen3.5-4B",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "gpu": {"type": "H100", "count": 1},
+    }
+    for algorithm in ("grpo", "opd"):
+        for label, train in (
+            (
+                "authored above the pool",
+                {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 2},
+            ),
+            ("unauthored, small pool", {"epochs": 1, "group_size": 4, "max_examples": 2}),
+            (
+                "authored below the pool",
+                {"epochs": 1, "group_size": 4, "prompts_per_step": 2, "max_examples": 128},
+            ),
+            # no pool size, horizon stated instead -- quotable, and nothing to cap against.
+            (
+                "authored, max_steps horizon",
+                {"epochs": 1, "group_size": 4, "prompts_per_step": 32, "max_steps": 10},
+            ),
+            (
+                "uncapped pool, max_steps horizon",
+                {
+                    "epochs": 1,
+                    "group_size": 4,
+                    "prompts_per_step": 8,
+                    "max_examples": 0,
+                    "max_steps": 10,
+                },
+            ),
+        ):
+            spec = JobSpec.from_dict(
+                {**base, "algorithm": algorithm, "run_id": "q", "train": train}
+            )
+            quoted = runconfig_from_spec(spec).normalized().batch_size
+            ranked = (
+                run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+                .normalized()
+                .batch_size
+            )
+            # compared after normalization: the two reach the recipe default by different routes,
+            # and it is the effective number that has to match, not how each got there.
+            assert quoted == ranked, (algorithm, label, quoted, ranked)
+
+    # the headline shape, pinned to its literal value so a change to BOTH sides cannot pass silently.
+    capped = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 2},
+        }
+    )
+    assert runconfig_from_spec(capped).normalized().batch_size == 2
+
+    # a stated horizon needs no pool size, so capping must not turn `max_steps` into a refusal.
+    # `spec_steps` returns before asking for a row count; asking anyway here would reject a fully
+    # specified run at submit time.
+    stated = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 32, "max_steps": 10},
+        }
+    )
+    assert runconfig_from_spec(stated).normalized().batch_size == 32
+
+    # and a pool that genuinely cannot be known is still dev's explicit refusal, not a cheap quote.
+    from flash.cost.spec import UnknownPromptPoolSize
+
+    unbounded = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 32},
+        }
+    )
+    with pytest.raises(UnknownPromptPoolSize):
+        runconfig_from_spec(unbounded)
+
+    # [environment.params] max_examples is not horizon evidence at all, so a spec stating only that
+    # is refused rather than priced from it. it is an opaque kwarg forwarded to the user's
+    # environment factory that neither worker applies, which makes it wrong in BOTH directions
+    # against `prompts_per_step = 128`: an environment that honours it trains 2 prompts, so pricing
+    # an uncapped 128-prompt step overcharges 64x, while one that ignores it yields every row, so
+    # deriving a 1-step horizon from the 2 underquotes a 1153-row pool 10x. Neither branch is a
+    # quote, and the run is billed from this estimate.
+    env_only = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "environment": {
+                "id": "github:owner/repo@main:env/environment.py",
+                "params": {"max_examples": 2},
+            },
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128},
+        }
+    )
+    with pytest.raises(UnknownPromptPoolSize):
+        runconfig_from_spec(env_only)
+
+    # a submit-time refusal is only correct because the run never launches: `_estimate_selected_quote`
+    # fails closed before allocation. the CANCEL path prices a run that already ran and must never
+    # refuse -- `charge_usd_for_spec` pins `max_steps` onto the very same spec and its outer
+    # `except Exception` converts any raise into the $0 fallback, billing nothing for real work. an
+    # overcharge is visible and disputable; a silent zero is neither, and the persisted quote caps
+    # the charge anyway. so this stays priced, and pinning it here keeps a future "refuse everywhere
+    # the key appears" tightening from turning a cancelled run into free GPU time.
+    from types import SimpleNamespace
+
+    from flash.runner.costs import cancelled_charge_usd
+
+    # 10 epochs over a 2-row env pool is a TEN step horizon, and that matters: a one-epoch spec
+    # plans a single step, where "cancelled after 1" and "cancelled after all" are the same charge
+    # and the proration below cannot be observed at all. The horizon has to exceed 1 for this to
+    # test anything.
+    cancelled = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "environment": {
+                "id": "github:owner/repo@main:env/environment.py",
+                "params": {"max_examples": 2},
+            },
+            "train": {"epochs": 10, "group_size": 4, "prompts_per_step": 128},
+        }
+    )
+
+    accepted_quote = 0.1
+    status = SimpleNamespace(
+        estimated_cost_usd=accepted_quote,
+        remote={"provider": "runpod", "allocated_gpu": "H100", "allocated_gpu_count": 1},
+    )
+    charged = cancelled_charge_usd(status, cancelled, steps=7, fallback=0.0)
+    assert charged > 0.0, "a cancelled run that really trained must not bill $0"
+    # and never above the quote the customer accepted, which is what bounds the overcharge.
+    assert charged <= accepted_quote
+
+    # the fraction itself, which is the part a dead `partial / full` silently destroys. with the
+    # full-work reprice unpriceable the ratio is skipped and every cancel falls through to the quote
+    # cap, so a run stopped after ONE of ten steps bills the whole quote. assert the curve, not just
+    # the bounds: these are the same proportions dev bills, and they only hold while the legacy pool
+    # still yields a full-work horizon to divide by.
+    for completed, expected_fraction in ((1, 0.1), (2, 0.2), (5, 0.5), (10, 1.0)):
+        billed = cancelled_charge_usd(status, cancelled, steps=completed, fallback=0.0)
+        assert billed == pytest.approx(accepted_quote * expected_fraction, rel=0.02), (
+            f"cancelled after {completed}/10 steps billed {billed}, "
+            f"expected ~{expected_fraction:.0%} of the accepted quote"
+        )
+
+    # and when both are stated, the enforced [train] cap is the one that binds.
+    both = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "environment": {
+                "id": "github:owner/repo@main:env/environment.py",
+                "params": {"max_examples": 2},
+            },
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 4},
+        }
+    )
+    assert runconfig_from_spec(both).normalized().batch_size == 4
+
+
 def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     """The ranking config carries NO provider, so reading it off the config alone was inert.
 
@@ -388,7 +642,14 @@ def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     }
     assert single["vast"] == single["runpod"]
     # not a blanket penalty: a genuinely cheaper vast pair still wins, it is just priced honestly.
-    assert at("vast", hourly=1.70) < at("runpod", hourly=1.95)
+    #
+    # the discount has to clear the interconnect penalty, and how big that is depends on how much of
+    # the step is gpu work. it used to be swamped: a phantom `completions x 1.0s` reward wall sat
+    # beside a step floor already fitted with grading included, so most of a modelled grpo step was
+    # an off-gpu wait no interconnect touches and a 12.8% discount was enough. with the double-count
+    # removed the step is gpu-bound, pcie costs ~17.4% more wall, and the discount must beat that.
+    # 1.70 (12.8% off) no longer does; 1.55 (20.5% off) does.
+    assert at("vast", hourly=1.55) < at("runpod", hourly=1.95)
 
 
 def test_a_live_vast_allocation_is_requoted_without_nvlink_credit():
@@ -423,3 +684,115 @@ def test_a_live_vast_allocation_is_requoted_without_nvlink_credit():
         "the wall the run is billed for"
     )
     assert quote("vast", gpu_count=1).train_seconds == quote("runpod", gpu_count=1).train_seconds
+
+
+def test_sft_fit_credits_only_the_ranks_that_will_launch():
+    """Regression: the fit gate credited cards the sft run never puts in the fsdp group.
+
+    Multi-card fit comes from SHARDING, so a card that does not join contributes no memory. sft
+    shards by data and bounds its width by the batch and the row count, and an unpacked profile pins
+    the batch to 1 -- so the run launches ONE rank no matter how many cards are rented.
+
+    The decisive shape is a run that one card correctly rejects: a 4B at 32k needs 28 GB and does not
+    fit a 24 GB card. Before this, renting two credited 35 GB and ADMITTED it, then launched a single
+    rank with 24 GB and OOM'd on paid hardware. Allocating more cards must not be a way to pass a
+    gate the executed run cannot pass.
+    """
+    from flash.providers.allocator import _executed_gpu_count, _fits
+    from flash.providers.base import Candidate
+
+    need = 28.0
+
+    def fits(cards, algorithm="sft", train=None, overrides=None):
+        candidate = Candidate(
+            provider="runpod", gpu="A10", hourly_usd=1.0, vram_gb=24, gpu_count=cards
+        )
+        width = _executed_gpu_count(algorithm, train, overrides, candidate.gpu_count)
+        return _fits(candidate, need, width)
+
+    unpacked = {"batch_size": 1}
+    # one card cannot hold it -- that is the baseline the wider shapes must not be able to dodge.
+    assert not fits(1, train=unpacked)
+    for cards in (2, 4, 8):
+        assert not fits(cards, train=unpacked), (
+            f"{cards} cards were credited as if all joined the run, but an unpacked sft run "
+            "launches one rank, so the run is admitted on memory it never has and OOMs when paid"
+        )
+
+    # a batch that DOES divide the allocation launches every card, so sharding is real and credited.
+    packed = {"batch_size": 8}
+    assert fits(2, train=packed, overrides={"sft_retained_examples": 64}), (
+        "a width the batch and rows both divide must keep its shard credit"
+    )
+
+    # ROWS bind too, and they arrive by a different route: `sft_retained_examples` is a profile
+    # measurement, not a TrainSpec knob, so `_overridden_train` never copies it onto `train`.
+    # reading it from there would find nothing and miss this narrowing entirely. sized against a
+    # need BETWEEN the 2- and 4-card credits, so narrowing 4 -> 2 actually crosses the gate rather
+    # than landing on the same side of it.
+    def fits_rows(cards, rows, need_gb):
+        candidate = Candidate(
+            provider="runpod", gpu="A10", hourly_usd=1.0, vram_gb=24, gpu_count=cards
+        )
+        width = _executed_gpu_count(
+            "sft", packed, {"sft_retained_examples": rows}, candidate.gpu_count
+        )
+        return _fits(candidate, need_gb, width)
+
+    between = 50.0  # 2 cards credit 35.2, 4 credit 62.4
+    assert fits_rows(4, 64, between), (
+        "64 rows split 4 ways, so all four cards join and are credited"
+    )
+    assert not fits_rows(4, 10, between), (
+        "10 rows cannot be split 4 ways, so the run launches 2 ranks -- crediting 4 admits it on "
+        "memory only the wider world would have had"
+    )
+
+    # grpo and opd bound their width too, but on their OWN unit of work: they never read
+    # `batch_size` (their batch is `prompts_per_step`, repeated `group_size` times), so an sft-shaped
+    # knob must leave them at full width rather than silently narrowing them through the wrong field.
+    assert fits(2, algorithm="grpo", train=unpacked)
+    assert fits(2, algorithm="opd", train=unpacked)
+
+    # their real narrowing: one prompt in a group of two is 2 sequences, which cannot fill 4 dp
+    # ranks. verl raises on the uneven chunk instead of degrading, so crediting 4 would admit a run
+    # that dies at step 0 on paid hardware -- the same over-credit as the sft case above.
+    tiny_rl = {"prompts_per_step": 1, "group_size": 2}
+    assert _executed_gpu_count("grpo", tiny_rl, None, 4) == 2
+    assert _executed_gpu_count("opd", {"prompts_per_step": 1, "group_size": 1}, None, 2) == 1
+    # and a real step fills every card, so the fix costs no capacity where it matters.
+    assert _executed_gpu_count("grpo", {"prompts_per_step": 8, "group_size": 4}, None, 8) == 8
+
+    # an OMITTED group takes the recipe default for that algorithm, which is what the worker resolves
+    # it to (`train/rl/inputs.py`) and what the quote fills in (`RunConfig.normalized`). the defaults
+    # differ -- grpo groups 8 completions per prompt, opd distills 1 -- so hardcoding either number
+    # here breaks the other. reading 1 for grpo under-credited it eightfold and REJECTED runs that fit.
+    assert _executed_gpu_count("grpo", {"prompts_per_step": 1}, None, 8) == 8
+    assert _executed_gpu_count("opd", {"prompts_per_step": 1}, None, 8) == 1
+    # an explicit group still wins over the default.
+    assert _executed_gpu_count("grpo", {"prompts_per_step": 1, "group_size": 1}, None, 8) == 1
+
+    # the quote must agree on every one of those, or a shape it prices gets refused at submit.
+    from flash.cost.analytical import executed_gpu_count
+    from flash.cost.types import RunConfig
+
+    for method, prompts, group in (("grpo", 1, None), ("opd", 1, None), ("grpo", 1, 1)):
+        train = {"prompts_per_step": prompts} | ({"group_size": group} if group else {})
+        quoted = executed_gpu_count(
+            RunConfig(
+                model_id="Qwen/Qwen3.5-4B",
+                method=method,
+                steps=10,
+                batch_size=prompts,
+                group_size=group,
+            ),
+            8,
+        )
+        assert quoted == _executed_gpu_count(method, train, None, 8), (method, prompts, group)
+
+    # an UNKNOWN batch must not be read as a batch of 1, and unmeasured rows must not invent a limit.
+    # callers that rank without knobs would otherwise have every multi-card sft shape rejected -- a
+    # worse failure than the over-credit this clamp exists to stop, and one no test above catches.
+    assert fits(2, train=None)
+    assert fits(2, train={})
+    assert fits(4, train=packed, overrides={})

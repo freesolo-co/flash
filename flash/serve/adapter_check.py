@@ -13,16 +13,14 @@ from __future__ import annotations
 import json
 import os
 
-from flash.adapters.artifacts import ADAPTER_WEIGHT_FILES
+from flash.adapters.artifacts import has_loadable_adapter_weights, is_adapter_weight_filename
 from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.serve.errors import AdapterConfigMissing, AdapterTensorMissing, ServingError
 
-
-def _is_adapter_tensor_filename(filename: str) -> bool:
-    name = filename.rsplit("/", 1)[-1]
-    if name in ADAPTER_WEIGHT_FILES:
-        return True
-    return name.startswith("adapter_model-") and name.endswith((".safetensors", ".bin"))
+# The accepted weight-file shapes live beside the filenames themselves so serving validation and
+# `flash.serve.export` cannot drift apart. The alias name is load-bearing: `flash.serve.deploy`
+# re-exports it and the serving tests resolve it there.
+_is_adapter_tensor_filename = is_adapter_weight_filename
 
 
 def _is_hf_not_found_error(exc: Exception) -> bool:
@@ -85,10 +83,16 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str, *, hf_revisio
             raise AdapterTensorMissing(message) from exc
         raise ServingError(message) from exc
 
+    listed_paths: list[str] = []
     tensor_paths: list[str] = []
     zero_byte_tensor_paths: list[str] = []
     for entry in entries:
         path = str(getattr(entry, "path", "") or "")
+        if not path:
+            continue
+        # every listed name, because whether the shards form a loadable set is decided by the index
+        # beside them -- and the index is not itself a weight file.
+        listed_paths.append(path)
         if not _is_adapter_tensor_filename(path):
             continue
         tensor_paths.append(path)
@@ -106,11 +110,21 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str, *, hf_revisio
             f"could not verify adapter tensors: {location} has zero-byte adapter tensor "
             f"file(s): {', '.join(zero_byte_tensor_paths)}"
         )
-    if tensor_paths:
-        return
-    raise AdapterTensorMissing(
-        f"could not verify adapter tensors: {location} has no adapter_model tensor file"
-    )
+    if not tensor_paths:
+        raise AdapterTensorMissing(
+            f"could not verify adapter tensors: {location} has no adapter_model tensor file"
+        )
+    # Present is not loadable. peft discovers the sharded representation only through
+    # `adapter_model.<ext>.index.json`, so an interrupted upload that left one
+    # `adapter_model-00001-of-00002.safetensors` behind passes the check above while carrying
+    # nothing peft can bind. Registering it deploys a base model the user benchmarks as their
+    # adapter, and peft reports that as a UserWarning rather than an error -- this refusal is the
+    # only signal that ever reaches them.
+    if not has_loadable_adapter_weights(listed_paths):
+        raise AdapterTensorMissing(
+            f"could not verify adapter tensors: {location} has adapter_model shard(s) but no "
+            "complete index-referenced set, so there is nothing peft can load"
+        )
 
 
 def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str) -> int:

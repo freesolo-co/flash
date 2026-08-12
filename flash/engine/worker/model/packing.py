@@ -15,7 +15,7 @@ def _text_config(cfg):
     return getattr(cfg, "text_config", None) or cfg
 
 
-def _load_text_config(model_id: str, revision: str):
+def _load_text_config(model_id: str, revision: str, *, trust_remote_code: bool = True):
     """The checkpoint's decoder config. Raises when the config cannot be resolved."""
     from transformers import AutoConfig
 
@@ -24,13 +24,15 @@ def _load_text_config(model_id: str, revision: str):
     return _text_config(
         AutoConfig.from_pretrained(
             model_id,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             **model_revision_kwargs(revision),
         )
     )
 
 
-def probe_is_pure_attention(model_id: str, revision: str = "") -> bool:
+def probe_is_pure_attention(
+    model_id: str, revision: str = "", *, trust_remote_code: bool = True
+) -> bool:
     """Pure-attention probe that RAISES rather than swallowing a failed config read.
 
     Callers that freeze the answer into a digest must use this. Returning False for "the hub timed
@@ -38,7 +40,7 @@ def probe_is_pure_attention(model_id: str, revision: str = "") -> bool:
     wrong answer written into a profile is compared byte-for-byte against a later re-derivation
     that may have gotten the config just fine.
     """
-    cfg = _load_text_config(model_id, revision)
+    cfg = _load_text_config(model_id, revision, trust_remote_code=trust_remote_code)
     layer_types = getattr(cfg, "layer_types", None)
     if layer_types:
         return all(t == "full_attention" for t in layer_types)
@@ -51,12 +53,14 @@ def probe_is_pure_attention(model_id: str, revision: str = "") -> bool:
     return not (sliding and getattr(cfg, "use_sliding_window", True))
 
 
-def probe_is_gdn_hybrid(model_id: str, revision: str = "") -> bool:
+def probe_is_gdn_hybrid(
+    model_id: str, revision: str = "", *, trust_remote_code: bool = True
+) -> bool:
     """``model_is_gdn_hybrid`` without the swallow: a failed probe RAISES.
 
     See ``probe_is_pure_attention`` for why a digest-freezing caller needs the distinction.
     """
-    cfg = _load_text_config(model_id, revision)
+    cfg = _load_text_config(model_id, revision, trust_remote_code=trust_remote_code)
     layer_types = getattr(cfg, "layer_types", None)
     if layer_types and any(t == "linear_attention" for t in layer_types):
         return True
@@ -123,21 +127,41 @@ def _gdn_forward_threads_reset_kwargs(model_id: str | None, revision: str = "") 
         return False
 
 
+def worker_image_packing_support(model_id: str, revision: str = "") -> tuple[str, bool]:
+    """Return the packing contract supplied by the fixed worker image.
+
+    the worker image pins transformers, fla, and causal_conv1d as one tested stack. the control plane
+    deliberately does not install those gpu-only modules, so curated catalog architecture identifies
+    the GDN contract without importing repository code or the worker stack. uncataloged models still
+    use a data-only config probe. the worker verifies its installed modules and forward signature
+    before executing a packed quote.
+    """
+    from flash.core.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    if info is not None:
+        if info.num_linear_attention_layers:
+            return "gdn-hybrid", True
+        if info.num_attention_layers:
+            return "pure-attention", True
+        return "unsupported", False
+    if probe_is_pure_attention(model_id, revision=revision, trust_remote_code=False):
+        return "pure-attention", True
+    if probe_is_gdn_hybrid(model_id, revision=revision, trust_remote_code=False):
+        return "gdn-hybrid", True
+    return "unsupported", False
+
+
 def gdn_packing_contract_available(model_id: str | None = None, revision: str = "") -> bool:
     """True when the installed gdn stack exposes the boundary-reset contract without opening cuda.
 
-    DEVICE-INDEPENDENT by construction, because the two callers of ``prepare_sft_workload`` run on
-    different hardware: the quote is produced by the cpu-only profile job (runner drops the gpu type
-    so it does not rent an H100 to tokenize), and training runs on the gpu worker. ``sft_train``
-    compares the two profiles byte-for-byte and raises "sft workload changed after the quote was
-    frozen" on any difference, so a packing gate that consults ``torch.cuda`` answers False in the
-    quote and True in training and fails EVERY run on the main path.
+    device-independent by construction because the gpu worker must verify capability without opening
+    cuda before it accepts a packed quote. a gate that consults ``torch.cuda`` could change the answer
+    across worker lifecycle stages.
 
-    So this asks only what both machines can answer identically: does the installed transformers
-    thread the reset kwargs into this arch's GDN forward, and are the kernels importable. Both are
-    properties of the pinned image, which is a fixed input to the job. ``is_*_available()`` is
-    deliberately NOT used -- those open with ``is_torch_cuda_available()`` (see Dockerfile.worker's
-    sanity block), which is exactly the device dependence this must not have.
+    this asks whether the installed transformers threads the reset kwargs into this arch's GDN
+    forward and whether both kernels are importable. ``is_*_available()`` is deliberately not used
+    because those open with ``is_torch_cuda_available()``.
     """
     try:
         import importlib

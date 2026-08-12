@@ -556,7 +556,7 @@ def test_startup_rejects_an_artifact_namespace_that_cannot_form_a_repo_id(monkey
 
     from flash.runner import managed_hf_repo_for_environment
 
-    validate_repo_id(managed_hf_repo_for_environment("github:owner/envs@main:gsm8k"))
+    validate_repo_id(managed_hf_repo_for_environment("github:owner/project/envs@main:gsm8k"))
 
 
 def test_the_env_template_does_not_preset_the_hosted_serving_url() -> None:
@@ -771,6 +771,18 @@ def _deps_module():
     return _deps
 
 
+def _environment_for(standalone_value: str | None) -> dict:
+    """The ``[environment]`` block the given plane accepts.
+
+    The two planes take disjoint environment sources -- the managed one runs hub slugs only, a
+    self-hosted one runs explicit GitHub refs only -- so a test about anything ELSE has to vary this
+    with the deployment or it trips the environment gate before reaching what it means to assert.
+    """
+    if standalone_value is None:
+        return {"id": "owner/project/env"}
+    return {"id": "github:owner/repo@main:env/environment.py"}
+
+
 def test_the_catalog_binds_on_both_deployments(monkeypatch) -> None:
     """Self-hosting relaxes billing boundaries, not the catalog -- an uncataloged model is refused
     on either plane.
@@ -786,12 +798,19 @@ def test_the_catalog_binds_on_both_deployments(monkeypatch) -> None:
 
     from tests._helpers.specs import raw_spec
 
-    payload = {"spec": raw_spec(model="meta-llama/Llama-3.1-8B")}
     for standalone_value in ("1", None):
         if standalone_value is None:
             monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
         else:
             monkeypatch.setenv(auth.STANDALONE_ENV, standalone_value)
+        # each plane's own accepted environment form: the two are disjoint, and this test is about
+        # the MODEL, so it must not trip the environment gate on either side.
+        payload = {
+            "spec": raw_spec(
+                model="meta-llama/Llama-3.1-8B",
+                environment=_environment_for(standalone_value),
+            )
+        }
         with pytest.raises(HTTPException) as ei:
             _deps._parse_spec(payload, run_id="r")
         assert ei.value.status_code == 400
@@ -809,7 +828,8 @@ def test_a_catalog_run_parses_on_both_deployments(monkeypatch) -> None:
             monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
         else:
             monkeypatch.setenv(auth.STANDALONE_ENV, standalone_value)
-        assert _deps._parse_spec({"spec": raw_spec()}, run_id="r").model == raw_spec()["model"]
+        spec = raw_spec(environment=_environment_for(standalone_value))
+        assert _deps._parse_spec({"spec": spec}, run_id="r").model == spec["model"]
 
 
 # ---------------------------------------------------------------------------
@@ -861,19 +881,93 @@ def test_a_self_hosted_plane_still_accepts_a_direct_github_environment(
     assert spec.environment.id == env_id
 
 
-def test_the_hub_slug_is_accepted_on_both_deployments(monkeypatch) -> None:
-    """The counterpart to the refusal: the managed form works everywhere, so the check above is
-    really about the GitHub forms and not about the hosted parser refusing environments at large."""
+def test_the_hub_slug_is_accepted_on_the_managed_plane(monkeypatch) -> None:
+    """The counterpart to the refusal: the managed form works on the plane that owns the hub, so
+    the check above is really about the GitHub forms and not about the hosted parser refusing
+    environments at large."""
     _deps = _deps_module()
     from tests._helpers.specs import raw_spec
 
-    for standalone_value in ("1", None):
-        if standalone_value is None:
-            monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
-        else:
-            monkeypatch.setenv(auth.STANDALONE_ENV, standalone_value)
-        spec = _deps._parse_spec({"spec": raw_spec(environment={"id": "owner/env"})}, run_id="r")
-        assert spec.environment.id == "owner/env"
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    spec = _deps._parse_spec(
+        {"spec": raw_spec(environment={"id": "owner/project/env"})}, run_id="r"
+    )
+    assert spec.environment.id == "owner/project/env"
+
+
+# every spelling that `canonical_managed_environment_slug` maps onto the private hub. a self-hosted
+# plane can read none of them, so admitting any one is the same defect wearing a different syntax.
+_MANAGED_HUB_FORMS: tuple[str, ...] = (
+    "owner/project/env",
+    "github:freesolo-co/environment-hub@main:owner/project/env/environment.py",
+    "github:FREESOLO-CO/Environment-Hub@main:owner/project/env/environment.py",
+    "https://github.com/freesolo-co/environment-hub/tree/main/owner/project/env",
+)
+
+
+@pytest.mark.parametrize("env_id", _MANAGED_HUB_FORMS)
+def test_a_self_hosted_plane_refuses_an_id_naming_the_private_hub(monkeypatch, env_id: str) -> None:
+    """A slug names the one repo a self-hosted plane provably cannot read.
+
+    ``managed_slug_to_github_ref`` maps every slug onto ``freesolo-co/environment-hub``, which is
+    private and hardcoded with no override. Accepted, the id passes submit, survives the
+    best-effort sha pin, and fails on a rented GPU as a bare GitHub 404 naming a repo the operator
+    has no relationship with -- after the run has cost money. Refusing at submit makes that failure
+    free and self-explanatory. Parametrized over all four spellings because they canonicalize to
+    the same unreadable repo.
+    """
+    _deps = _deps_module()
+    from fastapi import HTTPException
+
+    from tests._helpers.specs import raw_spec
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    with pytest.raises(HTTPException) as ei:
+        _deps._parse_spec({"spec": raw_spec(environment={"id": env_id})}, run_id="r")
+    assert ei.value.status_code == 400
+    detail = str(ei.value.detail)
+    # names the cause and the way out, not just "rejected"
+    assert "freesolo-co/environment-hub" in detail
+    assert "github:OWNER/REPO@REF:" in detail
+
+
+def test_a_self_hosted_plane_refuses_a_malformed_ref_into_the_hub(monkeypatch) -> None:
+    """A ref that targets the hub but is shaped wrong is still the unreachable repo.
+
+    ``canonical_managed_environment_slug`` raises rather than returns for this, so the guard has to
+    treat the raise as "names the hub". Reporting a shape complaint instead would send the operator
+    fixing the path of a repo they were never going to be able to read.
+    """
+    _deps = _deps_module()
+    from fastapi import HTTPException
+
+    from tests._helpers.specs import raw_spec
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    env_id = "github:freesolo-co/environment-hub@main:too-few-segments/environment.py"
+    with pytest.raises(HTTPException) as ei:
+        _deps._parse_spec({"spec": raw_spec(environment={"id": env_id})}, run_id="r")
+    assert ei.value.status_code == 400
+    assert "freesolo-co/environment-hub" in str(ei.value.detail)
+
+
+def test_a_missing_environment_id_keeps_the_schema_error_on_a_self_hosted_plane(monkeypatch):
+    """The new refusal must not intercept an absent id, exactly as the hosted one does not.
+
+    An unset ``[environment] id`` is a different mistake from naming the hub, and the schema already
+    explains it. Answering "names Freesolo's managed environment hub" for an id the caller never set
+    would be actively misleading.
+    """
+    _deps = _deps_module()
+    from fastapi import HTTPException
+
+    from tests._helpers.specs import raw_spec
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    with pytest.raises(HTTPException) as ei:
+        _deps._parse_spec({"spec": raw_spec(environment={})}, run_id="r")
+    assert ei.value.status_code == 400
+    assert "must set [environment] id" in str(ei.value.detail)
 
 
 def test_a_missing_environment_id_keeps_the_schema_error_on_the_hosted_plane(monkeypatch) -> None:
@@ -956,3 +1050,51 @@ def test_standalone_deployment_management_still_refuses_a_run_it_does_not_own(
     with pytest.raises(HTTPException) as ei:
         _deps.manageable_run("run-someone-else", key)
     assert ei.value.status_code == 404
+
+
+def test_standalone_deploy_needs_no_org_while_managed_fails_closed(monkeypatch) -> None:
+    """The org fail-closed gate on deploy is a managed-plane rule.
+
+    A standalone plane has no organization directory, so requiring an org there would make every
+    deploy impossible; managed mode is where an org-unscoped adapter registration would hand the
+    serving backend an unowned revision, so THAT is where the deploy must be refused.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi import HTTPException
+
+    from flash.server.routes import serving
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    serving._require_deploy_org("run-1", None)  # single-tenant: nothing to name, no rejection
+
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    with pytest.raises(HTTPException) as ei:
+        serving._require_deploy_org("run-1", None)
+    assert ei.value.status_code == 409
+    assert "owning organization" in str(ei.value.detail)
+    serving._require_deploy_org("run-1", "org-1")  # managed with an org still deploys
+
+
+def test_standalone_deployment_listing_stays_exact_key_scoped(monkeypatch) -> None:
+    """Standalone keeps the unscoped exact-key listing its operator CLI sends (no org headers)."""
+    pytest.importorskip("fastapi")
+    from fastapi import HTTPException
+
+    from flash.server.routes import serving
+
+    internal_key = {"id": 1, "auth_kind": "internal"}
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    assert serving._deployment_listing_scope(internal_key, None, None) is None
+
+    # managed mode: the internal key must name its scope; a user key stays key-scoped
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    with pytest.raises(HTTPException) as ei:
+        serving._deployment_listing_scope(internal_key, None, None)
+    assert ei.value.status_code == 400
+    project = "11111111-1111-4111-8111-111111111111"
+    assert serving._deployment_listing_scope(internal_key, "org-1", project) == ("org-1", project)
+    assert (
+        serving._deployment_listing_scope({"id": 2, "auth_kind": "freesolo_api_key"}, None, None)
+        is None
+    )

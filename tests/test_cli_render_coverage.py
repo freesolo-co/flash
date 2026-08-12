@@ -16,6 +16,7 @@ import types
 
 import pytest
 
+from flash.cli.ui import heartbeat as ui_heartbeat
 from flash.cli.ui import render
 
 
@@ -259,7 +260,10 @@ def test_humanize_age_buckets(monkeypatch) -> None:
         return render._humanize_age_seconds(render._heartbeat_age_seconds(value))
 
     now = 1_000_000.0
-    monkeypatch.setattr(render.time, "time", lambda: now)
+    # patch the clock in the module that READS it: both helpers live in `flash.cli.ui.heartbeat`
+    # and are re-exported through `render`, so patching a `time` on `render` would miss them (and
+    # `render` no longer imports `time` at all).
+    monkeypatch.setattr(ui_heartbeat.time, "time", lambda: now)
     assert humanize(now - 30) == "30s ago"  # < 90s
     assert humanize(now - 600) == "10m ago"  # < 5400s -> minutes
     assert humanize(now - 7200) == "2.0h ago"  # >= 5400s -> hours
@@ -395,7 +399,7 @@ def test_env_list_with_local_sources(styled_plain) -> None:
     assert "local sources" in out
     assert "envs/one" in out
     assert "envs/two" in out
-    assert "flash env push --project <project-uuid> --name <name> <path>" in out
+    assert f"{render.CLI_NAME} env push --project <project-uuid> --name <name> <path>" in out
 
 
 def test_projects_table_lists_name_and_id(styled_plain) -> None:
@@ -467,6 +471,73 @@ def test_run_cost_without_a_quote_reports_zero_unflagged() -> None:
     # nothing to show is not the same as an estimate of zero; don't decorate a bare 0.0.
     assert render.run_cost({"state": "queued", "cost_usd": 0.0}) == (0.0, False)
     assert render.run_cost({"state": "queued", "estimated_cost_usd": None}) == (0.0, False)
+
+
+def test_a_failed_run_that_never_measured_a_charge_is_not_reported_as_settled_zero() -> None:
+    """A terminal 0.0 is the absence of a measurement, not a measurement of zero.
+
+    ``cost_usd`` comes from the worker's metrics, so a run whose every attempt died before the
+    worker produced any never gets one, and that is exactly the run most likely to have rented
+    hardware over and over. one historical failure rented 47 instances, failed to confirm teardown
+    on 44, and printed $0.0000 with no estimate marker, which reads as "this cost nothing".
+    """
+    amount, is_estimate = render.run_cost(
+        {"state": "failed", "cost_usd": 0.0, "estimated_cost_usd": 3.5}
+    )
+    assert (amount, is_estimate) == (3.5, True)
+
+
+def test_realized_cogs_is_never_shown_as_the_customers_cost() -> None:
+    """``realized_cost_usd`` is provider COGS, not what the customer is charged.
+
+    ``runner.RunStatus`` says so directly: it is pulled from the provider's billing API by
+    reconciliation and is "distinct from ``cost_usd`` (the flash.cost ESTIMATE we charge the
+    customer)". Promoting it into the cost slot would bill the user our internal spend, and
+    ``run_status`` already prints it on its own dedicated ``realized`` row.
+    """
+    amount, _ = render.run_cost(
+        {
+            "state": "failed",
+            "cost_usd": 0.0,
+            "estimated_cost_usd": 3.5,
+            "realized_cost_usd": 1.75,
+        }
+    )
+    assert amount == 3.5
+
+
+def test_a_failed_run_with_no_evidence_at_all_still_reports_a_bare_zero() -> None:
+    """Without a quote there is nothing to show; do not invent a number."""
+    assert render.run_cost({"state": "failed", "cost_usd": 0.0}) == (0.0, False)
+
+
+def test_a_settled_zero_that_is_not_a_failure_keeps_its_zero() -> None:
+    """Only ``failed`` has an unmeasured zero. The other settled states earn theirs.
+
+    A ``dry_run`` rents nothing and a ``cancelled``/``done`` run with no charge went through the
+    normal accounting path, so resurfacing the submit quote for them would invent a charge nobody
+    incurred -- the mirror image of the bug this fix is for.
+    """
+    for state in ("dry_run", "cancelled", "done", "deployed"):
+        assert render.run_cost({"state": state, "cost_usd": 0.0, "estimated_cost_usd": 3.5}) == (
+            0.0,
+            False,
+        ), state
+
+
+def test_a_terminal_estimate_is_not_labelled_run_in_progress(styled_plain) -> None:
+    """The failed-run quote is flagged, but the run is over -- do not claim it is still running."""
+    out = render.run_status(
+        {
+            "run_id": "flash-1",
+            "state": "failed",
+            "cost_usd": 0.0,
+            "estimated_cost_usd": 3.5,
+            "spec": {"model": "m", "algorithm": "sft"},
+        }
+    )
+    assert "estimate, not measured" in out
+    assert "run in progress" not in out
 
 
 def test_run_status_marks_a_live_cost_as_an_estimate(styled_plain) -> None:

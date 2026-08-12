@@ -22,8 +22,10 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from jsonschema.validators import validator_for  # noqa: F401
 
-from flash.core.spec import JobSpec
+from flash._internal.channel import CLI_NAME
+from flash.core.spec import JobSpec, require_project_id
 from flash.runner import (
+    _internal_spec_from_status,
     effective_spec_from_status,
     # kept although this module no longer calls it: a deploy test patches
     # `serving.mark_deployed`, and `monkeypatch.setattr` needs the attribute to already exist.
@@ -48,7 +50,7 @@ from flash.serve.deploy import (  # noqa: F401
 )
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
-from flash.server.platform import db
+from flash.server.platform import auth, db
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
 from flash.server.platform.internal_client import run_org_id
 
@@ -245,12 +247,29 @@ def _validate_deploy_request(
 
     Returns the effective spec and the current deployment record for the caller to work from.
     """
-    if spec.model_revision:
+    # A pin the AUTHOR wrote before the config key was removed is a request serving cannot honour, so
+    # it stays refused for persisted runs.
+    #
+    # A pin the RUNNER assigned is different. SFT is force-pinned by
+    # `runner.submit.prepare_job` -> `_resolve_model_revision(required=True)` so workload profiling
+    # keys on an immutable commit. Rejecting those made every SFT run, and every adapter warm-started
+    # from one, permanently undeployable, which also blocks `flash models chat` and `flash env eval`,
+    # since both require a deployment.
+    #
+    # provenance and the pin are read from the INTERNAL worker spec, not `spec`: to_dict() strips both
+    # from new public specs. that includes a new child inheriting a legacy authored source pin, which
+    # must remain rejected just like its parent. `_internal_spec_from_status` falls back to the public
+    # spec for pre-upgrade runs without a worker snapshot, so historical authored pins also fail closed.
+    internal_spec = _internal_spec_from_status(status)
+    if (
+        spec.model_revision or internal_spec.model_revision
+    ) and not internal_spec.model_revision_auto:
         raise HTTPException(
             status_code=400,
             detail=(
-                "deployment does not support revision-pinned base models; "
-                "train without model_revision to deploy this run"
+                "deployment does not support this run's legacy revision-pinned base model; "
+                f"submit a new run without the removed model_revision key, or use `{CLI_NAME} "
+                "models export` to load the adapter from Hugging Face"
             ),
         )
     try:
@@ -290,6 +309,29 @@ def _validate_deploy_request(
             ),
         )
     return effective_spec, current_deployment
+
+
+def _require_deploy_org(run_id: str, deploy_org_id: str | None) -> None:
+    """Fail closed when a managed-plane deploy would register an adapter with no owning org.
+
+    Serving authorizes external chat requests against the org that owns the adapter (see
+    platform docs), so registering a revision without an org would leave the field's
+    enforcement to whatever the serving backend does with an unowned adapter. A standalone
+    plane is single-tenant by definition and has no organization directory, so it keeps
+    deploying without one (same escape hatch as ``deps.manageable_run``).
+    """
+    if deploy_org_id is not None or auth.standalone():
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"run {run_id} has no owning organization on record and the caller's key carries "
+            "none; refusing to register an adapter without an org, because serving authorizes "
+            "chat requests against the org that owns it. deploy with a key that belongs to the "
+            "run's organization, or re-submit the run through the platform so it carries an "
+            "org context."
+        ),
+    )
 
 
 @router.post("/v1/runs/{run_id}/deploy")
@@ -333,6 +375,7 @@ def deploy(
         prev_state = status.state
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
+        _require_deploy_org(run_id, deploy_org_id)
         previous_deployment = _deployment_predecessor(current_deployment)
         expected_adapter_revision = None
         if not dry_run:
@@ -539,7 +582,13 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 dest_token=hf_token,
                 private=private,
                 base_model=spec.model,
-                base_model_revision=spec.model_revision,
+                # the effective half, not the public one: a runner-assigned pin is stripped from
+                # the public spec (it cannot carry the marker that labels it), so `spec` reads "".
+                # the worker stamps the real sha into adapter_config.json from its internal spec,
+                # and export refuses a stamped revision that disagrees with what it is handed --
+                # so reading the public half here 404s every auto-pinned sft run and every warm
+                # start that inherited its pin.
+                base_model_revision=effective_spec.model_revision,
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -569,13 +618,62 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     return result
 
 
+def _deployment_listing_scope(
+    key: dict, org_id: str | None, project_id: str | None
+) -> tuple[str, str] | None:
+    """The (org, project) filter for ``/v1/deployments``, or None for an exact-key listing.
+
+    Mirrors ``deps.manageable_run``: on a managed plane the internal key is the platform proxy
+    and owns the runs it submitted on every org's behalf, so an unscoped listing would cross
+    orgs. It must name the org AND project it lists for, exactly as it must to manage a single
+    deployment. The headers are honored only for the internal key; a user key can only ever see
+    its own runs, and a standalone plane is single-tenant and keeps the exact-key listing.
+    """
+    if key.get("auth_kind") != "internal" or auth.standalone():
+        return None
+    org = str(org_id or "").strip()
+    try:
+        project = require_project_id(project_id)
+    except (TypeError, ValueError):
+        project = None
+    if not org or project is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "an internal-key deployment listing must be scoped: send X-Freesolo-Org-Id "
+                "and X-Freesolo-Project-Id for the org and project being listed"
+            ),
+        )
+    return org, project
+
+
+def _in_deployment_listing_scope(status, org: str, project: str) -> bool:
+    """Whether a run belongs to the requested org AND project (manageable_run's predicate)."""
+    from flash.runner import _status_org_id
+
+    if _status_org_id(status) != org:
+        return False
+    persisted_project = status.spec.get("project") if isinstance(status.spec, dict) else None
+    try:
+        return require_project_id(persisted_project) == project
+    except (TypeError, ValueError):
+        return False
+
+
 @router.get("/v1/deployments")
-def deployments(key: Annotated[dict, Depends(require_key)]):
+def deployments(
+    key: Annotated[dict, Depends(require_key)],
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+    x_freesolo_project_id: Annotated[str | None, Header()] = None,
+):
+    scope = _deployment_listing_scope(key, x_freesolo_org_id, x_freesolo_project_id)
     out = []
     for row in db.runs_for_key(key["id"]):
         try:
             status = _app.get_status(row["run_id"])
         except FileNotFoundError:
+            continue
+        if scope is not None and not _in_deployment_listing_scope(status, *scope):
             continue
         if status.deployment and status.deployment.get("state") not in (
             "undeployed",
@@ -687,6 +785,11 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     ] or None
     try:
         if payload.get("stream") is True:
+            # serve_chat_stream sends the upstream request and validates its status at call
+            # time, so an upstream 4xx/5xx raises here, inside the try, and becomes a real 502
+            # before the 200 headers are flushed. a failure after the first byte propagates out
+            # of the body iterator instead, which aborts the chunked response so the client
+            # cannot mistake the truncation for a finished answer.
             return StreamingResponse(
                 _app.serve_chat_stream(
                     run_id=serving_model,

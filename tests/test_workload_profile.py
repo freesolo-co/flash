@@ -10,7 +10,6 @@ from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
     sft_profile_input_digest,
     sft_profile_input_payload,
-    sft_profile_run_id,
 )
 
 
@@ -212,6 +211,34 @@ def test_sft_profile_input_payload_hashes_environment_params() -> None:
     assert "params_sha256" in encoded
 
 
+def test_sft_profile_identity_separates_configs_by_environment_pip() -> None:
+    """``[environment] pip`` changes the installed worker stack, so it cannot be absent from identity.
+
+    Two configs differing only here would otherwise share a profile digest, and the second would
+    reuse the first's measured quote and step horizon for a different dependency set.
+    """
+    spec = _spec()
+    with_pip = replace(spec, environment=replace(spec.environment, pip=("pymongo>=4.6",)))
+    reordered = replace(
+        spec, environment=replace(spec.environment, pip=("rapidfuzz", "pymongo>=4.6"))
+    )
+    ordered = replace(
+        spec, environment=replace(spec.environment, pip=("pymongo>=4.6", "rapidfuzz"))
+    )
+
+    def identity(job: JobSpec) -> dict:
+        return sft_profile_input_payload(
+            job, tokenizer_revision="tokenizer-a", producer_version="1.2.3"
+        )["environment"]
+
+    assert identity(spec) != identity(with_pip)
+    # pip resolves earlier entries first, so a reordering is a different install, not the same one.
+    assert identity(ordered) != identity(reordered)
+    assert identity(with_pip) == identity(
+        replace(spec, environment=replace(spec.environment, pip=("pymongo>=4.6",)))
+    )
+
+
 def test_sft_profile_contains_only_aggregate_evidence() -> None:
     encoded = json.dumps(_profile().to_dict(), sort_keys=True)
 
@@ -219,19 +246,10 @@ def test_sft_profile_contains_only_aggregate_evidence() -> None:
         assert forbidden not in encoded.lower()
 
 
-def test_sft_profile_run_id_is_deterministic_and_safe() -> None:
-    digest = "a" * 64
-
-    assert sft_profile_run_id(digest) == f"profile-sft-{digest}"
-    with pytest.raises(ValueError, match="sha256"):
-        sft_profile_run_id("not-a-digest")
-
-
 def test_profile_carrier_is_internal_and_round_trips_only_in_worker_specs() -> None:
     profile = _profile().to_dict()
     spec = replace(
         _spec(),
-        workload_profile_kind="sft",
         workload_profile_input_digest="c" * 64,
         workload_profile_producer_version="1.2.3",
         workload_profile=profile,
@@ -240,7 +258,6 @@ def test_profile_carrier_is_internal_and_round_trips_only_in_worker_specs() -> N
     public = spec.to_dict()
     internal = spec.to_internal_dict()
 
-    assert "workload_profile_kind" not in public
     assert "workload_profile_input_digest" not in public
     assert "workload_profile_producer_version" not in public
     assert "workload_profile" not in public

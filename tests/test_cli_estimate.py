@@ -9,6 +9,7 @@ import types
 import pytest
 
 from flash.cli.commands import cmd_train
+from flash.cost.spec import UnknownPromptPoolSize
 from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
 from flash.cost.types import RunConfig
@@ -25,7 +26,7 @@ GRPO_RAW = {
         "epochs": 1,
         "max_examples": 800,
         "group_size": 8,
-        "batch_size": 16,
+        "prompts_per_step": 16,
         "max_completion_tokens": 512,
         "max_context_tokens": 2048,
     },
@@ -69,9 +70,36 @@ def test_grpo_epochs_derive_steps_from_max_examples():
     assert _spec_steps(spec) == 5  # ceil(33 rows * 2 epochs / batch_size 16)
 
 
-def test_grpo_epochs_need_max_examples_for_cost():
+def test_an_unbounded_prompt_pool_refuses_to_quote_instead_of_pricing_one_step():
+    """No stated row count used to mean "the pool is one step wide", which is never true.
+
+    The worker sizes the horizon from ``len(prompts)`` -- every row the environment yields -- so a
+    config that bounded nothing was quoted at one step regardless of dataset size. Against a
+    1153-row pool at batch 8 that is 145 real steps priced as 1, and the opd teacher capability in
+    ``capability_limits_for_spec`` is sized off the same number. The quote now refuses rather than
+    reporting a horizon nothing stated.
+    """
     spec = _spec(**{"train.max_examples": None, "train.epochs": 2})
-    assert _spec_steps(spec) == 2
+
+    with pytest.raises(UnknownPromptPoolSize, match="without a prompt-pool size") as refusal:
+        _spec_steps(spec)
+    # only the knob the WORKER applies is advertised; see the [environment.params] note below.
+    assert "[environment.params]" not in str(refusal.value)
+
+    # the two the message names: a row count, or a horizon that needs no row count at all.
+    assert _spec_steps(_spec(**{"train.max_examples": 1153, "train.epochs": 1})) == 73
+    assert _spec_steps(_spec(**{"train.max_examples": None, "train.max_steps": 145})) == 145
+
+    # [environment.params] max_examples does NOT answer it. It reaches the environment as an opaque
+    # load_environment(**params) kwarg that the starter templates ignore, so it is wrong in both
+    # directions: an environment that honours it trains fewer rows than a horizon derived from the
+    # authored batch, and one that ignores it yields every row, making a 1153 here the pool size of
+    # a run that may really iterate far more. A number nothing enforces is not a stated horizon, so
+    # this stays the same refusal as a spec that says nothing at all.
+    env_bounded = _spec(**{"train.max_examples": None, "train.epochs": 1})
+    object.__setattr__(env_bounded.environment, "params", {"max_examples": 1153})
+    with pytest.raises(UnknownPromptPoolSize, match="without a prompt-pool size"):
+        _spec_steps(env_bounded)
 
 
 def test_grpo_positive_max_steps_is_authoritative():
@@ -176,7 +204,7 @@ def test_partial_reprice_counts_reached_saves_and_drops_future_saves():
 def test_opd_epochs_derive_steps_from_max_examples():
     raw = copy.deepcopy(GRPO_RAW)
     raw["algorithm"] = "opd"
-    raw["train"].update({"epochs": 2, "max_examples": 17, "batch_size": 8, "group_size": 1})
+    raw["train"].update({"epochs": 2, "max_examples": 17, "prompts_per_step": 8, "group_size": 1})
     spec = spec_from_dict(raw)
     assert _spec_steps(spec) == 5  # ceil(17 rows * 2 epochs / batch_size 8)
 
@@ -185,7 +213,7 @@ def test_opd_positive_max_steps_is_authoritative():
     raw = copy.deepcopy(GRPO_RAW)
     raw["algorithm"] = "opd"
     raw["train"].update(
-        {"epochs": 2, "max_examples": 17, "batch_size": 8, "group_size": 1, "max_steps": 31}
+        {"epochs": 2, "max_examples": 17, "prompts_per_step": 8, "group_size": 1, "max_steps": 31}
     )
     assert _spec_steps(spec_from_dict(raw)) == 31
 
@@ -197,7 +225,9 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
         raw = copy.deepcopy(GRPO_RAW)
         raw["model"] = "Qwen/Qwen3.5-4B"
         raw["algorithm"] = "opd"
-        raw["train"].update({"epochs": 1, "max_examples": 40, "batch_size": 8, "group_size": 1})
+        raw["train"].update(
+            {"epochs": 1, "max_examples": 40, "prompts_per_step": 8, "group_size": 1}
+        )
         if teacher is not None:
             raw["train"]["teacher_model"] = teacher
         return spec_from_dict(raw)
@@ -308,7 +338,7 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
         "[train]\n"
         "epochs = 1\n"
         "max_examples = 800\n"
-        "batch_size = 16\n"
+        "prompts_per_step = 16\n"
         "[gpu]\n"
         ""
     )
@@ -342,8 +372,6 @@ SFT_TOML = (
     "[gpu]\n"
 )
 
-PROFILE_RUN_ID = "profile-sft-" + "a" * 64
-
 EXACT_PROFILE = {
     "authoritative_steps": 7,
     "selected_examples": 10,
@@ -372,7 +400,7 @@ def _sft_args(tmp_path, body: str = SFT_TOML, **overrides):
 
 
 class _QuotingClient:
-    """Server that already holds a matching profile and answers the dry-run with an exact quote."""
+    """server that answers the dry-run with its packaged-dataset estimate."""
 
     def __init__(self, response: dict | None = None):
         self.calls: list[dict] = []
@@ -394,38 +422,22 @@ class _QuotingClient:
         return dict(self.response)
 
 
-class _PendingClient:
-    """Server with no matching profile: it starts one and rejects the quote with 409."""
+class _MissingDatasetClient:
+    """server refusal when the pinned package has no readable sft dataset file."""
 
-    def __init__(
-        self,
-        *,
-        state: str = "queued",
-        profile_quote: object = 0.25,
-        owned: bool | None = True,
-        launched: bool | None = True,
-    ):
+    def __init__(self):
         from flash.client import ApiError
 
-        detail = {
-            "code": "workload_profile_pending",
-            "profile_run_id": PROFILE_RUN_ID,
-            "state": state,
-        }
-        if owned is not None:
-            detail["owned"] = owned
-        if launched is not None:
-            detail["launched"] = launched
-        self.error = ApiError(409, "workload profile pending", detail=detail)
-        self.profile_quote = profile_quote
-        self.get_run_calls: list[str] = []
+        self.error = ApiError(
+            400,
+            "environment package has no readable dataset for split 'train'. "
+            "Add dataset/train.jsonl to the environment package.",
+        )
+        self.calls: list[dict] = []
 
     def create_run(self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None):
+        self.calls.append({"spec": spec, "dry_run": dry_run})
         raise self.error
-
-    def get_run(self, run_id):
-        self.get_run_calls.append(run_id)
-        return {"run_id": run_id, "state": "queued", "estimated_cost_usd": self.profile_quote}
 
 
 def _use_client(monkeypatch, client):
@@ -436,14 +448,13 @@ def _use_client(monkeypatch, client):
     return client
 
 
-def test_sft_cost_asks_the_server_for_the_exact_quote_without_creating_a_training_run(
+def test_sft_cost_asks_the_server_for_the_quote_without_creating_a_training_run(
     tmp_path, monkeypatch, capsys
 ):
-    """sft ``--cost`` is a dry-run submit, because only the server can hold the profile.
+    """sft ``--cost`` is a dry-run submit because the server builds the dataset estimate.
 
-    The public payload must stay public: the internal profile carrier is what the server attaches
-    after measuring, so a client that could send one could also fabricate the workload its own
-    quote is derived from.
+    the public payload must stay public: the internal profile carrier is attached by preparation,
+    so a client that could send one could fabricate the workload its own quote is derived from.
     """
     client = _use_client(monkeypatch, _QuotingClient())
 
@@ -456,13 +467,13 @@ def test_sft_cost_asks_the_server_for_the_exact_quote_without_creating_a_trainin
     assert not any(key.startswith("workload_profile") for key in call["spec"])
 
 
-def test_sft_cost_reports_the_measured_workload_and_no_invented_hardware(
+def test_sft_cost_reports_the_dataset_estimate_and_no_invented_hardware(
     tmp_path, monkeypatch, capsys
 ):
-    """The panel prints what was measured. It must not fabricate the timing fields it no longer has.
+    """the panel prints the dataset estimate without inventing unavailable timing fields.
 
-    The analytical breakdown named a GPU, an hourly rate, and a per-step time. An exact quote is
-    computed server-side, so reprinting that layout here would mean inventing every number in it.
+    the analytical breakdown named a gpu, an hourly rate, and a per-step time. the server-side quote
+    has none of those details, so reprinting that layout here would invent every number in it.
     """
     _use_client(monkeypatch, _QuotingClient())
 
@@ -480,6 +491,90 @@ def test_sft_cost_reports_the_measured_workload_and_no_invented_hardware(
     for invented in ("/hr", "setup", "per-step", "train_seconds"):
         assert invented not in captured.out
     assert "nothing was charged for training" in captured.err
+
+
+UNPACKED_MULTIMODAL_PROFILE = {
+    **EXACT_PROFILE,
+    "packing_mode": "exact-unpacked",
+    "architecture_mode": "multimodal",
+    "examples_per_update": 1,
+}
+
+
+def test_sft_cost_warns_that_an_unpacked_run_ignores_the_configured_batch_size(
+    tmp_path, monkeypatch, capsys
+):
+    """The batch override is a quote-time fact, so the user must hear it before submitting.
+
+    A multimodal run is never packed, so ``batch_size = 8`` in the config buys nothing: verl takes
+    one optimizer step per example.
+    """
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {"estimated_cost_usd": 1.25, "workload_profile": dict(UNPACKED_MULTIMODAL_PROFILE)}
+        ),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "sequence packing is OFF" in err
+    # the reason is the architecture label the packing decision froze on the profile
+    assert "multimodal" in err
+    assert "the configured batch_size 8 no longer groups examples into an update" in err
+    # batch_size is not inert: it still keys the profile and sizes an auto-picked gpu
+    assert "sizes the gpu" in err
+    # max_steps outranks epochs over rows, so the warning must claim no step count
+    assert "per epoch" not in err
+    assert "learning_rate" in err
+
+
+def test_a_real_unpacked_submit_warns_before_the_run_starts(tmp_path, monkeypatch, capsys):
+    """The submit path is the one that spends money, so it cannot be the one that stays quiet.
+
+    ``prepare_sft_workload`` warns too, but only into the remote worker log, and for a foreground
+    submit that is after the training gpu is already allocated.
+    """
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "run_id": "run-unpacked",
+                "workload_profile": dict(UNPACKED_MULTIMODAL_PROFILE),
+            }
+        ),
+    )
+
+    args = _sft_args(tmp_path)
+    args.cost = False
+    args.background = True
+
+    rc = cmd_train(args)
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "sequence packing is OFF" in err
+
+
+def test_sft_cost_stays_quiet_about_batching_when_the_run_is_packed(tmp_path, monkeypatch, capsys):
+    """A packed run honours ``batch_size``, so the warning must not cry wolf."""
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "estimated_cost_usd": 1.25,
+                "workload_profile": {**EXACT_PROFILE, "examples_per_update": 8},
+            }
+        ),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "sequence packing is OFF" not in err
 
 
 def test_sft_cost_omits_aggregates_the_profile_did_not_report(tmp_path, monkeypatch, capsys):
@@ -517,175 +612,29 @@ def test_sft_cost_refuses_to_print_a_total_the_server_did_not_quote(
     assert "$" not in capsys.readouterr().out
 
 
-def test_sft_cost_on_a_profile_miss_explains_the_separate_charge_and_fails(
-    tmp_path, monkeypatch, capsys
-):
-    """A miss must not read as "your training started". It started a different, billed job.
+@pytest.mark.parametrize(
+    ("cost", "dry_run"),
+    [(True, False), (False, True), (False, False)],
+    ids=("cost", "dry-run", "submit"),
+)
+def test_sft_commands_refuse_a_missing_packaged_dataset(tmp_path, monkeypatch, cost, dry_run):
+    """cost, dry-run, and submit surface the same packaged-dataset remediation."""
+    from flash.client import ApiError
 
-    The user asked what training would cost and instead incurred a charge. Naming the profile run,
-    its own quote, and what was NOT charged is the difference between that and a surprise.
-    """
-    from flash.client import ClientError
-
-    client = _use_client(monkeypatch, _PendingClient())
-
-    with pytest.raises(ClientError, match=f"workload profile {PROFILE_RUN_ID} is queued"):
-        cmd_train(_sft_args(tmp_path))
-
-    err = capsys.readouterr().err
-    assert "$0.25" in err
-    assert "billed on its own" in err
-    assert "no training run was created" in err
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
-    assert client.get_run_calls == [PROFILE_RUN_ID]
-
-
-@pytest.mark.parametrize("quote", [True, "0.25", None])
-def test_sft_cost_pending_omits_the_charge_it_cannot_read(tmp_path, monkeypatch, quote, capsys):
-    """An unreadable profile quote drops the amount rather than inventing one."""
-    from flash.client import ClientError
-
-    _use_client(monkeypatch, _PendingClient(profile_quote=quote))
-
-    with pytest.raises(ClientError):
-        cmd_train(_sft_args(tmp_path))
-
-    err = capsys.readouterr().err
-    assert "billed on its own;" in err
-    assert "$" not in err
-
-
-def test_sft_cost_pending_on_someone_elses_profile_promises_no_charge_and_no_poll(
-    tmp_path, monkeypatch, capsys
-):
-    """A profile another key launched is not readable here, so neither instruction may be repeated.
-
-    The id is deterministic in the workload, so this is ordinary reuse. Telling the user to poll it
-    would send them to a 404, and telling them they were billed for it would be false: they were
-    not charged, and nothing was started on their behalf.
-    """
-    from flash.client import ClientError
-
-    client = _use_client(monkeypatch, _PendingClient(owned=False))
-
-    with pytest.raises(ClientError, match=f"workload profile {PROFILE_RUN_ID} is queued"):
-        cmd_train(_sft_args(tmp_path))
-
-    err = capsys.readouterr().err
-    assert "already being measured" in err
-    assert "nothing was started or charged here" in err
-    assert "runs status" not in err
-    assert "$" not in err
-    # no charge was quoted, so the unreadable run is never fetched to price one.
-    assert client.get_run_calls == []
-
-
-def test_sft_cost_pending_without_an_ownership_flag_keeps_the_owner_wording(
-    tmp_path, monkeypatch, capsys
-):
-    """An older server omits ``owned``. Absent must mean "yours", not "someone else's".
-
-    Reading a missing key as not-owned would tell every user of such a server that they were not
-    charged for a profile run they in fact own and are paying for.
-    """
-    from flash.client import ClientError
-
-    client = _use_client(monkeypatch, _PendingClient(owned=None))
-
-    with pytest.raises(ClientError):
-        cmd_train(_sft_args(tmp_path))
-
-    err = capsys.readouterr().err
-    assert "billed on its own" in err
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
-    assert client.get_run_calls == [PROFILE_RUN_ID]
-
-
-def test_sft_cost_pending_on_your_own_running_profile_names_no_second_charge(
-    tmp_path, monkeypatch, capsys
-):
-    """Re-running against your own in-flight profile joins it. It does not start or bill another.
-
-    The profile id is deterministic in the workload, so the natural thing to do after a miss is to
-    re-run the same command. Only the request that won the claim launched anything; every later one
-    returns the same 409. Repeating the start-and-bill wording there would name a charge per retry
-    that the account never sees, and would read as the profile being relaunched each time.
-    """
-    from flash.client import ClientError
-
-    client = _use_client(monkeypatch, _PendingClient(state="running", launched=False))
-
-    with pytest.raises(ClientError, match=f"workload profile {PROFILE_RUN_ID} is running"):
-        cmd_train(_sft_args(tmp_path))
-
-    err = capsys.readouterr().err
-    assert "launched nothing and charged nothing" in err
-    assert "the server started a separate profile run" not in err
-    assert "billed on its own" not in err
-    # still the owner's run, so the poll instruction stays.
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
-    # no charge is quoted for a launch that did not happen, so the run is never priced.
-    assert "$" not in err
-    assert client.get_run_calls == []
-
-
-def test_sft_cost_pending_without_a_launched_flag_keeps_the_charge_warning(
-    tmp_path, monkeypatch, capsys
-):
-    """An older server omits ``launched``. Absent must mean "you were charged", not "you weren't".
-
-    The two errors are not symmetric. Warning about a charge that did not happen costs a re-read;
-    staying silent about one that did leaves the user paying for a run they were never told about.
-    """
-    from flash.client import ClientError
-
-    client = _use_client(monkeypatch, _PendingClient(launched=None))
-
-    with pytest.raises(ClientError):
-        cmd_train(_sft_args(tmp_path))
-
-    err = capsys.readouterr().err
-    assert "billed on its own" in err
-    assert "$0.25" in err
-    assert client.get_run_calls == [PROFILE_RUN_ID]
-
-
-def test_sft_dry_run_shares_the_profile_pending_path(tmp_path, monkeypatch, capsys):
-    """`train --dry-run` hits the same miss and must explain it identically, not print a traceback."""
-    from flash.client import ClientError
-
+    client = _use_client(monkeypatch, _MissingDatasetClient())
     args = _sft_args(tmp_path)
-    args.cost, args.dry_run = False, True
-    _use_client(monkeypatch, _PendingClient())
+    args.cost, args.dry_run = cost, dry_run
 
-    with pytest.raises(ClientError, match="workload profile"):
-        cmd_train(args)
-    assert "no training run was created" in capsys.readouterr().err
-
-
-def test_sft_real_submit_shares_the_profile_pending_path(tmp_path, monkeypatch, capsys):
-    """A real submit misses the cache like a preview does, and starts the same billed profile run.
-
-    This is the path that actually spends money, so it is the one where a bare 409 is worst: the
-    user is charged for a profile run whose id, purpose and cost the error never mentions.
-    """
-    from flash.client import ClientError
-
-    args = _sft_args(tmp_path)
-    args.cost, args.dry_run = False, False
-    client = _use_client(monkeypatch, _PendingClient())
-
-    with pytest.raises(ClientError, match=f"workload profile {PROFILE_RUN_ID} is queued"):
+    with pytest.raises(ApiError, match=r"dataset/train\.jsonl") as excinfo:
         cmd_train(args)
 
-    err = capsys.readouterr().err
-    assert "billed on its own" in err
-    assert "no training run was created" in err
-    assert f"flash runs status {PROFILE_RUN_ID}" in err
+    assert excinfo.value.status == 400
+    assert len(client.calls) == 1
+    assert client.calls[0]["dry_run"] is (cost or dry_run)
 
 
 def test_sft_cost_leaves_unrelated_api_errors_alone(tmp_path, monkeypatch):
-    """Only the profile-pending code is translated; every other rejection surfaces as itself."""
+    """unrelated server rejections surface unchanged."""
     from flash.client import ApiError
 
     class _Rejecting:
@@ -717,8 +666,8 @@ def test_sft_cost_forwards_declared_secrets_without_printing_them(tmp_path, monk
 
 
 def test_sft_cost_warns_when_an_env_key_shadows_the_saved_login(tmp_path, monkeypatch, capsys):
-    """The generic ``--cost`` hook stays quiet because it cannot know the algorithm yet. sft does
-    reach an organization and can start a billed profile there, so it warns for itself."""
+    """the generic ``--cost`` hook stays quiet because it cannot know the algorithm yet. sft does
+    reach an organization for the server-side dataset estimate, so it warns for itself."""
     from flash.cli import commands
 
     monkeypatch.setattr(commands, "shadowed_login_warning", lambda: "shadowed!")
@@ -745,7 +694,7 @@ def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
     monkeypatch.setenv("FLASH_STYLE", "0")
     # group_size 2 is grpo's floor (advantages are group-relative) and is valid for opd too.
     body = SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"').replace(
-        "batch_size = 8\n", "batch_size = 8\nmax_examples = 40\ngroup_size = 2\n"
+        "batch_size = 8\n", "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
     )
 
     assert cmd_train(_sft_args(tmp_path, body)) == 0

@@ -2,7 +2,7 @@
 
 The SDK ships the GRPO recipe knobs (group_size/temperature/
 kl_penalty_coef/thinking_length_penalty_coef) plus the optimizer/batching knobs
-(learning_rate/batch_size/max_context_tokens/save_every) in the job spec's ``[train]`` table
+(learning_rate/prompts_per_step/max_context_tokens/save_every) in the job spec's ``[train]`` table
 (TrainSpec) — NOT ``[environment.params]``, which is forwarded verbatim to the Freesolo
 env's ``load_environment`` — and an optional ``train.init_from_adapter``; these tests
 cover the pure plumbing the worker uses to honor them (the GPU trainer wiring itself is
@@ -226,7 +226,7 @@ def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypa
                 'algorithm = "grpo"',
                 "",
                 "[environment]",
-                'id = "owner/env"',
+                'id = "owner/project/env"',
                 "",
                 "[train]",
                 "entropy_quantile = 0.2",
@@ -400,7 +400,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "gpu": {},
         "train": {
             "learning_rate": 3e-5,
-            "batch_size": 16,
+            "prompts_per_step": 16,
             "max_context_tokens": 2048,
             "save_every": 5,
             "max_completion_tokens": 512,
@@ -410,7 +410,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
     spec = spec_from_dict(raw, run_id="grpo-z")
     for s in (spec, JobSpec.from_dict(spec.to_dict())):  # server parse + worker re-parse
         assert s.train.learning_rate == 3e-5
-        assert s.train.batch_size == 16
+        assert s.train.prompts_per_step == 16
         assert s.train.max_context_tokens == 2048
         assert s.train.save_every == 5
         assert s.train.max_completion_tokens == 512
@@ -418,7 +418,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
     # omitted optimizer knobs stay None so the worker applies its recipe defaults
     bare = spec_from_dict({**raw, "train": {"max_examples": 8}}, run_id="grpo-w")
     assert bare.train.learning_rate is None
-    assert bare.train.batch_size is None
+    assert bare.train.prompts_per_step is None
     assert bare.train.stop_sequences == ()
     # a bare-string stop_sequences is ONE stop, never split into characters
     one = spec_from_dict(
@@ -480,8 +480,10 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         "gpu": {},
     }
     bad_cases = [
-        {"batch_size": 0},  # must be >= 1
-        {"batch_size": -4},
+        # the batching knob for a rollout algorithm is prompts_per_step; spelling it batch_size
+        # here would raise for being sft-only and would pass even with range checking removed.
+        {"prompts_per_step": 0},  # must be >= 1
+        {"prompts_per_step": -4},
         {"max_context_tokens": 0},
         {"save_every": 0},
         {"group_size": 0},
@@ -491,15 +493,15 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         {"kl_penalty_coef": -1},
         {"entropy_quantile": -0.01},
         {"entropy_quantile": 1.01},
-        {"batch_size": 1.5},  # non-integer
-        {"batch_size": "16"},  # wrong type (string)
+        {"prompts_per_step": 1.5},  # non-integer
+        {"prompts_per_step": "16"},  # wrong type (string)
         {"learning_rate": [1]},  # wrong type (list) -> 400, not a 500 TypeError
         {"stop_sequences": {"a": 1}},  # dict not allowed
         {"stop_sequences": [1, 2]},  # non-string entries
         {"learning_rate": float("nan")},  # non-finite -> 400, not a silent NaN to the optimizer
         {"learning_rate": float("inf")},
         {"temperature": float("inf")},
-        {"batch_size": float("inf")},  # int knob: must 400, not OverflowError(500) from int(inf)
+        {"prompts_per_step": float("inf")},  # int knob: 400, not OverflowError(500) from int(inf)
         {"max_completion_tokens": float("nan")},
     ]
     for bad in bad_cases:
@@ -611,7 +613,7 @@ def test_grpo_masks_truncated_completions_by_default() -> None:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "environment": {"id": "owner/env"},
+            "environment": {"id": "owner/project/env"},
             "train": {},
         }
     )
@@ -630,7 +632,7 @@ def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "environment": {"id": "owner/env"},
+            "environment": {"id": "owner/project/env"},
             "train": {"stop_sequences": ["</answer>"]},
         }
     )
@@ -660,3 +662,65 @@ def test_build_grpo_prompt_dataset_survives_dataset_from_list() -> None:
     assert ds.column_names == ["prompt", "example_idx"]
     assert list(ds["example_idx"]) == [0, 1]
     assert [examples[i]["metadata"]["param"] for i in ds["example_idx"]] == [8, "gentle"]
+
+
+def test_grpo_rejects_prompt_budget_at_parse_time_before_provisioning() -> None:
+    """max_context_tokens <= the resolved completion budget leaves no prompt room, and the grpo
+    worker only discovers that in `_resolve_sequence_lengths` ("engine length leaves no room for
+    the completion") after the GPU is provisioned and billed. Reject it at spec-parse time, with
+    the SAME completion resolver the worker uses so the two can never disagree."""
+    from flash.engine.plan.recipe import RECIPE
+
+    def _spec(train_extra, thinking=False):
+        return spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "grpo",
+                "thinking": thinking,
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "train": {"epochs": 1, "max_examples": 5, **train_extra},
+            },
+            run_id="grpo-budget",
+        )
+
+    # room left after an explicit max_completion_tokens -> ok.
+    _spec({"max_context_tokens": 2048, "max_completion_tokens": 512})
+    # exactly one prompt token is the boundary the worker accepts (prompt_budget > 0).
+    _spec({"max_context_tokens": 513, "max_completion_tokens": 512})
+    # no prompt budget at all -> the worker would raise, so reject at parse.
+    with pytest.raises(ConfigError, match="prompt budget"):
+        _spec({"max_context_tokens": 512, "max_completion_tokens": 512})
+    with pytest.raises(ConfigError, match="prompt budget"):
+        _spec({"max_context_tokens": 400, "max_completion_tokens": 512})
+    # max_completion_tokens omitted -> the RL recipe default, per thinking, exactly as the worker
+    # resolves it; NOT the opd recipe's.
+    _spec({"max_context_tokens": RECIPE.rl.max_completion_len + 1})
+    with pytest.raises(ConfigError, match="prompt budget"):
+        _spec({"max_context_tokens": RECIPE.rl.max_completion_len})
+    _spec({"max_context_tokens": RECIPE.rl.max_completion_len_thinking + 1}, thinking=True)
+    with pytest.raises(ConfigError, match="prompt budget"):
+        _spec({"max_context_tokens": RECIPE.rl.max_completion_len_thinking}, thinking=True)
+    # an omitted context is the recipe-sized run, which always fits -> nothing to check.
+    _spec({})
+
+
+def test_grpo_prompt_budget_guard_matches_the_worker_resolver() -> None:
+    """The submit guard must never be stricter than the worker: both resolve the completion length
+    through `grpo_completion_len`, and the worker additionally clamps the context down to the model
+    architecture, which can only shrink the prompt budget it checks."""
+    import inspect
+
+    from flash import schema
+    from flash.engine.plan.recipe import RECIPE
+    from flash.engine.plan.vram import grpo_completion_len
+    from flash.engine.worker.train.rl import inputs
+
+    assert grpo_completion_len(None, False) == RECIPE.rl.max_completion_len
+    assert grpo_completion_len(None, True) == RECIPE.rl.max_completion_len_thinking
+    assert grpo_completion_len(4096, True) == 4096
+    # a zero/unset knob falls back to the recipe on both sides.
+    assert grpo_completion_len(0, False) == RECIPE.rl.max_completion_len
+
+    # both enforcement sites must read the shared helper, not re-derive the recipe inline.
+    assert "grpo_completion_len" in inspect.getsource(inputs._resolve_sequence_lengths)
+    assert "grpo_completion_len" in inspect.getsource(schema._validate_on_policy_prompt_budget)

@@ -1,4 +1,4 @@
-"""Shared exact SFT preprocessing for profile and training workers."""
+"""shared sft tokenization and workload construction for estimates and training."""
 
 from __future__ import annotations
 
@@ -13,7 +13,11 @@ from typing import Any
 
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
-from flash.engine.profiling.workload_profile import SftWorkloadProfile, sft_sample_policy
+from flash.engine.profiling.workload_profile import (
+    SftWorkloadProfile,
+    sft_sample_policy,
+    unpacked_batch_warning,
+)
 from flash.engine.worker.entry.sft import (
     _pretokenize_completion_only,
     _reject_image_completion,
@@ -36,6 +40,7 @@ class PreparedSftWorkload:
     processor: Any | None
     sampled_texts: list[str]
     multiturn_targets: int
+    coerced_singleturn_targets: int
 
 
 def _serialize_multimodal_inputs(values: dict) -> bytes:
@@ -137,7 +142,7 @@ def _materialize_verl_images(
     image_dir: str | None,
     row_index: int,
 ) -> list[str]:
-    """Decode image descriptors to files verl can load; a profile run passes no dir and writes none."""
+    """decode image descriptors to files verl can load; estimate-only callers write none."""
     if image_dir is None:
         return []
     from flash.content.multimodal import decode_image_descriptors
@@ -189,10 +194,9 @@ def _packing_mode(
                 # both, transformers' fallbacks accept the kwargs and DISCARD them, so state bleeds
                 # across examples inside a packed block while looking patched.
                 #
-                # the contract probe is device-independent on purpose: this same function runs in
-                # the cpu-only profile job that freezes the quote AND on the gpu worker, and
-                # sft_train compares the two profiles byte-for-byte. see
-                # gdn_packing_contract_available.
+                # the contract probe is device-independent on purpose: the control-plane estimate
+                # and gpu worker must derive the same packing capability from the pinned stack, not
+                # from whether cuda is locally visible. see gdn_packing_contract_available.
                 supported = gdn_packing_contract_available(model_id, revision=revision)
                 architecture_mode = "gdn-hybrid"
             else:
@@ -252,6 +256,7 @@ class _TokenizedSftRows:
     untruncated_by_index: dict[int, int]
     sampled_texts: list[str]
     multiturn_targets: int
+    coerced_singleturn_targets: int
     dropped: int
 
 
@@ -282,9 +287,16 @@ class _SftStepHorizon:
     authoritative_supervised_tokens: int
 
 
+def _sft_completion_with_provenance(env, example: dict) -> tuple[list[dict], bool]:
+    completion_with_provenance = getattr(env, "sft_completion_with_provenance", None)
+    if callable(completion_with_provenance):
+        return completion_with_provenance(example)
+    return env.sft_completion(example), False
+
+
 def _tokenize_prompt_rows(
     spec,
-    prompt_rows: list[tuple[Any, list[dict], list[dict]]],
+    prompt_rows: list[tuple[Any, list[dict], list[dict], bool]],
     *,
     package_root,
     tokenizer,
@@ -304,10 +316,22 @@ def _tokenize_prompt_rows(
     text_specs: list[dict[str, Any]] = []
     sampled_texts: list[str] = []
     multiturn_targets = 0
-    for row_index, (example, prompt_messages, completion_messages) in enumerate(prompt_rows):
+    coerced_singleturn_targets = 0
+    for row_index, (
+        example,
+        prompt_messages,
+        completion_messages,
+        coerced_scalar_output,
+    ) in enumerate(prompt_rows):
         _reject_image_completion(completion_messages)
         if len(completion_messages) > 1:
             multiturn_targets += 1
+        elif (
+            coerced_scalar_output
+            and len(completion_messages) == 1
+            and completion_messages[0].get("role") == "assistant"
+        ):
+            coerced_singleturn_targets += 1
         if record_has_images(example, prompt_messages):
             if processor is None:
                 raise RuntimeError("multimodal sft row has no processor")
@@ -380,6 +404,7 @@ def _tokenize_prompt_rows(
         untruncated_by_index=untruncated_by_index,
         sampled_texts=sampled_texts,
         multiturn_targets=multiturn_targets,
+        coerced_singleturn_targets=coerced_singleturn_targets,
         dropped=dropped,
     )
 
@@ -549,6 +574,8 @@ def prepare_sft_workload(
     image_dir: str | None = None,
     allow_packing: bool = True,
     packing_support: Callable[[str, str], tuple[str, bool]] | None = None,
+    source_examples: int | None = None,
+    examples_preselected: bool = False,
 ) -> PreparedSftWorkload:
     """Render, tokenize, filter, and pack the exact rows consumed by SFT."""
     from flash.content.multimodal import (
@@ -569,18 +596,29 @@ def prepare_sft_workload(
     max_steps = int(train_spec.max_steps or 0)
 
     source = list(env.dataset())
-    selected = select_sft_examples(source, max_examples, spec.seed)
-    prompt_rows = [
-        (example, env.prompt_messages(example), env.sft_completion(example)) for example in selected
-    ]
+    selected = (
+        source if examples_preselected else select_sft_examples(source, max_examples, spec.seed)
+    )
+    source_count = len(source) if source_examples is None else int(source_examples)
+    if source_count < len(selected):
+        raise ValueError("source_examples cannot be smaller than the selected sft sample")
+    prompt_rows = []
+    for example in selected:
+        prompt_messages = env.prompt_messages(example)
+        completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
+        prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
     package_root = getattr(env, "package_root", None)
     multimodal = any(
         record_has_images(example, prompt_messages)
-        for example, prompt_messages, _completion in prompt_rows
+        for example, prompt_messages, _completion, _used_fallback in prompt_rows
     )
     processor = None
     if multimodal:
-        validate_multimodal_training(spec.model, "sft")
+        validate_multimodal_training(
+            spec.model,
+            "sft",
+            getattr(spec.train, "teacher_model", None),
+        )
         processor = (processor_loader or _default_processor_loader)(
             spec.model,
             spec.model_revision,
@@ -627,7 +665,7 @@ def prepare_sft_workload(
     profile = _build_sft_profile(
         spec,
         producer_version=producer_version,
-        source_examples=len(source),
+        source_examples=source_count,
         selected_examples=len(selected),
         retained=retained,
         epochs=epochs,
@@ -638,6 +676,20 @@ def prepare_sft_workload(
         measurements=measurements,
         horizon=horizon,
     )
+    # one example per update instead of the authored batch is an optimization-semantics change
+    # whose only other trace is `notes["packing"]` in the finished run's metrics, which is not
+    # visible until after the run is paid for. this function runs for the control-plane estimate and
+    # again on the training worker, so the warning lands in both logs. pass the authored batch_size
+    # rather than `effective_batch`: the helper resolves None to the same recipe default but keeps the
+    # value's source, so an omitted knob is not reported to the user as one they configured.
+    warning = unpacked_batch_warning(
+        packing_mode=profile.packing_mode,
+        architecture_mode=profile.architecture_mode,
+        examples_per_update=profile.examples_per_update,
+        configured_batch_size=train_spec.batch_size,
+    )
+    if warning:
+        print(f"warning: [train] {warning}", file=sys.stderr)
     return PreparedSftWorkload(
         rows=retained.rows,
         profile=profile,
@@ -646,4 +698,5 @@ def prepare_sft_workload(
         processor=processor,
         sampled_texts=tokenized.sampled_texts,
         multiturn_targets=tokenized.multiturn_targets,
+        coerced_singleturn_targets=tokenized.coerced_singleturn_targets,
     )

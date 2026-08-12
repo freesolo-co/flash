@@ -30,10 +30,10 @@ jobs:
         # to support.
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -137,19 +137,26 @@ jobs:
     name: mypy (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # mypy is configured in pyproject but has never been enforced, and currently reports 352
-    # errors across 75 files. This job REPORTS that debt on every PR without gating anything:
+    # mypy is configured in pyproject but has never been enforced, and currently reports 411
+    # errors across 95 files. This job REPORTS that debt on every PR without gating anything:
     # flip the `|| true` below into a hard failure once the count reaches zero.
     #
     # `continue-on-error` alone is not enough -- it stops the job from blocking the run, but the
     # check still renders red in the PR's check list, which is indistinguishable from a real
     # failure to a contributor. Swallowing the exit code and printing the count keeps the check
     # green while the errors stay visible in the job log and the step summary.
+    #
+    # Swallowing the exit code also hides the one failure that matters more than the count: a
+    # syntax error makes mypy stop after the file it is in (`errors prevented further checking`),
+    # so the run reports a SMALL number while checking almost nothing. That is what a stray
+    # `# type:` prose comment did here -- `Found 1 error`, nothing else checked, job green. The
+    # step below therefore flags an early stop explicitly, so a shrinking count can never be
+    # mistaken for progress.
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           python-version: "3.11"
 
@@ -172,3 +179,16 @@ jobs:
             echo
             echo "This job reports type errors; it does not gate merges."
           } >> "$GITHUB_STEP_SUMMARY"
+          # A run that stopped early checked almost nothing, however small its error count. Call
+          # that out in the summary instead of leaving a green check that means nothing. Still
+          # advisory: this warns, it does not fail the job.
+          if grep -q 'errors prevented further checking' mypy.out; then
+            {
+              echo
+              echo ":warning: **mypy stopped early and did NOT check the whole tree.**"
+              echo "A syntax error aborts the run, so the count above is not the real total."
+              echo "Most likely a prose comment beginning \`type:\` (see"
+              echo "tests/test_type_comment_prose.py), or genuinely invalid syntax."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::mypy stopped early; the reported error count is not the real total."
+          fi

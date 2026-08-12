@@ -464,6 +464,7 @@ def test_opd_selects_only_managed_parasail_aliases():
     assert _spec("GLM 5.2").train.teacher_model == "glm-5.2"
     assert _spec("qwen3.5-397b-a17b").train.teacher_model == "qwen3.5-397b-a17b"
     assert _spec("deepseek-v4-pro").train.teacher_model == "deepseek-v4-pro"
+    assert _spec("qwen3-vl-235b").train.teacher_model == "qwen3-vl-235b"
     assert _spec("DeepSeek V4 Pro").train.teacher_model == "deepseek-v4-pro"
     assert _spec("").train.teacher_model == ""
 
@@ -580,14 +581,20 @@ def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
     # so this follows the wiring to where the validation and the GPU probe actually sit. verl probes
     # the GPU in a subprocess rather than calling wait_for_gpu, but the invariant is the same one:
     # an incompatible model must fail before any paid GPU work starts.
+    # The validation itself sits in `_validate_multimodal_opd`, so the ordering is proven in two
+    # steps: the caller runs that helper before the probe, and the helper is what calls the
+    # validator. Asserting only on the call site would pass if the helper stopped validating, and
+    # asserting only on the helper would pass if the caller moved it after the probe.
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.opd_train import _validate_multimodal_opd, run_opd_train
 
-    source = inspect.getsource(run_opd_train)
-    validation = 'validate_multimodal_training(model_id, "opd")'
+    caller = inspect.getsource(run_opd_train)
+    assert caller.index("_validate_multimodal_opd(") < caller.index("_probe_gpu_in_subprocess(")
 
-    assert source.index(validation) < source.index("_probe_gpu_in_subprocess(")
+    helper = inspect.getsource(_validate_multimodal_opd)
+    assert "validate_multimodal_training(" in helper
+    assert 'getattr(spec.train, "teacher_model", None)' in helper
 
 
 class _CharTok:
@@ -713,6 +720,27 @@ def test_opd_teacher_prompt_includes_thinking_prefill():
     assert opd_gkd._teacher_prompt_text(msgs).endswith("Assistant: ")
     # with a prefill -> the teacher conditions on the exact text the student sampled after.
     assert opd_gkd._teacher_prompt_text(msgs, "<think>\n").endswith("Assistant: <think>\n")
+
+
+def test_teacher_prompt_text_reads_content_blocks_rather_than_their_repr():
+    """A mixed image/text opd job carries block content on its TEXT-only rows too.
+
+    Those rows take the plain completion route, so rendering `content` with `!s` would hand the
+    teacher a python repr ("[{'type': 'text', 'text': 'hi'}]") and score that literal. It does not
+    raise, so only an assertion on the rendered text catches it.
+    """
+    from flash.engine.worker.train.opd import gkd as opd_gkd
+
+    blocks = [{"role": "user", "content": [{"type": "text", "text": "describe it"}]}]
+    rendered = opd_gkd._teacher_prompt_text(blocks)
+    assert "User: describe it" in rendered
+    assert "'type'" not in rendered, rendered
+    assert "[{" not in rendered, rendered
+    # an image-only turn contributes no text rather than a repr of the image block.
+    image_only = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]
+    assert opd_gkd._teacher_prompt_text(image_only).startswith("User: \n")
+    # a plain string stays byte-identical: the fix must not reformat the common path.
+    assert opd_gkd._teacher_prompt_text([{"role": "user", "content": "hi"}]).startswith("User: hi")
 
 
 def test_thinking_prefill_text_is_template_delta(monkeypatch):
@@ -1171,7 +1199,7 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
     assert 'if config.get("fp8_kv")' in inspect.getsource(opd_train.build_opd_overrides)
 
 
-def test_opd_oversized_reject_names_the_knobs_to_shrink():
+def test_opd_oversized_reject_names_the_knobs_to_shrink(monkeypatch):
     """When even the biggest GPU can't hold an OPD run, the reject must be actionable: it names that
     OPD is resident-only (trainer + colocated vLLM student = two weight copies + rollout KV) and the
     knobs that shrink it, not the opaque 'no GPU that big' message the raw cheapest_gpu emits."""
@@ -1180,15 +1208,19 @@ def test_opd_oversized_reject_names_the_knobs_to_shrink():
     train = {
         "max_context_tokens": 4096,
         "max_completion_tokens": 2048,
-        "batch_size": 8,
+        "prompts_per_step": 8,
         "group_size": 4,
     }
+    monkeypatch.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 2000)
     with pytest.raises(UnsupportedGpuError) as exc:
         provisional_gpu("Qwen/Qwen3.6-35B-A3B", "opd", train=train)
     msg = str(exc.value)
     assert "resident-only" in msg
     assert "group_size" in msg
-    assert "batch_size" in msg
+    # the remedy must name the key opd ACCEPTS: batch_size is rejected at parse time, so advising
+    # it sent a user whose run did not fit straight into a config error.
+    assert "prompts_per_step" in msg
+    assert "[train].batch_size" not in msg
     assert "max_completion_tokens" in msg
 
 
@@ -1200,9 +1232,9 @@ def test_opd_oversized_reject_reports_the_rentable_odd_ceiling(monkeypatch):
     with pytest.raises(UnsupportedGpuError) as exc:
         provisional_gpu("Qwen/Qwen3.6-35B-A3B", "opd", gpu_count=7)
     msg = str(exc.value)
-    assert "any 4-card validated GPU combination" in msg
-    assert "7-card" not in msg
-    assert "592.8 GB max" in msg
+    assert "gpu.count=7 provides at most 592.8 GB (4x B200)" in msg
+    assert "--gpus 8" in msg
+    assert "7x" not in msg
 
 
 def test_opd_vram_keeps_chunked_text_peak_when_it_exceeds_dense_image_peak():
@@ -1289,6 +1321,7 @@ def test_opd_teacher_price_table_covers_exact_parasail_catalog():
     assert teacher_price_per_1m("kimi-k3") == (3.00, 15.00)
     assert teacher_price_per_1m("qwen3.5-397b-a17b") == (0.50, 3.60)
     assert teacher_price_per_1m("deepseek-v4-pro") == (1.74, 3.48)
+    assert teacher_price_per_1m("qwen3-vl-235b") == (0.21, 1.90)
     with pytest.raises(ValueError, match="not a supported teacher"):
         teacher_price_per_1m("parasail-deepseek-v4-pro")
 
@@ -1331,6 +1364,43 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
     assert opd_mod._resolve_opd_knobs().kl_coef > 0.0
 
 
+def test_resolve_opd_knobs_trains_the_authored_prompts_per_step(monkeypatch):
+    """Regression (opd.py:86): the worker read the optimizer batch from ``batch_size``.
+
+    opd REJECTS ``batch_size`` at parse time, so an opd spec carries the batch only under
+    ``prompts_per_step`` -- the old read found None on every run and trained the recipe default no
+    matter what the user authored. That is silent: the run completes and bills normally, having
+    trained a fraction of the requested prompts per update.
+
+    Driven through the real schema parse rather than a stub, so it fails if either the parser or the
+    worker stops agreeing on the key.
+    """
+    from flash.engine.plan.recipe import RECIPE
+    from flash.engine.worker.entry import opd as opd_mod
+    from flash.schema import spec_from_dict
+
+    def _knobs(**train):
+        spec = spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "opd",
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "gpu": {},
+                "train": {"epochs": 1, "group_size": 1, **train},
+            },
+            run_id="pps",
+        )
+        monkeypatch.setattr(
+            opd_mod, "_w", SimpleNamespace(JOB_SPEC=spec, THINKING=False), raising=False
+        )
+        return opd_mod._resolve_opd_knobs()
+
+    assert _knobs(prompts_per_step=32).prompts_per_step == 32
+    assert _knobs(prompts_per_step=1).prompts_per_step == 1
+    # omitted -> recipe default, which is the value the broken read returned for EVERY spec.
+    assert _knobs().prompts_per_step == RECIPE.opd.prompts_per_step
+
+
 def test_resolve_opd_knobs_maps_alias_to_parasail_model(monkeypatch):
     from flash.engine.worker.entry import opd as opd_mod
 
@@ -1354,6 +1424,7 @@ def test_resolve_opd_knobs_maps_alias_to_parasail_model(monkeypatch):
     assert _knobs("kimi-k3").teacher_model == "parasail-kimi-k3-fast"
     assert _knobs("qwen3.5-397b-a17b").teacher_model == "parasail-qwen35-397b-a17b"
     assert _knobs("deepseek-v4-pro").teacher_model == "parasail-deepseek-v4-pro"
+    assert _knobs("qwen3-vl-235b").teacher_model == ("parasail-qwen3-vl-235b-a22b-instruct")
     assert _knobs("").teacher_model == "parasail-glm-52"
     assert _knobs(None).teacher_model == "parasail-glm-52"
     for teacher in (
@@ -1398,7 +1469,7 @@ def test_opd_spec_json_round_trip():
             "train": {
                 "epochs": 25,
                 "max_examples": 8,
-                "batch_size": 8,
+                "prompts_per_step": 8,
             },
         },
         run_id="x",
@@ -1410,21 +1481,45 @@ def test_opd_spec_json_round_trip():
     assert "PARASAIL_API_KEY" not in restored.environment.secrets
 
 
+def test_opd_worker_resolves_the_authored_prompt_batch(monkeypatch):
+    """The paid worker must train on the authored batch, not silently on the recipe default."""
+    from flash.engine.plan.recipe import RECIPE
+    from flash.engine.worker.entry import opd as opd_entry
+    from flash.engine.worker.runtime.pkg_proxy import W
+    from flash.schema import spec_from_dict
+
+    authored = int(RECIPE.opd.prompts_per_step) * 4
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "opd",
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+            "gpu": {},
+            "train": {"epochs": 1, "prompts_per_step": authored},
+        },
+        run_id="x",
+    )
+    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
+    monkeypatch.setattr(W, "THINKING", False, raising=False)
+    assert opd_entry._resolve_opd_knobs().prompts_per_step == authored
+
+
 def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
     from flash.cost.spec import estimate_for_spec, spec_steps
     from flash.schema import spec_from_dict
 
-    # No [train].max_examples set — opd falls back to one prompt batch per epoch for pricing.
+    # this test is about teacher-token itemization, so the horizon is stated rather than derived:
+    # 240 prompts at the opd default batch of 8 is 8 steps per epoch, 30 epochs -> 240 steps.
     spec = spec_from_dict(
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"epochs": 30},
+            "train": {"epochs": 30, "max_examples": 240},
         },
         run_id="x",
     )
-    assert spec_steps(spec) == 30
+    assert spec_steps(spec) == 900
     est = estimate_for_spec(spec)
     assert est.method == "opd"
     assert est.teacher_api_usd > 0.0  # external teacher token spend is itemized (diagnostic)
@@ -1473,8 +1568,8 @@ class _TinyLM:
         return self
 
 
-def test_opd_worker_rejects_images_before_gpu_or_teacher_use(monkeypatch):
-    """Image-bearing OPD must fail before teacher construction or paid GPU work."""
+def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
+    """Image-bearing OPD with a text teacher must fail before paid GPU work."""
     teacher_model = "glm-5.2"
     fake_torch = types.ModuleType("torch")
     fake_torch.manual_seed = lambda _seed: None
@@ -1533,5 +1628,5 @@ def test_opd_worker_rejects_images_before_gpu_or_teacher_use(monkeypatch):
     # ValueError, not RuntimeError: TRL re-wrapped this as `RuntimeError(f"opd: {exc}")`, verl lets it
     # propagate. The type carries no behavioral difference -- `_worker_failure_flags` branches only on
     # RetriableInfraError/GitHubRateLimitError and CUDA OOM, so both are fatal and non-retriable.
-    with pytest.raises(ValueError, match="image-bearing opd is not supported"):
+    with pytest.raises(ValueError, match=r"selected teacher 'glm-5\.2' cannot see images"):
         opd_mod.run_opd_train()

@@ -12,8 +12,6 @@ import contextlib
 import os
 import subprocess
 
-from flash.core.spec import gpu_count_of
-
 # several imports below are marked unused-ok on purpose: their call sites moved to
 # `.train.rl.inputs`, but tests still read or patch them as attributes of THIS module and the
 # resolver reads them back through it. an autofix that drops them breaks those tests.
@@ -48,6 +46,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     stamp_adapter_dir_provenance,
     verl_declares_rollout_field,
     verl_device_capability,
+    wrap_shim_fragment,
 )
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
 
@@ -262,8 +261,12 @@ def _configure_rl_child(
     # case cannot complete a step on verl's fsdp engine. see require_gdn_boundary_resets.
     gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
     if gdn_reset_arch is not None:
+        # wrapped like the fragments _write_rl_shim composed: the marker prologue is already in
+        # the file, and an unpatched gdn child training across packed example boundaries is
+        # exactly the silent failure the wrapper exists to prevent.
         with open(files["shim_py"], "a") as f:
-            f.write(render_gdn_varlen_shim(gdn_reset_arch))
+            f.write(wrap_shim_fragment("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
+        files["expected_shims"].append("gdn-varlen")
 
     expected_steps, loggers, project_name, experiment_name, cc_ok = _resolve_training_settings(
         inp, caps
@@ -285,7 +288,7 @@ def _configure_rl_child(
         inp,
         train_files=files["train_pq"],
         val_files=files["val_pq"],
-        model_id=model_path_for_verl,
+        model_path=model_path_for_verl,
         thinking=bool(_w.THINKING),
         loggers=loggers,
         fp8_kv=fp8_kv,
@@ -297,7 +300,11 @@ def _configure_rl_child(
         project_name=project_name,
         experiment_name=experiment_name,
         gpu_type=(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else ""),
-        n_gpus=gpu_count_of(_w.JOB_SPEC),
+        # the ranks verl will actually run, not the cards rented: with ulysses pinned off every rank
+        # is a dp rank, and verl chunks the step's sequences across them with an exact-divisibility
+        # assert. a wider launch than the sequences divide aborts at step 0 on a paid box. resolved
+        # in `_resolve_grpo_inputs` so the resume probe compares against this same width.
+        n_gpus=int(inp["dp_cards"]),
         # resolved from the out-of-process capability probe, never by opening cuda in this
         # parent -- see fused_ce_backend.
         ce_backend=fused_ce_backend(caps),
@@ -396,13 +403,10 @@ def run_rl_train():
                 state=state,
                 reward_runtime=reward_runtime,
                 _reward_observability=_reward_observability,
+                files=files,
             )
         _validate_rl_child(
-            rc,
-            state,
-            files["resume_step"],
-            expected_steps,
-            resume_uploader,
+            rc, state, files["resume_step"], expected_steps, resume_uploader, files=files
         )
     finally:
         # drain before the reward server goes down: on a cancel or crash the last completed
@@ -525,7 +529,6 @@ from flash.engine.worker.train.rl.multi_turn import (  # noqa: E402,F401
 from flash.engine.worker.train.rl.single_turn import (  # noqa: E402,F401
     _finalize_single_turn_reward,
     _log_reward_profile,
-    _ScoreBatcher,
     _single_turn_scoring_state,
     score_single_turn,
     score_single_turn_batch,

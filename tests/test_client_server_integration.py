@@ -42,7 +42,7 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
-    "environment": {"id": "freesolo/gsm8k", "params": {"max_examples": 8}},
+    "environment": {"id": "freesolo/example-project/gsm8k", "params": {"max_examples": 8}},
     "train": {"epochs": 1, "max_examples": 1},
     "gpu": {},
 }
@@ -71,10 +71,12 @@ def _identity_for_token(token: str) -> dict[str, str]:
 class _FakeUrlResponse:
     """Mimics the ``urllib`` response object ``ApiClient._request`` consumes."""
 
-    def __init__(self, body: bytes, status: int) -> None:
+    def __init__(self, body: bytes, status: int, headers=None) -> None:
         self._body = body
         self.status = status
         self.code = status
+        # `_request` reads Content-Type to say what answered when a 2xx body is not JSON.
+        self.headers = headers if headers is not None else {}
 
     def read(self) -> bytes:
         return self._body
@@ -162,7 +164,7 @@ def make_client(tmp_path, monkeypatch):
                     resp.headers,  # type: ignore[arg-type]
                     io.BytesIO(body),
                 )
-            return _FakeUrlResponse(body, resp.status_code)
+            return _FakeUrlResponse(body, resp.status_code, resp.headers)
 
         # Route the client's urllib through the ASGI app (no real socket).
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)

@@ -18,7 +18,6 @@ from flash.providers.base import (
     JobHandle,
     PollResult,
     Provider,
-    UnsupportedGpuError,
     rentable_gpu_counts,
 )
 
@@ -106,9 +105,15 @@ class VastProvider(InstanceProvider):
             destroy_run_instances(spec.run_id)
 
     def _gc(self, run_id: str) -> None:
-        from flash.providers.vast.jobs import destroy_run_instances
+        from flash.providers.vast.jobs import destroy_run_instances, forget_dead_machines
 
-        destroy_run_instances(run_id)
+        try:
+            destroy_run_instances(run_id)
+        finally:
+            # the run is being reaped, so its dead-machine blacklist has no further reader. freeing
+            # it in `finally` keeps a failed reap from leaking the entry -- releasing memory must
+            # not depend on the teardown succeeding.
+            forget_dead_machines(run_id)
 
     def _sweep_orphans(
         self,
@@ -136,14 +141,7 @@ class VastProvider(InstanceProvider):
         cap; the Vast package prices against the SAME effective disk/duration floors the submit path
         provisions with, so a high-disk or long run isn't advertised capacity it couldn't actually rent (an
         impossible attempt a max_retries=0 run never escapes).
-
-        Offers nothing at all when a private worker image is configured that this substrate cannot
-        authenticate (see ``_private_image_problem``), so the allocator never rents a box whose
-        image pull is certain to fail.
         """
-        problem = self._private_image_problem()
-        if problem:
-            raise UnsupportedGpuError(problem)
         from flash.providers.vast.pricing import live_candidate_rates
 
         fitting = [g for g in self.gpu_classes() if g.vram_gb >= need_vram_gb]

@@ -639,19 +639,17 @@ def _cancellation_billing(
     effective_spec,
     *,
     bill_cancel: bool,
+    rented_remote: dict | None = None,
 ) -> tuple[float | None, dict]:
     """Price a cancellation. Returns ``(charge_usd, billing_diagnostic)``.
 
     ``None`` means this cancellation is not billable at all and must not write ``cost_usd``; a
     pricing failure bills 0.0 and reports why, because teardown is attempted either way.
+    ``rented_remote`` is the provider handle snapshotted before teardown: the status reloaded here
+    no longer carries it after a confirmed teardown, and it is the only durable record of the
+    provider and card shape the run rented, which the cancel price must be computed on.
     """
-    from flash.runner import (
-        _status_estimated_charge,
-        actual_steps_run,
-        charge_usd_for_spec,
-        get_status,
-        profile_steps_run,
-    )
+    from flash.runner import actual_steps_run, cancelled_charge_usd, get_status
 
     if not bill_cancel:
         return None, {}
@@ -664,36 +662,18 @@ def _cancellation_billing(
             ),
         }
     cancel_status = get_status(run_id)
-    # a profile has no optimizer steps, so actual_steps_run reads 0 for every one and
-    # would price a profile that ran to completion at $0. profile_steps_run answers the
-    # question that actually applies to one: did it start at all.
-    #
-    # the profile marker is read from the STATUS, not from effective_spec: to_dict()
-    # strips workload_profile_kind as a platform-managed field, so a spec rebuilt from
-    # persisted public status always reports "" and the branch below would never be
-    # taken. the status carries the kind explicitly for exactly this reason.
-    steps_billed = (
-        profile_steps_run(cancel_status)
-        if cancel_status.workload_profile_kind
-        else actual_steps_run(cancel_status)
+    steps_billed = actual_steps_run(cancel_status)
+    # a fresh spec estimate uses offline static rates, which on live-market providers can
+    # exceed the accepted quote's rate, so a mid-training cancel is priced from the persisted
+    # quote (scaled by the completed share of the estimated work) to keep a near-complete
+    # cancel at or under what the run would have cost on success.
+    estimated_charge = cancelled_charge_usd(
+        cancel_status,
+        effective_spec,
+        steps=steps_billed,
+        fallback=float("nan"),
+        rented_remote=rented_remote,
     )
-    if cancel_status.workload_profile_kind and steps_billed > 0:
-        # a STARTED profile owes exactly the quote it was submitted under. re-deriving
-        # it here would re-price against today's offline rate table, so a cancel could
-        # bill a different number than the one the user was shown and than the same
-        # profile would have billed on success. it never started -> steps_billed is 0
-        # and the branch below correctly charges nothing.
-        estimated_charge = _status_estimated_charge(
-            cancel_status,
-            effective_spec,
-            fallback=float("nan"),
-        )
-    else:
-        estimated_charge = charge_usd_for_spec(
-            effective_spec,
-            steps=steps_billed,
-            fallback=float("nan"),
-        )
     if math.isfinite(estimated_charge):
         return estimated_charge, {}
     return 0.0, {
@@ -783,6 +763,10 @@ def cancel_run(run_id: str) -> RunStatus:
         status = get_status(run_id)
         entered_deployed = entered_deployed or status.state == "deployed"
 
+        # teardown clears the durable handle on success and it is the only record of the rented
+        # basis (provider, card, count), so capture it now for billing (see _cancellation_billing).
+        rented_remote = dict(status.remote) if isinstance(status.remote, dict) else None
+
         _teardown_persisted_remotes(
             run_id,
             confirmed_cleanup_identities=confirmed_cleanup_identities,
@@ -817,7 +801,7 @@ def cancel_run(run_id: str) -> RunStatus:
             )
 
         cancel_charge_usd, billing_diagnostic = _cancellation_billing(
-            run_id, effective_spec, bill_cancel=bill_cancel
+            run_id, effective_spec, bill_cancel=bill_cancel, rented_remote=rented_remote
         )
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
         cancel_updates.update(billing_diagnostic)

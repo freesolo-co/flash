@@ -10,9 +10,19 @@ Split out of `flash.engine.worker.backend_common` to keep that module under the 
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
+import os
 import re
+import textwrap
+
+# imported BY VALUE on purpose. perf's docstring notes that tests monkeypatch
+# `perf._find_real_libcudart` and its callers resolve it through the patched module globals -- this
+# caller must NOT. it needs the function's SOURCE to ship into the child, so resolving through
+# `perf.<attr>` would render a test double's body into the fragment and emit a broken shim. the
+# from-import keeps the real object bound here regardless of what is patched over there.
+from flash.engine.worker.perf import _find_real_libcudart
 
 # --------------------------- tf32 matmul (all three verl backends) ---------------------------
 # torch's TF32 flags are per-process, so setting them in the flash parent does not affect the verl
@@ -37,6 +47,149 @@ try:
     print({FLASH_TF32_MARKER!r}, flush=True)
 except Exception:
     pass
+"""
+
+
+# ----------------------- tilelang libcudart stub (all three verl backends) -----------------------
+# tilelang's bundled libcudart_stub.so does not export cudaDeviceReset. vLLM's CuMemAllocator
+# resolves libcudart out of the loaded-library set and can bind that stub instead of the real
+# runtime, so engine init dies with
+#   AttributeError: .../tilelang/lib/libcudart_stub.so: undefined symbol: cudaDeviceReset
+#   RuntimeError: Engine core initialization failed
+#
+# This repoint used to live in the flash PARENT, which located tilelang with
+# `importlib.util.find_spec` THERE. Training runs in a separate interpreter
+# (`FLASH_VERL_PYTHON`, `/opt/verl-venv`) that is built without --system-site-packages and where
+# flash is not installed at all -- and Dockerfile.worker installs tilelang into BOTH (the main
+# interpreter at the fla/Hopper layer, the child venv at its own layer), as does the run-time
+# rebuild in `verl.capabilities.resolve_verl_python`. So a parent-side repoint never reached the copy
+# the trainer loads, and the stub survived into the process that builds the vLLM engine.
+#
+# The allocator is only constructed when rollout sleep mode is on, which is why the one catalog
+# model flagged `sleep_unsupported` (35B-A3B, pinned resident by `rollout_resident_overrides`) got
+# past engine init while every other GRPO model crashed here.
+#
+# So the repoint lives HERE and only here: a child fragment running in the interpreter that owns the
+# loaded stub. It must run BEFORE any vLLM/model import, so it is emitted at the top of the generated
+# sitecustomize next to the tf32 fragment. The parent no longer repoints anything -- it never builds a
+# vLLM engine, so its own copy of the stub is inert (see the note in `perf/__init__.py`).
+FLASH_CUDART_STUB_MARKER = "[flash-verl] tilelang libcudart stub repointed"
+
+
+def render_tilelang_cudart_shim() -> str:
+    """child-side sitecustomize fragment that repoints tilelang's libcudart stub at the real runtime.
+
+    this is the only place the repoint happens: the stub only matters to the interpreter that builds
+    a sleeping vLLM engine, and that is the verl child. two load-bearing rules: never ``dlopen`` the
+    stub to test it (that maps the stub into this process, which is the crash being avoided), and
+    leave the stub alone when no real libcudart is found.
+
+    never raises. an unrepointed stub only crashes the runs that build a sleeping vLLM engine, so a
+    fragment that cannot find a runtime must leave the child to start rather than abort it here.
+
+    SHIPS THE PARENT'S OWN PROBE rather than restating it. ``perf._find_real_libcudart`` is the
+    canonical one -- nvidia wheel dirs across cuda majors, the -devel toolkit, the system resolver,
+    plus proc-filesystem resolution for a bare soname -- and a hand-copy here would silently keep the
+    old probe the next time a cuda release moves those paths, which is exactly the parent/child skew
+    this whole fragment exists to fix. ``inspect.getsource`` keeps one definition.
+
+    the probe only closes over ``os`` from its module scope (everything else is a builtin or bound
+    inside it), so the fragment imports ``os`` under both the real name -- which the shipped source
+    refers to -- and a private alias the swap below uses, so it cannot be shadowed by child code.
+    """
+    probe_src = textwrap.indent(textwrap.dedent(inspect.getsource(_find_real_libcudart)), "    ")
+    # the parent's docstrings carry `\"\"\"`, but they arrive through {probe_src} at runtime, so they
+    # never touch this literal and the delimiter below stays the repo-standard double quote.
+    return f"""
+# --- flash: repoint tilelang's libcudart stub (see child_io.render_tilelang_cudart_shim) ---
+# the probe below is perf._find_real_libcudart's own source, shipped verbatim. edit it THERE.
+try:
+    import importlib.util as _flash_cudart_importlib_util
+    import os
+    import os as _flash_cudart_os
+
+{probe_src}
+
+    try:
+        _flash_cudart_spec = _flash_cudart_importlib_util.find_spec("tilelang")
+    except Exception:
+        _flash_cudart_spec = None
+    _flash_cudart_locs = (
+        list(getattr(_flash_cudart_spec, "submodule_search_locations", None) or [])
+        if _flash_cudart_spec
+        else []
+    )
+    if _flash_cudart_locs:
+        _flash_cudart_stub = _flash_cudart_os.path.join(
+            _flash_cudart_locs[0], "lib", "libcudart_stub.so"
+        )
+        # lexists: a dangling symlink still shadows, and exists() would follow it away.
+        # do NOT probe the stub with CDLL -- that maps it into this process, the exact crash.
+        if _flash_cudart_os.path.lexists(_flash_cudart_stub) and not (
+            _flash_cudart_os.path.islink(_flash_cudart_stub)
+            and _flash_cudart_os.path.exists(_flash_cudart_stub)
+        ):
+            _flash_cudart_real = _find_real_libcudart()
+            if _flash_cudart_real is None:
+                print(
+                    "[flash-verl] tilelang libcudart stub: no real libcudart found; left as-is",
+                    flush=True,
+                )
+            else:
+                # ray starts several child interpreters against ONE venv, so every step below has
+                # to be safe under concurrency. no check-then-act: link() and symlink() both fail
+                # with FileExistsError rather than clobbering, which is the serialization.
+                _flash_cudart_backup = _flash_cudart_stub + ".orig"
+                try:
+                    # hard link, NOT replace(): the backup is created without unlinking the stub,
+                    # so a worker that loses this race still finds the stub in place. replace()
+                    # would move it and hand the loser FileNotFoundError -- and once .orig exists,
+                    # a second replace() would overwrite the preserved original with the symlink.
+                    _flash_cudart_os.link(_flash_cudart_stub, _flash_cudart_backup)
+                except FileExistsError:
+                    pass  # another worker already preserved it
+                except OSError:
+                    pass  # cross-device or a filesystem without hard links: proceed unbacked
+                # atomic swap through a private temp name: symlink() cannot overwrite, and an
+                # unlink-then-symlink would leave a window where the path does not resolve at all.
+                # the name carries os.urandom entropy, not just the pid: a worker killed between
+                # symlink() and replace() leaves its temp link behind, and a pid-only name would
+                # collide once the container reuses that pid -- symlink() would raise, the swap
+                # would be skipped, and the stub would silently stay in place.
+                _flash_cudart_tmp = ""
+                try:
+                    for _flash_cudart_attempt in range(8):
+                        _flash_cudart_tmp = (
+                            _flash_cudart_stub
+                            + ".flash-"
+                            + str(_flash_cudart_os.getpid())
+                            + "-"
+                            + _flash_cudart_os.urandom(8).hex()
+                        )
+                        try:
+                            _flash_cudart_os.symlink(_flash_cudart_real, _flash_cudart_tmp)
+                            break
+                        except FileExistsError:
+                            # astronomically unlikely; clear it and draw a fresh name.
+                            try:
+                                _flash_cudart_os.remove(_flash_cudart_tmp)
+                            except OSError:
+                                pass
+                    else:
+                        raise RuntimeError("could not create a temp swap link")
+                    _flash_cudart_os.replace(_flash_cudart_tmp, _flash_cudart_stub)
+                finally:
+                    if _flash_cudart_tmp:
+                        try:
+                            _flash_cudart_os.remove(_flash_cudart_tmp)
+                        except OSError:
+                            pass
+                print(
+                    {FLASH_CUDART_STUB_MARKER!r} + " -> " + _flash_cudart_real,
+                    flush=True,
+                )
+except Exception as _flash_cudart_exc:
+    print("[flash-verl] tilelang libcudart stub repoint failed: " + repr(_flash_cudart_exc), flush=True)
 """
 
 
@@ -92,6 +245,20 @@ except Exception:
 FLASH_GDN_VARLEN_MARKER = "[flash-verl] gdn packed-boundary resets active"
 
 
+# Why the shim below defers every import to the moment the child imports the modeling module.
+#
+# sitecustomize runs at INTERPRETER STARTUP, and ray starts each actor's interpreter before it
+# narrows that actor's CUDA_VISIBLE_DEVICES to its own card -- so an import here runs while the
+# process still sees every gpu. importing the modeling module transitively calls transformers'
+# is_flash_linear_attention_available / is_causal_conv1d_available, both of which call
+# torch.cuda.is_available(), and fla queries device capability at import. that initializes cuda
+# against the FULL device list, and a later env-only change cannot rebuild the device map, so every
+# rank keeps device 0 and nccl aborts with "Duplicate GPU detected". a meta_path finder carries no
+# import cost and fires after ray has pinned the actor.
+#
+# the finder patches from exec_module, never find_spec: find_spec runs against a half-built module
+# that the real import then replaces, which leaves the caller's class unpatched while the marker
+# still prints.
 def render_gdn_varlen_shim(model_type: str) -> str:
     """child-side sitecustomize fragment that resets GDN state at packed example boundaries.
 
@@ -104,29 +271,15 @@ def render_gdn_varlen_shim(model_type: str) -> str:
     """
     return f'''
 # --- flash: reset gdn state at packed example boundaries (backend_common.render_gdn_varlen_shim) ---
-import importlib as _flash_gdn_importlib
+import sys as _flash_gdn_sys
 
-import torch as _flash_gdn_torch
-from transformers.modeling_flash_attention_utils import (
-    _is_packed_sequence as _flash_gdn_is_packed,
-    prepare_fa_kwargs_from_position_ids as _flash_gdn_prepare_fa_kwargs,
-)
-
-_flash_gdn_modeling = _flash_gdn_importlib.import_module(
-    "transformers.models.{model_type}.modeling_{model_type}"
-)
-# raises if absent, deliberately: this shim is only rendered once the gate says resets are honored,
-# so a missing TextModel means the gate and the model disagree -- refuse rather than train packed
-# with an unpatched forward.
-_flash_gdn_text_model = next(
-    c
-    for n, c in vars(_flash_gdn_modeling).items()
-    if isinstance(c, type) and n.endswith("TextModel")
-)
+_FLASH_GDN_TARGET = "transformers.models.{model_type}.modeling_{model_type}"
 
 
 def _flash_gdn_seq_idx(position_ids, cu_seq_lens):
     """per-token example ordinal, int32 (1, total_nnz) -- what causal_conv1d_fn wants."""
+    import torch as _flash_gdn_torch
+
     lengths = cu_seq_lens.diff()
     return (
         _flash_gdn_torch.repeat_interleave(
@@ -140,8 +293,24 @@ def _flash_gdn_seq_idx(position_ids, cu_seq_lens):
     )
 
 
-def _flash_patch_gdn_varlen():
-    original = _flash_gdn_text_model.forward
+def _flash_patch_gdn_varlen(modeling):
+    # raises if absent, deliberately: this shim is only rendered once the gate says resets are
+    # honored, so a missing TextModel means the gate and the model disagree -- refuse rather than
+    # train packed with an unpatched forward.
+    text_model = next(
+        c
+        for n, c in vars(modeling).items()
+        if isinstance(c, type) and n.endswith("TextModel")
+    )
+    if getattr(text_model.forward, "_flash_gdn_varlen_patched", False):
+        return
+    # imported here, not at module scope: these pull in torch and transformers' cuda probes.
+    from transformers.modeling_flash_attention_utils import (
+        _is_packed_sequence as _flash_gdn_is_packed,
+        prepare_fa_kwargs_from_position_ids as _flash_gdn_prepare_fa_kwargs,
+    )
+
+    original = text_model.forward
 
     def forward(self, *args, **kwargs):
         # only derive what the caller did not supply, and only for a genuinely packed batch.
@@ -164,14 +333,161 @@ def _flash_patch_gdn_varlen():
                     kwargs["seq_idx"] = _flash_gdn_seq_idx(text_position_ids, cu_seq_lens_q)
         return original(self, *args, **kwargs)
 
-    _flash_gdn_text_model.forward = forward
-
-
-if not getattr(_flash_gdn_text_model.forward, "_flash_gdn_varlen_patched", False):
-    _flash_patch_gdn_varlen()
-    _flash_gdn_text_model.forward._flash_gdn_varlen_patched = True
+    forward._flash_gdn_varlen_patched = True
+    text_model.forward = forward
     print({FLASH_GDN_VARLEN_MARKER!r}, "{model_type}", flush=True)
+
+
+class _FlashGdnLoader:
+    """wrap the real loader so the patch lands once the module is fully executed.
+
+    ``exec_module`` returning means the module object the importer will hand the caller is
+    finished, so patching here is the first safe moment. patching from ``find_spec`` instead
+    would run against a half-built module that the real import then replaces, leaving the
+    caller's class unpatched while the marker still printed.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def create_module(self, spec):
+        return self._inner.create_module(spec)
+
+    def exec_module(self, module):
+        self._inner.exec_module(module)
+        _flash_gdn_uninstall()
+        _flash_patch_gdn_varlen(module)
+
+    def __getattr__(self, name):  # keep the rest of the loader protocol intact
+        return getattr(self._inner, name)
+
+
+class _FlashGdnFinder:
+    """intercept the first import of the modeling module, then get out of the way.
+
+    delegating to the finders AFTER this one resolves the real spec without importing anything,
+    so nothing here touches torch or cuda; only the loader is wrapped.
+    """
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != _FLASH_GDN_TARGET:
+            return None
+        rest = [f for f in _flash_gdn_sys.meta_path if not isinstance(f, _FlashGdnFinder)]
+        for finder in rest:
+            find = getattr(finder, "find_spec", None)
+            if find is None:
+                continue
+            spec = find(fullname, path, target)
+            if spec is not None and spec.loader is not None:
+                spec.loader = _FlashGdnLoader(spec.loader)
+                return spec
+        return None
+
+
+def _flash_gdn_uninstall():
+    _flash_gdn_sys.meta_path[:] = [
+        f for f in _flash_gdn_sys.meta_path if not isinstance(f, _FlashGdnFinder)
+    ]
+
+
+# already imported (a parent process may have loaded it): patch now, there is no import left to
+# intercept. otherwise arm the finder and let the child's own import trigger it.
+_flash_gdn_loaded = _flash_gdn_sys.modules.get(_FLASH_GDN_TARGET)
+if _flash_gdn_loaded is not None:
+    _flash_patch_gdn_varlen(_flash_gdn_loaded)
+else:
+    _flash_gdn_sys.meta_path.insert(0, _FlashGdnFinder())
 '''
+
+
+# --------------------------- fail-closed fragment wrapping (sft + grpo sitecustomize) ---------
+# cpython's site.execsitecustomize catches every Exception raised while sitecustomize imports,
+# prints a two-line note, and starts the interpreter anyway, so a failing fragment silently
+# disables itself AND every fragment concatenated after it, and the child trains unpatched.
+# wrapping gives every required fragment two guarantees: an exception hard-exits the child with
+# this code (os._exit cannot be swallowed by execsitecustomize), and successful application
+# appends the fragment's name to a marker file the parent verifies before trusting the run.
+SHIM_FRAGMENT_FAILED_EXIT_CODE = 97
+SHIM_MARKER_FILENAME = "applied_shims.txt"
+
+
+def shim_marker_file(shim_dir: str) -> str:
+    """the marker file the wrapped fragments in ``shim_dir``'s sitecustomize append to."""
+    return os.path.join(shim_dir, SHIM_MARKER_FILENAME)
+
+
+def render_shim_marker_prologue(marker_file: str) -> str:
+    """sitecustomize prologue defining the recorder every wrapped fragment reports through."""
+    return f"""
+# --- flash: record each applied runtime patch (see child_io.wrap_shim_fragment) ---
+_FLASH_SHIM_MARKER_FILE = {marker_file!r}
+
+
+def _flash_record_applied_shim(name):
+    # append-mode: torchrun ranks and ray actors import this same sitecustomize concurrently,
+    # and short O_APPEND writes keep each line intact. the parent reads the file as a set.
+    with open(_FLASH_SHIM_MARKER_FILE, "a") as _flash_shim_handle:
+        _flash_shim_handle.write(name + "\\n")
+"""
+
+
+def wrap_shim_fragment(name: str, source: str) -> str:
+    """wrap one required sitecustomize fragment so it fails closed and proves it applied.
+
+    "" stays "": a feature that is off has nothing to prove. requires the prologue above earlier
+    in the same sitecustomize. optional fragments (tf32, the wandb link) stay unwrapped, since they
+    swallow their own failures by design and must never be able to kill a paid run.
+    """
+    if not source:
+        return ""
+    return f"""
+# --- flash required fragment: {name} (fails closed; see child_io.wrap_shim_fragment) ---
+try:
+{textwrap.indent(source, "    ")}
+    _flash_record_applied_shim({name!r})
+except BaseException:
+    import os as _flash_shim_os
+    import sys as _flash_shim_sys
+    import traceback as _flash_shim_traceback
+
+    _flash_shim_traceback.print_exc()
+    print(
+        "[flash-verl] required shim fragment {name} failed to apply; "
+        "exiting {SHIM_FRAGMENT_FAILED_EXIT_CODE} rather than training unpatched",
+        file=_flash_shim_sys.stderr,
+        flush=True,
+    )
+    _flash_shim_sys.stderr.flush()
+    _flash_shim_os._exit({SHIM_FRAGMENT_FAILED_EXIT_CODE})
+"""
+
+
+def read_applied_shim_markers(marker_file: str) -> set[str]:
+    """the fragment names the child recorded as applied; empty when it recorded none."""
+    try:
+        with open(marker_file, encoding="utf-8") as handle:
+            return {line.strip() for line in handle if line.strip()}
+    except OSError:
+        return set()
+
+
+def verify_applied_shim_markers(marker_file: str, expected) -> None:
+    """raise unless every expected fragment proved it applied in the child.
+
+    the wrapped fragments hard-exit the child on failure, so the only way a marker goes missing
+    is the sitecustomize never running at all (a shadowing sitecustomize on a foreign
+    FLASH_VERL_PYTHON, or a lost PYTHONPATH entry). that child is training with NO flash patch
+    (seeding, kl anchoring, save gating, boundary resets), so the attempt must fail. permanent
+    rather than retriable by design: the same interpreter reproduces the same skip on retry.
+    """
+    missing = sorted(set(expected) - read_applied_shim_markers(marker_file))
+    if missing:
+        raise RuntimeError(
+            f"the verl child never proved these required runtime patches applied: {missing}. "
+            "its sitecustomize did not run (a shadowing sitecustomize or a dropped PYTHONPATH "
+            "entry on a foreign FLASH_VERL_PYTHON can cause this); refusing to train unpatched. "
+            "this is permanent for this interpreter, not a retriable infra fault."
+        )
 
 
 def parse_wandb_link(line: str) -> dict | None:

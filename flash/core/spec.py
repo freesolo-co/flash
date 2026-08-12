@@ -9,7 +9,8 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 from uuid import UUID
 
-from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
+from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm, samples_on_policy
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
@@ -135,6 +136,37 @@ def _opt_float(value: Any) -> float | None:
     return float(value)
 
 
+def _migrated_optimizer_batch(train: dict, algorithm: str) -> tuple[int | None, int | None]:
+    """``(batch_size, prompts_per_step)`` with the pre-1.1.43 rollout spelling migrated.
+
+    grpo/opd authored the optimizer batch as ``batch_size`` until it was split into
+    ``prompts_per_step``. The schema rejects the old name on SUBMISSION, but `from_dict` also
+    reparses PERSISTED specs, and the deployed release (1.1.40) has no ``prompts_per_step`` at all
+    -- so every rollout run in flight across this upgrade carries only the old key. The workers read
+    ``prompts_per_step`` alone, so without this a recovered run silently resumes on the recipe
+    default: 64 instead of an authored 32 on grpo, which OOMs a card rented for 32, and 8 on opd.
+
+    The old key is MOVED, not copied, and is dropped whenever the new one is present. Leaving it
+    populated would re-emit both names from ``to_dict()``, and a spec carrying both is rejected by
+    the schema -- breaking the resubmit that recovery and ``flash runs get`` perform, and leaving
+    `vram.py::_optimizer_batch_value` (which takes the larger of the two) free to size a card off
+    the stale value that ranking ignores. That applies to a payload written mid-upgrade carrying
+    BOTH spellings too: ``prompts_per_step`` wins, so the superseded key has to go with it.
+
+    A non-positive legacy value is discarded rather than migrated: ``minimum=1`` would have
+    rejected it at submission, and carrying it forward only fails later on a rented GPU. It is
+    discarded from BOTH names for the same round-trip reason -- retaining it under the old one
+    would re-emit a key the schema rejects for this algorithm.
+    """
+    batch_size = _opt_int(train.get("batch_size"))
+    prompts_per_step = _opt_int(train.get("prompts_per_step"))
+    if not samples_on_policy(algorithm):
+        return batch_size, prompts_per_step
+    if prompts_per_step is not None:
+        return None, prompts_per_step
+    return None, batch_size if batch_size is not None and batch_size >= 1 else None
+
+
 _MAX_GPU_COUNT = 8
 
 
@@ -199,6 +231,10 @@ CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
         OPD_RESUME_REVISION_ENV,
         PUBLIC_URL_ENV,
         TEACHER_CAPABILITY_ENV,
+        # the redactors' own transport: build_worker_env overwrites this with the generated list of
+        # declared secret names, so a job declaring it would have its credential silently replaced
+        # by that list and fail at runtime. control-plane-owned, hence rejected at declaration.
+        SECRET_ENV_KEYS_ENV,
         *MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
     }
 )
@@ -251,9 +287,9 @@ def parse_positive_int_tuple(value: Any, *, name: str) -> tuple[int, ...]:
 class EnvironmentSpec:
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
-    # Pip requirements the GPU worker needs for this environment; empty means "use defaults"
-    # (resolved via worker_pip_for_env in spec_payload / provider submit). An explicit
-    # [environment] pip is the escape hatch.
+    # Third-party requirements this environment's scorer imports, appended to Flash's own worker
+    # requirement at submit (worker_pip_with_extras). Empty means the scorer needs nothing beyond
+    # the worker's baseline; entries here never displace it.
     pip: tuple[str, ...] = ()
     # Names only — values sent out-of-band via runtime_secrets, never stored in spec.
     secrets: tuple[str, ...] = ()
@@ -288,7 +324,15 @@ class TrainSpec:
     hf_repo: str = ""
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    # sft only. the packaged-dataset estimate resolves this against the selected row count into
+    # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo/opd have no
+    # profile, so they take prompts_per_step instead and reject this key: the two are not the same
+    # quantity, and accepting one name for both let the standard sft memory workaround
+    # (batch_size = 1) silently mean one prompt per optimizer update on rl.
     batch_size: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    # grpo/opd ONLY: the optimizer batch itself, straight through to verl's data.train_batch_size
+    # and ppo_mini_batch_size. no workload profile sits in between.
+    prompts_per_step: int | None = field(default=None, metadata={"introduced_in": "1.1.43"})
     max_context_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     save_every: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     max_steps: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -356,15 +400,19 @@ MANAGED_GPU_KEYS = frozenset(
     {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
 )
 
-# Removed top-level fields that a PERSISTED record can still carry. Stored run records are never
-# rewritten, and effective_preparation.worker_spec is written with to_internal_dict() (asdict), which
-# emitted every field including the defaulted ones -- so every record written before a field was
-# dropped still names it. from_dict is strict, so without this the first reload after the upgrade
-# raises and a still-running job loses its recovery, deploy, and serving paths.
+# Removed public top-level fields that a PERSISTED record can still carry. Stored run records are
+# never rewritten, and effective_preparation.worker_spec is written with to_internal_dict() (asdict),
+# which emitted every field including the defaulted ones -- so every record written before a field
+# was dropped still names it. This registry also drives historical public-digest replay for
+# model_revision, which remains an internal field. Without it a still-running job can lose its
+# recovery, deploy, and serving paths after the upgrade.
 #
-# Ignored on READ only: nothing here is a JobSpec field, so an authored config naming one is still
-# rejected as unknown by the schema layer's own key check (see schema._TOP_LEVEL_KEYS).
-_DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy", "worker_env"})
+# Ignored on READ only. Most keys here no longer exist as JobSpec fields; model_revision remains an
+# internal runner field, but the public schema rejects it and to_dict omits it. Keeping it in this set
+# lets digest recovery identify the historical public key without weakening JobSpec.from_dict.
+_DROPPED_TOP_LEVEL_KEYS = frozenset(
+    {"model_policy", "model_revision", "worker_env", "workload_profile_kind"}
+)
 
 # Tolerating a dropped key keeps a pre-upgrade run's recovery path, but the values behind it stop
 # being applied -- so a run that authored them now trains on managed defaults instead of what was
@@ -419,9 +467,26 @@ class JobSpec:
     seed: int = FIXED_SEED
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
+    # internal base-model revision resolved by the runner. the public schema rejects this key, while
+    # persisted and worker specs keep it for exact model loading, profiling, geometry validation, and
+    # warm-start equality checks.
     model_revision: str = ""
+    # platform-managed marker: True when the runner resolved model_revision for a spec whose public
+    # input carried no pin (SFT, where `_resolve_model_revision(required=True)` pins the base so
+    # workload profiling keys on an immutable commit). An AUTHORED pin can still exist on a persisted
+    # pre-removal run and stays rejected at deploy; rejecting the auto-assigned one made every SFT run
+    # and every adapter warm-started from one permanently undeployable, unservable, and unscoreable by
+    # `flash env eval`.
+    #
+    # stripped by to_dict() like the other platform-managed carriers. Deploy reads the provenance
+    # from the internal worker spec under `effective_preparation` instead (see
+    # `_internal_spec_from_status`), which carries it verbatim.
+    model_revision_auto: bool = False
+    # platform-managed marker: true when the author omitted both gpu.type and gpu.count and the stored
+    # integer 1 is only the digest-stable public placeholder. allocation reads this marker as
+    # "auto-size"; a type pin or authored count=1 leaves it false and remains a hard ceiling.
+    gpu_count_auto: bool = False
     # platform-managed workload-profile carrier. public configs never author these fields.
-    workload_profile_kind: str = ""
     workload_profile_input_digest: str = ""
     # the flash version that keyed the digest above. it has to travel with the spec because the
     # worker cannot re-derive it: `flash.__version__` reads distribution metadata, and the worker
@@ -437,9 +502,18 @@ class JobSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
-        profile_kind = str(self.workload_profile_kind or "")
-        if profile_kind not in {"", "sft"}:
-            raise ValueError("unsupported workload profile kind")
+        # the marker qualifies a pin; it cannot outlive one. a spec carrying it with no revision
+        # would let a later edit that clears model_revision leave a True marker behind, and the
+        # deploy guard reads the pair.
+        if self.model_revision_auto and not self.model_revision:
+            object.__setattr__(self, "model_revision_auto", False)
+        # NOT cleared when gpu.count != 1. the marker records PROVENANCE -- that the author omitted
+        # gpu.count -- which stays true after allocation resolves a shape onto the spec. clearing it
+        # there destroyed the only record distinguishing an auto-sized run from an authored
+        # single-card pin: the public halves are byte-identical (to_dict strips the marker and keeps
+        # the placeholder count=1 for digest stability), so a recovered auto-sized run came back
+        # hard-pinned to one card and could never be re-offered its multi-card shape. consumers that
+        # mean "auto-size NOW" must additionally check that no shape has been resolved yet.
         profile_digest = str(self.workload_profile_input_digest or "")
         if profile_digest and (
             len(profile_digest) != 64 or any(c not in "0123456789abcdef" for c in profile_digest)
@@ -452,9 +526,20 @@ class JobSpec:
 
     @property
     def phase(self) -> str:
-        if self.workload_profile_kind:
-            return "profile"
         return "rl" if self.algorithm == "grpo" else self.algorithm
+
+    @property
+    def authored_gpu_count(self) -> int | None:
+        """The author's card ceiling: ``None`` when they omitted ``gpu.count``.
+
+        THE single reading of "is the stored count real, or the placeholder?". `gpu_count_auto` and
+        `gpu.count` are one value -- an optional ceiling -- split across two fields only because
+        `to_dict` must keep a digest-stable integer in the public spec. Every consumer that wants
+        the ceiling had to rejoin them by hand, and the hand-written guards disagreed: one checked
+        `count == 1`, another `count == 1 and not type`, two checked neither. Rejoin them here so a
+        consumer cannot invent a fifth spelling.
+        """
+        return None if self.gpu_count_auto else gpu_count_of(self)
 
     def to_dict(self) -> dict[str, Any]:
         """return the public user-authorable job specification.
@@ -465,7 +550,15 @@ class JobSpec:
         data = asdict(self)
         # server-assigned identity — never authored in a config.
         data.pop("run_id", None)
-        data.pop("workload_profile_kind", None)
+        # model_revision is runner-managed and no longer part of the public config or status spec.
+        # Internal round trips keep the value and marker through to_internal_dict(). Historical public
+        # specs that emitted this key are replayed only while verifying their stored preparation
+        # digest, using the exact value from the persisted bytes.
+        data.pop("model_revision", None)
+        data.pop("model_revision_auto", None)
+        # keep gpu.count=1 in the public gpu object for preparation-digest stability. only the
+        # platform-managed provenance marker is stripped; internal round trips carry it verbatim.
+        data.pop("gpu_count_auto", None)
         data.pop("workload_profile_input_digest", None)
         data.pop("workload_profile_producer_version", None)
         data.pop("workload_profile", None)
@@ -484,8 +577,9 @@ class JobSpec:
         for managed in MANAGED_GPU_KEYS:
             gpu.pop(managed, None)
         data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
-        # platform-managed worker requirement list, resolved by worker_pip_for_env at submit.
-        data["environment"].pop("pip", None)
+        # [environment] pip stays in the payload: it is the author's own scorer dependencies, which
+        # only they can declare. The submit paths append it to worker_pip_for_env, so what travels
+        # here is the extra requirements, not the worker's own.
         return data
 
     def to_internal_dict(self) -> dict[str, Any]:
@@ -554,10 +648,14 @@ class JobSpec:
         if not isinstance(project_raw, str):
             raise TypeError("project must be a string")
         project = require_project_id(project_raw) if project_raw.strip() else ""
+        algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
+        # one reading of the optimizer batch for both keys: the rollout spelling changed in 1.1.43
+        # and a persisted spec can still carry the old one.
+        batch_size, prompts_per_step = _migrated_optimizer_batch(train, algorithm)
         return cls(
             model=data.get("model", cls.model),
             model_revision=_model_revision(data.get("model_revision", cls.model_revision)),
-            algorithm=normalize_algorithm(data.get("algorithm", cls.algorithm)),
+            algorithm=algorithm,
             environment=EnvironmentSpec(
                 id=env.get("id", ""),
                 params=dict(env.get("params") or {}),
@@ -579,7 +677,8 @@ class JobSpec:
                 init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),
-                batch_size=_opt_int(train.get("batch_size")),
+                batch_size=batch_size,
+                prompts_per_step=prompts_per_step,
                 max_context_tokens=_opt_int(train.get("max_context_tokens")),
                 save_every=_opt_int(train.get("save_every")),
                 max_steps=parse_max_steps(train.get("max_steps")),
@@ -613,7 +712,8 @@ class JobSpec:
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
-            workload_profile_kind=str(data.get("workload_profile_kind") or ""),
+            model_revision_auto=coerce_bool(data.get("model_revision_auto", False)),
+            gpu_count_auto=coerce_bool(data.get("gpu_count_auto", False)),
             workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),
             workload_profile_producer_version=str(
                 data.get("workload_profile_producer_version") or ""

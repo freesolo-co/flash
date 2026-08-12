@@ -9,7 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 from flash.client import ClientError, create_project, get_project, list_projects
-from flash.server.domain.projects import require_project_access
+from flash.server.domain.projects import require_project_access, require_project_access_slug
 
 
 class _Response:
@@ -351,3 +351,75 @@ def test_standalone_still_requires_a_well_formed_project_id(monkeypatch) -> None
                 authorization=None,
             )
         assert excinfo.value.status_code == 400
+
+
+def test_standalone_refuses_to_resolve_a_publish_slug(monkeypatch) -> None:
+    """Standalone has no project directory, so a slug caller must fail HERE, naming that.
+
+    The id-only path above still succeeds: standalone runs are the reason it must. Only the
+    caller that needs a slug is refused, and it is refused where the reason is known -- publish
+    used to run on the empty string and fail later blaming a stale login key, which no re-login
+    can fix.
+    """
+    monkeypatch.setenv("FLASH_STANDALONE", "1")
+    _no_network(monkeypatch)
+
+    with pytest.raises(HTTPException) as excinfo:
+        require_project_access_slug(
+            project_id="11111111-1111-4111-8111-111111111111",
+            key={"auth_kind": "internal"},
+            authorization=None,
+        )
+    assert excinfo.value.status_code == 501
+    assert "standalone plane does not have" in excinfo.value.detail
+    assert "flash login" not in excinfo.value.detail
+
+
+def test_validation_without_a_slug_is_an_upstream_fault(monkeypatch) -> None:
+    """A managed validation response that omits the slug is a backend contract violation.
+
+    Distinct from the standalone case: that one is a permanent property of the deployment (501),
+    this one is a transient upstream fault (502). Both used to return "" and be reported as the
+    caller's key being stale.
+    """
+    project_id = "11111111-1111-4111-8111-111111111111"
+
+    def urlopen(_req, timeout=None):
+        # no projectSlug / slug anywhere in the body
+        return _Response({"project": {"id": project_id, "orgId": "org-one"}})
+
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
+    monkeypatch.setattr("flash.server.domain.projects.urllib.request.urlopen", urlopen)
+
+    key = {"auth_kind": "freesolo_api_key", "org_id": "org-one"}
+    with pytest.raises(HTTPException) as excinfo:
+        require_project_access_slug(
+            project_id=project_id, key=key, authorization="Bearer fslo-user"
+        )
+    assert excinfo.value.status_code == 502
+    assert "returned no slug" in excinfo.value.detail
+
+    # the id-only entry point is unaffected: it never promised a slug.
+    assert (
+        require_project_access(project_id=project_id, key=key, authorization="Bearer fslo-user")
+        == project_id
+    )
+
+
+def test_a_resolved_slug_still_passes_through(monkeypatch) -> None:
+    """The guard must reject only an ABSENT slug, not a present one."""
+    project_id = "11111111-1111-4111-8111-111111111111"
+
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
+    monkeypatch.setattr(
+        "flash.server.domain.projects.urllib.request.urlopen",
+        lambda _req, timeout=None: _Response(
+            {"project": {"id": project_id, "orgId": "org-one", "slug": "checkout-bot"}}
+        ),
+    )
+
+    assert require_project_access_slug(
+        project_id=project_id,
+        key={"auth_kind": "freesolo_api_key", "org_id": "org-one"},
+        authorization="Bearer fslo-user",
+    ) == (project_id, "checkout-bot")

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
-import math
 import queue
 import tempfile
 import threading
@@ -12,6 +10,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from flash._internal.channel import CLI_NAME
+from flash.cli.commands.env.eval_args import (
+    _MAX_CONCURRENCY,
+    bounded_concurrency,
+    finite_float,
+    positive_int,
+)
 from flash.cli.commands.env.push import _err
 from flash.cli.commands.env.test import _env_params, _evaluation_example
 from flash.cli.ui import render
@@ -24,36 +28,6 @@ from flash.envs.evaluations import (
     normalize_eval_result,
     validate_evaluation_cases,
 )
-
-_MAX_CONCURRENCY = 32
-
-
-def positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 1:
-        raise argparse.ArgumentTypeError("must be at least 1")
-    return parsed
-
-
-def finite_float(value: str) -> float:
-    """A temperature the chat route will accept.
-
-    Reject non-finite or negative values before they become one paid rejection per case.
-    The nonnegative floor matches `flash/schema/__init__.py`.
-    """
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise argparse.ArgumentTypeError(f"must be a finite number, got {value}")
-    if parsed < 0.0:
-        raise argparse.ArgumentTypeError(f"must be at least 0.0, got {value}")
-    return parsed
-
-
-def bounded_concurrency(value: str) -> int:
-    parsed = positive_int(value)
-    if parsed > _MAX_CONCURRENCY:
-        raise argparse.ArgumentTypeError(f"must be at most {_MAX_CONCURRENCY}")
-    return parsed
 
 
 def _generation_error(case_id: str, message: str) -> EvalResult:
@@ -159,13 +133,17 @@ def _scored_response(response: str, *, thinking: bool) -> str:
     """The response as a scorer should see it, matching what training grades.
 
     Strip reasoning only for `thinking` runs; raw reasoning mis-grades them, while unconditional
-    stripping can truncate non-thinking answers that mention `<think>`.
+    stripping can truncate non-thinking answers that mention `<think>`. An already-structured value
+    passes through: re-deriving it from its own answer-only string destroys the raw and thinking
+    views only its producer had the generation to build.
     """
     if not thinking:
         return response
     from flash.content.thinking import strip_think, thinking_text
     from flash.envs.adapter import _ScoredResponseText
 
+    if isinstance(response, _ScoredResponseText):
+        return response
     answer = strip_think(response)
     return _ScoredResponseText(
         answer if isinstance(answer, str) else response,
@@ -175,22 +153,47 @@ def _scored_response(response: str, *, thinking: bool) -> str:
 
 
 def _score_case(
-    suite, case: EvalCase, case_id: str, response: str, *, thinking: bool = False
+    suite,
+    case: EvalCase,
+    case_id: str,
+    response: str,
+    *,
+    thinking: bool = False,
+    state=None,
+    state_keyword: bool = False,
 ) -> EvalResult:
     """Grade one response on the caller's thread.
 
     Scorers may require main-thread resources such as signal-based timeouts; a lock prevents
     overlap but does not provide thread affinity.
+
+    `state` is the finished episode, passed only for a multi-turn suite that accepts it (see
+    `episode._score_episode_case`); single-turn scoring keeps the two-argument contract.
+    `state_keyword` says which way that suite's signature can take it -- `**kwargs` and
+    keyword-only scorers reject a third positional, `*args` scorers reject the keyword -- so the
+    caller decides, having read the signature.
+
+    The scorer grades the stripped answer; the RESULT records the raw generation. Stripping for the
+    scorer must not shorten what is recorded, on the error path least of all -- a failed case is
+    when the reasoning that explains it matters most.
     """
+    recorded_response = response
     try:
-        scored = suite.score(case, _scored_response(response, thinking=thinking))
-        return normalize_eval_result(case, response, scored, case_id=case_id)
+        scored_text = _scored_response(response, thinking=thinking)
+        recorded_response = getattr(scored_text, "raw", response)
+        if state is None:
+            scored = suite.score(case, scored_text)
+        elif state_keyword:
+            scored = suite.score(case, scored_text, state=state)
+        else:
+            scored = suite.score(case, scored_text, state)
+        return normalize_eval_result(case, recorded_response, scored, case_id=case_id)
     except (Exception, SystemExit) as exc:
         return EvalResult(
             case_id=case_id,
             passed=False,
             score=0.0,
-            response=response,
+            response=recorded_response,
             error=f"scoring failed: {str(exc) or exc.__class__.__name__}",
         )
 
@@ -262,6 +265,20 @@ def _run_cases(
 
     Scorers can hold thread-bound resources, so a lock around worker scoring is insufficient.
     """
+    # A transcript-grading suite must play the episode out: scoring one reply would grade a
+    # different task than the run trains on, and would still report a number for it. The suite
+    # opts in, because a multi-turn ENVIRONMENT does not imply a transcript-grading SUITE -- the
+    # scaffolded starter pairs a multi-turn env with a suite that deliberately grades only the
+    # first action, and playing its cases as episodes scores the wrong turn.
+    #
+    # Imported here, not at module scope: episode.py resolves this module's helpers back out of
+    # it, so a top-level import would be circular.
+    from flash.cli.commands.env.episode import _grades_episodes, _run_episode_cases
+
+    if _grades_episodes(suite) and environment is not None:
+        return _run_episode_cases(
+            client, target, suite, cases, args, environment, thinking=thinking
+        )
     case_ids = _case_ids(cases)
     prompts = [_build_messages(environment, case) for case in cases]
     if args.concurrency == 1 or len(cases) <= 1:
@@ -442,7 +459,7 @@ def _require_accessible_project(project_id: object) -> str:
     api_url, api_key = load_credentials()
     if not api_key:
         raise ClientError(
-            "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
+            f"not logged in — run `{CLI_NAME} login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
     # pass `api_url` so self-hosted planes get shape validation without sending
     # `FREESOLO_INTERNAL_KEY` to api.freesolo.co (SELF_HOSTING.md,
@@ -472,7 +489,7 @@ def _upload_report(
     _, api_key = load_credentials()
     if not api_key:
         return _err(
-            "cannot upload results: not logged in — run `flash login` with your freesolo "
+            f"cannot upload results: not logged in — run `{CLI_NAME} login` with your freesolo "
             "API key (or set FREESOLO_API_KEY)"
         )
 
@@ -686,7 +703,7 @@ def _resolve_evaluation_environment(args, spec, is_managed_environment_slug):
         _err(
             f"env eval failed: run {args.target} trains on {environment_reference}, which is not a "
             f"published environment. publish it with `{CLI_NAME} env push` and train a run against "
-            "the resulting namespace/name slug"
+            "the resulting namespace/project/name slug"
         )
         return environment_reference, _err("overall: FAIL")
     return environment_reference, None
@@ -708,7 +725,7 @@ def _prepare_evaluation_workdir(
     try:
         # download once through the control plane, the only credential boundary users have.
         # one archive pins moving environment-hub@main content for both environment and grader.
-        # load from its absolute extracted path so a matching local `namespace/name` checkout
+        # load from its absolute extracted path so a matching local `namespace/project/name` checkout
         # cannot override the published environment.
         package = client.download_env_package(environment_reference)
         entrypoint = (
@@ -959,4 +976,11 @@ def cmd_env_eval(args) -> int:
         )
 
 
-__all__ = ["_MAX_CONCURRENCY", "bounded_concurrency", "cmd_env_eval", "positive_int"]
+# re-exported from eval_args so `flash.cli` keeps importing the eval flag validators from here.
+__all__ = [
+    "_MAX_CONCURRENCY",
+    "bounded_concurrency",
+    "cmd_env_eval",
+    "finite_float",
+    "positive_int",
+]

@@ -39,14 +39,15 @@ from flash.engine.worker.train.opd.batching import (
 from flash.engine.worker.train.opd.gkd import (
     _rollout_terminated,
     _teacher_prompt_text,
-    _trim_trailing_stop,
     student_tokens_with_offsets,
 )
+from flash.engine.worker.train.opd.multiturn_validation import validated_multiturn_response
 from flash.engine.worker.train.opd.prompts import (
     _trim_response_and_forced,
     _validate_forced_mask,
     encode_shifted_group_metadata,
 )
+from flash.engine.worker.train.opd.scoring import score_rollout
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
 if TYPE_CHECKING:  # annotation-only: `opd_train` imports this module, so a runtime import
@@ -124,7 +125,7 @@ class _TeacherAlignmentBridge:
         self.generated_tokens = int(state.get("generated_tokens", 0))
         self.teacher_input_tokens = int(state.get("teacher_input_tokens", 0))
         self.teacher_output_tokens = int(state.get("teacher_output_tokens", 0))
-        self.aligned_sequences = int(state.get("aligned_sequences", state.get("granularity_n", 0)))
+        self.aligned_sequences = int(state.get("aligned_sequences", 0))
         self.empty_alignments = int(
             state.get(
                 "empty_alignments", dict(state.get("skip_counts", {})).get("empty_alignment", 0)
@@ -133,11 +134,10 @@ class _TeacherAlignmentBridge:
         self.truncated_rollouts = int(state.get("truncated_rollouts", 0))
         self.forced_tokens = int(state.get("forced_tokens", 0))
         self.dropped_forced_groups = int(state.get("dropped_forced_groups", 0))
-        self.coverage_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
+        self.coverage_sum = float(state.get("coverage_sum", 0.0))
         # alignment GRANULARITY (mean aligned-groups-per-sequence), distinct from coverage: a
         # collapsed alignment that maps every student token onto one group still scores coverage
-        # ~1.0, so coverage alone cannot flag that failure mode. no legacy alias here -- the old
-        # granularity_* state keys held coverage, so reading them would restore the wrong quantity.
+        # ~1.0, so coverage alone cannot flag that failure mode.
         self.align_group_sum = float(state.get("align_group_sum", 0.0))
         self.align_group_n = int(state.get("align_group_n", 0))
         # resume: baseline the per-step delta counters at the restored cumulative mass, so the
@@ -153,6 +153,11 @@ class _TeacherAlignmentBridge:
         self.no_signal_resamples = int(state.get("no_signal_resamples", 0))
         self.no_signal_skipped_steps = int(state.get("no_signal_skipped_steps", 0))
         self.skip_counts = dict(state.get("skip_counts", {}))
+        # what `skip_counts` already held at the start of the current step. the fatal no-signal
+        # message subtracts this so it reports only the gates that fired for THAT step. seeded from
+        # the restored counts, never from empty: on resume the rehydrated totals belong to steps
+        # that already happened, and a zero baseline would re-blame every one of them.
+        self._skip_baseline = dict(self.skip_counts)
         self.opd_phase_seconds = dict(state.get("opd_phase_seconds", {}))
         self.opd_phase_counts = dict(state.get("opd_phase_counts", {}))
         self._teacher_failure: tuple[str, str] | None = None
@@ -255,7 +260,6 @@ class _TeacherAlignmentBridge:
                 "truncated_rollouts": self.truncated_rollouts,
                 "forced_tokens": self.forced_tokens,
                 "dropped_forced_groups": self.dropped_forced_groups,
-                "granularity_n": self.aligned_sequences,
                 "samples_seen": self.score_requests,
                 "teacher_ok": self.teacher_ok,
                 "teacher_transient": self.teacher_transient,
@@ -264,7 +268,6 @@ class _TeacherAlignmentBridge:
                 "no_signal_skipped_steps": self.no_signal_skipped_steps,
                 "episodes_seen": self.episodes_seen,
                 "mt_turn_records": self.mt_turn_records,
-                "granularity_sum": self.coverage_sum,
                 "skip_counts": skip_counts,
                 "opd_phase_seconds": dict(self.opd_phase_seconds),
                 "opd_phase_counts": dict(self.opd_phase_counts),
@@ -274,6 +277,17 @@ class _TeacherAlignmentBridge:
                 "align_group_sum": self.align_group_sum,
                 "align_group_n": self.align_group_n,
             }
+
+    def _record_skip(self, reason: str) -> None:
+        """Count one single-turn rollout dropped BEFORE the teacher was called.
+
+        Call with ``_stats_lock`` already held. Multi-turn already records its own reason; the
+        single-turn gates did not, and that gap cost a paid GPU run: a run that lost every rollout
+        reported only "no aligned teacher signal", which names the symptom and not one of the three
+        very different causes (cap reached without EOS, empty response, undecodable text). The
+        counters live in the same ``skip_counts`` dict the stats snapshot already publishes.
+        """
+        self.skip_counts[reason] = self.skip_counts.get(reason, 0) + 1
 
     def _empty(self, prompt_length: int, response_length: int) -> dict:
         teacher_ids, teacher_logprobs = encode_shifted_group_metadata(
@@ -303,8 +317,6 @@ class _TeacherAlignmentBridge:
                 f"verl rollout reported {int(image_count)} image(s) for dataset index {index}; "
                 f"the frozen prompt has {expected_image_count}"
             )
-        if expected_image_count:
-            raise ValueError("image-bearing opd is not supported by managed Parasail teachers")
         prompt_ids = list(prompt.prompt_ids)
         prompt_length = int(prompt_length)
         sequence_ids = [int(token_id) for token_id in sequence_ids]
@@ -322,6 +334,8 @@ class _TeacherAlignmentBridge:
             self.generated_tokens += len(response_ids)
             self.forced_tokens += sum(forced)
         if not response_ids:
+            with self._stats_lock:
+                self._record_skip("empty_response")
             return self._empty(prompt_length, 0)
         stop_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
         if not _rollout_terminated(
@@ -329,6 +343,7 @@ class _TeacherAlignmentBridge:
         ):
             with self._stats_lock:
                 self.truncated_rollouts += 1
+                self._record_skip("not_terminated")
             return self._empty(prompt_length, len(response_ids))
         kept_ids, completion_text, kept_forced = _trim_response_and_forced(
             self.tokenizer,
@@ -338,13 +353,17 @@ class _TeacherAlignmentBridge:
             forced,
         )
         if not completion_text.strip() or "�" in completion_text:
+            with self._stats_lock:
+                self._record_skip("undecodable_or_blank")
             return self._empty(prompt_length, len(response_ids))
-        teacher_prompt = _teacher_prompt_text(prompt.teacher_messages, self.thinking_prefill)
         try:
-            if self._text_teacher_batcher is None:
-                teacher_score = self.teacher.score(teacher_prompt, completion_text)
-            else:
-                teacher_score = self._text_teacher_batcher.score(teacher_prompt, completion_text)
+            teacher_score = score_rollout(
+                prompt,
+                completion_text,
+                teacher=self.teacher,
+                thinking_prefill=self.thinking_prefill,
+                text_teacher_batcher=self._text_teacher_batcher,
+            )
         except TeacherError as error:
             if error.permanent:
                 raise
@@ -521,55 +540,12 @@ class _TeacherAlignmentBridge:
         return {"max_turns": turn_limit}
 
     def _validated_multiturn_response(self, payload: dict) -> tuple[list[int], list[int], str, str]:
-        raw_response_ids = [int(token_id) for token_id in payload.get("raw_response_ids", [])]
-        response_ids = [int(token_id) for token_id in payload.get("response_ids", [])]
-        completion_text = payload.get("completion_text")
-        if not isinstance(completion_text, str):
-            raise ValueError("multi-turn assistant completion text must be a string")
-        termination = str(payload.get("termination") or "")
-        truncated = bool(payload.get("truncated"))
-        skip_reason = str(payload.get("skip_reason") or "")
-        if skip_reason not in {
-            "",
-            "empty_completion",
-            "replacement_char",
-            "truncated_rollout",
-        }:
-            raise ValueError("multi-turn assistant turn has an unknown skip reason")
-        if truncated:
-            if termination != "truncated" or skip_reason != "truncated_rollout":
-                raise ValueError("multi-turn truncated assistant turn has inconsistent metadata")
-            if response_ids != raw_response_ids:
-                raise ValueError(
-                    "multi-turn truncated assistant ids must preserve the sampled span"
-                )
-        elif termination == "eos":
-            if self.eos_token_ids.isdisjoint(raw_response_ids):
-                raise ValueError("multi-turn eos termination is not present in the sampled ids")
-            if response_ids != raw_response_ids:
-                raise ValueError("multi-turn eos response ids must preserve the sampled span")
-        elif termination == "stop":
-            stop_text = self.tokenizer.decode(raw_response_ids, skip_special_tokens=False)
-            expected_ids, expected_text = _trim_trailing_stop(
-                self.tokenizer, raw_response_ids, stop_text, self.stop_sequences
-            )
-            if expected_ids != response_ids or expected_text != completion_text:
-                raise ValueError("multi-turn stop trimming does not match the legacy OPD contract")
-        elif termination == "accepted_stop":
-            max_tokens = int(payload.get("max_tokens", 0))
-            if (
-                payload.get("stop_reason") != "completed"
-                or max_tokens <= 0
-                or len(raw_response_ids) >= max_tokens
-                or response_ids != raw_response_ids
-            ):
-                raise ValueError("multi-turn accepted-stop metadata is not verifiable")
-        else:
-            raise ValueError("multi-turn assistant turn did not end at a verified boundary")
-        decoded = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-        if decoded != completion_text:
-            raise ValueError("multi-turn assistant text does not match its accepted token span")
-        return raw_response_ids, response_ids, completion_text, skip_reason
+        return validated_multiturn_response(
+            payload,
+            tokenizer=self.tokenizer,
+            eos_token_ids=self.eos_token_ids,
+            stop_sequences=self.stop_sequences,
+        )
 
     def step_multiturn(self, payload: dict) -> dict:
         self._require_multiturn()
@@ -773,12 +749,31 @@ class _TeacherAlignmentBridge:
                 self._teacher_failure = self._pending_teacher_transient
             self._pending_teacher_transient = None
             self._pending_teacher_success = False
-        return {"ok": True}
+            # hand the per-reason skip tally back to the child so the fatal error can NAME the
+            # cause. the stats snapshot that also carries these is only built after the child has
+            # already raised, so without this a run that loses every rollout dies reporting "no
+            # aligned teacher signal" and the artifacts cannot say which gate dropped them.
+            #
+            # report the DELTA since the last committed step, not `skip_counts` itself. that dict is
+            # a lifetime accumulator -- it is never zeroed and line 156 even rehydrates it from
+            # resume state -- so returning it raw would let a gate that fired in an earlier step be
+            # named as the cause of this one, which is worse than saying nothing.
+            skips = {
+                reason: count - self._skip_baseline.get(reason, 0)
+                for reason, count in self.skip_counts.items()
+                if count - self._skip_baseline.get(reason, 0) > 0
+            }
+            self._skip_baseline = dict(self.skip_counts)
+        return {"ok": True, "skip_counts": skips}
 
     def commit_teacher_cycle(self) -> dict:
         with self._stats_lock:
             self._pending_teacher_transient = None
             self._pending_teacher_success = False
+            # a committed step closes the window the next failure reports on. without this the
+            # baseline would only move on failures, so skips absorbed by a SUCCESSFUL step would be
+            # attributed to whatever step failed next.
+            self._skip_baseline = dict(self.skip_counts)
         return {"ok": True}
 
     def notify_mutation(self) -> None:

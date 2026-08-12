@@ -1,11 +1,9 @@
-"""What `flash train` prints before it launches: the cost quote and the config compatibility notes.
+"""cost quotes and config compatibility notes printed before `flash train` launches.
 
-These run against the plane's estimate endpoint, fall back to an offline calculation when there is
-no backend, and print the exact-SFT rows when a workload profile already exists. The workload
-profile handling is the bulky part: a pending profile is not an error the caller can act on, so it
-is turned into an explanation of which run to follow and what it will be billed.
+rl methods use the offline analytical calculation. sft asks the authenticated control-plane preview
+for the quote and renders its packaged-dataset aggregates, including the raw-record estimate caveat.
 
-Split out of `flash.cli.commands` to keep that module under the file-size limit.
+split out of `flash.cli.commands` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
@@ -15,10 +13,11 @@ import sys
 
 from flash import __version__
 from flash.cli.ui import render
-from flash.client import ApiClient, ApiError, ClientError
+from flash.client import ApiError, ClientError
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
+from flash.engine.profiling.workload_profile import unpacked_batch_warning
 from flash.schema import spec_and_train_keys_from_file, train_schema_metadata
 
 
@@ -48,10 +47,9 @@ _LEGACY_TRAIN_UNKNOWN_KEYS_RE = re.compile(
 def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
-    grpo and opd quote offline from the catalog. sft has no offline quote at all: its cost is
-    derived from the exact tokenized dataset, and only a workload profile knows that, so sft asks
-    the server for the same profile-backed quote a real submit would freeze. There is deliberately
-    no analytical sft fallback -- a guessed row count is what this whole path exists to remove.
+    grpo and opd quote offline from the catalog. sft asks the server to read the pinned packaged
+    dataset and statically readable training contract without executing environment code. tokens,
+    retention, truncation, and steps are estimates that can miss other environment transformations.
     """
     from flash.adapters.lora_rank import preflight_train_context_within_serving
 
@@ -80,7 +78,8 @@ def _cmd_train_cost_offline(spec) -> int:
         print(
             "warning: warm-start (train.init_from_adapter) cost uses the default LoRA rank; the "
             "source adapter's rank is authoritative and resolved at submit, so a higher-rank source "
-            "may cost more than this estimate. Run `flash train --dry-run` for a source-rank quote.",
+            f"may cost more than this estimate. Run `{_commands().CLI_NAME} train --dry-run` "
+            "for a source-rank quote.",
             file=sys.stderr,
         )
     estimate = estimate_cost(runconfig_from_spec(spec))
@@ -92,10 +91,10 @@ def _cmd_train_cost_offline(spec) -> int:
 
 
 def _cmd_train_cost_sft(args, spec, authored_train_keys: frozenset[str]) -> int:
-    """Exact sft quote, served by the same authenticated path that freezes a real submit's quote."""
+    """SFT estimate served by the same authenticated path that freezes a real submit's quote."""
     # cli._warn_if_login_shadowed() suppresses this warning for `--cost` because the catalog path
     # never reaches an organization. the sft path does: it authenticates, resolves the project, and
-    # can start a billed profile run, so the warning has to fire here after all.
+    # requests the server-side packaged-dataset estimate, so the warning has to fire here after all.
     message = _commands().shadowed_login_warning()
     if message:
         print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
@@ -111,12 +110,11 @@ def _cmd_train_cost_sft(args, spec, authored_train_keys: frozenset[str]) -> int:
             client_train_schema=_client_train_schema(authored_train_keys),
         )
     except ApiError as exc:
-        _raise_if_workload_profile_pending(client, exc)
         detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
         if detail is None:
             raise
         raise ApiError(exc.status, detail, detail=detail) from exc
-    _print_exact_sft_cost(status, spec)
+    _print_sft_cost(status, spec)
     return 0
 
 
@@ -128,89 +126,11 @@ def _client_train_schema(authored_train_keys: frozenset[str]) -> dict:
     }
 
 
-def _raise_if_workload_profile_pending(client: ApiClient, exc: ApiError) -> None:
-    """Explain a profile-pending rejection and fail, or return so the caller keeps handling `exc`.
-
-    A miss is not a validation error: the server started a real, separately billed profile run that
-    tokenizes the exact dataset. Saying only "409" would leave the user with a charge they cannot
-    see the reason for, and re-running blindly would look like the same request failing twice.
-    """
-    detail = exc.detail
-    if exc.code != "workload_profile_pending" or not isinstance(detail, dict):
-        return
-    profile_run_id = str(detail.get("profile_run_id") or "")
-    state = str(detail.get("state") or "unknown")
-    # the profile id is deterministic in the workload, so this config's profile may already be
-    # running under another key. that run is not readable here and is not billed here either, so
-    # both the follow-up command and the charge sentence have to change.
-    owned = detail.get("owned") is not False
-    # only a request that WON the claim started and billed a profile. an owner re-running `train`,
-    # `--cost` or `--dry-run` while its own profile is still queued/running joins that run: nothing
-    # is launched and nothing is charged again, so the start-and-bill wording would name a second
-    # charge that does not exist. absent reads as launched, matching `owned` above: an older server
-    # omits the field, and telling a user who WAS charged that nothing happened is the worse error.
-    launched = detail.get("launched") is not False
-    charge = _profile_charge(client, profile_run_id) if owned and launched else None
-    if owned and launched:
-        lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            "to print. the server started a separate profile run that loads your environment and "
-            "tokenizes the exact dataset this training would consume.",
-            "that profile run is real work and is billed on its own"
-            + (f" (estimated ${charge:.2f})" if charge is not None else "")
-            + "; no training run was created, no training gpu was allocated, and nothing was "
-            "charged for training.",
-            f"follow it with `{_commands().CLI_NAME} runs status {profile_run_id}`, then re-run this command "
-            "once it reports done."
-            if profile_run_id
-            else "re-run this command once the profile reports done.",
-        ]
-    elif owned:
-        lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            f"to print. the profile run you already started is still {state}; this command "
-            "launched nothing and charged nothing.",
-            f"follow it with `{_commands().CLI_NAME} runs status {profile_run_id}`, then re-run this command "
-            "once it reports done."
-            if profile_run_id
-            else "re-run this command once the profile reports done.",
-        ]
-    else:
-        lines = [
-            "no exact workload profile exists for this config yet, so there is no training quote "
-            "to print. one is already being measured for this exact config and will be reused, so "
-            "nothing was started or charged here.",
-            "re-run this command in a few minutes.",
-        ]
-    for line in lines:
-        print(render.note(line) if render.styled() else line, file=sys.stderr)
-    raise ClientError(
-        f"workload profile {profile_run_id or '(unknown)'} is {state}; "
-        "the exact quote is available once it succeeds"
-    )
-
-
-def _profile_charge(client: ApiClient, profile_run_id: str) -> float | None:
-    """The profile run's own quote, or None when it cannot be read (not owned by this key, etc)."""
-    if not profile_run_id:
-        return None
-    try:
-        status = client.get_run(profile_run_id)
-    except (ApiError, ClientError):
-        return None
-    quote = status.get("estimated_cost_usd") if isinstance(status, dict) else None
-    # bool is an int subclass, so an unchecked isinstance would render a JSON `true` as "$1.00" --
-    # a charge the user is told to expect that no profile ever quoted.
-    if not isinstance(quote, (int, float)) or isinstance(quote, bool):
-        return None
-    return float(quote)
-
-
-def _exact_sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
-    """Rows describing the exact measured workload behind an sft quote.
+def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
+    """Rows describing the packaged-dataset estimate behind an SFT quote.
 
     Only aggregates the server actually returned are shown. A field that is absent is dropped
-    rather than defaulted, so the panel never reports a count the profile did not measure.
+    rather than defaulted, so the panel never reports a count the profile did not compute.
     """
 
     def count(key: str) -> int | None:
@@ -246,7 +166,31 @@ def _exact_sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
     ]
 
 
-def _print_exact_sft_cost(status: dict, spec) -> None:
+def _print_unpacked_batch_warning(status: object, spec) -> None:
+    """Warn that an unpacked SFT run trains 1 example per update, ignoring `batch_size`.
+
+    The quote/dry-run response already carries the frozen packing decision, so the override is
+    knowable before any training GPU is allocated. The reason travels on the profile's
+    `architecture_mode`, which is what the packing decision froze.
+    """
+    profile = status.get("workload_profile") if isinstance(status, dict) else None
+    if not isinstance(profile, dict):
+        return
+    examples_per_update = profile.get("examples_per_update")
+    if isinstance(examples_per_update, bool) or not isinstance(examples_per_update, int):
+        return
+    message = unpacked_batch_warning(
+        packing_mode=str(profile.get("packing_mode") or ""),
+        architecture_mode=str(profile.get("architecture_mode") or ""),
+        examples_per_update=examples_per_update,
+        configured_batch_size=getattr(spec.train, "batch_size", None),
+    )
+    if not message:
+        return
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+
+
+def _print_sft_cost(status: dict, spec) -> None:
     total = status.get("estimated_cost_usd") if isinstance(status, dict) else None
     if not isinstance(total, (int, float)) or isinstance(total, bool):
         raise ClientError(
@@ -254,19 +198,23 @@ def _print_exact_sft_cost(status: dict, spec) -> None:
             f"run `{_commands().CLI_NAME} train --dry-run` to see the full server response"
         )
     profile = status.get("workload_profile")
-    rows = _exact_sft_cost_rows(spec, profile if isinstance(profile, dict) else {})
+    rows = _sft_cost_rows(spec, profile if isinstance(profile, dict) else {})
     if render.styled():
-        print(render.exact_cost_panel(rows, float(total)))
+        print(render.sft_cost_panel(rows, float(total)))
     else:
         for key, value in rows:
             if value is not None:
                 print(f"{key.ljust(8)}: {value}")
         print(f"{'TOTAL'.ljust(8)}: ${float(total):.2f}")
     print(
-        "quoted from the exact tokenized workload, not an assumed row count. no training gpu was "
-        "allocated and nothing was charged for training.",
+        "tokens, retained rows, truncation, and optimizer steps are estimated from packaged "
+        "input/output fields plus contract_text, contract_path, or TRAINING_CONTRACT.md. other "
+        "environment-added prompts, few-shot examples, tool schemas, filtering, or transformations "
+        "are not executed here, so actual training may retain fewer rows and cost more. no training "
+        "gpu was allocated and nothing was charged for training.",
         file=sys.stderr,
     )
+    _print_unpacked_batch_warning(status, spec)
 
 
 def _legacy_train_key_rejection_detail(

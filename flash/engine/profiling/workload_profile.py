@@ -10,16 +10,17 @@ from typing import Any
 
 SFT_PROFILE_KIND = "sft"
 ROLLOUT_PROFILE_KINDS = ("grpo", "opd")
-# 3 removes the deleted per-run worker environment map from both profile identity payloads. old
-# cached profiles use a different identity shape, so reject them and re-profile.
-WORKLOAD_PROFILE_SCHEMA_VERSION = 3
+# 3 removes the deleted per-run worker environment map from both profile identity payloads. 4 adds
+# the authored [environment] pip digest, which changes the installed worker stack and so cannot be
+# absent from identity. old cached profiles use a different identity shape, so reject them and
+# re-profile.
+WORKLOAD_PROFILE_SCHEMA_VERSION = 4
 # 2 lets a gdn hybrid pack when the installed stack proves it can reset example boundaries, where 1
 # always answered exact-unpacked. the same config therefore resolves to a different packing_mode and
 # examples_per_update, so a profile cached under 1 quotes a step count this policy would not: it has
 # to be a different identity rather than a cache hit.
 SFT_PACKING_POLICY_VERSION = 2
 ROLLOUT_SAMPLE_POLICY_VERSION = 1
-_PROFILE_RUN_PREFIX = "profile-sft-"
 
 # measured generation latency ages out; the shape it was measured from does not. a provider that
 # slows down, or a card whose neighbours change, invalidates the seconds without invalidating the
@@ -51,6 +52,70 @@ def sft_sample_policy(max_examples: object) -> str:
     return SFT_SAMPLE_POLICY_PREFIX if cap > 0 else SFT_SAMPLE_POLICY_FULL
 
 
+# why a run resolved to `exact-unpacked`, keyed by the architecture label the packing decision
+# froze alongside the mode (`sft_workload._packing_mode`). that label is the only part of the
+# decision that survives into the profile, so it is the only place the reason can come from.
+_UNPACKED_REASONS = {
+    "multimodal": "this run is multimodal, and image rows are never packed",
+    "gdn-hybrid": (
+        "this model is a gated-delta-net hybrid and the installed stack cannot reset the "
+        "linear-attention recurrence at example boundaries, so packed examples would bleed state"
+    ),
+    "unsupported": "this model architecture has no boundary-safe packing path in flash",
+    "pure-attention": "packing was disabled for this run",
+}
+
+
+def unpacked_batch_warning(
+    *,
+    packing_mode: str,
+    architecture_mode: str,
+    examples_per_update: int,
+    configured_batch_size: object = None,
+) -> str | None:
+    """One user-facing line for an sft run whose packing mode pins the optimizer batch to 1.
+
+    ``exact-unpacked`` is the boundary-safe design (see
+    ``sft_workload._resolve_sft_step_horizon``), and it overrides the authored ``batch_size``.
+    Returns None when packing is on, or when nothing was overridden because the authored batch
+    was already 1. An omitted ``configured_batch_size`` resolves to the recipe default, which is
+    the batch the run would otherwise have used and the one packing discarded.
+
+    The horizon is deliberately not described here: ``train.max_steps`` outranks epochs over rows
+    (``_resolve_sft_step_horizon``), and this helper is not given either, so any step-count claim
+    would be wrong for a ``max_steps`` run.
+    """
+    from flash.engine.plan.recipe import RECIPE
+
+    if packing_mode == "packed" or examples_per_update > 1:
+        return None
+    try:
+        batch = (
+            int(configured_batch_size)
+            if configured_batch_size is not None
+            else int(RECIPE.sft.effective_batch)
+        )
+    except (TypeError, ValueError):
+        batch = 0
+    if batch == 1:
+        return None
+    reason = _UNPACKED_REASONS.get(
+        architecture_mode, f"packing is unavailable for architecture {architecture_mode!r}"
+    )
+    # an omitted batch_size resolved to the recipe default above; calling that "configured"
+    # would send the reader hunting for a knob their toml never set.
+    source = "configured" if configured_batch_size is not None else "default"
+    authored = f"the {source} batch_size {batch}" if batch > 1 else f"the {source} batch_size"
+    return (
+        f"sequence packing is OFF for this SFT run ({architecture_mode}): {reason}. "
+        f"every optimizer update therefore trains exactly 1 example, so {authored} no longer "
+        "groups examples into an update. it is not inert: it still keys the workload estimate and "
+        "sizes the gpu for an auto-sized run, so changing it can change the quote and move the card. "
+        "the default learning rate is tuned for a batched update: expect noisier steps, "
+        "and lower train.learning_rate if you are comparing against a packed run."
+    )
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -67,6 +132,18 @@ def _sha256(value: object) -> str:
 
 def _digest_mapping(value: object) -> str:
     return _sha256(value if isinstance(value, dict) else {})
+
+
+def _digest_sequence(value: object) -> str:
+    """Digest an ordered sequence of strings, mirroring ``_digest_mapping`` for list-shaped fields.
+
+    ``[environment] pip`` is part of profile identity because those packages are installed into the
+    worker alongside the training stack: a different dependency set can change tokenization,
+    collation, or scorer cost, so two configs differing only here must not share a measured profile.
+    Order is preserved rather than sorted -- pip resolves earlier entries first, so a reordering is a
+    different install.
+    """
+    return _sha256([str(item) for item in value] if isinstance(value, (list, tuple)) else [])
 
 
 def sft_profile_input_payload(
@@ -87,6 +164,7 @@ def sft_profile_input_payload(
             "id": str(environment.id),
             "resolved_sha": str(environment.resolved_sha or ""),
             "params_sha256": _digest_mapping(environment.params),
+            "pip_sha256": _digest_sequence(environment.pip),
         },
         "model": {
             "id": str(spec.model),
@@ -120,20 +198,6 @@ def sft_profile_input_digest(
     )
 
 
-def _profile_run_id(prefix: str, input_digest: str) -> str:
-    """build a profile run id, validating the digest first.
-
-    validation prevents raw paths or truncated hashes from creating unreachable profile directories.
-    """
-    if len(input_digest) != 64 or any(c not in "0123456789abcdef" for c in input_digest):
-        raise ValueError("input_digest must be a lowercase sha256 hex digest")
-    return f"{prefix}{input_digest}"
-
-
-def sft_profile_run_id(input_digest: str) -> str:
-    return _profile_run_id(_PROFILE_RUN_PREFIX, input_digest)
-
-
 def _profile_from_dict(cls, raw: object):
     """rebuild a profile and verify its serialized digest.
 
@@ -156,12 +220,11 @@ def _profile_from_dict(cls, raw: object):
 
 @dataclass(frozen=True)
 class SftWorkloadProfile:
-    """describe the exact aggregate sft workload consumed by training.
+    """describe an sft estimate derived from packaged records and the static training contract.
 
-    measurement fields derive from immutable digest-keyed inputs. ``created_at`` is provenance and
-    stays outside ``_content()`` so repeated preprocessing yields the same workload identity.
-
-    sft profiles are exact or fail; unlike sampled rollout profiles, they need no trust verdict.
+    tokens, retention, truncation, and step horizon share one token stream. other environment prompt
+    transformations can still change all four during training. ``created_at`` is provenance and stays
+    outside ``_content()`` so repeated preprocessing yields the same profile identity.
     """
 
     input_digest: str
@@ -197,8 +260,7 @@ class SftWorkloadProfile:
     sample_policy: str
     schema_version: int = WORKLOAD_PROFILE_SCHEMA_VERSION
     kind: str = SFT_PROFILE_KIND
-    # unix seconds stamped by the profile run that produced this artifact. 0.0 on a recomputation
-    # (the training worker re-derives the measurement to check parity and is not a producer).
+    # unix seconds stamped by the control-plane profile producer. 0.0 on worker recomputation.
     created_at: float = field(default=0.0, compare=False)
 
     def __post_init__(self) -> None:
@@ -306,7 +368,7 @@ class SftWorkloadProfile:
 
     @property
     def content_digest(self) -> str:
-        """Digest of the measurement, so the same workload digests the same on any profile run."""
+        """digest of the estimate content, stable across equivalent control-plane computations."""
         return _sha256(self._content())
 
     def to_dict(self) -> dict[str, object]:
@@ -351,6 +413,7 @@ def rollout_profile_input_payload(
             "id": str(environment.id),
             "resolved_sha": str(environment.resolved_sha or ""),
             "params_sha256": _digest_mapping(environment.params),
+            "pip_sha256": _digest_sequence(environment.pip),
         },
         "model": {
             "id": str(spec.model),
