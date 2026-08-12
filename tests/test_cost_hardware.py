@@ -520,6 +520,77 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
     with pytest.raises(UnknownPromptPoolSize):
         runconfig_from_spec(unbounded)
 
+    # [environment.params] max_examples is not horizon evidence at all, so a spec stating only that
+    # is refused rather than priced from it. it is an opaque kwarg forwarded to the user's
+    # environment factory that neither worker applies, which makes it wrong in BOTH directions
+    # against `prompts_per_step = 128`: an environment that honours it trains 2 prompts, so pricing
+    # an uncapped 128-prompt step overcharges 64x, while one that ignores it yields every row, so
+    # deriving a 1-step horizon from the 2 underquotes a 1153-row pool 10x. Neither branch is a
+    # quote, and the run is billed from this estimate.
+    env_only = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "environment": {
+                "id": "github:owner/repo@main:env/environment.py",
+                "params": {"max_examples": 2},
+            },
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128},
+        }
+    )
+    with pytest.raises(UnknownPromptPoolSize):
+        runconfig_from_spec(env_only)
+
+    # a submit-time refusal is only correct because the run never launches: `_estimate_selected_quote`
+    # fails closed before allocation. the CANCEL path prices a run that already ran and must never
+    # refuse -- `charge_usd_for_spec` pins `max_steps` onto the very same spec and its outer
+    # `except Exception` converts any raise into the $0 fallback, billing nothing for real work. an
+    # overcharge is visible and disputable; a silent zero is neither, and the persisted quote caps
+    # the charge anyway. so this stays priced, and pinning it here keeps a future "refuse everywhere
+    # the key appears" tightening from turning a cancelled run into free GPU time.
+    from types import SimpleNamespace
+
+    from flash.runner.costs import cancelled_charge_usd
+
+    cancelled = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "environment": {
+                "id": "github:owner/repo@main:env/environment.py",
+                "params": {"max_examples": 2},
+            },
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128},
+        }
+    )
+
+    accepted_quote = 0.054551
+    status = SimpleNamespace(
+        estimated_cost_usd=accepted_quote,
+        remote={"provider": "runpod", "allocated_gpu": "H100", "allocated_gpu_count": 1},
+    )
+    charged = cancelled_charge_usd(status, cancelled, steps=7, fallback=0.0)
+    assert charged > 0.0, "a cancelled run that really trained must not bill $0"
+    # and never above the quote the customer accepted, which is what bounds the overcharge.
+    assert charged <= accepted_quote
+
+    # and when both are stated, the enforced [train] cap is the one that binds.
+    both = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "environment": {
+                "id": "github:owner/repo@main:env/environment.py",
+                "params": {"max_examples": 2},
+            },
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 4},
+        }
+    )
+    assert runconfig_from_spec(both).normalized().batch_size == 4
+
 
 def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     """The ranking config carries NO provider, so reading it off the config alone was inert.

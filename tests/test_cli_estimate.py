@@ -91,13 +91,16 @@ def test_an_unbounded_prompt_pool_refuses_to_quote_instead_of_pricing_one_step()
     assert _spec_steps(_spec(**{"train.max_examples": 1153, "train.epochs": 1})) == 73
     assert _spec_steps(_spec(**{"train.max_examples": None, "train.max_steps": 145})) == 145
 
-    # [environment.params] max_examples is still honoured when present -- an environment that reads
-    # it really does yield fewer rows -- but it is not advertised above: it reaches the environment
-    # as an opaque load_environment(**params) kwarg and the starter templates ignore it, so only
-    # [train] max_examples is applied by the worker itself.
+    # [environment.params] max_examples does NOT answer it. It reaches the environment as an opaque
+    # load_environment(**params) kwarg that the starter templates ignore, so it is wrong in both
+    # directions: an environment that honours it trains fewer rows than a horizon derived from the
+    # authored batch, and one that ignores it yields every row, making a 1153 here the pool size of
+    # a run that may really iterate far more. A number nothing enforces is not a stated horizon, so
+    # this stays the same refusal as a spec that says nothing at all.
     env_bounded = _spec(**{"train.max_examples": None, "train.epochs": 1})
     object.__setattr__(env_bounded.environment, "params", {"max_examples": 1153})
-    assert _spec_steps(env_bounded) == 73
+    with pytest.raises(UnknownPromptPoolSize, match="without a prompt-pool size"):
+        _spec_steps(env_bounded)
 
 
 def test_grpo_positive_max_steps_is_authoritative():
