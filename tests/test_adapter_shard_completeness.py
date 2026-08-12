@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import struct
+import time
 
 import pytest
 
@@ -47,6 +48,54 @@ def test_an_orphan_shard_is_not_loadable_weights():
 def test_a_complete_indexed_shard_set_is_loadable():
     assert has_loadable_adapter_weights([*_SHARDS, _INDEX])
     assert loadable_adapter_weight_files([*_SHARDS, _INDEX]) == list(_SHARDS)
+
+
+def test_a_complete_indexed_set_with_a_partial_larger_total_fails_closed():
+    """the listing cannot reveal whether the index names the complete old set or partial new set."""
+    stale_or_live = "adapter_model-00001-of-00003.safetensors"
+    assert loadable_adapter_weight_files([*_SHARDS, _INDEX, stale_or_live]) == []
+
+
+def test_a_complete_larger_set_with_a_partial_smaller_total_fails_closed():
+    """any second total is ambiguous regardless of which candidate happens to be complete."""
+    complete = tuple(f"adapter_model-{index:05d}-of-00003.safetensors" for index in range(1, 4))
+    stale_or_live = "adapter_model-00001-of-00002.safetensors"
+    assert loadable_adapter_weight_files([*complete, _INDEX, stale_or_live]) == []
+
+
+def test_an_old_complete_set_beside_an_incomplete_live_index_set_fails_closed():
+    """a retry can leave complete stale weights while its newly indexed upload is still partial."""
+    incomplete_live = "adapter_model-00001-of-00003.safetensors"
+    names = [*_SHARDS, incomplete_live, _INDEX]
+
+    assert not has_loadable_adapter_weights(names)
+    assert loadable_adapter_weight_files(names) == []
+
+
+def test_an_oversized_total_fails_closed_without_materializing_its_candidate_set(monkeypatch):
+    """untrusted residue cannot force allocation proportional to a filename's claimed total."""
+    import flash.adapters.artifacts as artifacts
+
+    names = [*_SHARDS, _INDEX, "adapter_model-00001-of-99999999.safetensors"]
+    builtin_range = range
+
+    def bounded_range(*args):
+        stop = args[-1]
+        assert stop <= len(names), f"materialized oversized shard range ending at {stop}"
+        return builtin_range(*args)
+
+    monkeypatch.setattr(artifacts, "range", bounded_range, raising=False)
+    started = time.monotonic()
+
+    assert loadable_adapter_weight_files(names) == []
+    assert time.monotonic() - started < 1.0
+
+
+def test_two_complete_indexed_sets_are_rejected_as_ambiguous():
+    """the listing cannot reveal which complete set the index names, so serving either may be stale."""
+    larger = tuple(f"adapter_model-{index:05d}-of-00003.safetensors" for index in range(1, 4))
+    assert not has_loadable_adapter_weights([*_SHARDS, *larger, _INDEX])
+    assert loadable_adapter_weight_files([*_SHARDS, *larger, _INDEX]) == []
 
 
 def test_an_index_missing_one_of_its_shards_is_not_loadable():
