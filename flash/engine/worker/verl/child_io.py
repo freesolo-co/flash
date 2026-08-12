@@ -381,10 +381,21 @@ class _FlashQlaLoader:
 
 
 class _FlashQlaFinder:
+    # delegate only to finders positioned AFTER this one, rather than to "everything that is not
+    # my own class". two fragments can target the SAME modeling module -- the varlen shim is
+    # rendered under the same gate as this one -- and each is rendered independently, so neither
+    # can name the other's class.
+    #
+    # skipping only `isinstance(self)` sends each into the other's find_spec forever
+    # (RecursionError before the model is built, killing every GDN SFT child). skipping ALL flash
+    # finders is worse: the first one resolves the spec, python never consults the second, and that
+    # fragment's patch silently never applies while its marker still records success. slicing past
+    # our own position keeps both wrappers stacked, so both patches land.
     def find_spec(self, fullname, path=None, target=None):
         if fullname != _FLASH_QLA_TARGET:
             return None
-        rest = [f for f in _flash_qla_sys.meta_path if not isinstance(f, _FlashQlaFinder)]
+        here = [i for i, f in enumerate(_flash_qla_sys.meta_path) if f is self]
+        rest = _flash_qla_sys.meta_path[here[0] + 1 :] if here else _flash_qla_sys.meta_path
         for finder in rest:
             find = getattr(finder, "find_spec", None)
             if find is None:
@@ -537,12 +548,20 @@ class _FlashGdnFinder:
 
     delegating to the finders AFTER this one resolves the real spec without importing anything,
     so nothing here touches torch or cuda; only the loader is wrapped.
+
+    delegate to the finders positioned AFTER this one, not to "everything that is not this class":
+    the flashqla fragment arms a finder on the SAME module under the same gate, and each fragment
+    is rendered independently so neither can name the other's class. delegating into it by class
+    recurses until RecursionError; skipping every flash finder instead would let whichever runs
+    first resolve the spec alone, silently dropping the other patch while its marker still records
+    success. slicing past our own position keeps both loaders stacked.
     """
 
     def find_spec(self, fullname, path=None, target=None):
         if fullname != _FLASH_GDN_TARGET:
             return None
-        rest = [f for f in _flash_gdn_sys.meta_path if not isinstance(f, _FlashGdnFinder)]
+        here = [i for i, f in enumerate(_flash_gdn_sys.meta_path) if f is self]
+        rest = _flash_gdn_sys.meta_path[here[0] + 1 :] if here else _flash_gdn_sys.meta_path
         for finder in rest:
             find = getattr(finder, "find_spec", None)
             if find is None:

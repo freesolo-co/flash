@@ -1320,6 +1320,84 @@ def test_the_flash_qla_fragment_is_wrapped_fail_closed_for_a_gdn_run():
     assert str(vc.SHIM_FRAGMENT_FAILED_EXIT_CODE) in wrapped
 
 
+@pytest.mark.parametrize("flashqla_first", [False, True])
+def test_both_gdn_finders_patch_the_same_module_without_recursing(tmp_path, flashqla_first):
+    # a gdn run arms BOTH finders on the SAME modeling module, and each fragment is rendered
+    # independently so neither can name the other's class. two ways to get this wrong, and this
+    # asserts against both at once:
+    #
+    #   delegate to "everything that is not my own class" -> each calls into the other's find_spec
+    #   forever, RecursionError before the model is built, every gdn sft child dead.
+    #
+    #   delegate to "everything that is not a flash finder" -> whichever runs first resolves the
+    #   spec alone, python never consults the second, and that patch silently never applies while
+    #   its marker still records success. that one is WORSE: unpatched boundaries corrupt training
+    #   instead of stopping it.
+    #
+    # so assert both patches landed, not merely that the import survived. parametrized on arming
+    # order because sitecustomize concatenation order is not a contract.
+    root = pathlib.Path(tmp_path, "root")
+    model_dir = root / "transformers" / "models" / "qwen3_5"
+    model_dir.mkdir(parents=True)
+    for parent in (root / "transformers", root / "transformers" / "models", model_dir):
+        (parent / "__init__.py").write_text("")
+    (model_dir / "modeling_qwen3_5.py").write_text(
+        "def chunk_gated_delta_rule(*a, **k):\n    return ('original', a)\n"
+        "class Qwen3_5TextModel:\n    def forward(self, *a, **k):\n        return None\n"
+    )
+    (root / "transformers" / "modeling_flash_attention_utils.py").write_text(
+        "def _is_packed_sequence(*a, **k):\n    return False\n"
+        "def prepare_fa_kwargs_from_position_ids(*a, **k):\n    return ((None, None), (None, None))\n"
+    )
+    (root / "torch.py").write_text(
+        "class _Cuda:\n"
+        "    @staticmethod\n    def is_available():\n        return True\n"
+        "    @staticmethod\n    def get_device_capability():\n        return (9, 0)\n"
+        "cuda = _Cuda()\n"
+    )
+    backends = root / "fla" / "ops" / "gated_delta_rule" / "backends"
+    backends.mkdir(parents=True)
+    for parent in (root / "fla", root / "fla" / "ops", root / "fla" / "ops" / "gated_delta_rule"):
+        (parent / "__init__.py").write_text("")
+    (backends / "__init__.py").write_text(
+        "class _B:\n"
+        "    backend_type = 'flash_qla'\n"
+        "    def is_available(self):\n        return True\n"
+        "    def chunk_gated_delta_rule(self, *a, **k):\n        return ('flashqla', a)\n"
+        "class _R:\n    def _get_sorted_backends(self):\n        return [_B()]\n"
+        "gdr_registry = _R()\n"
+    )
+    fragments = [vc.render_gdn_varlen_shim("qwen3_5"), vc.render_flash_qla_shim("qwen3_5")]
+    if flashqla_first:
+        fragments.reverse()
+    site = pathlib.Path(tmp_path, "shimdir")
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        "".join(fragments)
+        + textwrap.dedent(
+            """
+            import importlib
+            _m = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+            assert getattr(_m.chunk_gated_delta_rule, "_flash_qla_patched", False), "qla dropped"
+            assert getattr(
+                _m.Qwen3_5TextModel.forward, "_flash_gdn_varlen_patched", False
+            ), "varlen dropped"
+            print("BOTH")
+            """
+        )
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", ""],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONPATH": f"{site}{os.pathsep}{root}"},
+    )
+    assert "RecursionError" not in out.stderr, out.stderr
+    assert out.returncode == 0, out.stderr
+    assert "BOTH" in out.stdout
+
+
 def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
     # derive model_type from the child module so the gate and shim cannot disagree. patch the module
     # object because test cleanup may replace the parent package and break dotted monkeypatch
