@@ -34,6 +34,9 @@ _UPSTREAM_TIMEOUT_SECONDS = 300.0
 # copy is truncated to, so the recorded message is never the part that got cut, while still bounding
 # what one response can hold in memory.
 _MAX_RECORDED_ERROR_BYTES = 64 * 1024
+# told to the caller when the provider call succeeded but persisting its trace did not, so a
+# collection run cannot look complete while its exports quietly omit calls.
+_RECORD_FAILED_HEADER = "X-Freesolo-Record-Failed"
 _PROVIDER_HEADER = "X-Freesolo-Provider"
 _PROVIDER_KEY_HEADER = "X-Freesolo-Provider-Key"
 _PROJECT_HEADER = "X-Freesolo-Project-Id"
@@ -142,7 +145,7 @@ _JSON_SCHEMA_KEYWORDS = _JSON_SCHEMA_STRUCTURAL_KEYWORDS | _JSON_SCHEMA_ANNOTATI
 _JSON_SCHEMA_VALUE_KEYWORDS = frozenset({"default", "examples", "example"})
 
 
-@dataclass(frozen=True)
+@dataclass
 class _UpstreamRequestContext:
     url: str
     headers: dict[str, str]
@@ -155,6 +158,9 @@ class _UpstreamRequestContext:
     secrets: tuple[str, ...]
     started_at: float
     record_trace: bool
+    # set when persistence raised, so the response can tell the caller the call was NOT recorded
+    # instead of leaving the gap to be discovered at export time.
+    record_failed: bool = False
 
 
 def _is_secret_key(key: Any) -> bool:
@@ -298,6 +304,11 @@ async def _record_trace(
             spans=[span],
         )
     except Exception:
+        # the provider call already happened and the caller was already billed, so failing the
+        # request here would be worse than the lost trace. but staying silent lets someone finish a
+        # collection run believing it was captured, and only discover the gap at export. record the
+        # miss on the context so the response can say so.
+        context.record_failed = True
         logger.exception("[recording-proxy] failed to persist trace")
 
 
@@ -360,9 +371,6 @@ class _SseAccumulator:
         self._buffer = b""
         self._choices: dict[int, dict[str, Any]] = {}
         self.usage: Any = None
-        # whether any parseable SSE event arrived, so an empty stream is distinguishable from a
-        # stream whose events carried no choices.
-        self.received = False
 
     def feed(self, chunk: bytes) -> None:
         self._buffer += chunk
@@ -374,6 +382,17 @@ class _SseAccumulator:
         if self._buffer:
             self._consume_line(self._buffer.rstrip(b"\r"))
             self._buffer = b""
+
+    @property
+    def received(self) -> bool:
+        """Whether any CHOICE content arrived, which is what makes an output an output.
+
+        Derived from the accumulated choices rather than tracked as a flag set on each parsed
+        event: a usage-only or metadata-only chunk is a parseable event carrying no reply, so a
+        per-event flag reported "received" for a stream that produced nothing and re-stored the
+        synthesized empty-`choices` envelope -- the row `records` exists to skip.
+        """
+        return bool(self._choices)
 
     def output(self) -> dict[str, Any]:
         choices: list[dict[str, Any]] = []
@@ -414,7 +433,6 @@ class _SseAccumulator:
             return
         if not isinstance(payload, dict):
             return
-        self.received = True
         if isinstance(payload.get("usage"), dict):
             self.usage = payload["usage"]
         choices = payload.get("choices")
@@ -441,9 +459,16 @@ class _SseAccumulator:
         role = delta.get("role")
         if isinstance(role, str) and role:
             message["role"] = role
-        for key in ("content", "refusal"):
-            if key in delta:
-                _append_fragment(message, key, delta[key])
+        # every text-shaped delta field, not a fixed pair. providers stream their own alongside the
+        # standard ones -- OpenRouter's `reasoning`, audio transcripts -- and an allowlist silently
+        # dropped them, so a streamed trace held less than the identical non-streaming call.
+        for key, value in delta.items():
+            if key in {"role", "function_call", "tool_calls"}:
+                continue
+            if isinstance(value, str) or (key in message and isinstance(message[key], str)):
+                _append_fragment(message, key, value)
+            elif key not in message:
+                message[key] = value
         function_call = delta.get("function_call")
         if isinstance(function_call, dict):
             target = message.setdefault("function_call", {})
@@ -687,6 +712,8 @@ async def chat_completions(
     content_type = upstream_response.headers.get("content-type")
     if content_type:
         response_headers["content-type"] = content_type
+    if context.record_failed:
+        response_headers[_RECORD_FAILED_HEADER] = "true"
     return Response(
         content=upstream_response.content,
         status_code=upstream_response.status_code,

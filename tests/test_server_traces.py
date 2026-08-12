@@ -667,6 +667,90 @@ def test_an_empty_schema_under_a_secret_name_survives_redaction(trace_api, monke
     assert stored["tools"][0]["function"]["parameters"]["properties"]["password"] == {}
 
 
+def test_a_usage_only_stream_records_no_output(trace_api, monkeypatch) -> None:
+    """Providers close some streams with a usage-only chunk and no choice. "An event arrived" is not
+    "a reply arrived": treating the bookkeeping chunk as output stores a choiceless envelope, which
+    `records` would then have to skip while `raw` shows a completion that never existed."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [b'data: {"choices":[],"usage":{"prompt_tokens":3}}\n\ndata: [DONE]\n\n']
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    assert _raw(trace_api)["records"][0]["spans"][0]["output_payload"] is None
+
+
+def test_a_provider_specific_delta_field_is_accumulated(trace_api, monkeypatch) -> None:
+    """Reasoning traces arrive as `delta.reasoning` fragments exactly like `content` does. Keeping
+    only the fields this proxy happens to know about stores the last fragment of everything else --
+    a reasoning field reading "ing" instead of the thought the caller paid for."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"reasoning":"think ","content":"h"}}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{"reasoning":"more","content":"i"}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    message = _raw(trace_api)["records"][0]["spans"][0]["output_payload"]["choices"][0]["message"]
+    assert message["content"] == "hi"
+    assert message["reasoning"] == "think more"
+
+
+def test_a_long_conversation_is_stored_whole(trace_api) -> None:
+    """A payload is a training row, not an attribute. Capping sequences at the attribute bound drops
+    the NEWEST turns -- the reply and the turn that prompted it -- leaving a row that reads complete
+    and trains toward an answer to a question no longer in it."""
+    owner = db.ensure_standalone_owner()
+    messages = [{"role": "user", "content": f"m{index}"} for index in range(200)]
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="long conversation",
+        metadata=None,
+        spans=[TraceSpan(input_payload={"messages": messages}, output_payload="reply")],
+    )
+
+    stored = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]
+
+    assert stored["messages"] == messages
+
+
+def test_an_unrecorded_call_says_so_in_its_response(trace_api, monkeypatch) -> None:
+    """The provider call succeeded and the caller was billed, so the request must not fail. But a
+    silent miss is discovered at export, after the collection run is over and unrepeatable -- say it
+    on the response the caller is already reading."""
+    _StaticAsyncClient.requests = []
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    def _explode(**kwargs) -> str:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(traces, "store_trace", _explode)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 200
+    assert response.json() == _RESPONSE
+    assert response.headers["x-freesolo-record-failed"] == "true"
+    assert _raw(trace_api)["traces"] == 0
+
+
 def test_projects_and_exports_are_scoped_to_authenticated_key(trace_api, monkeypatch) -> None:
     owner = db.ensure_standalone_owner()
     external = db.ensure_external_key("external-key")

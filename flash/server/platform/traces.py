@@ -29,6 +29,10 @@ _MAX_PAYLOAD_VALUE_LENGTH = 1_000_000
 # field > type`) already sits at depth 6, so the attribute depth would repr() the leaf and store a
 # JSON schema as the string "{}".
 _MAX_PAYLOAD_DEPTH = 24
+# and for collection width. a long chat history past the 128-item attribute bound lost its TAIL --
+# the newest turns, including the prompt the reply actually answers -- while the response was stored
+# whole, so `records` paired a completion with a conversation that no longer led to it.
+_MAX_PAYLOAD_COLLECTION = 100_000
 
 
 @dataclass
@@ -47,7 +51,12 @@ class TraceSpan:
 
 
 def sanitize_json_value(
-    value: Any, *, depth: int = 0, max_string: int | None = None, max_depth: int | None = None
+    value: Any,
+    *,
+    depth: int = 0,
+    max_string: int | None = None,
+    max_depth: int | None = None,
+    max_collection: int | None = None,
 ) -> Any:
     """Bound nested values before they enter the plane's durable trace store.
 
@@ -57,6 +66,8 @@ def sanitize_json_value(
     """
     limit = _MAX_ATTRIBUTE_VALUE_LENGTH if max_string is None else max_string
     depth_limit = _MAX_ATTRIBUTE_DEPTH if max_depth is None else max_depth
+    keys = _MAX_ATTRIBUTE_COUNT if max_collection is None else max_collection
+    items = _MAX_SEQUENCE_LENGTH if max_collection is None else max_collection
     if depth >= depth_limit:
         return _truncate(repr(value), limit)
     if value is None or isinstance(value, bool | int):
@@ -68,14 +79,24 @@ def sanitize_json_value(
     if isinstance(value, dict):
         return {
             _truncate(str(key), limit): sanitize_json_value(
-                item, depth=depth + 1, max_string=max_string, max_depth=max_depth
+                item,
+                depth=depth + 1,
+                max_string=max_string,
+                max_depth=max_depth,
+                max_collection=max_collection,
             )
-            for key, item in list(value.items())[:_MAX_ATTRIBUTE_COUNT]
+            for key, item in list(value.items())[:keys]
         }
     if isinstance(value, list | tuple):
         return [
-            sanitize_json_value(item, depth=depth + 1, max_string=max_string, max_depth=max_depth)
-            for item in list(value)[:_MAX_SEQUENCE_LENGTH]
+            sanitize_json_value(
+                item,
+                depth=depth + 1,
+                max_string=max_string,
+                max_depth=max_depth,
+                max_collection=max_collection,
+            )
+            for item in list(value)[:items]
         ]
     return _truncate(repr(value), limit)
 
@@ -93,10 +114,47 @@ def store_trace(
     if not spans:
         raise ValueError("a trace requires at least one span")
 
-    conn = db._connect()
     created_at = time.time()
     trace_id = str(uuid.uuid4())
     model = next((span.model for span in spans if span.model), None)
+
+    # sanitize and serialize BEFORE taking the write lock. payloads are megabyte-scale by design
+    # here, and doing this inside `BEGIN IMMEDIATE` held the single writer for the whole encode --
+    # blocking unrelated writers (keys, runs, teacher ledgers) and pushing them toward the busy
+    # timeout for work that touches no database state.
+    serialized_metadata = _json_dump(metadata)
+    serialized_spans = [
+        (
+            str(uuid.uuid4()),
+            created_at,
+            trace_id,
+            span.name,
+            span.provider,
+            span.model,
+            span.duration_ms,
+            span.input_tokens,
+            span.output_tokens,
+            _json_dump(
+                span.input_payload,
+                max_string=_MAX_PAYLOAD_VALUE_LENGTH,
+                max_depth=_MAX_PAYLOAD_DEPTH,
+                max_collection=_MAX_PAYLOAD_COLLECTION,
+            ),
+            _json_dump(
+                span.output_payload,
+                max_string=_MAX_PAYLOAD_VALUE_LENGTH,
+                max_depth=_MAX_PAYLOAD_DEPTH,
+                max_collection=_MAX_PAYLOAD_COLLECTION,
+            ),
+            _json_dump(span.attributes),
+            span.status_code,
+            span.error,
+        )
+        for span in spans
+    ]
+    serialized_title = _truncate(trace_title or "", _MAX_TRACE_TITLE_LENGTH) or None
+
+    conn = db._connect()
     try:
         db._immediate(conn)
         conn.execute(
@@ -109,8 +167,8 @@ def store_trace(
                 int(key_id),
                 project_id,
                 model,
-                _truncate(trace_title or "", _MAX_TRACE_TITLE_LENGTH) or None,
-                _json_dump(metadata),
+                serialized_title,
+                serialized_metadata,
             ),
         )
         conn.executemany(
@@ -118,33 +176,7 @@ def store_trace(
             "id, created_at, llm_trace_id, name, provider, model, duration_ms, input_tokens, "
             "output_tokens, input_payload, output_payload, attributes, status_code, error"
             ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    str(uuid.uuid4()),
-                    created_at,
-                    trace_id,
-                    span.name,
-                    span.provider,
-                    span.model,
-                    span.duration_ms,
-                    span.input_tokens,
-                    span.output_tokens,
-                    _json_dump(
-                        span.input_payload,
-                        max_string=_MAX_PAYLOAD_VALUE_LENGTH,
-                        max_depth=_MAX_PAYLOAD_DEPTH,
-                    ),
-                    _json_dump(
-                        span.output_payload,
-                        max_string=_MAX_PAYLOAD_VALUE_LENGTH,
-                        max_depth=_MAX_PAYLOAD_DEPTH,
-                    ),
-                    _json_dump(span.attributes),
-                    span.status_code,
-                    span.error,
-                )
-                for span in spans
-            ],
+            serialized_spans,
         )
         conn.commit()
     except Exception:
@@ -176,11 +208,16 @@ def export_traces(
         raise ValueError(f"limit must be between 1 and {MAX_EXPORT_TRACES}")
 
     with db._connect() as conn:
-        trace_rows = conn.execute(
+        # one row past the limit, purely to tell "exactly `limit` traces exist" from "more exist".
+        # counting `len(rows) >= limit` cannot separate them, so a project holding exactly the cap
+        # would be reported incomplete and the CLI would claim older traces were missing.
+        probe_rows = conn.execute(
             "SELECT * FROM llm_traces WHERE key_id = ? AND project_id = ? "
             "ORDER BY created_at DESC, id DESC LIMIT ?",
-            (int(key_id), project_id, int(limit)),
+            (int(key_id), project_id, int(limit) + 1),
         ).fetchall()
+        truncated = len(probe_rows) > limit
+        trace_rows = probe_rows[:limit]
         records: list[dict[str, Any]] = []
         for trace_row in trace_rows:
             span_rows = conn.execute(
@@ -206,9 +243,9 @@ def export_traces(
         "traces": trace_count,
         "skipped": 0 if export_format == "raw" else trace_count - len(records),
         "format": export_format,
-        # the read is capped, so a project at the cap has older traces this response does not
+        # the read is capped, so a project past the cap has older traces this response does not
         # contain. reporting the truncated count alone would read as "that is all of them".
-        "truncated": trace_count >= limit,
+        "truncated": truncated,
     }
 
 
@@ -265,12 +302,18 @@ def _usable_payload(value: Any) -> bool:
 
 
 def _json_dump(
-    value: Any, *, max_string: int | None = None, max_depth: int | None = None
+    value: Any,
+    *,
+    max_string: int | None = None,
+    max_depth: int | None = None,
+    max_collection: int | None = None,
 ) -> str | None:
     if value is None:
         return None
     return json.dumps(
-        sanitize_json_value(value, max_string=max_string, max_depth=max_depth),
+        sanitize_json_value(
+            value, max_string=max_string, max_depth=max_depth, max_collection=max_collection
+        ),
         ensure_ascii=False,
         sort_keys=True,
     )
