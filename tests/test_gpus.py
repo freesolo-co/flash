@@ -180,7 +180,7 @@ def test_batch_bound_sft_is_rejected_at_parse_time():
     raw = {
         "model": "Qwen/Qwen3.6-27B",
         "algorithm": "sft",
-        "environment": {"id": "example/example"},
+        "environment": {"id": "freesolo/example/example"},
         "train": {
             "batch_size": 1,
             "lora_rank": 32,
@@ -235,7 +235,7 @@ def test_parse_and_allocator_agree_on_batch_bound_sft(sequence, accepted):
     raw = {
         "model": model_id,
         "algorithm": "sft",
-        "environment": {"id": "example/example"},
+        "environment": {"id": "freesolo/example/example"},
         "train": train,
     }
 
