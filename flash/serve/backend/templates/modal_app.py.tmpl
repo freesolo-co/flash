@@ -281,6 +281,31 @@ async def _release_lora_int_id(int_id: int, adapter_id: str) -> bool:
     return True
 
 
+async def _engine_is_warm() -> bool:
+    """Whether any Engine container is already running.
+
+    Asked before any best-effort engine round trip, so an idle deployment does not cold-start a GPU
+    just to remove an adapter that is not resident or delete files a CPU could not reach anyway.
+    `num_total_runners` counts containers starting or running, which is the right question: one
+    that is still booting will load the durable records, and those are already terminal by the time
+    this is called.
+
+    Fails CLOSED -- an unavailable stats call answers "not warm" and skips the call, which costs at
+    most a `max_loras` slot on a live container until it recycles, or one cached directory until
+    the next undeploy collects it. Answering "warm" instead would reinstate exactly the paid cold
+    start this avoids.
+
+    Module scope, not a closure inside `api()`. `settle_adapter` is a separate `@app.function` and
+    could not see the nested version, so its cleanup call had no warm guard at all -- and its
+    dominant failure case is an engine that never answered, i.e. exactly when nothing is warm.
+    """
+    try:
+        stats = await Engine().unregister.get_current_stats.aio()
+    except Exception:
+        return False
+    return bool(getattr(stats, "num_total_runners", 0))
+
+
 async def _discard_cached_adapter(adapter_id: str) -> None:
     """Delete one revision's downloaded weights from the shared volume.
 
@@ -940,7 +965,15 @@ async def settle_adapter(record: dict[str, Any]) -> None:
     # of the adapter id, so each distinct bad revision leaves its own directory behind forever.
     # Best effort and last: the record is already durably `failed`, which is what the client is
     # polling for, and reclaiming disk must not turn a reported failure into an unreported one.
-    if discard_cache:
+    #
+    # Gated on a WARM engine, like undeploy's eviction. The volume is only reachable from a
+    # container that mounts it, so with everything scaled to zero this call would boot a GPU --
+    # minutes of paid time, billed against a deploy that already failed -- purely to run `rmtree`.
+    # And the common path here is `register.remote` itself failing because no container could
+    # start, which is exactly when nothing is warm, so the unguarded version turned every engine
+    # outage into a paid cold start per failed registration. Skipping costs one cached directory
+    # until the next undeploy of that run collects it.
+    if discard_cache and await _engine_is_warm():
         with contextlib.suppress(Exception):
             await Engine().discard_cache.remote.aio(adapter_id)
 
@@ -955,24 +988,6 @@ async def settle_adapter(record: dict[str, Any]) -> None:
 def api():
     web = FastAPI(title=f"flash serving: {{BASE_MODEL}}")
     engine = Engine()
-
-    async def _engine_is_warm() -> bool:
-        """Whether any Engine container is already running.
-
-        Asked before a best-effort eviction, so undeploying an idle run does not cold-start a GPU
-        just to remove an adapter that is not resident. `num_total_runners` counts containers
-        starting or running, which is the right question: one that is still booting will load the
-        durable records, and those are already `disabled` by the time this is called.
-
-        Fails CLOSED -- an unavailable stats call answers "not warm" and skips the eviction, which
-        costs at most a `max_loras` slot on a live container until it recycles. Answering "warm"
-        instead would reinstate exactly the paid cold start this avoids.
-        """
-        try:
-            stats = await engine.unregister.get_current_stats.aio()
-        except Exception:
-            return False
-        return bool(getattr(stats, "num_total_runners", 0))
 
     async def _spawn_settle(record: dict[str, Any]) -> None:
         """Hand the load to a worker, marking the record `failed` if the handoff itself fails.

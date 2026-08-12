@@ -2687,12 +2687,15 @@ def test_registration_requires_a_pinned_commit_sha(client):
     makes one immutable id serve whatever that branch points at today: undeploy, re-register the
     same id, and different weights load while `_fingerprint` sees no change at all.
     """
+    # ONLY `hf_revision` varies. The id, `run_id` and `checkpoint_step` are held in agreement, so
+    # nothing else can supply the 422 -- an earlier version of this test posted an `@final` id
+    # while inheriting `REGISTRATION`'s `run_id` and `checkpoint_step: 10`, and those mismatches
+    # forced the 422 by themselves. It passed with the sha check deleted outright.
     for bad in ("main", "", "a" * 39, "A" * 40, "refs/heads/main"):
         response = client.post(
             "/adapters",
             json={
                 **REGISTRATION,
-                "adapter_id": "run-mutable@final." + "c" * 40,
                 "metadata": {**REGISTRATION["metadata"], "hf_revision": bad},
             },
         )
@@ -2701,6 +2704,18 @@ def test_registration_requires_a_pinned_commit_sha(client):
             f"{response.status_code}: a moved ref can then serve different weights under an id "
             f"the client is told is immutable"
         )
+    # A sha of the right SHAPE that names a different commit than the id does. This is the case a
+    # shape-only check passes and a reconciliation catches.
+    assert (
+        client.post(
+            "/adapters",
+            json={
+                **REGISTRATION,
+                "metadata": {**REGISTRATION["metadata"], "hf_revision": "b" * 40},
+            },
+        ).status_code
+        == 422
+    ), "a well-formed sha that disagrees with the id was accepted"
     # And the good case still registers, so the guard is not simply refusing everything.
     assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
 
@@ -2761,6 +2776,73 @@ def test_a_failed_load_reclaims_its_downloaded_weights(client):
     assert bad_revision not in module.unregistered, (
         "cleanup went through unregister, which evicts by int id -- but the failure already "
         "released that claim, so it can evict an adapter that has since taken the id"
+    )
+
+
+def test_a_failed_load_does_not_cold_start_a_gpu_to_reclaim_its_cache(client):
+    """Reclaiming disk must not boot a GPU against a deploy that already failed.
+
+    The volume is only reachable from a container that mounts it, so with everything scaled to zero
+    this call starts one -- minutes of paid time to run `rmtree`. And the dominant way a load goes
+    terminal is `register.remote` never answering because no container could start, which is
+    exactly when nothing is warm: unguarded, every engine outage bought a cold start per failed
+    registration.
+    """
+    module = client.app.state.generated_module
+    module.runners.count = 0
+    bad_revision = "run-idlecache@final." + "7" * 40
+    client.post(
+        "/adapters",
+        json={
+            **REGISTRATION,
+            "adapter_id": bad_revision,
+            "repo_id": BAD_REPO,
+            "checkpoint": "run-idlecache",
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "run-idlecache",
+                "checkpoint_step": None,
+                "hf_revision": "7" * 40,
+            },
+        },
+    )
+    assert _lifecycle(client, bad_revision) == "failed", (
+        "skipping the cache reclaim must not skip recording the failure the client polls for"
+    )
+    assert module.discarded == [], (
+        "a failed registration reached the engine with nothing warm, so it cold-started a gpu "
+        "purely to delete files -- paid boot time charged against a deploy that already failed"
+    )
+
+
+def test_a_failed_load_still_reclaims_its_cache_on_a_warm_engine(client):
+    """The skip above must not become "never reclaim".
+
+    A warm container is the case this is FOR: the files are on a mounted volume, no cold start is
+    needed, and nothing else ever collects them because DELETE skips already-disabled records.
+    """
+    module = client.app.state.generated_module
+    module.runners.count = 1
+    bad_revision = "run-warmcache@final." + "8" * 40
+    client.post(
+        "/adapters",
+        json={
+            **REGISTRATION,
+            "adapter_id": bad_revision,
+            "repo_id": BAD_REPO,
+            "checkpoint": "run-warmcache",
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "run-warmcache",
+                "checkpoint_step": None,
+                "hf_revision": "8" * 40,
+            },
+        },
+    )
+    assert _lifecycle(client, bad_revision) == "failed"
+    assert bad_revision in module.discarded, (
+        "a warm engine left the failed revision's download on the volume, and no other path "
+        "collects it: delete skips records that are already disabled"
     )
 
 
