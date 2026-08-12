@@ -493,6 +493,14 @@ def deploy_and_submit(
                             # would happily re-offer a box a previous attempt already killed.
                             exclude_machine_ids={o.machine_id for o in tried}
                             | dead_machine_ids(spec.run_id),
+                            # the exclusion this refresh exists to apply is what makes the default
+                            # page too small: `search_offers` caps rows SERVER-side on a price-sorted
+                            # prefix, and the machines are dropped client-side afterwards. so the
+                            # more boxes this run has burned, the more of the page is already spent
+                            # -- and once they fill it the refresh returns empty while dearer usable
+                            # capacity sits just past the cap. widen for the same reason, and by the
+                            # same amount, as the exhaustion recheck below.
+                            limit=_EXHAUSTION_RECHECK_LIMIT,
                             max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
                             # the transient attempt spec always carries the concrete allocated class.
                             gpu_type=spec.gpu.type,

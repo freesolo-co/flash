@@ -510,6 +510,45 @@ def test_deploy_refreshes_once_when_all_taken(monkeypatch):
     assert h.offer_id == 99
 
 
+def test_deploy_refresh_widens_the_page_it_filters(monkeypatch):
+    """The refresh must not ask for a page its own exclusion can fill.
+
+    ``search_offers`` caps rows SERVER-side on a price-sorted prefix and the burned machines are
+    dropped CLIENT-side afterwards, so the exclusion this refresh exists to apply is exactly what
+    makes the default page too small. A run that has lost enough boxes to fill the cheapest page
+    gets an empty result while dearer usable capacity sits just past it, and then retries keep
+    re-selecting the same small set instead of reaching that capacity.
+
+    Modelled with the real ordering (cap the rows, then exclude) rather than asserting the constant:
+    a mock that excluded first would find the offer at any limit and could not fail.
+    """
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    burned = set(range(300))
+
+    def fake_create(offer_id, **kw):
+        if offer_id != 999:
+            raise vast_api.VastCreateRejected("taken")
+        return 7
+
+    def paged_search(min_vram_gb, disk_gb, exclude_machine_ids=frozenset(), limit=256, **kw):
+        # the usable box sits at row 400, past the default cap but inside a widened one
+        rows = [_offer(offer_id=i, machine_id=i, gpu="RTX 4090") for i in range(300)] + [
+            _offer(offer_id=999, machine_id=999, gpu="RTX 4090")
+        ]
+        return [o for o in rows[:limit] if o.machine_id not in exclude_machine_ids]
+
+    monkeypatch.setattr(vast_api, "create_instance", fake_create)
+    monkeypatch.setattr(vast, "usable_offers", paged_search)
+    monkeypatch.setattr(vast, "dead_machine_ids", lambda _run_id: burned)
+
+    handle = _deploy(vast, _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
+
+    assert handle.offer_id == 999  # reached past the page the exclusion had filled
+    assert handle.instance_id == 7
+
+
 def test_deploy_refresh_uses_transient_concrete_gpu_type(monkeypatch):
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
