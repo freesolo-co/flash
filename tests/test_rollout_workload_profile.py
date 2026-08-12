@@ -417,6 +417,9 @@ class _QuotableTrain(_Train):
 
     # `_Spec.algorithm` is grpo, and the quote path reads the optimizer batch of a rollout
     # algorithm from `prompts_per_step`; `batch_size` is sft-only and would never be consulted.
+    # pinned to None rather than left absent, so a spec that reaches the sft branch by mistake fails
+    # loudly instead of quoting off an rl number.
+    batch_size = None
     prompts_per_step = 8
     lora_rank = 32
     save_at_steps: ClassVar[list] = []

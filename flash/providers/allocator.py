@@ -28,6 +28,8 @@ from flash.providers.base import (
     wider_shape_remedy,
 )
 from flash.providers.fit_errors import (
+    catalog_check_hint,
+    drop_pin_hint,
     rents_arbitrary_card_counts,
     vram_fit_error_message,
     widenable_gpu_names,
@@ -81,7 +83,40 @@ def _profile_cost_ranker():
     return lambda candidate: candidate.total_hourly_usd
 
 
-def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
+# RunConfig field -> the `train` knob holding the same quantity. The two vocabularies differ, so
+# VRAM sizing (which reads `train`) cannot consume `overrides` without this mapping. `lora_rank`
+# and the rest are absent because the profile does not measure them -- only these three move.
+_TRAIN_KNOB_FOR_OVERRIDE = {
+    "batch_size": "batch_size",
+    "seq_len": "max_context_tokens",
+}
+
+
+def _overridden_train(train, overrides):
+    """``train`` with profile-measured knobs substituted in, for VRAM sizing.
+
+    Ranking and sizing must agree on the shape of the work: ranking takes the profile through
+    ``overrides``, so sizing has to see the same numbers or submit reserves for a batch the run
+    never executes. Returns ``train`` untouched when there is nothing to substitute, which keeps
+    every non-SFT path byte-identical.
+    """
+    knobs = {
+        _TRAIN_KNOB_FOR_OVERRIDE[key]: value
+        for key, value in (overrides or {}).items()
+        if key in _TRAIN_KNOB_FOR_OVERRIDE
+    }
+    if not knobs or train is None:
+        return train
+    if isinstance(train, dict):
+        return {**train, **knobs}
+    from dataclasses import is_dataclass, replace
+
+    if is_dataclass(train):
+        return replace(train, **knobs)
+    return train
+
+
+def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision="", overrides=None):
     """``candidate -> dollars for one optimizer step``, or None when the run cannot be priced.
 
     Wraps the shared per-step cost key with the multi-card speedup, which is the one thing the
@@ -89,7 +124,12 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
     bills every card but only the gpu-bound half of a step is divided among them.
     """
     cost_key = _run_cost_key(
-        model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        model_revision=model_revision,
+        overrides=overrides,
     )
     if cost_key is None:
         logger.debug("total-cost ranking unavailable; ranking on $/hr")
@@ -98,9 +138,14 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
     from flash.cost.analytical import sharded_step_seconds
 
     # the same one-step config the cost key was built from, so the single- and multi-card branches
-    # below cannot price a run off different knobs.
+    # below cannot price a run off different knobs -- including the profile `overrides`.
     config = run_config_for_ranking(
-        model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        model_revision=model_revision,
+        overrides=overrides,
     )
 
     def cost_per_step(candidate: Candidate) -> float:
@@ -121,21 +166,102 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision=""):
     return cost_per_step
 
 
-def _fits(candidate: Candidate, need: int) -> bool:
-    """Whether this rentable shape can actually hold the run.
+def _fits(candidate: Candidate, need: int, executed_gpu_count: int = 0) -> bool:
+    """Whether this rentable shape can actually hold the run on the ranks it will launch.
 
     ``combined_vram_gb`` is the shared fit model, so a shape accepted here is a shape parse-time
-    sizing also accepted -- the two must not be able to disagree.
+    sizing also accepted -- the two must not be able to disagree. See ``_executed_width`` for why
+    the credited count is the launched one rather than the billed one.
     """
-    return combined_vram_gb(candidate.vram_gb, candidate.gpu_count) >= need
+    fit_count = executed_gpu_count or candidate.gpu_count
+    return combined_vram_gb(candidate.vram_gb, fit_count) >= need
 
 
-def _structurally_fits(available, need: int, cap: int) -> bool:
+def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int:
+    """Ranks a run of this shape would actually launch, which is the card count except for sft.
+
+    Reads the executed batch from the SAME substituted knobs sizing does (``_overridden_train``) so
+    the fit gate and the VRAM requirement describe one run. The retained row count comes from
+    ``overrides`` instead: it is a profile measurement rather than a ``TrainSpec`` sizing knob, so
+    ``_TRAIN_KNOB_FOR_OVERRIDE`` never carries it onto ``train`` and reading it there would miss
+    every rows-bound narrowing.
+    """
+    if (algorithm or "").strip().lower() != "sft":
+        return gpu_count
+    batch = _sizing_int(train, "batch_size", 0)
+    if batch <= 0:
+        # an UNKNOWN batch is not a batch of 1. defaulting it would assert the most restrictive
+        # width on every caller that ranks without knobs and reject multi-card sft outright, which
+        # is a worse failure than the one this clamp prevents: the narrowing must only bite where
+        # the executed width is actually known to be smaller.
+        return gpu_count
+    from flash.engine.plan.steps import sft_data_parallel_cards
+
+    # 0 rows means UNMEASURED, and `sft_data_parallel_cards` reads it that way (it does not narrow),
+    # so an absent profile keeps the batch-bound width rather than inventing a row limit.
+    return sft_data_parallel_cards(
+        gpu_count, batch, _sizing_int(overrides, "sft_retained_examples", 0)
+    )
+
+
+def _executed_width(algorithm: str, train, overrides):
+    """THE rule for how many of a rented card count actually join the run.
+
+    Multi-card fit comes from sharding, so a card that never enters the fsdp group contributes no
+    memory. sft shards by data and bounds its width by the batch and the row count, so an unpacked
+    profile pins the batch to 1 and launches ONE rank however many cards are rented. Crediting the
+    billed count admits a run on memory it will not have: a 4B at 32k needs 28 GB and is correctly
+    rejected on one 24 GB card, but renting two credits 35 GB, passes, then OOMs on the single rank
+    that starts. Renting more cards is not a way to pass the fit gate.
+
+    Bound ONCE per allocation and handed to every site that asks a question about a card count: the
+    filter that removes shapes, the classification that says why none were left, the pinned-class
+    precheck, and each ``--gpus N`` remedy. One rule for all of them is the invariant -- each time a
+    site was left crediting the RENTED count instead, it contradicted the filter: a width the filter
+    deterministically rejects was reported as "structurally offered" (a terminal miss raised as
+    retryable, re-polling a market that cannot widen a batch), and advice named a card count that
+    buys memory the run never joins. ``method_card_speedup`` already clamps throughput to this same
+    width; crediting VRAM is the other half of that.
+    """
+    return lambda gpu_count: _executed_gpu_count(algorithm, train, overrides, gpu_count)
+
+
+def _fitting_candidates(candidates, need: int, executed_width) -> list:
+    """The shapes that hold the run on the ranks they will actually launch.
+
+    Providers report the shapes they can genuinely rent (RunPod takes a count, Lambda names it in the
+    instance type, Vast bakes it into the offer); the allocator owns only whether a shape fits. The
+    executed width is per-candidate because it is bounded by that candidate's own card count.
+    """
+    return [c for c in candidates if _fits(c, need, executed_width(c.gpu_count))]
+
+
+def _sizing_int(train, name: str, default: int) -> int:
+    """A positive int knob off a dict-or-object ``train``, or ``default`` when absent/unusable."""
+    if train is None:
+        return default
+    value = train.get(name) if isinstance(train, dict) else getattr(train, name, None)
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
+def _structurally_fits(available, need: int, cap: int, executed_width, exact: str = "") -> bool:
     """Whether any provider OFFERS a class that could hold the run, ignoring current stock.
 
-    Separates "sold out right now" (retryable) from "no such shape exists" (terminal) for an
-    unpinned search. Reads each provider's advertised class list, never live capacity, so it stays
-    truthful during the very outage it is called to interpret.
+    Separates "sold out right now" (retryable) from "no such shape exists" (terminal). Reads each
+    provider's advertised class list, never live capacity, so it stays truthful during the very
+    outage it is called to interpret.
+
+    ``exact`` narrows the scan to a pinned class, since a pin cannot be satisfied by some other class
+    being offered -- the same rule ``_structural_gpu_names`` applies. Empty for an unpinned search,
+    where any offered class counts.
+
+    Credits ``_executed_width`` rather than the rented count: a width the run will not launch on is
+    not a shape waiting to come back in stock, so sharing the filter's own rule is what makes "no
+    candidate fit" and "no shape could fit" answer the same question.
     """
     for name in available:
         try:
@@ -143,8 +269,10 @@ def _structurally_fits(available, need: int, cap: int) -> bool:
         except Exception:  # a provider that cannot even list classes proves nothing either way
             continue
         for gpu_class in classes:
+            if exact and gpu_class.name != exact:
+                continue
             for count in rentable_gpu_counts(cap):
-                if combined_vram_gb(gpu_class.vram_gb, count) >= need:
+                if combined_vram_gb(gpu_class.vram_gb, executed_width(count)) >= need:
                     return True
     return False
 
@@ -252,13 +380,19 @@ def _resolve_exact_gpu(
     available: tuple[str, ...],
     widest_cap: int = 1,
     unpinned: tuple[str, ...] | None = None,
+    executed_width=None,
 ) -> tuple[str, tuple[str, ...]]:
     """Validate an explicitly pinned GPU class and narrow ``available`` to providers that offer it.
 
     ``unpinned`` is the configured fleet before a provider pin narrowed ``available``, or ``None``
     when nothing was pinned. A pin can hide the only provider that rents this class at a wider
     count, and suppressing the remedy entirely would hide a fix the user can actually apply.
+
+    ``executed_width`` is ``_executed_width``'s rule. Both the combination precheck below and every
+    ``--gpus N`` remedy have to apply it, or a pinned sft run whose batch caps it at one rank is told
+    to buy cards that cannot hold it.
     """
+    launched = executed_width or (lambda count: count)
     exact = canonical_gpu(gpu_type)
     exact_info = GPU_INFO.get(exact)
     if exact_info is None or not exact_info.validated:
@@ -296,43 +430,26 @@ def _resolve_exact_gpu(
         raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
 
     def _drop_pin_hint(above: int) -> str:
-        """Name dropping the pin AND the width it unlocks, or nothing if no width fits.
-
-        Routed through ``wider_shape_remedy`` so this shares the sibling path's two rules: a width
-        is only named once PROVED to fit (an oversized pin gets no hint at all, since dropping the
-        pin cannot help), and the ceiling is named alongside the pin -- reaching here means the
-        authored count already failed, so advice omitting it just buys a second rejection.
-        """
-        remedy = wider_shape_remedy(unpinned_widths, need, ceiling=widest_cap, above=above)
-        if not remedy:
-            return ""
-        # the shared helper opens with "; it fits on N cards -- ...", so splice the pin clause in
-        # front of its body rather than concatenating two separately punctuated sentences.
-        return f". Drop the provider pin to rent {exact!r}:{remedy.removeprefix(';')}"
+        return drop_pin_hint(
+            exact,
+            unpinned_widths,
+            need,
+            ceiling=widest_cap,
+            above=above,
+            executed_width=launched,
+        )
 
     def _catalog_check_hint(above: int) -> str:
-        """Name the width to ASK a fixed-count provider for, when no offline width can be proved.
-
-        `live_capacity` means the count must be confirmed dynamically -- not that the wider SKU is
-        absent. Lambda really does resolve `gpu_4x_h100_pcie` against its catalog and rejects a
-        shape it does not sell with its own precise error, so naming the width to try beats a bare
-        shortfall the user cannot act on. Withheld once the class is oversized at every rentable
-        width, where no count would help and the honest answer is the shortfall alone.
-
-        Also withheld when NO configured provider carries this class at all: the obstacle is then
-        the class, not the width, and `--gpus N` cannot succeed at any N. That run belongs to the
-        `no configured active provider` rejection below, which names the real problem.
-        """
-        if widths or unpinned_widths or not (reachable or unpinned_reachable):
-            return ""
-        width = smallest_fitting_gpu_count(
-            need, max_gpu_count=widest_cap, gpu_names=(exact,) if exact_info.validated else ()
-        )
-        if width is None or width <= above:
-            return ""
-        return (
-            f". Their catalog may list a {width}-card {exact} instance -- raise the card ceiling "
-            f"with `--gpus {width}` to check it against their catalog"
+        return catalog_check_hint(
+            exact,
+            need,
+            ceiling=widest_cap,
+            above=above,
+            # a freely-rentable width was already provable, or nothing carries this class: either
+            # way the catalog question is not the one to ask. see `catalog_check_hint`.
+            offerable=not (widths or unpinned_widths) and bool(reachable or unpinned_reachable),
+            validated=exact_info.validated,
+            executed_width=launched,
         )
 
     if exact_info.vram_gb < need and max_gpu_count <= 1:
@@ -340,7 +457,9 @@ def _resolve_exact_gpu(
             f"exact GPU {exact!r} has {exact_info.vram_gb} GB VRAM, "
             f"but this run requires at least {need} GB"
             + (
-                wider_shape_remedy(widths, need, ceiling=widest_cap, above=1)
+                wider_shape_remedy(
+                    widths, need, ceiling=widest_cap, above=1, executed_width=launched
+                )
                 or _drop_pin_hint(1)
                 or _catalog_check_hint(1)
             )
@@ -351,12 +470,25 @@ def _resolve_exact_gpu(
     if (
         exact_info.vram_gb < need
         and max_gpu_count > 1
-        and combined_vram_gb(exact_info.vram_gb, cap) < need
+        and combined_vram_gb(exact_info.vram_gb, launched(cap)) < need
     ):
+        # the width the VRAM math above actually credited, which is what the message has to name.
+        # naming `cap` instead points the operator at the card ceiling when the real limiter is the
+        # batch: they raise `--gpus` and hit the identical failure.
+        tried = launched(cap)
         raise UnsupportedGpuError(
-            f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
+            f"exact GPU {exact!r} cannot fit this run even as a {tried}-card combination"
             + (
-                wider_shape_remedy(widths, need, ceiling=widest_cap, above=cap)
+                f" (of the {cap} cards allowed, only {tried} "
+                f"{'joins' if tried == 1 else 'join'} this run -- sft shards by data, so the "
+                f"batch and retained rows bound the rank count)"
+                if tried != cap
+                else ""
+            )
+            + (
+                wider_shape_remedy(
+                    widths, need, ceiling=widest_cap, above=cap, executed_width=launched
+                )
                 or _drop_pin_hint(cap)
                 or _catalog_check_hint(cap)
             )
@@ -385,6 +517,7 @@ def _resolved_gpu_count(
     available: tuple[str, ...],
     exact: str,
     unpinned: tuple[str, ...] | None = None,
+    executed_width=None,
 ) -> int:
     """Resolve auto-size or validate that an authored ceiling can structurally fit.
 
@@ -392,6 +525,10 @@ def _resolved_gpu_count(
     when nothing was pinned. A rejection needs it to decide whether dropping the pin is a remedy:
     ``available`` alone cannot tell a pin from a plane that only ever configured one provider, and
     a pin on such a plane drops to the same pool and the same failure.
+
+    ``executed_width`` (``_executed_width``) decides both the auto-sized ceiling and the
+    authored-ceiling check on the width that will run. Without it an sft run the batch caps at one
+    rank is told to raise `[gpu] count` to a width that changes nothing.
 
     Certifies the pin (``certify=True``): this runs inside ``allocate()``, which already does
     network i/o and can retry, and the width decided here is the one the run is really rented at. A
@@ -405,7 +542,7 @@ def _resolved_gpu_count(
     gpu_names = _structural_gpu_names(available, exact)
     if requested_gpu_count is None:
         fitting_count = smallest_fitting_gpu_count(
-            need, max_gpu_count=auto_cap, gpu_names=gpu_names
+            need, max_gpu_count=auto_cap, gpu_names=gpu_names, executed_width=executed_width
         )
         if fitting_count is not None:
             return fitting_count
@@ -415,7 +552,12 @@ def _resolved_gpu_count(
             model_id, requested_gpu_count, model_revision=model_revision, certify=True
         )
         if (
-            smallest_fitting_gpu_count(need, max_gpu_count=effective_count, gpu_names=gpu_names)
+            smallest_fitting_gpu_count(
+                need,
+                max_gpu_count=effective_count,
+                gpu_names=gpu_names,
+                executed_width=executed_width,
+            )
             is not None
         ):
             return effective_count
@@ -428,6 +570,7 @@ def _resolved_gpu_count(
             max_gpu_count=auto_cap,
             gpu_names=gpu_names,
             providers=available,
+            executed_width=executed_width,
             # the pin is worth dropping only if the fleet behind it still buys a wider shape, so
             # ask the same question of the unpinned pool that the pinned one just failed.
             widenable_without_pin=(
@@ -493,16 +636,29 @@ def _raise_no_candidate_error(
     supported_available: tuple[str, ...],
     structurally_unsupported: dict[str, UnsupportedGpuError],
     lookup_failed: bool,
+    executed_width,
 ) -> NoReturn:
-    """Classify an empty candidate set as retryable capacity or a terminal structural miss."""
+    """Classify an empty candidate set as retryable capacity or a terminal structural miss.
+
+    Retryable means "the shape exists but is sold out", so both branches below ask about the shape
+    the run would EXECUTE (``_executed_width``): a width the filter deterministically rejects is a
+    dead end, and calling it retryable spends the infra budget re-polling for capacity that would
+    not help.
+    """
     if not supported_available and structurally_unsupported:
         # Every configured provider rejected the shape structurally. Surface one provider's
         # concrete reason rather than misclassifying an impossible SKU as temporary capacity.
         raise next(iter(structurally_unsupported.values()))
-    if lookup_failed:
+    # THE precondition for every retryable answer below: a shape the run could execute on is
+    # advertised somewhere, so "come back later" is a coherent thing to say. Evaluated once -- three
+    # copies of this question is what let the sft width clamp reach one branch and not the others.
+    could_fit = _structurally_fits(supported_available, need, cap, executed_width, exact)
+    if lookup_failed and could_fit:
         # No candidate fit, but a live capacity lookup blipped and was the only possible source of one
         # -> retryable, NOT terminal: a Vast/Lambda-only run must ride out a market/API outage on its
-        # infra budget instead of dying as if the job exceeds every GPU class.
+        # infra budget instead of dying as if the job exceeds every GPU class. The class list stays
+        # readable during the outage (it is static), so `could_fit` keeps a run the blip did not
+        # cause and cannot cure from burning that budget.
         raise CapacityLookupError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}): a provider's live capacity lookup "
             f"failed transiently and was the only source of a fitting class — retry may find hidden capacity"
@@ -515,7 +671,7 @@ def _raise_no_candidate_error(
         getattr(get_provider(name), "live_capacity", False) for name in supported_available
     )
     if exact:
-        if live_only:
+        if live_only and could_fit:
             raise CapacityLookupError(
                 f"exact GPU {exact!r} is structurally supported but currently has no capacity on "
                 f"{', '.join(supported_available)}"
@@ -527,7 +683,7 @@ def _raise_no_candidate_error(
     # unpinned: only retryable when SOME structurally-offered shape could have held the run.
     # without that guard a genuinely oversized run would retry until its infra budget ran out
     # instead of failing immediately with the reason.
-    if live_only and _structurally_fits(supported_available, need, cap):
+    if live_only and could_fit:
         raise CapacityLookupError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) right now: a fitting class is "
             f"structurally offered on {', '.join(supported_available)} but has no capacity — "
@@ -553,6 +709,7 @@ def allocate(
     model_revision: str = "",
     max_gpu_count: int | None = None,
     workload_profile: bool = False,
+    overrides: dict | None = None,
 ) -> Allocation:
     """Pick the cheapest fitting combination of (provider, GPU class, count) able to run the job.
 
@@ -562,6 +719,14 @@ def allocate(
     ``workload_profile=True`` allocates the cpu-only profile job instead of the run it measures: it
     needs no training VRAM and gains nothing from a faster card, so it ranks on rate alone.
     """
+    # the same profile knobs ranking prices on: VRAM must be sized for the work that will RUN, not
+    # the authored request. an exact-unpacked run executes batch 1 at the measured length, so sizing
+    # off the authored batch over-reserves (4 GB on a 4B at batch 8 / 4096) and can reject a card the
+    # run would have fit on. `_fits` reads it too, so the requirement and the fit cannot disagree.
+    sized_train = _overridden_train(train, overrides)
+    # bound before the pinned-class checks below, which need it too: every question about a card
+    # count in this function is asked through this one rule. see `_executed_width`.
+    executed_width = _executed_width(algorithm, sized_train, overrides)
     if workload_profile:
         need = profile_required_vram_gb()
         max_gpu_count = 1
@@ -569,7 +734,7 @@ def allocate(
         need = required_vram_gb(
             model_id,
             algorithm,
-            train=train,
+            train=sized_train,
             thinking=thinking,
             model_revision=model_revision,
         )
@@ -613,6 +778,7 @@ def allocate(
                 model_id, MAX_COMBINATION_CARDS, model_revision=model_revision, certify=True
             ),
             unpinned=unpinned,
+            executed_width=executed_width,
         )
         if not available:
             raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
@@ -625,6 +791,7 @@ def allocate(
         available=available,
         exact=exact,
         unpinned=unpinned,
+        executed_width=executed_width,
     )
 
     constraints = AllocationConstraints(
@@ -647,9 +814,7 @@ def allocate(
         exact=exact,
         provider=provider,
     )
-    # providers report the shapes they can genuinely rent (RunPod takes a count, Lambda names it in
-    # the instance type, Vast bakes it into the offer); the allocator owns only whether a shape fits.
-    candidates = [c for c in candidates if _fits(c, need)]
+    candidates = _fitting_candidates(candidates, need, executed_width)
     supported_available = tuple(name for name in available if name not in structurally_unsupported)
     if not candidates:
         _raise_no_candidate_error(
@@ -660,17 +825,26 @@ def allocate(
             supported_available=supported_available,
             structurally_unsupported=structurally_unsupported,
             lookup_failed=lookup_failed,
+            executed_width=executed_width,
         )
-    # cheapest JOB first, not cheapest rental: rank on the dollars one step costs on each candidate
-    # (rate x how long that hardware takes), so a faster card wins whenever it finishes enough sooner
-    # to pay for itself. ties prefer fewer cards (less inter-card overhead), then combined VRAM, then
-    # class name. sorting is stable, so provider and provider-local order apply only when all key
-    # fields match. a run the cost model cannot price falls back to total $/hr.
     cost_per_step = (
         _profile_cost_ranker()
         if workload_profile
-        else _step_cost_ranker(model_id, algorithm, train, thinking, model_revision)
+        else _step_cost_ranker(model_id, algorithm, train, thinking, model_revision, overrides)
     )
+    return _cheapest_allocation(candidates, need=need, cost_per_step=cost_per_step)
+
+
+def _cheapest_allocation(candidates, *, need: float, cost_per_step) -> Allocation:
+    """The cheapest-JOB shape from a non-empty fitting set, plus the full ranking behind it.
+
+    Cheapest job, not cheapest rental: rank on the dollars one step costs on each candidate (rate x
+    how long that hardware takes), so a faster card wins whenever it finishes enough sooner to pay
+    for itself. Ties prefer fewer cards (less inter-card overhead), then combined VRAM, then class
+    name. Sorting is stable, so provider and provider-local order apply only when all key fields
+    match. A run the cost model cannot price (``cost_per_step`` is ``None``) falls back to total
+    $/hr.
+    """
     primary = cost_per_step if cost_per_step is not None else (lambda c: c.total_hourly_usd)
     ranked = sorted(
         candidates,

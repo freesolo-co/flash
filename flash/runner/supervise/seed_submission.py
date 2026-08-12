@@ -360,11 +360,16 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
     with contextlib.suppress(FileNotFoundError):
         if get_status(ctx.spec.run_id).state == "cancelled":
             raise ctx.cancel()
+    from flash.cost.spec import sft_ranking_overrides
+
     try:
         allocation = allocate(
             prepared.attempt_spec.model,
             prepared.attempt_spec.algorithm,
             train=prepared.attempt_spec.train,
+            # profile-derived knobs (executed batch, row count, measured length): ranking must price
+            # the work that will run, not the authored request. see `sft_ranking_overrides`.
+            overrides=sft_ranking_overrides(prepared.attempt_spec),
             thinking=prepared.attempt_spec.thinking,
             # the run's requested disk, so the vast capacity check searches at the same effective
             # floor submit provisions with — else a high-disk run is advertised vast capacity that

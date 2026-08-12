@@ -39,6 +39,20 @@ def samples_on_policy(algorithm: str) -> bool:
     return algo in _ON_POLICY_ALGORITHMS
 
 
+def optimizer_batch_key(algorithm: str) -> str:
+    """The ``[train]`` key holding the optimizer batch for this algorithm.
+
+    The two names are different quantities and the schema rejects the wrong one, so a reader that
+    guesses finds nothing and silently falls back to the recipe default. Sizing, ranking and the
+    quote must agree on the name or they price and allocate the same job differently.
+
+    Unknown and empty algorithms resolve to the sft name, matching how the sizing paths treat
+    anything that is not recognisably rl.
+    """
+    algo = (algorithm or "").strip().lower()
+    return "prompts_per_step" if algo in ("grpo", "rl", "opd") else "batch_size"
+
+
 def normalize_algorithm(value: str) -> str:
     """Canonical (lowercased, validated) algorithm name."""
     if not value:
@@ -119,8 +133,9 @@ class ModelInfo:
     num_key_value_heads: int = 0
     # QUERY heads, from the checkpoint's own config. NOT derivable as hidden_size // head_dim: these
     # models decouple head_dim from that ratio (3.5-4B is hidden 2560 / head_dim 256 but has 16
-    # heads, not 10). verl's ulysses sequence parallelism requires this to divide the gpu count, so
-    # a derived value silently caps runs on a number that is not the constraint.
+    # heads, not 10). verl's ulysses sequence parallelism requires this to divide the gpu count --
+    # grpo and opd use it, sft no longer does -- so a derived value silently caps runs on a number
+    # that is not the constraint.
     num_attention_heads: int = 0
     head_dim: int = 0
     linear_num_key_heads: int = 0
