@@ -23,6 +23,7 @@ from flash.cost.facts import (
     total_params_b,
 )
 from flash.cost.types import CostEstimate, RunConfig
+from flash.engine.plan.steps import sft_data_parallel_cards
 from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY, opd_teacher_request_multiplier
 
@@ -260,40 +261,52 @@ def multi_card_speedup(gpu_count: int, gpu: str, provider: str = "") -> float:
     return max(k * (scaling ** (k - 1)) for k in range(1, n + 1))
 
 
-# --- sft shards by SEQUENCE, not by data ---------------------------------------------------------
-# sft_train.py pins Ulysses sequence parallelism, while grpo/opd use fsdp data parallelism; their
-# collective costs are not interchangeable. no matched multi-card sft arm exists, so these separate
-# constants conservatively reuse the dp values until an sft-specific measurement replaces them.
-# verl reference: workers/engine/fsdp/transformer_impl.py get_data_parallel_size.
-MULTI_CARD_SCALING_SP_NVLINK = 0.88
-MULTI_CARD_SCALING_SP_PCIE = 0.71
-
-
-def sequence_parallel_speedup(gpu_count: int, gpu: str, provider: str = "") -> float:
-    """Return SFT sequence-parallel throughput across cards.
-
-    Keep separate constants from fsdp data parallelism; see MULTI_CARD_SCALING_SP_NVLINK.
-    """
-    n = max(1, int(gpu_count))
-    scaling = (
-        MULTI_CARD_SCALING_SP_NVLINK if has_nvlink(gpu, provider) else MULTI_CARD_SCALING_SP_PCIE
-    )
-    return max(k * (scaling ** (k - 1)) for k in range(1, n + 1))
-
-
 def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str, provider: str = "") -> float:
-    """Return throughput for the run's sequence- or data-parallel strategy.
+    """Return multi-card throughput for the run.
+
+    Every algorithm now shards by DATA. SFT used to pin Ulysses sequence parallelism and therefore
+    carried its own scaling constants, but sequence parallelism is incorrect for the catalog's GDN
+    hybrids (the linear-attention recurrence and causal conv carry state along the sequence, and
+    verl passes no state across ranks), so ``sft_train_runner`` pins it off. One fsdp constant now
+    describes all three -- and the sp pair it replaces was numerically identical to it, so no quote
+    moves. See ``sft_data_parallel_cards``.
 
     ``provider`` must reflect the rented substrate because interconnect changes scaling. Live
     allocation paths learn it after building ``config``; pinned ``config.provider`` is the fallback.
+
+    Credit SFT only the ranks that will actually execute. ``gpu_count`` here is the BILLED shape,
+    and sharding by data bounds the executed width by BOTH the batch and the row count: an unpacked
+    profile pins ``batch_size`` to 1, so a 2-card rental trains on one rank, and a batch-compatible
+    width that does not divide the rows is narrowed again so the sampler cannot drop the remainder.
+    Quoting the billed width would promise throughput the run cannot deliver and understate wall
+    time against the run's cap. The cards are still billed -- that is the point of the
+    ``[sft][warn]`` line the worker prints.
+
+    ``sft_retained_examples`` is the rows the trainer iterates. It must be carried explicitly
+    rather than derived from ``sft_packed_blocks``, which is ``ceil(rows / examples_per_update)``
+    and reconstructs 10 rows at a batch of 8 as 16 -- an over-credit, i.e. the failure this clamp
+    exists to prevent.
     """
     n = config.normalized()
     resolved = (provider or "").strip().lower()
     if not resolved:
         resolved = n.provider if n.provider != "auto" else ""
-    if n.method == "sft":
-        return sequence_parallel_speedup(gpu_count, gpu, resolved)
-    return multi_card_speedup(gpu_count, gpu, resolved)
+    return multi_card_speedup(executed_gpu_count(config, gpu_count), gpu, resolved)
+
+
+def executed_gpu_count(config: RunConfig, gpu_count: int) -> int:
+    """Ranks this run launches on ``gpu_count`` cards, which is all of them except for sft.
+
+    THE definition of "how wide does this actually run", shared by the throughput model above and
+    the offline shape search below. They must not answer it separately: the quote reporting a shape
+    the allocator then rejects tells a user a run is feasible and priced, and then refuses it at
+    submit. sft shards by data, so its width is bounded by the batch and the retained rows; every
+    other algorithm runs the shape it rents.
+    """
+    n = config.normalized()
+    if n.method != "sft":
+        return gpu_count
+    return sft_data_parallel_cards(gpu_count, n.batch_size or 1, n.sft_retained_examples or 0)
 
 
 def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int, provider: str = "") -> float:
@@ -470,6 +483,9 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
         # been "already tried" and the search must exclude nothing. 0 is that empty exclusion --
         # passing none compares int > none and crashes the quote.
         above=config.gpu_count or 0,
+        # the same width rule the ranking loop above rejected shapes with, so the remedy cannot
+        # promise a count the retry will not launch on.
+        executed_width=lambda count: executed_gpu_count(config, count),
     )
 
 
@@ -484,6 +500,11 @@ def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]
     shortfall reads the same whether it surfaced from `--cost` or from submit.
 
     Still a check and never a promise: nothing offline proved the wider SKU is purchasable.
+
+    Withheld when the run would not LAUNCH on the width found, mirroring ``_catalog_check_hint``:
+    ``smallest_fitting_gpu_count`` credits rented cards, so for an sft run the batch caps at fewer
+    ranks it names a count that buys idle cards. The mirror has to hold in both directions or
+    `--cost` promises a width submit rejects.
     """
     from flash.providers.base import MAX_COMBINATION_CARDS, smallest_fitting_gpu_count
 
@@ -493,6 +514,7 @@ def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]
             config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
         ),
         gpu_names=names,
+        executed_width=lambda count: executed_gpu_count(config, count),
     )
     if width is None or width <= (config.gpu_count or 0):
         return ""
@@ -500,6 +522,36 @@ def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]
     return (
         f". Their catalog may list a {width}-card {pinned} instance -- raise the card ceiling "
         f"with `--gpus {width}` to check it against their catalog"
+    )
+
+
+def _quote_gpu_ceiling(
+    config: RunConfig, need: float, names: tuple[str, ...], *, ceiling: int | None, auto_cap: int
+) -> int:
+    """The widest count this quote ranks over: the authored ceiling, or the smallest that fits.
+
+    An authored ceiling is the user's own `[gpu] count`, narrowed only by the model's geometry cap.
+    Auto-sizing instead searches for the smallest fitting count, with the SAME executed-width rule
+    the ranking loop applies -- without it the ceiling is chosen on rented cards and can land below
+    the shape that actually fits, because sft's executed width is not monotonic in the rented count
+    (batch 3 over 3 rows launches 1 rank on 2 cards but 3 on 4). A ceiling of 2 would then hide the
+    4-card shape and the quote would reject a job submit accepts.
+
+    Falls back to ``auto_cap`` when nothing fits, so the caller reports the shortfall against the
+    widest shape rather than silently ranking a narrow one.
+    """
+    if ceiling is not None:
+        return geometry_safe_gpu_cap(config.model_id, ceiling, model_revision=config.model_revision)
+    from flash.providers.base import smallest_fitting_gpu_count
+
+    return (
+        smallest_fitting_gpu_count(
+            need,
+            max_gpu_count=auto_cap,
+            gpu_names=names,
+            executed_width=lambda count: executed_gpu_count(config, count),
+        )
+        or auto_cap
     )
 
 
@@ -530,7 +582,6 @@ def _offline_gpu_shape(
         combined_vram_gb,
         providers_for,
         rentable_gpu_counts,
-        smallest_fitting_gpu_count,
     )
     from flash.providers.fit_errors import vram_fit_error_message, vram_knob_advice
 
@@ -564,19 +615,17 @@ def _offline_gpu_shape(
         config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
     )
     ceiling = authored_gpu_ceiling(config.gpu_type, config.gpu_count)
-    if ceiling is None:
-        safe_gpu_count = (
-            smallest_fitting_gpu_count(need, max_gpu_count=auto_cap, gpu_names=names) or auto_cap
-        )
-    else:
-        safe_gpu_count = geometry_safe_gpu_cap(
-            config.model_id, ceiling, model_revision=config.model_revision
-        )
+    safe_gpu_count = _quote_gpu_ceiling(config, need, names, ceiling=ceiling, auto_cap=auto_cap)
     ranked = []
     for gpu in names:
         info = GPU_INFO[gpu]
         for count in rentable_gpu_counts(safe_gpu_count):
-            if combined_vram_gb(info.vram_gb, count) < need:
+            # credit only the cards that JOIN the run, matching the allocator's `_fits`. quoting the
+            # billed count here made the two disagree: a 27B at 128k over 10 rows was quoted 4x H200
+            # (460 GB credited against a 422 GB need) while the allocator launches 2 ranks -- 234 GB
+            # -- and rejects it, so the run was priced as feasible and then refused at submit.
+            launched = executed_gpu_count(config, count)
+            if combined_vram_gb(info.vram_gb, launched) < need:
                 continue
             # Provisional quoting is structural and must not touch a live market. Vast pricing is
             # offer-backed (therefore capacity-backed), and Lambda's catalog can blip too. Use the
@@ -598,7 +647,7 @@ def _offline_gpu_shape(
                 (
                     hourly * count * step_seconds,
                     count,
-                    combined_vram_gb(info.vram_gb, count),
+                    combined_vram_gb(info.vram_gb, launched),
                     info.vram_gb,
                     gpu,
                     hourly,
@@ -630,6 +679,9 @@ def _offline_gpu_shape(
                 max_gpu_count=auto_cap,
                 gpu_names=names,
                 providers=None if provider == "auto" else (provider,),
+                # same rule the ranking loop rejected shapes with, so the advice cannot name a
+                # width the retry will not launch on.
+                executed_width=lambda count: executed_gpu_count(config, count),
                 # an offline quote does not know the configured fleet, so it cannot claim that
                 # dropping a provider pin would make a wider shape purchasable.
                 widenable_without_pin=None,

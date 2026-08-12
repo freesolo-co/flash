@@ -305,6 +305,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         ),
         sft_packing_mode=profile.packing_mode if profile is not None else "",
         sft_packed_blocks=profile.packed_blocks if profile is not None else None,
+        sft_retained_examples=profile.retained_examples if profile is not None else None,
         measured_completion_tokens=(
             rollout.completion_tokens_mean if rollout is not None else None
         ),
@@ -319,6 +320,38 @@ def runconfig_from_spec(spec) -> RunConfig:
             else None
         ),
     )
+
+
+def sft_ranking_overrides(spec) -> dict:
+    """Profile-derived knobs hardware ranking must price SFT on, or ``{}`` when unavailable.
+
+    Ranking runs BEFORE the quote (``_allocate_attempt`` precedes ``_estimate_selected_quote``) and
+    must never fail a submission, so this fails OPEN where ``runconfig_from_spec`` fails closed.
+    That is the only difference between them: both read the same digest-validated profile, and the
+    keys here mirror the profile-derived fields there so the two cannot describe different work.
+
+    ``batch_size`` is the executed batch, not the authored one -- the profile reduces it to
+    ``examples_per_update``, which every exact-unpacked run pins to 1. It and
+    ``sft_retained_examples`` both bound the width ``sft_data_parallel_cards`` credits, so ranking
+    without them picks a wider, costlier shape than the run can use. ``seq_len`` follows for the
+    same reason: the authored context length is not the one measured.
+    """
+    if getattr(spec, "algorithm", "") != "sft":
+        return {}
+    try:
+        profile = _sft_profile(spec)
+    except Exception:
+        # unreadable or mismatched profile: rank exactly as unconstrained as before. the quote path
+        # validates the digest and fails closed, so a bad profile still cannot reach a paid launch.
+        return {}
+    overrides = {}
+    if int(profile.examples_per_update) >= 1:
+        overrides["batch_size"] = int(profile.examples_per_update)
+    if int(profile.retained_examples) > 0:
+        overrides["sft_retained_examples"] = int(profile.retained_examples)
+    if int(profile.max_length) >= 1:
+        overrides["seq_len"] = int(profile.max_length)
+    return overrides
 
 
 def estimate_for_spec(spec, *, allocation=None) -> CostEstimate:
