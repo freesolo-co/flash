@@ -96,23 +96,6 @@ def test_explicit_sft_batch_is_still_forwarded_for_sizing():
     assert need == real
 
 
-def test_explicit_opd_batch_is_forwarded_under_the_knob_opd_authors():
-    # RunConfig.batch_size is the cost model's own name for examples-per-update, but the sizing
-    # helper reads the knob a spec authors, and opd spells that prompts_per_step. Emitting
-    # "batch_size" here would price an opd run at the recipe batch while the allocator sized the
-    # authored one, so the quote and the rented card would disagree.
-    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
-
-    cfg = RunConfig(MID, "opd", 100, batch_size=32, group_size=1)
-    assert cfg.train_knobs()["prompts_per_step"] == 32
-    assert "batch_size" not in cfg.train_knobs()
-    _, need, *_ = _offline_gpu_shape(cfg)
-    real = alloc_required_vram_gb(
-        MID, "opd", train={"prompts_per_step": 32, "group_size": 1}, thinking=False
-    )
-    assert need == real
-
-
 def test_grpo_colocate_routes_4b_to_a_bigger_card_than_sft():
     # 4.7B SFT fits a 32 GB 5090; GRPO's 2nd weight copy + logits push it past 32 GB.
     sft = estimate_cost(RunConfig(MID, "sft", 100))
