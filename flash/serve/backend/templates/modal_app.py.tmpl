@@ -134,16 +134,19 @@ async def _run_lock(run_id: str):
     Modal's Dict offers no general compare-and-swap, but `put(skip_if_exists=True)` is an atomic
     insert-if-absent, which is enough to build one: whoever inserts the key holds the lock. The
     expiry stamp is what keeps a container that died mid-update from wedging the run forever.
+
+    Every Dict call here uses `.aio`: this runs on the request event loop, and a blocking Modal
+    call stalls every other request the container is serving concurrently, not just this one.
     """
     deadline = time.monotonic() + LOCK_TTL_SECONDS
     key = _lock_key(run_id)
     while True:
-        if adapter_records.put(key, time.time() + LOCK_TTL_SECONDS, skip_if_exists=True):
+        if await adapter_records.put.aio(key, time.time() + LOCK_TTL_SECONDS, skip_if_exists=True):
             break
-        holder = adapter_records.get(key)
+        holder = await adapter_records.get.aio(key)
         # a stale lock (holder crashed) is reclaimed rather than waited on forever.
         if not isinstance(holder, (int, float)) or holder < time.time():
-            adapter_records.pop(key, None)
+            await adapter_records.pop.aio(key, None)
             continue
         if time.monotonic() > deadline:
             raise TimeoutError(f"timed out waiting for the {{run_id}} lock")
@@ -151,7 +154,7 @@ async def _run_lock(run_id: str):
     try:
         yield
     finally:
-        adapter_records.pop(key, None)
+        await adapter_records.pop.aio(key, None)
 
 
 def _fingerprint(record: dict[str, Any]) -> tuple:
@@ -306,6 +309,35 @@ class Engine:
 
 
 # ---------------------------------------------------------------------------------------------
+# Registration settles here, off the web request, because loading weights takes minutes and the
+# client polls for the result rather than holding the connection open.
+#
+# A separate Modal function rather than a background task in the web container: `api` scales
+# horizontally and to zero, and an `asyncio` task belongs to one container's event loop. When that
+# container goes away mid-load the task goes with it, no error is raised anywhere, and the record
+# stays `registered` until the client gives up -- with the GPU idle and healthy the whole time.
+# ---------------------------------------------------------------------------------------------
+@app.function(image=image, secrets=secrets, timeout=TIMEOUT_SECONDS)
+async def settle_adapter(record: dict[str, Any]) -> None:
+    """Load one adapter onto the engine, then write the lifecycle state the client waits on."""
+    adapter_id = record["adapter_id"]
+    result = await Engine().register.remote.aio(record)
+    current = (await adapter_records.get.aio(_record_key(adapter_id))) or record
+    if result.get("ok"):
+        current["status"] = "ready"
+        current["metadata"] = {{**current.get("metadata", {{}}), "lifecycle_state": "ready"}}
+    else:
+        current["status"] = "disabled"
+        current["metadata"] = {{
+            **current.get("metadata", {{}}),
+            "lifecycle_state": "failed",
+            "failure": result.get("failure"),
+        }}
+    current["updated_at"] = _utc_now()
+    await adapter_records.put.aio(_record_key(adapter_id), current)
+
+
+# ---------------------------------------------------------------------------------------------
 # The HTTP front door: the contract flash speaks. Runs on CPU and is the only public surface --
 # vLLM itself is never exposed, so nothing outside can ask the engine to load an arbitrary path.
 # ---------------------------------------------------------------------------------------------
@@ -331,12 +363,14 @@ def api():
         if not hmac.compare_digest(presented, expected):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid serving key")
 
-    def _read(adapter_id: str) -> dict[str, Any] | None:
-        return adapter_records.get(_record_key(adapter_id))
+    # async, and `.aio` throughout: these run on the request event loop with up to 100 requests in
+    # flight per container, so a blocking Modal round trip stalls all of them, not just this one.
+    async def _read(adapter_id: str) -> dict[str, Any] | None:
+        return await adapter_records.get.aio(_record_key(adapter_id))
 
-    def _write(record: dict[str, Any]) -> None:
+    async def _write(record: dict[str, Any]) -> None:
         record["updated_at"] = _utc_now()
-        adapter_records[_record_key(record["adapter_id"])] = record
+        await adapter_records.put.aio(_record_key(record["adapter_id"]), record)
 
     @web.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -390,7 +424,7 @@ def api():
             }},
         }}
         async with _run_lock(run_id):
-            existing = _read(adapter_id)
+            existing = await _read(adapter_id)
             if existing is not None:
                 # Immutability: same id, same content is a no-op; same id, different content is a
                 # conflict. Never an overwrite.
@@ -399,11 +433,11 @@ def api():
                         status.HTTP_409_CONFLICT, "immutable adapter revision already exists"
                     )
                 return {{"ok": True, "adapter": existing}}
-            _write(record)
+            await _write(record)
             # Create the run alias disabled, pointing at nothing yet. Activation is what makes it
             # serve, so a half-finished deploy never takes traffic.
-            if _read(run_id) is None:
-                _write(
+            if await _read(run_id) is None:
+                await _write(
                     {{
                         "adapter_id": run_id,
                         "base_model": BASE_MODEL,
@@ -412,28 +446,18 @@ def api():
                     }}
                 )
 
-        async def _load() -> None:
-            result = await engine.register.remote.aio(record)
-            current = _read(adapter_id) or record
-            if result.get("ok"):
-                current["status"] = "ready"
-                current["metadata"] = {{**current.get("metadata", {{}}), "lifecycle_state": "ready"}}
-            else:
-                current["status"] = "disabled"
-                current["metadata"] = {{
-                    **current.get("metadata", {{}}),
-                    "lifecycle_state": "failed",
-                    "failure": result.get("failure"),
-                }}
-            _write(current)
-
-        asyncio.create_task(_load())
+        # Spawned, NOT `asyncio.create_task`: this web function scales horizontally and to zero, so a
+        # task parked in one container's event loop dies with that container -- and because the very
+        # next poll is load balanced to a different replica, nothing is left to notice. The record
+        # then sits in `registered` forever and the deploy times out with the GPU perfectly healthy.
+        # `spawn` hands the work to Modal, which runs it server-side and survives the response.
+        settle_adapter.spawn(record)
         return {{"ok": True, "adapter": record}}
 
     @web.get("/adapters/{{adapter_id:path}}")
     async def get_adapter(adapter_id: str, request: Request, response: Response) -> dict[str, Any]:
         _require_key(request)
-        record = _read(adapter_id)
+        record = await _read(adapter_id)
         if record is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown adapter id")
         state = (record.get("metadata") or {{}}).get("lifecycle_state")
@@ -445,7 +469,7 @@ def api():
     @web.post("/adapters/{{revision_id:path}}/activate")
     async def activate(revision_id: str, payload: dict[str, Any], request: Request) -> dict[str, Any]:
         _require_key(request)
-        revision = _read(revision_id)
+        revision = await _read(revision_id)
         if revision is None or (revision.get("metadata") or {{}}).get("record_type") != "revision":
             raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown adapter revision")
         if revision.get("status") != "ready":
@@ -455,7 +479,7 @@ def api():
         # writing is a lost-update race: two deploys of the same run both read the same previous,
         # both pass the check, and the second silently overwrites the first.
         async with _run_lock(run_id):
-            alias = _read(run_id)
+            alias = await _read(run_id)
             if alias is None:
                 raise HTTPException(status.HTTP_409_CONFLICT, "run alias is missing")
             previous = (
@@ -472,7 +496,7 @@ def api():
                 "run_id": run_id,
                 "alias_of": revision_id,
             }}
-            _write(alias)
+            await _write(alias)
         return {{
             "adapter_id": run_id,
             "target_adapter_revision": revision_id,
@@ -484,14 +508,14 @@ def api():
     @web.delete("/adapters/{{adapter_id:path}}")
     async def remove(adapter_id: str, request: Request) -> dict[str, Any]:
         _require_key(request)
-        record = _read(adapter_id)
+        record = await _read(adapter_id)
         if record is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown adapter id")
         run_id = (record.get("metadata") or {{}}).get("run_id") or adapter_id
         disabled_aliases: list[str] = []
         disabled_revisions: list[str] = []
-        for key in list(adapter_records.keys()):
-            candidate = adapter_records.get(key)
+        for key in [k async for k in adapter_records.keys.aio()]:
+            candidate = await adapter_records.get.aio(key)
             if not isinstance(candidate, dict):
                 continue
             metadata = candidate.get("metadata") or {{}}
@@ -499,7 +523,7 @@ def api():
                 continue
             candidate["status"] = "disabled"
             candidate["metadata"] = {{**metadata, "lifecycle_state": "disabled"}}
-            _write(candidate)
+            await _write(candidate)
             if metadata.get("record_type") == "alias":
                 disabled_aliases.append(candidate["adapter_id"])
             else:
@@ -517,14 +541,14 @@ def api():
     async def chat_completions(payload: dict[str, Any], request: Request) -> dict[str, Any]:
         _require_key(request)
         requested = str(payload.get("model") or "")
-        record = _read(requested)
+        record = await _read(requested)
         if record is None or record.get("status") == "disabled":
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown model {{requested}}")
         metadata = record.get("metadata") or {{}}
         # A run id is an ALIAS; resolve it to the immutable revision actually serving right now.
         if metadata.get("record_type") == "alias":
             target = metadata.get("alias_of")
-            record = _read(target) if target else None
+            record = await _read(target) if target else None
             if record is None:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown model {{requested}}")
         if (record.get("metadata") or {{}}).get("lifecycle_state") != "ready":

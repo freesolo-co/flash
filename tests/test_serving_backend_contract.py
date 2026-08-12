@@ -11,7 +11,10 @@ and FastAPI resolves them against MODULE globals -- with the fastapi imports ins
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import sys
+import threading
 import time
 import types
 
@@ -46,6 +49,32 @@ REGISTRATION = {
 }
 
 
+class _Aio:
+    """Modal exposes the async form of every Dict method as a `.aio` attribute on the method.
+
+    Modelled here because the app calls Dict exclusively through `.aio` -- a stub offering only the
+    blocking form would pass every test while the deployed app raises AttributeError on the first
+    request. The blocking form stays available for anything that still uses it.
+    """
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def __call__(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+    async def aio(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+class _AsyncIterAio(_Aio):
+    """`keys()` is iterated with `async for`, so its `.aio` yields rather than returning."""
+
+    async def aio(self, *args, **kwargs):  # type: ignore[override]
+        for item in self._fn(*args, **kwargs):
+            yield item
+
+
 class _FakeDict(dict):
     """modal.Dict, including the atomic insert-if-absent the alias lock is built on."""
 
@@ -53,11 +82,52 @@ class _FakeDict(dict):
     def from_name(cls, *args, **kwargs):
         return cls()
 
-    def put(self, key, value, skip_if_exists=False):
+    def _put(self, key, value, skip_if_exists=False):
         if skip_if_exists and key in self:
             return False
         self[key] = value
         return True
+
+    @property
+    def put(self):
+        return _Aio(self._put)
+
+    @property
+    def get(self):
+        return _Aio(super().get)
+
+    @property
+    def pop(self):
+        return _Aio(super().pop)
+
+    @property
+    def keys(self):
+        return _AsyncIterAio(lambda: list(super(_FakeDict, self).keys()))
+
+
+def _run_awaitable(awaitable):
+    """Drive a coroutine to completion from inside a running event loop.
+
+    `spawn` is called from an async request handler, so the loop on this thread is already running
+    and `asyncio.run` would refuse. A private loop on its own thread runs the work to completion
+    before the caller continues, which keeps the test deterministic.
+    """
+    error: list[BaseException] = []
+
+    def _target():
+        try:
+            asyncio.run(_await(awaitable))
+        except BaseException as exc:  # surfaced below, never swallowed
+            error.append(exc)
+
+    async def _await(value):
+        return await value
+
+    thread = threading.Thread(target=_target)
+    thread.start()
+    thread.join()
+    if error:
+        raise error[0]
 
 
 def _stub_modal(monkeypatch, engine_methods):
@@ -83,6 +153,27 @@ def _stub_modal(monkeypatch, engine_methods):
         def __getattr__(self, name):
             return types.SimpleNamespace(remote=types.SimpleNamespace(aio=engine_methods[name]))
 
+    class _Spawnable:
+        """A Modal function handle.
+
+        `spawn` runs the work server-side and outlives the request that scheduled it; the local
+        stand-in runs it to completion immediately, which is the same observable outcome for a
+        client that polls. Modelling it at all matters: registration settles through `spawn`, so a
+        stub exposing only `__call__` would make every lifecycle test pass against an app whose
+        adapters never reach `ready` once deployed.
+        """
+
+        def __init__(self, fn):
+            self._fn = fn
+
+        def __call__(self, *args, **kwargs):
+            return self._fn(*args, **kwargs)
+
+        def spawn(self, *args, **kwargs):
+            result = self._fn(*args, **kwargs)
+            if inspect.isawaitable(result):
+                _run_awaitable(result)
+
     class _App:
         def __init__(self, *args, **kwargs):
             pass
@@ -91,7 +182,7 @@ def _stub_modal(monkeypatch, engine_methods):
             return lambda klass: lambda *a, **k: _EngineHandle()
 
         def function(self, *args, **kwargs):
-            return lambda fn: fn
+            return _Spawnable
 
     modal.App = _App
     modal.Dict = _FakeDict
