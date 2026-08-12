@@ -254,6 +254,50 @@ def test_traces_export_reads_from_the_self_hosted_plane(monkeypatch, tmp_path) -
     assert calls == [(_PROJECTS[0]["id"], _SELF_HOSTED_URL)]
 
 
+def test_a_configured_backend_does_not_divert_self_hosted_trace_reads(
+    monkeypatch, tmp_path
+) -> None:
+    """`FREESOLO_BASE_URL` must not move the trace store off the plane that recorded into it.
+
+    That variable supplies a project DIRECTORY, which a self-hosted operator can legitimately point
+    at a Freesolo-compatible backend. A trace store cannot be delegated the same way: the recording
+    proxy writes into the SQLite database of the plane it ran on, so an export routed to the
+    configured backend reads a store that never held these traces -- and sends the plane's operator
+    key to a service that did not issue it.
+
+    Asserted on the URL actually requested rather than on an argument handed to a mocked client, so
+    that a base_url dropped BELOW this layer still fails the test.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.example")
+    monkeypatch.setattr(traces, "load_credentials", lambda: (_SELF_HOSTED_URL, "operator-key"))
+
+    requested: list[str] = []
+    payload = json.dumps({"format": "records", "records": [{"input": "a", "output": "b"}]})
+
+    class _Response:
+        status = 200
+
+        def read(self):
+            return payload.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _urlopen(req, timeout=None):
+        requested.append(req.full_url)
+        return _Response()
+
+    monkeypatch.setattr("flash.client.freesolo_api.urllib.request.urlopen", _urlopen)
+
+    assert cli.main(["traces", "export", "--project", _PROJECTS[0]["id"]]) == 0
+    assert requested != []
+    assert all(url.startswith(_SELF_HOSTED_URL) for url in requested), requested
+
+
 def test_fetch_records_without_explicit_key_snapshots_self_hosted_credentials(monkeypatch) -> None:
     monkeypatch.setattr(traces, "load_credentials", lambda: (_SELF_HOSTED_URL, "operator-key"))
     calls: list[tuple[str, str, str | None]] = []

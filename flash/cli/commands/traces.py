@@ -14,7 +14,7 @@ from flash._internal.channel import CLI_NAME
 from flash.cli.commands import render
 from flash.client import ClientError, export_trace_records, list_trace_projects
 from flash.client.config import load_credentials
-from flash.client.http import has_freesolo_backend
+from flash.serve.urls import is_freesolo_hosted_url
 
 DEFAULT_EXPORT_PATH = Path("dataset/train.jsonl")
 # raw rows are not a dataset. load_freesolo_environment auto-selects
@@ -32,6 +32,22 @@ EXPORT_FORMATS = (RECORDS_FORMAT, PROMPTS_FORMAT, RAW_FORMAT)
 def default_output_path(export_format: str) -> Path:
     """Where an export lands when no --output is given."""
     return RAW_EXPORT_PATH if export_format == RAW_FORMAT else DEFAULT_EXPORT_PATH
+
+
+def trace_store_url(api_url: str) -> str | None:
+    """Which plane holds this account's traces, or `None` for the hosted backend's own store.
+
+    Deliberately NOT `has_freesolo_backend`. That answers a question about the project DIRECTORY --
+    "is there a Freesolo-compatible backend to resolve projects against" -- which `FREESOLO_BASE_URL`
+    can satisfy on behalf of a self-hosted plane. A trace store cannot be delegated that way: the
+    recording proxy writes into the SQLite database of the plane that served it, so the traces exist
+    on the plane the operator is logged into and nowhere else.
+
+    Routing them through the directory classifier would send `/api/traces/export` to the configured
+    backend for an operator who set `FREESOLO_BASE_URL` for project lookups, which both misses every
+    locally recorded trace and hands this plane's key to a service that never stored one.
+    """
+    return None if is_freesolo_hosted_url(api_url) else api_url
 
 
 def _require_api_key(api_key: str | None) -> str:
@@ -84,8 +100,8 @@ def fetch_records(
     if api_key is None:
         api_url, snapshot_key = load_credentials()
         key = _require_api_key(snapshot_key)
-        if base_url is None and not has_freesolo_backend(api_url):
-            base_url = api_url
+        if base_url is None:
+            base_url = trace_store_url(api_url)
     else:
         key = _require_api_key(api_key)
     return export_trace_records(project_id, key, base_url, export_format=export_format)
@@ -155,7 +171,7 @@ def cmd_traces_export(args) -> int:
     # credential and disclose either credential to the wrong service.
     api_url, snapshot_key = load_credentials()
     api_key = _require_api_key(snapshot_key)
-    trace_base_url = None if has_freesolo_backend(api_url) else api_url
+    trace_base_url = trace_store_url(api_url)
     project_id = _resolve_project_id(args, api_key, trace_base_url)
     export_format = getattr(args, "format", None) or RECORDS_FORMAT
 

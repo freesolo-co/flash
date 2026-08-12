@@ -368,7 +368,11 @@ def test_upstream_transport_failure_returns_502_and_records(trace_api, monkeypat
 
 
 def test_record_false_proxies_without_project_or_storage(trace_api, monkeypatch) -> None:
+    """Recording off still has to PROXY. Asserting only "200 and nothing stored" would be equally
+    satisfied by returning an empty response and never calling the provider at all, which is the
+    one outcome a caller would never accept: a successful-looking completion that is fabricated."""
     _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    _StaticAsyncClient.requests.clear()
     monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
     headers = {key: value for key, value in _HEADERS.items() if key != "X-Freesolo-Project-Id"}
     headers["X-Freesolo-Record"] = "false"
@@ -376,6 +380,10 @@ def test_record_false_proxies_without_project_or_storage(trace_api, monkeypatch)
     response = trace_api.post("/v1/chat/completions", headers=headers, json=_REQUEST)
 
     assert response.status_code == 200
+    # the provider was really called, and the caller got the provider's own body back
+    assert len(_StaticAsyncClient.requests) == 1
+    assert _StaticAsyncClient.requests[0]["json"]["model"] == _REQUEST["model"]
+    assert response.json() == _RESPONSE
     assert trace_api.get(
         "/api/traces/projects", headers={"Authorization": f"Bearer {_KEY}"}
     ).json() == {"projects": []}
@@ -392,6 +400,7 @@ def test_record_false_proxies_without_project_or_storage(trace_api, monkeypatch)
 def test_recording_validates_model_and_metadata(
     trace_api, monkeypatch, body, expected_detail
 ) -> None:
+    _StaticAsyncClient.requests.clear()
     monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
 
     response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=body)
@@ -399,6 +408,9 @@ def test_recording_validates_model_and_metadata(
     assert response.status_code == 400
     assert response.json()["detail"] == expected_detail
     assert _raw(trace_api)["traces"] == 0
+    # rejected locally BEFORE the provider is billed: forwarding first and refusing afterwards
+    # would spend the caller's quota (and disclose the payload) on a request we already know is bad
+    assert _StaticAsyncClient.requests == []
 
 
 @pytest.mark.parametrize(
@@ -412,6 +424,7 @@ def test_recording_validates_model_and_metadata(
 def test_recording_rejects_missing_invalid_project_or_auth(
     trace_api, monkeypatch, headers, expected_status
 ) -> None:
+    _StaticAsyncClient.requests.clear()
     monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
 
     response = trace_api.post("/v1/chat/completions", headers=headers, json=_REQUEST)
@@ -420,6 +433,8 @@ def test_recording_rejects_missing_invalid_project_or_auth(
     assert trace_api.get(
         "/api/traces/projects", headers={"Authorization": f"Bearer {_KEY}"}
     ).json() == {"projects": []}
+    # an unrecordable or unauthenticated request must not reach the provider first
+    assert _StaticAsyncClient.requests == []
 
 
 def test_export_formats_convert_and_count_skips(trace_api) -> None:
