@@ -180,10 +180,29 @@ def vram_fit_error_message(
                 if catalog_width > requested_gpu_count
                 else "Configure a provider that rents card counts directly (RunPod)"
             )
+        # the shape the user must reach is only WIDER when the fitting width exceeds the one they
+        # authored. dropping a pin can instead reveal a BIGGER CARD at the same count (Vast tops out
+        # at 80 GB/card while RunPod has H200/B200), and then "fits only on a multi-card shape"
+        # contradicts the remedy printed right after it, which offers a single-card fallback.
+        fits_at_authored_width = unpinned_width is not None and unpinned_width <= (
+            requested_gpu_count or 0
+        )
+        obstacle = (
+            (
+                "which no available provider is confirmed to sell at "
+                f"{requested_gpu_count} {'card' if requested_gpu_count == 1 else 'cards'}: the "
+                "pinned provider's largest card is too small, and the classes that would fit are "
+                "sold by providers this pin excludes"
+            )
+            if fits_at_authored_width
+            else (
+                "which fits only on a multi-card shape that no available provider is confirmed to "
+                "sell: they offer fixed card counts as distinct instance types, so a wider shape "
+                "exists only if their live catalog lists one"
+            )
+        )
         return (
-            f"{algorithm} needs >= {need:g} GB VRAM, which fits only on a multi-card shape that "
-            "no available provider is confirmed to sell: they offer fixed card counts as distinct "
-            "instance types, so a wider shape exists only if their live catalog lists one. "
+            f"{algorithm} needs >= {need:g} GB VRAM, {obstacle}. "
             f"{remedy}, or {vram_knob_advice(algorithm)}."
         )
 

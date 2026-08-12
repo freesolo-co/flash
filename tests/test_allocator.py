@@ -2025,6 +2025,12 @@ def test_unpurchasable_width_names_a_remedy_the_user_can_actually_apply():
     assert "Drop the provider pin" in same_width
     assert "raise the card ceiling" not in same_width
     assert "--gpus" not in same_width
+    # and the DESCRIPTION must agree with that remedy: the fallback is a bigger card at the same
+    # count, so claiming the run "fits only on a multi-card shape" contradicts the very next
+    # sentence. the obstacle is the pin hiding a large enough class, not the width.
+    assert "fits only on a multi-card shape" not in same_width
+    assert "at 1 card:" in same_width
+    assert "the pinned provider's largest card is too small" in same_width
 
     # no message may claim the run exceeds every class -- it fits, it just cannot be bought.
     for message in (droppable, futile, unpinned):
@@ -2196,6 +2202,48 @@ def test_exact_pin_on_a_fixed_count_provider_still_names_a_width_to_check():
             unpinned=("lambda",),
         )
     assert "`--gpus 4`" in str(combo.value)
+
+
+def test_unreachable_class_reports_the_configuration_not_the_vram_shortfall():
+    """One root cause must not produce two different errors depending on the run's size.
+
+    A class no configured provider carries is blocked by the CONFIGURATION. Deciding fit first meant
+    an oversized run got a VRAM shortfall while the same fleet with a smaller need correctly got
+    ``no configured active provider`` -- so the diagnostic depended on how big the run happened to
+    be rather than on what actually blocked it, and the shortfall pointed at a knob that cannot help.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
+
+    assert "lambda" not in providers_for("H200")
+    over = GPU_INFO["H200"].vram_gb * 2.5  # far beyond one card
+    under = GPU_INFO["H200"].vram_gb - 40  # comfortably inside one card
+
+    for need in (over, under):
+        with pytest.raises(UnsupportedGpuError, match="no configured active provider"):
+            _resolve_exact_gpu(
+                "H200",
+                need=need,
+                cap=1,
+                max_gpu_count=1,
+                provider="",
+                available=("lambda",),
+                widest_cap=8,
+                unpinned=("lambda",),
+            )
+
+    # a plane that DOES carry the class still reports the fit failure, not a configuration error.
+    with pytest.raises(UnsupportedGpuError, match="requires at least"):
+        _resolve_exact_gpu(
+            "H200",
+            need=over,
+            cap=1,
+            max_gpu_count=1,
+            provider="",
+            available=("runpod",),
+            widest_cap=8,
+            unpinned=("runpod",),
+        )
 
 
 def test_catalog_check_is_withheld_when_no_configured_provider_carries_the_class():

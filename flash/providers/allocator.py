@@ -287,6 +287,13 @@ def _resolve_exact_gpu(
         if not widths and unpinned_reachable and rents_arbitrary_card_counts(unpinned_reachable)
         else ()
     )
+    # a class nobody configured can provision is blocked by the CONFIGURATION, not by its VRAM, and
+    # no width or knob change can move that. reporting the shortfall first would answer a question
+    # the user never reached: the same fleet with a smaller need already fails on reachability in
+    # `allocate()`, so deciding it here keeps one root cause from producing two different errors
+    # depending on how large the run happens to be.
+    if not (reachable or unpinned_reachable):
+        raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
 
     def _drop_pin_hint(above: int) -> str:
         """Name dropping the pin AND the width it unlocks, or nothing if no width fits.
