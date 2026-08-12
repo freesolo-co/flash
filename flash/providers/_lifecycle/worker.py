@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
 from io import BytesIO
 
+from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash._internal.logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.core.spec import (
@@ -80,40 +80,8 @@ WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100"})
 
 
-@dataclass(frozen=True)
-class WorkerImageOverride:
-    """A worker-image override and the registry credential needed to pull it.
-
-    only auth remains here (#906): GPU class encodes the CUDA floor and each run owns
-    ``[gpu] disk_gb``. the credential cannot be derived from the image ref.
-    """
-
-    image: str
-    registry_auth_id: str = ""
-
-
-def worker_image_override() -> WorkerImageOverride | None:
-    """Parse the FLASH_WORKER_IMAGE override and its registry credential.
-
-    The credential cannot be derived from the image ref, so it stays configurable. The image's CUDA
-    and disk floors are NOT configurable: the GPU class floor (min_cuda_modern) already encodes the
-    real constraint, and a run that needs more container disk sets ``[gpu] disk_gb`` in its own
-    spec, where the requirement is recorded with the run.
-    """
-    image = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
-    if not image:
-        return None
-    return WorkerImageOverride(
-        image=image,
-        registry_auth_id=os.environ.get("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "").strip(),
-    )
-
-
 def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
-    """Return the worker Docker image for a GPU class (per-SM kernel-cache tag or base), respecting the FLASH_WORKER_IMAGE override."""
-    override = worker_image_override()
-    if override:
-        return override.image
+    """Return the worker Docker image for a GPU class (per-SM kernel-cache tag or base)."""
     if friendly_gpu and allow_default:
         info = get_gpu_info(friendly_gpu)
         # Per-SM baked kernel-cache image is always used for baked arches (skips ~10-15 min
@@ -267,6 +235,23 @@ def build_worker_env(
             raise RuntimeError("managed opd control-panel teacher transport is missing")
         env[PUBLIC_URL_ENV] = public_url
         env[TEACHER_CAPABILITY_ENV] = capability
+    # declared runtime secrets can carry any name, so their names are listed explicitly for the
+    # redactors (flash._internal.diagnostics and the provider bootstraps): the name-shape
+    # heuristic alone would let AWS_SECRET_ACCESS_KEY-style values through. set last so no
+    # runtime secret can clobber it -- SECRET_ENV_KEYS_ENV is control-plane-owned, so a job cannot
+    # declare it as a secret and have its value overwritten by this list.
+    secret_keys = (set(allowed_runtime_secrets) | {TEACHER_CAPABILITY_ENV}) & set(env)
+    # the list is comma-joined, so a name containing a comma would arrive at every redactor as two
+    # unrelated names and its value would never be recognized. [environment] secrets rejects those
+    # names at declaration; this is the fail-closed guard, because emitting a silently ambiguous
+    # list is how a credential reaches diagnostics verbatim.
+    ambiguous = sorted(key for key in secret_keys if "," in key)
+    if ambiguous:
+        raise RuntimeError(
+            f"secret env name(s) contain the {SECRET_ENV_KEYS_ENV} delimiter: {ambiguous}"
+        )
+    if secret_keys:
+        env[SECRET_ENV_KEYS_ENV] = ",".join(sorted(secret_keys))
     return env
 
 

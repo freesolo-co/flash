@@ -90,8 +90,21 @@ def _rollout_profile(spec):
 
 
 def _on_policy_example_count(spec) -> int:
-    t = spec.train
-    pinned_examples = int(t.max_examples) if t.max_examples else 0
+    """Prompts this quote prices, preferring the cap flash actually enforces.
+
+    Deliberately NOT ``min()`` of the two caps. ``[train] max_examples`` is a validated ``TrainSpec``
+    field the worker enforces unconditionally as ``train[:max_examples]``, so it is a real ceiling on
+    the retained pool. ``[environment.params] max_examples`` is not a flash contract at all: params
+    are opaque kwargs forwarded to the user's own environment factory, and neither flash nor the
+    freesolo sdk applies the name to a dataset. An environment free to ignore it can return every
+    row while the key says 2, and since a completed run is billed from this persisted quote, taking
+    the smaller value would underquote real training. The train cap can overquote when the
+    environment returns fewer rows, which is the safe direction.
+
+    Reading the env value when no train cap is set is pre-existing behavior (#465) and is left
+    alone; narrowing it needs a real enforced cap, which is pricing work outside this change.
+    """
+    pinned_examples = int(spec.train.max_examples) if spec.train.max_examples else 0
     if pinned_examples > 0:
         return pinned_examples
     env_examples = _env_max_examples(spec)
@@ -106,7 +119,13 @@ def _env_max_examples(spec) -> int:
         return 0
     try:
         value = int(params.get("max_examples") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is the one that is easy to miss: `int(nan)` raises ValueError but
+        # `int(inf)` raises OverflowError, and `max_examples = inf` is valid toml an environment
+        # may well use to mean "uncapped". params are opaque kwargs flash does not define, so
+        # anything unreadable here means "no cap I can price", never a reason to abort. this
+        # feeds an advisory warning that runs before `create_run`, so raising would turn a
+        # courtesy line into a submit-blocking traceback.
         return 0
     return max(0, value)
 
@@ -118,12 +137,11 @@ def _on_policy_requested_prompts_per_step(spec) -> int:
     default = (
         RECIPE.rl.prompts_per_step if spec.algorithm == "grpo" else RECIPE.opd.prompts_per_step
     )
-    return max(1, int(t.batch_size) if t.batch_size is not None else default)
+    return max(1, int(t.prompts_per_step) if t.prompts_per_step is not None else default)
 
 
 def _on_policy_prompts_per_step(spec, examples: int) -> int:
-    requested = _on_policy_requested_prompts_per_step(spec)
-    return min(requested, max(1, int(examples)))
+    return min(_on_policy_requested_prompts_per_step(spec), max(1, int(examples)))
 
 
 def spec_steps(spec) -> int:
@@ -165,7 +183,8 @@ def profile_runconfig_from_spec(spec) -> RunConfig:
         gpu_type=g.type,
         model_revision=spec.model_revision,
         disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
-        gpu_count=g.count,
+        # the workload profile never loads model weights and always rents one cheapest card.
+        gpu_count=1,
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
     )
@@ -206,7 +225,15 @@ def runconfig_from_spec(spec) -> RunConfig:
         steps=spec_steps(spec),
         seq_len=profile.max_length if profile is not None else t.max_context_tokens,
         completion_len=t.max_completion_tokens if has_rollout else None,
-        batch_size=profile.examples_per_update if profile is not None else t.batch_size,
+        # RunConfig.batch_size is the cost model's own name for "examples per optimizer update", and
+        # each algorithm reaches it by a different key: sft through the measured profile, grpo/opd
+        # straight from prompts_per_step. reading t.batch_size for rl would always find None now and
+        # silently price the recipe default, ignoring an authored batch.
+        batch_size=(
+            profile.examples_per_update
+            if profile is not None
+            else (t.prompts_per_step if has_rollout else t.batch_size)
+        ),
         group_size=t.group_size if has_rollout else None,
         lora_rank=t.lora_rank,
         thinking=spec.thinking,
@@ -217,7 +244,12 @@ def runconfig_from_spec(spec) -> RunConfig:
         gpu_type=g.type,
         model_revision=spec.model_revision,
         disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
-        gpu_count=g.count,
+        # deliberately NOT spec.authored_gpu_count: this asks whether a shape has been RESOLVED
+        # yet, not what the author wrote. the marker is provenance and survives allocation, so an
+        # allocated run still reports no authored ceiling -- quoting that as auto would re-size a
+        # run whose geometry is already rented and bill a different one. auto-size only while the
+        # shape is still unresolved (no class chosen and the count still the placeholder).
+        gpu_count=(None if spec.gpu_count_auto and g.count == 1 and not g.type else g.count),
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
         save_at_steps=t.save_at_steps,

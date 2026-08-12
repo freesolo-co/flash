@@ -123,9 +123,11 @@ def test_onstart_ships_payload_and_runs_shared_bootstrap(monkeypatch):
     # payload travels base64-encoded inside a quoted heredoc, byte-exact
     b64 = script.split("FLASH_PAYLOAD_EOF")[1].strip()
     assert json.loads(base64.b64decode(b64)) == payload
-    # the SHARED instance bootstrap is embedded + run as the container command
+    # the SHARED instance bootstrap is embedded + run as the container command, with its
+    # redaction sibling next to it
     assert "FLASH_BOOTSTRAP_EOF" in script
     assert "/root/flash/bootstrap.py" in script
+    assert "/root/flash/bootstrap_secrets.py" in script
     # it is genuinely the shared module (a distinctive line only that file has)
     from pathlib import Path
 
@@ -155,7 +157,7 @@ def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch
     monkeypatch.setenv("HF_TOKEN", "hf")
     script = builders.build_onstart(_build_payload(builders, _spec(), seed=0, attempt=1))
     # Each closing terminator is preceded by a newline (own line), regardless of payload/src content.
-    for term in ("FLASH_PAYLOAD_EOF", "FLASH_BOOTSTRAP_EOF"):
+    for term in ("FLASH_PAYLOAD_EOF", "FLASH_BOOTSTRAP_EOF", "FLASH_BOOTSTRAP_SECRETS_EOF"):
         assert f"\n{term}\n" in script, f"{term} terminator must be on its own line"
     # PYBIN never silently empty: python fallback + a diagnostic when nothing resolves.
     assert "command -v python3 || command -v python" in script
@@ -185,7 +187,7 @@ def test_onstart_spills_large_spec_to_hf(monkeypatch):
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
-    big = "x" * 20_000  # > _SPEC_SPILL_THRESHOLD (16k)
+    big = "x" * 20_000  # > _SPEC_SPILL_THRESHOLD
     payload = {
         "job_spec_json": big,
         "hf_prefix": "sft/run/seed0",
@@ -758,15 +760,12 @@ def test_deploy_decoys_without_exact_match_abort_with_no_second_create(monkeypat
     assert destroyed_for
 
 
-def test_vast_image_honors_worker_image_override(monkeypatch):
-    # Vast must honor FLASH_WORKER_IMAGE (and per-SM) via worker_image_for_gpu like RunPod/Lambda,
-    # not always return the baked default.
+def test_vast_image_selects_the_per_sm_tag():
+    # Vast routes through worker_image_for_gpu like RunPod/Lambda, so it gets the arch-matched
+    # baked image rather than always returning the flat default.
     from flash.providers.vast.jobs.builders import vast_image
 
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/x/hotfix:test")
-    assert vast_image("RTX 4090") == "ghcr.io/x/hotfix:test"
-    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
-    assert vast_image("RTX 4090")  # default path still returns a real (baked) image
+    assert vast_image("RTX 4090") == "ghcr.io/freesolo-co/flash-worker:cu128-sm89"
 
 
 def test_deploy_raises_when_pool_exhausted(monkeypatch):

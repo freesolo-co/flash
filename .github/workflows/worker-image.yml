@@ -2,9 +2,9 @@ name: flash worker image
 
 # builds the prebuilt flash worker image (full training stack + flash-attn baked in) and
 # pushes it to ghcr, so runpod/vast/lambda training cold-start skips the per-host dependency
-# install (the dominant cold-start cost). training providers select the pinned image and operator
-# override through flash/providers/_lifecycle/worker.py. serving has no consumer for this training-worker
-# image or override.
+# install (the dominant cold-start cost). training providers select the pinned image through
+# flash/providers/_lifecycle/worker.py; there is no override, so a new build means bumping the
+# WORKER_IMAGE constant. serving has no consumer for this training-worker image.
 #
 # Triggered automatically on flash/** changes (worker training code is baked in; skipping a
 # rebuild leaves GPU workers running stale code) and manually for Dockerfile/dep changes.
@@ -23,6 +23,12 @@ on:
           FlashAttention-3 (Hopper sm90) install spec -> FLASH_ATTN_3_SPEC build-arg. Leave at the
           default validated wheel to bake FA3 into every image; override to pin a different wheel.
         default: "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl"
+        required: false
+      flash_attn_3_sha256:
+        description: >-
+          sha256 of the FA3 wheel above -> FLASH_ATTN_3_SHA256 build-arg. The wheel is verified
+          before install, so override this whenever flash_attn_3_spec is overridden.
+        default: "13ec39bc8cb37d37b1efd3bff76ee5e994f5cac3ca6a8ce35db6f54b98ca3862"
         required: false
   push:
     branches: [main]
@@ -70,15 +76,22 @@ jobs:
     env:
       FA2_SPEC: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
       FA3_SPEC: ${{ github.event.inputs.flash_attn_3_spec || 'https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl' }}
+      # The wheels are verified against these before install (Dockerfile.worker does the sha256sum
+      # -c). Keep them in sync with Dockerfile.worker's ARG defaults, exactly like the specs. Also
+      # fingerprint inputs, same as the specs above: a maintainer who rotates a digest after a
+      # release asset was replaced (same url, new sha256) must move fp_base, or auto-rebake would
+      # call every per-arch tag up to date on a base that no longer matches what got baked.
+      FA2_SHA256: a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12e36a0f
+      FA3_SHA256: ${{ github.event.inputs.flash_attn_3_sha256 || '13ec39bc8cb37d37b1efd3bff76ee5e994f5cac3ca6a8ce35db6f54b98ca3862' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Compute the kernel-cache fingerprints (stdlib-only, no uv sync) and stamp them as labels on
       # :cu128 below, so auto-rebake.yml can read what this base was built from. Fails the build if a
       # pin can't be parsed -- a silent miss would let a stale per-arch cache ship as a cold-JIT.
       - name: Compute kernel fingerprints
         id: fp
-        run: python3 docker/kernel_fingerprint.py --format github --fa2-spec "$FA2_SPEC" --fa3-spec "$FA3_SPEC" >> "$GITHUB_OUTPUT"
+        run: python3 docker/kernel_fingerprint.py --format github --fa2-spec "$FA2_SPEC" --fa3-spec "$FA3_SPEC" --fa2-sha256 "$FA2_SHA256" --fa3-sha256 "$FA3_SHA256" >> "$GITHUB_OUTPUT"
 
       - name: Free disk space
         run: |
@@ -90,17 +103,17 @@ jobs:
           sudo docker image prune -af || true
           df -h /
 
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build + push worker image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile.worker
@@ -122,6 +135,8 @@ jobs:
           build-args: |
             FLASH_ATTN_SPEC=${{ env.FA2_SPEC }}
             FLASH_ATTN_3_SPEC=${{ env.FA3_SPEC }}
+            FLASH_ATTN_SHA256=${{ env.FA2_SHA256 }}
+            FLASH_ATTN_3_SHA256=${{ env.FA3_SHA256 }}
 
       # When :cu128 is republished the per-arch cu128-sm* tags go stale. auto-rebake.yml now handles
       # that automatically on this workflow's completion: a free re-layer when only the base moved, or

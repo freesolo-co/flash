@@ -35,7 +35,11 @@ PARASAIL_API_KEY_ENV = "PARASAIL_API_KEY"
 MAX_REQUEST_BODY_BYTES = 48 * 1024 * 1024
 MAX_RESPONSE_BODY_BYTES = 32 * 1024 * 1024
 MAX_PROVIDER_ERROR_BODY_BYTES = 64 * 1024
-MAX_UPSTREAM_ATTEMPTS = 1
+# per-logical-request upstream attempt budget, enforced by mark_teacher_request_started.
+# retries reuse the request_id, so they spend this budget rather than the request/score-item
+# quotas, and the no-signal replacement multiplier composes with it instead of multiplying it.
+# kept equal to the worker client's max_retries so neither side retries past the other.
+MAX_UPSTREAM_ATTEMPTS = 4
 MAX_REQUEST_TOKENS = 131_072
 MAX_TOTAL_SCORE_ITEMS = 1_000_000
 MAX_TOTAL_REQUESTS = 1_000_000
@@ -44,6 +48,25 @@ MAX_CAPABILITY_LIFETIME_S = 24 * 60 * 60
 MAX_PROVIDER_TIMEOUT_S = 90.0
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._~-]{16,128}\Z")
 CAPABILITY_PATTERN = re.compile(r"[A-Za-z0-9_-]{40,128}\Z")
+
+
+class TeacherBrokerConfigurationError(RuntimeError):
+    """A submit-time managed-teacher gate rejection whose message is safe to show the submitter.
+
+    The generic run-failure handler redacts ``str(exc)`` on purpose: an arbitrary exception can name
+    internal storage paths, provider internals, or upstream bodies. These messages are authored
+    here, contain no such detail, and are the only thing that distinguishes a plane misconfiguration
+    from a bad spec -- so this type opts them back in to being surfaced rather than swallowed.
+
+    ``plane_fault`` carries which side is at fault. The submitter cannot fix an unset plane-side
+    credential by editing their config, so reporting it as a client error would re-create the same
+    conflation one layer up: a spec the user must change and an outage they can only wait out would
+    again be indistinguishable.
+    """
+
+    def __init__(self, message: str, *, plane_fault: bool = False) -> None:
+        super().__init__(message)
+        self.plane_fault = plane_fault
 
 
 class TeacherBrokerError(RuntimeError):
@@ -94,12 +117,15 @@ def validate_public_url(value: str) -> str:
     # the gpu is already allocated, and a zero one is in range but falsy, so the `parsed.port or
     # 443` at engine/worker/teacher/client.py silently dials 443 instead of the configured port.
     invalid_port = f"{PUBLIC_URL_ENV} must be a worker-reachable https URL with a valid port"
+    # these messages name the env var and the shape rule only -- never the configured value, which
+    # can embed credentials -- so they stay safe to surface to the submitter verbatim. every one is
+    # plane_fault: the only production caller is resolve_public_url, reading the plane's own env.
     try:
         port = parsed.port
     except ValueError as error:
-        raise RuntimeError(invalid_port) from error
+        raise TeacherBrokerConfigurationError(invalid_port, plane_fault=True) from error
     if port == 0:
-        raise RuntimeError(invalid_port)
+        raise TeacherBrokerConfigurationError(invalid_port, plane_fault=True)
     if (
         parsed.scheme != "https"
         or not parsed.hostname
@@ -108,9 +134,10 @@ def validate_public_url(value: str) -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise RuntimeError(
+        raise TeacherBrokerConfigurationError(
             f"{PUBLIC_URL_ENV} must be a worker-reachable https URL without credentials, "
-            "query parameters, or a fragment"
+            "query parameters, or a fragment",
+            plane_fault=True,
         )
     return url
 
@@ -137,26 +164,49 @@ def require_teacher_broker_configuration(
     now: float | None = None,
 ) -> str:
     if spec.algorithm != "opd":
-        raise RuntimeError("teacher broker configuration is only valid for opd runs")
+        raise TeacherBrokerConfigurationError(
+            "teacher broker configuration is only valid for opd runs"
+        )
     public_url = resolve_public_url()
     if not os.environ.get(PARASAIL_API_KEY_ENV, "").strip():
-        raise RuntimeError(
-            f"{PARASAIL_API_KEY_ENV} is required on the control plane for managed opd teachers"
+        raise TeacherBrokerConfigurationError(
+            f"{PARASAIL_API_KEY_ENV} is required on the control plane for managed opd teachers",
+            plane_fault=True,
         )
     teacher = resolve_teacher(spec.train.teacher_model)
     if teacher.alias not in {"kimi-k3", "glm-5.2", "qwen3.5-397b-a17b", "deepseek-v4-pro"}:
-        raise RuntimeError("the selected managed teacher is not supported by the Parasail broker")
+        raise TeacherBrokerConfigurationError(
+            "the selected managed teacher is not supported by the Parasail broker"
+        )
     capability_limits_for_spec(spec)
     if deadline_at is not None:
         current = time.time() if now is None else float(now)
         deadline = float(deadline_at)
         if not math.isfinite(current) or not math.isfinite(deadline) or deadline <= current:
-            raise RuntimeError("the run deadline leaves no valid teacher capability lifetime")
+            raise TeacherBrokerConfigurationError(
+                "the run deadline leaves no valid teacher capability lifetime"
+            )
         if deadline - current > MAX_CAPABILITY_LIFETIME_S:
-            raise RuntimeError(
+            raise TeacherBrokerConfigurationError(
                 "managed opd teacher capabilities are limited to a 24-hour run deadline"
             )
     return public_url
+
+
+def preflight_validate_managed_teacher(spec: JobSpec) -> None:
+    """Validate the managed-teacher gate at submit, before a run record exists.
+
+    The same checks run again before allocation (that is what actually protects a paid worker), but
+    running them here too means a `--dry-run` reports a plane misconfiguration or an unsupported
+    teacher/shape instead of validating clean and then failing seconds after a real submit.
+
+    Deadline-dependent policy is deliberately excluded: the run deadline is derived from the status
+    record this runs ahead of. `capability_limits_for_spec` already rejects a `gpu.max_wall_seconds`
+    over the capability lifetime, so the only gap is the queue allowance, which is not knowable yet.
+    """
+    if spec.algorithm != "opd":
+        return
+    require_teacher_broker_configuration(spec)
 
 
 def capability_limits_for_spec(spec: JobSpec) -> dict[str, int]:
@@ -178,7 +228,7 @@ def capability_limits_for_spec(spec: JobSpec) -> dict[str, int]:
     from flash.engine.plan.vram import opd_completion_len
 
     steps = int(spec_steps(spec))
-    prompts_per_step = int(spec.train.batch_size or RECIPE.opd.prompts_per_step)
+    prompts_per_step = int(spec.train.prompts_per_step or RECIPE.opd.prompts_per_step)
     group_size = int(spec.train.group_size or RECIPE.opd.group_size)
     base_items = steps * max(1, prompts_per_step) * max(1, group_size)
     multi_turn, max_turns = configured_opd_turn_limit(spec.environment)
@@ -660,6 +710,9 @@ def _dispatch_to_teacher_provider(
             request_id=request_id,
         ) from exc
     except (OSError, http.client.HTTPException) as exc:
+        # the connection failed mid-call, so the upstream outcome is unknown. the row stays
+        # readmissible for a re-dispatch of the same request_id; billed usage lands only on
+        # the terminal 'succeeded' completion, so re-dispatching cannot double-bill.
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,
@@ -670,23 +723,28 @@ def _dispatch_to_teacher_provider(
         raise TeacherBrokerError(
             "outcome_unknown",
             status_code=502,
+            retryable=True,
             request_id=request_id,
         ) from exc
     if status < 200 or status >= 300:
-        # every provider rejection, including 429, is terminal while `MAX_UPSTREAM_ATTEMPTS == 1`.
-        # the ledger cannot readmit completed `provider_rejected` rows; retrying requires a larger
-        # attempt budget and broker lifecycle changes.
+        # 408, 429 and 5xx are provider-side conditions a retry can outlive (a 408 is the
+        # provider timing out the request, not rejecting it), so those rows are recorded
+        # readmissible; other 4xx (400/401/403/404/422 ...) reject the request or credential
+        # itself, so a retry cannot change the outcome. the recorded error_class is the value
+        # readmission keys on.
+        transient = status in (408, 429) or 500 <= status <= 599
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,
                 request_id,
                 state="provider_rejected",
                 provider_status=status,
-                error_class="permanent",
+                error_class="transient" if transient else "permanent",
             )
         raise TeacherBrokerError(
             "provider_rejected",
             status_code=502,
+            retryable=transient,
             request_id=request_id,
         )
     return status, response_body
@@ -743,6 +801,7 @@ def _settle_teacher_response(
         raise TeacherBrokerError(
             "outcome_unknown",
             status_code=503,
+            retryable=True,
             request_id=request_id,
         ) from exc
     return response.body

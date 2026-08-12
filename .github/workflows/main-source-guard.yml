@@ -10,15 +10,55 @@ concurrency:
 jobs:
   source-is-dev:
     name: Source branch is dev
+    # This job carries NO `if:`, and no exemption of any kind. Both are security properties.
+    #
+    # `Source branch is dev` is a REQUIRED check under this repo's `main` ruleset (17887734), and a
+    # skipped required check counts as SUCCESS. So a job-level `if:` is not an exemption mechanism
+    # but a supersede primitive: run the guard, let it fail on a human head, then fire an event
+    # that takes the false branch, and the skip supersedes the failure on the same SHA. Close and
+    # reopen is enough -- `reopened` is in this workflow's trigger set, since no `types:` is
+    # declared and the defaults are opened+synchronize+reopened. With no `if:`, the job always
+    # produces a real pass or a real fail and a failure can never be replaced by a skip.
+    #
+    # There is also no dependabot carve-out here, because none is needed and none can be written
+    # safely. NEEDED: this guard only triggers on PRs into `main`, and dependabot never opens one.
+    # All 11 dependabot PRs in this repo's history target `dev` (`target-branch: dev` in
+    # .github/dependabot.yml), including under alert-driven security updates, which are enabled
+    # (`automated-security-fixes` -> enabled, not paused). This job has never run on a dependabot
+    # PR. SAFE: no commit-metadata tuple can prove dependabot authorship, because GitHub signs
+    # whatever a caller hands it. The signed payload of a real dependabot push contains only
+    # `author dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>` -- a
+    # caller-supplied header -- and `committer GitHub <noreply@github.com>`, the same generic
+    # identity used for every web-editor and contents-api commit. A write-capable maintainer
+    # calling the contents API with dependabot's noreply address in the `author` object reproduces
+    # that tuple exactly, so any check built from it exempts human content on a `dependabot/*`
+    # branch. If dependabot is ever pointed at `main`, exempt it with something outside the
+    # commit -- a separate workflow keyed on the API's PR-level bot identity, or a ruleset bypass
+    # actor -- rather than reintroducing a check on forgeable commit fields.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require PRs into main to originate from dev
+      - name: Require PRs into main to originate from this repo's dev branch
         env:
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          UPSTREAM_REPO: ${{ github.repository }}
         run: |
-          if [ "$HEAD_REF" != "dev" ]; then
-            echo "::error::PRs into main must come from 'dev' (got '$HEAD_REF'). Merge into dev, then promote dev -> main."
+          # provenance is checked BEFORE the branch name, because the name alone proves nothing.
+          # `github.head_ref` is the branch name inside the HEAD repository, which for a fork PR is
+          # whatever the fork owner called it, so a name-only check goes green for anyone who
+          # forks this repo, names a branch `dev`, and opens a PR straight into main. under the
+          # documented dev -> main promotion model a cross-repo head is never legitimate, so it is
+          # rejected outright rather than compared by name.
+          #
+          # an unset HEAD_REPO (deleted fork, non-pull_request event) is an empty string here and
+          # therefore fails closed.
+          if [ "$HEAD_REPO" != "$UPSTREAM_REPO" ]; then
+            echo "::error::fork source not allowed for main: this PR's head repository is '$HEAD_REPO', not '$UPSTREAM_REPO'. Open contributions against dev; only a dev -> main promotion inside '$UPSTREAM_REPO' may target main."
             exit 1
           fi
-          echo "Source branch '$HEAD_REF' is allowed."
+          if [ "$HEAD_REF" != "dev" ]; then
+            echo "::error::wrong source branch: PRs into main must come from 'dev' (got '$HEAD_REF'). Merge into dev, then promote dev -> main."
+            exit 1
+          fi
+          echo "Source '$HEAD_REPO' branch '$HEAD_REF' is allowed."

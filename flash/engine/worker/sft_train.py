@@ -15,6 +15,7 @@ import threading
 import time
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
 
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
 _SFT_LORAPLUS_RATIO = 16.0
@@ -95,11 +96,20 @@ def _verl_image_message_content(content) -> str:
     return "".join(parts)
 
 
-def _restore_verl_resume(local_dir: str) -> int:
-    resume = _w.hf_resume_checkpoint()
+def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
+    """stage this run's streamed resume checkpoint; 0 when there is nothing usable to resume from.
+
+    ``world_size`` is the rank count this attempt launches verl at; a checkpoint written at a
+    different one is discarded rather than staged (see ``resume_topology_matches``). the fetch itself
+    prefers a lower loadable checkpoint over a higher incompatible one, so a repeated discard cannot
+    starve a compatible checkpoint uploaded after the one this attempt already rejected.
+    """
+    resume = _w.hf_resume_checkpoint(
+        prefer=lambda path: resume_checkpoint_is_loadable(path, world_size=world_size)
+    )
     if not resume:
         return 0
-    return stage_verl_resume(resume, local_dir, job_label="SFT")
+    return stage_verl_resume(resume, local_dir, job_label="SFT", world_size=world_size)
 
 
 def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
@@ -124,6 +134,22 @@ def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: i
         if exists:
             durable.add(step)
     return durable
+
+
+def _processed_resume_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
+    """steps a resumed watcher must not publish again, for seeding ``processed_steps``.
+
+    the staged resume checkpoint lands in local_dir as ``global_step_N`` with the tracker pointing
+    at it, so an unseeded watcher sees it as pending on its first sweep and re-runs the merger and
+    the multi-GB resume upload for state hf already holds. the resume artifact only exists because a
+    previous attempt published its deployable first (``before_upload``), so the step's deployable is
+    already on hf. a resume step that IS a required save is credited only when
+    ``_durable_required_save_steps`` finds its adapter on hf, leaving it to be staged otherwise.
+    """
+    processed = _durable_required_save_steps(required_steps, resume_step)
+    if resume_step and resume_step not in required_steps:
+        processed.add(resume_step)
+    return processed
 
 
 _CHILD_ENV_EXACT = frozenset(
@@ -585,9 +611,12 @@ def run_sft_train(spec=None) -> None:
             python_bin=child.python_bin,
         )
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        if (
-            final_save_due(final_step, options.save_at_steps)
-            and final_step not in child.watcher.processed_steps
+        # only a step this session's watcher actually published may suppress the final publish.
+        # the seeded resume step is excluded: the prior attempt's deployable publish is best-effort
+        # (`required=False`) while its resume upload is not, so hf can hold the resumable state
+        # without the servable adapter. re-publishing is an idempotent upload to the same path.
+        if final_save_due(final_step, options.save_at_steps) and final_step not in (
+            child.watcher.processed_steps - {child.resume_step}
         ):
             _w.publish_deployable_checkpoint(adapter_dir, final_step)
         outputs = _SftOutputs(adapter_dir, train_wall, device_peak_gpu_gb)

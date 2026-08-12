@@ -290,7 +290,7 @@ def _configure_rl_child(
         inp,
         train_files=files["train_pq"],
         val_files=files["val_pq"],
-        model_id=model_path_for_verl,
+        model_path=model_path_for_verl,
         thinking=bool(_w.THINKING),
         loggers=loggers,
         fp8_kv=fp8_kv,
