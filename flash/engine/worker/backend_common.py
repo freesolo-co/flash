@@ -953,14 +953,20 @@ from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     FLASH_GDN_VARLEN_MARKER,
     FLASH_TF32_MARKER,
     FLASH_WANDB_LINK_MARKER,
+    SHIM_FRAGMENT_FAILED_EXIT_CODE,
     append_step_metrics,
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
+    read_applied_shim_markers,
     render_gdn_varlen_shim,
+    render_shim_marker_prologue,
     render_tf32_shim,
     render_wandb_link_shim,
+    shim_marker_file,
+    verify_applied_shim_markers,
     verl_step_number,
+    wrap_shim_fragment,
 )
 
 # re-exported so the child-tail and ray-log diagnostics stay reachable as

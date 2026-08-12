@@ -498,10 +498,12 @@ def vram_knob_advice(algorithm: str) -> str:
             "[train].lora_rank to fit"
         )
     if algorithm == "opd":
+        # names prompts_per_step, not batch_size: opd REJECTS batch_size at parse time, so the old
+        # wording sent a user whose run did not fit straight into a config error.
         return (
-            "lower [train].group_size and/or [train].batch_size (rollout concurrency = "
-            "batch_size x group_size; distillation needs no group variance, so group_size=1 is "
-            "fine) and/or [train].max_completion_tokens / [train].max_context_tokens to fit"
+            "lower [train].group_size and/or [train].prompts_per_step (rollout concurrency = "
+            "prompts_per_step x group_size; distillation needs no group variance, so group_size=1 "
+            "is fine) and/or [train].max_completion_tokens / [train].max_context_tokens to fit"
         )
     return "lower [train].batch_size / [train].max_context_tokens / [train].lora_rank to fit"
 
