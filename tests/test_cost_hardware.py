@@ -553,6 +553,10 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
 
     from flash.runner.costs import cancelled_charge_usd
 
+    # 10 epochs over a 2-row env pool is a TEN step horizon, and that matters: a one-epoch spec
+    # plans a single step, where "cancelled after 1" and "cancelled after all" are the same charge
+    # and the proration below cannot be observed at all. The horizon has to exceed 1 for this to
+    # test anything.
     cancelled = JobSpec.from_dict(
         {
             **base,
@@ -562,11 +566,11 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
                 "id": "github:owner/repo@main:env/environment.py",
                 "params": {"max_examples": 2},
             },
-            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128},
+            "train": {"epochs": 10, "group_size": 4, "prompts_per_step": 128},
         }
     )
 
-    accepted_quote = 0.054551
+    accepted_quote = 0.1
     status = SimpleNamespace(
         estimated_cost_usd=accepted_quote,
         remote={"provider": "runpod", "allocated_gpu": "H100", "allocated_gpu_count": 1},
@@ -575,6 +579,18 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
     assert charged > 0.0, "a cancelled run that really trained must not bill $0"
     # and never above the quote the customer accepted, which is what bounds the overcharge.
     assert charged <= accepted_quote
+
+    # the fraction itself, which is the part a dead `partial / full` silently destroys. with the
+    # full-work reprice unpriceable the ratio is skipped and every cancel falls through to the quote
+    # cap, so a run stopped after ONE of ten steps bills the whole quote. assert the curve, not just
+    # the bounds: these are the same proportions dev bills, and they only hold while the legacy pool
+    # still yields a full-work horizon to divide by.
+    for completed, expected_fraction in ((1, 0.1), (2, 0.2), (5, 0.5), (10, 1.0)):
+        billed = cancelled_charge_usd(status, cancelled, steps=completed, fallback=0.0)
+        assert billed == pytest.approx(accepted_quote * expected_fraction, rel=0.02), (
+            f"cancelled after {completed}/10 steps billed {billed}, "
+            f"expected ~{expected_fraction:.0%} of the accepted quote"
+        )
 
     # and when both are stated, the enforced [train] cap is the one that binds.
     both = JobSpec.from_dict(
