@@ -2532,6 +2532,71 @@ def test_the_fit_message_states_capacity_the_run_will_actually_have():
         assert "`--gpus 2` (2x H200 = 234.1 GB)" in control
 
 
+def test_a_shape_label_reconciles_with_the_capacity_printed_beside_it():
+    """A rented COUNT next to a launched CAPACITY states a false equation unless the gap is named.
+
+    Valuing capacity at the executed width fixed the arithmetic but left the labels reading as
+    though the hardware were smaller: `2x H200` beside 141 GB says an H200 is a 70 GB card, and an
+    `8-card combination` capped at 446.6 GB understates the class without saying why. A user who
+    cannot reconcile the two numbers reaches for `--gpus`, which is the one knob that cannot help
+    when the batch is the limiter -- so the label has to name the join count and the reason.
+    """
+    from flash.engine.plan.steps import sft_data_parallel_cards
+    from flash.providers.fit_errors import vram_fit_error_message
+
+    width = lambda count: sft_data_parallel_cards(count, 3, 3)  # noqa: E731
+    reason = "sft shards by data, so the batch and retained rows bound the rank count"
+
+    pinned = vram_fit_error_message(
+        "sft",
+        230,
+        requested_gpu_count=2,
+        effective_gpu_count=2,
+        max_gpu_count=8,
+        gpu_names=("H100", "H200"),
+        executed_width=width,
+    )
+    # both shapes carry their join count, and the reason is stated once rather than per shape.
+    assert "(2x H200, 1 of which joins this run)" in pinned
+    assert "(4x H200 = 347.15 GB, 3 of which join this run)" in pinned
+    assert pinned.count(reason) == 1
+
+    terminal = vram_fit_error_message(
+        "sft",
+        9000,
+        requested_gpu_count=8,
+        effective_gpu_count=8,
+        max_gpu_count=8,
+        gpu_names=None,
+        executed_width=width,
+    )
+    # the count attaches to the CARDS, never to the GB figure ("446.6 GB max, 3 of which join").
+    assert "8-card validated GPU combination, 3 of which join this run (446.6 GB max)" in terminal
+    assert terminal.count(reason) == 1
+
+    # a run that launches every card it rents is never told about ranks at all.
+    for control in (
+        vram_fit_error_message(
+            "sft",
+            230,
+            requested_gpu_count=2,
+            effective_gpu_count=2,
+            max_gpu_count=8,
+            gpu_names=("H100", "H200"),
+        ),
+        vram_fit_error_message(
+            "grpo",
+            500,
+            requested_gpu_count=4,
+            effective_gpu_count=4,
+            max_gpu_count=8,
+            gpu_names=("H100",),
+        ),
+    ):
+        assert "of which" not in control
+        assert reason not in control
+
+
 def test_unreachable_class_reports_the_configuration_not_the_vram_shortfall():
     """One root cause must not produce two different errors depending on the run's size.
 

@@ -24,6 +24,39 @@ def _shape_label(gpu: GpuClass, count: int) -> str:
     return f"{count}x {gpu.name}" if count > 1 else gpu.name
 
 
+def _join_note(count: int, executed_width=None) -> str:
+    """Reconcile a rented card count with the launched capacity printed beside it.
+
+    The count names what you RENT while the capacity is what LAUNCHES, so a bare label states a
+    false equation: `2x H200` next to 141 GB reads as though an H200 were a 70 GB card. Naming the
+    join count keeps the two numbers reconcilable. Empty when every rented card joins, which is
+    every algorithm but sft and most sft runs.
+
+    Deliberately terse -- a message can print two of these, and the reason they differ is stated
+    once by ``_batch_bound_width_note`` rather than repeated per shape.
+    """
+    launched = executed_width(count) if executed_width else count
+    if launched == count:
+        return ""
+    return f", {launched} of which {'joins' if launched == 1 else 'join'} this run"
+
+
+def _batch_bound_width_note(*counts: str, parenthetical: bool = False) -> str:
+    """Explain a launched-vs-rented gap ONCE, after the shapes that showed it.
+
+    Only appended when some shape actually printed a join count, so a run that launches every card
+    it rents never sees it. Worded as ``_resolve_exact_gpu`` words it: the operator has to learn
+    that the card ceiling is not the limiter, or they raise `--gpus` and hit the same failure.
+
+    ``parenthetical`` when a remedy clause follows -- a trailing dash clause would swallow it, so
+    "..., or lower batch_size" would read as part of the explanation rather than as the fix.
+    """
+    if not any(counts):
+        return ""
+    reason = "sft shards by data, so the batch and retained rows bound the rank count"
+    return f" ({reason})" if parenthetical else f" -- {reason}"
+
+
 def vram_knob_advice(algorithm: str) -> str:
     """Return the algorithm knobs that actually reduce its measured vram floor."""
     algorithm = (algorithm or "").lower()
@@ -297,11 +330,16 @@ def vram_fit_error_message(
             fitting_gpu, fitting_count, fitting_vram = fitting
             # `--gpus {n}` is spelled exactly as `wider_shape_remedy` spells it, so the flag a user
             # copies out of a fit failure is the same string on every path that can reject one.
+            provided_join = _join_note(provided_count, executed_width)
+            fitting_join = _join_note(fitting_count, executed_width)
             return (
                 f"{algorithm} needs >= {need:g} GB VRAM; gpu.count={requested_gpu_count} provides "
-                f"at most {provided_vram:g} GB ({_shape_label(provided_gpu, provided_count)}). "
+                f"at most {provided_vram:g} GB "
+                f"({_shape_label(provided_gpu, provided_count)}{provided_join}). "
                 f"Raise the card ceiling with `--gpus {fitting_count}` "
-                f"({_shape_label(fitting_gpu, fitting_count)} = {fitting_vram:g} GB), or "
+                f"({_shape_label(fitting_gpu, fitting_count)} = {fitting_vram:g} GB"
+                f"{fitting_join})"
+                f"{_batch_bound_width_note(provided_join, fitting_join, parenthetical=True)}, or "
                 f"{vram_knob_advice(algorithm)}."
             )
 
@@ -326,19 +364,23 @@ def vram_fit_error_message(
     widest = gpu_capacity_shape(max_gpu_count, gpu_names=gpu_names, executed_width=executed_width)
     widest_count = largest_rentable_count(max_gpu_count)
     biggest = widest[2] if widest is not None else 0.0
+    # the note attaches to the CARD COUNT, not to the GB figure -- "446.6 GB max, 3 of which join"
+    # reads as though ranks were a subset of gigabytes.
+    widest_join = _join_note(widest_count, executed_width) if widest_count > 1 else ""
     shape = (
-        f"any {widest_count}-card validated GPU combination"
+        f"any {widest_count}-card validated GPU combination{widest_join}"
         if widest_count > 1
         else "any single validated GPU"
     )
+    ceiling = f"{shape} ({biggest:g} GB max){_batch_bound_width_note(widest_join)}"
     if algorithm == "opd":
         return (
-            f"opd needs >= {need:g} GB VRAM, more than {shape} ({biggest:g} GB max). "
+            f"opd needs >= {need:g} GB VRAM, more than {ceiling}. "
             "opd is resident-only: the trainer and the colocated vLLM student rollout engine hold "
             "two model-weight copies plus the rollout KV cache at once. "
             f"{vram_knob_advice(algorithm).capitalize()}."
         )
     return (
-        f"{algorithm} needs >= {need:g} GB VRAM, more than {shape} ({biggest:g} GB max). "
+        f"{algorithm} needs >= {need:g} GB VRAM, more than {ceiling}. "
         f"{vram_knob_advice(algorithm).capitalize()}."
     )
