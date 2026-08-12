@@ -77,6 +77,39 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return runner.JobSpec.from_dict(d)
 
 
+def _pin_failure_reason(spec: JobSpec) -> str:
+    """Why the env ref->sha pin failed, as one short user-facing clause, or "".
+
+    ``_assign_resolved_env_sha`` is best-effort and returns the spec unpinned on any failure, so its
+    caller sees only the ABSENCE of a pin and has to describe it generically. GitHub's own answer is
+    the diagnosis -- "No commit found for SHA: main" names the wrong ref, the fix, and distinguishes
+    itself from a rate limit or a private-repo auth failure, all of which produce the identical
+    missing pin. Resolving twice is acceptable here: this runs only on the failure path, where the
+    submit is already being rejected and one extra call costs nothing anyone is waiting on.
+    """
+    env_id = spec.environment.id
+    if not env_id or spec.environment.resolved_sha:
+        return ""
+    try:
+        from flash.envs.loader import (
+            _parse_github_environment_ref,
+            _resolve_ref_sha,
+            is_managed_environment_slug,
+            managed_slug_to_github_ref,
+        )
+
+        ref_str = (
+            managed_slug_to_github_ref(env_id) if is_managed_environment_slug(env_id) else env_id
+        )
+        parsed = _parse_github_environment_ref(ref_str)
+        if parsed is None:
+            return ""
+        _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
+    except Exception as exc:
+        return str(exc).strip()
+    return ""
+
+
 def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
     """Pin env ref->SHA once so N workers don't fan-out N GitHub API calls (secondary rate-limit). Best-effort."""
     import logging

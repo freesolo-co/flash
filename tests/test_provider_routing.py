@@ -631,6 +631,65 @@ def test_sft_submission_fails_closed_when_the_environment_cannot_be_pinned(orch,
     assert persisted == []
 
 
+@pytest.mark.parametrize(
+    ("github_error", "expected"),
+    [
+        pytest.param(
+            'GitHub environment request failed (422): {"message":"No commit found for SHA: main"}',
+            "No commit found for SHA: main",
+            id="wrong-ref",
+        ),
+        pytest.param(
+            "GitHub API rate limit exceeded (403)",
+            "rate limit",
+            id="rate-limit",
+        ),
+        pytest.param(
+            'GitHub environment request failed (404): {"message":"Not Found"}',
+            "404",
+            id="private-or-missing",
+        ),
+    ],
+)
+def test_unpinnable_sft_environment_reports_githubs_own_diagnosis(
+    orch, monkeypatch, github_error, expected
+):
+    """The pin failure must name WHY, not just that a revision is missing.
+
+    `@main` against a master-default repo made GitHub answer "No commit found for SHA: main" -- the
+    ref, the cause and the fix in one line. The plane had that string and threw it away, reporting
+    only "sft workload profiling requires a pinned environment package revision", which names none
+    of the three. A rate limit, an outage and a private repo the token cannot read all produce the
+    identical missing pin and all need different fixes, so the generic text sends every one of them
+    to the wrong remedy.
+    """
+    from dataclasses import replace
+
+    import flash.envs.loader as env_loader
+    from flash.providers import allocator
+
+    def fail(_parsed, *_args, **_kwargs):
+        raise RuntimeError(github_error)
+
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", fail)
+    monkeypatch.setattr(
+        orch,
+        "_resolve_model_revision",
+        lambda spec, **_kw: replace(spec, model_revision="b" * 40, model_revision_auto=True),
+    )
+    monkeypatch.setattr(
+        allocator, "allocate", lambda *a, **k: pytest.fail("allocated without a profile")
+    )
+
+    with pytest.raises(orch.WorkloadProfileUnavailable) as excinfo:
+        orch.submit_job(_public_spec())
+
+    message = str(excinfo.value)
+    assert expected in message, message
+    # the ref itself has to appear too: the operator has to know WHICH environment to fix.
+    assert "github:owner/repo@main:env/environment.py" in message
+
+
 def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     """A pin the lifecycle fallback recovers must survive a control-plane restart.
 
