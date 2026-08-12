@@ -163,10 +163,10 @@ class _UpstreamRequestContext:
     record_failed: bool = False
 
 
-def _is_secret_key(key: Any) -> bool:
+def _is_secret_key(key: Any, *, allow_token: bool = False) -> bool:
     normalized = str(key).casefold().replace("_", "").replace("-", "")
     return normalized in _SECRET_KEY_EXACT or (
-        normalized != "token"
+        not (allow_token and normalized == "token")
         and any(normalized.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES)
     )
 
@@ -189,11 +189,22 @@ def _is_schema_definition(value: Any) -> bool:
     return bool(keys) and all(key not in _JSON_SCHEMA_VALUE_KEYWORDS for key in keys)
 
 
-def _redact_secret_fields(value: Any, *, schema_property_map: bool = False) -> Any:
+def _redact_secret_fields(
+    value: Any,
+    *,
+    schema_property_map: bool = False,
+    response_root: bool = False,
+    choice_list: bool = False,
+    choice: bool = False,
+    logprobs: bool = False,
+    logprob_entries: bool = False,
+) -> Any:
     if isinstance(value, dict):
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
-            if _is_secret_key(key) and not (schema_property_map and _is_schema_definition(item)):
+            if _is_secret_key(key, allow_token=logprob_entries) and not (
+                schema_property_map and _is_schema_definition(item)
+            ):
                 redacted[key] = "[redacted]"
             else:
                 redacted[key] = _redact_secret_fields(
@@ -201,10 +212,25 @@ def _redact_secret_fields(value: Any, *, schema_property_map: bool = False) -> A
                     schema_property_map=(
                         key in {"properties", "$defs", "definitions"} and isinstance(item, dict)
                     ),
+                    response_root=False,
+                    choice_list=response_root and key == "choices" and isinstance(item, list),
+                    choice=choice_list,
+                    logprobs=choice and key == "logprobs" and isinstance(item, dict),
+                    logprob_entries=logprob_entries
+                    or (logprobs and key in {"content", "refusal", "top_logprobs"}),
                 )
         return redacted
     if isinstance(value, list | tuple):
-        return [_redact_secret_fields(item) for item in value]
+        return [
+            _redact_secret_fields(
+                item,
+                schema_property_map=schema_property_map,
+                choice=choice_list,
+                logprobs=logprobs,
+                logprob_entries=logprob_entries,
+            )
+            for item in value
+        ]
     return value
 
 
@@ -233,8 +259,8 @@ def _redact_secret_values(value: Any, secrets: tuple[str, ...]) -> Any:
     return value
 
 
-def _sanitize_for_trace(value: Any, secrets: tuple[str, ...]) -> Any:
-    return _redact_secret_values(_redact_secret_fields(value), secrets)
+def _sanitize_for_trace(value: Any, secrets: tuple[str, ...], *, response: bool = False) -> Any:
+    return _redact_secret_values(_redact_secret_fields(value, response_root=response), secrets)
 
 
 def _safe_provider_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -267,7 +293,7 @@ def _decoded_payload(response: httpx.Response) -> Any:
 
 
 def _error_for_status(status_code: int) -> str | None:
-    return None if status_code < 400 else f"upstream returned status {status_code}"
+    return None if 200 <= status_code < 300 else f"upstream returned status {status_code}"
 
 
 async def _record_trace(
@@ -276,7 +302,7 @@ async def _record_trace(
     if not context.record_trace or context.project_id is None:
         return
     duration_ms = max(0, round((time.perf_counter() - context.started_at) * 1000))
-    sanitized_output = _sanitize_for_trace(output_payload, context.secrets)
+    sanitized_output = _sanitize_for_trace(output_payload, context.secrets, response=True)
     prompt_tokens, completion_tokens = _usage_tokens(sanitized_output)
     span = TraceSpan(
         name="chat.completions",
@@ -396,6 +422,8 @@ def _merge_fragment_dict(target: dict[str, Any], fragment: dict[str, Any]) -> No
                 target[key].append(value)
             else:
                 target[key] = _StringFragments(value)
+        elif isinstance(value, list):
+            _append_fragment(target, key, value)
         elif value is not None:
             target[key] = value
 
@@ -446,13 +474,14 @@ class _SseAccumulator:
                 message["tool_calls"] = [
                     _materialize_fragments(tool_calls[i]) for i in sorted(tool_calls)
                 ]
-            choices.append(
-                {
-                    "index": index,
-                    "message": message,
-                    "finish_reason": state["finish_reason"],
-                }
-            )
+            choice = {
+                "index": index,
+                "message": message,
+                "finish_reason": state["finish_reason"],
+            }
+            if state["logprobs"]:
+                choice["logprobs"] = _materialize_fragments(state["logprobs"])
+            choices.append(choice)
         return {"choices": choices, "usage": self.usage}
 
     def _choice_state(self, index: int) -> dict[str, Any]:
@@ -461,6 +490,7 @@ class _SseAccumulator:
             {
                 "message": {"role": "assistant"},
                 "tool_calls": {},
+                "logprobs": {},
                 "finish_reason": None,
             },
         )
@@ -498,6 +528,9 @@ class _SseAccumulator:
             delta = choice.get("delta")
             if isinstance(delta, dict):
                 self._consume_delta(state, delta)
+            logprobs = choice.get("logprobs")
+            if isinstance(logprobs, dict):
+                _merge_fragment_dict(state["logprobs"], logprobs)
             if choice.get("finish_reason") is not None:
                 state["finish_reason"] = choice["finish_reason"]
 
@@ -514,7 +547,7 @@ class _SseAccumulator:
                 continue
             if isinstance(value, dict) and isinstance(message.get(key), dict):
                 _merge_fragment_dict(message[key], value)
-            elif isinstance(value, str) or (
+            elif isinstance(value, str | list) or (
                 key in message and isinstance(message[key], str | _StringFragments)
             ):
                 _append_fragment(message, key, value)
@@ -600,7 +633,7 @@ async def _stream_response(
                         if error is None and accumulator.received and not accumulator.terminal:
                             error = "upstream stream ended before completion"
                     await _record_trace(context, output_payload=output_payload, error=error)
-    if context.record_trace and context.record_failed and not client_disconnected:
+    if context.record_trace and context.record_failed and not client_disconnected and not is_error:
         yield b": freesolo-record-failed\n\n"
 
 

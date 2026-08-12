@@ -14,6 +14,7 @@ from flash._internal.channel import CLI_NAME
 from flash.cli.commands import render
 from flash.client import ClientError, export_trace_records, list_trace_projects
 from flash.client.config import load_credentials
+from flash.client.http import DEFAULT_FREESOLO_BASE_URL
 from flash.serve.urls import is_freesolo_hosted_url
 
 DEFAULT_EXPORT_PATH = Path("dataset/train.jsonl")
@@ -34,8 +35,8 @@ def default_output_path(export_format: str) -> Path:
     return RAW_EXPORT_PATH if export_format == RAW_FORMAT else DEFAULT_EXPORT_PATH
 
 
-def trace_store_url(api_url: str) -> str | None:
-    """Which plane holds this account's traces, or `None` for the hosted backend's own store.
+def trace_store_url(api_url: str) -> str:
+    """Which plane holds this account's traces, independent of project-directory overrides.
 
     Deliberately NOT `has_freesolo_backend`. That answers a question about the project DIRECTORY --
     "is there a Freesolo-compatible backend to resolve projects against" -- which `FREESOLO_BASE_URL`
@@ -43,11 +44,10 @@ def trace_store_url(api_url: str) -> str | None:
     recording proxy writes into the SQLite database of the plane that served it, so the traces exist
     on the plane the operator is logged into and nowhere else.
 
-    Routing them through the directory classifier would send `/api/traces/export` to the configured
-    backend for an operator who set `FREESOLO_BASE_URL` for project lookups, which both misses every
-    locally recorded trace and hands this plane's key to a service that never stored one.
+    Passing an explicit URL in both directions prevents `FREESOLO_BASE_URL` from diverting either a
+    self-hosted operator key or a hosted account key to a service that never stored those traces.
     """
-    return None if is_freesolo_hosted_url(api_url) else api_url
+    return DEFAULT_FREESOLO_BASE_URL if is_freesolo_hosted_url(api_url) else api_url
 
 
 def _require_api_key(api_key: str | None) -> str:

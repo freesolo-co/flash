@@ -435,6 +435,38 @@ async def test_streaming_upstream_error_records_raw_json(tmp_path, monkeypatch) 
     assert span["output_payload"] == {"error": {"message": "rate limited"}}
 
 
+def test_a_redirect_is_recorded_but_not_exported_as_a_training_target(
+    trace_api, monkeypatch
+) -> None:
+    """The proxy does not follow redirects, so a 3xx body is an interstitial rather than the model's
+    reply. Marking it successful exports HTML or redirect metadata as the assistant target, even though
+    raw export should still preserve the provider response for diagnosis."""
+    redirect_body = b'<html><a href="https://provider.example/login">continue</a></html>'
+    _StaticAsyncClient.response = httpx.Response(
+        307,
+        content=redirect_body,
+        headers={"content-type": "text/html", "location": "https://provider.example/login"},
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 307
+    assert response.content == redirect_body
+    raw = _raw(trace_api)
+    span = raw["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == "upstream returned status 307"
+    assert span["output_payload"] == redirect_body.decode()
+    records = trace_api.get(
+        "/api/traces/export",
+        headers={"Authorization": f"Bearer {_KEY}"},
+        params={"project_id": _PROJECT_ID, "format": "records"},
+    ).json()
+    assert records["records"] == []
+    assert records["skipped"] == 1
+
+
 def test_upstream_transport_failure_returns_502_and_records(trace_api, monkeypatch) -> None:
     class _FailingClient(_StaticAsyncClient):
         async def post(self, url, *, headers, json):
@@ -771,11 +803,44 @@ def test_an_empty_schema_under_a_secret_name_survives_redaction(trace_api, monke
     assert stored["tools"][0]["function"]["parameters"]["properties"]["password"] == {}
 
 
+def test_a_request_token_field_is_redacted(trace_api, monkeypatch) -> None:
+    """A request-side `token` can hold an unrelated third-party credential. Exempting that key
+    globally because response logprobs also call generated text `token` persists the credential and
+    returns it through `format=raw`, even though it is not one of the proxy's known header secrets."""
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+    third_party_secret = "third-party-secret-abc123"
+
+    response = trace_api.post(
+        "/v1/chat/completions",
+        headers=_HEADERS,
+        json={**_REQUEST, "metadata": {"token": third_party_secret}},
+    )
+
+    assert response.status_code == 200
+    assert _StaticAsyncClient.requests[-1]["json"]["metadata"]["token"] == third_party_secret
+    stored = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]
+    assert stored["metadata"]["token"] == "[redacted]"
+    assert third_party_secret not in json.dumps(_raw(trace_api))
+
+
 def test_logprob_token_text_survives_redaction(trace_api, monkeypatch) -> None:
     """A bare `token` in Chat Completions logprobs is generated text, not a credential. Redacting it
     destroys the token-to-logprob pairing that raw trace consumers need for scoring and analysis."""
     response_payload = {
-        "choices": [{"logprobs": {"content": [{"token": "hello", "logprob": -0.1}]}}]
+        "choices": [
+            {
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": "hello",
+                            "logprob": -0.1,
+                            "top_logprobs": [{"token": "hi", "logprob": -0.2}],
+                        }
+                    ]
+                }
+            }
+        ]
     }
     _StaticAsyncClient.response = httpx.Response(200, json=response_payload)
     monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
@@ -787,6 +852,39 @@ def test_logprob_token_text_survives_redaction(trace_api, monkeypatch) -> None:
     assert stored["choices"][0]["logprobs"]["content"][0] == {
         "token": "hello",
         "logprob": -0.1,
+        "top_logprobs": [{"token": "hi", "logprob": -0.2}],
+    }
+
+
+def test_streamed_logprobs_are_accumulated_without_redacting_token_text(
+    trace_api, monkeypatch
+) -> None:
+    """Streaming puts logprobs beside `delta`, not inside it. Dropping that choice-level field makes
+    streaming traces poorer than identical non-streaming traces, while redacting its `token` entries
+    destroys the token-to-score pairing raw consumers need for analysis."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"hel"},"logprobs":{"content":[{"token":"hel","logprob":-0.1}]}}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{"content":"lo"},"logprobs":{"content":[{"token":"lo","logprob":-0.2}],"refusal":[{"token":"no","logprob":-3.0}]},"finish_reason":"stop"}]}\n\n',
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    choice = _raw(trace_api)["records"][0]["spans"][0]["output_payload"]["choices"][0]
+    assert choice["message"]["content"] == "hello"
+    assert choice["logprobs"] == {
+        "content": [
+            {"token": "hel", "logprob": -0.1},
+            {"token": "lo", "logprob": -0.2},
+        ],
+        "refusal": [{"token": "no", "logprob": -3.0}],
     }
 
 
@@ -832,6 +930,29 @@ def test_a_provider_specific_delta_field_is_accumulated(trace_api, monkeypatch) 
     message = _raw(trace_api)["records"][0]["spans"][0]["output_payload"]["choices"][0]["message"]
     assert message["content"] == "hi"
     assert message["reasoning"] == "think more"
+
+
+def test_a_list_delta_keeps_every_streamed_fragment(trace_api, monkeypatch) -> None:
+    """Providers can send one `reasoning_details` list per chunk. Keeping only the first list makes
+    the recorded reasoning shorter than the response the caller received, so raw traces silently lose
+    paid output whenever a list-valued extension is streamed incrementally."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"reasoning_details":[{"a":1}]}}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{"reasoning_details":[{"b":2}]},"finish_reason":"stop"}]}\n\n',
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    message = _raw(trace_api)["records"][0]["spans"][0]["output_payload"]["choices"][0]["message"]
+    assert message["reasoning_details"] == [{"a": 1}, {"b": 2}]
 
 
 def test_many_stream_fragments_are_accumulated_linearly() -> None:
@@ -914,6 +1035,43 @@ def test_an_unrecorded_call_says_so_in_its_response(trace_api, monkeypatch) -> N
     assert response.status_code == 200
     assert response.json() == _RESPONSE
     assert response.headers["x-freesolo-record-failed"] == "true"
+    assert _raw(trace_api)["traces"] == 0
+
+
+def test_a_failed_recording_does_not_corrupt_a_streamed_json_error(trace_api, monkeypatch) -> None:
+    """A caller may request streaming and still receive a provider's ordinary JSON error body.
+    Appending an SSE comment after persistence fails makes that 4xx body invalid JSON, hiding the
+    provider's actual rejection behind a recording failure that should only be logged."""
+    error_body = b'{"error":{"message":"rate limited"}}'
+
+    class _JsonErrorStreamingClient(_StreamingAsyncClient):
+        requests: ClassVar[list[dict]] = []
+        body = _StreamingBody([error_body])
+
+        async def send(self, request, *, stream) -> httpx.Response:
+            assert stream is True
+            return httpx.Response(
+                429,
+                headers={"content-type": "application/json"},
+                stream=type(self).body,
+                request=request,
+            )
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _JsonErrorStreamingClient)
+
+    def _explode(**kwargs) -> str:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(traces, "store_trace", _explode)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 429
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.content == error_body
+    assert response.json() == {"error": {"message": "rate limited"}}
     assert _raw(trace_api)["traces"] == 0
 
 

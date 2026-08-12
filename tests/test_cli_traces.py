@@ -228,7 +228,7 @@ def test_traces_export_sends_the_key_from_the_url_it_decided_on(monkeypatch, tmp
 
     def _record(project_id, api_key, base_url=None, export_format=None):
         sent.append(api_key)
-        assert base_url is None
+        assert base_url == "https://api.freesolo.co"
         return {"format": "records", "records": [{"input": "a", "output": "b"}]}
 
     monkeypatch.setattr(traces, "export_trace_records", _record)
@@ -296,6 +296,43 @@ def test_a_configured_backend_does_not_divert_self_hosted_trace_reads(
     assert cli.main(["traces", "export", "--project", _PROJECTS[0]["id"]]) == 0
     assert requested != []
     assert all(url.startswith(_SELF_HOSTED_URL) for url in requested), requested
+
+
+def test_a_configured_backend_does_not_divert_hosted_trace_reads(monkeypatch, tmp_path) -> None:
+    """A hosted login's traces live in the hosted store even when an operator sets
+    `FREESOLO_BASE_URL` for project lookups. Letting the client fall back to that override sends the
+    hosted account key to a service that never recorded the traces and makes the export look empty.
+
+    Asserted on the requested URL so an override-sensitive sentinel below this layer cannot pass.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.example")
+    monkeypatch.setattr(traces, "load_credentials", lambda: (_HOSTED_URL, "hosted-key"))
+
+    requested: list[str] = []
+    payload = json.dumps({"format": "records", "records": [{"input": "a", "output": "b"}]})
+
+    class _Response:
+        status = 200
+
+        def read(self):
+            return payload.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _urlopen(req, timeout=None):
+        requested.append(req.full_url)
+        return _Response()
+
+    monkeypatch.setattr("flash.client.freesolo_api.urllib.request.urlopen", _urlopen)
+
+    assert cli.main(["traces", "export", "--project", _PROJECTS[0]["id"]]) == 0
+    assert requested != []
+    assert all(url.startswith("https://api.freesolo.co") for url in requested), requested
 
 
 def test_fetch_records_without_explicit_key_snapshots_self_hosted_credentials(monkeypatch) -> None:
