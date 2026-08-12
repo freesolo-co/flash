@@ -85,7 +85,7 @@ def _resolve_structured_model_metadata(
 
     from flash.engine.plan.vram import fetch_hf_model_geometry
 
-    _params_b, vocab_size, _hidden, _layers = fetch_hf_model_geometry(
+    _params_b, vocab_size, _hidden, _layers, _heads = fetch_hf_model_geometry(
         model_id,
         model_revision,
         strict=True,

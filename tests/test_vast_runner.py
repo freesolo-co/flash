@@ -760,15 +760,12 @@ def test_deploy_decoys_without_exact_match_abort_with_no_second_create(monkeypat
     assert destroyed_for
 
 
-def test_vast_image_honors_worker_image_override(monkeypatch):
-    # Vast must honor FLASH_WORKER_IMAGE (and per-SM) via worker_image_for_gpu like RunPod/Lambda,
-    # not always return the baked default.
+def test_vast_image_selects_the_per_sm_tag():
+    # Vast routes through worker_image_for_gpu like RunPod/Lambda, so it gets the arch-matched
+    # baked image rather than always returning the flat default.
     from flash.providers.vast.jobs.builders import vast_image
 
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/x/hotfix:test")
-    assert vast_image("RTX 4090") == "ghcr.io/x/hotfix:test"
-    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
-    assert vast_image("RTX 4090")  # default path still returns a real (baked) image
+    assert vast_image("RTX 4090") == "ghcr.io/freesolo-co/flash-worker:cu128-sm89"
 
 
 def test_deploy_raises_when_pool_exhausted(monkeypatch):
