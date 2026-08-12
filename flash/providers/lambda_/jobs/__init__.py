@@ -223,7 +223,7 @@ def _build_launch_user_data(
     )
 
 
-def _cleanup_unpublished_instance(run_id: str, instance_id: str, *, context: str) -> bool:
+def _cleanup_unpublished_instance(run_id: str, instance_id: str, *, context: str) -> None:
     """Clean an exact unpublished instance, falling back to its run label only when unconfirmed.
 
     The window between a successful launch and the returned handle owns a rented box that nothing
@@ -243,7 +243,6 @@ def _cleanup_unpublished_instance(run_id: str, instance_id: str, *, context: str
             )
         with contextlib.suppress(BaseException):
             terminate_run_instances(run_id)
-    return confirmed
 
 
 def _disk_capable_instances(spec, instances: list[LambdaInstance], say) -> list[LambdaInstance]:
