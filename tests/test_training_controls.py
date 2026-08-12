@@ -20,7 +20,7 @@ model = "Qwen/Qwen3.5-0.8B"
 algorithm = "grpo"
 
 [environment]
-id = "freesolo/gsm8k"
+id = "freesolo/example-project/gsm8k"
 
 [train]
 epochs = 1
@@ -386,7 +386,7 @@ def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
         'model = "Qwen/Qwen3.5-0.8B"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
-        'id = "freesolo/gsm8k"\n'
+        'id = "freesolo/example-project/gsm8k"\n'
         'secrets = ["SEED"]\n'
         "[train]\n"
         "epochs = 1\n"

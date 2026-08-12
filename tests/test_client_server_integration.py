@@ -42,7 +42,7 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
-    "environment": {"id": "freesolo/gsm8k", "params": {"max_examples": 8}},
+    "environment": {"id": "freesolo/example-project/gsm8k", "params": {"max_examples": 8}},
     "train": {"epochs": 1, "max_examples": 1},
     "gpu": {},
 }

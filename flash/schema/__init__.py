@@ -818,10 +818,10 @@ def _validate_spec(spec: JobSpec) -> None:
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "
-            f'`{CLI_NAME} env push --project <project-uuid> --name <name>` and paste the returned id, e.g. "your-name/your-env"); '
+            f'`{CLI_NAME} env push --project <project-uuid> --name <name>` and paste the returned id, e.g. "your-org/your-project/your-env"); '
             "there is no local path mode"
         )
     _require_environment_ref(
         spec.environment.id,
-        '[environment] id must be a Freesolo environment id (for example "your-name/your-env")',
+        '[environment] id must be a Freesolo environment id (for example "your-org/your-project/your-env")',
     )
