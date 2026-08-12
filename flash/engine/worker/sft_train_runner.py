@@ -26,7 +26,6 @@ build_sft_overrides = _sft_train.build_sft_overrides
 # taken from the parent like every other name here, so the runner and `sft_train`'s own
 # `sft_data_loading`/`sft_configuring` wraps use one object rather than two imports of it.
 liveness_heartbeat = _sft_train.liveness_heartbeat
-gdn_reset_arch_from_caps = _sft_train.gdn_reset_arch_from_caps
 render_gdn_varlen_shim = _sft_train.render_gdn_varlen_shim
 render_shim_marker_prologue = _sft_train.render_shim_marker_prologue
 render_wandb_link_shim = _sft_train.render_wandb_link_shim

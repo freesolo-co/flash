@@ -10,7 +10,7 @@ Split out of `flash.engine.worker.sft_train` to keep that module under the file-
 
 from __future__ import annotations
 
-from flash.engine.worker.backend_common import render_tf32_shim
+from flash.engine.worker.backend_common import render_tf32_shim, render_tilelang_cudart_shim
 
 # printed by the LoRA+ shim once it has installed itself, and matched on the child's stdout by the
 # parent: the shim runs inside verl, so this line is the only proof the optimizer grouping took.
@@ -370,8 +370,11 @@ def _render_sft_sitecustomize(
     required_steps = tuple(int(step) for step in save_at_steps)
     # the tf32 fragment goes first, above the verl imports: grpo and opd share the same renderer,
     # and putting it ahead of them means an import that raises cannot cost the run its throughput.
+    # the cudart fragment sits with it, above the verl imports for the same structural reason: it
+    # repoints tilelang's libcudart stub on disk and cannot help once vllm has bound the stub.
     source = f"""# generated flash sft runtime patches for verl 0.8
 {render_tf32_shim()}
+{render_tilelang_cudart_shim()}
 import random as _flash_random
 
 import numpy as _flash_numpy

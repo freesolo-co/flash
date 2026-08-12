@@ -15,6 +15,7 @@ from flash.server.domain.teacher_broker import (
     MAX_REQUEST_BODY_BYTES,
     TeacherBrokerError,
     authenticate_teacher_capability,
+    complete_teacher_chat_request,
     complete_teacher_request,
 )
 
@@ -99,8 +100,7 @@ def _bearer(request: Request) -> str:
     return token
 
 
-@router.post("/v1/teacher/completions")
-async def teacher_completions(request: Request):
+async def _teacher_request(request: Request, complete):
     request_id = request.headers.get("x-flash-teacher-request-id", "")
     try:
         content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
@@ -119,7 +119,7 @@ async def teacher_completions(request: Request):
         async with _body_ingress_slot(capability, max_seconds=ingress_timeout):
             body = await _bounded_body(request)
         response = await asyncio.to_thread(
-            complete_teacher_request,
+            complete,
             capability_token=capability,
             request_id=request_id,
             raw_body=body,
@@ -127,3 +127,13 @@ async def teacher_completions(request: Request):
         return JSONResponse(response)
     except TeacherBrokerError as exc:
         return JSONResponse(exc.payload(), status_code=exc.status_code)
+
+
+@router.post("/v1/teacher/completions")
+async def teacher_completions(request: Request):
+    return await _teacher_request(request, complete_teacher_request)
+
+
+@router.post("/v1/teacher/chat_completions")
+async def teacher_chat_completions(request: Request):
+    return await _teacher_request(request, complete_teacher_chat_request)

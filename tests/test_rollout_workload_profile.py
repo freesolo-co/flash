@@ -415,6 +415,8 @@ class _QuotableTrain(_Train):
     """`_Train` plus the fields the quote path reads. Kept separate so the digest tests above keep
     exercising the minimal spec surface they were written against."""
 
+    # `_Spec.algorithm` is grpo, and the quote path reads the optimizer batch of a rollout
+    # algorithm from `prompts_per_step`; `batch_size` is sft-only and would never be consulted.
     prompts_per_step = 8
     lora_rank = 32
     save_at_steps: ClassVar[list] = []
