@@ -2170,6 +2170,13 @@ def test_undeploy_reports_when_registrations_outran_its_passes(client):
         f"undeploy returned {response.status_code} while revisions it never disabled were still "
         f"ready and callable by their immutable ids"
     )
+    # And the 409 must not cost the eviction of what this call DID disable. Raised before the
+    # eviction loop, those revisions are already `disabled`, so the retry passes over them and
+    # their max_loras slots stay occupied until the container recycles.
+    assert REVISION in module.unregistered, (
+        "the straggler 409 skipped the gpu eviction, so revisions this call disabled stay resident "
+        "and a retry will pass over them as already disabled"
+    )
 
 
 def test_a_colliding_load_evicts_a_stale_local_resident(client, monkeypatch):

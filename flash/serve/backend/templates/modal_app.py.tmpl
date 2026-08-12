@@ -1203,18 +1203,13 @@ def api():
                 members = list(dict.fromkeys([*members, *await _run_members(run_id)]))
             # The pass budget is bounded, so it can run out with members still unvisited: a
             # registration landing during the final pass is appended by the read above and then
-            # never processed. Reported rather than swallowed -- returning 200 with a revision
+            # never processed. Recorded here but NOT raised here -- returning 200 with a revision
             # still `ready` and directly callable by its immutable id is the one outcome an
-            # operator cannot detect. 409 says the run is in flux and the retry is theirs to make;
-            # the passes that DID land stay disabled, so a retry converges.
+            # operator cannot detect, but raising inside the lock would skip the eviction below
+            # for every revision this call DID disable. Those are already `disabled`, so a retry
+            # passes over them and their `max_loras` slots stay occupied until the container
+            # recycles. So: finish the eviction, then report.
             stragglers = [member for member in members if member not in seen]
-            if stragglers:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    f"{{run_id}} kept receiving registrations while it was being undeployed "
-                    f"({{len(stragglers)}} still active). the rest of the run is disabled; "
-                    f"repeat the delete once deploys to this run have stopped.",
-                )
         # Outside the lock: evicting from the GPU is slow and best effort, and the records are
         # already durably disabled, so holding the lock across it would only block other deploys.
         #
@@ -1228,6 +1223,16 @@ def api():
             for revision_id in disabled_revisions:
                 with contextlib.suppress(Exception):  # gpu eviction is best effort
                     await engine.unregister.remote.aio(revision_id)
+        # Reported only now, after everything this call did disable has been evicted. 409 says the
+        # run is in flux and the retry is theirs to make; what this pass disabled stays disabled
+        # and is off the GPU, so a retry converges on the remainder.
+        if stragglers:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{{run_id}} kept receiving registrations while it was being undeployed "
+                f"({{len(stragglers)}} still active). the rest of the run is disabled; "
+                f"repeat the delete once deploys to this run have stopped.",
+            )
         return {{
             "ok": True,
             "run_id": run_id,
