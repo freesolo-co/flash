@@ -92,6 +92,75 @@ def widenable_gpu_names(
     )
 
 
+def drop_pin_hint(
+    exact: str,
+    unpinned_widths: tuple[int, ...],
+    need: float,
+    *,
+    ceiling: int,
+    above: int,
+    executed_width=None,
+) -> str:
+    """Name dropping the provider pin AND the width it unlocks, or nothing if no width fits.
+
+    Routed through ``wider_shape_remedy`` so this shares the sibling path's two rules: a width is
+    only named once PROVED to fit (an oversized pin gets no hint at all, since dropping the pin
+    cannot help), and the ceiling is named alongside the pin -- reaching here means the authored
+    count already failed, so advice omitting it just buys a second rejection.
+    """
+    from flash.providers.base import wider_shape_remedy
+
+    remedy = wider_shape_remedy(
+        unpinned_widths, need, ceiling=ceiling, above=above, executed_width=executed_width
+    )
+    if not remedy:
+        return ""
+    # the shared helper opens with "; it fits on N cards -- ...", so splice the pin clause in
+    # front of its body rather than concatenating two separately punctuated sentences.
+    return f". Drop the provider pin to rent {exact!r}:{remedy.removeprefix(';')}"
+
+
+def catalog_check_hint(
+    exact: str,
+    need: float,
+    *,
+    ceiling: int,
+    above: int,
+    offerable: bool,
+    validated: bool,
+    executed_width=None,
+) -> str:
+    """Name the width to ASK a fixed-count provider for, when no offline width can be proved.
+
+    `live_capacity` means the count must be confirmed dynamically -- not that the wider SKU is
+    absent. Lambda really does resolve `gpu_4x_h100_pcie` against its catalog and rejects a shape it
+    does not sell with its own precise error, so naming the width to try beats a bare shortfall the
+    user cannot act on. Withheld once the class is oversized at every rentable width, where no count
+    would help and the honest answer is the shortfall alone.
+
+    ``offerable`` is false when no configured provider carries this class at all, or when a freely
+    rented width was already provable: the obstacle is then the class or the other remedy, and
+    `--gpus N` either cannot succeed at any N or has already been named.
+
+    ``executed_width`` keeps the named count one the run would LAUNCH on -- asking a provider to
+    confirm a SKU whose extra cards never join the run is a wasted round trip.
+    """
+    if not offerable:
+        return ""
+    width = smallest_fitting_gpu_count(
+        need,
+        max_gpu_count=ceiling,
+        gpu_names=(exact,) if validated else (),
+        executed_width=executed_width,
+    )
+    if width is None or width <= above:
+        return ""
+    return (
+        f". Their catalog may list a {width}-card {exact} instance -- raise the card ceiling "
+        f"with `--gpus {width}` to check it against their catalog"
+    )
+
+
 def vram_fit_error_message(
     algorithm: str,
     need: float,
@@ -102,6 +171,7 @@ def vram_fit_error_message(
     gpu_names: tuple[str, ...] | None = None,
     providers: tuple[str, ...] | None = None,
     widenable_without_pin: tuple[str, ...] | None = None,
+    executed_width=None,
 ) -> str:
     """Build an actionable pinned-count or terminal vram rejection.
 
@@ -119,7 +189,7 @@ def vram_fit_error_message(
     algorithm = (algorithm or "").lower()
     widenable = widenable_gpu_names(gpu_names, providers)
     fitting_count = smallest_fitting_gpu_count(
-        need, max_gpu_count=max_gpu_count, gpu_names=widenable
+        need, max_gpu_count=max_gpu_count, gpu_names=widenable, executed_width=executed_width
     )
     if requested_gpu_count is not None and fitting_count is not None:
         provided = gpu_capacity_shape(effective_gpu_count, gpu_names=gpu_names)
@@ -141,7 +211,7 @@ def vram_fit_error_message(
     # class: saying it "needs more than any 8-card combination" would be false, and the knob advice
     # would send the user to shrink a run that already fits. name the real obstacle instead.
     if requested_gpu_count is not None and smallest_fitting_gpu_count(
-        need, max_gpu_count=max_gpu_count, gpu_names=gpu_names
+        need, max_gpu_count=max_gpu_count, gpu_names=gpu_names, executed_width=executed_width
     ):
         # the remedy differs by WHY only fixed-count providers are in play. dropping a pin helps
         # only when the fleet BEHIND it still sells the wider shape; a pin on a Lambda-only plane
@@ -154,7 +224,10 @@ def vram_fit_error_message(
         # out at 80 GB/card while RunPod has H200/B200), and then the same width fits and the raise
         # clause would name a ceiling the user already set. only append it when it really rises.
         unpinned_width = smallest_fitting_gpu_count(
-            need, max_gpu_count=max_gpu_count, gpu_names=widenable_without_pin or ()
+            need,
+            max_gpu_count=max_gpu_count,
+            gpu_names=widenable_without_pin or (),
+            executed_width=executed_width,
         )
         if unpinned_width is not None:
             remedy = (
@@ -171,7 +244,10 @@ def vram_fit_error_message(
             # rejects a shape it does not sell with its own precise error. So naming the width to
             # try and letting the catalog decide beats sending the user to switch providers.
             catalog_width = smallest_fitting_gpu_count(
-                need, max_gpu_count=max_gpu_count, gpu_names=gpu_names
+                need,
+                max_gpu_count=max_gpu_count,
+                gpu_names=gpu_names,
+                executed_width=executed_width,
             )
             # the identical fit check guarding this block guarantees a catalog width is present.
             remedy = (

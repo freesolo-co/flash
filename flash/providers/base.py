@@ -488,10 +488,22 @@ def smallest_fitting_gpu_count(
     *,
     max_gpu_count: int,
     gpu_names: tuple[str, ...] | None = None,
+    executed_width=None,
 ) -> int | None:
-    """Return the smallest rentable count whose structural pool can hold the run."""
+    """Return the smallest rentable count whose structural pool can hold the run.
+
+    ``executed_width`` maps a rented count to the ranks that actually JOIN the run, defaulting to
+    "all of them". Only sft narrows it (it shards by data, so the batch and retained rows bound the
+    rank count), and every consumer of this function is deciding something the user pays for -- an
+    auto-sized ceiling, an authored-ceiling check, a `--gpus N` suggestion. Crediting cards that
+    never join makes all three name a width that cannot hold the run.
+    """
+    launched = executed_width or (lambda count: count)
     for count in reversed(rentable_gpu_counts(max_gpu_count)):
-        if gpu_capacity_shape(count, min_vram_gb=min_vram_gb, gpu_names=gpu_names) is not None:
+        if (
+            gpu_capacity_shape(launched(count), min_vram_gb=min_vram_gb, gpu_names=gpu_names)
+            is not None
+        ):
             return count
     return None
 

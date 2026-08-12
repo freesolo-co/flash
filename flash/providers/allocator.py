@@ -28,6 +28,8 @@ from flash.providers.base import (
     wider_shape_remedy,
 )
 from flash.providers.fit_errors import (
+    catalog_check_hint,
+    drop_pin_hint,
     rents_arbitrary_card_counts,
     vram_fit_error_message,
     widenable_gpu_names,
@@ -431,51 +433,26 @@ def _resolve_exact_gpu(
         raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
 
     def _drop_pin_hint(above: int) -> str:
-        """Name dropping the pin AND the width it unlocks, or nothing if no width fits.
-
-        Routed through ``wider_shape_remedy`` so this shares the sibling path's two rules: a width
-        is only named once PROVED to fit (an oversized pin gets no hint at all, since dropping the
-        pin cannot help), and the ceiling is named alongside the pin -- reaching here means the
-        authored count already failed, so advice omitting it just buys a second rejection.
-        """
-        remedy = wider_shape_remedy(
-            unpinned_widths, need, ceiling=widest_cap, above=above, executed_width=launched
+        return drop_pin_hint(
+            exact,
+            unpinned_widths,
+            need,
+            ceiling=widest_cap,
+            above=above,
+            executed_width=launched,
         )
-        if not remedy:
-            return ""
-        # the shared helper opens with "; it fits on N cards -- ...", so splice the pin clause in
-        # front of its body rather than concatenating two separately punctuated sentences.
-        return f". Drop the provider pin to rent {exact!r}:{remedy.removeprefix(';')}"
 
     def _catalog_check_hint(above: int) -> str:
-        """Name the width to ASK a fixed-count provider for, when no offline width can be proved.
-
-        `live_capacity` means the count must be confirmed dynamically -- not that the wider SKU is
-        absent. Lambda really does resolve `gpu_4x_h100_pcie` against its catalog and rejects a
-        shape it does not sell with its own precise error, so naming the width to try beats a bare
-        shortfall the user cannot act on. Withheld once the class is oversized at every rentable
-        width, where no count would help and the honest answer is the shortfall alone.
-
-        Also withheld when NO configured provider carries this class at all: the obstacle is then
-        the class, not the width, and `--gpus N` cannot succeed at any N. That run belongs to the
-        `no configured active provider` rejection below, which names the real problem.
-
-        Withheld too when the run would not LAUNCH on the width found: `smallest_fitting_gpu_count`
-        credits rented cards, so for an sft run the batch caps at one rank it names a count that
-        buys nothing. Asking a provider to confirm a SKU that cannot help is a wasted round trip.
-        """
-        if widths or unpinned_widths or not (reachable or unpinned_reachable):
-            return ""
-        width = smallest_fitting_gpu_count(
-            need, max_gpu_count=widest_cap, gpu_names=(exact,) if exact_info.validated else ()
-        )
-        if width is None or width <= above:
-            return ""
-        if combined_vram_gb(exact_info.vram_gb, launched(width)) < need:
-            return ""
-        return (
-            f". Their catalog may list a {width}-card {exact} instance -- raise the card ceiling "
-            f"with `--gpus {width}` to check it against their catalog"
+        return catalog_check_hint(
+            exact,
+            need,
+            ceiling=widest_cap,
+            above=above,
+            # a freely-rentable width was already provable, or nothing carries this class: either
+            # way the catalog question is not the one to ask. see `catalog_check_hint`.
+            offerable=not (widths or unpinned_widths) and bool(reachable or unpinned_reachable),
+            validated=exact_info.validated,
+            executed_width=launched,
         )
 
     if exact_info.vram_gb < need and max_gpu_count <= 1:
@@ -544,6 +521,7 @@ def _resolved_gpu_count(
     available: tuple[str, ...],
     exact: str,
     unpinned: tuple[str, ...] | None = None,
+    executed_width=None,
 ) -> int:
     """Resolve auto-size or validate that an authored ceiling can structurally fit.
 
@@ -551,6 +529,10 @@ def _resolved_gpu_count(
     when nothing was pinned. A rejection needs it to decide whether dropping the pin is a remedy:
     ``available`` alone cannot tell a pin from a plane that only ever configured one provider, and
     a pin on such a plane drops to the same pool and the same failure.
+
+    ``executed_width`` maps a rented count to the ranks that join the run, so an auto-sized ceiling
+    and an authored-ceiling check are both decided on the width that will run. Without it an sft run
+    the batch caps at one rank is told to raise `[gpu] count` to a width that changes nothing.
 
     Certifies the pin (``certify=True``): this runs inside ``allocate()``, which already does
     network i/o and can retry, and the width decided here is the one the run is really rented at. A
@@ -564,7 +546,7 @@ def _resolved_gpu_count(
     gpu_names = _structural_gpu_names(available, exact)
     if requested_gpu_count is None:
         fitting_count = smallest_fitting_gpu_count(
-            need, max_gpu_count=auto_cap, gpu_names=gpu_names
+            need, max_gpu_count=auto_cap, gpu_names=gpu_names, executed_width=executed_width
         )
         if fitting_count is not None:
             return fitting_count
@@ -574,7 +556,12 @@ def _resolved_gpu_count(
             model_id, requested_gpu_count, model_revision=model_revision, certify=True
         )
         if (
-            smallest_fitting_gpu_count(need, max_gpu_count=effective_count, gpu_names=gpu_names)
+            smallest_fitting_gpu_count(
+                need,
+                max_gpu_count=effective_count,
+                gpu_names=gpu_names,
+                executed_width=executed_width,
+            )
             is not None
         ):
             return effective_count
@@ -587,6 +574,7 @@ def _resolved_gpu_count(
             max_gpu_count=auto_cap,
             gpu_names=gpu_names,
             providers=available,
+            executed_width=executed_width,
             # the pin is worth dropping only if the fleet behind it still buys a wider shape, so
             # ask the same question of the unpinned pool that the pinned one just failed.
             widenable_without_pin=(
@@ -810,6 +798,7 @@ def allocate(
         available=available,
         exact=exact,
         unpinned=unpinned,
+        executed_width=executed_width,
     )
 
     constraints = AllocationConstraints(

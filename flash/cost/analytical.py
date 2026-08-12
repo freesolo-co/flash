@@ -500,6 +500,11 @@ def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]
     shortfall reads the same whether it surfaced from `--cost` or from submit.
 
     Still a check and never a promise: nothing offline proved the wider SKU is purchasable.
+
+    Withheld when the run would not LAUNCH on the width found, mirroring ``_catalog_check_hint``:
+    ``smallest_fitting_gpu_count`` credits rented cards, so for an sft run the batch caps at fewer
+    ranks it names a count that buys idle cards. The mirror has to hold in both directions or
+    `--cost` promises a width submit rejects.
     """
     from flash.providers.base import MAX_COMBINATION_CARDS, smallest_fitting_gpu_count
 
@@ -509,6 +514,7 @@ def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]
             config.model_id, MAX_COMBINATION_CARDS, model_revision=config.model_revision
         ),
         gpu_names=names,
+        executed_width=lambda count: executed_gpu_count(config, count),
     )
     if width is None or width <= (config.gpu_count or 0):
         return ""
@@ -651,6 +657,9 @@ def _offline_gpu_shape(
                 max_gpu_count=auto_cap,
                 gpu_names=names,
                 providers=None if provider == "auto" else (provider,),
+                # same rule the ranking loop rejected shapes with, so the advice cannot name a
+                # width the retry will not launch on.
+                executed_width=lambda count: executed_gpu_count(config, count),
                 # an offline quote does not know the configured fleet, so it cannot claim that
                 # dropping a provider pin would make a wider shape purchasable.
                 widenable_without_pin=None,

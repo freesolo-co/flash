@@ -2065,6 +2065,38 @@ def test_pin_rejection_names_the_width_it_actually_credited():
     assert "join this run" not in full
 
 
+def test_width_search_credits_only_the_ranks_that_join():
+    """Regression: the shared width search credited rented cards on every consumer.
+
+    `smallest_fitting_gpu_count` backs the auto-sized ceiling, the authored-ceiling check, and both
+    catalog hints. Crediting cards that never join made all of them name a width that cannot hold
+    the run -- an unpinned sft run with `gpu.count=1` was told to raise the ceiling to two, and the
+    resubmission failed identically because `executed_width(2)` is still one.
+
+    Fixing the shared helper rather than each caller is what makes the ceiling search, the pinned
+    precheck, and the `--gpus N` advice answer one question.
+    """
+    from flash.providers.base import GPU_INFO, smallest_fitting_gpu_count
+
+    need = GPU_INFO["H100"].vram_gb + 40.0  # fits on 2 rented cards, never on 1
+
+    assert (
+        smallest_fitting_gpu_count(
+            need, max_gpu_count=8, gpu_names=("H100",), executed_width=lambda _n: 1
+        )
+        is None
+    ), "a run clamped to one rank has no fitting width, so no ceiling can be promised"
+
+    # unchanged for runs that launch what they rent, and unchanged when no rule is supplied at all.
+    assert smallest_fitting_gpu_count(need, max_gpu_count=8, gpu_names=("H100",)) == 2
+    assert (
+        smallest_fitting_gpu_count(
+            need, max_gpu_count=8, gpu_names=("H100",), executed_width=lambda n: n
+        )
+        == 2
+    )
+
+
 def test_catalog_hint_is_withheld_when_the_width_would_not_launch():
     """The `--gpus N` catalog hint searched widths crediting rented cards, like the remedy did.
 
