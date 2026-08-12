@@ -106,8 +106,8 @@ class _OpdProgressState:
         self.loss_curve = [float(value) for value in state.get("loss_curve", [])]
         self.coverage_curve = [float(value) for value in state.get("coverage_curve", [])]
         self.base_train_wall_seconds = float(state.get("train_wall_seconds", 0.0))
-        self._prev_aligned = int(state.get("aligned_sequences", state.get("granularity_n", 0)))
-        self._prev_cov_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
+        self._prev_aligned = int(state.get("aligned_sequences", 0))
+        self._prev_cov_sum = float(state.get("coverage_sum", 0.0))
         self._prev_truncated = int(state.get("truncated_rollouts", 0))
         self._prev_samples_seen = int(state.get("samples_seen", 0))
         self._prev_no_signal_skipped_steps = int(state.get("no_signal_skipped_steps", 0))
