@@ -839,15 +839,55 @@ def test_a_reply_with_text_and_tool_calls_is_not_exported_as_text_only(
 ) -> None:
     """One assistant action can contain both visible text and a tool invocation. Exporting only the
     text silently changes what happened and trains an incomplete target, so the whole row must skip.
+
+    Deliberately reported as `finish_reason: "stop"`, which is what a provider sends when the model
+    both answered and invoked. That isolates the message-payload guard: the finish-reason set does
+    not reject this row, so if the payload check regresses the row exports and this test fails.
     """
     owner = db.ensure_standalone_owner()
     response = _reply_envelope("I will look that up.")
-    response["choices"][0]["finish_reason"] = "tool_calls"
+    response["choices"][0]["finish_reason"] = "stop"
     response["choices"][0]["message"][action_key] = action
     store_trace(
         key_id=owner["id"],
         project_id=_PROJECT_ID,
         trace_title="tool call",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=response)],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == []
+    assert export["skipped"] == 1
+
+
+@pytest.mark.parametrize("tool_calls", [None, [], {}])
+def test_a_tool_call_finish_is_skipped_even_with_no_tool_calls_payload(
+    trace_api, tool_calls
+) -> None:
+    """`finish_reason: "tool_calls"` disqualifies a row on its own, without a tool-call payload.
+
+    Gating this on the message payload alone left a hole. A provider can report that the model
+    stopped to invoke a tool while sending an empty or absent `tool_calls` array -- OpenAI-compatible
+    backends behind OpenRouter do exactly this -- and both guards then pass: the finish reason was
+    accepted, and an empty list is falsy. The model's narration ("I will look that up.") exported as
+    the training target for an action that was never in the row.
+
+    The finish reason is the provider stating what the assistant did. When it says the turn ended in
+    an invocation, converted text cannot represent that turn, whatever the payload happens to carry.
+    """
+    owner = db.ensure_standalone_owner()
+    response = _reply_envelope("I will look that up.")
+    response["choices"][0]["finish_reason"] = "tool_calls"
+    if tool_calls is not None:
+        response["choices"][0]["message"]["tool_calls"] = tool_calls
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="empty tool call",
         metadata=None,
         spans=[TraceSpan(input_payload=_REQUEST, output_payload=response)],
     )

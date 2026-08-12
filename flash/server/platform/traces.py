@@ -48,9 +48,11 @@ _MAX_PAYLOAD_COLLECTION = 100_000
 _PAYLOAD_TRUNCATED_ATTRIBUTE = "payload_truncated"
 # absent finish reasons are accepted for providers and older envelopes that never supplied one;
 # explicit unknown reasons are rejected because they are not evidence of a clean terminal response.
-# `tool_calls` is a clean termination signal, but the message payload check below still rejects it
-# because converted text cannot represent the whole assistant action.
-_ACCEPTED_FINISH_REASONS = {None, "stop", "tool_calls"}
+# `tool_calls` is NOT accepted. it is a clean termination, but it says the assistant's action was an
+# invocation, and a converted row is text. leaving it in and relying on the message check below to
+# reject it left a hole: a provider that reports `finish_reason: "tool_calls"` while sending an
+# empty or absent `tool_calls` array passed both guards, and its narration exported as the target.
+_ACCEPTED_FINISH_REASONS = {None, "stop"}
 
 
 @dataclass
@@ -446,6 +448,11 @@ def _chat_reply(payload: Any) -> str | None:
     if message.get("tool_calls") or message.get("function_call"):
         # a training target must contain the whole assistant action. exporting only the accompanying
         # text would silently discard the invocation, so skipping the row is the only faithful choice.
+        #
+        # this is not redundant with the finish-reason check above: the two catch opposite halves of
+        # the same mismatch. that one rejects a response that SAYS it ended in a tool call; this one
+        # rejects a response that CARRIES one while reporting `stop`, which is what a provider does
+        # when the model both answered and invoked.
         return None
     return _message_text(message.get("content"))
 
