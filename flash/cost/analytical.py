@@ -291,12 +291,22 @@ def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str, provider: s
     resolved = (provider or "").strip().lower()
     if not resolved:
         resolved = n.provider if n.provider != "auto" else ""
-    executed = gpu_count
-    if n.method == "sft":
-        executed = sft_data_parallel_cards(
-            gpu_count, n.batch_size or 1, n.sft_retained_examples or 0
-        )
-    return multi_card_speedup(executed, gpu, resolved)
+    return multi_card_speedup(executed_gpu_count(config, gpu_count), gpu, resolved)
+
+
+def executed_gpu_count(config: RunConfig, gpu_count: int) -> int:
+    """Ranks this run launches on ``gpu_count`` cards, which is all of them except for sft.
+
+    THE definition of "how wide does this actually run", shared by the throughput model above and
+    the offline shape search below. They must not answer it separately: the quote reporting a shape
+    the allocator then rejects tells a user a run is feasible and priced, and then refuses it at
+    submit. sft shards by data, so its width is bounded by the batch and the retained rows; every
+    other algorithm runs the shape it rents.
+    """
+    n = config.normalized()
+    if n.method != "sft":
+        return gpu_count
+    return sft_data_parallel_cards(gpu_count, n.batch_size or 1, n.sft_retained_examples or 0)
 
 
 def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int, provider: str = "") -> float:
@@ -579,7 +589,12 @@ def _offline_gpu_shape(
     for gpu in names:
         info = GPU_INFO[gpu]
         for count in rentable_gpu_counts(safe_gpu_count):
-            if combined_vram_gb(info.vram_gb, count) < need:
+            # credit only the cards that JOIN the run, matching the allocator's `_fits`. quoting the
+            # billed count here made the two disagree: a 27B at 128k over 10 rows was quoted 4x H200
+            # (460 GB credited against a 422 GB need) while the allocator launches 2 ranks -- 234 GB
+            # -- and rejects it, so the run was priced as feasible and then refused at submit.
+            launched = executed_gpu_count(config, count)
+            if combined_vram_gb(info.vram_gb, launched) < need:
                 continue
             # Provisional quoting is structural and must not touch a live market. Vast pricing is
             # offer-backed (therefore capacity-backed), and Lambda's catalog can blip too. Use the
@@ -601,7 +616,7 @@ def _offline_gpu_shape(
                 (
                     hourly * count * step_seconds,
                     count,
-                    combined_vram_gb(info.vram_gb, count),
+                    combined_vram_gb(info.vram_gb, launched),
                     info.vram_gb,
                     gpu,
                     hourly,

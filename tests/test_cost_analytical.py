@@ -405,3 +405,50 @@ def test_revision_pinned_sizing_flows_into_setup_and_required_save(monkeypatch, 
     default = RunConfig(SMALL, "sft", 100, save_at_steps=(100,))
     assert setup_seconds(pinned) < setup_seconds(default)
     assert required_save_overhead_seconds(pinned) < required_save_overhead_seconds(default)
+
+
+def test_offline_quote_and_allocator_agree_on_the_executed_sft_width():
+    """A quoted shape must be one the allocator will actually accept.
+
+    Both sides credit multi-card VRAM from sharding, so both must credit the same number of ranks.
+    The offline quote used the BILLED count while the allocator credits the launched one, so a 27B
+    at 128k over 10 retained rows was quoted 4x H200 -- 460 GB credited against a 422 GB need --
+    while the allocator launches 2 ranks (10 rows cannot split 4 ways), credits 234 GB, and rejects
+    it. The run was priced as feasible and then refused at submit.
+
+    Asserted as agreement rather than against a literal shape: the requirement moves with the vram
+    model, but the two paths must never disagree about the same run.
+    """
+    import pytest
+
+    from flash.cost.analytical import _offline_gpu_shape, executed_gpu_count
+    from flash.cost.types import RunConfig
+    from flash.providers.allocator import _fits
+    from flash.providers.base import GPU_INFO, Candidate
+
+    def quoted_shape_is_allocatable(**kwargs):
+        config = RunConfig("Qwen/Qwen3.6-27B", "sft", 10, **kwargs)
+        gpu, need, count, _provider, rate = _offline_gpu_shape(config)
+        candidate = Candidate(
+            provider="runpod",
+            gpu=gpu,
+            hourly_usd=rate,
+            vram_gb=GPU_INFO[gpu].vram_gb,
+            gpu_count=count,
+        )
+        return _fits(candidate, need, executed_gpu_count(config, count))
+
+    # the shape that exposed the disagreement: rows bind the width below the quoted card count.
+    with pytest.raises(ValueError, match="VRAM"):
+        quoted_shape_is_allocatable(seq_len=131072, batch_size=8, sft_retained_examples=10)
+
+    # and a run that genuinely fits must still be quoted, or the clamp would reject everything.
+    assert quoted_shape_is_allocatable(seq_len=4096, batch_size=8, sft_retained_examples=64)
+
+    # the shared helper is the reason they cannot drift: sft narrows, everything else does not.
+    grpo = RunConfig("Qwen/Qwen3.6-27B", "grpo", 10, batch_size=8, sft_retained_examples=10)
+    assert executed_gpu_count(grpo, 4) == 4
+    sft_rows_bound = RunConfig(
+        "Qwen/Qwen3.6-27B", "sft", 10, batch_size=8, sft_retained_examples=10
+    )
+    assert executed_gpu_count(sft_rows_bound, 4) == 2
