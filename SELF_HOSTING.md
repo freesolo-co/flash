@@ -161,7 +161,10 @@ is never rewritten on the way out.
 
 Each request records one `chat.completions` span after a normal response, a streamed response,
 a client disconnect, or an upstream failure. The request and response payloads land in the
-plane's own SQLite database under the authenticated single-tenant owner. Export them with:
+plane's own SQLite database under the authenticated single-tenant owner. If a streamed provider
+call succeeds but persistence fails after headers were sent, the stream ends with the SSE comment
+`: freesolo-record-failed`; conforming SSE clients ignore comments, while collection clients can
+watch for it and report the missing trace. Export stored traces with:
 
 ```bash
 flash traces export --project 11111111-1111-4111-8111-111111111111
@@ -169,10 +172,14 @@ flash traces export --project 11111111-1111-4111-8111-111111111111 --format prom
 flash traces export --project 11111111-1111-4111-8111-111111111111 --format raw
 ```
 
-`records` pairs a request with its reply and skips calls that failed or never answered, so a
-provider error is never exported as a completion to train toward. `prompts` needs only the
-request. `raw` returns every stored trace, failures included. An export reads the newest 1000
-traces; past that it says so rather than presenting a partial dump as the whole project.
+For recording-proxy traces, `records` emits the last user message's text as `input` and the first
+choice's assistant text as `output`; text content parts are joined. `prompts` emits the same
+last-user text without the reply. Both formats skip rows missing the text they require, and
+`records` also skips calls that failed, ended mid-stream, or never answered, so a provider error or
+partial reply is never exported as a completion to train toward. Non-proxy spans retain their
+stored payload shapes. `raw` returns every stored trace verbatim, failures included. An export
+reads the newest 1000 traces; past that it says so rather than presenting a partial dump as the
+whole project.
 
 A standalone plane is single-tenant and applies no rate limit or spend limit to this proxy.
 Every forwarded call uses the caller-supplied paid provider key. Do not expose the endpoint to

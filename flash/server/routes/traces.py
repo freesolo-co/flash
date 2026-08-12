@@ -165,8 +165,9 @@ class _UpstreamRequestContext:
 
 def _is_secret_key(key: Any) -> bool:
     normalized = str(key).casefold().replace("_", "").replace("-", "")
-    return normalized in _SECRET_KEY_EXACT or any(
-        normalized.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES
+    return normalized in _SECRET_KEY_EXACT or (
+        normalized != "token"
+        and any(normalized.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES)
     )
 
 
@@ -321,9 +322,32 @@ async def _upstream_failure_response(context: _UpstreamRequestContext) -> Respon
     )
 
 
+class _StringFragments:
+    def __init__(self, value: str) -> None:
+        self.parts = [value]
+
+    def append(self, value: str) -> None:
+        self.parts.append(value)
+
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+def _materialize_fragments(value: Any) -> Any:
+    if isinstance(value, _StringFragments):
+        return value.text()
+    if isinstance(value, dict):
+        return {key: _materialize_fragments(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_materialize_fragments(item) for item in value]
+    return value
+
+
 def _content_parts(value: Any) -> list[Any]:
     if isinstance(value, list):
         return list(value)
+    if isinstance(value, _StringFragments):
+        value = value.text()
     if isinstance(value, str):
         return [{"type": "text", "text": value}] if value else []
     return [value]
@@ -332,16 +356,19 @@ def _content_parts(value: Any) -> list[Any]:
 def _append_fragment(target: dict[str, Any], key: str, value: Any) -> None:
     current = target.get(key)
     if isinstance(value, str):
-        if isinstance(current, str):
-            target[key] = f"{current}{value}"
+        if isinstance(current, _StringFragments):
+            current.append(value)
+        elif isinstance(current, str):
+            target[key] = _StringFragments(current)
+            target[key].append(value)
         elif isinstance(current, list):
-            target[key] = [*current, *_content_parts(value)]
+            current.extend(_content_parts(value))
         else:
-            target[key] = value
+            target[key] = _StringFragments(value)
     elif isinstance(value, list):
         if isinstance(current, list):
-            target[key] = [*current, *value]
-        elif isinstance(current, str):
+            current.extend(value)
+        elif isinstance(current, str | _StringFragments):
             target[key] = [*_content_parts(current), *value]
         else:
             target[key] = list(value)
@@ -359,9 +386,16 @@ def _merge_fragment_dict(target: dict[str, Any], fragment: dict[str, Any]) -> No
                 target[key] = dict(value)
         elif isinstance(value, str):
             current = target.get(key)
-            if current == value and key in {"id", "type"}:
+            current_text = current.text() if isinstance(current, _StringFragments) else current
+            if current_text == value and key in {"id", "type"}:
                 continue
-            target[key] = f"{current}{value}" if isinstance(current, str) else value
+            if isinstance(current, _StringFragments):
+                current.append(value)
+            elif isinstance(current, str):
+                target[key] = _StringFragments(current)
+                target[key].append(value)
+            else:
+                target[key] = _StringFragments(value)
         elif value is not None:
             target[key] = value
 
@@ -370,6 +404,7 @@ class _SseAccumulator:
     def __init__(self) -> None:
         self._buffer = b""
         self._choices: dict[int, dict[str, Any]] = {}
+        self._done = False
         self.usage: Any = None
 
     def feed(self, chunk: bytes) -> None:
@@ -394,14 +429,23 @@ class _SseAccumulator:
         """
         return bool(self._choices)
 
+    @property
+    def terminal(self) -> bool:
+        return self._done or (
+            bool(self._choices)
+            and all(choice["finish_reason"] is not None for choice in self._choices.values())
+        )
+
     def output(self) -> dict[str, Any]:
         choices: list[dict[str, Any]] = []
         for index in sorted(self._choices):
             state = self._choices[index]
-            message = dict(state["message"])
+            message = _materialize_fragments(state["message"])
             tool_calls = state["tool_calls"]
             if tool_calls:
-                message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+                message["tool_calls"] = [
+                    _materialize_fragments(tool_calls[i]) for i in sorted(tool_calls)
+                ]
             choices.append(
                 {
                     "index": index,
@@ -425,7 +469,10 @@ class _SseAccumulator:
         if not line.startswith(b"data:"):
             return
         data = line[len(b"data:") :].strip()
-        if not data or data == b"[DONE]":
+        if not data:
+            return
+        if data == b"[DONE]":
+            self._done = True
             return
         try:
             payload = json.loads(data)
@@ -465,7 +512,11 @@ class _SseAccumulator:
         for key, value in delta.items():
             if key in {"role", "function_call", "tool_calls"}:
                 continue
-            if isinstance(value, str) or (key in message and isinstance(message[key], str)):
+            if isinstance(value, dict) and isinstance(message.get(key), dict):
+                _merge_fragment_dict(message[key], value)
+            elif isinstance(value, str) or (
+                key in message and isinstance(message[key], str | _StringFragments)
+            ):
                 _append_fragment(message, key, value)
             elif key not in message:
                 message[key] = value
@@ -504,6 +555,7 @@ async def _stream_response(
     raw_output = bytearray()
     is_error = upstream_response.status_code >= 400
     error = _error_for_status(upstream_response.status_code)
+    client_disconnected = False
     try:
         async for chunk in upstream_response.aiter_bytes():
             if context.record_trace:
@@ -517,6 +569,7 @@ async def _stream_response(
                     accumulator.feed(chunk)
             yield chunk
     except (asyncio.CancelledError, GeneratorExit):
+        client_disconnected = True
         error = "client disconnected"
         raise
     except Exception:
@@ -544,7 +597,11 @@ async def _stream_response(
                         # training pair whose response half is an empty envelope -- exactly the
                         # row that format exists to skip.
                         output_payload = accumulator.output() if accumulator.received else None
+                        if error is None and accumulator.received and not accumulator.terminal:
+                            error = "upstream stream ended before completion"
                     await _record_trace(context, output_payload=output_payload, error=error)
+    if context.record_trace and context.record_failed and not client_disconnected:
+        yield b": freesolo-record-failed\n\n"
 
 
 def _request_context(

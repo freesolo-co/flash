@@ -279,6 +279,7 @@ def _raw_trace(trace_row: Any, span_rows: list[Any]) -> dict[str, Any]:
 
 
 def _training_pair(spans: list[dict[str, Any]]) -> tuple[Any, Any]:
+    """Return a trainable pair, reducing chat envelopes to their last user and assistant text."""
     input_payload = next(
         (span.get("input_payload") for span in spans if _usable_payload(span.get("input_payload"))),
         None,
@@ -294,7 +295,56 @@ def _training_pair(spans: list[dict[str, Any]]) -> tuple[Any, Any]:
         ),
         None,
     )
-    return input_payload, output_payload
+    # each half falls back on its own. a span pairing a chat request with a non-chat response (or
+    # the reverse) is not this proxy's shape, and reducing the half that IS an envelope while
+    # dropping the half that is not would silently discard a usable reply and skip the row.
+    prompt = _chat_prompt(input_payload)
+    reply = _chat_reply(output_payload)
+    return (
+        input_payload if prompt is None else prompt,
+        output_payload if reply is None else reply,
+    )
+
+
+def _chat_prompt(payload: Any) -> str | None:
+    """The prompt text of a chat-completions request, or None when it is not one.
+
+    The LAST user turn, not the whole conversation: a recorded request carries the system prompt
+    and every prior turn, and `records` pairs one prompt with one reply. Joining the whole
+    transcript into the prompt half would train the model to produce a reply to a conversation it
+    is also being shown the answers to.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+        return None
+    for message in reversed(payload["messages"]):
+        if isinstance(message, dict) and message.get("role") == "user":
+            return _message_text(message.get("content")) or ""
+    return ""
+
+
+def _chat_reply(payload: Any) -> str | None:
+    """The assistant text of a chat-completions response, or None when it is not one."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
+        return None
+    if not payload["choices"]:
+        return ""
+    choice = payload["choices"][0]
+    if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+        return ""
+    return _message_text(choice["message"].get("content")) or ""
+
+
+def _message_text(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    parts = [
+        part.get("text")
+        for part in content
+        if isinstance(part, dict) and isinstance(part.get("text"), str)
+    ]
+    return "".join(parts) if parts else None
 
 
 def _usable_payload(value: Any) -> bool:

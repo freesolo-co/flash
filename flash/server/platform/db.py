@@ -315,13 +315,13 @@ def ensure_standalone_owner() -> dict:
     Not reachable by presenting a token: nothing hashes to the sentinel, so this row is only ever
     returned to a caller who already matched the operator key in ``authenticate``.
 
-    Runs already in the store are ADOPTED, not orphaned. A plane that ran managed first -- or ran
-    on an earlier build of this code -- has runs pointing at whichever key row created them, and
-    leaving them there would reproduce the bug this row exists to fix the moment standalone is
-    switched on: empty listing, 404 on status/logs/cancel, an in-flight job still spending. Adopting
-    is sound precisely because standalone is SINGLE-TENANT: there is exactly one principal, so
-    every run in this store is already the operator's, and there is no second identity that
-    reassignment could take a run away from.
+    Runs and traces already in the store are ADOPTED, not orphaned. A plane that ran managed first
+    -- or ran on an earlier build of this code -- has records pointing at whichever key row created
+    them, and leaving them there would reproduce the bug this row exists to fix the moment
+    standalone is switched on: empty run and trace listings, 404 on status/logs/cancel, an in-flight
+    job still spending. Adopting is sound precisely because standalone is SINGLE-TENANT: there is
+    exactly one principal, so every run and trace in this store is already the operator's, and there
+    is no second identity that reassignment could take a record away from.
 
     Called on EVERY authenticated request, so in the steady state this function must issue NO
     write statements at all. SQLite has a single write slot and takes it for any write regardless
@@ -335,12 +335,12 @@ def ensure_standalone_owner() -> dict:
       purely that it takes the write slot. Kept as OR IGNORE in the miss path because two threads
       can both miss the SELECT and race to insert; OR IGNORE makes the loser a no-op instead of
       an IntegrityError, and the re-read then returns the winner's row.
-    - The adoption `UPDATE` cannot use `runs_key_idx` (`WHERE key_id != ?` plans as `SCAN runs`),
-      so unguarded it would also full-scan the whole run history every request. The `< or >`
-      split is a MULTI-INDEX OR over the covering index that stops at the first foreign row: at
-      50k runs, 1.22 ms/call becomes 0.003 ms/call. Standalone mints no new foreign rows --
-      `record_run` takes the key_id of the authenticated identity, which is this row -- so the
-      guard cannot miss a run that appears later.
+    - The adoption `UPDATE`s cannot use their key indexes (`WHERE key_id != ?` plans as a table
+      scan), so unguarded they would also full-scan the whole run and trace histories every request.
+      The `< or >` split is a MULTI-INDEX OR over each covering index that stops at the first foreign
+      row. Standalone mints no new foreign rows -- new runs and traces take the key_id of the
+      authenticated identity, which is this row -- so the guards cannot miss a record that appears
+      later.
     """
     now = time.time()
     with _connect() as conn:
@@ -363,6 +363,14 @@ def ensure_standalone_owner() -> dict:
         ).fetchone()
         if unowned is not None:
             conn.execute("UPDATE runs SET key_id = ? WHERE key_id != ?", (row["id"], row["id"]))
+        unowned_traces = conn.execute(
+            "SELECT 1 FROM llm_traces WHERE key_id < ? OR key_id > ? LIMIT 1",
+            (row["id"], row["id"]),
+        ).fetchone()
+        if unowned_traces is not None:
+            conn.execute(
+                "UPDATE llm_traces SET key_id = ? WHERE key_id != ?", (row["id"], row["id"])
+            )
     return dict(row)
 
 
