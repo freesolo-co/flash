@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 import tomllib
 from pathlib import Path
 
@@ -133,21 +134,13 @@ def test_the_serve_modal_extra_installs_what_the_generated_app_imports_locally()
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             imported.add(node.module.split(".")[0])
 
-    stdlib = {
-        "__future__",
-        "asyncio",
-        "contextlib",
-        "hashlib",
-        "hmac",
-        "os",
-        "time",
-        "uuid",
-        "typing",
-        "json",
-        "datetime",
-        "dataclasses",
-    }
-    missing = sorted(imported - stdlib - packages)
+    # Asked of the running interpreter rather than hand-listed. A literal set has to be edited
+    # every time the template picks up another stdlib module, and forgetting turns an ordinary
+    # `import shutil` into "[serve-modal] does not install ['shutil']" -- a failure that names the
+    # wrong problem and cannot be fixed by adding the package it asks for. The names are
+    # version-specific, so on 3.11 this still rejects a module that is only stdlib in 3.12, which
+    # is what `requires-python = ">=3.11"` means.
+    missing = sorted(imported - sys.stdlib_module_names - packages)
     assert not missing, f"[serve-modal] does not install {missing}, imported at module scope"
 
 
