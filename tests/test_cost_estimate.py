@@ -916,7 +916,10 @@ def test_quote_catalog_check_is_withheld_when_the_sft_width_would_not_launch():
     not a check worth a provider round trip.
 
     The grpo control is the point: same pool, same pin, same shortfall, and it still names the width
-    -- so this cannot pass by suppressing the remedy everywhere.
+    -- so this cannot pass by suppressing the remedy everywhere. Its batch has to be widened to earn
+    that, because grpo bounds its width too now (see `rl_data_parallel_cards`): `RunConfig.batch_size`
+    IS grpo's `prompts_per_step`, so at 1 prompt x 4 generations the control would clamp for the same
+    reason as the sft arm and stop being a control at all.
     """
     from flash.cost.analytical import _offline_gpu_shape
     from flash.cost.types import RunConfig
@@ -941,9 +944,11 @@ def test_quote_catalog_check_is_withheld_when_the_sft_width_would_not_launch():
         "confirm one is a round trip that cannot fix the quote"
     )
 
-    # grpo launches every card it rents, so its catalog check is unchanged at the SAME shortfall.
+    # grpo whose step fills every rank still names the width, at the SAME shortfall: 8 prompts x 4
+    # generations is 32 sequences, which divides every rentable count, so nothing clamps and the
+    # remedy is reached exactly as before.
     with pytest.raises(ValueError, match="VRAM") as grpo:
-        _offline_gpu_shape(RunConfig(method="grpo", **shared))
+        _offline_gpu_shape(RunConfig(method="grpo", **{**shared, "batch_size": 8}))
     assert "--gpus" in str(grpo.value)
 
 

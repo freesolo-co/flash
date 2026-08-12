@@ -29,6 +29,7 @@ from flash.providers.base import (
     wider_shape_remedy,
 )
 from flash.providers.fit_errors import (
+    batch_bound_width_note,
     catalog_check_hint,
     drop_pin_hint,
     rents_arbitrary_card_counts,
@@ -63,25 +64,6 @@ def required_vram_gb(
         headroom=vram_headroom(),
         model_revision=model_revision,
     )
-
-
-def profile_required_vram_gb() -> int:
-    """VRAM a workload-profile job needs: none beyond the smallest rentable card.
-
-    A profile job renders and tokenizes the exact dataset on cpu and exits before model weights or
-    cuda are touched, so sizing it like the training run it measures would rent (and bill) a card the
-    work never uses.
-    """
-    return 1
-
-
-def _profile_cost_ranker():
-    """``candidate -> dollars for the profile job``, which is rate alone.
-
-    The profile's wall is a fixed cap rather than a function of the hardware, so no card finishes it
-    sooner and the cheapest rentable shape always wins.
-    """
-    return lambda candidate: candidate.total_hourly_usd
 
 
 # RunConfig field -> the `train` knob holding the same quantity. The two vocabularies differ, so
@@ -179,15 +161,22 @@ def _fits(candidate: Candidate, need: int, executed_gpu_count: int = 0) -> bool:
 
 
 def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int:
-    """Ranks a run of this shape would actually launch, which is the card count except for sft.
+    """Ranks a run of this shape would actually launch, which is the card count unless a batch bounds it.
 
     Reads the executed batch from the SAME substituted knobs sizing does (``_overridden_train``) so
     the fit gate and the VRAM requirement describe one run. The retained row count comes from
     ``overrides`` instead: it is a profile measurement rather than a ``TrainSpec`` sizing knob, so
     ``_TRAIN_KNOB_FOR_OVERRIDE`` never carries it onto ``train`` and reading it there would miss
     every rows-bound narrowing.
+
+    Both branches are the same rule -- verl divides the batch across dp ranks, so a rank with no
+    share cannot launch -- over each algorithm's own unit of work: sft counts rows, grpo/opd count
+    the sequences one step holds after the group repeat.
     """
-    if (algorithm or "").strip().lower() != "sft":
+    algo = (algorithm or "").strip().lower()
+    if algo in ("grpo", "rl", "opd"):
+        return _executed_rl_gpu_count(algo, train, gpu_count)
+    if algo != "sft":
         return gpu_count
     batch = _sizing_int(train, "batch_size", 0)
     if batch <= 0:
@@ -203,6 +192,38 @@ def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int
     return sft_data_parallel_cards(
         gpu_count, batch, _sizing_int(overrides, "sft_retained_examples", 0)
     )
+
+
+def _executed_rl_gpu_count(algorithm: str, train, gpu_count: int) -> int:
+    """Ranks grpo/opd would launch: bounded by the SEQUENCES one step holds, not the prompt count.
+
+    Both algorithms hand verl ``data.train_batch_size = prompts_per_step`` (grpo
+    ``train/rl/verl_config.py``, opd ``opd_train_runner`` via ``train/opd/overrides.py``) and then
+    ``batch.repeat(rollout.n)``, so a step carries ``prompts_per_step * group_size`` sequences. That
+    product is the quantity verl chunks across dp ranks -- verl derives its own agent-loop worker
+    count from the same product -- and it must divide the width exactly or the run aborts at step 0.
+
+    An unknown prompt count does not narrow, matching the sft branch: defaulting it would assert the
+    most restrictive width on every caller that ranks without knobs and reject multi-card rl
+    outright.
+
+    An unknown ``group_size`` takes the RECIPE default for this algorithm, which is the value the
+    worker resolves it to (``train/rl/inputs.py``: ``gcfg.get("group_size") or rl.group_size``) and
+    the one the cost path fills in (``RunConfig.normalized``). Hardcoding 1 here would under-credit a
+    grpo step eightfold -- `RECIPE.rl.group_size` is 8 -- so one prompt on eight cards would be
+    sized as a single rank and a model that fits across the fsdp group would be REJECTED before it
+    could launch. The two defaults differ by algorithm (grpo groups, opd distills one completion per
+    prompt), which is exactly why this reads the recipe rather than a literal.
+    """
+    prompts = _sizing_int(train, "prompts_per_step", 0)
+    if prompts <= 0:
+        return gpu_count
+    from flash.engine.plan.recipe import RECIPE
+    from flash.engine.plan.steps import rl_data_parallel_cards
+
+    recipe = RECIPE.opd if algorithm == "opd" else RECIPE.rl
+    group = _sizing_int(train, "group_size", recipe.group_size)
+    return rl_data_parallel_cards(gpu_count, prompts * group)
 
 
 def _executed_width(algorithm: str, train, overrides):
@@ -244,13 +265,19 @@ def _fitting_candidates(candidates, need: int, executed_width) -> list:
 
 
 def _sizing_int(train, name: str, default: int) -> int:
-    """A positive int knob off a dict-or-object ``train``, or ``default`` when absent/unusable."""
+    """A positive int knob off a dict-or-object ``train``, or ``default`` when absent/unusable.
+
+    ``OverflowError`` joins the type errors because ``int(float("inf"))`` raises it, and sizing runs
+    BEFORE the knob validator that rejects a non-finite number: escaping here turns the clean 400
+    that validator produces into a 500. Unusable is unusable however the conversion fails -- the run
+    is still rejected, this only has to let the rejection reach the validator that words it.
+    """
     if train is None:
         return default
     value = train.get(name) if isinstance(train, dict) else getattr(train, name, None)
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return number if number > 0 else default
 
@@ -295,13 +322,27 @@ _UNCERTIFIED_CAP = 4
 def geometry_safe_gpu_cap(
     model_id: str, max_gpu_count: int, *, model_revision: str = "", certify: bool = False
 ) -> int:
-    """Rentable ceiling whose sequence-parallel divisibility is known before paid allocation.
+    """Rentable ceiling whose head divisibility is known before paid allocation.
 
-    The width becomes ``ulysses_sequence_parallel_size``, and verl requires
-    ``num_attention_heads % sp_size == 0``, so a catalog row is only safe at the counts that divide
-    its OWN head count. Curated membership is not uniform geometry: catalog head counts are 8, 8,
-    16, 16, 24, and 16, so trusting membership alone accepted an 8-card width for the 27B (24 heads)
-    that verl rejects at Ulysses init, after the box was already rented.
+    The width becomes vLLM's ``tensor_model_parallel_size`` for the rollout engine (grpo
+    ``train/rl/verl_config.py``, opd ``train/opd/overrides.py``), and vLLM requires
+    ``num_attention_heads % tp_size == 0`` -- it raises at engine init otherwise -- so a catalog row
+    is only safe at the counts that divide its OWN head count. Curated membership is not uniform
+    geometry: catalog head counts are 8, 8, 16, 16, 24, and 16, so trusting membership alone
+    accepted an 8-card width for the 27B (24 heads) that the engine rejects at init, after the box
+    was already rented.
+
+    This cap OUTLIVED ulysses. It was written when the width was also
+    ``ulysses_sequence_parallel_size``; sequence parallelism is now pinned off on all three
+    algorithms (it corrupts GatedDeltaNet state), but rollout tensor parallelism still consumes the
+    same width, so the same divisibility gate is still what stands between a rented box and a
+    post-payment engine failure.
+
+    Scope, stated precisely: this certifies QUERY-head divisibility only. vLLM also constrains kv
+    heads and the GDN linear dimensions under tensor parallelism, and Flash records both
+    (``num_key_value_heads``, ``linear_num_value_heads``) without gating on them. Every current row
+    divides 1/2/4/8 on all three axes, so nothing is mis-admitted today. Widening the check to those
+    two axes is a separate invariant and deliberately not in this change.
 
     The head count is READ from the row (``num_attention_heads``), never derived: ``hidden_size //
     head_dim`` is a different number on four of the six rows -- see ``_query_attention_heads``.
@@ -388,6 +429,7 @@ def _resolve_exact_gpu(
     widest_cap: int = 1,
     unpinned: tuple[str, ...] | None = None,
     executed_width=None,
+    algorithm: str = "",
 ) -> tuple[str, tuple[str, ...]]:
     """Validate an explicitly pinned GPU class and narrow ``available`` to providers that offer it.
 
@@ -397,7 +439,8 @@ def _resolve_exact_gpu(
 
     ``executed_width`` is ``_executed_width``'s rule. Both the combination precheck below and every
     ``--gpus N`` remedy have to apply it, or a pinned sft run whose batch caps it at one rank is told
-    to buy cards that cannot hold it.
+    to buy cards that cannot hold it. ``algorithm`` only words the reason for that narrowing, so it
+    defaults to sft's phrasing rather than being required of every caller.
     """
     launched = executed_width or (lambda count: count)
     exact = canonical_gpu(gpu_type)
@@ -487,8 +530,12 @@ def _resolve_exact_gpu(
             f"exact GPU {exact!r} cannot fit this run even as a {tried}-card combination"
             + (
                 f" (of the {cap} cards allowed, only {tried} "
-                f"{'joins' if tried == 1 else 'join'} this run -- sft shards by data, so the "
-                f"batch and retained rows bound the rank count)"
+                f"{'joins' if tried == 1 else 'join'} this run"
+                # the reason comes from the shared formatter rather than being spelled again here:
+                # this copy said "sft" unconditionally, so a pinned small-batch grpo/opd run was sent
+                # to a batch knob opd rejects at parse time and rows rl does not have. the dash form,
+                # not the parenthetical: this clause is already inside parens.
+                f"{batch_bound_width_note(algorithm=algorithm)})"
                 if tried != cap
                 else ""
             )
@@ -715,7 +762,6 @@ def allocate(
     gpu_type: str = "",
     model_revision: str = "",
     max_gpu_count: int | None = None,
-    workload_profile: bool = False,
     overrides: dict | None = None,
 ) -> Allocation:
     """Pick the cheapest fitting combination of (provider, GPU class, count) able to run the job.
@@ -723,8 +769,6 @@ def allocate(
     ``max_gpu_count=None`` auto-sizes to the smallest geometry-safe ceiling that can fit. an integer
     is an authored hard ceiling; fitting shapes up to that ceiling still compete on dollars per step.
 
-    ``workload_profile=True`` allocates the cpu-only profile job instead of the run it measures: it
-    needs no training VRAM and gains nothing from a faster card, so it ranks on rate alone.
     """
     # the same profile knobs ranking prices on: VRAM must be sized for the work that will RUN, not
     # the authored request. an exact-unpacked run executes batch 1 at the measured length, so sizing
@@ -734,17 +778,13 @@ def allocate(
     # bound before the pinned-class checks below, which need it too: every question about a card
     # count in this function is asked through this one rule. see `_executed_width`.
     executed_width = _executed_width(algorithm, sized_train, overrides)
-    if workload_profile:
-        need = profile_required_vram_gb()
-        max_gpu_count = 1
-    else:
-        need = required_vram_gb(
-            model_id,
-            algorithm,
-            train=sized_train,
-            thinking=thinking,
-            model_revision=model_revision,
-        )
+    need = required_vram_gb(
+        model_id,
+        algorithm,
+        train=sized_train,
+        thinking=thinking,
+        model_revision=model_revision,
+    )
     provider = (provider or "").strip().lower()
     if provider and provider not in PROVIDER_NAMES:
         raise UnsupportedGpuError(
@@ -786,6 +826,7 @@ def allocate(
             ),
             unpinned=unpinned,
             executed_width=executed_width,
+            algorithm=algorithm,
         )
         if not available:
             raise UnsupportedGpuError(f"exact GPU {exact!r} has no configured active provider")
@@ -834,10 +875,8 @@ def allocate(
             lookup_failed=lookup_failed,
             executed_width=executed_width,
         )
-    cost_per_step = (
-        _profile_cost_ranker()
-        if workload_profile
-        else _step_cost_ranker(model_id, algorithm, train, thinking, model_revision, overrides)
+    cost_per_step = _step_cost_ranker(
+        model_id, algorithm, train, thinking, model_revision, overrides
     )
     return _cheapest_allocation(candidates, need=need, cost_per_step=cost_per_step)
 

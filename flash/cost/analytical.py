@@ -23,7 +23,7 @@ from flash.cost.facts import (
     total_params_b,
 )
 from flash.cost.types import CostEstimate, RunConfig
-from flash.engine.plan.steps import sft_data_parallel_cards
+from flash.engine.plan.steps import rl_data_parallel_cards, sft_data_parallel_cards
 from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY, opd_teacher_request_multiplier
 
@@ -295,18 +295,23 @@ def method_card_speedup(config: RunConfig, gpu_count: int, gpu: str, provider: s
 
 
 def executed_gpu_count(config: RunConfig, gpu_count: int) -> int:
-    """Ranks this run launches on ``gpu_count`` cards, which is all of them except for sft.
+    """Ranks this run launches on ``gpu_count`` cards, which a small batch can bound below it.
 
     THE definition of "how wide does this actually run", shared by the throughput model above and
     the offline shape search below. They must not answer it separately: the quote reporting a shape
     the allocator then rejects tells a user a run is feasible and priced, and then refuses it at
-    submit. sft shards by data, so its width is bounded by the batch and the retained rows; every
-    other algorithm runs the shape it rents.
+    submit. Every algorithm shards by data, so every width is bounded by the work one step holds --
+    rows for sft, sequences (prompts times group) for grpo and opd. Mirrors
+    ``allocator._executed_gpu_count``; the two are one rule stated on each side of the quote.
     """
     n = config.normalized()
-    if n.method != "sft":
+    if n.method == "sft":
+        return sft_data_parallel_cards(gpu_count, n.batch_size or 1, n.sft_retained_examples or 0)
+    prompts = int(n.batch_size or 0)
+    if prompts <= 0:
+        # unknown batch does not narrow: see `_executed_rl_gpu_count`.
         return gpu_count
-    return sft_data_parallel_cards(gpu_count, n.batch_size or 1, n.sft_retained_examples or 0)
+    return rl_data_parallel_cards(gpu_count, prompts * int(n.group_size or 1))
 
 
 def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int, provider: str = "") -> float:
@@ -689,40 +694,6 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
     return gpu, need, count, provider, hourly
 
 
-def _offline_profile_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
-    """Offline structural quote for a cpu-only profile job: the cheapest rentable single card.
-
-    Mirrors ``_offline_gpu_shape``'s offline-only rule, but not its ranking: the profile job's wall
-    is a fixed cap, so no card finishes it sooner and rate alone decides.
-    """
-    from flash.providers.allocator import profile_required_vram_gb
-    from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
-
-    need = profile_required_vram_gb()
-    provider = config.provider if config.provider != "auto" else "auto"
-    names = (
-        (canonical_gpu(config.gpu_type),)
-        if config.gpu_type
-        else tuple(info.name for info in GPU_INFO.values() if info.enum_member and info.validated)
-    )
-    ranked = []
-    for gpu in names:
-        info = GPU_INFO[gpu]
-        if provider != "auto" and provider not in providers_for(gpu):
-            continue
-        if provider == "lambda":
-            from flash.providers.lambda_.pricing import static_hourly_rate
-
-            hourly = static_hourly_rate(gpu)
-        else:
-            hourly = info.hourly_usd
-        ranked.append((hourly, info.vram_gb, gpu))
-    if not ranked:
-        raise ValueError("no GPU class can host the workload profile job")
-    hourly, _vram, gpu = min(ranked)
-    return gpu, need, 1, provider, hourly
-
-
 def _allocation_quote_shape(config: RunConfig, allocation) -> tuple[str, int, int, str, float]:
     """The (gpu, need, count, provider, per-card rate) billed against a SELECTED live candidate.
 
@@ -745,45 +716,6 @@ def _allocation_quote_shape(config: RunConfig, allocation) -> tuple[str, int, in
         int(getattr(allocation, "gpu_count", 1) or 1),
         allocation.provider,
         float(allocation.hourly_usd),
-    )
-
-
-def estimate_profile_cost(config: RunConfig, *, allocation=None) -> CostEstimate:
-    """Price a workload profile from its wall cap.
-
-    Pricing through the workload it exists to measure would be circular. It runs no optimizer steps;
-    charge only the rented shape held up to the cap.
-    """
-    wall_s = max(60.0, float(config.max_wall_seconds or 0.0))
-    # without a selected candidate the shape is the offline structural pick, which must never touch
-    # a live market (see ``_offline_profile_shape``).
-    gpu, need, billed_gpu_count, quote_provider, hourly = (
-        _allocation_quote_shape(config, allocation)
-        if allocation is not None
-        else _offline_profile_shape(config)
-    )
-    return CostEstimate(
-        model_id=config.model_id,
-        method=config.method,
-        steps=config.steps,
-        gpu=gpu,
-        provider=quote_provider,
-        gpu_vram_gb=gpu_vram_gb(gpu),
-        required_vram_gb=need,
-        gpu_hourly_usd=hourly,
-        setup_seconds=0.0,
-        seconds_per_step=wall_s,
-        train_seconds=wall_s,
-        wall_clock_seconds=wall_s,
-        wall_capped=True,
-        gpu_count=billed_gpu_count,
-        total_usd=wall_s / 3600.0 * hourly * billed_gpu_count,
-        notes=(
-            (
-                f"workload profile job: billed at most its {_fmt_duration(wall_s)} wall cap "
-                "(no optimizer steps)"
-            ),
-        ),
     )
 
 

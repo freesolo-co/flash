@@ -99,7 +99,6 @@ def test_a_pre_upgrade_snapshot_still_passes_its_integrity_digest(tmp_path, monk
     spec = type(spec).from_dict(
         {
             **spec.to_internal_dict(),
-            "workload_profile_kind": "sft",
             "workload_profile": {"steps": 10},
         }
     )
@@ -127,7 +126,6 @@ def test_a_pre_upgrade_snapshot_still_passes_its_integrity_digest(tmp_path, monk
             v
             or k
             not in (
-                "workload_profile_kind",
                 "workload_profile_input_digest",
                 "workload_profile_producer_version",
                 "workload_profile",
@@ -178,7 +176,6 @@ def test_a_pre_upgrade_worker_env_snapshot_still_passes_its_integrity_digest(tmp
     spec = type(spec).from_dict(
         {
             **spec.to_internal_dict(),
-            "workload_profile_kind": "sft",
             "workload_profile": {"steps": 10},
         }
     )
@@ -207,7 +204,6 @@ def test_a_pre_upgrade_worker_env_snapshot_still_passes_its_integrity_digest(tmp
             v
             or k
             not in (
-                "workload_profile_kind",
                 "workload_profile_input_digest",
                 "workload_profile_producer_version",
                 "workload_profile",
@@ -254,7 +250,7 @@ def test_a_pre_upgrade_environment_pip_snapshot_still_passes_its_integrity_diges
     """The same replay for ``[environment] pip``, which to_dict() used to strip.
 
     A snapshot prepared before pip became authorable hashed an environment with NO pip key. This
-    build re-serializes it as an empty tuple, so a still-valid workload-profile run would rehash to
+    build re-serializes it as an empty tuple, so a still-valid profile-bearing run would rehash to
     different bytes and fail "persisted effective preparation failed integrity validation" on
     recovery -- blocking deploy and serving for a run that never did anything wrong.
     """
@@ -268,7 +264,6 @@ def test_a_pre_upgrade_environment_pip_snapshot_still_passes_its_integrity_diges
     spec = type(spec).from_dict(
         {
             **spec.to_internal_dict(),
-            "workload_profile_kind": "sft",
             "workload_profile": {"steps": 10},
         }
     )
@@ -289,7 +284,6 @@ def test_a_pre_upgrade_environment_pip_snapshot_still_passes_its_integrity_diges
         or k
         not in (
             "model_revision_auto",
-            "workload_profile_kind",
             "workload_profile_input_digest",
             "workload_profile_producer_version",
             "workload_profile",

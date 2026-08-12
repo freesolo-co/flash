@@ -10,7 +10,6 @@ from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
     sft_profile_input_digest,
     sft_profile_input_payload,
-    sft_profile_run_id,
 )
 
 
@@ -247,19 +246,10 @@ def test_sft_profile_contains_only_aggregate_evidence() -> None:
         assert forbidden not in encoded.lower()
 
 
-def test_sft_profile_run_id_is_deterministic_and_safe() -> None:
-    digest = "a" * 64
-
-    assert sft_profile_run_id(digest) == f"profile-sft-{digest}"
-    with pytest.raises(ValueError, match="sha256"):
-        sft_profile_run_id("not-a-digest")
-
-
 def test_profile_carrier_is_internal_and_round_trips_only_in_worker_specs() -> None:
     profile = _profile().to_dict()
     spec = replace(
         _spec(),
-        workload_profile_kind="sft",
         workload_profile_input_digest="c" * 64,
         workload_profile_producer_version="1.2.3",
         workload_profile=profile,
@@ -268,7 +258,6 @@ def test_profile_carrier_is_internal_and_round_trips_only_in_worker_specs() -> N
     public = spec.to_dict()
     internal = spec.to_internal_dict()
 
-    assert "workload_profile_kind" not in public
     assert "workload_profile_input_digest" not in public
     assert "workload_profile_producer_version" not in public
     assert "workload_profile" not in public

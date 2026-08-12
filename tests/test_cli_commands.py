@@ -828,7 +828,7 @@ def test_env_setup_names_the_plane_side_opd_teacher_setup_when_self_hosted(
 def test_env_setup_caveats_that_a_github_id_needs_a_standalone_plane(monkeypatch, tmp_path) -> None:
     """The scaffolded github: id is rejected by an identity-backed self-hosted plane.
 
-    `_require_hosted_environment_form` accepts a non-slug id only when `auth.standalone()`, which
+    `_require_supported_environment_form` accepts a non-slug id only when `auth.standalone()`, which
     reads the plane's OWN environment. Setup classifies on the API URL and cannot see that, so the
     scaffold writes an id that a non-standalone plane answers with a 400 -- name the requirement
     rather than let it surface as an unexplained submit failure.

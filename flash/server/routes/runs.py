@@ -158,7 +158,6 @@ class _SubmissionContext:
     billable_key: bool
     bill_on_completion: bool
     billing_context: dict | None
-    profile_billing_context: dict | None
     platform_context: dict
 
 
@@ -177,12 +176,8 @@ def _submission_context(
             status_code=400,
             detail="org id is required to bill a completed training run",
         )
-    # a workload profile is a separate job that really runs, so it bills on its own completion
-    # whenever the key is billable -- including under `--dry-run`. dry-run previews the TRAINING
-    # run; it does not make work that actually executed free.
-    profile_billing_context = {"org_id": affordability_org_id} if billable_key else None
     if bill_on_completion:
-        billing_context = profile_billing_context
+        billing_context = {"org_id": affordability_org_id}
     platform_context = {
         field: value
         for field, value in {
@@ -198,7 +193,6 @@ def _submission_context(
         billable_key=billable_key,
         bill_on_completion=bill_on_completion,
         billing_context=billing_context,
-        profile_billing_context=profile_billing_context,
         platform_context=platform_context,
     )
 
@@ -227,86 +221,6 @@ def _resolve_managed_environment(spec, *, project_id: str, reporting_key: dict) 
         repair_missing=True,
     )
     return environment_slug
-
-
-def _launch_pending_workload_profile(
-    exc,
-    *,
-    key: dict,
-    runtime_secrets,
-    profile_billing_context: dict | None,
-    platform_context: dict,
-    billable_key: bool,
-    affordability_org_id: str,
-) -> tuple[bool, str]:
-    """Claim and launch the pending workload profile.
-
-    Returns ``(launched, state)`` where ``launched`` says whether THIS request started and billed the
-    profile, as opposed to joining one another submitter already owns.
-    """
-    pending = exc.prepared_job
-    state = exc.state
-    # whether THIS request launched and billed the profile, as opposed to joining one that
-    # was already running. only a winning claim launches, so anything else must not be told
-    # it was charged. defaults false: a path that never reaches the claim launched nothing.
-    launched = False
-    if not isinstance(pending, _runner.PreparedJob):
-        return launched, state
-    profile_run_id = pending.public_spec.run_id
-    # claim before spending anything on it. the id is deterministic in the workload, so
-    # another key may already own this exact profile -- in which case it is already
-    # running and this submitter neither launches it again nor pays for it a second
-    # time. losing the claim is ordinary reuse, not an error; it just means waiting.
-    spent_at = getattr(exc, "spent_at", None)
-    if spent_at is None:
-        claimed = db.claim_profile_run(profile_run_id, key["id"])
-    else:
-        # the id is already claimed by a run that is spent, so a fresh claim cannot be
-        # inserted. take the existing one over against the spent run's own timestamp,
-        # so of several submitters watching the same dead profile exactly one relaunches
-        # it and the rest are told to wait on the one that is now running.
-        claimed = db.reclaim_spent_profile_run(profile_run_id, key["id"], spent_at=spent_at)
-    if claimed:
-        profile_submit_kwargs = {
-            "background": True,
-            "owner_key_id": key["id"],
-            "prepared_job": pending,
-        }
-        if runtime_secrets:
-            profile_submit_kwargs["runtime_secrets"] = runtime_secrets
-        if profile_billing_context:
-            profile_submit_kwargs["billing_context"] = profile_billing_context
-        if platform_context:
-            profile_submit_kwargs["platform_context"] = platform_context
-        try:
-            if billable_key:
-                _precheck_budget_or_block(
-                    run_id=profile_run_id,
-                    estimate_usd=pending.estimated_cost_usd,
-                    org_id=affordability_org_id,
-                )
-            _app.submit_job(pending.public_spec, **profile_submit_kwargs)
-        except Exception:
-            # delete the deterministic claim when launch creates no run, or the id wedges
-            # forever. if ``submit_job`` already persisted status, keep the claim so
-            # ownership and normal lifecycle cleanup remain intact.
-            if not os.path.exists(runs_file_path(profile_run_id, ".json")):
-                db.delete_run(profile_run_id)
-            raise
-        # set only after submit_job returns: a launch that raised deleted the row and
-        # charged nothing, so reporting it as launched would name a charge that was
-        # rolled back.
-        launched = True
-    # launched here, lost the claim to a submitter who launched it, or
-    # lost a takeover to one who is relaunching it. in every case the
-    # id now belongs to a live attempt, so the state has to name that
-    # attempt: reporting the spent state a takeover loser read would
-    # name a run that no longer exists under this id, and leaving a
-    # plain claim loser on the synthetic "required" tells a user whose
-    # profile is queued and running that it has not started --
-    # `required` is a marker this route invents, not a state any run
-    # is ever in.
-    return launched, "queued"
 
 
 def _record_environment_use(
@@ -459,7 +373,6 @@ def create_run(
     billable_key = ctx.billable_key
     bill_on_completion = ctx.bill_on_completion
     billing_context = ctx.billing_context
-    profile_billing_context = ctx.profile_billing_context
     platform_context = ctx.platform_context
     run_id = spec.run_id
     affordability_verified = False
@@ -490,32 +403,6 @@ def create_run(
                     f"train.init_from_adapter source {source_ref!r} could not be prepared; "
                     "verify that the source adapter is complete, compatible, and unchanged"
                 ),
-            ) from exc
-        except _runner.WorkloadProfilePending as exc:
-            launched, state = _launch_pending_workload_profile(
-                exc,
-                key=key,
-                runtime_secrets=runtime_secrets,
-                profile_billing_context=profile_billing_context,
-                platform_context=platform_context,
-                billable_key=billable_key,
-                affordability_org_id=affordability_org_id,
-            )
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "workload_profile_pending",
-                    "profile_run_id": exc.profile_run_id,
-                    "state": state,
-                    # whether THIS key can read that run. the id is deterministic, so a submitter
-                    # can be waiting on a profile another key launched -- telling them to poll a
-                    # run id that answers 404 for them would read as the server inventing an id.
-                    "owned": db.run_owner(exc.profile_run_id) == key["id"],
-                    # whether this request started and billed the profile. an owner polling a
-                    # profile it launched earlier joins rather than launches, and must not be told
-                    # it was charged again.
-                    "launched": launched,
-                },
             ) from exc
         run_id = prepared.public_spec.run_id
         # validate the spec BEFORE charging affordability against it. these gates are pure and

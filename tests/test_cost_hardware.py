@@ -748,10 +748,47 @@ def test_sft_fit_credits_only_the_ranks_that_will_launch():
         "memory only the wider world would have had"
     )
 
-    # and no other algorithm is touched: they launch the shape they rent, so a batch of 1 that would
-    # collapse sft to one rank must leave THEM at full width.
+    # grpo and opd bound their width too, but on their OWN unit of work: they never read
+    # `batch_size` (their batch is `prompts_per_step`, repeated `group_size` times), so an sft-shaped
+    # knob must leave them at full width rather than silently narrowing them through the wrong field.
     assert fits(2, algorithm="grpo", train=unpacked)
     assert fits(2, algorithm="opd", train=unpacked)
+
+    # their real narrowing: one prompt in a group of two is 2 sequences, which cannot fill 4 dp
+    # ranks. verl raises on the uneven chunk instead of degrading, so crediting 4 would admit a run
+    # that dies at step 0 on paid hardware -- the same over-credit as the sft case above.
+    tiny_rl = {"prompts_per_step": 1, "group_size": 2}
+    assert _executed_gpu_count("grpo", tiny_rl, None, 4) == 2
+    assert _executed_gpu_count("opd", {"prompts_per_step": 1, "group_size": 1}, None, 2) == 1
+    # and a real step fills every card, so the fix costs no capacity where it matters.
+    assert _executed_gpu_count("grpo", {"prompts_per_step": 8, "group_size": 4}, None, 8) == 8
+
+    # an OMITTED group takes the recipe default for that algorithm, which is what the worker resolves
+    # it to (`train/rl/inputs.py`) and what the quote fills in (`RunConfig.normalized`). the defaults
+    # differ -- grpo groups 8 completions per prompt, opd distills 1 -- so hardcoding either number
+    # here breaks the other. reading 1 for grpo under-credited it eightfold and REJECTED runs that fit.
+    assert _executed_gpu_count("grpo", {"prompts_per_step": 1}, None, 8) == 8
+    assert _executed_gpu_count("opd", {"prompts_per_step": 1}, None, 8) == 1
+    # an explicit group still wins over the default.
+    assert _executed_gpu_count("grpo", {"prompts_per_step": 1, "group_size": 1}, None, 8) == 1
+
+    # the quote must agree on every one of those, or a shape it prices gets refused at submit.
+    from flash.cost.analytical import executed_gpu_count
+    from flash.cost.types import RunConfig
+
+    for method, prompts, group in (("grpo", 1, None), ("opd", 1, None), ("grpo", 1, 1)):
+        train = {"prompts_per_step": prompts} | ({"group_size": group} if group else {})
+        quoted = executed_gpu_count(
+            RunConfig(
+                model_id="Qwen/Qwen3.5-4B",
+                method=method,
+                steps=10,
+                batch_size=prompts,
+                group_size=group,
+            ),
+            8,
+        )
+        assert quoted == _executed_gpu_count(method, train, None, 8), (method, prompts, group)
 
     # an UNKNOWN batch must not be read as a batch of 1, and unmeasured rows must not invent a limit.
     # callers that rank without knobs would otherwise have every multi-card sft shape rejected -- a

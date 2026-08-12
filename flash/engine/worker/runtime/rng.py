@@ -11,13 +11,10 @@ def backend_seed(seed: int) -> int:
 
 
 def seed_host_rngs(seed: int) -> None:
-    """Seed the generators that run outside the model: Python's and NumPy's.
+    """seed the generators that run outside the model: python's and numpy's.
 
-    Split out for the workload-profile run, which must reach the same rows the training run will and
-    must not import torch. Environment code is user code and may consume either of these while
-    building its dataset, so a profile that skipped them could select a different sample than
-    training and fail the parity check. Neither generator has anything to do with model init, which
-    is the part a profile deliberately never reaches.
+    environment code may consume either generator while building its training rows. neither has
+    anything to do with model initialization, so this helper stays independent of torch.
     """
     seed = int(seed)
     random.seed(seed)

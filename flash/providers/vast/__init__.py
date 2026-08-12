@@ -105,9 +105,15 @@ class VastProvider(InstanceProvider):
             destroy_run_instances(spec.run_id)
 
     def _gc(self, run_id: str) -> None:
-        from flash.providers.vast.jobs import destroy_run_instances
+        from flash.providers.vast.jobs import destroy_run_instances, forget_dead_machines
 
-        destroy_run_instances(run_id)
+        try:
+            destroy_run_instances(run_id)
+        finally:
+            # the run is being reaped, so its dead-machine blacklist has no further reader. freeing
+            # it in `finally` keeps a failed reap from leaking the entry -- releasing memory must
+            # not depend on the teardown succeeding.
+            forget_dead_machines(run_id)
 
     def _sweep_orphans(
         self,

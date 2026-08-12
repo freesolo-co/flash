@@ -555,6 +555,45 @@ def test_deploy_refreshes_once_when_all_taken(monkeypatch):
     assert h.offer_id == 99
 
 
+def test_deploy_refresh_widens_the_page_it_filters(monkeypatch):
+    """The refresh must not ask for a page its own exclusion can fill.
+
+    ``search_offers`` caps rows SERVER-side on a price-sorted prefix and the burned machines are
+    dropped CLIENT-side afterwards, so the exclusion this refresh exists to apply is exactly what
+    makes the default page too small. A run that has lost enough boxes to fill the cheapest page
+    gets an empty result while dearer usable capacity sits just past it, and then retries keep
+    re-selecting the same small set instead of reaching that capacity.
+
+    Modelled with the real ordering (cap the rows, then exclude) rather than asserting the constant:
+    a mock that excluded first would find the offer at any limit and could not fail.
+    """
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    burned = set(range(300))
+
+    def fake_create(offer_id, **kw):
+        if offer_id != 999:
+            raise vast_api.VastCreateRejected("taken")
+        return 7
+
+    def paged_search(min_vram_gb, disk_gb, exclude_machine_ids=frozenset(), limit=256, **kw):
+        # the usable box sits at row 400, past the default cap but inside a widened one
+        rows = [_offer(offer_id=i, machine_id=i, gpu="RTX 4090") for i in range(300)] + [
+            _offer(offer_id=999, machine_id=999, gpu="RTX 4090")
+        ]
+        return [o for o in rows[:limit] if o.machine_id not in exclude_machine_ids]
+
+    monkeypatch.setattr(vast_api, "create_instance", fake_create)
+    monkeypatch.setattr(vast, "usable_offers", paged_search)
+    monkeypatch.setattr(vast, "dead_machine_ids", lambda _run_id: burned)
+
+    handle = _deploy(vast, _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
+
+    assert handle.offer_id == 999  # reached past the page the exclusion had filled
+    assert handle.instance_id == 7
+
+
 def test_deploy_refresh_uses_transient_concrete_gpu_type(monkeypatch):
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
@@ -1942,6 +1981,246 @@ def test_runner_destroys_on_success(monkeypatch):
     res = _submit(vast, _spec(), seed=0)
     assert res.ok
     assert destroyed == [9999]  # the rented instance is torn down
+
+
+# ---------------------------------------------------------------------------
+# submit_run_vast: a machine that took the rental and never booted is retired
+# ---------------------------------------------------------------------------
+def _offered_machines(monkeypatch, vast, market=None) -> list[frozenset[int]]:
+    """Record which machines actually reached ``deploy_and_submit`` on each attempt.
+
+    Asserts the OUTCOME rather than how it is reached: the search itself is no longer told what to
+    exclude, because the message distinguishing "this run burned the pool" from "the pool is dry"
+    needs the unfiltered market to compare against.
+    """
+    seen: list[frozenset[int]] = []
+    rows = list(market) if market is not None else [_offer()]
+
+    monkeypatch.setattr(vast, "usable_offers", lambda *_a, **_k: list(rows))
+    monkeypatch.setattr(
+        vast,
+        "deploy_and_submit",
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+            seen.append(frozenset(o.machine_id for o in offers)) or _handle()
+        ),
+    )
+    return seen
+
+
+def _never_started(vast) -> str:
+    """The detail vast's own ``load_timeout_detail`` emits for a box that never booted."""
+    return f"instance stuck in 'loading' for 900s ({vast._NEVER_STARTED_MARKER})"
+
+
+def test_stalled_machine_is_excluded_from_the_next_attempts_search(monkeypatch):
+    """A box that rents, never boots, and stalls must not be re-rented by the next attempt.
+
+    This is the loop the fix exists to stop: the offer stays in the market at the top of the
+    cheapest-first ranking, so a per-call ``tried`` list (rebuilt on every ``deploy_and_submit``)
+    let one run rent the same dead machine eleven times and burn its whole retry budget.
+    """
+    from flash.providers.base import PollResult
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    vast.forget_dead_machines(spec.run_id)
+    try:
+        _wire_submit(
+            monkeypatch,
+            poll_result=PollResult(False, failure="stalled", detail=_never_started(vast)),
+        )
+        # two hosts in the market, so the second attempt still has somewhere to go once 10 is out.
+        offered = _offered_machines(
+            monkeypatch, vast, market=[_offer(), _offer(offer_id=2, machine_id=11)]
+        )
+
+        first = _submit(vast, spec, seed=0)
+        assert first.failure == "stalled"
+        # the first attempt could not have known: both hosts were on the table.
+        assert offered[0] == frozenset({10, 11})
+        # _handle()'s machine_id -- the HOST is retired, not the offer id, because vast relists the
+        # same box under a fresh offer id.
+        assert vast.dead_machine_ids(spec.run_id) == frozenset({10})
+
+        _submit(vast, spec, seed=0)
+        # 10 is gone from what the next attempt may rent; 11 is untouched.
+        assert offered[1] == frozenset({11})
+    finally:
+        vast.forget_dead_machines(spec.run_id)
+
+
+def test_a_runs_own_failure_does_not_retire_a_healthy_machine(monkeypatch):
+    """Only host-shaped failures retire a box.
+
+    ``job_failed`` is the run's own doing and would recur on any machine, and ``poll_error`` covers
+    transient HF read gaps that say nothing about the host. Blacklisting on either would shrink the
+    usable pool on every attempt and recreate the starvation from the other direction.
+    """
+    from flash.providers.base import PollResult
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    for failure in ("job_failed", "poll_error", "oom"):
+        vast.forget_dead_machines(spec.run_id)
+        _wire_submit(monkeypatch, poll_result=PollResult(False, failure=failure, detail="x"))
+        _submit(vast, spec, seed=0)
+        assert vast.dead_machine_ids(spec.run_id) == frozenset(), failure
+    vast.forget_dead_machines(spec.run_id)
+
+
+def test_a_stall_after_the_box_booted_does_not_retire_it(monkeypatch):
+    """``stalled`` alone is not a host fault -- four conditions report that name.
+
+    Only the pre-boot load timeout indicts the machine. A mid-TRAINING progress stall, a
+    post-running liveness stall, and the client-side wall deadline all describe a box that booted
+    and ran, so the failure would recur anywhere. Retiring a working host for one of those shrinks
+    the pool every attempt and, with a small pool, makes the next resumable attempt hit the
+    "already rented and lost" error instead of reusing the only machine there is.
+    """
+    from flash.providers.base import PollResult
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    booted_stalls = (
+        "no worker progress for 3600s during training (instance status running, limit 3600s)",
+        (
+            "no worker heartbeat AND no container-log output for 900s after the container "
+            "started (worker never came up; limit 900s)"
+        ),
+        "client-side deadline exceeded",
+    )
+    for detail in booted_stalls:
+        vast.forget_dead_machines(spec.run_id)
+        _wire_submit(monkeypatch, poll_result=PollResult(False, failure="stalled", detail=detail))
+        _submit(vast, spec, seed=0)
+        assert vast.dead_machine_ids(spec.run_id) == frozenset(), detail
+    vast.forget_dead_machines(spec.run_id)
+
+
+def test_the_never_started_marker_is_the_one_vast_actually_emits(monkeypatch):
+    """The discriminator must match vast's real ``load_timeout_detail``, not a guess at it.
+
+    The blacklist reads a substring out of the poll detail, so a reworded detail string would
+    silently stop retiring dead hosts and quietly restore the re-rent loop. Interpolating the same
+    constant into both sides is what prevents that; this pins that they stayed together.
+    """
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_poll_instance_job(adapter, **kw):
+        captured["detail"] = adapter.load_timeout_detail("loading", 900.0)
+        raise AssertionError("stop after capturing the adapter")
+
+    monkeypatch.setattr(vast, "poll_instance_job", fake_poll_instance_job)
+    with pytest.raises(AssertionError, match="stop after capturing"):
+        vast.poll_vast_job(_handle(), _spec(), 0, deadline_at=time.time() + 3600)
+
+    assert vast._NEVER_STARTED_MARKER in captured["detail"]
+
+
+def test_a_pool_exhausted_by_this_runs_own_dead_machines_says_so(monkeypatch):
+    """The empty-pool error must distinguish "Vast is out" from "this run killed them all".
+
+    The two have different operator fixes -- wait, versus move to another class or provider -- and
+    the generic message only ever suggested the first.
+    """
+    from flash.providers.base import RunExhaustedProviderPoolError
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    vast.forget_dead_machines(spec.run_id)
+    try:
+        vast._note_dead_machine(spec.run_id, 10)
+        # the class still HAS an offer; this run has simply already lost that host.
+        monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer(machine_id=10)])
+
+        # its own type, not VastApiError: supervision withholds provider exception text from the
+        # run record, so only an authored error survives to the operator.
+        with pytest.raises(RunExhaustedProviderPoolError, match="already rented and lost"):
+            _submit(vast, spec, seed=0)
+    finally:
+        vast.forget_dead_machines(spec.run_id)
+
+
+def test_a_dry_market_is_not_blamed_on_this_runs_blacklist(monkeypatch):
+    """An empty class must not be reported as self-inflicted just because a blacklist is non-empty.
+
+    The blacklist is keyed by run, not by GPU class, so after an escalation it still holds hosts
+    from the class the run has already moved off. Blaming a genuinely dry market on those points the
+    operator at the wrong fix -- "switch class or provider" when the real answer is "wait" -- and
+    the count it quotes would name machines that were never in this class's pool to begin with.
+    """
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    vast.forget_dead_machines(spec.run_id)
+    try:
+        # a dead host from an earlier class, and no offers at all for the one being searched now.
+        vast._note_dead_machine(spec.run_id, 777)
+        monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [])
+
+        with pytest.raises(vast_api.VastApiError) as caught:
+            _submit(vast, spec, seed=0)
+        assert "already rented and lost" not in str(caught.value)
+    finally:
+        vast.forget_dead_machines(spec.run_id)
+
+
+def test_a_fully_blacklisted_first_page_widens_the_search_before_giving_up(monkeypatch):
+    """The row cap is a price-sorted prefix, so an all-dead page is not an exhausted class.
+
+    ``search_offers`` applies its limit server-side and the machine exclusion runs client-side, so a
+    run that burned the cheap boxes sees an empty list while dearer usable capacity sits just past
+    the cap. Concluding exhaustion from that page fails the run with capacity still available.
+    """
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    vast.forget_dead_machines(spec.run_id)
+    try:
+        _wire_submit(monkeypatch)
+        vast._note_dead_machine(spec.run_id, 10)
+        limits: list[int] = []
+
+        def _paged(*_a, limit=256, **_k):
+            limits.append(int(limit))
+            # the cheap page is entirely this run's own dead host; the wider page reaches a live one.
+            if int(limit) <= 256:
+                return [_offer(machine_id=10)]
+            return [_offer(machine_id=10), _offer(offer_id=2, machine_id=11)]
+
+        seen: list[frozenset[int]] = []
+        monkeypatch.setattr(vast, "usable_offers", _paged)
+        monkeypatch.setattr(
+            vast,
+            "deploy_and_submit",
+            lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+                seen.append(frozenset(o.machine_id for o in offers)) or _handle()
+            ),
+        )
+
+        _submit(vast, spec, seed=0)
+
+        assert limits[-1] > limits[0], f"never widened past the default page: {limits}"
+        assert seen == [frozenset({11})], f"expected the host past the cap, rented {seen}"
+    finally:
+        vast.forget_dead_machines(spec.run_id)
+
+
+def test_gc_frees_the_runs_dead_machine_set(monkeypatch):
+    """The blacklist is process-local state, so the run's reap has to release it."""
+    from flash.providers.vast import PROVIDER
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    vast._note_dead_machine(spec.run_id, 10)
+    monkeypatch.setattr(vast, "destroy_run_instances", lambda _run_id: [])
+
+    PROVIDER.gc(spec)
+
+    assert vast.dead_machine_ids(spec.run_id) == frozenset()
 
 
 def test_runner_destroys_on_exception(monkeypatch):
