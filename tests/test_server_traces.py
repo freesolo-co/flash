@@ -23,12 +23,12 @@ from flash.server.platform.traces import (
     sanitize_json_value,
     store_trace,
 )
-from flash.server.routes import traces
+from flash.server.routes import trace_sse, traces
 
 _PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 _OTHER_PROJECT_ID = "22222222-2222-4222-8222-222222222222"
-_KEY = "operator-secret"
-_PROVIDER_KEY = "provider-secret"
+_KEY = "operator-secret-long"
+_PROVIDER_KEY = "provider-secret-long"
 _HEADERS = {
     "Authorization": f"Bearer {_KEY}",
     "X-Freesolo-Provider": "openai",
@@ -86,9 +86,20 @@ class _StaticAsyncClient:
     async def __aexit__(self, *args) -> None:
         await self.aclose()
 
-    async def post(self, url, *, headers, json) -> httpx.Response:
+    class _StreamContext:
+        def __init__(self, response: httpx.Response) -> None:
+            self.response = response
+
+        async def __aenter__(self) -> httpx.Response:
+            return self.response
+
+        async def __aexit__(self, *args) -> None:
+            await self.response.aclose()
+
+    def stream(self, method, url, *, headers, json):
+        assert method == "POST"
         type(self).requests.append({"url": url, "headers": headers, "json": json})
-        return type(self).response
+        return self._StreamContext(type(self).response)
 
     async def aclose(self) -> None:
         self.closed = True
@@ -216,6 +227,108 @@ def test_non_streaming_records_response_and_filters_headers(trace_api, monkeypat
     assert _PROVIDER_KEY not in json.dumps(raw)
 
 
+def test_a_non_streaming_response_under_the_limit_is_relayed_byte_identically(
+    trace_api, monkeypatch
+) -> None:
+    """Bounding the provider body must not re-encode ordinary replies. A caller may verify signatures
+    or depend on whitespace, so fitting bodies retain the provider's exact bytes, status, and headers."""
+    body = b'{ "choices" : [ { "message" : { "role" : "assistant", "content" : "world" } } ] }\n'
+    _StaticAsyncClient.requests = []
+    _StaticAsyncClient.response = httpx.Response(
+        201,
+        content=body,
+        headers={"content-type": "application/json", "x-request-id": "exact-1"},
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 201
+    assert response.content == body
+    assert response.headers["x-request-id"] == "exact-1"
+
+
+def test_an_oversized_non_streaming_response_returns_502_and_records_error(
+    trace_api, monkeypatch
+) -> None:
+    """A bounded relay must never hand the caller a JSON prefix that looks like a provider reply.
+    Reject the oversized body and record only an ERROR diagnosis so converted records skip it."""
+    payload = (
+        b'{"choices":[{"message":{"role":"assistant","content":"'
+        + b"x" * (platform_traces.MAX_PAYLOAD_TOTAL_BYTES)
+        + b'"}}]}'
+    )
+    _StaticAsyncClient.response = httpx.Response(
+        200,
+        content=payload,
+        headers={"content-type": "application/json", "x-request-id": "large-1"},
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Upstream response was too large to relay"}
+    assert response.content != payload[: platform_traces.MAX_PAYLOAD_TOTAL_BYTES]
+    assert response.headers["x-request-id"] == "large-1"
+    raw = _raw(trace_api)
+    span = raw["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == traces._UPSTREAM_TOO_LARGE_ERROR
+    assert span["output_payload"] is None
+    records = trace_api.get(
+        "/api/traces/export",
+        headers={"Authorization": f"Bearer {_KEY}"},
+        params={"project_id": _PROJECT_ID, "format": "records"},
+    ).json()
+    assert records["records"] == []
+    assert records["skipped"] == 1
+
+
+def test_a_short_secret_does_not_corrupt_payload_substrings(trace_api, monkeypatch, caplog) -> None:
+    """A short self-hosted key such as `test` is ordinary language, not a safe global substring.
+    Replacing it turns `testing` into corrupted training text, so short credentials use field-only
+    redaction and raise an operator warning instead of silently mutating every stored payload."""
+    short_headers = {**_HEADERS, "X-Freesolo-Provider-Key": "test"}
+    body = {**_REQUEST, "messages": [{"role": "user", "content": "testing"}]}
+    _StaticAsyncClient.response = httpx.Response(200, json=_reply_envelope("testing reply"))
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    with caplog.at_level("WARNING"):
+        response = trace_api.post("/v1/chat/completions", headers=short_headers, json=body)
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["input_payload"]["messages"][0]["content"] == "testing"
+    assert span["output_payload"]["choices"][0]["message"]["content"] == "testing reply"
+    assert any("substring redaction is disabled" in record.message for record in caplog.records)
+
+
+def test_a_full_length_secret_is_still_redacted(trace_api, monkeypatch) -> None:
+    """The short-secret guard must not weaken credential protection. A real-length bearer secret
+    quoted in prompt and reply text is still removed from both stored payload sides."""
+    long_secret = "credential-0123456789abcdef"
+    headers = {
+        **_HEADERS,
+        "X-Freesolo-Provider-Key": long_secret,
+    }
+    body = {
+        **_REQUEST,
+        "messages": [{"role": "user", "content": f"inspect {long_secret} now"}],
+    }
+    _StaticAsyncClient.response = httpx.Response(200, json=_reply_envelope(f"saw {long_secret}"))
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=headers, json=body)
+
+    assert response.status_code == 200
+    raw = _raw(trace_api)
+    assert long_secret not in json.dumps(raw)
+    span = raw["records"][0]["spans"][0]
+    assert span["input_payload"]["messages"][0]["content"] == "inspect [redacted] now"
+    assert span["output_payload"]["choices"][0]["message"]["content"] == "saw [redacted]"
+
+
 def test_a_credential_used_as_an_object_key_is_not_stored(trace_api, monkeypatch) -> None:
     """A credential is a credential wherever it sits. Value-only redaction walks dict VALUES, so a
     key-shaped secret -- `{"<key>": "seen"}` -- would round-trip into the span and back out through
@@ -234,6 +347,51 @@ def test_a_credential_used_as_an_object_key_is_not_stored(trace_api, monkeypatch
     # forwarded verbatim, stored redacted
     assert _StaticAsyncClient.requests[0]["json"]["metadata"] == {_PROVIDER_KEY: "marker"}
     assert _PROVIDER_KEY not in json.dumps(_raw(trace_api))
+
+
+def test_an_oversized_sse_stream_forwards_every_byte_and_marks_output_truncated(
+    trace_api, monkeypatch
+) -> None:
+    """The storage budget governs only the trace accumulator. A runaway stream still reaches the
+    caller byte-for-byte, while its bounded stored prefix is marked output-truncated so `records`
+    skips it and `prompts` can still recover the unaffected input side."""
+    monkeypatch.setattr(traces, "MAX_PAYLOAD_TOTAL_BYTES", 256)
+    chunks = [
+        b'data: {"choices":[{"index":0,"delta":{"content":"' + b"x" * 180 + b'"}}]}\n\n',
+        b'data: {"choices":[{"index":0,"delta":{"content":"'
+        + b"y" * 180
+        + b'"},"finish_reason":"stop"}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(chunks)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"".join(chunks)
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["attributes"] == {"payload_truncated": ["output"]}
+    stored_content = span["output_payload"]["choices"][0]["message"]["content"]
+    assert len(stored_content) < 360
+    records = trace_api.get(
+        "/api/traces/export",
+        headers={"Authorization": f"Bearer {_KEY}"},
+        params={"project_id": _PROJECT_ID, "format": "records"},
+    ).json()
+    prompts = trace_api.get(
+        "/api/traces/export",
+        headers={"Authorization": f"Bearer {_KEY}"},
+        params={"project_id": _PROJECT_ID, "format": "prompts"},
+    ).json()
+    assert records["records"] == []
+    assert records["skipped"] == 1
+    assert prompts["records"] == [{"input": "hello"}]
+    assert prompts["skipped"] == 0
 
 
 def test_streaming_client_disconnect_before_any_event_records_no_output(
@@ -516,8 +674,8 @@ def test_a_redirect_is_recorded_but_not_exported_as_a_training_target(
 
 def test_upstream_transport_failure_returns_502_and_records(trace_api, monkeypatch) -> None:
     class _FailingClient(_StaticAsyncClient):
-        async def post(self, url, *, headers, json):
-            raise httpx.ConnectError("offline", request=httpx.Request("POST", url))
+        def stream(self, method, url, *, headers, json):
+            raise httpx.ConnectError("offline", request=httpx.Request(method, url))
 
     monkeypatch.setattr(traces.httpx, "AsyncClient", _FailingClient)
 
@@ -529,6 +687,48 @@ def test_upstream_transport_failure_returns_502_and_records(trace_api, monkeypat
     assert span["status_code"] == "ERROR"
     assert span["error"] == "upstream request failed"
     assert span["output_payload"] is None
+
+
+def test_a_transport_failure_502_reports_when_persistence_failed(trace_api, monkeypatch) -> None:
+    """The provider transport already failed, but raw export must still reveal that failure. If the
+    diagnostic write also fails, the 502 must say so instead of looking recorded when no row exists."""
+
+    class _FailingClient(_StaticAsyncClient):
+        def stream(self, method, url, *, headers, json):
+            raise httpx.ConnectError("offline", request=httpx.Request(method, url))
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _FailingClient)
+    monkeypatch.setattr(
+        traces,
+        "store_trace",
+        lambda **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+    )
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 502
+    assert response.headers["x-freesolo-record-failed"] == "true"
+    assert _raw(trace_api)["traces"] == 0
+
+
+def test_a_transport_failure_502_omits_record_failed_when_persistence_succeeded(
+    trace_api, monkeypatch
+) -> None:
+    """The failure header means a missing trace, not merely an upstream failure. A successfully
+    persisted transport error keeps the header absent so callers do not retry or flag a false gap."""
+
+    class _FailingClient(_StaticAsyncClient):
+        def stream(self, method, url, *, headers, json):
+            raise httpx.ConnectError("offline", request=httpx.Request(method, url))
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _FailingClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 502
+    assert "x-freesolo-record-failed" not in response.headers
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["error"] == "upstream request failed"
 
 
 def test_record_false_proxies_without_project_or_storage(trace_api, monkeypatch) -> None:
@@ -955,6 +1155,53 @@ def test_a_tool_call_finish_is_skipped_even_with_no_tool_calls_payload(
 
     assert export["records"] == []
     assert export["skipped"] == 1
+
+
+@pytest.mark.parametrize("role", ["tool", "user"])
+def test_an_explicit_non_assistant_reply_role_is_skipped(trace_api, role) -> None:
+    """A gateway can return the chat message shape with text owned by a tool or user. Treating that
+    explicit role as the desired assistant target corrupts converted training records."""
+    owner = db.ensure_standalone_owner()
+    response = _reply_envelope("not an assistant reply")
+    response["choices"][0]["message"]["role"] = role
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="wrong reply role",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=response)],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == []
+    assert export["skipped"] == 1
+
+
+@pytest.mark.parametrize("role", [None, "assistant"])
+def test_an_absent_or_assistant_reply_role_still_exports(trace_api, role) -> None:
+    """Older providers may omit the response role, while current providers send `assistant`.
+    Tightening explicit bad roles must preserve both accepted success shapes."""
+    owner = db.ensure_standalone_owner()
+    response = _reply_envelope("complete")
+    if role is None:
+        response["choices"][0]["message"].pop("role")
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="accepted reply role",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=response)],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == [{"input": "hello", "output": "complete"}]
+    assert export["skipped"] == 0
 
 
 def test_a_text_only_reply_still_exports_after_tool_call_filtering(trace_api) -> None:
@@ -1845,7 +2092,7 @@ def test_many_stream_fragments_stay_unjoined_until_output() -> None:
     """Each streamed fragment runs on the async response iterator. Rebuilding the whole reply per
     chunk makes total work quadratic, while retaining one part per chunk keeps ingestion linear
     regardless of scheduler timing."""
-    accumulator = traces._SseAccumulator()
+    accumulator = trace_sse.SseAccumulator()
     fragment = "x" * 40
 
     for _ in range(32_000):
@@ -1854,7 +2101,7 @@ def test_many_stream_fragments_stay_unjoined_until_output() -> None:
         )
 
     content = accumulator._choices[0]["message"]["content"]
-    assert isinstance(content, traces._StringFragments)
+    assert isinstance(content, trace_sse._StringFragments)
     assert content.parts == [fragment] * 32_000
     assert accumulator.output()["choices"][0]["message"]["content"] == fragment * 32_000
 
@@ -2323,6 +2570,197 @@ def test_a_non_object_delta_marks_the_stream_errored(trace_api, monkeypatch) -> 
         limit=1000,
     )
     assert records["records"] == []
+
+
+def test_null_logprobs_on_every_stream_chunk_is_not_a_defect(trace_api, monkeypatch) -> None:
+    """OpenAI routinely sends `logprobs: null` when logprobs were not requested. Null means no scored
+    fragment, not corruption, so an ordinary successful stream must remain exportable by `records`."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"wor"},"logprobs":null}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{"content":"ld"},"logprobs":null,"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "OK"
+    assert span["error"] is None
+    records = export_traces(
+        key_id=db.ensure_standalone_owner()["id"],
+        project_id=_PROJECT_ID,
+        export_format="records",
+        limit=1000,
+    )
+    assert records["records"] == [{"input": "hello", "output": "world"}]
+
+
+def test_a_null_delta_on_a_terminal_chunk_is_not_a_defect(trace_api, monkeypatch) -> None:
+    """Compatible providers may send `delta: null` on the terminal bookkeeping chunk. It carries no
+    content to lose, so treating it as malformed incorrectly rejects an otherwise complete reply."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"world"}}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":null,"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "OK"
+    assert span["error"] is None
+    records = export_traces(
+        key_id=db.ensure_standalone_owner()["id"],
+        project_id=_PROJECT_ID,
+        export_format="records",
+        limit=1000,
+    )
+    assert records["records"] == [{"input": "hello", "output": "world"}]
+
+
+def test_a_present_malformed_logprobs_still_marks_the_stream_errored(
+    trace_api, monkeypatch
+) -> None:
+    """Ignoring null must not reopen the original hole. A non-null string cannot carry the expected
+    scored fragments, so the surviving text is incomplete evidence and must not enter `records`."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"world"},"logprobs":"bad","finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == "stream choice contained non-object logprobs"
+    records = export_traces(
+        key_id=db.ensure_standalone_owner()["id"],
+        project_id=_PROJECT_ID,
+        export_format="records",
+        limit=1000,
+    )
+    assert records["records"] == []
+
+
+def test_a_present_malformed_delta_list_still_marks_the_stream_errored(
+    trace_api, monkeypatch
+) -> None:
+    """Null is empty bookkeeping, but a present list is the wrong representation for a delta and may
+    hide paid content. It must retain the defect guard rather than being treated like absence."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"hel"}}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":["missing fragment"]}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == "stream choice contained a non-object delta"
+    records = export_traces(
+        key_id=db.ensure_standalone_owner()["id"],
+        project_id=_PROJECT_ID,
+        export_format="records",
+        limit=1000,
+    )
+    assert records["records"] == []
+
+
+def test_a_malformed_tool_call_entry_marks_the_stream_errored(trace_api, monkeypatch) -> None:
+    """A `tool_calls` list advertises assistant actions. A scalar or null slot is therefore a lost
+    invocation, not the same as an absent or null field, and the remaining text cannot be a complete
+    training target even when the stream later finishes cleanly."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial","tool_calls":[null,"bad"]},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == "stream tool_calls contained a non-object entry"
+    records = export_traces(
+        key_id=db.ensure_standalone_owner()["id"],
+        project_id=_PROJECT_ID,
+        export_format="records",
+        limit=1000,
+    )
+    assert records["records"] == []
+
+
+def test_an_error_only_sse_envelope_survives_in_raw_but_not_records(trace_api, monkeypatch) -> None:
+    """An SSE error event may carry the provider's only useful diagnosis without any choices. Raw
+    export must preserve that exact envelope, while the ERROR span remains excluded from training
+    records just like every other failed upstream response."""
+    error_event = b'data: {"error":{"message":"quota exceeded","code":"quota"}}\n\ndata: [DONE]\n\n'
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody([error_event])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    assert response.content == error_event
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["output_payload"]["error"] == {
+        "message": "quota exceeded",
+        "code": "quota",
+    }
+    records = export_traces(
+        key_id=db.ensure_standalone_owner()["id"],
+        project_id=_PROJECT_ID,
+        export_format="records",
+        limit=1000,
+    )
+    assert records["records"] == []
+    assert records["skipped"] == 1
 
 
 def test_a_choice_without_delta_is_not_a_stream_defect(trace_api, monkeypatch) -> None:

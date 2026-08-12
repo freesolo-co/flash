@@ -26,7 +26,7 @@ from flash.server.platform.traces import (
     list_projects,
     store_trace,
 )
-from flash.server.routes.trace_sse import SseDoneGate
+from flash.server.routes.trace_sse import SseAccumulator, SseDoneGate
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -36,6 +36,11 @@ _UPSTREAM_TIMEOUT_SECONDS = 300.0
 # copy is truncated to, so the recorded message is never the part that got cut, while still bounding
 # what one response can hold in memory.
 _MAX_RECORDED_ERROR_BYTES = 64 * 1024
+# short strings occur naturally in prompts and object keys. treating one as a global substring
+# secret corrupts unrelated training text, while real bearer credentials are comfortably longer.
+_MIN_SECRET_SUBSTRING_LENGTH = 16
+_UPSTREAM_TOO_LARGE_ERROR = "upstream response exceeded the 8 MiB relay limit"
+_UPSTREAM_TOO_LARGE_BODY = b'{"detail":"Upstream response was too large to relay"}'
 # told to the caller when the provider call succeeded but persisting its trace did not, so a
 # collection run cannot look complete while its exports quietly omit calls.
 _RECORD_FAILED_HEADER = "X-Freesolo-Record-Failed"
@@ -243,7 +248,7 @@ def _redact_secret_fields(
 
 def _redact_secret_string(value: str, secrets: tuple[str, ...]) -> str:
     for secret in secrets:
-        if secret:
+        if len(secret) >= _MIN_SECRET_SUBSTRING_LENGTH:
             value = value.replace(secret, "[redacted]")
     return value
 
@@ -321,7 +326,11 @@ def _is_event_stream(response: httpx.Response) -> bool:
 
 
 async def _record_trace(
-    context: _UpstreamRequestContext, *, output_payload: Any, error: str | None
+    context: _UpstreamRequestContext,
+    *,
+    output_payload: Any,
+    error: str | None,
+    output_truncated: bool = False,
 ) -> None:
     if not context.record_trace or context.project_id is None:
         return
@@ -337,6 +346,7 @@ async def _record_trace(
         output_tokens=completion_tokens,
         input_payload=_sanitize_for_trace(context.body, context.secrets),
         output_payload=sanitized_output,
+        attributes={"payload_truncated": ["output"]} if output_truncated else None,
         status_code="ERROR" if error else "OK",
         error=_sanitize_for_trace(error, context.secrets) if error else None,
     )
@@ -363,271 +373,29 @@ async def _record_trace(
         logger.exception("[recording-proxy] failed to persist trace")
 
 
+def _response_headers(context: _UpstreamRequestContext) -> dict[str, str]:
+    headers = {"content-type": "application/json"}
+    if context.record_failed:
+        headers[_RECORD_FAILED_HEADER] = "true"
+    return headers
+
+
 async def _upstream_failure_response(context: _UpstreamRequestContext) -> Response:
     await _record_trace(context, output_payload=None, error="upstream request failed")
     return Response(
         content=b'{"detail":"Upstream request failed"}',
         status_code=502,
-        headers={"content-type": "application/json"},
+        headers=_response_headers(context),
     )
 
 
-class _StringFragments:
-    def __init__(self, value: str) -> None:
-        self.parts = [value]
-
-    def append(self, value: str) -> None:
-        self.parts.append(value)
-
-    def text(self) -> str:
-        return "".join(self.parts)
-
-
-def _materialize_fragments(value: Any) -> Any:
-    if isinstance(value, _StringFragments):
-        return value.text()
-    if isinstance(value, dict):
-        return {key: _materialize_fragments(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_materialize_fragments(item) for item in value]
-    return value
-
-
-def _content_parts(value: Any) -> list[Any]:
-    if isinstance(value, list):
-        return list(value)
-    if isinstance(value, _StringFragments):
-        value = value.text()
-    if isinstance(value, str):
-        return [{"type": "text", "text": value}] if value else []
-    return [value]
-
-
-def _append_fragment(target: dict[str, Any], key: str, value: Any) -> None:
-    current = target.get(key)
-    if isinstance(value, str):
-        if isinstance(current, _StringFragments):
-            current.append(value)
-        elif isinstance(current, str):
-            target[key] = _StringFragments(current)
-            target[key].append(value)
-        elif isinstance(current, list):
-            current.extend(_content_parts(value))
-        else:
-            target[key] = _StringFragments(value)
-    elif isinstance(value, list):
-        if isinstance(current, list):
-            current.extend(value)
-        elif isinstance(current, str | _StringFragments):
-            target[key] = [*_content_parts(current), *value]
-        else:
-            target[key] = list(value)
-    elif value is not None:
-        target[key] = value
-
-
-def _merge_fragment_dict(target: dict[str, Any], fragment: dict[str, Any]) -> None:
-    for key, value in fragment.items():
-        if isinstance(value, dict):
-            nested = target.setdefault(key, {})
-            if isinstance(nested, dict):
-                _merge_fragment_dict(nested, value)
-            else:
-                target[key] = dict(value)
-        elif isinstance(value, str):
-            current = target.get(key)
-            current_text = current.text() if isinstance(current, _StringFragments) else current
-            if current_text == value and key in {"id", "type"}:
-                continue
-            if isinstance(current, _StringFragments):
-                current.append(value)
-            elif isinstance(current, str):
-                target[key] = _StringFragments(current)
-                target[key].append(value)
-            else:
-                target[key] = _StringFragments(value)
-        elif isinstance(value, list):
-            _append_fragment(target, key, value)
-        elif value is not None:
-            target[key] = value
-
-
-class _SseAccumulator:
-    def __init__(self) -> None:
-        self._buffer = b""
-        self._choices: dict[int, dict[str, Any]] = {}
-        self._envelope: dict[str, Any] = {}
-        self._done = False
-        self.usage: Any = None
-        # why this stream cannot be trusted as a complete reply, if anything went wrong in it. a
-        # 200 SSE stream can still fail: an unparseable `data:` event drops a fragment out of the
-        # middle of the text, and a `data: {"error": ...}` envelope reports a mid-stream failure.
-        # both used to leave the span `OK`, so `records` exported the surviving text as a complete
-        # training target with a hole in it.
-        self.defect: str | None = None
-
-    def feed(self, chunk: bytes) -> None:
-        self._buffer += chunk
-        while b"\n" in self._buffer:
-            line, self._buffer = self._buffer.split(b"\n", 1)
-            self._consume_line(line.rstrip(b"\r"))
-
-    def finish(self) -> None:
-        if self._buffer:
-            self._consume_line(self._buffer.rstrip(b"\r"))
-            self._buffer = b""
-
-    def _note_defect(self, reason: str) -> None:
-        """Record the FIRST thing that went wrong; later ones are usually consequences of it."""
-        if self.defect is None:
-            self.defect = reason
-
-    @property
-    def received(self) -> bool:
-        """Whether any CHOICE content arrived, which is what makes an output an output.
-
-        Derived from the accumulated choices rather than tracked as a flag set on each parsed
-        event: a usage-only or metadata-only chunk is a parseable event carrying no reply, so a
-        per-event flag reported "received" for a stream that produced nothing and re-stored the
-        synthesized empty-`choices` envelope -- the row `records` exists to skip.
-        """
-        return bool(self._choices)
-
-    @property
-    def terminal(self) -> bool:
-        return self._done or (
-            bool(self._choices)
-            and all(choice["finish_reason"] is not None for choice in self._choices.values())
-        )
-
-    def output(self) -> dict[str, Any]:
-        choices: list[dict[str, Any]] = []
-        for index in sorted(self._choices):
-            state = self._choices[index]
-            message = _materialize_fragments(state["message"])
-            tool_calls = state["tool_calls"]
-            if tool_calls:
-                message["tool_calls"] = [
-                    _materialize_fragments(tool_calls[i]) for i in sorted(tool_calls)
-                ]
-            choice = {
-                "index": index,
-                "message": message,
-                "finish_reason": state["finish_reason"],
-            }
-            if state["logprobs"]:
-                choice["logprobs"] = _materialize_fragments(state["logprobs"])
-            choices.append(choice)
-        return {**self._envelope, "choices": choices, "usage": self.usage}
-
-    def _choice_state(self, index: int) -> dict[str, Any]:
-        return self._choices.setdefault(
-            index,
-            {
-                "message": {"role": "assistant"},
-                "tool_calls": {},
-                "logprobs": {},
-                "finish_reason": None,
-            },
-        )
-
-    def _consume_line(self, line: bytes) -> None:
-        if not line.startswith(b"data:"):
-            return
-        data = line[len(b"data:") :].strip()
-        if not data:
-            return
-        if data == b"[DONE]":
-            self._done = True
-            return
-        try:
-            payload = json.loads(data)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self._note_defect("stream contained an unparseable data event")
-            return
-        if not isinstance(payload, dict):
-            self._note_defect("stream contained a non-object data event")
-            return
-        if payload.get("error") is not None:
-            # providers report a mid-stream failure in-band, as a data event on a 200 response,
-            # sometimes after real deltas have already arrived. the partial text is not a reply.
-            self._note_defect("upstream reported an error mid-stream")
-        self._envelope.update(
-            {key: value for key, value in payload.items() if key not in {"choices", "usage"}}
-        )
-        if isinstance(payload.get("usage"), dict):
-            self.usage = payload["usage"]
-        choices = payload.get("choices")
-        if not isinstance(choices, list):
-            return
-        for position, choice in enumerate(choices):
-            if not isinstance(choice, dict):
-                continue
-            raw_index = choice.get("index", position)
-            index = (
-                raw_index
-                if isinstance(raw_index, int) and not isinstance(raw_index, bool)
-                else position
-            )
-            state = self._choice_state(index)
-            if "delta" in choice:
-                delta = choice["delta"]
-                if isinstance(delta, dict):
-                    self._consume_delta(state, delta)
-                else:
-                    self._note_defect("stream choice contained a non-object delta")
-            if "logprobs" in choice:
-                logprobs = choice["logprobs"]
-                if isinstance(logprobs, dict):
-                    _merge_fragment_dict(state["logprobs"], logprobs)
-                else:
-                    # malformed logprobs lose scored fragments just as a malformed delta loses text.
-                    self._note_defect("stream choice contained non-object logprobs")
-            if choice.get("finish_reason") is not None:
-                state["finish_reason"] = choice["finish_reason"]
-
-    def _consume_delta(self, state: dict[str, Any], delta: dict[str, Any]) -> None:
-        message = state["message"]
-        role = delta.get("role")
-        if isinstance(role, str) and role:
-            message["role"] = role
-        # every text-shaped delta field, not a fixed pair. providers stream their own alongside the
-        # standard ones -- OpenRouter's `reasoning`, audio transcripts -- and an allowlist silently
-        # dropped them, so a streamed trace held less than the identical non-streaming call.
-        for key, value in delta.items():
-            if key in {"role", "function_call", "tool_calls"}:
-                continue
-            if isinstance(value, dict) and isinstance(message.get(key), dict):
-                _merge_fragment_dict(message[key], value)
-            elif isinstance(value, str | list) or (
-                key in message and isinstance(message[key], str | _StringFragments)
-            ):
-                _append_fragment(message, key, value)
-            elif key not in message:
-                message[key] = value
-        function_call = delta.get("function_call")
-        if isinstance(function_call, dict):
-            target = message.setdefault("function_call", {})
-            if isinstance(target, dict):
-                _merge_fragment_dict(target, function_call)
-        tool_calls = delta.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            return
-        accumulated_calls: dict[int, dict[str, Any]] = state["tool_calls"]
-        for position, tool_call in enumerate(tool_calls):
-            if not isinstance(tool_call, dict):
-                continue
-            raw_index = tool_call.get("index", position)
-            index = (
-                raw_index
-                if isinstance(raw_index, int) and not isinstance(raw_index, bool)
-                else position
-            )
-            target = accumulated_calls.setdefault(index, {})
-            _merge_fragment_dict(
-                target,
-                {key: value for key, value in tool_call.items() if key != "index"},
-            )
+async def _bounded_upstream_response(response: httpx.Response) -> tuple[bytes, bool]:
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(chunk) > MAX_PAYLOAD_TOTAL_BYTES - len(body):
+            return bytes(body), True
+        body.extend(chunk)
+    return bytes(body), False
 
 
 async def _stream_response(
@@ -636,7 +404,7 @@ async def _stream_response(
     upstream_response: httpx.Response,
     context: _UpstreamRequestContext,
 ) -> AsyncIterator[bytes]:
-    accumulator = _SseAccumulator()
+    accumulator = SseAccumulator(max_accumulated_bytes=MAX_PAYLOAD_TOTAL_BYTES)
     raw_output = bytearray()
     # a body is parsed as SSE only if it says it is one. an error status is one way to get a
     # non-SSE body, but a 2xx gateway envelope is another, and feeding either to the accumulator
@@ -698,11 +466,14 @@ async def _stream_response(
                     else:
                         accumulator.finish()
                         # a stream that ended before any content arrived has NO output, which is
-                        # not the same as an output with zero choices. recording the synthesized
-                        # `{"choices": [], "usage": null}` would make `format=records` emit a
-                        # training pair whose response half is an empty envelope -- exactly the
-                        # row that format exists to skip.
-                        output_payload = accumulator.output() if accumulator.received else None
+                        # not the same as an output with zero choices. keep an error-only envelope
+                        # because raw export is the operator's record of what the provider returned,
+                        # but keep suppressing usage-only and genuinely empty synthesized envelopes.
+                        output_payload = (
+                            accumulator.output()
+                            if accumulator.received or accumulator.has_error
+                            else None
+                        )
                         if error is None and accumulator.received and not accumulator.terminal:
                             error = "upstream stream ended before completion"
                         # a defect outranks a clean finish: a stream can drop a fragment or carry
@@ -710,7 +481,12 @@ async def _stream_response(
                         # store the holed text as an OK reply for `records` to train on.
                         if accumulator.defect is not None:
                             error = error or accumulator.defect
-                    await _record_trace(context, output_payload=output_payload, error=error)
+                    await _record_trace(
+                        context,
+                        output_payload=output_payload,
+                        error=error,
+                        output_truncated=accumulator.truncated if not raw_body else False,
+                    )
     if not client_disconnected and done_gate is not None:
         if context.record_failed:
             yield b": freesolo-record-failed\n\n"
@@ -784,6 +560,15 @@ def _request_context(
         )
         if value
     )
+    if any(len(secret) < _MIN_SECRET_SUBSTRING_LENGTH for secret in secrets):
+        # skipping a short substring avoids silently rewriting ordinary payload text, but it also
+        # means that exact short credential is not removed when quoted outside a secret-named field.
+        # warn the operator on every affected request rather than weakening redaction silently.
+        logger.warning(
+            "recording proxy received a credential shorter than %d characters; global substring "
+            "redaction is disabled for that credential",
+            _MIN_SECRET_SUBSTRING_LENGTH,
+        )
     return _UpstreamRequestContext(
         url=_PROVIDER_URLS[provider],
         headers=headers,
@@ -903,31 +688,45 @@ async def chat_completions(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT_SECONDS) as client:
-            upstream_response = await client.post(
+        async with (
+            httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT_SECONDS) as client,
+            client.stream(
+                "POST",
                 context.url,
                 headers=context.headers,
                 json=forwarded_body,
-            )
+            ) as upstream_response,
+        ):
+            upstream_status = upstream_response.status_code
+            upstream_headers = upstream_response.headers
+            upstream_body, response_too_large = await _bounded_upstream_response(upstream_response)
     except httpx.HTTPError:
         return await _upstream_failure_response(context)
 
+    response_headers = _safe_provider_response_headers(upstream_headers)
+    if response_too_large:
+        await _record_trace(context, output_payload=None, error=_UPSTREAM_TOO_LARGE_ERROR)
+        response_headers["content-type"] = "application/json"
+        if context.record_failed:
+            response_headers[_RECORD_FAILED_HEADER] = "true"
+        return Response(content=_UPSTREAM_TOO_LARGE_BODY, status_code=502, headers=response_headers)
+
+    buffered_response = httpx.Response(
+        upstream_status,
+        headers=upstream_headers,
+        content=upstream_body,
+    )
     await _record_trace(
         context,
-        output_payload=_decoded_payload(upstream_response),
-        error=_error_for_status(upstream_response.status_code),
+        output_payload=_decoded_payload(buffered_response),
+        error=_error_for_status(upstream_status),
     )
-    response_headers = _safe_provider_response_headers(upstream_response.headers)
-    content_type = upstream_response.headers.get("content-type")
+    content_type = upstream_headers.get("content-type")
     if content_type:
         response_headers["content-type"] = content_type
     if context.record_failed:
         response_headers[_RECORD_FAILED_HEADER] = "true"
-    return Response(
-        content=upstream_response.content,
-        status_code=upstream_response.status_code,
-        headers=response_headers,
-    )
+    return Response(content=upstream_body, status_code=upstream_status, headers=response_headers)
 
 
 @router.get("/api/traces/projects")

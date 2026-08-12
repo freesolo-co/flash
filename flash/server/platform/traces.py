@@ -464,6 +464,10 @@ def _chat_reply(payload: Any) -> str | None:
     if choice.get("finish_reason") not in _ACCEPTED_FINISH_REASONS:
         return None
     message = choice["message"]
+    # absent roles remain accepted for providers and older envelopes that omit them. an explicit
+    # non-assistant role is different: its text is not a desired assistant completion.
+    if message.get("role") not in {None, "assistant"}:
+        return None
     if message.get("tool_calls") or message.get("function_call"):
         # a training target must contain the whole assistant action. exporting only the accompanying
         # text would silently discard the invocation, so skipping the row is the only faithful choice.
