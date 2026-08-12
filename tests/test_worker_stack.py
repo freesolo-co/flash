@@ -138,6 +138,32 @@ def test_arch_dims_revision_nonzero_mismatch_still_fails_closed(monkeypatch):
         sft._model_arch_dims("Qwen/Qwen3.6-35B-A3B", revision="refs/pr/123")
 
 
+def test_control_plane_tokenizer_disables_remote_repository_code_without_changing_workers(
+    monkeypatch,
+):
+    calls = []
+
+    class _AutoTokenizer:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            calls.append((model_id, kwargs))
+            return object()
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoTokenizer = _AutoTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    from flash.engine.profiling.tokenizer import load_control_plane_tokenizer, load_tokenizer
+
+    load_control_plane_tokenizer("org/model", revision="refs/pr/123")
+    load_tokenizer("org/model", revision="refs/pr/123")
+
+    assert calls == [
+        ("org/model", {"trust_remote_code": False, "revision": "refs/pr/123"}),
+        ("org/model", {"trust_remote_code": True, "revision": "refs/pr/123"}),
+    ]
+
+
 def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
     calls = []
 

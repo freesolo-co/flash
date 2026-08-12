@@ -246,6 +246,11 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
             "the accepted sft quote requires packed execution, but this worker cannot reproduce its "
             "boundary-safe packing contract"
         )
+    if expected_profile.examples_per_update > len(rows):
+        raise RuntimeError(
+            "the accepted sft quote requires more examples per update than the environment retained; "
+            "refusing to change the accepted training and billing contract"
+        )
     if realized_profile != expected_profile:
         print(
             "[sft][warn] environment processing changed the packaged-dataset token estimate; "

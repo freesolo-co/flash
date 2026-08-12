@@ -574,6 +574,8 @@ def prepare_sft_workload(
     image_dir: str | None = None,
     allow_packing: bool = True,
     packing_support: Callable[[str, str], tuple[str, bool]] | None = None,
+    source_examples: int | None = None,
+    examples_preselected: bool = False,
 ) -> PreparedSftWorkload:
     """Render, tokenize, filter, and pack the exact rows consumed by SFT."""
     from flash.content.multimodal import (
@@ -594,7 +596,12 @@ def prepare_sft_workload(
     max_steps = int(train_spec.max_steps or 0)
 
     source = list(env.dataset())
-    selected = select_sft_examples(source, max_examples, spec.seed)
+    selected = (
+        source if examples_preselected else select_sft_examples(source, max_examples, spec.seed)
+    )
+    source_count = len(source) if source_examples is None else int(source_examples)
+    if source_count < len(selected):
+        raise ValueError("source_examples cannot be smaller than the selected sft sample")
     prompt_rows = []
     for example in selected:
         prompt_messages = env.prompt_messages(example)
@@ -658,7 +665,7 @@ def prepare_sft_workload(
     profile = _build_sft_profile(
         spec,
         producer_version=producer_version,
-        source_examples=len(source),
+        source_examples=source_count,
         selected_examples=len(selected),
         retained=retained,
         epochs=epochs,

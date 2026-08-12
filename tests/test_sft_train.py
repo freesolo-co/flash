@@ -1984,6 +1984,41 @@ def test_worker_uses_the_accepted_unpacked_quote_when_its_stack_can_pack(monkeyp
     assert model.update_horizon == data.profile.authoritative_steps
 
 
+def test_a_packed_quote_fails_closed_when_environment_filtering_leaves_less_than_one_batch(
+    monkeypatch,
+):
+    """the worker must not silently shrink the accepted batch and change the billed contract."""
+    from flash.engine.profiling.workload_profile import SftWorkloadProfile
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    quoted = SftWorkloadProfile.from_dict(spec.workload_profile)
+    spec.workload_profile = replace(
+        quoted,
+        packing_mode="packed",
+        architecture_mode="pure-attention",
+        examples_per_update=2,
+        packed_blocks=1,
+    ).to_dict()
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+    from flash.engine.profiling import sft_workload
+
+    monkeypatch.setattr(sft_workload, "probe_is_pure_attention", lambda _m, revision="": True)
+    prepared = sft_train.prepare_sft_workload
+
+    def retain_one(*args, **kwargs):
+        workload = prepared(*args, **kwargs)
+        return replace(workload, rows=workload.rows[:1])
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", retain_one)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    with pytest.raises(
+        RuntimeError, match="more examples per update than the environment retained"
+    ):
+        sft_train_runner._prepare_sft_data(options)
+
+
 def test_a_packed_quote_fails_closed_when_the_worker_cannot_pack_safely(monkeypatch):
     """a worker without boundary resets must never execute a packed accepted quote."""
     from flash.engine.profiling.workload_profile import SftWorkloadProfile

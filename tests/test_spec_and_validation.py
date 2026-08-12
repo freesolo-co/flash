@@ -333,6 +333,19 @@ def test_train_key_validator_rejects_unknown_names_only() -> None:
     assert "allowed:" in message
 
 
+def test_persisted_worker_specs_tolerate_the_removed_platform_profile_kind_without_warning(
+    caplog,
+) -> None:
+    payload = JobSpec().to_internal_dict()
+    payload["workload_profile_kind"] = "sft"
+
+    with caplog.at_level(logging.WARNING, logger="flash.spec"):
+        restored = JobSpec.from_dict(payload)
+
+    assert restored == JobSpec()
+    assert not caplog.records
+
+
 def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None:
     established = frozenset(
         {

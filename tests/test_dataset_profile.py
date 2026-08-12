@@ -45,9 +45,14 @@ class FakeTokenizer:
         return {"input_ids": ids}
 
 
-def _spec(*, params: dict | None = None, environment_id: str = "team/example") -> JobSpec:
+def _spec(
+    *,
+    params: dict | None = None,
+    environment_id: str = "team/example",
+    model: str = "test/model",
+) -> JobSpec:
     base = JobSpec(
-        model="test/model",
+        model=model,
         model_revision="a" * 40,
         algorithm="sft",
         environment=EnvironmentSpec(
@@ -111,16 +116,14 @@ def test_profile_reads_packaged_train_jsonl_without_executing_environment_code(t
     assert profile.input_digest == spec.workload_profile_input_digest
 
 
-def test_profile_accepts_plural_datasets_layout(tmp_path) -> None:
+def test_profile_rejects_the_plural_dataset_layout_that_the_worker_never_reads(tmp_path) -> None:
     entrypoint = _package(
         tmp_path,
         {"datasets/train.jsonl": '{"input":"one","output":"alpha"}\n'},
     )
 
-    _spec_value, profile = _profile(entrypoint)
-
-    assert profile.source_examples == 1
-    assert profile.retained_examples == 1
+    with pytest.raises(PackagedDatasetUnavailable, match=r"dataset/train\.jsonl"):
+        _profile(entrypoint)
 
 
 def test_profile_prefers_canonical_dataset_over_plural_layout(tmp_path) -> None:
@@ -257,6 +260,18 @@ def test_profile_rejects_dataset_path_outside_the_package(tmp_path) -> None:
         _profile(entrypoint, params={"dataset_path": str(outside)})
 
 
+def test_profile_rejects_contract_path_outside_the_package_before_reading_it(tmp_path) -> None:
+    outside = tmp_path / "secret.txt"
+    outside.write_text("sensitive host content", encoding="utf-8")
+    entrypoint = _package(
+        tmp_path / "package",
+        {"dataset/train.jsonl": '{"input":"prompt","output":"answer"}\n'},
+    )
+
+    with pytest.raises(PackagedDatasetUnavailable, match=r"contract_path.*outside"):
+        _profile(entrypoint, params={"contract_path": str(outside)})
+
+
 def test_profile_tokenizes_raw_record_fields_and_message_shapes_only(tmp_path) -> None:
     entrypoint = _package(
         tmp_path,
@@ -286,4 +301,108 @@ def test_profile_rejects_mixed_message_lists(tmp_path) -> None:
     )
 
     with pytest.raises(ValueError, match="non-object message entries"):
+        _profile(entrypoint)
+
+
+def test_control_plane_profile_refuses_image_rows_before_loading_a_processor(
+    tmp_path, monkeypatch
+) -> None:
+    entrypoint = _package(
+        tmp_path,
+        {
+            "dataset/train.jsonl": (
+                '{"input":"describe","output":"red","image":"dataset/red.png"}\n'
+            )
+        },
+    )
+    spec = _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B")
+    monkeypatch.setattr(
+        "flash.engine.profiling.sft_workload._default_processor_loader",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("processor loader reached")),
+    )
+
+    with pytest.raises(PackagedDatasetUnavailable, match="torch-free control plane"):
+        profile_packaged_sft_dataset(
+            spec,
+            producer_version="1.2.3",
+            tokenizer_loader=lambda _model, _revision: FakeTokenizer(),
+            packing_support=lambda _model, _revision: ("gdn-hybrid", True),
+        )
+
+
+def test_profile_streams_jsonl_and_tokenizes_only_the_deterministic_max_examples_prefix(
+    tmp_path, monkeypatch
+) -> None:
+    from flash.engine.profiling import dataset_profile
+
+    entrypoint = _package(
+        tmp_path,
+        {
+            "dataset/train.jsonl": "".join(
+                json.dumps({"input": f"prompt-{index}", "output": f"answer-{index}"}) + "\n"
+                for index in range(100)
+            )
+        },
+    )
+    seen = {}
+    real_prepare = dataset_profile.prepare_sft_workload
+
+    def capture_rows(spec, env, **kwargs):
+        seen["rows"] = list(env.rows)
+        return real_prepare(spec, env, **kwargs)
+
+    monkeypatch.setattr(dataset_profile, "prepare_sft_workload", capture_rows)
+    spec = _spec(params={}, environment_id=str(entrypoint))
+    spec = replace(spec, train=replace(spec.train, max_examples=3))
+
+    profile = profile_packaged_sft_dataset(
+        spec,
+        producer_version="1.2.3",
+        tokenizer_loader=lambda _model, _revision: FakeTokenizer(),
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    assert profile.source_examples == 100
+    assert profile.selected_examples == 3
+    assert {row["input"] for row in seen["rows"]} == {"prompt-0", "prompt-1", "prompt-2"}
+
+
+def test_jsonl_profile_never_slurps_the_dataset_into_one_control_plane_string(
+    tmp_path, monkeypatch
+) -> None:
+    entrypoint = _package(
+        tmp_path,
+        {
+            "dataset/train.jsonl": (
+                '{"input":"one","output":"alpha"}\n{"input":"two","output":"beta"}\n'
+            )
+        },
+    )
+    dataset_path = tmp_path / "dataset/train.jsonl"
+    read_text = Path.read_text
+
+    def refuse_dataset_slurp(path, *args, **kwargs):
+        if path == dataset_path:
+            raise AssertionError("jsonl dataset was slurped with Path.read_text")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", refuse_dataset_slurp)
+
+    _spec_value, profile = _profile(entrypoint)
+
+    assert profile.source_examples == 2
+
+
+def test_profile_refuses_a_dataset_file_above_the_control_plane_memory_bound(
+    tmp_path, monkeypatch
+) -> None:
+    from flash.engine.profiling import dataset_profile
+
+    entrypoint = _package(
+        tmp_path,
+        {"dataset/train.jsonl": '{"input":"prompt","output":"answer"}\n'},
+    )
+    monkeypatch.setattr(dataset_profile, "_MAX_PROFILE_DATASET_BYTES", 1)
+
+    with pytest.raises(PackagedDatasetUnavailable, match="profiling limit"):
         _profile(entrypoint)

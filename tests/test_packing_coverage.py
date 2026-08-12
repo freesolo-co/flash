@@ -86,6 +86,29 @@ def test_gdn_forward_probe_swallows_import_and_inspection_failures(monkeypatch) 
     assert packing._gdn_forward_threads_reset_kwargs(None) is False
 
 
+def test_control_plane_packing_uses_the_fixed_worker_image_contract_without_gpu_modules(
+    monkeypatch,
+) -> None:
+    """gdn estimates preserve the worker batch without importing model code or gpu modules."""
+    monkeypatch.setattr(
+        packing,
+        "probe_is_pure_attention",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected config probe")),
+    )
+    monkeypatch.setattr(
+        packing,
+        "probe_is_gdn_hybrid",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected config probe")),
+    )
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name: (_ for _ in ()).throw(AssertionError(f"unexpected plane import: {name}")),
+    )
+
+    assert packing.worker_image_packing_support("Qwen/Qwen3.5-4B") == ("gdn-hybrid", True)
+
+
 def test_the_packing_contract_gate_never_consults_the_device() -> None:
     """the control-plane gate must decide without a gpu.
 

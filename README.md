@@ -97,8 +97,8 @@ flash models chat RUN_ID -m "hello"    # talk to it
 `flash train`, `flash train --dry-run`, and `flash train --cost` resolve the pinned environment
 package on the control plane and read its dataset file without importing `environment.py`. The
 package must contain a readable JSON or JSONL dataset. `dataset/train.jsonl` is the canonical
-default; `dataset/train.json`, `datasets/train.jsonl`, and `datasets/train.json` are accepted, and
-`[environment.params] split` or `dataset_path` can select another packaged file.
+default; `dataset/train.json` is also accepted, and `[environment.params] split` or `dataset_path`
+can select another packaged file.
 
 The control plane tokenizes raw `input` and `output` fields plus the statically readable training
 contract, using the same precedence as the environment loader: explicit `contract_text`, then

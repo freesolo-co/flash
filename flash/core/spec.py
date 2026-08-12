@@ -408,7 +408,7 @@ MANAGED_GPU_KEYS = frozenset(
 #
 # Ignored on READ only: nothing here is a JobSpec field, so an authored config naming one is still
 # rejected as unknown by the schema layer's own key check (see schema._TOP_LEVEL_KEYS).
-_DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy", "worker_env"})
+_DROPPED_TOP_LEVEL_KEYS = frozenset({"model_policy", "worker_env", "workload_profile_kind"})
 
 # Tolerating a dropped key keeps a pre-upgrade run's recovery path, but the values behind it stop
 # being applied -- so a run that authored them now trains on managed defaults instead of what was

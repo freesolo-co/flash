@@ -17,16 +17,18 @@ from pathlib import Path
 from typing import Any
 
 from flash.engine.profiling.sft_workload import prepare_sft_workload
-from flash.engine.profiling.tokenizer import load_tokenizer
+from flash.engine.profiling.tokenizer import load_control_plane_tokenizer
+from flash.engine.worker.entry.sft import select_sft_examples
+from flash.engine.worker.model.packing import worker_image_packing_support
 from flash.envs.dataset_selection import (
     _packaged_dataset_file,
-    _plural_dataset_file,
     _validate_packaged_dataset_split,
 )
 from flash.envs.loader import _load_contract_text, _resolve_environment_reference, _resolve_path_arg
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
+_MAX_PROFILE_DATASET_BYTES = 32 * 1024 * 1024
 
 
 class PackagedDatasetUnavailable(ValueError):
@@ -108,9 +110,20 @@ def _contract_text(base_dir: Path, params: dict[str, Any]) -> str:
     authored = params.get("contract_text")
     if authored:
         return str(authored)
-    contract_path = _resolve_path_arg(params.get("contract_path"), base_dir)
+    configured_path = params.get("contract_path")
+    contract_path = _resolve_path_arg(configured_path, base_dir)
     if not isinstance(contract_path, str):
         contract_path = str(base_dir / "TRAINING_CONTRACT.md")
+    path = Path(contract_path)
+    try:
+        packaged = path.resolve().is_relative_to(base_dir.resolve())
+    except (OSError, RuntimeError):
+        packaged = False
+    if not packaged:
+        raise PackagedDatasetUnavailable(
+            f"[environment.params] contract_path {configured_path!r} is outside the environment "
+            "package. Package the contract file with the environment."
+        )
     return str(_load_contract_text(contract_path))
 
 
@@ -136,59 +149,88 @@ def _selected_dataset_path(base_dir: Path, params: dict[str, Any]) -> Path:
     canonical = _packaged_dataset_file(base_dir, wanted)
     if canonical is not None:
         return canonical
-    plural = _plural_dataset_file(base_dir, wanted)
-    if plural is not None:
-        return plural
     raise PackagedDatasetUnavailable(
         f"environment package has no readable dataset for split {wanted!r}. Add "
         "dataset/train.jsonl to the environment package, or package the selected split as "
-        f"dataset/{wanted}.jsonl. The plural datasets/{wanted}.jsonl layout is also accepted."
+        f"dataset/{wanted}.jsonl."
     )
 
 
-def _read_dataset_rows(path: Path) -> list[dict[str, Any]]:
+def _read_jsonl_rows(path: Path, *, max_examples: int) -> tuple[int, list[dict[str, Any]]]:
+    source_examples = 0
+    values = []
+    missing = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise TypeError("dataset row is not an object")
+            if _CANONICAL_INPUT_KEY not in row and len(missing) < 10:
+                missing.append(source_examples)
+            source_examples += 1
+            if max_examples <= 0 or len(values) < max_examples:
+                values.append(row)
+    if missing:
+        raise ValueError(
+            "Freesolo dataset records must contain an input field; missing at row indexes "
+            f"{missing}"
+        )
+    return source_examples, values
+
+
+def _read_dataset_rows(path: Path, *, max_examples: int) -> tuple[int, list[dict[str, Any]]]:
     try:
+        if path.stat().st_size > _MAX_PROFILE_DATASET_BYTES:
+            raise PackagedDatasetUnavailable(
+                f"environment dataset file {path.name!r} exceeds the 32 MiB control-plane profiling "
+                "limit. Reduce the packaged training dataset."
+            )
         if path.suffix.lower() == ".jsonl":
-            values = [
-                json.loads(line)
-                for line in path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
+            source_examples, values = _read_jsonl_rows(path, max_examples=max_examples)
         elif path.suffix.lower() == ".json":
             loaded = json.loads(path.read_text(encoding="utf-8"))
             values = loaded.get("records") if isinstance(loaded, dict) else loaded
+            if not isinstance(values, list) or not all(isinstance(row, dict) for row in values):
+                raise TypeError("dataset rows are not objects")
+            source_examples = len(values)
+            missing = [index for index, row in enumerate(values) if _CANONICAL_INPUT_KEY not in row]
+            if missing:
+                raise ValueError(
+                    "Freesolo dataset records must contain an input field; missing at row indexes "
+                    f"{missing[:10]}"
+                )
+            if max_examples > 0:
+                values = values[:max_examples]
         else:
             raise ValueError("dataset file must end in .jsonl or .json")
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    except PackagedDatasetUnavailable:
+        raise
+    except TypeError as exc:
+        raise PackagedDatasetUnavailable(
+            f"environment dataset file {path.name!r} must contain JSON object rows. Add a valid "
+            "dataset/train.jsonl to the environment package."
+        ) from exc
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise PackagedDatasetUnavailable(
             f"environment dataset file {path.name!r} is not readable JSON. Add a valid "
             "dataset/train.jsonl to the environment package."
         ) from exc
-    if not isinstance(values, list) or not all(isinstance(row, dict) for row in values):
-        raise PackagedDatasetUnavailable(
-            f"environment dataset file {path.name!r} must contain JSON object rows. Add a valid "
-            "dataset/train.jsonl to the environment package."
-        )
     if not values:
         raise PackagedDatasetUnavailable(
             f"environment dataset file {path.name!r} contains no rows. Add training rows to "
             "dataset/train.jsonl in the environment package."
         )
-    missing = [index for index, row in enumerate(values) if _CANONICAL_INPUT_KEY not in row]
-    if missing:
-        raise ValueError(
-            "Freesolo dataset records must contain an input field; missing at row indexes "
-            f"{missing[:10]}"
-        )
-    return [dict(row) for row in values]
+    return source_examples, [dict(row) for row in values]
 
 
 def profile_packaged_sft_dataset(
     spec,
     *,
     producer_version: str,
-    tokenizer_loader=load_tokenizer,
-    packing_support=None,
+    tokenizer_loader=load_control_plane_tokenizer,
+    packing_support=worker_image_packing_support,
 ):
     """build an sft quote profile from the pinned package's raw dataset records.
 
@@ -212,16 +254,28 @@ def profile_packaged_sft_dataset(
     base_dir = reference.parent
     params = dict(spec.environment.params or {})
     dataset_path = _selected_dataset_path(base_dir, params)
-    rows = _read_dataset_rows(dataset_path)
+    max_examples = int(spec.train.max_examples or 0)
+    source_examples, rows = _read_dataset_rows(dataset_path, max_examples=max_examples)
+    rows = select_sft_examples(rows, 0, spec.seed)
+    raw_environment = _RawRecordEnvironment(
+        rows=rows,
+        package_root=base_dir,
+        contract_text=_contract_text(base_dir, params),
+    )
+    from flash.content.multimodal import record_has_images
+
+    if any(record_has_images(row, raw_environment.prompt_messages(row)) for row in rows):
+        raise PackagedDatasetUnavailable(
+            "image-bearing SFT datasets cannot be profiled on the torch-free control plane. "
+            "Use text-only SFT records."
+        )
     return prepare_sft_workload(
         spec,
-        _RawRecordEnvironment(
-            rows=rows,
-            package_root=base_dir,
-            contract_text=_contract_text(base_dir, params),
-        ),
+        raw_environment,
         tokenizer_loader=tokenizer_loader,
         producer_version=producer_version,
         allow_packing=True,
         packing_support=packing_support,
+        source_examples=source_examples,
+        examples_preselected=True,
     ).profile
