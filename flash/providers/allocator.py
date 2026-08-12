@@ -265,13 +265,19 @@ def _fitting_candidates(candidates, need: int, executed_width) -> list:
 
 
 def _sizing_int(train, name: str, default: int) -> int:
-    """A positive int knob off a dict-or-object ``train``, or ``default`` when absent/unusable."""
+    """A positive int knob off a dict-or-object ``train``, or ``default`` when absent/unusable.
+
+    ``OverflowError`` joins the type errors because ``int(float("inf"))`` raises it, and sizing runs
+    BEFORE the knob validator that rejects a non-finite number: escaping here turns the clean 400
+    that validator produces into a 500. Unusable is unusable however the conversion fails -- the run
+    is still rejected, this only has to let the rejection reach the validator that words it.
+    """
     if train is None:
         return default
     value = train.get(name) if isinstance(train, dict) else getattr(train, name, None)
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return number if number > 0 else default
 
