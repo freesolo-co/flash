@@ -365,11 +365,40 @@ def _status_request(url: str, headers: dict[str, str]) -> dict:
 
     It still sends the internal key, because the contract permits a backend to authenticate
     /healthz and an unauthenticated probe would report a working backend as down.
+
+    Which is why redirects are origin-scoped here. urllib re-sends every custom header to the
+    redirect target, and on a standalone plane this header is the credential that controls the
+    plane: one `/healthz` that 302s off-origin -- a misconfigured proxy, or a backend someone else
+    now controls -- hands it over. `flash.serve.deploy` installs an httpx hook for exactly this;
+    the dependency-free path needs its own, so the two agree on what leaves the serving origin.
     """
+    import urllib.error
     import urllib.request
 
+    from flash.serve.urls import displayable_url, url_origin
+
+    origin = url_origin(url)
+
+    class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+            new = super().redirect_request(req, fp, code, msg, hdrs, newurl)
+            if new is not None and url_origin(newurl) != origin:
+                # Dropped rather than followed-without-the-key: a status probe that silently
+                # reports on some other host's health is worse than one that says it was
+                # redirected somewhere it will not follow.
+                raise urllib.error.HTTPError(
+                    newurl,
+                    code,
+                    f"{displayable_url(url)} redirected to another origin "
+                    f"({displayable_url(newurl)}); refusing to send the serving key there",
+                    hdrs,
+                    fp,
+                )
+            return new
+
+    opener = urllib.request.build_opener(_SameOriginRedirect)
     request = urllib.request.Request(f"{url}/healthz", headers=headers, method="GET")
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with opener.open(request, timeout=30) as response:
         return json.load(response)
 
 

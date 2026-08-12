@@ -1118,6 +1118,30 @@ def test_undeploy_works_when_the_member_index_is_missing(client):
     assert response.json()["disabled_revisions"] == [REVISION]
 
 
+def test_undeploy_by_run_id_disables_revisions_when_the_index_is_missing(client):
+    """The client deletes by RUN id, so the missing-index repair must work on that path.
+
+    `undeploy_adapter` builds its url from the run id and nothing else, so `adapter_id == run_id`
+    on every real undeploy and unioning the two adds nothing. With no `members:` key the loop then
+    sees only the alias: sibling revisions stay `ready`, stay resident on the GPU, and can be
+    reactivated by their immutable ids while undeploy answers 200.
+
+    The sibling test above deletes by REVISION id, where the union does carry the record through --
+    which is exactly why it cannot catch this.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    del module.adapter_records[module._members_key(RUN_ID)]
+
+    response = client.delete(f"/adapters/{RUN_ID}")
+    assert response.status_code == 200
+    assert module.adapter_records[module._record_key(REVISION)]["status"] == "disabled", (
+        "undeploying by run id left the revision `ready`, so it is still on the GPU and still "
+        "callable by its immutable id after undeploy reported success"
+    )
+    assert REVISION in response.json()["disabled_revisions"]
+
+
 def test_an_activation_racing_an_expired_undeploy_lease_cannot_leave_a_ready_alias(client):
     """Undeploy must disable the run alias LAST, so losing the lock mid-pass is not corrupting.
 

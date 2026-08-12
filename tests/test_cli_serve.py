@@ -478,6 +478,97 @@ def test_a_credential_in_the_serving_url_is_never_printed(monkeypatch, capsys, u
     assert "acme.modal.run" in err, "the redaction dropped the host, so the error names nothing"
 
 
+@pytest.mark.parametrize(
+    "same_origin",
+    [True, False],
+    ids=["same-origin-redirect-is-followed", "cross-origin-redirect-drops-the-key"],
+)
+def test_status_never_sends_the_serving_key_to_another_origin(same_origin):
+    """A `/healthz` redirect must not carry the plane's root credential off-origin.
+
+    urllib re-sends custom headers to a redirect target -- it strips only the ones IT set -- so a
+    backend that 302s elsewhere collects `X-Freesolo-Internal-Key`, which on a standalone plane is
+    the credential that controls the plane. `flash.serve.deploy` installs an httpx hook for exactly
+    this; the dependency-free status path needs its own.
+
+    Driven against two real loopback servers rather than a mocked opener, because the leak IS
+    urllib's redirect behavior: a stub would only test the stub. The same-origin case is not
+    decoration -- Modal 303s slow requests to a same-origin poll url, so a handler that refused
+    every redirect would break the ordinary path while passing the security half.
+    """
+    import http.server
+    import threading
+    import urllib.error
+
+    seen: list[dict] = []
+
+    class _Target(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # matches BaseHTTPRequestHandler's own naming
+            seen.append({k.lower(): v for k, v in self.headers.items()})
+            body = b'{"ok": true, "capabilities": []}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    class _Redirector(_Target):
+        def do_GET(self):
+            if self.path == "/healthz":
+                self.send_response(302)
+                self.send_header("Location", target_url + "/elsewhere")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            super().do_GET()
+
+    target = http.server.HTTPServer(("127.0.0.1", 0), _Target)
+    handler = _Redirector if not same_origin else _Target
+    front = http.server.HTTPServer(("127.0.0.1", 0), handler)
+    target_url = f"http://127.0.0.1:{target.server_port}"
+    front_url = f"http://127.0.0.1:{front.server_port}"
+    if same_origin:
+        # redirect to a different PATH on the same origin, which is modal's async-result poll.
+        class _SelfRedirector(_Target):
+            def do_GET(self):
+                if self.path == "/healthz":
+                    self.send_response(302)
+                    self.send_header("Location", front_url + "/poll")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                super().do_GET()
+
+        front.RequestHandlerClass = _SelfRedirector
+
+    for server in (target, front):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        headers = {"X-Freesolo-Internal-Key": "sekrit"}
+        if same_origin:
+            payload = serve_cmd._status_request(front_url, headers)
+            assert payload["ok"] is True, "a same-origin redirect must still be followed"
+            assert seen, "the redirect target was never reached"
+            assert seen[-1].get("x-freesolo-internal-key") == "sekrit", (
+                "the key was dropped on a same-origin redirect, so modal's async-result poll "
+                "would arrive unauthenticated"
+            )
+        else:
+            with pytest.raises(urllib.error.HTTPError, match="another origin"):
+                serve_cmd._status_request(front_url, headers)
+            assert not any(h.get("x-freesolo-internal-key") for h in seen), (
+                "the serving key was sent to the redirect target, disclosing the standalone "
+                "plane's root credential to whoever controls it"
+            )
+    finally:
+        for server in (target, front):
+            server.shutdown()
+            server.server_close()
+
+
 def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, capsys):
     """Both key-setup paths must generate into a variable, not inline into `modal secret create`.
 
@@ -569,6 +660,28 @@ def test_subcommands_are_registered(argv, expected):
 
     args = _build_parser().parse_args(argv)
     assert args.func.__name__ == expected
+
+
+def test_a_negative_context_length_is_rejected_at_parse_time():
+    """A negative `--context-len` inverts the sizing math instead of failing.
+
+    The estimator multiplies KV bytes per token by this value, so a negative SUBTRACTS memory:
+    `--context-len -900000` reports a 24 GB A10 as fitting `ample` with 124 GB spare. The table
+    looks entirely ordinary, which is what makes it worth rejecting at the boundary -- the command
+    exists to answer "will this fit", and this is the one input that makes it answer backwards.
+
+    Zero stays valid: it is the documented sentinel for the model's own serving context.
+    """
+    from flash.cli import _build_parser
+
+    parser = _build_parser()
+    assert parser.parse_args(["serve", "gpus", "--model", "Qwen/Qwen3.5-4B"]).context_len == 0
+    ok = parser.parse_args(["serve", "gpus", "--model", "Qwen/Qwen3.5-4B", "--context-len", "0"])
+    assert ok.context_len == 0
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["serve", "gpus", "--model", "Qwen/Qwen3.5-4B", "--context-len", "-900000"]
+        )
 
 
 def test_setup_defaults_are_safe():

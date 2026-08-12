@@ -160,6 +160,25 @@ def _wait_seconds(value: str) -> float:
     return seconds
 
 
+def _serving_context_len(value: str) -> int:
+    """A context length for `serve gpus`, rejecting negatives at parse time.
+
+    The estimator multiplies KV bytes per token by this number, so a negative SUBTRACTS memory:
+    `--context-len -900000` reports a 24 GB A10 as fitting with 124 GB spare. That is the exact
+    inverse of what a sizing command is for, and it is silent -- the table looks ordinary. Zero
+    stays valid: it is the documented sentinel for "use the model's own serving context".
+    """
+    try:
+        length = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number of tokens, got {value!r}") from None
+    if length < 0:
+        raise argparse.ArgumentTypeError(
+            f"--context-len cannot be negative, got {value!r} (0 means the model's own context)"
+        )
+    return length
+
+
 def _gpu_count_override(value: str) -> str:
     """Turn `--gpus N` into the `gpu.count=N` override it is sugar for.
 
@@ -372,7 +391,7 @@ def _add_serve_commands(sub: argparse._SubParsersAction) -> None:
     gpus.add_argument("--model", required=True, help="base model id, e.g. Qwen/Qwen3.5-4B")
     gpus.add_argument(
         "--context-len",
-        type=int,
+        type=_serving_context_len,
         default=0,
         help="context length to size the KV cache for (default: the model's serving context)",
     )

@@ -206,6 +206,31 @@ async def _release_lora_int_id(int_id: int, adapter_id: str) -> bool:
     return True
 
 
+async def _rebuild_run_members(run_id: str) -> list[str]:
+    """Find a run's members by scanning, for when the index does not have them.
+
+    The repair path for an index that is missing or predates this app version. Deliberately NOT
+    called under the run lock: its cost tracks every adapter ever registered, and the lock's lease
+    is a fixed TTL that cannot be renewed atomically (see `_run_lock`), so a scan inside it is the
+    one thing that can push a critical section past its own expiry.
+
+    Running it outside the lock makes it a snapshot, which is safe HERE and nowhere else: it only
+    supplements the in-lock index read, and it only finds records the index missed -- records that
+    predate the index or were orphaned by a dead container. A revision registered concurrently is
+    added to the index under the lock, so the in-lock read is what catches it, not this.
+    """
+    found: list[str] = []
+    async for key in adapter_records.keys.aio():
+        if not isinstance(key, str) or not key.startswith("record:"):
+            continue
+        record = await adapter_records.get.aio(key)
+        if not isinstance(record, dict):
+            continue
+        if (record.get("metadata") or {{}}).get("run_id") == run_id:
+            found.append(record.get("adapter_id") or key[len("record:") :])
+    return found
+
+
 async def _run_members(run_id: str) -> list[str]:
     """Every adapter id belonging to one run: its alias plus each revision registered under it.
 
@@ -893,6 +918,15 @@ def api():
         run_id = (record.get("metadata") or {{}}).get("run_id") or adapter_id
         disabled_aliases: list[str] = []
         disabled_revisions: list[str] = []
+        # Repair BEFORE the lock, because the scan is unbounded and the lease is not renewable.
+        # Only when the index is empty, so the ordinary path stays one indexed read.
+        #
+        # Unioning `adapter_id` into the members below is not enough on its own: flash's client
+        # always deletes by RUN id (`undeploy_adapter` builds the url from run_id), so on the real
+        # path `adapter_id == run_id` and the union adds nothing. With no index, the loop would
+        # then disable the alias alone and leave every sibling revision `ready`, resident on the
+        # GPU, and reactivatable -- undeploy answering 200 for a run that still serves.
+        repaired = [] if await _run_members(run_id) else await _rebuild_run_members(run_id)
         # Under the SAME per-run lock `activate` and registration take. Without it, an in-flight
         # activation can write the alias back to `ready` after this loop disabled it, and undeploy
         # returns success while the run stays callable -- the lost update
@@ -904,12 +938,15 @@ def api():
             # by its immutable id even though undeploy reported success. Being an indexed lookup
             # rather than a keyspace scan is what makes it affordable to hold the lock across.
             #
-            # `adapter_id` is unioned in because the index is a repairable cache, not the source of
-            # truth: an app upgraded from the earlier scan-based version has no `members:` key at
-            # all, and a container that died between the revision write and `_ensure_run_alias`
-            # left one incomplete. Without this, `_run_members` returns [] and the loop below does
-            # nothing -- undeploy answers 200 with empty lists while the adapter keeps serving.
-            members = list(dict.fromkeys([*await _run_members(run_id), adapter_id, run_id]))
+            # `repaired` and the two ids are unioned in because the index is a repairable cache,
+            # not the source of truth: an app upgraded from the earlier scan-based version has no
+            # `members:` key at all, and a container that died between the revision write and
+            # `_ensure_run_alias` left one incomplete. Without this, `_run_members` returns [] and
+            # the loop below does nothing -- undeploy answers 200 with empty lists while the
+            # adapter keeps serving.
+            members = list(
+                dict.fromkeys([*await _run_members(run_id), *repaired, adapter_id, run_id])
+            )
             # The alias goes LAST, which is what makes this loop safe to lose halfway through. Its
             # cost grows with the run's member count while the lock's lease does not renew -- the
             # TTL cannot be extended atomically on modal.Dict (see `_run_lock`) -- so a long enough
