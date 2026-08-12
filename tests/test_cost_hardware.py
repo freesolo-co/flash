@@ -386,6 +386,53 @@ def test_ranking_prices_the_authored_rollout_batch_not_the_recipe_default():
     assert bare.normalized().batch_size == RECIPE.rl.prompts_per_step
 
 
+def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
+    """Ranking must price the batch a step can actually reach, not the authored ceiling.
+
+    Both rollout workers retain at most ``max_examples`` rows and then clamp the batch to what is
+    left, so `prompts_per_step = 128` with `max_examples = 2` trains on 2. Ranking the raw 128 sizes
+    hardware for a step that cannot happen, and disagrees with the persisted quote, which already
+    takes this minimum -- so the run is billed against one number and provisioned against another.
+
+    Only the validated ``[train] max_examples`` is a cap here. ``[environment.params] max_examples``
+    is an opaque kwarg flash never enforces, and `_on_policy_example_count` deliberately does not
+    take a min() with it; a run whose environment ignores the key would otherwise be underprovisioned.
+    """
+    from types import SimpleNamespace
+
+    from flash.cost.spec import _on_policy_prompts_per_step, _on_policy_requested_prompts_per_step
+    from flash.providers.base import run_config_for_ranking
+
+    for algorithm in ("grpo", "opd"):
+        # (authored prompts_per_step, max_examples, expected ranked batch)
+        for authored, retained, expected in (
+            (128, 2, 2),  # the reported shape: pool far below the authored batch
+            (2, 128, 2),  # pool above the batch changes nothing
+            (8, 8, 8),  # equal
+            (8, 0, 8),  # 0 means uncapped, not "a pool of zero"
+            (8, None, 8),  # unset
+        ):
+            train = {"epochs": 1, "group_size": 4, "prompts_per_step": authored}
+            if retained is not None:
+                train["max_examples"] = retained
+            config = run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+            assert config.batch_size == expected, (algorithm, authored, retained)
+
+    # sft is untouched: its `batch_size` is examples per update on a dataset it may revisit across
+    # epochs, so a small `max_examples` does not bound it the way a rollout pool bounds a step.
+    sft = run_config_for_ranking(
+        "Qwen/Qwen3.5-4B", "sft", train={"epochs": 1, "batch_size": 8, "max_examples": 2}
+    )
+    assert sft.batch_size == 8
+
+    # and it agrees with the quote that bills the run, which is the disagreement being fixed.
+    spec = SimpleNamespace(
+        algorithm="grpo", train=SimpleNamespace(prompts_per_step=128, max_examples=2)
+    )
+    assert _on_policy_requested_prompts_per_step(spec) == 128
+    assert _on_policy_prompts_per_step(spec, spec.train.max_examples) == 2
+
+
 def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     """The ranking config carries NO provider, so reading it off the config alone was inert.
 

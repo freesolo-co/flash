@@ -351,6 +351,21 @@ def run_config_for_ranking(
             return None
         return int(number)
 
+    def rollout_batch():
+        """Prompts a rollout step really trains on: the authored batch, capped by the pool.
+
+        Both workers retain at most ``max_examples`` rows and then clamp the batch to what is left
+        (`resolve_grpo_prompts_per_step`, and opd's `_prepare_workload` slice), so an authored 128
+        against `max_examples = 2` trains on 2. Ranking the raw 128 would size hardware for a step
+        that cannot happen. `flash.cost.spec._on_policy_prompts_per_step` already takes this same
+        minimum, so skipping it here also left ranking and the persisted quote disagreeing.
+        """
+        authored = knob("prompts_per_step")
+        retained = knob("max_examples")
+        if authored is None or retained is None:
+            return authored
+        return min(authored, retained)
+
     return RunConfig(
         model_id=model_id,
         method=algorithm,
@@ -364,9 +379,7 @@ def run_config_for_ranking(
         # authored 32 -- and could select a costlier shape than the run actually needs.
         # `flash.cost.spec.estimate_for_spec` splits the same way, with a third branch this has no
         # input for: it prefers a measured sft workload profile, which ranking runs before.
-        batch_size=(
-            knob("prompts_per_step") if samples_on_policy(algorithm) else knob("batch_size")
-        ),
+        batch_size=(rollout_batch() if samples_on_policy(algorithm) else knob("batch_size")),
         group_size=knob("group_size"),
         lora_rank=knob("lora_rank"),
         thinking=thinking,
