@@ -74,7 +74,13 @@ def _require_gpu():
 
 
 def warm_flash_attn(torch) -> bool:
-    """Compile FlashAttention fwd + bwd (FA2 everywhere, + FA3 on Hopper) with one tiny attention."""
+    """Compile FlashAttention fwd + bwd with one tiny attention.
+
+    FA2 only. The FA3 (``flash_attn_interface``) warm was removed with the wheel: it was installed
+    into this interpreter while training runs in /opt/verl-venv, and nothing ever set
+    ``attn_implementation``, so verl's "flash_attention_2" default meant FA3 never ran in a training
+    forward on any arch. Warming a kernel the trainer cannot reach only bloated the mega-cache.
+    """
     warmed = False
     try:
         from flash_attn import flash_attn_func
@@ -90,27 +96,6 @@ def warm_flash_attn(torch) -> bool:
         warmed = True
     except Exception as e:
         _log(f"flash-attn (FA2) warm skipped: {e}")
-    # FA3 is Hopper-only: launching it on another arch produces a "no kernel image" CUDA error that
-    # POISONS the context (not cleared by Python exception) and breaks save_cache_artifacts.
-    if _torch_sm(torch) == "sm90":
-        try:
-            import flash_attn_interface
-
-            q, k, v = (
-                torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-                for _ in range(3)
-            )
-            out = flash_attn_interface.flash_attn_func(q, k, v, causal=True)
-            if isinstance(out, tuple):
-                out = out[0]
-            out.sum().backward()
-            torch.cuda.synchronize()
-            _log("flash-attn-3 (Hopper) fwd/bwd compiled")
-            warmed = True
-        except Exception as e:
-            _log(f"flash-attn-3 warm skipped: {e}")
-    else:
-        _log("flash-attn-3 warm skipped (Hopper-only; not this arch)")
     return warmed
 
 

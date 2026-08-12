@@ -9,8 +9,8 @@ CHANNEL = "prod"
 # Must stay in lockstep with [project.scripts] in pyproject.toml.
 _DEFAULT_CLI_NAME = "flash-dev" if CHANNEL == "dev" else "flash"
 
-# The product's name, for places that IDENTIFY the tool rather than tell the operator what to
-# type: the styled wordmark, `flash version`, `--version`. Fixed per channel, never per
+# The product's name, for places that IDENTIFY the tool rather than tell the operator what
+# to type: the styled wordmark, `flash version`, `--version`. Fixed per channel, never per
 # invocation -- reaching the same tool through a different entry point does not rename it, and
 # `python -m flash.cli 1.1.43` reads as a command someone forgot to finish rather than a version
 # banner.
