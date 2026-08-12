@@ -2383,6 +2383,30 @@ def test_env_eval_reports_the_whole_completion_it_graded() -> None:
     assert result.response == "<think>2+2 is 4</think>4"
 
 
+@pytest.mark.parametrize("scorer_raises", [False, True])
+def test_env_eval_records_raw_episode_generation_on_success_and_failure(scorer_raises) -> None:
+    """episode state carries answer-only text, but its raw generation is the diagnostic record."""
+    from flash.cli.commands.env.eval import _case_payload, _score_case
+    from flash.envs.adapter import _ScoredResponseText
+
+    raw = "<think>2+2 is 4</think>4"
+    stored = _ScoredResponseText("4", raw=raw, thinking="2+2 is 4")
+
+    class Suite:
+        def score(self, case, response, state=None):
+            assert response is stored
+            if scorer_raises:
+                raise RuntimeError("scorer bailed")
+            return 1.0
+
+    case = EvalCase(id="c1", input="2+2", expected="4")
+    result = _score_case(Suite(), case, "c1", stored, state={"response_text": stored})
+
+    assert result.response == raw
+    assert _case_payload(case, result)["actual"] == raw
+    assert result.error == ("scoring failed: scorer bailed" if scorer_raises else None)
+
+
 def test_env_eval_uploads_a_suite_that_failed_to_load(monkeypatch, tmp_path, capsys) -> None:
     # skipping the upload for a suite that never graded a case left the dashboard showing the
     # earlier suites as a completed run with the failing suite simply absent -- a green-looking

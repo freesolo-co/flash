@@ -200,21 +200,23 @@ def _score_case(
     keyword-only scorers reject a third positional, `*args` scorers reject the keyword -- so the
     caller decides, having read the signature.
     """
+    recorded_response = response
     try:
         scored_text = _scored_response(response, thinking=thinking)
+        recorded_response = getattr(scored_text, "raw", response)
         if state is None:
             scored = suite.score(case, scored_text)
         elif state_keyword:
             scored = suite.score(case, scored_text, state=state)
         else:
             scored = suite.score(case, scored_text, state)
-        return normalize_eval_result(case, response, scored, case_id=case_id)
+        return normalize_eval_result(case, recorded_response, scored, case_id=case_id)
     except (Exception, SystemExit) as exc:
         return EvalResult(
             case_id=case_id,
             passed=False,
             score=0.0,
-            response=response,
+            response=recorded_response,
             error=f"scoring failed: {str(exc) or exc.__class__.__name__}",
         )
 
