@@ -925,8 +925,6 @@ def kill_process_group(proc: subprocess.Popen, *, process_group_id: int | None =
     _reap_group_zombies(pgid, skip=proc.pid)
 
 
-# re-exported so the shim renderers and metric parsers stay reachable as
-# `backend_common.<name>`: all three trainers and the tests import them from here.
 # re-exported so the capability probe and the checkpoint exporter stay reachable as
 # `backend_common.<name>`: the trainers and the tests both import them from here.
 from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
