@@ -97,9 +97,16 @@ def publish_slug_for_name(name: str, key: dict, project_slug: str) -> tuple[str,
     caller_namespace = namespace_for(key)
     project = str(project_slug or "").strip()
     if not project:
+        # The route resolves the slug through `require_project_access_slug`, which already refuses
+        # an empty one and says WHY (standalone has no project directory; a validation response
+        # missing it is an upstream fault). Neither cause is the caller's key, so this no longer
+        # blames one -- it stays as the last guard for a direct domain-level caller, which is why
+        # it is a 500: reaching here means a caller skipped the resolution that would have
+        # explained it.
         raise EnvPublishError(
-            "the project's slug could not be resolved, so the environment's destination is "
-            "unknown; re-run `flash login` to refresh the key"
+            "the project's slug was not resolved before publishing, so the environment's "
+            "destination is unknown",
+            status=500,
         )
     if not _NAMESPACE_RE.fullmatch(project):
         raise EnvPublishError("project slug must match [a-z0-9][a-z0-9._-]*")

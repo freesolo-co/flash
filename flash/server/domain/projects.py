@@ -150,7 +150,7 @@ def require_project_access(
     org_id: str | None = None,
 ) -> str:
     """Require the explicit project to resolve under the authenticated Freesolo organization."""
-    return require_project_access_slug(
+    return _project_access(
         project_id=project_id,
         key=key,
         authorization=authorization,
@@ -165,12 +165,59 @@ def require_project_access_slug(
     authorization: str | None,
     org_id: str | None = None,
 ) -> tuple[str, str]:
-    """As :func:`require_project_access`, but also returns the project's slug.
+    """As :func:`require_project_access`, but also returns the project's non-empty slug.
 
-    The slug is the second segment of every environment slug this project publishes, so the env
-    routes need it; runs do not, which is why the id-only wrapper above stays the common entry
-    point. The slug is ``""`` in standalone mode, where there is no Freesolo project directory
-    to resolve it from.
+    The slug is the second segment of every environment slug this project publishes, so a caller
+    that asked for one cannot proceed without it. Validation therefore ends here rather than at
+    the publish itself: the destination is unknowable, and the failure has to name that.
+
+    Two ways a slug can come back empty, both of which used to reach ``publish_slug_for_name``
+    and surface as "re-run `flash login` to refresh the key" -- advice that cannot help, because
+    neither cause is the caller's key. A standalone plane has no Freesolo project directory to
+    resolve a slug from and cannot publish to the managed hub at all, and a validation response
+    that omits ``projectSlug``/``slug`` is a backend contract violation. Reporting them apart is
+    the point: one is a permanent property of the deployment, the other is an upstream fault.
+    """
+    project_id, slug = _project_access(
+        project_id=project_id,
+        key=key,
+        authorization=authorization,
+        org_id=org_id,
+    )
+    if not slug:
+        if standalone():
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "publishing environments requires a Freesolo project directory to resolve "
+                    "the project slug, which a standalone plane does not have; reference the "
+                    "environment from git instead (see SELF_HOSTING.md)"
+                ),
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Freesolo project validation returned no slug for project {project_id!r}, "
+                "so the environment's destination cannot be resolved"
+            ),
+        )
+    return project_id, slug
+
+
+def _project_access(
+    *,
+    project_id: str,
+    key: dict[str, Any],
+    authorization: str | None,
+    org_id: str | None = None,
+) -> tuple[str, str]:
+    """Validate project ownership and return ``(project_id, slug)``, slug possibly ``""``.
+
+    The private primitive behind both public entry points, because only one of them needs a slug.
+    ``require_project_access`` is the id-only path taken by runs and env delete, and standalone
+    legitimately has no slug for it -- so the "a slug must exist" rule cannot live here without
+    failing every standalone run. It lives in ``require_project_access_slug`` instead, which is
+    the entry point whose return type promises one.
     """
     try:
         project_id = require_project_id(project_id)
