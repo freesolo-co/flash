@@ -23,7 +23,7 @@ from flash.envs.evaluations import (
 
 # an explicit --project is validated before spending anything, so tests must pass a real UUID.
 _PROJECT_ID = "11111111-1111-1111-1111-111111111111"
-_PUBLISHED_SLUG = "acme/starter"
+_PUBLISHED_SLUG = "acme/example-project/starter"
 # a full immutable revision: the one target shape that needs no resolution, so a test about
 # anything else does not have to stub `deployments()`. `RUN/step-N` is a shorthand the CLI now
 # pins first, which is its own contract (`test_env_eval_pins_a_step_shorthand_...`).
@@ -958,7 +958,7 @@ def test_env_eval_records_the_published_environment_it_graded(monkeypatch, tmp_p
     monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
     _patch_upload(monkeypatch, uploader)
 
-    slugs = ["acme/easy", "acme/hard"]
+    slugs = ["acme/example-project/easy", "acme/example-project/hard"]
     for slug in slugs:
         root = tmp_path / slug.rsplit("/", 1)[-1]
         root.mkdir()
@@ -1238,7 +1238,7 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
     from flash.envs.loader import managed_slug_to_github_ref
 
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
-    expected = "acme/starter"
+    expected = "acme/example-project/starter"
     # built by the library rather than hand-written, so the fixture cannot drift from the ref format
     # the loader actually parses.
     spec_environment = managed_slug_to_github_ref(expected) if as_github_ref else expected

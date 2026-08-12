@@ -19,8 +19,8 @@ SPEC = {
     "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
     # A hub slug, because this fixture drives the HOSTED api: the managed plane accepts
-    # `namespace/name` only, and a `github:` ref is refused at submit (see test_server_standalone).
-    "environment": {"id": "acme/gsm8k"},
+    # `namespace/project/name` only, and a `github:` ref is refused at submit (see test_server_standalone).
+    "environment": {"id": "acme/example-project/gsm8k"},
     "train": {"epochs": 1, "max_examples": 1},
     "gpu": {},
 }

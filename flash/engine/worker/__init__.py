@@ -180,7 +180,7 @@ def _load_active_env():
     if not env_id:
         raise RuntimeError(
             "JobSpec sets no environment: provide [environment] id "
-            "(a Freesolo environment id like 'your-name/your-env', returned by "
+            "(a Freesolo environment id like 'your-org/your-project/your-env', returned by "
             "`flash env push --project <project-uuid> --name <name>`)."
         )
     env = load_environment(
@@ -206,7 +206,7 @@ def require_active_env():
             "no environment is loaded: this worker was started without a JobSpec "
             "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
             "carry a JobSpec naming [environment] id "
-            "(a Freesolo environment id like 'your-name/your-env', returned by "
+            "(a Freesolo environment id like 'your-org/your-project/your-env', returned by "
             "`flash env push --project <project-uuid> --name <name>`)."
         )
     return ACTIVE_ENV

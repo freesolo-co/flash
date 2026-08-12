@@ -111,7 +111,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatc
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
-        'id = "owner/env"\n'
+        'id = "owner/project/env"\n'
         "[train]\n"
         "epochs = 1\n"
         "max_examples = 10\n"

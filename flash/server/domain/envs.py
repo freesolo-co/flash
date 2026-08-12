@@ -13,7 +13,6 @@ import tarfile
 import tempfile
 import time
 import urllib.parse
-from collections.abc import Callable
 from pathlib import Path
 
 from flash.envs.loader import _github_token
@@ -83,30 +82,50 @@ def _sanitize_name(name: str) -> str:
     return normalize_env_name_segment(name) or "env"
 
 
-def publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
-    """The ``(namespace, name)`` a publish of ``name`` by ``key`` would write.
+def publish_slug_for_name(name: str, key: dict, project_slug: str) -> tuple[str, str, str]:
+    """The ``(namespace, project, name)`` a publish of ``name`` by ``key`` would write.
 
-    Pure and side-effect free, so the publish route can resolve the destination slug and check
-    its ownership before uploading anything.
+    Environment names are unique per PROJECT, so the owning project is part of the published
+    identity: the destination is ``<org-slug>/<project-slug>/<name>``, which is also the
+    directory the package occupies in the hub repository.
+
+    Pure and side-effect free, so the publish route can resolve the destination slug before
+    uploading anything. Accepts a bare name, or a fully qualified id whose namespace and project
+    segments must match the caller's org and the project being published to -- a qualified id
+    that disagrees is refused rather than silently redirected.
     """
     caller_namespace = namespace_for(key)
+    project = str(project_slug or "").strip()
+    if not project:
+        raise EnvPublishError(
+            "the project's slug could not be resolved, so the environment's destination is "
+            "unknown; re-run `flash login` to refresh the key"
+        )
+    if not _NAMESPACE_RE.fullmatch(project):
+        raise EnvPublishError("project slug must match [a-z0-9][a-z0-9._-]*")
     raw = str(name or "").strip()
     if "/" not in raw:
-        return caller_namespace, _sanitize_name(raw)
+        return caller_namespace, project, _sanitize_name(raw)
     parts = [part.strip() for part in raw.split("/")]
-    if len(parts) != 2 or not all(parts):
-        raise EnvPublishError("env name with namespace must be 'namespace/name'")
-    namespace = parts[0]
+    if len(parts) != 3 or not all(parts):
+        raise EnvPublishError("env name with namespace must be 'namespace/project/name'")
+    namespace, given_project = parts[0], parts[1]
     if not _NAMESPACE_RE.fullmatch(namespace):
         raise EnvPublishError("env namespace must match [a-z0-9][a-z0-9._-]*")
-    clean_name = _sanitize_name(parts[1])
+    clean_name = _sanitize_name(parts[2])
     if namespace != caller_namespace:
         raise EnvPublishError(
             "env namespace must match your Freesolo org namespace "
-            f"({caller_namespace}/...); got {namespace}/{clean_name}",
+            f"({caller_namespace}/...); got {namespace}/{given_project}/{clean_name}",
             status=403,
         )
-    return namespace, clean_name
+    if given_project != project:
+        raise EnvPublishError(
+            "env project segment must match the project you are publishing to "
+            f"({caller_namespace}/{project}/...); got {namespace}/{given_project}/{clean_name}",
+            status=403,
+        )
+    return namespace, project, clean_name
 
 
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
@@ -367,7 +386,7 @@ def _github_publish(
     *,
     name: str,
     key: dict,
-    before_write: Callable[[str], None] | None = None,
+    project_slug: str,
 ) -> str:
     token = _github_token()
     if not token:
@@ -376,18 +395,13 @@ def _github_publish(
             status=503,
         )
     repo = _DEFAULT_GITHUB_REPO
-    ns, clean = publish_slug_for_name(name, key)
-    publish_root = f"{ns}/{clean}"
+    ns, project, clean = publish_slug_for_name(name, key, project_slug)
+    publish_root = f"{ns}/{project}/{clean}"
     if not (dest / _DEFAULT_ENVIRONMENT_FILE).is_file():
         raise EnvPublishError("env package must contain environment.py")
     if not any(path.is_file() for path in dest.rglob("*")):
         raise EnvPublishError("env package contains no files")
-    # Last point before the hub write, and the first at which the package is fully validated. A
-    # caller that needs to gate the write on the destination slug runs here so a request that
-    # could never publish keeps its own error instead of the gate's.
-    if before_write is not None:
-        before_write(f"{ns}/{clean}")
-    message = f"Upload Flash environment {ns}/{clean}"
+    message = f"Upload Flash environment {publish_root}"
 
     last_error: EnvPublishError | None = None
     max_attempts = len(_GIT_PUSH_RETRY_DELAYS_SECONDS) + 1
@@ -402,7 +416,9 @@ def _github_publish(
                 publish_root=publish_root,
                 message=message,
             )
-            return f"{ns}/{clean}"
+            # the id the caller pastes into `[environment] id` must be the SAME three segments
+            # the package was written under, or it resolves to nothing.
+            return publish_root
         except EnvPublishError as exc:
             last_error = exc
             if attempt == max_attempts - 1 or not _is_retryable_git_publish_error(str(exc)):
@@ -450,28 +466,23 @@ def publish_package(
     package_b64: str,
     name: str,
     key: dict,
-    before_write: Callable[[str], None] | None = None,
+    project_slug: str,
 ) -> str:
-    """Publish a package to the hub, optionally gating the write on its destination slug.
-
-    ``before_write`` is called with the resolved ``namespace/name`` once the package is fully
-    validated and immediately before anything is written. Raising from it aborts the publish
-    without touching the hub, so a caller's gate cannot preempt the package's own errors.
-    """
+    """Publish a package to the hub under ``<namespace>/<project>/<name>``."""
     tar_bytes = validate_publish_inputs(package_b64=package_b64, name=name)
     with tempfile.TemporaryDirectory(prefix="flash-env-publish-") as tmp:
         dest = Path(tmp)
         _safe_extract(tar_bytes, dest)
-        return _github_publish(dest, name=name, key=key, before_write=before_write)
+        return _github_publish(dest, name=name, key=key, project_slug=project_slug)
 
 
 _SLUG_SEGMENT_RE = re.compile(r"^[a-z0-9._-]+$")
 
 
-def _validate_slug(slug: str) -> tuple[str, str]:
-    """Validate a ``namespace/name`` environment id and return its two segments.
+def _validate_slug(slug: str) -> tuple[str, str, str]:
+    """Validate a ``namespace/project/name`` environment id and return its three segments.
 
-    Rejects anything that isn't exactly two non-empty path-safe segments — in particular
+    Rejects anything that isn't exactly three non-empty path-safe segments — in particular
     ``..`` and stray separators — so the slug can be used directly as a git pathspec / on-disk
     publish root without traversal risk (mirrors the guarantees `_sanitize_name` gives publish).
     """
@@ -481,30 +492,30 @@ def _validate_slug(slug: str) -> tuple[str, str]:
     # slug
     # while returning a non-canonical id. validate the raw segments.
     parts = slug.split("/")
-    if len(parts) != 2 or not all(parts):
-        raise EnvPublishError("env id must be 'namespace/name'")
+    if len(parts) != 3 or not all(parts):
+        raise EnvPublishError("env id must be 'namespace/project/name'")
     for segment in parts:
         if segment in {".", ".."} or not _SLUG_SEGMENT_RE.match(segment):
             raise EnvPublishError(f"invalid env id segment: {segment!r}")
-    namespace, name = parts
+    namespace, project, name = parts
     # delete runs git rm against the hub checkout, so block repo-control top-level paths here.
     # use only _REPO_CONTROL_TOP_LEVEL_PATHS because valid namespaces such as source must remain
     # deletable.
     if namespace in _REPO_CONTROL_TOP_LEVEL_PATHS:
         raise EnvPublishError(f"invalid env id segment: {namespace!r}")
-    return namespace, name
+    return namespace, project, name
 
 
 def canonical_env_id(slug: str) -> str:
-    """Validate ``slug`` and return the canonical ``namespace/name`` id.
+    """Validate ``slug`` and return the canonical ``namespace/project/name`` id.
 
     Public wrapper over :func:`_validate_slug` so the route can normalize the id ONCE up front and
     use the same canonical value for deletion, the metadata-mirror drop, and the response — never a
     non-canonical variant. Raises :class:`EnvPublishError` (400) for anything that isn't already
     canonical, so a padded / stray-separator id is rejected rather than silently trimmed.
     """
-    namespace, name = _validate_slug(slug)
-    return f"{namespace}/{name}"
+    namespace, project, name = _validate_slug(slug)
+    return f"{namespace}/{project}/{name}"
 
 
 def _require_namespace_access(canonical: str, key: dict, *, action: str) -> None:
@@ -604,10 +615,10 @@ def _authorized_hub_request(slug: str, key: dict, *, action: str) -> tuple[str, 
     Every hub operation asks the same two questions in the same order -- is this key allowed to touch
     this namespace, and does the control plane have a hub credential at all -- and they must stay in
     that order: a caller with no access should be told so whether or not the server happens to be
-    configured. Returns the canonical ``namespace/name`` and the token.
+    configured. Returns the canonical ``namespace/project/name`` and the token.
     """
-    namespace, name = _validate_slug(slug)
-    canonical = f"{namespace}/{name}"
+    namespace, project, name = _validate_slug(slug)
+    canonical = f"{namespace}/{project}/{name}"
     _require_namespace_access(canonical, key, action=action)
     token = _github_token()
     if not token:
@@ -628,7 +639,7 @@ def download_package(*, slug: str, key: dict) -> bytes:
 
 
 def list_namespace_slugs(*, key: dict) -> list[str]:
-    """Return the published ``namespace/name`` slugs the caller's org owns, sorted.
+    """Return the published ``namespace/project/name`` slugs the caller's org owns, sorted.
 
     Reads the hub through the GitHub tree API rather than the clone the publish/delete paths use:
     the hub is hundreds of MB and clones non-shallow, so a read-only list must not pay for a

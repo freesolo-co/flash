@@ -29,10 +29,15 @@ def _safe_repo_relative_path(path: str) -> str:
 
 
 def environment_local_dirname(env_ref: str) -> str:
+    """The local directory a pull of ``env_ref`` writes into: the env NAME, not its namespace.
+
+    The slug is ``(namespace, project, name)``, so the name is the LAST segment -- pulling
+    `acme/checkout-bot/math` writes `math/`, not a directory named after the project.
+    """
     slug = loader._parse_managed_environment_slug(env_ref)
     if slug is None:
         raise ValueError(f"not a managed Freesolo environment slug: {env_ref!r}")
-    return slug[1]
+    return slug[2]
 
 
 def _cwd_is_inside(path: Path) -> bool:

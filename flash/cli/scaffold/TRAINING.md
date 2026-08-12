@@ -144,7 +144,7 @@ conversation across turns. The reward is the same `RewardResult` contract either
 A managed run references a **published** environment by id — so push your folder first:
 
 ```bash
-flash env push --project <project-uuid> --name my-env .       # uploads this project; prints an env id like "your-org/my-env"
+flash env push --project <project-uuid> --name my-env .       # uploads this project; prints an env id like "your-org/your-project/my-env"
 flash env list                       # local env sources you can push
 ```
 
@@ -154,7 +154,7 @@ Re-push after any
 edit to `environment.py` or `dataset/` so the managed run uses your change.
 
 **Self-hosted plane?** `flash env push` publishes to Freesolo's managed environment hub, which
-your plane cannot write to, and a bare `your-org/my-env` slug resolves against that same hub. Use
+your plane cannot write to, and a bare `your-org/your-project/my-env` slug resolves against that same hub. Use
 the git form instead — commit this folder to a repo your plane can read, then name it directly:
 
 ```toml
@@ -188,7 +188,7 @@ cover:
 
 ```bash
 flash env test .                     # imports environment.py, loads the dataset, runs the scorer
-flash env pull your-org/my-env -o ./pulled   # -o must be a FILE for a single file, a DIR for a
+flash env pull your-org/your-project/my-env -o ./pulled   # -o must be a FILE for a single file, a DIR for a
                                              # whole env; a new path is created for you, but an
                                              # existing non-empty dir is refused
 ```
@@ -243,7 +243,7 @@ algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-poli
 # seed = 42                 # reproducible per-run seed; omitted defaults to 42
 
 [environment]
-id = "your-org/my-env"      # the id printed by `flash env push`
+id = "your-org/your-project/my-env"      # the id printed by `flash env push`
                             # self-hosted plane: "github:OWNER/REPO@main:environment.py" (see above)
 # params = { split = "train" }    # kwargs passed to load_environment(); the table is
                                    # `params` — NOT `args`
@@ -959,7 +959,7 @@ model = "Qwen/Qwen3.5-4B"
 algorithm = "opd"
 
 [environment]
-id = "your-org/my-env"
+id = "your-org/your-project/my-env"
 
 [train]
 epochs = 1
@@ -1442,8 +1442,8 @@ flash whoami                          # confirm which identity/org you are about
 flash env setup                       # scaffold environment.py, dataset/, configs/, this file
 flash env test .                      # load + run the environment locally, before any GPU spend
 flash env push --project <project-uuid> --name my-env .        # publish the environment; paste the returned id into [environment]
-flash env pull your-org/my-env        # download a published environment into the current folder
-flash env delete --project <project-uuid> your-org/my-env -y   # delete a published environment
+flash env pull your-org/your-project/my-env        # download a published environment into the current folder
+flash env delete --project <project-uuid> your-org/your-project/my-env -y   # delete a published environment
 # ^ push/pull/delete act on Freesolo's managed hub. On a self-hosted plane they do not apply:
 #   your environment lives in your own git repo, named directly by [environment] id.
 flash train configs/sft.toml --dry-run # validate the config on the server (no GPU, no charge)

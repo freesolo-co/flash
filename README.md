@@ -77,7 +77,7 @@ model = "Qwen/Qwen3.5-4B"
 algorithm = "sft"
 
 [environment]
-id = "your-name/my-env"
+id = "your-org/your-project/my-env"
 
 [train]
 epochs = 1

@@ -28,7 +28,7 @@ BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
     "algorithm": "grpo",
     "project": "11111111-1111-4111-8111-111111111111",
-    "environment": {"id": "freesolo/gsm8k"},
+    "environment": {"id": "freesolo/math-agent/gsm8k"},
     "train": {"epochs": 1, "max_examples": 10, "lora_rank": 8},
     "gpu": {},
 }
@@ -638,17 +638,18 @@ def test_lora_rank_must_fit_large_serving_cap() -> None:
 
 
 def test_bare_environment_id_is_rejected() -> None:
-    # A bare id like "gsm8k" passes the presence check but is not a Freesolo env slug;
-    # reject it up front.
+    # A bare id like "gsm8k", or a two-segment one that predates per-project names, passes the
+    # presence check but is not a Freesolo env slug; reject it up front.
     for bad in (
         "gsm8k",
-        "owner/",
-        "/name",
-        "a/b/c",
-        "owner/..",
-        "owner/.",
-        "owner/na me",
-        "owner/name:tag",
+        "owner/name",
+        "owner/project/",
+        "/project/name",
+        "a/b/c/d",
+        "owner/project/..",
+        "owner/project/.",
+        "owner/project/na me",
+        "owner/project/name:tag",
         "https://freesolo.co/owner/name",
         "github:owner/repo/extra@main:x/environment.py",
         "github:owner/repo@:x/environment.py",

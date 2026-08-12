@@ -67,7 +67,7 @@ def stub():
             n = int(self.headers.get("Content-Length") or 0)
             seen["body"] = json.loads(self.rfile.read(n) or b"{}")
             if self.path == "/v1/envs":
-                self._send(200, {"id": "freesolo-co/e"})
+                self._send(200, {"id": "freesolo-co/my-project/e"})
                 return
             if self.path == "/v1/runs/json-chat/chat":
                 self._send(200, {"choices": [{"message": {"content": "json reply"}}]})
@@ -177,7 +177,7 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
             "model": "Qwen/Qwen3.5-4B",
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "opd",
-            "environment": {"id": "owner/env"},
+            "environment": {"id": "owner/project/env"},
             "train": {
                 "epochs": 1,
                 "max_examples": 1,
@@ -543,7 +543,7 @@ def test_publish_env_plain_without_progress(stub):
     out = client.publish_env(
         name="e", package_b64="QQ==", project_id="11111111-1111-4111-8111-111111111111"
     )
-    assert out["id"] == "freesolo-co/e"
+    assert out["id"] == "freesolo-co/my-project/e"
     assert seen["path"] == "/v1/envs"
     assert seen["body"] == {
         "name": "e",
@@ -558,7 +558,7 @@ def test_publish_env_sends_project_id_when_given(stub):
     out = client.publish_env(
         name="e", package_b64="QQ==", project_id="11111111-1111-4111-8111-111111111111"
     )
-    assert out["id"] == "freesolo-co/e"
+    assert out["id"] == "freesolo-co/my-project/e"
     assert seen["body"] == {
         "name": "e",
         "package_b64": "QQ==",
@@ -577,11 +577,13 @@ def test_publish_env_rejects_blank_project_id_before_request(stub):
 def test_delete_env_sends_delete_to_slug_path(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    out = client.delete_env("acme/my-env", project_id="11111111-1111-4111-8111-111111111111")
-    assert out == {"id": "acme/my-env", "deleted": True}
+    out = client.delete_env(
+        "acme/checkout-bot/my-env", project_id="11111111-1111-4111-8111-111111111111"
+    )
+    assert out == {"id": "acme/checkout-bot/my-env", "deleted": True}
     assert seen["method"] == "DELETE"
-    # the namespace/name slug (with its slash) goes straight into the path
-    assert seen["path"] == "/v1/envs/acme/my-env"
+    # the namespace/project/name slug (with its slashes) goes straight into the path
+    assert seen["path"] == "/v1/envs/acme/checkout-bot/my-env"
     assert seen["auth"] == "Bearer fslo-user-test"
     assert seen["project_id"] == "11111111-1111-4111-8111-111111111111"
 
@@ -590,7 +592,7 @@ def test_delete_env_rejects_blank_project_before_request(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
     with pytest.raises(ClientError, match="project id is required"):
-        client.delete_env("acme/my-env", project_id="   ")
+        client.delete_env("acme/checkout-bot/my-env", project_id="   ")
     assert "method" not in seen
 
 
@@ -599,20 +601,22 @@ def test_delete_env_percent_encodes_reserved_chars(stub):
     client = ApiClient(url, "fslo-user-test")
     # A programmatic caller passing reserved characters must NOT be able to truncate the request
     # target: `?` becomes %3F (not a query string), `#` becomes %23 (not a dropped fragment), while
-    # the namespace/name separator `/` is preserved so the server still routes the :path param.
-    client.delete_env("team/env?x=1#frag", project_id="11111111-1111-4111-8111-111111111111")
+    # the namespace/project/name separators `/` are preserved so the server still routes the :path param.
+    client.delete_env(
+        "team/project/env?x=1#frag", project_id="11111111-1111-4111-8111-111111111111"
+    )
     assert seen["method"] == "DELETE"
-    assert seen["path"] == "/v1/envs/team/env%3Fx%3D1%23frag"
+    assert seen["path"] == "/v1/envs/team/project/env%3Fx%3D1%23frag"
 
 
 def test_download_env_package_uses_flash_control_plane(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
-    data = client.download_env_package("acme/my-env")
+    data = client.download_env_package("acme/checkout-bot/my-env")
 
     assert data == b"package-bytes"
-    assert seen["path"] == "/v1/envs/acme/my-env/package"
+    assert seen["path"] == "/v1/envs/acme/checkout-bot/my-env/package"
     assert seen["auth"] == "Bearer fslo-user-test"
 
 
@@ -620,9 +624,9 @@ def test_download_env_package_percent_encodes_reserved_chars(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
-    client.download_env_package("team/env?x=1#frag")
+    client.download_env_package("team/project/env?x=1#frag")
 
-    assert seen["path"] == "/v1/envs/team/env%3Fx%3D1%23frag/package"
+    assert seen["path"] == "/v1/envs/team/project/env%3Fx%3D1%23frag/package"
 
 
 def test_download_env_package_caps_response_body(stub, monkeypatch):
@@ -633,7 +637,7 @@ def test_download_env_package_caps_response_body(stub, monkeypatch):
     client = ApiClient(url, "fslo-user-test")
 
     with pytest.raises(ClientError, match="maximum allowed size"):
-        client.download_env_package("acme/my-env")
+        client.download_env_package("acme/checkout-bot/my-env")
 
 
 def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
@@ -665,7 +669,7 @@ def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
         project_id="11111111-1111-4111-8111-111111111111",
         progress=lambda sent, total: calls.append((sent, total)),
     )
-    assert out["id"] == "freesolo-co/e"
+    assert out["id"] == "freesolo-co/my-project/e"
     # the server reads exactly Content-Length bytes, so a correct multi-chunk stream
     # round-trips the full 30 KB body byte-for-byte across the chunk boundaries.
     assert seen["body"] == body
@@ -691,7 +695,7 @@ def test_publish_env_progress_errors_do_not_abort_upload(stub):
         project_id="11111111-1111-4111-8111-111111111111",
         progress=boom,
     )
-    assert out["id"] == "freesolo-co/e"
+    assert out["id"] == "freesolo-co/my-project/e"
     assert seen["body"] == {
         "name": "e",
         "package_b64": "QQ==",
@@ -1125,7 +1129,7 @@ def test_spec_payload_sends_an_omitted_gpu_count_as_omitted() -> None:
         "model": "Qwen/Qwen3.5-4B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
-        "environment": {"id": "owner/env"},
+        "environment": {"id": "owner/project/env"},
         "train": {"max_steps": 10},
     }
 

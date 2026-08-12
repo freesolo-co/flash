@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import NoReturn
 
 from flash._internal.logging import get_logger
@@ -212,9 +213,15 @@ def _fitting_candidates(candidates, need: int, executed_width) -> list:
 
     Providers report the shapes they can genuinely rent (RunPod takes a count, Lambda names it in the
     instance type, Vast bakes it into the offer); the allocator owns only whether a shape fits. The
-    executed width is per-candidate because it is bounded by that candidate's own card count.
+    executed width is per-candidate because it is bounded by that candidate's own card count. Stamp it
+    on every survivor so recovery values the failed and retry shapes with the exact rule used here.
     """
-    return [c for c in candidates if _fits(c, need, executed_width(c.gpu_count))]
+    fitting = []
+    for candidate in candidates:
+        executed_gpu_count = executed_width(candidate.gpu_count)
+        if _fits(candidate, need, executed_gpu_count):
+            fitting.append(replace(candidate, executed_gpu_count=executed_gpu_count))
+    return fitting
 
 
 def _sizing_int(train, name: str, default: int) -> int:

@@ -163,17 +163,18 @@ def test_normalize_env_path_variants():
 
 
 def test_slug_and_github_predicates_and_conversion():
-    assert loader.is_managed_environment_slug("david-freesolo-co/stuff") is True
+    assert loader.is_managed_environment_slug("david-freesolo-co/my-project/stuff") is True
     assert loader.is_managed_environment_slug("has:colon") is False
     assert loader.is_managed_environment_slug("only-one-part") is False
-    assert loader.is_managed_environment_slug("too/many/parts") is False
+    assert loader.is_managed_environment_slug("too/many/parts") is True
+    assert loader.is_managed_environment_slug("too/many/parts/extra") is False
 
     assert loader.is_github_environment_ref("github:owner/repo@main:env/environment.py") is True
-    assert loader.is_freesolo_environment_id("david-freesolo-co/stuff") is True
+    assert loader.is_freesolo_environment_id("david-freesolo-co/my-project/stuff") is True
     assert loader.is_freesolo_environment_id("nonsense value") is False
 
-    assert loader.managed_slug_to_github_ref("david-freesolo-co/stuff") == (
-        "github:freesolo-co/environment-hub@main:david-freesolo-co/stuff/environment.py"
+    assert loader.managed_slug_to_github_ref("david-freesolo-co/my-project/stuff") == (
+        "github:freesolo-co/environment-hub@main:david-freesolo-co/my-project/stuff/environment.py"
     )
     with pytest.raises(ValueError, match="not a Freesolo environment slug"):
         loader.managed_slug_to_github_ref("github:owner/repo@main:environment.py")
@@ -195,6 +196,30 @@ def test_parse_github_ref_from_https_urls():
     # Non-github hosts and too-short paths are not github refs.
     assert loader._parse_github_environment_ref("https://example.com/owner/repo") is None
     assert loader._parse_github_environment_ref("https://github.com/owner") is None
+
+
+def test_managed_hub_package_root_is_one_environment_not_the_project():
+    """The package root is `<org>/<project>/<name>`, the directory of a single environment.
+
+    `<org>/<project>` is the project directory holding every environment the project has
+    published, and the package root is what gets downloaded and copied into the cache, so
+    stopping a segment short fetches all of a project's environments to import one.
+    """
+    ref = loader._parse_github_environment_ref(
+        loader.managed_slug_to_github_ref("acme/checkout-bot/math")
+    )
+    assert ref.path == "acme/checkout-bot/math/environment.py"
+    assert loader._managed_hub_package_root(ref) == "acme/checkout-bot/math"
+
+    # A managed ref that stops at the project has no environment to root on.
+    two_segment = loader._parse_github_environment_ref(
+        "github:freesolo-co/environment-hub@main:acme/environment.py"
+    )
+    assert loader._managed_hub_package_root(two_segment) == ""
+
+    # Outside the managed hub the layout is the user's own, so there is no root to derive.
+    foreign = loader._parse_github_environment_ref("github:owner/repo@main:a/b/c/environment.py")
+    assert loader._managed_hub_package_root(foreign) == ""
 
 
 def test_resolve_path_arg_variants(tmp_path):
