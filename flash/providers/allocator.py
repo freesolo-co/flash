@@ -459,6 +459,10 @@ def _resolve_exact_gpu(
         Also withheld when NO configured provider carries this class at all: the obstacle is then
         the class, not the width, and `--gpus N` cannot succeed at any N. That run belongs to the
         `no configured active provider` rejection below, which names the real problem.
+
+        Withheld too when the run would not LAUNCH on the width found: `smallest_fitting_gpu_count`
+        credits rented cards, so for an sft run the batch caps at one rank it names a count that
+        buys nothing. Asking a provider to confirm a SKU that cannot help is a wasted round trip.
         """
         if widths or unpinned_widths or not (reachable or unpinned_reachable):
             return ""
@@ -466,6 +470,8 @@ def _resolve_exact_gpu(
             need, max_gpu_count=widest_cap, gpu_names=(exact,) if exact_info.validated else ()
         )
         if width is None or width <= above:
+            return ""
+        if combined_vram_gb(exact_info.vram_gb, launched(width)) < need:
             return ""
         return (
             f". Their catalog may list a {width}-card {exact} instance -- raise the card ceiling "
@@ -492,8 +498,20 @@ def _resolve_exact_gpu(
         and max_gpu_count > 1
         and combined_vram_gb(exact_info.vram_gb, launched(cap)) < need
     ):
+        # the width the VRAM math above actually credited, which is what the message has to name.
+        # crediting `launched(cap)` while claiming a `cap`-card combination was tried points the
+        # operator at the card ceiling when the real limiter is the batch that caps the rank count:
+        # they raise `--gpus` and hit the identical failure. see `_executed_width`.
+        tried = launched(cap)
         raise UnsupportedGpuError(
-            f"exact GPU {exact!r} cannot fit this run even as a {cap}-card combination"
+            f"exact GPU {exact!r} cannot fit this run even as a {tried}-card combination"
+            + (
+                f" (of the {cap} cards allowed, only {tried} "
+                f"{'joins' if tried == 1 else 'join'} this run -- sft shards by data, so the "
+                f"batch and retained rows bound the rank count)"
+                if tried != cap
+                else ""
+            )
             + (
                 wider_shape_remedy(
                     widths, need, ceiling=widest_cap, above=cap, executed_width=launched

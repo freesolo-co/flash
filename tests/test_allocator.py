@@ -2025,6 +2025,79 @@ def test_remedy_never_names_a_width_the_run_will_not_launch_on():
     )
 
 
+def test_pin_rejection_names_the_width_it_actually_credited():
+    """Regression: the message claimed a `cap`-card combination the VRAM math never tried.
+
+    Once the precheck credits `launched(cap)`, saying "cannot fit even as an 8-card combination" for
+    a run that launches one rank points the operator at the card ceiling -- they raise `--gpus` and
+    hit the identical failure. The real limiter is the batch that bounds the rank count, so the
+    message has to name the width it credited and why it is smaller than the one allowed.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import UnsupportedGpuError
+
+    def reject(executed_width):
+        with pytest.raises(UnsupportedGpuError) as ei:
+            _resolve_exact_gpu(
+                "H100",
+                need=500.0,
+                cap=8,
+                max_gpu_count=8,
+                provider="",
+                available=("runpod",),
+                widest_cap=8,
+                executed_width=executed_width,
+            )
+        return str(ei.value)
+
+    clamped = reject(lambda _n: 1)
+    assert "1-card combination" in clamped, (
+        "the math credited one rank, so claiming a wider combination was tried sends the operator "
+        "to raise a ceiling that is not the limiter"
+    )
+    assert "8-card combination" not in clamped
+    assert "only 1 joins this run" in clamped, "the message must say WHY the width is smaller"
+
+    # a run that launches what it rents keeps the original wording, with no confusing aside.
+    full = reject(lambda n: n)
+    assert "8-card combination" in full
+    # "join this run" also covers the singular "joins this run", which contains it.
+    assert "join this run" not in full
+
+
+def test_catalog_hint_is_withheld_when_the_width_would_not_launch():
+    """The `--gpus N` catalog hint searched widths crediting rented cards, like the remedy did.
+
+    `smallest_fitting_gpu_count` has no executed-width notion, so for a clamped sft run it names a
+    count that buys nothing -- sending the user to ask a provider to confirm a SKU that cannot help.
+    """
+    from flash.providers.allocator import _resolve_exact_gpu
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError
+
+    need = GPU_INFO["H100"].vram_gb + 40.0  # fits on 2 rented cards, never on 1
+
+    def message(executed_width):
+        with pytest.raises(UnsupportedGpuError) as ei:
+            _resolve_exact_gpu(
+                "H100",
+                need=need,
+                cap=1,
+                max_gpu_count=1,
+                provider="lambda",
+                available=("lambda",),
+                widest_cap=8,
+                executed_width=executed_width,
+            )
+        return str(ei.value)
+
+    assert "--gpus" not in message(lambda _n: 1), (
+        "a clamped sft run stays at one rank, so asking lambda to confirm a 2-card SKU is a round "
+        "trip that cannot fix the run"
+    )
+    # unchanged for runs that launch what they rent: the hint is real advice there.
+    assert "--gpus 2" in message(lambda n: n)
+
+
 def test_provider_incompatible_pin_reports_the_incompatibility_not_a_fit_remedy():
     """A class the pinned provider does not carry is a provider error at EVERY width.
 
