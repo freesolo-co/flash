@@ -288,6 +288,30 @@ def test_a_keyless_deploy_warns_that_anyone_can_spend_the_gpu_budget(
     assert ("no FLASH_SERVING_KEY" in err) is warns
 
 
+def test_the_keyless_warning_redeploys_the_file_that_was_actually_deployed(
+    tmp_path, monkeypatch, capsys
+):
+    """The remediation must name the deployed file, not the default one.
+
+    Under `--output` a hardcoded `flash_serving_app.py` either fails or deploys an unrelated app,
+    so a user who follows the warning exactly is left with the same public keyless endpoint they
+    were warned about -- the one instruction that has to work is the one closing the exposure.
+    """
+
+    def _fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="https://acme--flash-serve-api.modal.run\n", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr(serve_cmd, "_healthz", lambda url: {"ok": True, "requires_key": False})
+    app_file = tmp_path / "serving" / "my_app.py"
+    assert serve_cmd._deploy(app_file) == 0
+    err = capsys.readouterr().err
+    assert f"modal deploy {app_file}" in err
+    assert serve_cmd.DEFAULT_APP_FILE not in err
+
+
 def test_status_asks_the_backend_the_way_deploy_does(monkeypatch, capsys):
     """`serve status` must use the client's authenticated request path.
 
@@ -317,6 +341,30 @@ def test_status_asks_the_backend_the_way_deploy_does(monkeypatch, capsys):
     assert seen == [("GET", "https://acme.modal.run/healthz")], (
         "status did not go through the authenticated serving request path"
     )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["a string", ["a", "list"], 42, {"capabilities": "not-a-list"}, {"capabilities": [1, 2]}],
+    ids=["string", "list", "number", "capabilities-not-list", "capabilities-not-strings"],
+)
+def test_a_malformed_health_payload_is_diagnosed_not_a_traceback(monkeypatch, capsys, payload):
+    """Diagnosing a broken backend is what `serve status` is FOR.
+
+    Valid JSON that is not the expected shape decodes fine and escapes the decode guard, so an
+    unchecked `.get` reaches the user as an AttributeError traceback -- the command failing at
+    exactly the moment its job starts. Every shape below has to come back as a stated error.
+    """
+    from flash.serve import deploy as deploy_mod
+
+    monkeypatch.setattr(deploy_mod, "serving_base_url", lambda: "https://acme.modal.run")
+    monkeypatch.setattr(
+        deploy_mod,
+        "_serving_request",
+        lambda method, url, **kwargs: types.SimpleNamespace(json=lambda: payload),
+    )
+    assert serve_cmd.cmd_serve_status(_args()) == 1
+    assert "serving backend at" in capsys.readouterr().err
 
 
 def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, capsys):

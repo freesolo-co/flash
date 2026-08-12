@@ -218,9 +218,39 @@ async def _run_lock(run_id: str):
                 status.HTTP_409_CONFLICT, f"another operation on {{run_id}} is in progress"
             )
         await asyncio.sleep(0.1)
+
+    async def _renew() -> None:
+        """Keep the held lease from expiring underneath its own holder.
+
+        `expires_at` is stamped once at acquire, so any critical section longer than the TTL marks
+        ITSELF reclaimable -- `remove` scans every key in the Dict, which grows with the number of
+        adapters, so this is reachable in normal use rather than only after a crash. A waiter would
+        then reclaim a live lease and enter alongside the holder, which is precisely the exclusion
+        `alias_compare_and_swap` advertises.
+
+        Ownership-conditional, like every other write to this key: pop, and only write back if what
+        came back is still ours. If another container has already reclaimed it, put THEIR lease back
+        untouched and stop -- the holder's own release then finds a value that is not its lease and
+        correctly leaves it alone.
+        """
+        nonlocal lease
+        while True:
+            await asyncio.sleep(LOCK_TTL_SECONDS / 3)
+            current = await adapter_records.pop.aio(key, None)
+            if current != lease:
+                if current is not None:
+                    await adapter_records.put.aio(key, current, skip_if_exists=True)
+                return
+            lease = {{"token": token, "expires_at": time.time() + LOCK_TTL_SECONDS}}
+            await adapter_records.put.aio(key, lease, skip_if_exists=True)
+
+    heartbeat = asyncio.create_task(_renew())
     try:
         yield
     finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
         await _drop_if(lease)
 
 
@@ -417,16 +447,24 @@ class Engine:
 async def settle_adapter(record: dict[str, Any]) -> None:
     """Load one adapter onto the engine, then write the lifecycle state the client waits on."""
     adapter_id = record["adapter_id"]
+    attempt = (record.get("metadata") or {{}}).get("settle_attempt")
     result = await Engine().register.remote.aio(record)
     current = (await adapter_records.get.aio(_record_key(adapter_id))) or record
+    current_metadata = current.get("metadata") or {{}}
     # An undeploy that lands while the load is still running wins. Without this, a slow load
     # finishing after DELETE would write `ready` back over `disabled` and resurrect a revision
     # the user already took out of service -- and it could then be activated again.
-    if current.get("status") == "disabled" and (current.get("metadata") or {{}}).get(
-        "lifecycle_state"
-    ) == "disabled":
+    if current.get("status") == "disabled" and current_metadata.get("lifecycle_state") == "disabled":
         with contextlib.suppress(Exception):  # gpu eviction is best effort
             await Engine().unregister.remote.aio(adapter_id)
+        return
+    # Only the CURRENT attempt may write a terminal state. A user who retries `models deploy` after
+    # the client's readiness budget expires re-registers while the first load is still running, so
+    # two settles for one revision are in flight on different containers and finish in any order.
+    # Unguarded, a stale transient failure lands after a fresh success and pins the record to
+    # `failed`, which an identical re-registration then treats as a state to reset rather than a
+    # load to retry. Stamped by the handler under the run lock, so "current" is unambiguous.
+    if attempt is not None and current_metadata.get("settle_attempt") != attempt:
         return
     if result.get("ok"):
         current["status"] = "ready"
@@ -559,17 +597,20 @@ def api():
                 state = (existing.get("metadata") or {{}}).get("lifecycle_state")
                 if state == "ready":
                     return {{"ok": True, "adapter": existing}}
-                if state != "registered":
-                    existing["status"] = "registered"
-                    existing["metadata"] = {{
-                        **(existing.get("metadata") or {{}}),
-                        "lifecycle_state": "registered",
-                    }}
-                    # Drop a stale failure reason so a retried load does not report the old one.
-                    existing["metadata"].pop("failure", None)
-                    await _write(existing)
+                existing["status"] = "registered"
+                existing["metadata"] = {{
+                    **(existing.get("metadata") or {{}}),
+                    "lifecycle_state": "registered",
+                    # A new attempt id retires whatever settle is still running for this revision:
+                    # it stops the older one from writing a terminal state over this attempt's.
+                    "settle_attempt": uuid.uuid4().hex,
+                }}
+                # Drop a stale failure reason so a retried load does not report the old one.
+                existing["metadata"].pop("failure", None)
+                await _write(existing)
                 settle_adapter.spawn(existing)
                 return {{"ok": True, "adapter": existing}}
+            record["metadata"]["settle_attempt"] = uuid.uuid4().hex
             await _write(record)
             # Create the run alias disabled, pointing at nothing yet. Activation is what makes it
             # serve, so a half-finished deploy never takes traffic.
@@ -616,6 +657,15 @@ def api():
         # writing is a lost-update race: two deploys of the same run both read the same previous,
         # both pass the check, and the second silently overwrites the first.
         async with _run_lock(run_id):
+            # Re-read the REVISION inside the lock, not just the alias. The readiness check above
+            # ran outside it, so an undeploy can disable both records in between -- and because
+            # undeploy leaves the alias `disabled`, `previous` collapses to None and a first
+            # activation's `expected_adapter_revision: null` still matches. The alias would then be
+            # written back to `ready` pointing at a revision that is disabled and evicted from the
+            # GPU: a successful activation that can never serve a request.
+            revision = await _read(revision_id)
+            if revision is None or revision.get("status") != "ready":
+                raise HTTPException(status.HTTP_409_CONFLICT, "adapter revision is not ready")
             alias = await _read(run_id)
             if alias is None:
                 raise HTTPException(status.HTTP_409_CONFLICT, "run alias is missing")
@@ -685,6 +735,27 @@ def api():
     async def chat_completions(payload: dict[str, Any], request: Request) -> dict[str, Any]:
         _require_key(request)
         requested = str(payload.get("model") or "")
+        # TEXT ONLY, said out loud rather than silently. `flash env eval` sends images as OpenAI
+        # `image_url` content blocks and EVERY model in the catalog is image-capable, so this is
+        # reachable in ordinary use. The engine renders messages through the chat template and
+        # passes token ids alone: nothing fetches or decodes the image, and no `multi_modal_data`
+        # reaches vLLM. Served anyway, the model answers having never seen the image and the eval
+        # scores those answers as if they were valid. Rejected at the HTTP boundary, not in the
+        # engine, so the caller gets a 400 naming the reason instead of an opaque RPC failure.
+        for message in payload.get("messages") or []:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            if any(
+                isinstance(block, dict) and block.get("type") in ("image", "image_url")
+                for block in content
+            ):
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "this serving backend is text-only: it does not decode images or pass "
+                    "multi_modal_data to vLLM, so serving an image-bearing request would answer "
+                    "without seeing the image",
+                )
         record = await _read(requested)
         if record is None or record.get("status") == "disabled":
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown model {{requested}}")
@@ -695,7 +766,14 @@ def api():
             record = await _read(target) if target else None
             if record is None:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown model {{requested}}")
-        if (record.get("metadata") or {{}}).get("lifecycle_state") != "ready":
+        resolved_state = (record.get("metadata") or {{}}).get("lifecycle_state")
+        # A revision that reached a TERMINAL state is a hard miss, not a slow load. Retrying it is
+        # not merely wasteful: a plane's deployment smoke honours `retryable` and would poll a
+        # permanently dead adapter until its budget expired, reporting a timeout instead of the
+        # failure that actually happened. Only `registered` is still on its way to ready.
+        if record.get("status") == "disabled" or resolved_state in ("disabled", "failed"):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown model {{requested}}")
+        if resolved_state != "ready":
             # A retryable envelope in the shape flash's deployment smoke understands, so it waits
             # for a cold start instead of failing the deploy. Returned as an explicit JSONResponse,
             # NOT raised: FastAPI wraps HTTPException detail as {{"detail": ...}}, and the client

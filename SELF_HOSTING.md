@@ -390,6 +390,13 @@ production-validated serving config for that model.
 Writing your own instead is fully supported: [docs/serving-contract.md](docs/serving-contract.md)
 documents every endpoint, and its conformance suite checks an implementation in one command.
 
+**The generated app serves text only.** Every catalog model can be trained on images, but this
+app renders messages through the chat template and passes token ids to vLLM - it does not decode
+images or pass `multi_modal_data`. An image-bearing request (what `flash env eval` sends for an
+image example) is rejected with a 400 rather than answered, because a model replying without
+having seen the image would produce eval scores that look valid and measure nothing. Serving
+images means adding image decoding and validating it on a GPU.
+
 On a standalone plane those three commands **error out** until you point it at a backend
 you operate. Every serving request carries `FREESOLO_INTERNAL_KEY`, and on your plane that
 key is what grants full control of it - so reaching Freesolo's serving app would hand your

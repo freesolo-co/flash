@@ -12,6 +12,7 @@ and FastAPI resolves them against MODULE globals -- with the fastapi imports ins
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import sys
 import threading
@@ -553,6 +554,179 @@ def test_a_terminal_record_is_not_resettled_on_reregistration(client):
     assert not module.spawned, "a settled revision was re-settled"
 
 
+def test_a_stale_settle_cannot_overwrite_a_newer_attempts_result(client):
+    """Two settles for one revision must not commit out of order.
+
+    Reachable without any crash: a user whose `models deploy` exceeded the client's five-minute
+    readiness budget retries while the first load is still running, so two settles for the same
+    revision are in flight on separate containers. Unguarded, a stale FAILURE landing after a fresh
+    success pins the record to `failed` -- and re-registration treats a terminal state as something
+    to reset rather than a load to retry, so the run needs a new artifact to recover.
+
+    Driven by replaying the first attempt's record (carrying its now-superseded attempt id) after a
+    second registration has already settled.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    first_attempt = dict(client.get(f"/adapters/{REVISION}").json()["adapter"])
+    # Re-register so a NEW attempt id is stamped and settles to ready, retiring the one above.
+    module.adapter_records[module._record_key(REVISION)] = {
+        **first_attempt,
+        "status": "registered",
+        "metadata": {**first_attempt["metadata"], "lifecycle_state": "registered"},
+    }
+    assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
+    assert _lifecycle(client, REVISION) == "ready"
+
+    # The older attempt now reports the transient failure it hit, minutes late.
+    async def _failing_register(record):
+        return {"ok": False, "failure": "transient: connection reset"}
+
+    module.Engine = lambda: types.SimpleNamespace(
+        register=types.SimpleNamespace(remote=types.SimpleNamespace(aio=_failing_register)),
+        unregister=types.SimpleNamespace(
+            remote=types.SimpleNamespace(aio=lambda *a, **k: _noop_coroutine())
+        ),
+    )
+    module.settle_adapter.local(first_attempt)
+    assert client.get(f"/adapters/{REVISION}").json()["adapter"]["status"] == "ready", (
+        "a retired settle attempt overwrote the current one's result"
+    )
+
+
+async def _noop_coroutine():
+    return {"ok": True}
+
+
+def test_activation_rechecks_readiness_inside_the_lock(client):
+    """The revision's readiness must be re-read inside the critical section.
+
+    Checked only outside it, an undeploy can land between the check and the lock. Undeploy leaves
+    the alias `disabled`, so `previous` collapses to None and a first activation's
+    `expected_adapter_revision: null` still matches -- the alias is written back to `ready`
+    pointing at a revision that is disabled and evicted from the GPU. That is a 200 the client
+    trusts, followed by a run that cannot answer a single request.
+
+    Driven by disabling the revision while the activation is parked on the run lock.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    read_barrier = threading.Event()
+    released = threading.Event()
+    original = module._run_lock
+
+    @contextlib.asynccontextmanager
+    async def _slow_lock(run_id):
+        async with original(run_id):
+            # Inside the lock, before the handler re-reads: stand in for the undeploy that
+            # completed after the outer readiness check.
+            read_barrier.set()
+            await asyncio.get_running_loop().run_in_executor(None, released.wait, 5)
+            yield
+
+    def _undeploy_once():
+        read_barrier.wait(5)
+        record = module.adapter_records[module._record_key(REVISION)]
+        record["status"] = "disabled"
+        record["metadata"] = {**record["metadata"], "lifecycle_state": "disabled"}
+        module.adapter_records[module._record_key(REVISION)] = record
+        released.set()
+
+    module._run_lock = _slow_lock
+    worker = threading.Thread(target=_undeploy_once)
+    worker.start()
+    try:
+        response = client.post(
+            f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None}
+        )
+    finally:
+        released.set()
+        worker.join()
+        module._run_lock = original
+    assert response.status_code == 409, (
+        f"activation returned {response.status_code} for a revision undeployed under the lock"
+    )
+    assert module.adapter_records[module._record_key(RUN_ID)]["status"] == "disabled", (
+        "an undeployed run was made live again by a concurrent activation"
+    )
+
+
+def test_chat_fails_closed_on_a_terminal_revision(client):
+    """A dead revision is a hard miss, not a slow load.
+
+    The retryable 503 tells a plane's deployment smoke to keep polling. Returned for a revision
+    that already reached `disabled` or `failed`, the smoke polls a permanently dead adapter until
+    its budget expires and then reports a TIMEOUT -- hiding the load failure that actually
+    happened behind a symptom that reads like a slow cold start.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    client.post(f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None})
+    record = module.adapter_records[module._record_key(REVISION)]
+    record["metadata"] = {**record["metadata"], "lifecycle_state": "failed"}
+    module.adapter_records[module._record_key(REVISION)] = record
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": RUN_ID, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8},
+    )
+    assert response.status_code == 404, (
+        f"a terminally failed revision answered {response.status_code}, which the smoke retries"
+    )
+
+
+def test_an_image_request_is_refused_rather_than_answered_blind(client):
+    """An image-bearing request must not be served as if it were text.
+
+    `flash env eval` sends images as OpenAI `image_url` blocks and every catalog model is
+    image-capable, so this arrives in ordinary use. The engine renders messages to token ids and
+    passes nothing else: no image is fetched or decoded and no `multi_modal_data` reaches vLLM.
+    Answered anyway, the model replies having never seen the image and the eval scores those
+    replies as valid -- a silently invalid result, which is worse than a refusal.
+    """
+    _register_and_ready(client)
+    client.post(f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None})
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": RUN_ID,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is in this image?"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR"}},
+                    ],
+                }
+            ],
+            "max_tokens": 16,
+        },
+    )
+    assert response.status_code == 400, (
+        f"an image request was answered with {response.status_code} by a text-only backend"
+    )
+    assert "text-only" in response.json()["detail"]
+
+
+def test_a_text_request_is_unaffected_by_the_image_guard(client):
+    """The guard must not reject ordinary structured text content.
+
+    OpenAI content blocks are a list for plain text too, so a guard keyed on "content is a list"
+    rather than on the block type would refuse every request `flash models chat` sends.
+    """
+    _register_and_ready(client)
+    client.post(f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None})
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": RUN_ID,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 16,
+        },
+    )
+    assert response.status_code == 200, "structured text content was refused as if it were an image"
+
+
 def test_a_failed_adapter_load_reports_failed_not_ready(client):
     """A bad adapter must fail loudly at registration.
 
@@ -752,6 +926,34 @@ class _StaleReadBarrier(_FakeDict):
         gated = _Aio(lambda *args, **kwargs: dict.get(self, *args, **kwargs))
         gated.aio = _read
         return gated
+
+
+def test_a_held_lock_does_not_expire_underneath_its_own_holder(client):
+    """A critical section longer than the TTL must not mark ITSELF reclaimable.
+
+    `expires_at` is stamped once at acquire. Undeploy scans every key in the Dict, so the hold time
+    grows with the number of adapters and crossing the TTL needs no crash at all -- and a waiter
+    that finds an expired lease reclaims it and enters alongside the live holder, which is exactly
+    the exclusion `alias_compare_and_swap` advertises.
+
+    Driven with a TTL far shorter than the hold, which is the same shape as a slow scan under the
+    real 30s TTL.
+    """
+    module = client.app.state.generated_module
+    key = module._lock_key(RUN_ID)
+    module.LOCK_TTL_SECONDS = 0.3
+
+    async def _hold_past_the_ttl():
+        async with module._run_lock(RUN_ID):
+            await asyncio.sleep(0.7)
+            lease = module.adapter_records.get(key)
+            assert lease is not None, "the holder's lease vanished while it was inside"
+            assert lease["expires_at"] > time.time(), (
+                "the lease expired while still held, so another container may enter alongside"
+            )
+
+    _run_awaitable(_hold_past_the_ttl())
+    assert module.adapter_records.get(key) is None, "the lock outlived its holder"
 
 
 def test_two_waiters_reclaiming_one_dead_lease_do_not_both_enter(client):

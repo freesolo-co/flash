@@ -313,11 +313,22 @@ def test_registration_settles_through_a_spawned_function(model_id):
 
     Asserted on the AST, not the text, so the comment explaining why `create_task` is wrong does
     not read as the defect itself.
+
+    Scoped to the REQUEST HANDLERS rather than the whole module. A blanket `create_task` ban would
+    read as this rule while actually enforcing a stricter one, and would fail on work that is
+    legitimately loop-local -- the run lock's lease heartbeat only has to outlive the critical
+    section it is renewing, and dying with its container is correct there.
     """
     source = render_app(MODELS[model_id])
+    tree = ast.parse(source)
+    api = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "api"
+    )
     created = [
         node
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(api)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "create_task"
