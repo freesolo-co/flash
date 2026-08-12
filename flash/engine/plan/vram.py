@@ -15,6 +15,9 @@ _BASE_OVERHEAD_GB = 4.0
 _ACT_COEF = 0.12
 _SFT_PER_DEVICE_BS_DEFAULT = 4
 _VOCAB_DEFAULT = 248_320
+# algorithms that author the optimizer batch as `prompts_per_step`. "rl" is the legacy spelling of
+# grpo this module already accepts everywhere else it branches on the algorithm.
+_ROLLOUT_ALGOS = frozenset({"grpo", "rl", "opd"})
 # must track verl's `FusedLinearForPPO(chunk_size=...)` default
 # (verl/utils/experimental/torch_functional.py). the child projects the vocab in chunks of this
 # many token rows, so a smaller value here under-reserves and admits a job that then OOMs.
@@ -506,18 +509,21 @@ def sft_grad_checkpoint_can_disable(
     return peak + float(margin_gb) <= float(card_vram_gb)
 
 
-def _config_geometry(config: dict) -> tuple[int, int, int]:
+def _config_geometry(config: dict) -> tuple[int, int, int, int]:
     text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
     return (
         int(text.get("vocab_size") or config.get("vocab_size") or 0),
         int(text.get("hidden_size") or config.get("hidden_size") or 0),
         int(text.get("num_hidden_layers") or config.get("num_hidden_layers") or 0),
+        # QUERY heads. verl's ulysses sequence parallelism requires this to divide the card count,
+        # so it decides how wide a pinned run may be -- see `allocator.geometry_safe_gpu_cap`.
+        int(text.get("num_attention_heads") or config.get("num_attention_heads") or 0),
     )
 
 
 def fetch_hf_model_geometry(
     model_id: str, revision: str = "", *, strict: bool = False
-) -> tuple[float | None, int, int, int]:
+) -> tuple[float | None, int, int, int, int]:
     """Return revision-aware params and config geometry from Hugging Face."""
     try:
         from huggingface_hub import HfApi, hf_hub_download
@@ -542,44 +548,14 @@ def fetch_hf_model_geometry(
             config = json.load(handle)
         if not isinstance(config, dict):
             raise ValueError("model config is not an object")
-        vocab, hidden, layers = _config_geometry(config)
-        return params_b, vocab, hidden, layers
+        vocab, hidden, layers, heads = _config_geometry(config)
+        return params_b, vocab, hidden, layers, heads
     except Exception as exc:
         if strict:
             raise ValueError(
                 f"could not resolve revision-specific sizing metadata for model {model_id!r}"
             ) from exc
-        return None, 0, 0, 0
-
-
-def _validated_revision_geometry(model_id: str, revision: str, info):
-    params_b, vocab, hidden, layers = fetch_hf_model_geometry(model_id, revision, strict=True)
-    # Revision-aware sizing is authoritative and must fail closed. When the pinned commit exposes no
-    # parameter-count metadata (no safetensors.total), we cannot derive its size; silently reusing the
-    # catalog default-revision count would size the exact-GPU preflight on weights the worker never loads,
-    # the precise mis-provisioning this pin exists to prevent.
-    if params_b is None:
-        raise ValueError(
-            f"model_revision for {model_id!r} exposes no parameter-count metadata "
-            f"(no safetensors.total); cannot size the pinned revision"
-        )
-    mismatches: list[str] = []
-    if info.params_b > 0:
-        delta = abs(params_b - info.params_b) / info.params_b
-        if delta > 0.05:
-            mismatches.append("parameter count")
-    if vocab and info.vocab_size and vocab != info.vocab_size:
-        mismatches.append("vocabulary size")
-    if hidden and info.hidden_size and hidden != info.hidden_size:
-        mismatches.append("hidden size")
-    if layers and info.num_layers and layers != info.num_layers:
-        mismatches.append("layer count")
-    if mismatches:
-        raise ValueError(
-            f"model_revision for {model_id!r} has geometry incompatible with the catalog: "
-            f"{', '.join(mismatches)}"
-        )
-    return params_b, vocab or info.vocab_size
+        return None, 0, 0, 0, 0
 
 
 def _sizing_value(obj, key):
@@ -587,6 +563,26 @@ def _sizing_value(obj, key):
     if obj is None:
         return None
     return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+
+def _optimizer_batch_value(train, algorithm: str):
+    """Return the authored optimizer batch under whichever key this algorithm accepts.
+
+    The optimizer batch is one sizing input here but two config keys: sft authors `batch_size`,
+    grpo/opd author `prompts_per_step`, and the schema rejects each name under the other algorithm.
+    Reading only `batch_size` therefore sized every rl run on the recipe default no matter what the
+    user wrote, because an rl spec's `batch_size` is always None -- so a wide `prompts_per_step`
+    silently under-provisioned the card instead of escalating it.
+
+    Sizing runs before the train validators, so a spec carrying both keys cannot be assumed
+    rejected yet; take the larger rather than trusting one, since under-sizing is the failure that
+    OOMs a paid run and over-sizing only costs a bigger card.
+    """
+    names = ("prompts_per_step", "batch_size") if algorithm in _ROLLOUT_ALGOS else ("batch_size",)
+    values = [
+        v for v in (_positive_int_or_default(_sizing_value(train, n), None) for n in names) if v
+    ]
+    return max(values) if values else None
 
 
 def _positive_int_or_default(v, default):
@@ -855,13 +851,7 @@ def model_required_vram_gb(
         batch_size_default = _sft_per_device_bs()
         group_size_default = 8
     group_size = _positive_int_or_default(_sizing_value(train, "group_size"), group_size_default)
-    # opd authors the examples-per-update knob as prompts_per_step, sft as batch_size. reading
-    # batch_size for opd finds None on every spec and sizes the rollout at the recipe default,
-    # ignoring the authored batch. grpo never reads this term, so it keeps the sft spelling.
-    batch_size = _positive_int_or_default(
-        _sizing_value(train, "prompts_per_step" if _algo == "opd" else "batch_size"),
-        batch_size_default,
-    )
+    batch_size = _positive_int_or_default(_optimizer_batch_value(train, _algo), batch_size_default)
 
     from flash.core.catalog import MODELS, vocab_size_for
 
@@ -935,4 +925,18 @@ from flash.engine.plan.kv_sizing import (  # noqa: E402,F401
     _colocate_util_cap,
     _resident_kv_gb,
     colocate_kv_util,
+)
+
+# The pinned-commit config probe lives in `flash.engine.plan.model_config_probe`, for the same
+# file-size reason. Re-exported because `from flash.engine.plan.vram import
+# _validated_revision_geometry` must keep working. NOTE that `_CONFIG_PROBE_MEMO` is
+# deliberately NOT re-exported: an alias would be a SECOND name for one dict, and a test that
+# swaps `vram._CONFIG_PROBE_MEMO` would leave the module actually reading the original --
+# a silently ineffective patch. Reach for it at its defining module.
+from flash.engine.plan.model_config_probe import (  # noqa: E402,F401
+    _certify_model_config,
+    _config_mismatches,
+    _memoized_config_probe,
+    _validated_revision_geometry,
+    certified_attention_heads,
 )

@@ -638,6 +638,51 @@ def test_opd_applies_the_colocated_vllm_floor():
     assert model_required_vram_gb("Qwen/Qwen3.5-0.8B", "opd", train=train, headroom=1.0) == 24
 
 
+def test_opd_sizes_on_the_authored_prompts_per_step():
+    """The rl optimizer batch is named ``prompts_per_step``, and sizing must read THAT key.
+
+    Regression: the sizer only ever read ``batch_size``. Once the rl batch was split out under its
+    own name, an rl spec's ``batch_size`` was always None, so every authored ``prompts_per_step``
+    fell through to the recipe default -- a wide batch sized as if it were the default one and
+    under-provisioned the card it was then rented on. Sizing has to move with the knob, on the
+    TrainSpec the submit path passes and on the raw dict the parse gate passes.
+    """
+    from flash.engine.plan.vram import model_required_vram_gb
+    from flash.schema import spec_from_dict
+
+    def _train(**over):
+        return {
+            "epochs": 1,
+            "group_size": 1,
+            "max_context_tokens": 1536,
+            "max_completion_tokens": 512,
+            "lora_rank": 16,
+            **over,
+        }
+
+    narrow = model_required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=_train(prompts_per_step=1))
+    wide = model_required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=_train(prompts_per_step=32))
+    assert wide > narrow, "an authored prompts_per_step must move the opd vram floor"
+
+    # the submit path allocates from the parsed TrainSpec, not the raw dict, and that object carries
+    # the batch ONLY under prompts_per_step -- so it has to size identically to the dict above.
+    def _spec_need(pps):
+        spec = spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "opd",
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "gpu": {},
+                "train": _train(prompts_per_step=pps),
+            },
+            run_id="pps",
+        )
+        return model_required_vram_gb(spec.model, "opd", train=spec.train)
+
+    assert _spec_need(1) == narrow
+    assert _spec_need(32) == wide
+
+
 def test_vram_headroom_consistent_across_sizing_paths():
     """provisional_gpu (parse-time) and required_vram_gb (submit-time) must size with the SAME
     headroom (a validated constant), so they never disagree."""
