@@ -415,6 +415,26 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
     && /opt/verl-venv/bin/python -c "import causal_conv1d" \
     && echo "causal_conv1d (verl venv): installed (GDN boundary resets enabled)"
 
+# Neutralize tilelang's libcudart stub in THIS venv, after the last install that can write tilelang
+# into it (the install above and the flash-attn one before it) and before anything imports vLLM here.
+# vLLM aborts its import when it finds that stub (it has no cudaDeviceReset) in /proc/self/maps, and
+# this venv is where the child actually trains, so an unrepaired stub kills grpo/opd on a rented gpu.
+#
+# resolve_verl_python applies the same repair to the venv it provisions itself, but it returns a
+# preset FLASH_VERL_PYTHON untouched -- flash does not own a foreign interpreter -- and this image
+# sets that variable (above), so live workers take the early return and never reach it. That makes
+# this the ONLY place the production venv gets repaired.
+#
+# The script is EXTRACTED from _CHILD_CUDART_FIX rather than copied: both paths repair the same venv
+# and must not drift. It is stdlib-only by construction (the venv has no flash), which the extractor
+# asserts. Part of the same && chain: a stub left shadowing libcudart exits nonzero and fails the
+# BUILD, which is strictly cheaper than failing the run after the gpu is paid for -- the same
+# discipline as the causal_conv1d layer above.
+COPY flash/engine/worker/verl/capabilities.py docker/extract_cudart_fix.py /tmp/cudartfix/
+RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /tmp/cudartfix/fix.py \
+    && /opt/verl-venv/bin/python /tmp/cudartfix/fix.py \
+    && rm -rf /tmp/cudartfix
+
 # Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
 # have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
 # (rl_train -> main_ppo, opd_plugin -> main_ppo_sync, sft_train -> sft_trainer; note it is
