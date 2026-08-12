@@ -783,6 +783,34 @@ def test_train_body_extra_pip_matches_the_bootstrap_on_git_http_blips(monkeypatc
     assert len(calls) == 1
 
 
+def test_train_body_extra_pip_matches_the_bootstrap_on_an_index_outage_footer(monkeypatch):
+    # an unreachable index prints the same no-candidate footer a typo'd name does, so that footer
+    # alone must not be terminal when the tail also carries a transient marker. A build failure in
+    # the same tail still decides it, since pip only reaches one with real content in hand. Both
+    # classifiers must agree on this, so the RunPod copy is pinned exactly as the bootstrap is.
+    from flash.providers.runpod.serverless import endpoints
+
+    outage = (
+        "WARNING: Retrying (Retry(total=4, connect=None)) after connection broken by "
+        "NewConnectionError\n"
+        "ERROR: Could not find a version that satisfies the requirement requests "
+        "(from versions: none)\n"
+        "ERROR: No matching distribution found for requests\n"
+    )
+    calls = _wire_train_body_pip(
+        monkeypatch, [(outage, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 2
+
+    built = outage + "ERROR: Failed building wheel for requests\n"
+    calls = _wire_train_body_pip(monkeypatch, [(built, 1)])
+    with pytest.raises(RuntimeError, match="extra_pip install failed"):
+        endpoints._train_body(_extra_pip_input())
+    assert len(calls) == 1
+
+
 def test_train_body_extra_pip_stops_after_the_bounded_retries(monkeypatch):
     from flash.providers.runpod.serverless import endpoints
 

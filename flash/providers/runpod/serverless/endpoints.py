@@ -269,18 +269,36 @@ def _train_body(input_data: dict) -> dict:
                 # pin or a missing token and must still fail fast rather than burn three backoffs.
                 r"|returned error: (?:429|5\d\d)|could not resolve (?:host|proxy)"
             )
-            # Build/resolution failures, reachable only AFTER pip downloaded real content, so they
-            # name the cause and outrank a transient warning pip already recovered from in the same
-            # tail; without that precedence one early "Retrying (Retry(" makes a deterministic
-            # failure look retriable and this ladder repeats it for nothing. Kept identical to the
-            # instance bootstrap's _PIP_TERMINAL_RE: the two classifiers must agree on what is
-            # retriable, including excluding the bare subprocess-exited-with-error marker that a
-            # network-interrupted VCS `git clone` also prints.
+            # Build/resolution failures, which name the cause and outrank a transient warning pip
+            # already recovered from in the same tail; without that precedence one early
+            # "Retrying (Retry(" makes a deterministic failure look retriable and this ladder
+            # repeats it for nothing. Kept identical to the instance bootstrap's _PIP_TERMINAL_RE:
+            # the two classifiers must agree on what is retriable, including excluding the bare
+            # subprocess-exited-with-error marker that a network-interrupted VCS `git clone` also
+            # prints.
             pip_terminal_re = re.compile(
                 r"(?i)failed building wheel|metadata-generation-failed|could not build wheels"
                 r"|no matching distribution|could not find a version|resolutionimpossible"
                 r"|invalid requirement"
             )
+            # The subset pip can print having downloaded NOTHING: an unreachable index yields no
+            # candidate versions, so it finishes with exactly the footer a typo'd name produces.
+            # When that footer is the only terminal evidence and the tail also carries a transient
+            # marker, the network explains it and the run retries. Mirrors the bootstrap's
+            # _PIP_NO_CANDIDATE_RE / _is_terminal.
+            pip_no_candidate_re = re.compile(
+                r"(?i)no matching distribution|could not find a version"
+            )
+
+            def _pip_is_terminal(output: str) -> bool:
+                if not pip_terminal_re.search(output):
+                    return not pip_transient_re.search(output)
+                if not pip_transient_re.search(output):
+                    return True
+                # a build or resolver failure surviving the footer strip proves pip held real
+                # content, so it stays deterministic; nothing left means the outage explains it.
+                return bool(pip_terminal_re.search(pip_no_candidate_re.sub("", output)))
+
             pip_retry_delays = (3.0, 9.0, 27.0)
             # held back from a deadline-clamped backoff so the retry it precedes has wall to run in
             _PIP_RETRY_RESERVE_S = 1.0
@@ -318,9 +336,7 @@ def _train_body(input_data: dict) -> dict:
                     if rc == 0:
                         break
                     pip_output = "".join(tail)
-                    if pip_terminal_re.search(pip_output) or not pip_transient_re.search(
-                        pip_output
-                    ):
+                    if _pip_is_terminal(pip_output):
                         raise RuntimeError(f"extra_pip install failed: pip exited {rc}")
                     if pip_attempt >= len(pip_retry_delays):
                         raise RuntimeError(

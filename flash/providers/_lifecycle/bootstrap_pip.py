@@ -43,6 +43,33 @@ _PIP_TERMINAL_RE = re.compile(
     r"(?i)failed building wheel|could not build wheels|metadata-generation-failed"
     r"|no matching distribution|could not find a version|resolutionimpossible|invalid requirement"
 )
+# terminal markers pip can print having downloaded NOTHING; see _is_terminal.
+_PIP_NO_CANDIDATE_RE = re.compile(r"(?i)no matching distribution|could not find a version")
+
+
+def _is_terminal(output: str) -> bool:
+    """Whether this pip failure is deterministic, so retrying it would only re-fail identically.
+
+    Three cases, in order:
+
+    No terminal marker at all -- retry only if the tail looks network-shaped.
+
+    A terminal marker and nothing transient -- deterministic.
+
+    Both. An unreachable index yields no candidate versions, so pip finishes with exactly the
+    footer a typo'd package name produces ("could not find a version" / "no matching
+    distribution"): that text alone cannot tell a permanent bad spec from a total outage. Drop
+    those footers and re-test. If another terminal marker still stands, pip held real content and
+    the failure is deterministic regardless of the earlier warning -- the remaining alternatives
+    are unreachable without content in hand (a wheel that failed to build, metadata that failed to
+    generate, a genuine resolver conflict) or are decided before any request at all (an
+    unparseable requirement). If nothing is left, the network fully explains the footer, so retry.
+    """
+    if not _PIP_TERMINAL_RE.search(output):
+        return not _PIP_TRANSIENT_RE.search(output)
+    if not _PIP_TRANSIENT_RE.search(output):
+        return True
+    return bool(_PIP_TERMINAL_RE.search(_PIP_NO_CANDIDATE_RE.sub("", output)))
 
 
 def _extra_pip_env(payload: dict) -> tuple[dict[str, str], str | None]:
@@ -115,7 +142,7 @@ def install(payload: dict, *, require_deadline_at, retriable_error) -> None:
             if rc == 0:
                 return
             output = "".join(tail)  # a build failure outranks it; below that, network shapes retry
-            if _PIP_TERMINAL_RE.search(output) or not _PIP_TRANSIENT_RE.search(output):
+            if _is_terminal(output):
                 raise RuntimeError(f"extra_pip install failed: pip exited {rc}")
             if attempt >= len(_PIP_RETRY_DELAYS_S):
                 raise retriable_error(

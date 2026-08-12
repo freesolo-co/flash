@@ -543,6 +543,63 @@ def test_bootstrap_extra_pip_retries_a_vcs_clone_that_cannot_resolve_the_host(mo
     assert len(calls) == 2
 
 
+def test_bootstrap_extra_pip_retries_an_index_outage_that_ends_in_the_no_match_footer(monkeypatch):
+    """An unreachable index produces the SAME footer a typo'd package name does.
+
+    pip that cannot reach the index sees no candidate versions, so it prints its retry warnings and
+    then finishes with "could not find a version" / "no matching distribution". Those footers alone
+    therefore cannot prove a deterministic bad spec, and treating them as terminal fails a paid run
+    on exactly the outage this ladder exists to absorb, without ever making a second attempt.
+    """
+    lb, calls = _wire_pip(
+        monkeypatch,
+        [
+            (
+                (
+                    "WARNING: Retrying (Retry(total=4, connect=None)) after connection broken by "
+                    "NewConnectionError\n"
+                    "ERROR: Could not find a version that satisfies the requirement requests "
+                    "(from versions: none)\n"
+                    "ERROR: No matching distribution found for requests\n"
+                ),
+                1,
+            ),
+            ("Successfully installed requests\n", 0),
+        ],
+    )
+    lb.install_extra_pip(_pip_payload())
+    assert len(calls) == 2
+
+
+def test_bootstrap_extra_pip_build_failure_still_outranks_a_recovered_blip(monkeypatch):
+    """The counterpart bound: loosening the footer must not loosen the precedence rule.
+
+    A wheel that failed to build is only reachable AFTER pip downloaded real content, so it names a
+    deterministic cause no matter what warning preceded it. It must keep absolute precedence over a
+    transient marker pip already recovered from earlier in the same attempt, or one early
+    "Retrying (Retry(" makes a permanent failure walk the whole ladder for nothing.
+    """
+    lb, calls = _wire_pip(
+        monkeypatch,
+        [
+            (
+                (
+                    "WARNING: Retrying (Retry(total=4)) after connection broken by "
+                    "NewConnectionError\n"
+                    "Collecting numpy\n"
+                    "ERROR: No matching distribution found for numpy\n"
+                    "ERROR: Failed building wheel for numpy\n"
+                ),
+                1,
+            )
+        ],
+    )
+    with pytest.raises(RuntimeError, match="extra_pip install failed") as exc_info:
+        lb.install_extra_pip(_pip_payload())
+    assert not isinstance(exc_info.value, lb.RetriableBootstrapError)
+    assert len(calls) == 1  # the build failure decides it; no ladder
+
+
 def test_bootstrap_extra_pip_vcs_clone_rejected_by_a_404_still_fails_fast(monkeypatch):
     # the counterpart bound: git reports a missing repo or an unauthorized private pin in the same
     # sentence as the blip above. Only 429/5xx may retry, or a typo'd pin re-rents a box three
