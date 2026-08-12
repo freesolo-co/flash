@@ -24,6 +24,7 @@ from flash.adapters.artifacts import (
     ADAPTER_SHARD_PREFIX,
     ADAPTER_WEIGHT_INDEX_FILES,
     ADAPTER_WEIGHT_SUFFIXES,
+    has_loadable_adapter_weights,
     is_adapter_weight_filename,
 )
 from flash.serve.deploy import ServingError
@@ -178,7 +179,13 @@ def _adapter_weight_paths(adapter_dir: Path) -> list[Path]:
         active = _index_referenced_shards(adapter_dir, suffix, candidates)
         if active:
             return active
-        return candidates
+        # No index, or one that names nothing readable. Shards without an index are not a
+        # representation peft can discover, so exporting them all would ship weights it loads as a
+        # no-op. Falling through to the next suffix is what makes a stale orphan shard beside a
+        # complete `.bin` export correctly, and returning [] when neither suffix resolves makes
+        # `_normalize_adapter_key_namespace` refuse -- the export failing is the only signal the
+        # user ever gets, since peft's own answer to mismatched keys is a UserWarning.
+        continue
     return []
 
 
@@ -573,11 +580,11 @@ def export_adapter(
             sorted(p for p in adapter_dir.rglob("*") if p.is_file()) if adapter_dir.is_dir() else []
         )
         names = {p.name for p in files}
-        has_weight = any(is_adapter_weight_filename(n) for n in names)
-        if not has_weight or "adapter_config.json" not in names:
+        if not has_loadable_adapter_weights(names) or "adapter_config.json" not in names:
             raise ValueError(
                 f"no loadable LoRA adapter at {source_repo}:{source_subfolder} "
-                "(need adapter_config.json + an adapter_model* weight; nothing to export)"
+                "(need adapter_config.json + an adapter_model weight, or a complete "
+                "index-referenced shard set; nothing to export)"
             )
         _repair_export_metadata(adapter_dir, base_model, base_model_revision)
         namespace = _normalize_export_adapter_keys(adapter_dir)

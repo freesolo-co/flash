@@ -163,3 +163,51 @@ def test_domain_translates_hub_failures_without_returning_empty(monkeypatch):
     with pytest.raises(domain.EnvPublishError) as excinfo:
         domain.list_namespace_slugs(key=_user_key())
     assert excinfo.value.status == 502
+
+
+def test_domain_reports_a_quota_refusal_as_rate_limited(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+
+    def fail(_namespace):
+        raise loader.GitHubRateLimitError("GitHub API rate limit exceeded (429)")
+
+    monkeypatch.setattr(loader, "list_managed_namespace_slugs", fail)
+
+    with pytest.raises(domain.EnvPublishError) as excinfo:
+        domain.list_namespace_slugs(key=_user_key())
+    assert excinfo.value.status == 429
+
+
+def test_domain_reports_an_outage_as_unavailable_not_rate_limited(monkeypatch):
+    """A 5xx or a dead connection is GitHub being unreachable, and 429 misdescribes it.
+
+    Both are retriable, so the loader raised one type for both and every outage reached the caller
+    as "you are rate limited" -- telling them to back off against a quota they never hit, while the
+    real cause went unreported.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+
+    def fail(_namespace):
+        raise loader.GitHubUnavailableError("GitHub server error (502, transient)")
+
+    monkeypatch.setattr(loader, "list_managed_namespace_slugs", fail)
+
+    with pytest.raises(domain.EnvPublishError) as excinfo:
+        domain.list_namespace_slugs(key=_user_key())
+    assert excinfo.value.status == 503
+    assert "rate limit" not in str(excinfo.value).lower()
+
+
+def test_the_worker_still_reschedules_on_either_transient_cause():
+    """Splitting the type must not change what the worker does: both still retry.
+
+    The worker classifies on the shared base, so an outage that used to arrive as the rate-limit
+    type keeps rescheduling the run rather than failing it permanently.
+    """
+    from flash.engine.worker import _worker_failure_flags
+
+    for exc in (
+        loader.GitHubRateLimitError("quota"),
+        loader.GitHubUnavailableError("outage"),
+    ):
+        assert _worker_failure_flags(exc)["retriable"]

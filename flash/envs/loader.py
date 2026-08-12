@@ -63,6 +63,12 @@ from flash.envs.identity import (
     GitHubRateLimitError as GitHubRateLimitError,
 )
 from flash.envs.identity import (
+    GitHubTransientError as GitHubTransientError,
+)
+from flash.envs.identity import (
+    GitHubUnavailableError as GitHubUnavailableError,
+)
+from flash.envs.identity import (
     _is_safe_github_path_parts as _is_safe_github_path_parts,
 )
 from flash.envs.identity import (
@@ -271,7 +277,7 @@ def _urlopen(
                     f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
                 ) from exc
             if exc.code >= 500:
-                raise GitHubRateLimitError(
+                raise GitHubUnavailableError(
                     f"GitHub server error ({exc.code}, transient) after {attempt} retries: {body[:300]}"
                 ) from exc
             raise RuntimeError(
@@ -283,7 +289,7 @@ def _urlopen(
                 attempt += 1
                 continue
             reason = getattr(exc, "reason", exc)
-            raise GitHubRateLimitError(
+            raise GitHubUnavailableError(
                 f"GitHub environment request failed after {attempt} retries (transient network): {reason}"
             ) from exc
 

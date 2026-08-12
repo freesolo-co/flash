@@ -396,19 +396,23 @@ def _require_setup_project(args) -> str:
 # Guidance the starter .py docstrings carry, per plane kind. The templates hold placeholders
 # rather than one plane's wording plus a rewrite pass: matching prose back out after rendering
 # breaks silently the moment a template is reworded.
+# `CLI_NAME`, not a literal `flash`: the executable is `flash-cli` (or `python -m flash.cli`) when
+# `flash` on PATH belongs to RunPod, and the terminal-facing output below already renders it that
+# way. A generated file that says `flash env push` sends the user to the shadowing binary, which
+# exits 0 without publishing anything -- so the instructions look followed and nothing happened.
 _HOSTED_GUIDANCE = {
     "ENVIRONMENT_GUIDANCE": (
         "upload with\n"
-        "`flash env push --project PROJECT_UUID --name my-env .`.\n"
+        f"`{CLI_NAME} env push --project PROJECT_UUID --name my-env .`.\n"
         "\n"
         "A managed run should use the returned [environment] id from\n"
-        "`flash env push --project PROJECT_UUID --name my-env .`."
+        f"`{CLI_NAME} env push --project PROJECT_UUID --name my-env .`."
     ),
     "EVALUATIONS_GUIDANCE": (
         "Publish this file beside environment.py with\n"
-        "`flash env push --project PROJECT_UUID --name my-env .`, then run the suites against a\n"
-        "model trained on it with `flash env eval TARGET`. The run names the published\n"
-        "environment, so `env eval` takes no local path."
+        f"`{CLI_NAME} env push --project PROJECT_UUID --name my-env .`, then run the suites\n"
+        f"against a model trained on it with `{CLI_NAME} env eval TARGET`. The run names the\n"
+        "published environment, so `env eval` takes no local path."
     ),
 }
 
