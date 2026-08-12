@@ -1005,50 +1005,25 @@ def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
     assert steady_state_commits_per_hour <= 5.0
 
 
-def test_worker_image_override_carries_its_registry_credential(monkeypatch):
-    # a private override image needs its provider-side pull credential; that cannot be derived
-    # from the image ref, so it rides alongside it.
-    from flash.providers._lifecycle import worker as _worker
-
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/private-worker:cu13")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-123")
-    o = _worker.worker_image_override()
-    assert o.image == "ghcr.io/example/private-worker:cu13"
-    assert o.registry_auth_id == "auth-123"
-    assert _worker.worker_image_for_gpu("H200") == o.image
-
-
-def test_worker_image_override_absent_is_none(monkeypatch):
-    from flash.providers._lifecycle import worker as _worker
-
-    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
-    assert _worker.worker_image_override() is None
-
-
-def test_min_cuda_for_uses_the_gpu_class_floor(monkeypatch):
-    # the CUDA floor is a property of the GPU class, not of an operator-supplied image tag
+def test_min_cuda_for_uses_the_gpu_class_floor():
+    # the CUDA floor is a property of the GPU class, not of the image tag
     from flash.providers.runpod.serverless.endpoints import min_cuda_for
 
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:cu13")
     assert min_cuda_for("B200") == "13.0"  # blackwell needs cu13 drivers
     assert min_cuda_for("H200") == "12.8"
 
 
-def test_apply_disk_raises_to_the_requested_floor(monkeypatch):
+def test_apply_disk_raises_to_the_requested_floor():
     from types import SimpleNamespace
 
-    from flash.providers.runpod.jobs import apply_disk_gb, apply_image_override_constraints
+    from flash.providers.runpod.jobs import apply_disk_gb
 
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/w:big")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-xyz")
-    tpl = SimpleNamespace(containerDiskInGb=64, containerRegistryAuthId=None)
+    tpl = SimpleNamespace(containerDiskInGb=64)
     cfg = SimpleNamespace(template=tpl)
     apply_disk_gb(cfg, 80)
     assert tpl.containerDiskInGb == 80  # raise-only: the request wins over the smaller default
     apply_disk_gb(cfg, 32)
     assert tpl.containerDiskInGb == 80  # never lowers an already-larger disk
-    apply_image_override_constraints(cfg)
-    assert tpl.containerRegistryAuthId == "auth-xyz"
 
 
 def test_snapshot_weight_validation(tmp_path):
@@ -1060,36 +1035,3 @@ def test_snapshot_weight_validation(tmp_path):
     assert not _snapshot_has_weights(str(d))  # configs only = stale partial snapshot
     (d / "model.safetensors-00001-of-00001.safetensors").write_text("x")
     assert _snapshot_has_weights(str(d))
-
-
-def test_private_worker_image_is_refused_by_providers_that_cannot_authenticate(monkeypatch):
-    """Lambda and Vast must offer NO capacity while a credential-backed private image is set.
-
-    ``FLASH_WORKER_IMAGE_REGISTRY_AUTH`` is a RunPod provider-side credential id and only RunPod
-    attaches it; these substrates pull the image on the rented instance with no registry login. The
-    image override reaches every provider, so an automatic allocation onto either one rented a box
-    whose pull could not succeed -- and a never-started worker is retriable, so the paid attempt
-    could repeat.
-    """
-    from flash.providers.base import AllocationConstraints, UnsupportedGpuError
-    from flash.providers.lambda_ import LambdaProvider
-    from flash.providers.vast import VastProvider
-
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/private-worker:cu13")
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", "auth-123")
-
-    for provider in (LambdaProvider(), VastProvider()):
-        with pytest.raises(UnsupportedGpuError, match="private FLASH_WORKER_IMAGE"):
-            provider.live_candidates(24, AllocationConstraints())
-
-
-def test_a_public_override_image_still_allocates_on_those_providers(monkeypatch):
-    """The guard keys on the CREDENTIAL, not on the override: a public image pulls fine anywhere."""
-    from flash.providers.lambda_ import LambdaProvider
-    from flash.providers.vast import VastProvider
-
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/example/public-worker:cu13")
-    monkeypatch.delenv("FLASH_WORKER_IMAGE_REGISTRY_AUTH", raising=False)
-
-    for provider in (LambdaProvider(), VastProvider()):
-        assert provider._private_image_problem() == ""
