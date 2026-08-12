@@ -1614,14 +1614,51 @@ def test_two_adapters_sharing_one_lora_int_id_are_refused_not_aliased(client, mo
     assert "collision" in result["failure"]
 
 
-def test_a_failed_load_releases_its_lora_id_claim(client, monkeypatch):
-    """A claim taken before the download must not survive a download that fails.
+def test_a_revision_that_settles_failed_releases_its_lora_id_claim(client):
+    """A claim taken before the download must not survive the revision going terminal.
 
     Claiming early is what makes the download window safe, and it is also what makes a leak
     permanent: settle records the revision `failed`, undeploy skips already-disabled records, so
     nothing later clears the claim. The id is then refused forever for an adapter that was never
     resident -- and because the id is a hash of the adapter id, the run cannot get a different one
     by retrying.
+    """
+    module = client.app.state.generated_module
+    record = dict(REGISTRATION)
+    key = module._lora_id_key(module._lora_int_id(REVISION))
+    module.adapter_records[key] = REVISION
+
+    async def _failing_register(_record):
+        return {"ok": False, "failure": "RuntimeError: hf download failed"}
+
+    module.Engine = lambda: types.SimpleNamespace(
+        register=types.SimpleNamespace(remote=types.SimpleNamespace(aio=_failing_register)),
+        unregister=types.SimpleNamespace(
+            remote=types.SimpleNamespace(aio=lambda *a, **k: _noop_coroutine())
+        ),
+    )
+    assert client.post("/adapters", json=record).status_code in (200, 202)
+    assert _lifecycle(client, REVISION) == "failed"
+    assert dict.get(module.adapter_records, key) is None, (
+        "a revision that settled `failed` kept its lora id claim, so that id is refused forever "
+        "for an adapter that never became resident"
+    )
+
+
+def test_a_failed_load_does_not_release_a_claim_another_container_is_using(client, monkeypatch):
+    """One container's failed load must not release the shared claim.
+
+    A load runs PER CONTAINER but the claim is global. `Engine` scales horizontally and a retried
+    `models deploy` starts a second settle for the same revision, so a container failing says
+    nothing about whether another already has the adapter resident -- and `_claim_lora_int_id`
+    deliberately lets a second loader through when the recorded owner already matches, so the
+    failing container reaches the release holding a claim that is not exclusively its own.
+
+    Released there, the id goes free while the peer is still serving under it, and a colliding
+    adapter can then claim and load it -- the exact outcome the claim exists to prevent, since vLLM
+    addresses a LoRA solely by the int and would answer from the wrong run's weights. Only
+    `settle_adapter`, under the run lock and behind the `settle_attempt` guard, can tell "this
+    revision failed" from "this container's attempt at it failed".
     """
     lora = types.ModuleType("vllm.lora.request")
     lora.LoRARequest = lambda *args, **kwargs: object()
@@ -1642,14 +1679,17 @@ def test_a_failed_load_releases_its_lora_id_claim(client, monkeypatch):
     instance._adapter_path = _boom
     instance.engine = types.SimpleNamespace(add_lora=lambda request: None)
 
-    doomed = {"adapter_id": "run-doomed@final." + "d" * 40}
-    with pytest.raises(RuntimeError, match="download failed"):
-        _run_awaitable(engine_class._lora_request(instance, doomed))
+    retried = {"adapter_id": "run-retried@final." + "e" * 40}
+    key = module._lora_id_key(module._lora_int_id(retried["adapter_id"]))
+    # The peer container that already loaded this revision successfully holds the claim.
+    module.adapter_records[key] = retried["adapter_id"]
 
-    key = module._lora_id_key(module._lora_int_id(doomed["adapter_id"]))
-    assert dict.get(module.adapter_records, key) is None, (
-        "a failed load kept its lora id claim, so that id is refused forever for an adapter that "
-        "never became resident"
+    with pytest.raises(RuntimeError, match="download failed"):
+        _run_awaitable(engine_class._lora_request(instance, retried))
+
+    assert dict.get(module.adapter_records, key) == retried["adapter_id"], (
+        "a failed load released the shared lora id claim while another container still had the "
+        "adapter resident under it, leaving the id free for a colliding adapter to take"
     )
 
 

@@ -508,21 +508,25 @@ class Engine:
                     f"lora id collision: {{adapter_id}} and {{owner}} both hash to {{int_id}}, and "
                     f"vllm cannot tell them apart. redeploy under a different run id."
                 )
-            # Released on ANY post-claim failure, because claiming early is what makes the download
-            # window safe and also what makes a leak permanent: settle records the revision
-            # `failed`, undeploy skips already-disabled records, so nothing later would ever clear
-            # it -- and the id is then refused forever for an adapter that was never resident.
-            try:
-                path = await self._adapter_path(record)
-                request = LoRARequest(adapter_id, int_id, path)
-                # Load it NOW rather than lazily on first generate: a bad adapter (wrong rank,
-                # missing tensors) must fail here so registration reports `failed` with a real
-                # reason, instead of reporting ready and then 500ing on the user's first chat.
-                await self.engine.add_lora(request)
-            except Exception:
-                # Conditional release, so a retry that already re-claimed keeps its own claim.
-                await _release_lora_int_id(int_id, adapter_id)
-                raise
+            # NOT released here, even though this is where the failure happens. The claim is
+            # global and keyed by adapter id, but a load is per-container: `Engine` scales
+            # horizontally and a retried `models deploy` starts a second settle for the SAME
+            # revision, so one container failing says nothing about whether another already has
+            # the adapter resident. Releasing on the local failure pops the claim out from under
+            # that live load, and the id is then free for a colliding adapter to take -- which is
+            # the one outcome this whole mechanism exists to prevent, because vLLM addresses a
+            # LoRA solely by the int and would answer from the wrong run's weights.
+            #
+            # `settle_adapter` releases instead: it runs under the run lock, and its
+            # `settle_attempt` guard already decides which of several in-flight attempts is the
+            # authoritative one. That is the only place that can tell "this revision failed" from
+            # "this container's attempt at it failed".
+            path = await self._adapter_path(record)
+            request = LoRARequest(adapter_id, int_id, path)
+            # Load it NOW rather than lazily on first generate: a bad adapter (wrong rank,
+            # missing tensors) must fail here so registration reports `failed` with a real
+            # reason, instead of reporting ready and then 500ing on the user's first chat.
+            await self.engine.add_lora(request)
             self._loaded[adapter_id] = request
             self._int_ids[int_id] = adapter_id
             return request
@@ -723,6 +727,16 @@ async def settle_adapter(record: dict[str, Any]) -> None:
                     "lifecycle_state": "failed",
                     "failure": result.get("failure"),
                 }}
+                # A FAILED load's claim is released here, not in the engine. The load runs
+                # per-container and cannot tell its own failure from the revision's: a retried
+                # deploy has a second settle in flight for the same adapter, possibly already
+                # resident on another container. This branch is the one place that knows better --
+                # it holds the run lock, and reaching it means this attempt is the authoritative
+                # one AND its load failed, so the revision really is going terminal and its id
+                # must not stay reserved. Otherwise the claim outlives its adapter permanently:
+                # undeploy skips already-disabled records, and the id is a hash of the adapter id,
+                # so a retry cannot get a different one.
+                await _release_lora_int_id(_lora_int_id(adapter_id), adapter_id)
             current["updated_at"] = _utc_now()
             await adapter_records.put.aio(_record_key(adapter_id), current)
     # Outside the lock: an engine round trip is slow, and the record is already durably correct.
