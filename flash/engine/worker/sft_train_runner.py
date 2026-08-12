@@ -516,6 +516,51 @@ def _resolve_sft_run_identity(
     return loggers, project_name, _w.wandb_run_name()
 
 
+def _write_sft_child_shims(
+    options: _SftOptions,
+    model: _SftModelSetup,
+    *,
+    shim_dir: str,
+    custom_dataset_path: str,
+    seed: int,
+    loggers: list[str],
+    gdn_reset_arch: str | None,
+) -> tuple[str, tuple[str, ...]]:
+    """Write the child's sitecustomize and dataset module; return its marker file and shim names."""
+    core_source = _render_sft_sitecustomize(
+        seed=seed,
+        loraplus_ratio=_SFT_LORAPLUS_RATIO,
+        save_at_steps=options.save_at_steps,
+        total_steps=model.update_horizon,
+        reentrant_gradient_checkpointing=model.reentrant_gradient_checkpointing,
+    )
+    # both shims, not either: this one patches DistributedSampler/StatefulDataLoader so the child's
+    # row order matches the profile's byte for byte, and the gdn one patches the model's text
+    # forward to reset linear-attention state at packed example boundaries. different objects,
+    # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
+    core_source = _sft_train._append_exact_sft_dataloader_shim(core_source)
+    # every required fragment is wrapped fail-closed (see wrap_shim_fragment): execsitecustomize
+    # would otherwise swallow a fragment's exception and the child would train unpatched (no
+    # seeding, no exact dataloader order, no lora+, no boundary resets) while looking healthy.
+    # the wandb link shim stays unwrapped: it swallows its own failures by design and a logging
+    # link must not be able to abort paid training.
+    required_fragments = [("sft-core", core_source)]
+    if gdn_reset_arch is not None:
+        required_fragments.append(("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
+    shim_markers = shim_marker_file(shim_dir)
+    # the workdir is wiped per attempt (_resolve_sft_options), so no stale marker can survive here.
+    shim_source = render_shim_marker_prologue(shim_markers) + "".join(
+        wrap_shim_fragment(name, source) for name, source in required_fragments
+    )
+    if "wandb" in loggers:
+        shim_source += render_wandb_link_shim()
+    with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
+        file.write(shim_source)
+    with open(custom_dataset_path, "w", encoding="utf-8") as file:
+        file.write(_render_sft_dataset_module())
+    return shim_markers, tuple(name for name, source in required_fragments if source)
+
+
 def _prepare_sft_child(
     options: _SftOptions,
     data: _SftData,
@@ -583,37 +628,15 @@ def _prepare_sft_child(
         "fused_ce_backend": _sft_train._resolve_sft_fused_ce_backend(capabilities.caps),
     }
     overrides = build_sft_overrides(config)
-    core_source = _render_sft_sitecustomize(
+    shim_markers, expected_shims = _write_sft_child_shims(
+        options,
+        model,
+        shim_dir=shim_dir,
+        custom_dataset_path=custom_dataset_path,
         seed=config["seed"],
-        loraplus_ratio=_SFT_LORAPLUS_RATIO,
-        save_at_steps=options.save_at_steps,
-        total_steps=model.update_horizon,
-        reentrant_gradient_checkpointing=model.reentrant_gradient_checkpointing,
+        loggers=loggers,
+        gdn_reset_arch=gdn_reset_arch,
     )
-    # both shims, not either: this one patches DistributedSampler/StatefulDataLoader so the child's
-    # row order matches the profile's byte for byte, and the gdn one patches the model's text
-    # forward to reset linear-attention state at packed example boundaries. different objects,
-    # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
-    core_source = _sft_train._append_exact_sft_dataloader_shim(core_source)
-    # every required fragment is wrapped fail-closed (see wrap_shim_fragment): execsitecustomize
-    # would otherwise swallow a fragment's exception and the child would train unpatched (no
-    # seeding, no exact dataloader order, no lora+, no boundary resets) while looking healthy.
-    # the wandb link shim stays unwrapped: it swallows its own failures by design and a logging
-    # link must not be able to abort paid training.
-    required_fragments = [("sft-core", core_source)]
-    if gdn_reset_arch is not None:
-        required_fragments.append(("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
-    shim_markers = shim_marker_file(shim_dir)
-    # the workdir is wiped per attempt (_resolve_sft_options), so no stale marker can survive here.
-    shim_source = render_shim_marker_prologue(shim_markers) + "".join(
-        wrap_shim_fragment(name, source) for name, source in required_fragments
-    )
-    if "wandb" in loggers:
-        shim_source += render_wandb_link_shim()
-    with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(shim_source)
-    with open(custom_dataset_path, "w", encoding="utf-8") as file:
-        file.write(_render_sft_dataset_module())
 
     # the RESOLVED width, not the allocated card count: it is what becomes --nproc-per-node below,
     # so the guard compares the checkpoint against the topology this attempt really launches. sft
@@ -670,7 +693,7 @@ def _prepare_sft_child(
         world_size=world_size,
         micro_batch=micro_batch,
         shim_markers=shim_markers,
-        expected_shims=tuple(name for name, source in required_fragments if source),
+        expected_shims=expected_shims,
     )
 
 
