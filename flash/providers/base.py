@@ -6,8 +6,6 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from flash.core.catalog import samples_on_policy
-
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
@@ -331,6 +329,7 @@ def run_config_for_ranking(
     Ranking is per step, so run length is irrelevant. Import lazily because the cost model imports
     this module.
     """
+    from flash.core.catalog import samples_on_policy
     from flash.cost.types import RunConfig
 
     def knob(key):
@@ -362,8 +361,9 @@ def run_config_for_ranking(
         # under a different key: sft as `batch_size`, grpo/opd as `prompts_per_step` (the schema
         # rejects `batch_size` outright for them). Reading only the sft name left every authored
         # rollout batch as None here, so ranking priced the recipe default -- 64 against an
-        # authored 32 -- and could select a costlier shape than the run actually needs. Mirrors
-        # the same split in `flash.cost.spec.estimate_for_spec`.
+        # authored 32 -- and could select a costlier shape than the run actually needs.
+        # `flash.cost.spec.estimate_for_spec` splits the same way, with a third branch this has no
+        # input for: it prefers a measured sft workload profile, which ranking runs before.
         batch_size=(
             knob("prompts_per_step") if samples_on_policy(algorithm) else knob("batch_size")
         ),

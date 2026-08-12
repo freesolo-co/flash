@@ -183,15 +183,42 @@ def test_persisted_rollout_batch_survives_the_prompts_per_step_rename() -> None:
             }
         ).train
 
-    for algorithm in ("grpo", "opd"):
+    for algorithm, default in (
+        ("grpo", RECIPE.rl.prompts_per_step),
+        ("opd", RECIPE.opd.prompts_per_step),
+    ):
         legacy = _train(algorithm, {"batch_size": 32})
         assert legacy.prompts_per_step == 32, algorithm
-        # the value the broken read resumed on, asserted so the test fails loudly rather than
-        # coincidentally matching if a recipe default ever becomes 32.
-        assert legacy.prompts_per_step != RECIPE.rl.prompts_per_step or algorithm != "grpo"
+        # the value the broken read resumed on. per-algorithm, so the assertion cannot pass by
+        # short-circuiting on the other one -- and so it fails loudly rather than matching by
+        # coincidence if a recipe default ever becomes 32.
+        assert default != 32, algorithm
+        # the old key is MOVED, not copied: a spec carrying both names is rejected by the schema,
+        # which would break the resubmit that recovery and `flash runs get` perform, and would let
+        # `vram.py::_optimizer_batch_value` (which takes the larger of the two) size a card off the
+        # stale value that ranking ignores.
+        assert legacy.batch_size is None, algorithm
+        # so the migrated spec must survive a full re-serialize -> reparse round trip.
+        roundtrip = spec_from_dict(
+            _job_from_dict(
+                {
+                    "model": "Qwen/Qwen3.5-4B",
+                    "algorithm": algorithm,
+                    "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                    "train": {"epochs": 1, "group_size": 4, "batch_size": 32},
+                }
+            ).to_dict()
+        )
+        assert (roundtrip.train.prompts_per_step, roundtrip.train.batch_size) == (32, None), (
+            algorithm
+        )
         # the current spelling is untouched, and wins when a spec somehow carries both.
         assert _train(algorithm, {"prompts_per_step": 16}).prompts_per_step == 16
         assert _train(algorithm, {"batch_size": 32, "prompts_per_step": 16}).prompts_per_step == 16
+        # a non-positive legacy value is dropped rather than migrated: `minimum=1` would have
+        # rejected it at submission, so carrying it forward only fails later on a rented GPU.
+        for bad in (0, -5):
+            assert _train(algorithm, {"batch_size": bad}).prompts_per_step is None, (algorithm, bad)
 
     # sft is NOT migrated: there `batch_size` is a different quantity (examples per update, resolved
     # against a measured workload profile), so copying it into prompts_per_step would be wrong.
@@ -1334,6 +1361,115 @@ def test_stripping_an_auto_pin_keeps_the_preparation_digest_stable() -> None:
         at_create = _preparation_digest(public, worker, None)
         at_repersist = _preparation_digest(spec_from_dict(stored), worker, None)
         assert at_create == at_repersist
+
+
+def test_migrating_a_legacy_rollout_batch_keeps_its_preparation_digest_valid() -> None:
+    """Recovering a pre-rename snapshot must not fail integrity validation.
+
+    The digest hashes the bytes that were STORED, and those spelled the rollout batch
+    ``batch_size``. `from_dict` now moves it onto ``prompts_per_step``, so rehashing a legacy
+    snapshot with today's parse yields different bytes -- rejecting exactly the warm-start grpo/opd
+    runs this migration exists to rescue. Two stored shapes exist: 1.1.40 predates the field and
+    carried no such key, and 1.1.43+ stored an explicit null.
+
+    The restore must stay scoped to that population, so the tamper and modern cases below are the
+    controls: an assertion that only checked recovery would also pass if the digest stopped binding
+    the batch at all.
+    """
+    import flash.runner as runner
+
+    def _stored(*, absent: bool, batch: int = 32):
+        """A snapshot as the pre-rename build persisted it, with the digest hashed from ITS bytes."""
+        spec = replace(
+            JobSpec.from_dict(
+                {
+                    "model": "Qwen/Qwen3.5-4B",
+                    "algorithm": "grpo",
+                    "run_id": "legacy",
+                    "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                    "gpu": {"type": "H100", "count": 1},
+                    "train": {"epochs": 1, "group_size": 4, "batch_size": batch},
+                }
+            ),
+            model_revision="a" * 40,
+            model_revision_auto=True,  # one of the two triggers for the digest check
+        )
+        # the pre-rename parse: the old key retained, the new one unset.
+        legacy_spec = replace(
+            spec, train=replace(spec.train, batch_size=batch, prompts_per_step=None)
+        )
+        worker, public = legacy_spec.to_internal_dict(), legacy_spec.to_dict()
+        if absent:
+            worker["train"].pop("prompts_per_step", None)
+            public["train"].pop("prompts_per_step", None)
+        digest = _preparation_digest_for(legacy_spec, batch, absent)
+        return worker, public, digest
+
+    def _preparation_digest_for(spec, batch, absent):
+        return runner._preparation_digest(
+            spec, spec, None, legacy_rollout_batch=batch, legacy_rollout_batch_absent=absent
+        )
+
+    def _recover(worker, public, digest):
+        return runner.effective_spec_from_status(
+            runner.RunStatus(
+                state="running",
+                run_id="legacy",
+                spec=public,
+                effective_preparation={"worker_spec": worker, "preparation_digest": digest},
+            )
+        )
+
+    for absent in (False, True):
+        worker, public, digest = _stored(absent=absent)
+        recovered = _recover(worker, public, digest)
+        # recovered AND migrated: the batch survives under the name the workers now read.
+        assert (recovered.train.prompts_per_step, recovered.train.batch_size) == (32, None), absent
+
+        # control: the digest still binds the batch. without this, "recovery works" would also be
+        # satisfied by a restore that let any value through.
+        tampered_worker, tampered_public, _ = _stored(absent=absent)
+        tampered_worker["train"]["batch_size"] = 128
+        tampered_public["train"]["batch_size"] = 128
+        with pytest.raises(ValueError, match="failed integrity validation"):
+            _recover(tampered_worker, tampered_public, digest)
+
+    # control: a spec that authored the CURRENT name is not treated as legacy, so its digest keeps
+    # binding `prompts_per_step` normally.
+    modern = replace(
+        JobSpec.from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "grpo",
+                "run_id": "modern",
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "gpu": {"type": "H100", "count": 1},
+                "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 32},
+            }
+        ),
+        model_revision="a" * 40,
+        model_revision_auto=True,
+    )
+    assert runner._legacy_rollout_optimizer_batch(modern.to_internal_dict()) is None
+    worker, public = modern.to_internal_dict(), modern.to_dict()
+    digest = runner._preparation_digest(modern, modern, None)
+    worker["train"]["prompts_per_step"] = 128
+    public["train"]["prompts_per_step"] = 128
+    with pytest.raises(ValueError, match="failed integrity validation"):
+        _recover(worker, public, digest)
+
+    # sft authors `batch_size` under its CURRENT name, so it must never be read as legacy.
+    sft = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "sft",
+            "run_id": "sft",
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+            "gpu": {"type": "H100", "count": 1},
+            "train": {"epochs": 1, "batch_size": 4},
+        }
+    )
+    assert runner._legacy_rollout_optimizer_batch(sft.to_internal_dict()) is None
 
 
 def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> None:

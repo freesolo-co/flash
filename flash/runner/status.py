@@ -75,6 +75,11 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     raw_public = status.spec if isinstance(status.spec, dict) else {}
     legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
     legacy_public_alpha = runner._prepared_before_public_alpha(raw_public)
+    # the rollout optimizer batch was renamed, and `from_dict` moves it -- so a snapshot written
+    # under the old name has to be rehashed under the old name. Read from the WORKER payload: it is
+    # the authoritative half, and the public one is a stripped view of the same spec.
+    legacy_rollout_batch = runner._legacy_rollout_optimizer_batch(raw_worker)
+    legacy_rollout_batch_absent = "prompts_per_step" not in raw_worker.get("train", {})
     has_workload_profile = bool(
         worker_spec.workload_profile_kind
         or worker_spec.workload_profile_input_digest
@@ -112,6 +117,8 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=legacy_public_alpha,
+            legacy_rollout_batch=legacy_rollout_batch,
+            legacy_rollout_batch_absent=legacy_rollout_batch_absent,
         )
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
@@ -128,6 +135,8 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             legacy_keys=legacy_keys,
             legacy_public_keys=legacy_public_keys,
             legacy_public_alpha=legacy_public_alpha,
+            legacy_rollout_batch=legacy_rollout_batch,
+            legacy_rollout_batch_absent=legacy_rollout_batch_absent,
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:
