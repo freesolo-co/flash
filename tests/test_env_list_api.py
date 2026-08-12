@@ -20,12 +20,12 @@ def test_list_endpoint_returns_published_slugs(monkeypatch):
 
     def fake_list(*, key):
         seen["key"] = key
-        return ["acme/beta", "acme/my-env"]
+        return ["acme/project/beta", "acme/project/my-env"]
 
     monkeypatch.setattr(domain, "list_namespace_slugs", fake_list)
 
     assert routes.list_envs(key={"org_slug": "acme"}) == {
-        "environments": [{"id": "acme/beta"}, {"id": "acme/my-env"}]
+        "environments": [{"id": "acme/project/beta"}, {"id": "acme/project/my-env"}]
     }
     assert seen["key"]["org_slug"] == "acme"
 
@@ -49,11 +49,11 @@ def test_client_parses_ids_and_uses_list_bounds(monkeypatch):
 
     def fake_request(self, method, path, **kwargs):
         seen.update(method=method, path=path, **kwargs)
-        return {"environments": [{"id": " acme/my-env "}]}
+        return {"environments": [{"id": " acme/project/my-env "}]}
 
     monkeypatch.setattr(ApiClient, "_request", fake_request)
 
-    assert client.list_envs() == ["acme/my-env"]
+    assert client.list_envs() == ["acme/project/my-env"]
     assert seen == {
         "method": "GET",
         "path": "/v1/envs",
@@ -67,8 +67,8 @@ def test_client_parses_ids_and_uses_list_bounds(monkeypatch):
     "payload",
     [
         {},
-        {"environments": "acme/my-env"},
-        {"environments": [{"name": "acme/my-env"}]},
+        {"environments": "acme/project/my-env"},
+        {"environments": [{"name": "acme/project/my-env"}]},
         {"environments": [{"id": ""}]},
     ],
 )
@@ -80,7 +80,9 @@ def test_client_rejects_malformed_environment_lists(monkeypatch, payload):
         client.list_envs()
 
 
-@pytest.mark.parametrize("env_id", ["my-env", "acme/env/extra", "acme/../secrets", "acme/my env"])
+@pytest.mark.parametrize(
+    "env_id", ["my-env", "acme/project/env/extra", "acme/../secrets", "acme/project/my env"]
+)
 def test_client_rejects_noncanonical_environment_ids(monkeypatch, env_id):
     """A nonblank id that the managed parser would reject must not be advertised as usable.
 
@@ -101,10 +103,12 @@ def test_client_accepts_a_canonical_environment_id(monkeypatch):
     """The guard above must not reject the ids the hub actually publishes."""
     client = ApiClient(api_url="https://plane.example", api_key="key")
     monkeypatch.setattr(
-        ApiClient, "_request", lambda *_args, **_kwargs: {"environments": [{"id": "acme/my-env"}]}
+        ApiClient,
+        "_request",
+        lambda *_args, **_kwargs: {"environments": [{"id": "acme/project/my-env"}]},
     )
 
-    assert client.list_envs() == ["acme/my-env"]
+    assert client.list_envs() == ["acme/project/my-env"]
 
 
 def test_list_route_does_not_shadow_package_route():

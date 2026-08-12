@@ -556,7 +556,7 @@ def test_startup_rejects_an_artifact_namespace_that_cannot_form_a_repo_id(monkey
 
     from flash.runner import managed_hf_repo_for_environment
 
-    validate_repo_id(managed_hf_repo_for_environment("github:owner/envs@main:gsm8k"))
+    validate_repo_id(managed_hf_repo_for_environment("github:owner/project/envs@main:gsm8k"))
 
 
 def test_the_env_template_does_not_preset_the_hosted_serving_url() -> None:
@@ -872,8 +872,10 @@ def test_the_hub_slug_is_accepted_on_both_deployments(monkeypatch) -> None:
             monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
         else:
             monkeypatch.setenv(auth.STANDALONE_ENV, standalone_value)
-        spec = _deps._parse_spec({"spec": raw_spec(environment={"id": "owner/env"})}, run_id="r")
-        assert spec.environment.id == "owner/env"
+        spec = _deps._parse_spec(
+            {"spec": raw_spec(environment={"id": "owner/project/env"})}, run_id="r"
+        )
+        assert spec.environment.id == "owner/project/env"
 
 
 def test_a_missing_environment_id_keeps_the_schema_error_on_the_hosted_plane(monkeypatch) -> None:

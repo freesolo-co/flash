@@ -150,7 +150,7 @@ def _require_hosted_environment_form(env_raw: dict) -> None:
         status_code=400,
         detail=(
             f"[environment] id {env_id!r} is not a Freesolo environment id; the managed service "
-            'runs environments from its hub only, addressed as "namespace/name". Publish yours '
+            'runs environments from its hub only, addressed as "namespace/project/name". Publish yours '
             "with `flash env push --project <project-uuid> --name <name>` and use the returned id. "
             "Direct GitHub references are supported only on a self-hosted plane."
         ),

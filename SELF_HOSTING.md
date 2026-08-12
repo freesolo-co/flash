@@ -161,14 +161,14 @@ An environment is the Python package defining your task - dataset, rollout, rewa
 | --------------------------------------------- | ------------------------------------------------------------ |
 | `github:owner/repo@ref:path/to/env`           | that repo at that ref. **Use this when self-hosting.**       |
 | `https://github.com/owner/repo/tree/ref/path` | the same thing, in browser-URL form.                         |
-| `namespace/name`                              | Freesolo's managed hub (`freesolo-co/environment-hub`) only. |
+| `namespace/project/name`                      | Freesolo's managed hub (`freesolo-co/environment-hub`) only. |
 
-A bare `namespace/name` slug is **not** a generic shorthand - it always resolves against
+A bare `namespace/project/name` slug is **not** a generic shorthand - it always resolves against
 Freesolo's hub, so a self-hosted plane should use the explicit `github:` form. `ref` may be
 a branch, tag, or commit sha; pin a sha if you want runs to be reproducible.
 
 **The two GitHub forms are self-hosted-only.** Freesolo's managed service accepts
-`namespace/name` and nothing else: the hub is the only repo it can vouch for, being the one
+`namespace/project/name` and nothing else: the hub is the only repo it can vouch for, being the one
 `flash env push` writes to and the one whose packages carry a validated project association.
 Submitting a `github:` or browser-URL ref there is rejected at submit with a `400`. A
 standalone plane (`FLASH_STANDALONE=1`) accepts all three forms, which is what makes

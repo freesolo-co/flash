@@ -68,18 +68,18 @@ def test_is_retryable_git_publish_error_classifies_markers():
 
 
 def test_publish_slug_and_input_validation(monkeypatch):
-    # A namespaced name must be exactly two non-empty segments.
-    with pytest.raises(envs.EnvPublishError, match="namespace/name"):
-        envs.publish_slug_for_name("a/b/c", {"org_slug": "acme"})
-    with pytest.raises(envs.EnvPublishError, match="namespace/name"):
-        envs.publish_slug_for_name("acme/", {"org_slug": "acme"})
+    # A namespaced name must be exactly three non-empty segments.
+    with pytest.raises(envs.EnvPublishError, match="namespace/project/name"):
+        envs.publish_slug_for_name("a/b/c/d", {"org_slug": "acme"}, "proj")
+    with pytest.raises(envs.EnvPublishError, match="namespace/project/name"):
+        envs.publish_slug_for_name("acme/proj/", {"org_slug": "acme"}, "proj")
 
     # publish_package validates argument TYPES before touching storage.
     monkeypatch.setattr(envs, "_github_publish_once", lambda **_k: None)
     with pytest.raises(envs.EnvPublishError, match="env name must be a string"):
-        envs.publish_package(package_b64="x", name=123, key={})  # type: ignore[arg-type]
+        envs.publish_package(package_b64="x", name=123, key={}, project_slug="proj")  # type: ignore[arg-type]
     with pytest.raises(envs.EnvPublishError, match="base64 string"):
-        envs.publish_package(package_b64=123, name="e", key={})  # type: ignore[arg-type]
+        envs.publish_package(package_b64=123, name="e", key={}, project_slug="proj")  # type: ignore[arg-type]
 
     # canonical_env_id / _validate_slug reject a non-string id.
     with pytest.raises(envs.EnvPublishError, match="env id must be a string"):
@@ -217,7 +217,7 @@ def test_github_publish_does_not_retry_permanent_error(tmp_path, monkeypatch):
     )
 
     with pytest.raises(envs.EnvPublishError, match="authentication failed"):
-        envs._github_publish(tmp_path, name="e", key={"org_slug": "acme"})
+        envs._github_publish(tmp_path, name="e", key={"org_slug": "acme"}, project_slug="proj")
     assert calls["n"] == 1
 
 
@@ -229,11 +229,11 @@ def test_github_download_wrapper_uses_default_repo(monkeypatch):
         return b"package-bytes"
 
     monkeypatch.setattr(envs, "_github_download_once", fake_once)
-    assert envs._github_download("ns/env", token="tok") == b"package-bytes"
+    assert envs._github_download("ns/project/env", token="tok") == b"package-bytes"
     assert seen == {
         "repo": envs._DEFAULT_GITHUB_REPO,
         "token": "tok",
-        "publish_root": "ns/env",
+        "publish_root": "ns/project/env",
     }
 
 

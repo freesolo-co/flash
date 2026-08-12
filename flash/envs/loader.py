@@ -13,7 +13,6 @@ import gzip
 import hashlib
 import json
 import os
-import re
 import shutil
 import stat
 import sys
@@ -23,7 +22,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterator
-from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
@@ -43,6 +41,63 @@ from flash.envs.dataset_selection import (
     env_dataset_rows,
     select_dataset_source,
 )
+
+# the env-id grammar lives in its own module; the underscored names are re-exports because
+# tests and sibling modules have always reached them through loader.
+from flash.envs.identity import (
+    _DEFAULT_ENVIRONMENT_PATH as _DEFAULT_ENVIRONMENT_PATH,
+)
+from flash.envs.identity import (
+    _DEFAULT_GITHUB_REF as _DEFAULT_GITHUB_REF,
+)
+from flash.envs.identity import (
+    _DEFAULT_MANAGED_ENV_REPO as _DEFAULT_MANAGED_ENV_REPO,
+)
+from flash.envs.identity import (
+    _GITHUB_SAFE_PART_RE as _GITHUB_SAFE_PART_RE,
+)
+from flash.envs.identity import (
+    GitHubEnvironmentRef as GitHubEnvironmentRef,
+)
+from flash.envs.identity import (
+    GitHubRateLimitError as GitHubRateLimitError,
+)
+from flash.envs.identity import (
+    _is_safe_github_path_parts as _is_safe_github_path_parts,
+)
+from flash.envs.identity import (
+    _managed_environment_ref_error as _managed_environment_ref_error,
+)
+from flash.envs.identity import (
+    _normalize_env_path as _normalize_env_path,
+)
+from flash.envs.identity import (
+    _parse_github_environment_ref as _parse_github_environment_ref,
+)
+from flash.envs.identity import (
+    _parse_managed_environment_slug as _parse_managed_environment_slug,
+)
+from flash.envs.identity import (
+    _targets_managed_environment_repo as _targets_managed_environment_repo,
+)
+from flash.envs.identity import (
+    canonical_managed_environment_slug as canonical_managed_environment_slug,
+)
+from flash.envs.identity import (
+    is_commit_sha as is_commit_sha,
+)
+from flash.envs.identity import (
+    is_freesolo_environment_id as is_freesolo_environment_id,
+)
+from flash.envs.identity import (
+    is_github_environment_ref as is_github_environment_ref,
+)
+from flash.envs.identity import (
+    is_managed_environment_slug as is_managed_environment_slug,
+)
+from flash.envs.identity import (
+    managed_slug_to_github_ref as managed_slug_to_github_ref,
+)
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
     ARCHIVE_SCAN_MEMBER_LIMIT,
@@ -51,9 +106,6 @@ from flash.envs.package.limits import (
 )
 from flash.envs.package.unpack import extract_validated_archive_members
 
-_DEFAULT_GITHUB_REF = "main"
-_DEFAULT_ENVIRONMENT_PATH = "environment.py"
-_DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT_DIR_NAME = "env-cache"
 
 
@@ -102,198 +154,6 @@ _MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = ARCHIVE_MEMBER_LIMIT
 _MAX_ARCHIVE_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
-_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
-_GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-
-
-class GitHubRateLimitError(RuntimeError):
-    """Persistent GitHub rate-limit; worker handler stamps retriable=True for rescheduling."""
-
-
-@dataclass(frozen=True)
-class GitHubEnvironmentRef:
-    owner: str
-    repo: str
-    ref: str
-    path: str
-
-    @property
-    def repo_full_name(self) -> str:
-        return f"{self.owner}/{self.repo}"
-
-    def canonical(self) -> str:
-        return f"github:{self.repo_full_name}@{self.ref}:{self.path}"
-
-
-def is_github_environment_ref(value: str) -> bool:
-    return _parse_github_environment_ref(value) is not None
-
-
-def is_managed_environment_slug(value: str) -> bool:
-    return _parse_managed_environment_slug(value) is not None
-
-
-def is_freesolo_environment_id(value: str) -> bool:
-    return is_managed_environment_slug(value) or is_github_environment_ref(value)
-
-
-def managed_slug_to_github_ref(value: str) -> str:
-    parsed = _parse_managed_environment_slug(value)
-    if parsed is None:
-        raise ValueError(f"not a Freesolo environment slug: {value!r}")
-    namespace, name = parsed
-    return (
-        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
-        f"{namespace}/{name}/{_DEFAULT_ENVIRONMENT_PATH}"
-    )
-
-
-def canonical_managed_environment_slug(value: str) -> str | None:
-    if _parse_managed_environment_slug(value) is not None:
-        return value
-
-    parsed = _parse_github_environment_ref(value)
-    if parsed is None:
-        if _targets_managed_environment_repo(value):
-            raise ValueError(_managed_environment_ref_error())
-        return None
-    if parsed.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
-        return None
-
-    parts = parsed.path.split("/")
-    if (
-        parsed.ref != _DEFAULT_GITHUB_REF
-        or len(parts) != 3
-        or parts[2] != _DEFAULT_ENVIRONMENT_PATH
-        or not _is_safe_github_path_parts(tuple(parts[:2]))
-    ):
-        raise ValueError(_managed_environment_ref_error())
-    return "/".join(parts[:2])
-
-
-def _targets_managed_environment_repo(value: str) -> bool:
-    text = (value or "").strip()
-    if not text.startswith("github:"):
-        return False
-    repo_ref = text[len("github:") :].partition(":")[0]
-    repo = repo_ref.partition("@")[0]
-    return repo.lower() == _DEFAULT_MANAGED_ENV_REPO.lower()
-
-
-def _managed_environment_ref_error() -> str:
-    return (
-        "managed environment GitHub reference must be "
-        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
-        f"<namespace>/<name>/{_DEFAULT_ENVIRONMENT_PATH}"
-    )
-
-
-def _parse_managed_environment_slug(value: str) -> tuple[str, str] | None:
-    text = (value or "").strip()
-    if not text or ":" in text:
-        return None
-    parsed = urllib.parse.urlparse(text)
-    if parsed.scheme or parsed.netloc:
-        return None
-    parts = text.split("/")
-    if len(parts) != 2 or not _is_safe_github_path_parts(tuple(parts)):
-        return None
-    return parts[0], parts[1]
-
-
-def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
-    text = (value or "").strip()
-    if not text:
-        return None
-    if text.startswith("github:"):
-        body = text[len("github:") :]
-        repo_ref, sep, path = body.partition(":")
-        try:
-            path = _normalize_env_path(path)
-        except ValueError:
-            return None
-        if not sep:
-            path = _DEFAULT_ENVIRONMENT_PATH
-        repo_part, at, ref = repo_ref.partition("@")
-        if not at:
-            ref = _DEFAULT_GITHUB_REF
-        if not ref:
-            return None
-        if not _is_safe_github_path_parts((ref,)):
-            return None
-        owner_repo = repo_part.split("/")
-        if len(owner_repo) == 2 and _is_safe_github_path_parts(owner_repo):
-            return GitHubEnvironmentRef(owner_repo[0], owner_repo[1], ref, path)
-        return None
-
-    parsed = urllib.parse.urlparse(text)
-    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "github.com":
-        return None
-    parts = [urllib.parse.unquote(p) for p in parsed.path.strip("/").split("/") if p]
-    if len(parts) < 2:
-        return None
-    owner, repo = parts[0], parts[1]
-    repo = repo[:-4] if repo.endswith(".git") else repo
-    if not _is_safe_github_path_parts((owner, repo)):
-        return None
-    if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
-        ref = parts[3]
-        if not _is_safe_github_path_parts((ref,)):
-            return None
-        raw_path = "/".join(parts[4:])
-        try:
-            path = _normalize_env_path(raw_path)
-        except ValueError:
-            return None
-        if parts[2] == "tree" and raw_path and not path.endswith(".py"):
-            path = f"{path.rstrip('/')}/{_DEFAULT_ENVIRONMENT_PATH}"
-    elif len(parts) == 2:
-        ref = _DEFAULT_GITHUB_REF
-        path = _DEFAULT_ENVIRONMENT_PATH
-    else:
-        return None
-    return GitHubEnvironmentRef(owner, repo, ref, path)
-
-
-def _normalize_env_path(path: str | None) -> str:
-    if not path:
-        return _DEFAULT_ENVIRONMENT_PATH
-    raw = path.strip()
-    if not raw:
-        return _DEFAULT_ENVIRONMENT_PATH
-    raw = raw.replace("\\", "/")
-    if raw.startswith("/"):
-        raise ValueError(f"unsafe environment path: {path!r}")
-    parts = [part for part in raw.split("/") if part]
-    if not parts:
-        return _DEFAULT_ENVIRONMENT_PATH
-    if any(part == ".." or part == "." for part in parts):
-        raise ValueError(f"unsafe environment path: {path!r}")
-    return "/".join(parts)
-
-
-def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
-    if not parts:
-        return False
-    if any(part in {".", "..", ""} for part in parts):
-        return False
-    return all(_GITHUB_SAFE_PART_RE.fullmatch(part) for part in parts)
-
-
-def _github_token() -> str | None:
-    """The GitHub token, or ``None`` when unset OR blank.
-
-    Blank must collapse to ``None``, not fall through as a truthy string: a whitespace-only
-    GITHUB_TOKEN would otherwise build ``Authorization: Bearer <whitespace>``, and GitHub REJECTS a
-    malformed credential rather than treating the request as anonymous - so a public repo that
-    loads fine with no token at all would fail with one that is merely blank.
-    """
-    return (os.environ.get("GITHUB_TOKEN") or "").strip() or None
-
-
-def is_commit_sha(value: str) -> bool:
-    """True when value is a full 40-hex-char git commit id (an immutable ref)."""
-    return _COMMIT_SHA_RE.fullmatch(value) is not None
 
 
 def _resolve_ref_sha(
@@ -452,12 +312,18 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
 
 
 def _managed_hub_package_root(ref: GitHubEnvironmentRef) -> str:
+    """The directory holding ONE environment's package: ``<org>/<project>/<name>``.
+
+    All three segments, not two: the package root is what gets downloaded and copied into the
+    cache entry, and ``<org>/<project>`` is the project directory holding every environment
+    the project has published. Stopping at two would fetch all of them to import one.
+    """
     if ref.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
         return ""
     parts = [part for part in ref.path.split("/") if part]
-    if len(parts) < 2 or not _is_safe_github_path_parts(tuple(parts[:2])):
+    if len(parts) < 3 or not _is_safe_github_path_parts(tuple(parts[:3])):
         return ""
-    return "/".join(parts[:2])
+    return "/".join(parts[:3])
 
 
 def _github_contents_url(ref: GitHubEnvironmentRef, path: str) -> str:
@@ -476,6 +342,17 @@ def _github_tree_url(ref: GitHubEnvironmentRef, treeish: str, *, recursive: bool
     if recursive:
         url = f"{url}?recursive=1"
     return url
+
+
+def _github_token() -> str | None:
+    """The GitHub token, or ``None`` when unset OR blank.
+
+    Blank must collapse to ``None``, not fall through as a truthy string: a whitespace-only
+    GITHUB_TOKEN would otherwise build ``Authorization: Bearer <whitespace>``, and GitHub REJECTS a
+    malformed credential rather than treating the request as anonymous - so a public repo that
+    loads fine with no token at all would fail with one that is merely blank.
+    """
+    return (os.environ.get("GITHUB_TOKEN") or "").strip() or None
 
 
 def _github_headers(accept: str) -> dict[str, str]:
@@ -808,7 +685,7 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     package_root = _managed_hub_package_root(parsed)
     if parsed.repo_full_name.lower() == _DEFAULT_MANAGED_ENV_REPO.lower() and not package_root:
         raise ValueError(
-            "managed environment hub refs must include a namespace/name environment path"
+            "managed environment hub refs must include a namespace/project/name environment path"
         )
     cache_scope = "managed-hub" if package_root else "github"
     cache_key = hashlib.sha256(

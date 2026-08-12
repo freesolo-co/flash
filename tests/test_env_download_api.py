@@ -72,15 +72,15 @@ def test_download_env_package_endpoint_returns_package(api, monkeypatch):
 
     monkeypatch.setattr(envs_mod, "download_package", fake_download_package)
 
-    resp = api.get("/v1/envs/acme/my-env/package", headers=_bearer(_USER_TOKEN))
+    resp = api.get("/v1/envs/acme/checkout-bot/my-env/package", headers=_bearer(_USER_TOKEN))
 
     assert resp.status_code == 200, resp.text
     assert resp.content == b"package-bytes"
     assert resp.headers["content-type"] == "application/gzip"
-    assert seen["slug"] == "acme/my-env"
+    assert seen["slug"] == "acme/checkout-bot/my-env"
     assert seen["key"]["org_slug"] == "acme"
 
-    assert api.get("/v1/envs/acme/my-env/package").status_code in (401, 403)
+    assert api.get("/v1/envs/acme/checkout-bot/my-env/package").status_code in (401, 403)
 
 
 def test_download_env_package_endpoint_rejects_non_canonical_id(api, monkeypatch):
@@ -90,6 +90,6 @@ def test_download_env_package_endpoint_rejects_non_canonical_id(api, monkeypatch
         envs_mod, "download_package", lambda **_k: pytest.fail("storage must not be touched")
     )
 
-    resp = api.get("/v1/envs/Acme/My-Env/package", headers=_bearer(_USER_TOKEN))
+    resp = api.get("/v1/envs/Acme/Checkout-Bot/My-Env/package", headers=_bearer(_USER_TOKEN))
 
     assert resp.status_code == 400, resp.text
