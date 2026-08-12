@@ -12,6 +12,19 @@ from collections.abc import Callable
 from pathlib import Path
 
 
+def _text(path: Path) -> str:
+    """The file's text, or "" if it cannot be decoded as UTF-8.
+
+    This whole path only decides whether to PRINT an advisory, and setup leaves the retained files
+    untouched either way, so a file it cannot read is a file it has nothing to say about. Reading
+    strictly would let a valid PEP 263 latin-1 `environment.py` abort `env setup` outright.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
 def _warn_if_retained_starter_files_describe_another_plane(
     starter_files: tuple[Path, ...],
     *,
@@ -41,7 +54,7 @@ def _warn_if_retained_starter_files_describe_another_plane(
         path
         for path in starter_files
         if path.exists()
-        if any(marker in path.read_text(encoding="utf-8") for marker in wanted)
+        if any(marker in _text(path) for marker in wanted)
     ]
     if not mismatched:
         return
@@ -87,7 +100,9 @@ def _warn_if_environment_form_disagrees(
             continue
         try:
             raw = tomllib.loads(cfg.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as exc:
+        # UnicodeDecodeError too: it is not an OSError, so without it a non-UTF-8 config escapes
+        # as a traceback instead of the actionable message this branch exists to give.
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise ClientError(f"cannot read existing {cfg}: {exc}") from exc
         environment = raw.get("environment")
         environment_id = environment.get("id") if isinstance(environment, dict) else None

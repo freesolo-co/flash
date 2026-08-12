@@ -477,7 +477,7 @@ def _validate_existing_config_projects(project_id: str) -> None:
             continue
         try:
             raw = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise ClientError(f"cannot read existing {path}: {exc}") from exc
         try:
             existing = require_project_id(raw.get("project"))
@@ -503,7 +503,7 @@ def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
             continue
         try:
             raw = tomllib.loads(cfg.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise ClientError(f"cannot read existing {cfg}: {exc}") from exc
         found[cfg] = raw.get("thinking") is True
     if len(set(found.values())) > 1:
@@ -568,6 +568,19 @@ def _setup_interactive(args) -> bool:
     return render.can_prompt()
 
 
+def _marker_text(path: Path) -> str:
+    """The file's text for a marker probe, or "" if it cannot be decoded as UTF-8.
+
+    Probing for a marker is a best-effort read of a file the operator owns: `# -*- coding:
+    latin-1 -*-` is valid Python, and a file we cannot decode simply does not carry the marker.
+    Reading strictly here aborted `env setup` before it did anything.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
 def _resolve_turn_mode(args, starter_env: Path, dataset: Path) -> tuple[bool, bool]:
     """resolve the turn-mode reconciliation phase."""
     # An existing environment.py is the authoritative signal for which turn mode this
@@ -578,11 +591,11 @@ def _resolve_turn_mode(args, starter_env: Path, dataset: Path) -> tuple[bool, bo
     anchor = "environment.py"
     starter_env_exists = starter_env.exists()
     if starter_env_exists:
-        existing_multi = "EnvironmentMultiTurn" in starter_env.read_text(encoding="utf-8")
+        existing_multi = "EnvironmentMultiTurn" in _marker_text(starter_env)
     elif dataset.exists():
         # No env.py to anchor on, but the starter multi-turn dataset carries a
         # distinctive prompt; use it so we don't drop a single-turn env beside it.
-        existing_multi = "secret whole number" in dataset.read_text(encoding="utf-8")
+        existing_multi = "secret whole number" in _marker_text(dataset)
         anchor = "dataset/train.jsonl"
 
     # Resolve the turn mode. An existing scaffold wins (warn if a flag disagrees); otherwise an
@@ -888,10 +901,10 @@ def cmd_env_setup(args) -> int:
     if can_publish:
         print(f"next: flash env push --project {project_id} --name my-env .")
     else:
-        # hedged like every other self-hosted hint here: only a standalone plane accepts a direct
-        # `github:` id, and the CLI cannot read server-side FLASH_STANDALONE to tell which this is.
+        # `env push` targets the managed hub, which a self-hosted plane cannot write to. Same
+        # wording as the styled path in `render.env_setup`, which is what a TTY actually shows.
         print(
-            "next: push this folder to a git repo, then set [environment] id to its github: form "
-            "(FLASH_STANDALONE=1 planes); on an identity-backed plane use the managed hub id instead"
+            "next: push this folder to a git repo, then set [environment] id = "
+            "github:OWNER/REPO@main:environment.py"
         )
     return 0

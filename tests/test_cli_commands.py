@@ -716,6 +716,63 @@ def test_env_setup_clean_scaffold_has_no_environment_form_warning(
     assert capsys.readouterr().err == ""
 
 
+def test_env_setup_survives_a_retained_starter_it_cannot_decode(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A non-UTF-8 retained starter must not abort setup.
+
+    `# -*- coding: latin-1 -*-` is valid Python, and this path only decides whether to PRINT an
+    advisory -- the files are left untouched either way. Reading them strictly turned an operator's
+    perfectly runnable environment.py into a UnicodeDecodeError traceback out of `env setup`.
+    """
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+
+    _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    capsys.readouterr()
+    (tmp_path / "environment.py").write_bytes(b"# -*- coding: latin-1 -*-\n# caf\xe9\n")
+
+    # not through `_scaffold`: its read-back of every written file is itself strict UTF-8, so it
+    # would raise on the byte this test just wrote and hide whether the CLI survived.
+    monkeypatch.setattr(env_setup, "_require_setup_project", lambda _args: _SCAFFOLD_PROJECT)
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://plane.example.test", "key")
+    )
+    monkeypatch.chdir(tmp_path)
+    rc = env_setup.cmd_env_setup(
+        Namespace(
+            project=_SCAFFOLD_PROJECT,
+            yes=True,
+            turn_mode=None,
+            reasoning=None,
+            from_traces=None,
+            trace=None,
+            force=False,
+        )
+    )
+
+    assert rc == 0  # completed rather than raising UnicodeDecodeError
+    # the undecodable file carries no marker, so it is simply not named in the advisory
+    assert "environment.py" not in capsys.readouterr().err
+
+
+def test_env_setup_reports_an_undecodable_config_as_an_error(monkeypatch, tmp_path) -> None:
+    """A config that cannot be decoded is a hard error, unlike a starter .py.
+
+    The distinction is deliberate: `[environment] id` is read to classify the plane, so an
+    unreadable config cannot be skipped. UnicodeDecodeError is not an OSError, so it needs naming
+    explicitly or it escapes as a traceback instead of this message.
+    """
+    from flash.client import ClientError
+
+    _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
+    (tmp_path / "configs" / "sft.toml").write_bytes(b'[environment]\nid = "caf\xe9"\n')
+
+    with pytest.raises(ClientError, match="cannot read existing"):
+        _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+
 def test_training_guide_caveats_the_managed_hub_commands(monkeypatch, tmp_path) -> None:
     """The guide says `env push` is unavailable, then later prescribes it without caveat.
 
