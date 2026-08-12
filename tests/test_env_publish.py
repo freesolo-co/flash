@@ -640,6 +640,60 @@ def test_require_environment_project_repairs_missing_row_without_error_detail(mo
     assert records[0]["project_id"] == "11111111-1111-4111-8111-111111111111"
 
 
+def test_repairing_another_projects_environment_never_launches_the_run(monkeypatch):
+    """A repair may not move an environment between projects.
+
+    The repair path checks only the ORG segment locally, so `acme/proj-a/env` submitted under
+    project B reaches `record_published_environment` carrying B's id. The recording endpoint is
+    what rejects the mismatched pair (`backend/routes/flash.py` validates the slug's project
+    segment against the supplied project), and a rejection there returns False rather than
+    raising. So the load-bearing behavior is local: a non-True answer must abort. If it were
+    ever read as success, the caller would launch a run against an environment it does not own.
+    """
+    import urllib.error
+
+    from fastapi import HTTPException
+
+    from flash.server.domain import environment_registry
+
+    error = urllib.error.HTTPError(
+        "https://backend.test/api/flash/environments/validate/internal",
+        404,
+        "not found",
+        {},
+        io.BytesIO(b'{"detail":"flash environment not found"}'),
+    )
+    recorded: list[dict] = []
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(envs, "download_package", lambda **_kwargs: b"package")
+    # the org segment matches, so the local guard passes and the backend is the one that says no.
+    monkeypatch.setattr(
+        environment_registry,
+        "record_published_environment",
+        lambda **kwargs: recorded.append(kwargs) or False,
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        environment_registry.require_environment_project(
+            slug="acme/proj-a/example",
+            project_id="22222222-2222-4222-8222-222222222222",
+            key={"org_id": "org-A", "org_slug": "acme"},
+            repair_missing=True,
+        )
+
+    # 502, not a silent return: the run must not proceed on an unrepaired association.
+    assert excinfo.value.status_code == 502
+    assert excinfo.value.detail == environment_registry._REPAIR_FAILURE_DETAIL
+    # the mismatched pair was sent for validation rather than resolved locally to something else.
+    assert recorded[0]["slug"] == "acme/proj-a/example"
+    assert recorded[0]["project_id"] == "22222222-2222-4222-8222-222222222222"
+
+
 def test_require_environment_project_missing_package_does_not_backfill(monkeypatch):
     import urllib.error
 
