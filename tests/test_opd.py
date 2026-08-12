@@ -1180,7 +1180,7 @@ def test_opd_oversized_reject_names_the_knobs_to_shrink(monkeypatch):
     train = {
         "max_context_tokens": 4096,
         "max_completion_tokens": 2048,
-        "batch_size": 8,
+        "prompts_per_step": 8,
         "group_size": 4,
     }
     monkeypatch.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 2000)
@@ -1189,7 +1189,10 @@ def test_opd_oversized_reject_names_the_knobs_to_shrink(monkeypatch):
     msg = str(exc.value)
     assert "resident-only" in msg
     assert "group_size" in msg
-    assert "batch_size" in msg
+    # the remedy must name the key opd ACCEPTS: batch_size is rejected at parse time, so advising
+    # it sent a user whose run did not fit straight into a config error.
+    assert "prompts_per_step" in msg
+    assert "[train].batch_size" not in msg
     assert "max_completion_tokens" in msg
 
 
@@ -1399,7 +1402,7 @@ def test_opd_spec_json_round_trip():
             "train": {
                 "epochs": 25,
                 "max_examples": 8,
-                "batch_size": 8,
+                "prompts_per_step": 8,
             },
         },
         run_id="x",

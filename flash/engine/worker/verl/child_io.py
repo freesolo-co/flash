@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 import json
 import math
+import os
 import re
 import textwrap
 
@@ -396,6 +397,96 @@ if _flash_gdn_loaded is not None:
 else:
     _flash_gdn_sys.meta_path.insert(0, _FlashGdnFinder())
 '''
+
+
+# --------------------------- fail-closed fragment wrapping (sft + grpo sitecustomize) ---------
+# cpython's site.execsitecustomize catches every Exception raised while sitecustomize imports,
+# prints a two-line note, and starts the interpreter anyway, so a failing fragment silently
+# disables itself AND every fragment concatenated after it, and the child trains unpatched.
+# wrapping gives every required fragment two guarantees: an exception hard-exits the child with
+# this code (os._exit cannot be swallowed by execsitecustomize), and successful application
+# appends the fragment's name to a marker file the parent verifies before trusting the run.
+SHIM_FRAGMENT_FAILED_EXIT_CODE = 97
+SHIM_MARKER_FILENAME = "applied_shims.txt"
+
+
+def shim_marker_file(shim_dir: str) -> str:
+    """the marker file the wrapped fragments in ``shim_dir``'s sitecustomize append to."""
+    return os.path.join(shim_dir, SHIM_MARKER_FILENAME)
+
+
+def render_shim_marker_prologue(marker_file: str) -> str:
+    """sitecustomize prologue defining the recorder every wrapped fragment reports through."""
+    return f"""
+# --- flash: record each applied runtime patch (see child_io.wrap_shim_fragment) ---
+_FLASH_SHIM_MARKER_FILE = {marker_file!r}
+
+
+def _flash_record_applied_shim(name):
+    # append-mode: torchrun ranks and ray actors import this same sitecustomize concurrently,
+    # and short O_APPEND writes keep each line intact. the parent reads the file as a set.
+    with open(_FLASH_SHIM_MARKER_FILE, "a") as _flash_shim_handle:
+        _flash_shim_handle.write(name + "\\n")
+"""
+
+
+def wrap_shim_fragment(name: str, source: str) -> str:
+    """wrap one required sitecustomize fragment so it fails closed and proves it applied.
+
+    "" stays "": a feature that is off has nothing to prove. requires the prologue above earlier
+    in the same sitecustomize. optional fragments (tf32, the wandb link) stay unwrapped, since they
+    swallow their own failures by design and must never be able to kill a paid run.
+    """
+    if not source:
+        return ""
+    return f"""
+# --- flash required fragment: {name} (fails closed; see child_io.wrap_shim_fragment) ---
+try:
+{textwrap.indent(source, "    ")}
+    _flash_record_applied_shim({name!r})
+except BaseException:
+    import os as _flash_shim_os
+    import sys as _flash_shim_sys
+    import traceback as _flash_shim_traceback
+
+    _flash_shim_traceback.print_exc()
+    print(
+        "[flash-verl] required shim fragment {name} failed to apply; "
+        "exiting {SHIM_FRAGMENT_FAILED_EXIT_CODE} rather than training unpatched",
+        file=_flash_shim_sys.stderr,
+        flush=True,
+    )
+    _flash_shim_sys.stderr.flush()
+    _flash_shim_os._exit({SHIM_FRAGMENT_FAILED_EXIT_CODE})
+"""
+
+
+def read_applied_shim_markers(marker_file: str) -> set[str]:
+    """the fragment names the child recorded as applied; empty when it recorded none."""
+    try:
+        with open(marker_file, encoding="utf-8") as handle:
+            return {line.strip() for line in handle if line.strip()}
+    except OSError:
+        return set()
+
+
+def verify_applied_shim_markers(marker_file: str, expected) -> None:
+    """raise unless every expected fragment proved it applied in the child.
+
+    the wrapped fragments hard-exit the child on failure, so the only way a marker goes missing
+    is the sitecustomize never running at all (a shadowing sitecustomize on a foreign
+    FLASH_VERL_PYTHON, or a lost PYTHONPATH entry). that child is training with NO flash patch
+    (seeding, kl anchoring, save gating, boundary resets), so the attempt must fail. permanent
+    rather than retriable by design: the same interpreter reproduces the same skip on retry.
+    """
+    missing = sorted(set(expected) - read_applied_shim_markers(marker_file))
+    if missing:
+        raise RuntimeError(
+            f"the verl child never proved these required runtime patches applied: {missing}. "
+            "its sitecustomize did not run (a shadowing sitecustomize or a dropped PYTHONPATH "
+            "entry on a foreign FLASH_VERL_PYTHON can cause this); refusing to train unpatched. "
+            "this is permanent for this interpreter, not a retriable infra fault."
+        )
 
 
 def parse_wandb_link(line: str) -> dict | None:
