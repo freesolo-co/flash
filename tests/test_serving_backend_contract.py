@@ -2311,13 +2311,18 @@ def test_a_load_that_loses_its_claim_mid_download_undoes_itself(client, monkeypa
     assert mine not in instance._loaded
 
 
-def test_a_superseded_load_does_not_evict_the_adapter_that_took_its_id(client, monkeypatch):
-    """Undoing a superseded load must never kick the claim's new owner off the GPU.
+def test_a_superseded_load_leaves_no_orphan_when_a_peer_took_its_id(client, monkeypatch):
+    """Undoing a superseded load must not leave a LoRA resident that nothing can find.
 
-    `remove_lora` addresses the int id, not the adapter. Once a collider has taken the claim, the
-    same call that undoes this load evicts the WINNER -- the outcome `unregister` refuses eviction
-    to avoid. The superseded load reports the failure either way; the difference is whether a live
-    adapter loses its weights with a `ready` record still pointing at it.
+    An earlier version skipped the eviction whenever a peer held the claim, to avoid kicking the
+    winner off the GPU. That traded one fault for a worse one: the LoRA this container had just
+    loaded stayed resident with no `_int_ids` entry, and the collision sweep only consults
+    `_int_ids` -- so the winner's own load could not find the orphan and its `add_lora` failed on
+    this replica. Neither ordering is fixable here, because `_locks` is keyed by ADAPTER id while
+    the contested resource is the INT id, so two colliding adapters never serialize.
+
+    Evicting is the recoverable side: the durable claim is atomic, the winner still owns the id,
+    and its next load re-adds the adapter. An orphan has no path back.
     """
     lora = types.ModuleType("vllm.lora.request")
     lora.LoRARequest = lambda *args, **kwargs: object()
@@ -2354,9 +2359,12 @@ def test_a_superseded_load_does_not_evict_the_adapter_that_took_its_id(client, m
     with pytest.raises(RuntimeError, match="changed hands"):
         _run_awaitable(engine_class._lora_request(instance, {"adapter_id": mine}))
 
-    assert removed == [], (
-        "undoing a superseded load evicted the int id a peer now owns, so the winning adapter is "
-        "off the gpu while its record still says ready"
+    assert removed == [int_id], (
+        "the superseded load left its lora resident, and with no _int_ids entry the winner's own "
+        "load cannot find the orphan -- its add_lora then fails on this replica"
+    )
+    assert int_id not in instance._int_ids, (
+        "the undo left an _int_ids entry pointing at the superseded adapter"
     )
     assert mine not in instance._loaded
     assert module.adapter_records[module._lora_id_key(int_id)] == winner, (
@@ -2440,3 +2448,82 @@ def test_a_redeployed_revision_keeps_its_downloaded_adapter(client, monkeypatch,
         "cleanup deleted the weights of a revision that had been redeployed, so a ready record "
         "now points at files that are gone"
     )
+
+
+def test_undeploy_redisables_a_revision_that_was_re_registered_mid_pass(client):
+    """A member re-registered after being visited must still end disabled.
+
+    The lock's lease does not renew, so a long undeploy can hand the lock to a concurrent
+    registration. Re-registering an EXISTING revision resets it to `registered` without adding a
+    new member id, so a loop that skipped already-visited members would never look at it again --
+    its settle turns it back to `ready` and DELETE answers 200 for a run that is still directly
+    callable by that revision's immutable id.
+    """
+    module = client.app.state.generated_module
+    _register_and_ready(client)
+
+    original_read = module._run_members
+    calls = {"n": 0}
+
+    async def _revives_the_same_member(run_id):
+        # `_run_members` is called twice BEFORE the loop (the repair probe and the membership read)
+        # and then once at the end of each pass, so the revive has to wait for the call that
+        # follows the first pass. At that point the revision has been disabled, and a concurrent
+        # re-registration of that same immutable id brings it back `ready`. The membership does NOT
+        # grow -- re-registering an existing revision adds no new member id -- so only a
+        # status-based convergence check can notice.
+        calls["n"] += 1
+        if calls["n"] == 3:
+            record = dict(module.adapter_records[module._record_key(REVISION)])
+            record["status"] = "ready"
+            record["metadata"] = {**(record.get("metadata") or {}), "lifecycle_state": "ready"}
+            module.adapter_records[module._record_key(REVISION)] = record
+        return await original_read(run_id)
+
+    module._run_members = _revives_the_same_member
+    try:
+        response = client.delete(f"/adapters/{RUN_ID}")
+    finally:
+        module._run_members = original_read
+
+    assert response.status_code == 200, response.text
+    final = module.adapter_records[module._record_key(REVISION)]
+    assert final["status"] == "disabled", (
+        "a revision re-registered after its pass stayed ready, so undeploy returned success for a "
+        "run that is still callable by that revision's immutable id"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "literal"),
+    [
+        ("temperature", "1e400"),
+        ("temperature", "NaN"),
+        ("top_p", "NaN"),
+        ("top_p", "Infinity"),
+    ],
+)
+def test_a_non_finite_sampling_value_is_rejected(client, field, literal):
+    """inf and NaN must not reach the GPU as sampling parameters.
+
+    json accepts `1e400` and the bare literals `Infinity` and `NaN`. The first two parse to inf,
+    which passes `temperature >= 0` because temperature has no upper bound; NaN defeats every
+    ordered comparison at once, so `nan <= 0.0` and `nan > 1.0` are both False and it passes even a
+    two-sided bound. Both then reach vLLM as sampling nobody asked for.
+    """
+    _register_and_ready(client)
+    response = client.post(
+        "/v1/chat/completions",
+        # Raw body, not `json=`: the whole point is a literal python's json parser turns into inf
+        # or nan, and `json.dumps` cannot emit `1e400` or a bare `NaN` through a float round-trip.
+        content=(
+            f'{{"model": "{RUN_ID}", "messages": [{{"role": "user", "content": "hi"}}], '
+            f'"{field}": {literal}}}'
+        ),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 400, (
+        f"{field}={literal} was accepted with {response.status_code}, so a non-finite sampling "
+        f"value reaches the gpu"
+    )
+    assert "finite" in response.text

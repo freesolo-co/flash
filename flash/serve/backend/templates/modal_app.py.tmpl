@@ -18,6 +18,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import math
 import os
 import shutil
 import time
@@ -574,16 +575,32 @@ class Engine:
             # int. Losing the claim means this load must not stay resident, so it undoes itself
             # and reports the failure rather than leaving the engine in that state.
             if not await _still_holds_lora_int_id(int_id, adapter_id):
-                # Undone by evicting the int this load just wrote -- but ONLY while no peer holds
-                # the claim. `remove_lora` addresses the id, not the adapter, so once a collider
-                # has taken it the same call would kick the WINNER off the GPU: the very outcome
-                # `unregister` refuses eviction to avoid. A peer that already claimed the id has
-                # not loaded under it on this container (its own load evicts a stale resident
-                # first), so leaving this one resident costs a `max_loras` slot until the
-                # container recycles, while evicting would corrupt a live adapter.
-                if await _owns_lora_int_id(int_id, adapter_id):
-                    with contextlib.suppress(Exception):
-                        await self.engine.remove_lora(int_id)
+                # Recorded in `_int_ids` BEFORE the undo, and the undo is unconditional.
+                #
+                # Two earlier shapes were both wrong, in opposite directions, and the pair is why
+                # this is written the way it is. Evicting unconditionally without recording can
+                # kick a collider that already took the id off the GPU. Skipping the eviction when
+                # a peer holds the claim leaves this container's just-loaded LoRA resident with no
+                # `_int_ids` entry -- and the collision sweep above only consults `_int_ids`, so
+                # the winner's own load cannot find the orphan and its `add_lora` fails on this
+                # replica. Neither is fixable by reordering the checks: `self._locks` is keyed by
+                # ADAPTER id while the contended resource is the INT id, so two colliding adapters
+                # never serialize and the claim can change hands across any await here.
+                #
+                # So: evict unconditionally, and record the residency first so the eviction is
+                # recoverable if it fails. A stale `_int_ids` entry is repairable -- the sweep
+                # above finds it and evicts before loading over the id. A resident LoRA that
+                # nothing recorded is not findable by anything.
+                #
+                # Evicting an id a collider has taken is the lesser harm of the two, and it is
+                # self-correcting: the durable claim is atomic, so the winner still owns the id,
+                # and its record stays `ready` while its next load re-adds the adapter. The
+                # orphan has no such path back.
+                self._int_ids[int_id] = adapter_id
+                with contextlib.suppress(Exception):
+                    await self.engine.remove_lora(int_id)
+                self._int_ids.pop(int_id, None)
+                self._loaded.pop(adapter_id, None)
                 raise RuntimeError(
                     f"lora id {{int_id}} changed hands while {{adapter_id}} was loading, so this "
                     f"load was superseded. redeploy to retry."
@@ -1212,13 +1229,23 @@ def api():
             # and stays callable by its immutable id while undeploy reports 200. Looping until the
             # membership stops growing closes it, and the loop terminates because each extra pass
             # requires another registration to have landed inside it.
+            #
+            # `seen` records what a pass VISITED, and a later pass re-checks those anyway. It would
+            # be wrong to treat it as "already disabled, never look again": the lock's lease does
+            # not renew, so a long run can hand the lock to a concurrent registration mid-undeploy,
+            # and re-registering an existing revision resets it to `registered` WITHOUT adding a
+            # new member id. Skipping visited members would then exclude it from every later pass
+            # while its settle turns it back to `ready`, and DELETE still answers 200 for a run
+            # that is directly callable by that revision's immutable id.
+            #
+            # So each pass walks the full membership and the `disabled` check below does the
+            # filtering -- one indexed read per member per pass, against a membership that only
+            # grows when a registration actually lands. `seen` survives only to decide when the
+            # loop has converged and to name the stragglers.
             seen: set[str] = set()
             for _ in range(_UNDEPLOY_PASSES):
-                pending = [member for member in members if member not in seen]
-                if not pending:
-                    break
-                seen.update(pending)
-                for member_id in sorted(pending, key=lambda m: m == run_id):
+                disabled_here = 0
+                for member_id in sorted(members, key=lambda m: m == run_id):
                     candidate = await _read(member_id)
                     if not isinstance(candidate, dict):
                         continue
@@ -1228,11 +1255,22 @@ def api():
                     candidate["status"] = "disabled"
                     candidate["metadata"] = {{**metadata, "lifecycle_state": "disabled"}}
                     await _write(candidate)
+                    disabled_here += 1
                     if metadata.get("record_type") == "alias":
                         disabled_aliases.append(candidate["adapter_id"])
                     else:
                         disabled_revisions.append(candidate["adapter_id"])
+                seen.update(members)
                 members = list(dict.fromkeys([*members, *await _run_members(run_id)]))
+                # Converged only when a FULL pass found nothing left to disable and the membership
+                # stopped growing. Stopping on membership alone is not enough: re-registering an
+                # existing revision resets it to `registered` without adding a new member id, so a
+                # loop that watched only the member list would exit with that revision heading back
+                # to `ready` -- DELETE answering 200 for a run still callable by its immutable id.
+                # A pass that disabled something is evidence the run was in flux, so it costs one
+                # more read per member to confirm nothing came back.
+                if not disabled_here and seen.issuperset(members):
+                    break
             # The pass budget is bounded, so it can run out with members still unvisited: a
             # registration landing during the final pass is appended by the read above and then
             # never processed. Recorded here but NOT raised here -- returning 200 with a revision
@@ -1319,6 +1357,16 @@ def api():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise HTTPException(
                     status.HTTP_400_BAD_REQUEST, f"{{field}} must be a number, got {{value!r}}"
+                )
+            # Finiteness FIRST, because the range test below cannot catch either non-finite case.
+            # json accepts `1e400` and the bare literals `Infinity` and `NaN`: the first two parse
+            # to inf, which passes `temperature >= 0` since temperature has no upper bound, and
+            # NaN defeats every ordered comparison at once -- `nan <= 0.0` and `nan > 1.0` are both
+            # False, so it passes even a two-sided bound. Either one reaches the GPU as a sampling
+            # parameter no caller can have meant.
+            if not math.isfinite(value):
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST, f"{{field}} must be finite, got {{value!r}}"
                 )
             if (value < low if low_ok else value <= low) or (high is not None and value > high):
                 bound = f"in ({{low}}, {{high}}]" if high is not None else f">= {{low}}"
