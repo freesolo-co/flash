@@ -77,19 +77,22 @@ def _drive_episode(client, target: str, environment, case: EvalCase, args) -> di
             break
 
     # The loop exits before the inter-turn env_reply, leaving the last model turn unapplied. A
-    # stateful env would then score a transcript missing the last thing the model did, so give it
-    # that turn before scoring; only the inter-turn glue is skipped, since no further model turn
-    # is conditioned on the reply.
+    # stateful env would then score a transcript missing the last thing the model did: `env_reply`
+    # is what runs `step_episode`, so board state, metadata and `final_response_text` all lag one
+    # action behind. Apply it before scoring. Only the inter-turn glue is skipped, since no further
+    # model turn is conditioned on the reply.
     #
-    # But NOT at the turn cap. Both trainers check termination before requesting a reply and skip
-    # it there (opd/bridge.py and rl/multi_turn.py), so stepping once more would score a state the
-    # trained rollout never produced -- an env whose step mutates game state, metadata, or
-    # final_response_text would be graded on a move training never made. `rollout_done` cannot
-    # answer this on its own: it counts `state["turn"]`, which only `env_reply` increments, so
-    # after the final model turn it is still one short of the cap. The local turn count is the
-    # only thing that knows the cap was reached.
-    at_turn_cap = turns >= hard_cap
-    if env_step_pending and not at_turn_cap and not environment.rollout_done(state, hard_cap):
+    # This DOES run at the turn cap, matching training. `rl/multi_turn.py` gates its reply solely on
+    # `rollout_done`, which counts `state["turn"]` -- incremented only by `env_reply`, never by
+    # `record_model_turn`. So after the capped model turn the counter is still one short, the check
+    # passes, and RL steps the env on that turn. `opd/bridge.py` skips only the reply that would
+    # glue on a next-turn prompt, which is the same thing skipped here by exiting the loop.
+    #
+    # An earlier revision suppressed this at the cap. That was wrong twice over: it dropped the
+    # last action's side effects from the scored state, and it made the branch unreachable outright
+    # -- `env_step_pending` survives only the line-70 break, whose condition is exactly what the
+    # extra guard then excluded.
+    if env_step_pending:
         environment.env_reply(state["messages"], state)
     return state
 
