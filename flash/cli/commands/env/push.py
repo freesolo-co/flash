@@ -370,15 +370,20 @@ def _env_name_error(raw: str) -> str:
     name required" sends the user looking for a missing flag they actually passed.
     """
     text = str(raw or "").strip()
+    if not text:
+        return "env name required: pass `--name <name>`"
+    parts = [part.strip() for part in text.split("/")]
+    # a correctly-shaped id that still failed normalized on its NAME segment, not its shape.
+    # Blaming the missing project here would tell the user to add one they already passed.
+    if len(parts) == 3 and all(parts):
+        return f"env name invalid: {parts[2]!r} has no usable characters"
     if "/" in text:
         return (
             f"env name invalid: {text!r} is not `<namespace>/<project>/<name>`. "
             "environment names are unique per project, so a qualified id needs the project "
             "segment; or pass a bare `--name <name>` with `--project <project-uuid>`"
         )
-    if text:
-        return f"env name invalid: {text!r} has no usable characters"
-    return "env name required: pass `--name <name>`"
+    return f"env name invalid: {text!r} has no usable characters"
 
 
 def _with_syspath_bootstrap(env_source: str) -> str:

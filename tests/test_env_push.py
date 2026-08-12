@@ -930,6 +930,22 @@ def test_push_names_the_missing_project_segment_for_a_legacy_id(tmp_path, capsys
     assert "env name required" not in err
 
 
+def test_push_blames_the_name_segment_not_the_project_when_the_shape_is_right(tmp_path, capsys):
+    """A three-segment id that fails normalization failed on its NAME, not its shape.
+
+    Telling the user to add a project segment they already passed sends them to fix the one
+    part of the id that is correct.
+    """
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+
+    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file), name="acme/proj/---")) == 1
+
+    err = capsys.readouterr().err
+    assert "no usable characters" in err
+    assert "<namespace>/<project>/<name>" not in err
+
+
 def test_push_still_reports_a_genuinely_absent_name(tmp_path, capsys):
     """No `--name` at all keeps the flag-shaped message, which is the right one there."""
     env_file = tmp_path / "environment.py"
