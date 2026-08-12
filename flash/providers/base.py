@@ -555,18 +555,24 @@ def smallest_fitting_gpu_count(
     return min(fitting) if fitting else None
 
 
-def cheapest_gpu(min_vram_gb: int, *, gpu_count: int = 1, cost_key=None) -> str:
+def cheapest_gpu(
+    min_vram_gb: int, *, gpu_count: int = 1, cost_key=None, executed_width=None
+) -> str:
     """Return the cheapest fitting validated GPU class for the card ceiling.
 
-    Size against the rentable multi-card shape so ``--gpus`` is not rejected as single-card. A
-    ``cost_key`` ranks job cost; without one, rank hourly rate.
+    Size against the rentable multi-card shape so ``--gpus`` is not rejected as single-card, but
+    credit only ``executed_width`` when the run launches fewer ranks than it rents. A ``cost_key``
+    ranks job cost; without one, rank hourly rate.
     """
     # the allocator never proposes a wider combination, so sizing against one would admit a spec
     # here only for submit to reject it -- the same defect this parameter exists to fix, inverted.
     # size against the largest count providers actually RENT (powers of two): a ceiling of 3 buys
     # 2 cards at submit, so sizing on 3 would admit a shape that never gets provisioned.
     cards = largest_rentable_count(gpu_count)
-    pool = [g for g in _eligible_gpu_infos() if combined_vram_gb(g.vram_gb, cards) >= min_vram_gb]
+    launched = executed_width(cards) if executed_width else cards
+    pool = [
+        g for g in _eligible_gpu_infos() if combined_vram_gb(g.vram_gb, launched) >= min_vram_gb
+    ]
     if not pool:
         shape = f" even as a {cards}-card combination" if cards > 1 else ""
         raise UnsupportedGpuError(f"no validated GPU class has >= {min_vram_gb} GB VRAM{shape}")
@@ -591,7 +597,7 @@ def provisional_gpu_count(
     gpu_count: int | None = None,
 ) -> int:
     """Resolve an authored ceiling or the smallest geometry-safe auto-sized count."""
-    from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb
+    from flash.providers.allocator import _executed_width, geometry_safe_gpu_cap, required_vram_gb
 
     ceiling = MAX_COMBINATION_CARDS if gpu_count is None else gpu_count
     geometry_revision = (
@@ -607,7 +613,22 @@ def provisional_gpu_count(
         thinking=thinking,
         model_revision=model_revision,
     )
-    return smallest_fitting_gpu_count(need, max_gpu_count=safe_ceiling) or safe_ceiling
+    # parse has no workload profile yet, so retained rows are deliberately unmeasured. the shared
+    # allocator rule treats that as no row narrowing while still bounding sft by its known batch.
+    executed_width = _executed_width(algorithm, train, None)
+    fitting_count = smallest_fitting_gpu_count(
+        need,
+        max_gpu_count=safe_ceiling,
+        executed_width=executed_width,
+    )
+    if fitting_count is not None:
+        return fitting_count
+    # the caller still needs a shape to preview for its rejection. use the smallest rental that
+    # reaches the widest executable rank count, rather than idle cards that add no capacity.
+    return min(
+        rentable_gpu_counts(safe_ceiling),
+        key=lambda count: (-executed_width(count), count),
+    )
 
 
 def provisional_gpu(
@@ -638,7 +659,7 @@ def provisional_gpu(
     if authored_gpu_ceiling is None and gpu_count is not None:
         authored_gpu_ceiling = gpu_count
     from flash.engine.plan.vram import model_required_vram_gb
-    from flash.providers.allocator import geometry_safe_gpu_cap, vram_headroom
+    from flash.providers.allocator import _executed_width, geometry_safe_gpu_cap, vram_headroom
 
     min_vram = model_required_vram_gb(
         model_id,
@@ -663,6 +684,9 @@ def provisional_gpu(
     auto_cap = geometry_safe_gpu_cap(
         model_id, MAX_COMBINATION_CARDS, model_revision=geometry_revision
     )
+    # no profile exists at parse time, so rows stay unmeasured while the known sft batch still bounds
+    # the ranks that can join. this is the same rule allocation applies once a profile is available.
+    executed_width = _executed_width(algorithm, train, None)
     try:
         # same job-cost basis the submit-time allocator ranks on, so the class previewed here is
         # the class that actually gets provisioned; falls back to $/hr for an unpriceable run.
@@ -672,6 +696,7 @@ def provisional_gpu(
             cost_key=_run_cost_key(
                 model_id, algorithm, train=train, thinking=thinking, model_revision=model_revision
             ),
+            executed_width=executed_width,
         )
     except UnsupportedGpuError as exc:
         # deferred: fit_errors imports from here, so a module-level import would be circular.
@@ -684,6 +709,7 @@ def provisional_gpu(
                 requested_gpu_count=authored_gpu_ceiling,
                 effective_gpu_count=effective_count,
                 max_gpu_count=auto_cap,
+                executed_width=executed_width,
             )
         ) from exc
 
@@ -792,6 +818,9 @@ class Candidate:
     # cards in this candidate combination; hourly_usd and vram_gb stay PER-CARD so existing
     # single-gpu consumers are unchanged. total cost = gpu_count * hourly_usd.
     gpu_count: int = 1
+    # ranks that join the run after allocation; none preserves all-rented-card behavior for candidates
+    # constructed by providers or tests before the allocator stamps the run-specific width.
+    executed_gpu_count: int | None = None
 
     @property
     def total_hourly_usd(self) -> float:

@@ -719,7 +719,7 @@ def _resolve_evaluation_environment(args, spec, is_managed_environment_slug):
         _err(
             f"env eval failed: run {args.target} trains on {environment_reference}, which is not a "
             f"published environment. publish it with `{CLI_NAME} env push` and train a run against "
-            "the resulting namespace/name slug"
+            "the resulting namespace/project/name slug"
         )
         return environment_reference, _err("overall: FAIL")
     return environment_reference, None
@@ -741,7 +741,7 @@ def _prepare_evaluation_workdir(
     try:
         # download once through the control plane, the only credential boundary users have.
         # one archive pins moving environment-hub@main content for both environment and grader.
-        # load from its absolute extracted path so a matching local `namespace/name` checkout
+        # load from its absolute extracted path so a matching local `namespace/project/name` checkout
         # cannot override the published environment.
         package = client.download_env_package(environment_reference)
         entrypoint = (

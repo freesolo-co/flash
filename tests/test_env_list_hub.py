@@ -37,17 +37,17 @@ def test_lists_only_environment_directories_in_two_tree_reads(monkeypatch):
         {
             "main": _tree(_directory("acme", "sha-acme"), _directory("rival", "sha-rival")),
             "sha-acme": _tree(
-                _directory("my-env", "sha-env"),
-                _blob("my-env/environment.py"),
+                _directory("project", "sha-project"),
+                _blob("project/my-env/environment.py"),
                 _directory("notes", "sha-notes"),
                 _blob("notes/readme.md"),
-                _blob("nested/deeper/environment.py"),
+                _blob("nested/deeper/too-deep/environment.py"),
             ),
         },
         calls,
     )
 
-    assert loader.list_managed_namespace_slugs("acme") == ["acme/my-env"]
+    assert loader.list_managed_namespace_slugs("acme") == ["acme/project/my-env"]
     assert len(calls) == 2
     assert calls[1][0].endswith("?recursive=1")
     assert all(call[1] == {"timeout": 20.0, "max_rate_limit_retries": 1} for call in calls)
@@ -72,7 +72,7 @@ def test_truncated_namespace_tree_fails_instead_of_under_reporting(monkeypatch):
         monkeypatch,
         {
             "main": _tree(_directory("acme", "sha-acme")),
-            "sha-acme": _tree(_blob("my-env/environment.py"), truncated=True),
+            "sha-acme": _tree(_blob("project/my-env/environment.py"), truncated=True),
         },
     )
 
@@ -85,14 +85,14 @@ def test_listing_uses_tree_api_and_never_clones(monkeypatch):
         monkeypatch,
         {
             "main": _tree(_directory("acme", "sha-acme")),
-            "sha-acme": _tree(_blob("my-env/environment.py")),
+            "sha-acme": _tree(_blob("project/my-env/environment.py")),
         },
     )
     monkeypatch.setattr(
         domain, "_run_git", lambda *_args, **_kwargs: pytest.fail("listing must not clone")
     )
 
-    assert loader.list_managed_namespace_slugs("acme") == ["acme/my-env"]
+    assert loader.list_managed_namespace_slugs("acme") == ["acme/project/my-env"]
 
 
 def _user_key() -> dict:
@@ -105,10 +105,10 @@ def test_domain_derives_namespace_from_authenticated_key(monkeypatch):
     monkeypatch.setattr(
         loader,
         "list_managed_namespace_slugs",
-        lambda namespace: seen.append(namespace) or [f"{namespace}/my-env"],
+        lambda namespace: seen.append(namespace) or [f"{namespace}/project/my-env"],
     )
 
-    assert domain.list_namespace_slugs(key=_user_key()) == ["acme/my-env"]
+    assert domain.list_namespace_slugs(key=_user_key()) == ["acme/project/my-env"]
     assert seen == ["acme"]
 
 

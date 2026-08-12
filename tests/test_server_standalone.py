@@ -556,7 +556,7 @@ def test_startup_rejects_an_artifact_namespace_that_cannot_form_a_repo_id(monkey
 
     from flash.runner import managed_hf_repo_for_environment
 
-    validate_repo_id(managed_hf_repo_for_environment("github:owner/envs@main:gsm8k"))
+    validate_repo_id(managed_hf_repo_for_environment("github:owner/project/envs@main:gsm8k"))
 
 
 def test_the_env_template_does_not_preset_the_hosted_serving_url() -> None:
@@ -779,7 +779,7 @@ def _environment_for(standalone_value: str | None) -> dict:
     with the deployment or it trips the environment gate before reaching what it means to assert.
     """
     if standalone_value is None:
-        return {"id": "owner/env"}
+        return {"id": "owner/project/env"}
     return {"id": "github:owner/repo@main:env/environment.py"}
 
 
@@ -889,17 +889,19 @@ def test_the_hub_slug_is_accepted_on_the_managed_plane(monkeypatch) -> None:
     from tests._helpers.specs import raw_spec
 
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
-    spec = _deps._parse_spec({"spec": raw_spec(environment={"id": "owner/env"})}, run_id="r")
-    assert spec.environment.id == "owner/env"
+    spec = _deps._parse_spec(
+        {"spec": raw_spec(environment={"id": "owner/project/env"})}, run_id="r"
+    )
+    assert spec.environment.id == "owner/project/env"
 
 
 # every spelling that `canonical_managed_environment_slug` maps onto the private hub. a self-hosted
 # plane can read none of them, so admitting any one is the same defect wearing a different syntax.
 _MANAGED_HUB_FORMS: tuple[str, ...] = (
-    "owner/env",
-    "github:freesolo-co/environment-hub@main:owner/env/environment.py",
-    "github:FREESOLO-CO/Environment-Hub@main:owner/env/environment.py",
-    "https://github.com/freesolo-co/environment-hub/tree/main/owner/env",
+    "owner/project/env",
+    "github:freesolo-co/environment-hub@main:owner/project/env/environment.py",
+    "github:FREESOLO-CO/Environment-Hub@main:owner/project/env/environment.py",
+    "https://github.com/freesolo-co/environment-hub/tree/main/owner/project/env",
 )
 
 
@@ -942,7 +944,7 @@ def test_a_self_hosted_plane_refuses_a_malformed_ref_into_the_hub(monkeypatch) -
     from tests._helpers.specs import raw_spec
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
-    env_id = "github:freesolo-co/environment-hub@main:only-one-segment/environment.py"
+    env_id = "github:freesolo-co/environment-hub@main:too-few-segments/environment.py"
     with pytest.raises(HTTPException) as ei:
         _deps._parse_spec({"spec": raw_spec(environment={"id": env_id})}, run_id="r")
     assert ei.value.status_code == 400

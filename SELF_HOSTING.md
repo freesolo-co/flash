@@ -161,28 +161,29 @@ An environment is the Python package defining your task - dataset, rollout, rewa
 | --------------------------------------------- | ------------------------------------------------------------- |
 | `github:owner/repo@ref:path/to/env`           | that repo at that ref. **Use this when self-hosting.**        |
 | `https://github.com/owner/repo/tree/ref/path` | the same thing, in browser-URL form.                          |
-| `namespace/name`                              | Freesolo's managed hub only - **rejected when self-hosting.** |
+| `namespace/project/name`                      | Freesolo's managed hub only - **rejected when self-hosting.** |
 
-A bare `namespace/name` slug is **not** a generic shorthand - it always resolves against
-`freesolo-co/environment-hub`, which is private. `ref` may be a branch, tag, or commit sha;
-pin a sha if you want runs to be reproducible.
+A bare `namespace/project/name` slug is **not** a generic shorthand - it always resolves
+against `freesolo-co/environment-hub`, which is private. `ref` may be a branch, tag, or
+commit sha; pin a sha if you want runs to be reproducible.
 
 **Each plane accepts only the form it can actually fetch, and the two do not overlap.**
-Freesolo's managed service accepts `namespace/name` and nothing else: the hub is the only
-repo it can vouch for, being the one `flash env push` writes to and the one whose packages
-carry a validated project association. Submitting a `github:` or browser-URL ref there is
-rejected at submit with a `400`.
+Freesolo's managed service accepts `namespace/project/name` and nothing else: the hub is the
+only repo it can vouch for, being the one `flash env push` writes to and the one whose
+packages carry a validated project association. Submitting a `github:` or browser-URL ref
+there is rejected at submit with a `400`.
 
 A standalone plane (`FLASH_STANDALONE=1`) is the exact inverse: the two GitHub forms are its
-only environment source, and a `namespace/name` slug is **rejected at submit with a `400`**.
-Every slug maps onto Freesolo's private hub, so such an id names the one repository your
-plane certainly cannot read - left to run it would fail on a rented GPU with a bare GitHub
-`404`, after the run had already cost you money. The refusal names the repo and the form to
-use instead. This applies to every spelling of the hub, including an explicit
+only environment source, and a `namespace/project/name` slug is **rejected at submit with a
+`400`**. Every slug maps onto Freesolo's private hub, so such an id names the one repository
+your plane certainly cannot read - left to run it would fail on a rented GPU with a bare
+GitHub `404`, after the run had already cost you money. The refusal names the repo and the
+form to use instead. This applies to every spelling of the hub, including an explicit
 `github:freesolo-co/environment-hub@main:...` ref and its browser-URL form.
 
-The check reads `FLASH_STANDALONE` on the server, so it is the plane you submit to, not the
-CLI you submit from, that decides.
+A local directory is not a supported source either (see below). The check reads
+`FLASH_STANDALONE` on the server, so it is the plane you submit to, not the CLI you submit
+from, that decides.
 
 Public repos work without credentials, subject to GitHub's unauthenticated rate limit. Set
 `GITHUB_TOKEN` for private repos. `flash env push` publishes to the managed hub and is not
@@ -233,7 +234,7 @@ With it set:
   directory that does not exist here.
 - **Environment mirror validation is skipped.** The environment package itself is still
   resolved and authorized normally.
-- **Managed hub environment ids are refused at submit.** Every `namespace/name` slug resolves
+- **Managed hub environment ids are refused at submit.** Every `namespace/project/name` slug resolves
   to Freesolo's private hub, which this plane cannot read, so it is rejected with a `400`
   naming the repo instead of failing later on a rented GPU. Use the `github:` form
   ([environments](#environments)).

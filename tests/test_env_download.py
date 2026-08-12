@@ -26,8 +26,11 @@ def test_download_package_user_can_download_own_namespace(monkeypatch):
 
     monkeypatch.setattr(envs, "_github_download", fake_download)
 
-    assert envs.download_package(slug="acme/my-env", key={"org_slug": "acme"}) == b"package"
-    assert seen == {"slug": "acme/my-env", "token": "ghp-test"}
+    assert (
+        envs.download_package(slug="acme/checkout-bot/my-env", key={"org_slug": "acme"})
+        == b"package"
+    )
+    assert seen == {"slug": "acme/checkout-bot/my-env", "token": "ghp-test"}
 
 
 def test_download_package_rejects_other_users_namespace(monkeypatch):
@@ -37,7 +40,7 @@ def test_download_package_rejects_other_users_namespace(monkeypatch):
     )
 
     with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.download_package(slug="someone-else/env", key={"org_slug": "acme"})
+        envs.download_package(slug="someone-else/project/env", key={"org_slug": "acme"})
 
     assert excinfo.value.status == 403
 
@@ -51,15 +54,18 @@ def test_download_package_internal_key_can_download_any_namespace(monkeypatch):
         lambda slug, *, token: seen.update(slug=slug, token=token) or b"package",
     )
 
-    assert envs.download_package(slug="acme/paper-foo", key={"auth_kind": "internal"}) == b"package"
-    assert seen == {"slug": "acme/paper-foo", "token": "ghp-test"}
+    assert (
+        envs.download_package(slug="acme/project/paper-foo", key={"auth_kind": "internal"})
+        == b"package"
+    )
+    assert seen == {"slug": "acme/project/paper-foo", "token": "ghp-test"}
 
 
 def test_download_package_requires_control_plane_github_credential(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
     with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.download_package(slug="acme/x", key={"auth_kind": "internal"})
+        envs.download_package(slug="acme/project/x", key={"auth_kind": "internal"})
 
     assert excinfo.value.status == 503
     assert "control plane" in str(excinfo.value)
@@ -72,7 +78,7 @@ def test_github_download_once_packages_slug_directory(tmp_path, monkeypatch):
     _git(seed, "init", "--initial-branch", "main")
     _git(seed, "config", "user.name", "test")
     _git(seed, "config", "user.email", "test@example.com")
-    env_dir = seed / "ns" / "env"
+    env_dir = seed / "ns" / "project" / "env"
     env_dir.mkdir(parents=True)
     (env_dir / "environment.py").write_text("def load_environment(**k): pass\n")
     (env_dir / "datasets").mkdir()
@@ -88,7 +94,9 @@ def test_github_download_once_packages_slug_directory(tmp_path, monkeypatch):
 
     monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
 
-    package = envs._github_download_once(repo="ignored/repo", token="tok", publish_root="ns/env")
+    package = envs._github_download_once(
+        repo="ignored/repo", token="tok", publish_root="ns/project/env"
+    )
 
     with tarfile.open(fileobj=io.BytesIO(package), mode="r:gz") as tar:
         names = sorted(member.name for member in tar.getmembers() if member.isfile())
