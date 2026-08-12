@@ -442,7 +442,7 @@ def _require_accessible_project(project_id: object) -> str:
     api_url, api_key = load_credentials()
     if not api_key:
         raise ClientError(
-            "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
+            f"not logged in — run `{CLI_NAME} login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
     # pass `api_url` so self-hosted planes get shape validation without sending
     # `FREESOLO_INTERNAL_KEY` to api.freesolo.co (SELF_HOSTING.md,
@@ -472,7 +472,7 @@ def _upload_report(
     _, api_key = load_credentials()
     if not api_key:
         return _err(
-            "cannot upload results: not logged in — run `flash login` with your freesolo "
+            f"cannot upload results: not logged in — run `{CLI_NAME} login` with your freesolo "
             "API key (or set FREESOLO_API_KEY)"
         )
 

@@ -36,6 +36,13 @@ export RUNPOD_API_KEY=...              # or LAMBDA_API_KEY, or VAST_API_KEY
 flash-server --host 0.0.0.0 --port 8080
 ```
 
+The `server` extra pulls in `runpod-flash`, which declares its own `flash` console script.
+Whichever distribution installs last wins, so on a plane host the bare `flash` command may launch
+RunPod's CLI instead of this one - it exits 0 and does nothing, which is easy to miss. Use
+**`flash-cli`**: the same CLI under a name nothing else claims. Check with `flash --help`; if it
+does not mention `train`, use `flash-cli` (or `python -m flash.cli`) wherever this guide says
+`flash`. A client-only machine that never installs the `server` extra is unaffected.
+
 `flash-server` speaks plain HTTP. For anything but loopback, put a TLS-terminating reverse proxy
 (nginx, Caddy, a cloud load balancer) in front of it and point DNS for your hostname at the proxy -
 the plane itself never terminates TLS. On the same machine, skip the proxy and use
@@ -50,6 +57,8 @@ flash login --api-url https://your-plane.example --api-key "$FREESOLO_INTERNAL_K
 # flash login --api-url http://127.0.0.1:8080 --api-key "$FREESOLO_INTERNAL_KEY"
 flash train run.toml
 ```
+
+(On a host that has the `server` extra installed, run these as `flash-cli` - see the note above.)
 
 Because `--api-url` points at your own plane, `flash login` stores the key and checks it
 against that plane. It does **not** send it to `api.freesolo.co` for verification: your

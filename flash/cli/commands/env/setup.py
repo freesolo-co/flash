@@ -7,6 +7,7 @@ import sys
 import tomllib
 from pathlib import Path
 
+from flash._internal.channel import CLI_NAME
 from flash.cli.commands import traces
 from flash.cli.commands.env.retained import (
     _warn_if_environment_form_disagrees,
@@ -355,7 +356,8 @@ def _require_setup_project(args) -> str:
     api_url, api_key = load_credentials()
     if not api_key:
         raise ClientError(
-            "not logged in. Run `flash login` before `flash env setup` so the project can be validated"
+            f"not logged in. Run `{CLI_NAME} login` before `{CLI_NAME} env setup` "
+            "so the project can be validated"
         )
 
     supplied = str(getattr(args, "project", "") or "").strip()
@@ -378,7 +380,8 @@ def _require_setup_project(args) -> str:
     options = traces.project_options(projects)
     if not options:
         raise ClientError(
-            "no Freesolo projects are available for this organization; create one with `flash projects create NAME`"
+            f"no Freesolo projects are available for this organization; create one with "
+            f"`{CLI_NAME} projects create NAME`"
         )
     selected = render.select_required("Choose the Freesolo project for this environment", options)
     return resolve_project_id(selected, api_key, api_url)
@@ -453,12 +456,12 @@ def _environment_comment(project_id: str, *, can_publish: bool, extra: str = "")
     if can_publish:
         head = (
             "# Environment: upload this project folder with\n"
-            f"# `flash env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
+            f"# `{CLI_NAME} env push --project {project_id} --name my-env .`, then paste the returned id below.\n"
         )
         placeholder = 'id = ""\n\n'
     else:
         head = (
-            "# Environment: this plane is self-hosted, so `flash env push` does not apply -- it\n"
+            f"# Environment: this plane is self-hosted, so `{CLI_NAME} env push` does not apply -- it\n"
             "# publishes to Freesolo's managed environment hub. Name a git repo instead:\n"
             "#   github:OWNER/REPO@REF:PATH   (PATH is the file, or the directory holding environment.py)\n"
             "# Push this folder to a repo your plane can read, then fill in the id below.\n"
@@ -519,7 +522,7 @@ def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
         raise ClientError(
             f"existing configs disagree about reasoning: {on} set `thinking = true`, "
             f"{off} do not. Delete {', '.join(str(cfg) for cfg in found)} and re-run "
-            "`flash env setup` with --reasoning or --no-reasoning to scaffold them together."
+            f"`{CLI_NAME} env setup` with --reasoning or --no-reasoning to scaffold them together."
         )
     return next(iter(found.values()), None)
 
@@ -917,7 +920,7 @@ def cmd_env_setup(args) -> int:
         return 0
     print(f"ensured {', '.join(scaffolded)}")
     if can_publish:
-        print(f"next: flash env push --project {project_id} --name my-env .")
+        print(f"next: {CLI_NAME} env push --project {project_id} --name my-env .")
     else:
         # `env push` targets the managed hub, which a self-hosted plane cannot write to. Same
         # wording as the styled path in `render.env_setup`, which is what a TTY actually shows --

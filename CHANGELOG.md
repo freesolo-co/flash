@@ -11,7 +11,24 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ## Unreleased
 
+### Added
+
+- A `flash-cli` console script, the same entry point as `flash` under a name nothing else
+  claims. The `server` and `dev` extras install `runpod-flash`, which declares its own `flash`
+  script; whichever distribution is installed last wins, so on a control-plane host
+  `pip install 'freesolo-flash[server]'` could leave `flash` running RunPod's CLI, which exits 0
+  and does nothing. `flash` is unchanged and remains correct on a base (client-only) install.
+
 ### Fixed
+
+- Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
+  usage strings, `next:` hints) now name the executable actually invoked rather than always
+  `flash`. On a host where `runpod-flash` owns the `flash` script, the printed
+  `flash runs cancel <run-id>` exited 0 without cancelling, leaving a run billing while the
+  operator believed they had stopped it. Reached through the `python -m flash.cli` escape hatch,
+  the printed command now names the interpreter that is actually running, rather than a bare
+  `python` that is absent on a python3-only host and may resolve to a different environment
+  inside a virtualenv.
 
 - `flash env setup` scaffolded hosted-only environment instructions on every plane. A
   self-hosted plane cannot publish to Freesolo's managed environment hub, so the generated
