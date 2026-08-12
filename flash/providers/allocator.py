@@ -68,22 +68,26 @@ def profile_required_vram_gb() -> int:
     return 1
 
 
-def _profile_gpu_ceiling(max_gpu_count: int | None) -> int | None:
-    """Card ceiling for a profile allocation: the author's ceiling, else one card.
+def _profile_gpu_ceiling(max_gpu_count: int | None) -> int:
+    """Card ceiling for a profile allocation: the author's ceiling, else the platform maximum.
 
-    One card is what this job USES, not a shape it requires. Providers sell a card count as a
-    distinct product rather than a divisible pool -- vast filters offers on ``num_gpus`` equality
-    and lambda names the count in the instance type -- so a class whose 4-card shape is live while
-    its 1-card shape is sold out yields NO candidate for a hard ceiling of one. A pinned run in that
-    state is allocatable while its mandatory profile is not, which reinstates the exact deadlock
-    inheriting the pin exists to break (see ``preparation._prepared_sft_profile_job``).
+    One card is what this job USES, not a shape it requires, and a ceiling is not a request: every
+    count up to it is QUERIED and the cheapest live one wins. So the ceiling's only job here is to
+    keep shapes reachable.
 
-    So one card is the default rather than a constraint: an authored ceiling passes through, letting
-    the profile reach the same widths its own run may rent. Ranking is unchanged, so the cheapest
-    fitting shape still wins -- and a 1 GB job fits every one of them, which is why widening the
-    ceiling never widens the bill on a provider that has the narrow shape.
+    Capping it at one made the narrow shape the only one ever asked for. Providers sell a card count
+    as a distinct product rather than a divisible pool -- ``rentable_gpu_counts`` walks the counts
+    and vast searches each as its own market, so a count with no live host simply returns nothing --
+    and a class whose 4-card shape is live while its 1-card shape is sold out therefore yielded NO
+    candidate at all. The run itself auto-sizes against ``MAX_COMBINATION_CARDS`` and stays
+    allocatable, so its mandatory profile became the thing that blocked it: the exact deadlock
+    inheriting the run's pins exists to break (see ``preparation._prepared_sft_profile_job``).
+
+    Widening cannot widen the bill, which is what makes this safe rather than a tradeoff. Ranking is
+    on ``total_hourly_usd``, which bills every card, so a live single card always outranks the same
+    class in fours; the multi-card shape wins only when it is the one that exists.
     """
-    return 1 if max_gpu_count is None else max_gpu_count
+    return MAX_COMBINATION_CARDS if max_gpu_count is None else max_gpu_count
 
 
 def _profile_cost_ranker():

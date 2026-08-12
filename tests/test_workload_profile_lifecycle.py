@@ -481,23 +481,35 @@ def test_a_pinned_profile_does_not_forge_a_one_card_ceiling(tmp_path, monkeypatc
     assert worker.authored_gpu_count is None
 
 
-def test_an_unpinned_profile_still_allocates_a_single_card(monkeypatch) -> None:
-    """The paired control: the default with nothing authored is still exactly one card.
+def _profile_allocation(monkeypatch, *, live_counts: set[int]):
+    """Allocate an unpinned profile against a market that only rents ``live_counts``.
 
-    Without this, widening every profile to a multi-card shape would satisfy the test above just as
-    well, and the cheap single card the unpinned common case depends on could regress unnoticed.
+    Models what a provider actually does with the ceiling: ``rentable_gpu_counts`` walks every count
+    up to it and each is its own market search, so a count with no live host contributes nothing.
+    A mock that answers every count with an offer cannot see a ceiling that never asks.
     """
     from flash.providers import allocator
-    from flash.providers.base import Candidate
+    from flash.providers.base import Candidate, rentable_gpu_counts
 
-    seen: list[int] = []
+    queried: list[int] = []
 
     def fake_live_candidates(_need, constraints):
-        seen.append(int(getattr(constraints, "max_gpu_count", 1) or 1))
-        return [
-            Candidate(provider="runpod", gpu="RTX 4090", hourly_usd=0.69, vram_gb=24),
-            Candidate(provider="runpod", gpu="H100", hourly_usd=3.29, vram_gb=80, gpu_count=2),
-        ]
+        offers = []
+        for count in rentable_gpu_counts(constraints.max_gpu_count):
+            queried.append(count)
+            if count in live_counts:
+                offers.append(
+                    Candidate(
+                        provider="runpod",
+                        gpu="H100",
+                        hourly_usd=3.29,
+                        vram_gb=80,
+                        gpu_count=count,
+                    )
+                )
+        if 1 in live_counts:
+            offers.append(Candidate(provider="runpod", gpu="RTX 4090", hourly_usd=0.69, vram_gb=24))
+        return offers
 
     provider = type(
         "P",
@@ -510,9 +522,38 @@ def test_an_unpinned_profile_still_allocates_a_single_card(monkeypatch) -> None:
     alloc = allocator.allocate(
         "Qwen/Qwen3.5-0.8B", "sft", train=_spec().train, workload_profile=True
     )
+    return alloc, queried
 
-    assert seen == [1]  # an unpinned profile never even queries a wider shape
+
+def test_an_unpinned_profile_still_lands_on_the_cheap_single_card(monkeypatch) -> None:
+    """The paired control: when the narrow shape is live, the profile still rents exactly one card.
+
+    Deliberately NOT asserted as "never queries a wider shape". A ceiling is not a request -- every
+    count under it is searched and the cheapest live one wins -- so asking about 8 costs nothing.
+    Pinning the query list would re-encode the very cap that made a multi-card-only class
+    unallocatable, and would fail this suite for a change that widens reach without widening spend.
+
+    What must hold is the spend: ranking is on ``total_hourly_usd``, which bills every card, so a
+    live single card outranks the same class in fours even at a ceiling of eight.
+    """
+    alloc, queried = _profile_allocation(monkeypatch, live_counts={1, 2, 4})
+
+    assert alloc.gpu == "RTX 4090"  # the cheapest live shape, not the widest reachable one
     assert alloc.gpu_count == 1
+    assert max(queried) > 1  # ...chosen against wider shapes rather than by never asking
+
+
+def test_an_unpinned_profile_reaches_a_class_sold_only_in_multi_card_shapes(monkeypatch) -> None:
+    """A ceiling of one made the profile unallocatable wherever the 1-card shape was sold out.
+
+    The run it gates auto-sizes against ``MAX_COMBINATION_CARDS`` and stays allocatable, so capping
+    its mandatory profile at one card meant the profile alone blocked the whole sft path -- with no
+    override, since the ceiling is platform-derived rather than authored.
+    """
+    alloc, queried = _profile_allocation(monkeypatch, live_counts={4})
+
+    assert alloc.gpu_count == 4  # the only shape this class is currently sold in
+    assert 4 in queried
 
 
 def test_profile_provenance_is_covered_by_preparation_digest(tmp_path, monkeypatch) -> None:
