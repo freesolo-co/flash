@@ -83,10 +83,11 @@ def _could_be_done_line(line: bytes) -> bool:
 
 class _StringFragments:
     def __init__(self, value: str) -> None:
-        self.parts = [value]
+        self.parts = [value] if value else []
 
     def append(self, value: str) -> None:
-        self.parts.append(value)
+        if value:
+            self.parts.append(value)
 
     def text(self) -> str:
         return "".join(self.parts)
@@ -164,6 +165,8 @@ def _merge_fragment_dict(target: dict[str, Any], fragment: dict[str, Any]) -> No
 class SseAccumulator:
     def __init__(self, *, max_accumulated_bytes: int | None = None) -> None:
         self._buffer = b""
+        self._event_data: list[bytes] = []
+        self._event_data_bytes = 0
         self._choices: dict[int, dict[str, Any]] = {}
         self._envelope: dict[str, Any] = {}
         self._done = False
@@ -206,6 +209,7 @@ class SseAccumulator:
         if self._buffer:
             self._consume_line(self._buffer.rstrip(b"\r"))
             self._buffer = b""
+        self._consume_event()
 
     def _note_defect(self, reason: str) -> None:
         """Record the FIRST thing that went wrong; later ones are usually consequences of it."""
@@ -299,9 +303,29 @@ class SseAccumulator:
         )
 
     def _consume_line(self, line: bytes) -> None:
+        if not line:
+            self._consume_event()
+            return
         if not line.startswith(b"data:"):
             return
         data = line[len(b"data:") :].strip()
+        added_bytes = len(data) + (1 if self._event_data else 0)
+        if self._max_accumulated_bytes is not None and added_bytes > (
+            self._max_accumulated_bytes - self._event_data_bytes
+        ):
+            self._event_data.clear()
+            self._event_data_bytes = 0
+            self.truncated = True
+            return
+        self._event_data.append(data)
+        self._event_data_bytes += added_bytes
+
+    def _consume_event(self) -> None:
+        if not self._event_data:
+            return
+        data = b"\n".join(self._event_data)
+        self._event_data.clear()
+        self._event_data_bytes = 0
         if not data:
             return
         if data == b"[DONE]":
@@ -333,13 +357,16 @@ class SseAccumulator:
             return
         for position, choice in enumerate(choices):
             if not isinstance(choice, dict):
+                self._note_defect("stream choices contained a non-object entry")
                 continue
             raw_index = choice.get("index", position)
-            index = (
-                raw_index
-                if isinstance(raw_index, int) and not isinstance(raw_index, bool)
-                else position
-            )
+            if raw_index is None:
+                index = position
+            elif not isinstance(raw_index, int) or isinstance(raw_index, bool):
+                self._note_defect("stream choice contained a non-integer index")
+                continue
+            else:
+                index = raw_index
             if index not in self._choices and not self._reserve(b"x" * 64):
                 continue
             state = self._choice_state(index)
@@ -385,10 +412,13 @@ class SseAccumulator:
             elif key not in message:
                 message[key] = value
         function_call = delta.get("function_call")
-        if isinstance(function_call, dict) and self._reserve(function_call):
-            target = message.setdefault("function_call", {})
-            if isinstance(target, dict):
-                _merge_fragment_dict(target, function_call)
+        if isinstance(function_call, dict):
+            if self._reserve(function_call):
+                target = message.setdefault("function_call", {})
+                if isinstance(target, dict):
+                    _merge_fragment_dict(target, function_call)
+        elif function_call is not None:
+            self._note_defect("stream function_call was not an object")
         tool_calls = delta.get("tool_calls")
         if not isinstance(tool_calls, list):
             if tool_calls is not None:

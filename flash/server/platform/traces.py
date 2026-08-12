@@ -63,6 +63,8 @@ _INSTRUCTION_CONTEXT_FIELDS = frozenset(
         "tool_choice",
         "function_call",
         "response_schema",
+        "prediction",
+        "web_search_options",
     }
 )
 
@@ -452,6 +454,8 @@ def _chat_prompt(payload: Any) -> str | None:
         return None
     message = messages[0]
     if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+    if any(value for key, value in message.items() if key not in {"role", "content"}):
         return None
     return _message_text(message.get("content"))
 

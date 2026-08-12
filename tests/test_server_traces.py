@@ -227,6 +227,26 @@ def test_non_streaming_records_response_and_filters_headers(trace_api, monkeypat
     assert _PROVIDER_KEY not in json.dumps(raw)
 
 
+def test_out_of_range_usage_counters_do_not_drop_the_trace(trace_api, monkeypatch) -> None:
+    too_large = 2**63
+    _StaticAsyncClient.response = httpx.Response(
+        200,
+        json={
+            **_RESPONSE,
+            "usage": {"prompt_tokens": too_large, "completion_tokens": -(2**63) - 1},
+        },
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["input_tokens"] is None
+    assert span["output_tokens"] is None
+    assert response.headers.get(traces._RECORD_FAILED_HEADER) is None
+
+
 def test_a_non_streaming_response_under_the_limit_is_relayed_byte_identically(
     trace_api, monkeypatch
 ) -> None:
@@ -246,6 +266,24 @@ def test_a_non_streaming_response_under_the_limit_is_relayed_byte_identically(
     assert response.status_code == 201
     assert response.content == body
     assert response.headers["x-request-id"] == "exact-1"
+
+
+def test_json_value_conversion_failure_relays_body_and_records_text(trace_api, monkeypatch) -> None:
+    body = b'{"number":' + b"9" * 4_301 + b"}"
+    _StaticAsyncClient.response = httpx.Response(
+        200,
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 200
+    assert response.content == body
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["output_payload"] == body.decode()
+    assert span["status_code"] == "OK"
 
 
 def test_an_oversized_non_streaming_response_returns_502_and_records_error(
@@ -412,6 +450,22 @@ def test_done_gate_waits_for_split_event_terminator(line_ending: bytes) -> None:
     assert b"".join(forwarded) == completion + terminator
 
 
+def test_empty_string_deltas_do_not_accumulate_fragment_entries() -> None:
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=256)
+    empty_event = b'data: {"choices":[{"index":0,"delta":{"content":""}}]}\n\n'
+
+    for _ in range(10_000):
+        accumulator.feed(empty_event)
+    accumulator.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}\n\n'
+    )
+
+    content = accumulator._choices[0]["message"]["content"]
+    assert content.parts == ["world"]
+    assert accumulator.output()["choices"][0]["message"]["content"] == "world"
+    assert accumulator.truncated is False
+
+
 def test_repeated_sse_envelope_fields_do_not_consume_the_stream_budget() -> None:
     accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=700)
     fragment = "x"
@@ -439,6 +493,37 @@ def test_unterminated_sse_line_is_bounded_by_the_accumulation_budget() -> None:
 
     assert accumulator.truncated is True
     assert accumulator._buffer == b""
+
+
+@pytest.mark.parametrize(
+    ("line_ending", "terminated"),
+    [(b"\n", True), (b"\r\n", True), (b"\n", False), (b"\r\n", False)],
+    ids=["lf-delimited", "crlf-delimited", "lf-eof", "crlf-eof"],
+)
+def test_sse_accumulator_assembles_multiline_data_events(
+    line_ending: bytes, terminated: bool
+) -> None:
+    accumulator = trace_sse.SseAccumulator()
+    lines = [
+        b"data: {",
+        b'data: "choices": [{"index": 0, "delta": {"content": "world"},',
+        b'data: "finish_reason": "stop"}]',
+        b"data: }",
+    ]
+    event = line_ending.join(lines) + line_ending
+    if terminated:
+        event += line_ending
+
+    accumulator.feed(event)
+    accumulator.finish()
+
+    assert accumulator.defect is None
+    assert accumulator.output()["choices"][0]["message"]["content"] == "world"
+    assert accumulator.terminal is True
+
+    bounded = trace_sse.SseAccumulator(max_accumulated_bytes=10)
+    bounded.feed(b"data: 12345\ndata: 67890")
+    assert bounded.truncated is True
 
 
 def test_streaming_client_disconnect_before_any_event_records_no_output(
@@ -829,6 +914,61 @@ async def test_streaming_header_wait_cancellation_closes_client_and_propagates(
 
     assert _HeaderBlockingClient.instance is not None
     assert _HeaderBlockingClient.instance.closed is True
+    exported = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000
+    )
+    span = exported["records"][0]["spans"][0]
+    assert span["error"] == "client disconnected"
+    assert span["output_payload"] is None
+
+
+@pytest.mark.anyio
+async def test_non_streaming_cancellation_records_trace_and_propagates(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+    monkeypatch.setenv("FLASH_STANDALONE", "1")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", _KEY)
+    owner = db.ensure_internal_key(_KEY)
+    body = json.dumps(_REQUEST).encode()
+    sent_body = False
+
+    async def receive() -> dict:
+        nonlocal sent_body
+        if sent_body:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        sent_body = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = traces.Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [
+                (name.lower().encode(), value.encode()) for name, value in _HEADERS.items()
+            ],
+        },
+        receive,
+    )
+
+    class _BodyBlockingClient(_StaticAsyncClient):
+        read_started = asyncio.Event()
+
+        class _StreamContext(_StaticAsyncClient._StreamContext):
+            async def __aenter__(self) -> httpx.Response:
+                _BodyBlockingClient.read_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _BodyBlockingClient)
+    task = asyncio.create_task(traces.chat_completions(request, owner))
+    await _BodyBlockingClient.read_started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
     exported = export_traces(
         key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000
     )
@@ -1716,6 +1856,31 @@ def test_a_system_instruction_makes_the_single_turn_export_unreachable(trace_api
     assert export["skipped"] == 1
 
 
+@pytest.mark.parametrize("field", ["prediction", "web_search_options"])
+def test_top_level_content_context_makes_the_exported_prompt_unreachable(
+    trace_api, field: str
+) -> None:
+    owner = db.ensure_standalone_owner()
+    request = {
+        **_REQUEST,
+        field: {"content": "Alice"} if field == "prediction" else {"search_context_size": "high"},
+    }
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="top level context",
+        metadata=None,
+        spans=[TraceSpan(input_payload=request, output_payload=_reply_envelope("Alice"))],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == []
+    assert export["skipped"] == 1
+
+
 def test_a_response_schema_makes_the_exported_prompt_unreachable(trace_api) -> None:
     """A JSON schema can determine the entire reply shape while the user text stays vague. Omitting
     that top-level instruction makes both converted formats claim an input that cannot reach the row."""
@@ -1826,6 +1991,49 @@ def test_ordinary_sampling_controls_do_not_disqualify_a_single_user_message(trac
 
     assert export["records"] == [{"input": "hello", "output": "world"}]
     assert export["skipped"] == 0
+
+
+@pytest.mark.parametrize("field", ["name", "tool_call_id", "provider_context"])
+def test_per_message_context_makes_the_single_turn_export_unreachable(
+    trace_api, field: str
+) -> None:
+    owner = db.ensure_standalone_owner()
+    request = {"messages": [{"role": "user", "content": "What is my name?", field: "alice"}]}
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="message context",
+        metadata=None,
+        spans=[TraceSpan(input_payload=request, output_payload=_reply_envelope("Alice"))],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == []
+    assert export["skipped"] == 1
+
+
+@pytest.mark.parametrize("value", [None, "", [], {}])
+def test_empty_per_message_extensions_do_not_disqualify_a_single_user_message(
+    trace_api, value
+) -> None:
+    owner = db.ensure_standalone_owner()
+    request = {"messages": [{"role": "user", "content": "hello", "provider_context": value}]}
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="empty message context",
+        metadata=None,
+        spans=[TraceSpan(input_payload=request, output_payload=_reply_envelope("world"))],
+    )
+
+    export = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert export["records"] == [{"input": "hello", "output": "world"}]
 
 
 def test_a_single_user_message_still_exports_as_training_data(trace_api) -> None:
@@ -2154,6 +2362,63 @@ def test_an_empty_schema_under_a_secret_name_survives_redaction(trace_api, monke
     assert response.status_code == 200
     stored = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]
     assert stored["tools"][0]["function"]["parameters"]["properties"]["password"] == {}
+
+
+def test_secret_named_schema_literals_are_redacted_without_losing_structure(
+    trace_api, monkeypatch
+) -> None:
+    third_party_secret = "third-party-secret-abc123"
+    schema = {
+        "type": "object",
+        "properties": {
+            "password": {
+                "type": "object",
+                "description": "credential payload",
+                "default": {"value": third_party_secret},
+                "const": third_party_secret,
+                "enum": [third_party_secret],
+                "examples": [{"value": third_party_secret}],
+                "example": {"value": third_party_secret},
+                "properties": {
+                    "value": {"type": "string", "default": third_party_secret},
+                },
+                "required": ["value"],
+            },
+            "label": {"type": "string", "default": "ordinary-default"},
+        },
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "login", "parameters": schema},
+        }
+    ]
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "tools": tools}
+    )
+
+    assert response.status_code == 200
+    properties = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]["tools"][0]["function"][
+        "parameters"
+    ]["properties"]
+    password = properties["password"]
+    assert password["type"] == "object"
+    assert password["description"] == "credential payload"
+    assert password["required"] == ["value"]
+    assert password["default"] == {"value": "[redacted]"}
+    assert password["const"] == "[redacted]"
+    assert password["enum"] == ["[redacted]"]
+    assert password["examples"] == [{"value": "[redacted]"}]
+    assert password["example"] == {"value": "[redacted]"}
+    assert password["properties"]["value"] == {
+        "type": "string",
+        "default": "[redacted]",
+    }
+    assert properties["label"]["default"] == "ordinary-default"
+    assert third_party_secret not in json.dumps(_raw(trace_api))
 
 
 def test_a_request_token_field_is_redacted(trace_api, monkeypatch) -> None:
@@ -2792,6 +3057,30 @@ def test_a_non_object_delta_marks_the_stream_errored(trace_api, monkeypatch) -> 
     assert records["records"] == []
 
 
+def test_a_non_object_choice_entry_marks_the_stream_errored_without_blocking_valid_choices(
+    trace_api, monkeypatch
+) -> None:
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[null,{"index":0,"delta":{"content":"right"},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == "stream choices contained a non-object entry"
+    assert span["output_payload"]["choices"][0]["message"]["content"] == "right"
+
+
 def test_a_present_malformed_choices_container_marks_the_stream_errored(
     trace_api, monkeypatch
 ) -> None:
@@ -2822,6 +3111,54 @@ def test_a_present_malformed_choices_container_marks_the_stream_errored(
         limit=1000,
     )
     assert records["records"] == []
+
+
+@pytest.mark.parametrize("bad_index", ["a", True])
+def test_a_present_malformed_choice_index_marks_the_stream_errored_without_merging(
+    trace_api, monkeypatch, bad_index
+) -> None:
+    first = json.dumps({"choices": [{"index": bad_index, "delta": {"content": "wrong"}}]}).encode()
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b"data: " + first + b"\n\n",
+            b'data: {"choices":[{"index":0,"delta":{"content":"right"},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == "stream choice contained a non-integer index"
+    assert span["output_payload"]["choices"][0]["message"]["content"] == "right"
+
+
+@pytest.mark.parametrize("index_field", [{}, {"index": None}])
+def test_absent_or_null_choice_index_uses_list_position(
+    trace_api, monkeypatch, index_field
+) -> None:
+    choice = {**index_field, "delta": {"content": "world"}, "finish_reason": "stop"}
+    event = b"data: " + json.dumps({"choices": [choice]}).encode() + b"\n\n"
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody([event, b"data: [DONE]\n\n"])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "OK"
+    assert span["output_payload"]["choices"][0]["message"]["content"] == "world"
 
 
 def test_null_logprobs_on_every_stream_chunk_is_not_a_defect(trace_api, monkeypatch) -> None:
@@ -2950,6 +3287,52 @@ def test_a_present_malformed_delta_list_still_marks_the_stream_errored(
         limit=1000,
     )
     assert records["records"] == []
+
+
+def test_a_wrong_typed_function_call_container_marks_the_stream_errored(
+    trace_api, monkeypatch
+) -> None:
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial","function_call":"missing action"},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == "stream function_call was not an object"
+
+
+@pytest.mark.parametrize("function_call", [{}, {"function_call": None}])
+def test_absent_or_null_function_call_is_not_a_stream_defect(
+    trace_api, monkeypatch, function_call
+) -> None:
+    delta = {"content": "world", **function_call}
+    event = json.dumps(
+        {"choices": [{"index": 0, "delta": delta, "finish_reason": "stop"}]}
+    ).encode()
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody([b"data: " + event + b"\n\n", b"data: [DONE]\n\n"])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "OK"
+    assert span["error"] is None
 
 
 def test_a_wrong_typed_tool_calls_container_marks_the_stream_errored(

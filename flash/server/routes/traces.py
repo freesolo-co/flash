@@ -44,6 +44,8 @@ _UPSTREAM_TOO_LARGE_BODY = b'{"detail":"Upstream response was too large to relay
 # told to the caller when the provider call succeeded but persisting its trace did not, so a
 # collection run cannot look complete while its exports quietly omit calls.
 _RECORD_FAILED_HEADER = "X-Freesolo-Record-Failed"
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
 _PROVIDER_HEADER = "X-Freesolo-Provider"
 _PROVIDER_KEY_HEADER = "X-Freesolo-Provider-Key"
 _PROJECT_HEADER = "X-Freesolo-Project-Id"
@@ -155,6 +157,9 @@ _JSON_SCHEMA_ANNOTATION_KEYWORDS = frozenset(
 )
 _JSON_SCHEMA_KEYWORDS = _JSON_SCHEMA_STRUCTURAL_KEYWORDS | _JSON_SCHEMA_ANNOTATION_KEYWORDS
 _JSON_SCHEMA_VALUE_KEYWORDS = frozenset({"default", "examples", "example"})
+_JSON_SCHEMA_SECRET_LITERAL_KEYWORDS = frozenset(
+    {"default", "const", "enum", "examples", "example"}
+)
 
 
 @dataclass
@@ -201,10 +206,19 @@ def _is_schema_definition(value: Any) -> bool:
     return bool(keys) and all(key not in _JSON_SCHEMA_VALUE_KEYWORDS for key in keys)
 
 
+def _redact_schema_literal(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _redact_schema_literal(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_redact_schema_literal(item) for item in value]
+    return "[redacted]"
+
+
 def _redact_secret_fields(
     value: Any,
     *,
     schema_property_map: bool = False,
+    secret_schema_definition: bool = False,
     response_root: bool = False,
     choice_list: bool = False,
     choice: bool = False,
@@ -214,9 +228,10 @@ def _redact_secret_fields(
     if isinstance(value, dict):
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
-            if _is_secret_key(key, allow_token=logprob_entries) and not (
-                schema_property_map and _is_schema_definition(item)
-            ):
+            schema_definition = schema_property_map and _is_schema_definition(item)
+            if secret_schema_definition and key in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
+                redacted[key] = _redact_schema_literal(item)
+            elif _is_secret_key(key, allow_token=logprob_entries) and not schema_definition:
                 redacted[key] = "[redacted]"
             else:
                 redacted[key] = _redact_secret_fields(
@@ -224,6 +239,8 @@ def _redact_secret_fields(
                     schema_property_map=(
                         key in {"properties", "$defs", "definitions"} and isinstance(item, dict)
                     ),
+                    secret_schema_definition=secret_schema_definition
+                    or (schema_definition and _is_secret_key(key)),
                     response_root=False,
                     choice_list=response_root and key == "choices" and isinstance(item, list),
                     choice=choice_list,
@@ -237,6 +254,7 @@ def _redact_secret_fields(
             _redact_secret_fields(
                 item,
                 schema_property_map=schema_property_map,
+                secret_schema_definition=secret_schema_definition,
                 choice=choice_list,
                 logprobs=logprobs,
                 logprob_entries=logprob_entries,
@@ -292,7 +310,13 @@ def _usage_tokens(payload: Any) -> tuple[int | None, int | None]:
         return None, None
 
     def _token(value: Any) -> int | None:
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
+        return (
+            value
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX
+            else None
+        )
 
     return _token(usage.get("prompt_tokens")), _token(usage.get("completion_tokens"))
 
@@ -300,7 +324,7 @@ def _usage_tokens(payload: Any) -> tuple[int | None, int | None]:
 def _decoded_payload(response: httpx.Response) -> Any:
     try:
         return response.json()
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError):
         return response.text
 
 
@@ -506,6 +530,55 @@ async def _stream_response(
         )
 
 
+async def _non_streaming_response(
+    context: _UpstreamRequestContext, forwarded_body: dict[str, Any]
+) -> Response:
+    try:
+        async with (
+            httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT_SECONDS) as client,
+            client.stream(
+                "POST",
+                context.url,
+                headers=context.headers,
+                json=forwarded_body,
+            ) as upstream_response,
+        ):
+            upstream_status = upstream_response.status_code
+            upstream_headers = upstream_response.headers
+            upstream_body, response_too_large = await _bounded_upstream_response(upstream_response)
+    except asyncio.CancelledError:
+        with anyio.CancelScope(shield=True):
+            await _record_trace(context, output_payload=None, error="client disconnected")
+        raise
+    except httpx.HTTPError:
+        return await _upstream_failure_response(context)
+
+    response_headers = _safe_provider_response_headers(upstream_headers)
+    if response_too_large:
+        await _record_trace(context, output_payload=None, error=_UPSTREAM_TOO_LARGE_ERROR)
+        response_headers["content-type"] = "application/json"
+        if context.record_failed:
+            response_headers[_RECORD_FAILED_HEADER] = "true"
+        return Response(content=_UPSTREAM_TOO_LARGE_BODY, status_code=502, headers=response_headers)
+
+    buffered_response = httpx.Response(
+        upstream_status,
+        headers=upstream_headers,
+        content=upstream_body,
+    )
+    await _record_trace(
+        context,
+        output_payload=_decoded_payload(buffered_response),
+        error=_error_for_status(upstream_status),
+    )
+    content_type = upstream_headers.get("content-type")
+    if content_type:
+        response_headers["content-type"] = content_type
+    if context.record_failed:
+        response_headers[_RECORD_FAILED_HEADER] = "true"
+    return Response(content=upstream_body, status_code=upstream_status, headers=response_headers)
+
+
 async def _bounded_request_body(request: Request) -> bytes:
     content_length = request.headers.get("content-length")
     if content_length is not None:
@@ -696,46 +769,7 @@ async def chat_completions(
             headers=response_headers,
         )
 
-    try:
-        async with (
-            httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT_SECONDS) as client,
-            client.stream(
-                "POST",
-                context.url,
-                headers=context.headers,
-                json=forwarded_body,
-            ) as upstream_response,
-        ):
-            upstream_status = upstream_response.status_code
-            upstream_headers = upstream_response.headers
-            upstream_body, response_too_large = await _bounded_upstream_response(upstream_response)
-    except httpx.HTTPError:
-        return await _upstream_failure_response(context)
-
-    response_headers = _safe_provider_response_headers(upstream_headers)
-    if response_too_large:
-        await _record_trace(context, output_payload=None, error=_UPSTREAM_TOO_LARGE_ERROR)
-        response_headers["content-type"] = "application/json"
-        if context.record_failed:
-            response_headers[_RECORD_FAILED_HEADER] = "true"
-        return Response(content=_UPSTREAM_TOO_LARGE_BODY, status_code=502, headers=response_headers)
-
-    buffered_response = httpx.Response(
-        upstream_status,
-        headers=upstream_headers,
-        content=upstream_body,
-    )
-    await _record_trace(
-        context,
-        output_payload=_decoded_payload(buffered_response),
-        error=_error_for_status(upstream_status),
-    )
-    content_type = upstream_headers.get("content-type")
-    if content_type:
-        response_headers["content-type"] = content_type
-    if context.record_failed:
-        response_headers[_RECORD_FAILED_HEADER] = "true"
-    return Response(content=upstream_body, status_code=upstream_status, headers=response_headers)
+    return await _non_streaming_response(context, forwarded_body)
 
 
 @router.get("/api/traces/projects")
