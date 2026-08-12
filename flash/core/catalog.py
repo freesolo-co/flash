@@ -587,7 +587,7 @@ def resolve_vocab_size(model_id: str, revision: str = "") -> int:
         if info is not None:
             _params_b, vocab = _validated_revision_geometry(model_id, revision, info)
             return int(vocab or info.vocab_size)
-        _p, vocab, _h, _l = fetch_hf_model_geometry(model_id, revision, strict=True)
+        _p, vocab, _h, _l, _heads = fetch_hf_model_geometry(model_id, revision, strict=True)
         if vocab:
             return int(vocab)
     return vocab_size_for(model_id)

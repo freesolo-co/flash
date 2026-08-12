@@ -810,21 +810,29 @@ def test_public_max_gpu_count_is_rentable_not_silently_clamped():
     assert combined_vram_gb(get_gpu_info(chosen).vram_gb, 8) >= need
 
 
-def test_eight_cards_require_validated_head_geometry():
+def test_eight_cards_require_validated_head_geometry(monkeypatch):
     """A run must not rent 8 cards before its attention-head count is known to divide.
 
-    verl requires ``num_attention_heads % sp_size == 0``. A PINNED revision cannot be checked: the
-    pin's own config is fetched for parameter/vocabulary size but its head count never is, so an
-    8-card pinned run could pay for a box and abort during sequence-parallel initialization. Those
-    stay at four. Catalog rows ARE readable, and are capped on their real geometry -- see
-    ``test_geometry_cap_follows_each_models_own_head_count``.
+    verl requires ``num_attention_heads % sp_size == 0``, so a width nobody certified can pay for a
+    box and abort during sequence-parallel initialization. A pin whose geometry cannot be read
+    certifies nothing and keeps the four-card ceiling; a pin that CAN be read is capped on the head
+    count in that commit's own config -- see ``test_a_certified_pin_reaches_eight_cards``.
     """
+    import flash.engine.plan.model_config_probe as model_config_probe
+    import flash.engine.plan.vram as vram
     from flash.providers.allocator import geometry_safe_gpu_cap
 
+    monkeypatch.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
+
+    def _unreadable(*_a, **_k):
+        raise RuntimeError("transient hub error")
+
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", _unreadable)
+
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40) == 4
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40, certify=True) == 4
     # odd ceilings still normalize through the shared rentable-count helper.
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 3, model_revision="a" * 40) == 2
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 3, model_revision="a" * 40, certify=True) == 2
 
 
 def test_geometry_cap_follows_each_models_own_head_count():
@@ -844,10 +852,6 @@ def test_geometry_cap_follows_each_models_own_head_count():
         # the derived quotient must never be used as the head count; pin the divergence so a future
         # refactor cannot quietly reintroduce it.
         assert heads % geometry_safe_gpu_cap(model_id, 8) == 0
-        # SFT resolves the omitted revision to a sha BEFORE allocation
-        # (`prepare_job` -> `_resolve_model_revision(required=True)`), so the cap must still read
-        # the row's geometry when a revision is present.
-        assert heads % geometry_safe_gpu_cap(model_id, 8, model_revision="a" * 40) == 0
 
     # the derivation this replaced disagrees with the truth on four of six rows.
     derived_wrong = [
@@ -865,6 +869,375 @@ def test_geometry_cap_follows_each_models_own_head_count():
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 2) == 2
     # a model outside the catalog has no readable geometry, so it keeps the unvalidated ceiling.
     assert geometry_safe_gpu_cap("some-org/not-in-catalog", 8) == 4
+
+
+def _stub_model_config_probe(monkey, info, *, heads=None):
+    """Answer the pinned-config fetch from a catalog row, optionally with drifted head geometry."""
+    import flash.engine.plan.model_config_probe as model_config_probe
+    import flash.engine.plan.vram as vram
+
+    def _pinned(_model_id, revision="", strict=False):
+        return (
+            info.params_b,
+            info.vocab_size,
+            info.hidden_size,
+            info.num_layers,
+            info.num_attention_heads if heads is None else heads,
+        )
+
+    monkey.setattr(vram, "fetch_hf_model_geometry", _pinned)
+    monkey.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
+
+
+def test_a_certified_pin_reaches_eight_cards():
+    """A pinned SFT run must be offered the width its own commit's geometry certifies.
+
+    Treating "pinned" as "unknown geometry" made 8 cards unreachable for SFT specifically: every
+    SFT run reaches allocation with a revision already resolved to a sha (`prepare_job` ->
+    `_resolve_model_revision(required=True)`), so the pin branch fired on all six catalog models
+    and `--gpus 8` silently became `--gpus 4` -- including for a run that only FITS at eight. The
+    pinned commit's own config is readable, so it is what decides the width.
+    """
+    from flash.core.catalog import MODELS
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        for model_id, info in MODELS.items():
+            _stub_model_config_probe(monkey, info)
+            heads = info.num_attention_heads
+            capped = geometry_safe_gpu_cap(model_id, 8, model_revision="a" * 40, certify=True)
+            # the real invariant is divisibility; every current row happens to divide 8.
+            assert heads % capped == 0, model_id
+            assert capped == 8, model_id
+            # the pin must never WIDEN past the authored ceiling either.
+            assert geometry_safe_gpu_cap(model_id, 2, model_revision="a" * 40) == 2, model_id
+    finally:
+        monkey.undo()
+
+
+def test_a_pin_that_contradicts_the_catalog_certifies_nothing():
+    """A pin whose own config disagrees with its catalog row must not widen the run.
+
+    The width follows the PINNED commit, so a commit contradicting the row it matches is exactly
+    the case that must not be trusted for 8 -- the catalog row divides 8 cleanly and the pin is
+    what the worker actually loads. Such a pin is rejected outright by `_validated_revision_geometry`
+    when sizing runs, so the conservative ceiling here is belt-and-braces rather than the only gate.
+    """
+    from flash.core.catalog import MODELS
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    info = MODELS["Qwen/Qwen3.5-9B"]
+    assert info.num_attention_heads == 16
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        # a drifted head count is REJECTED by the catalog cross-check, so it certifies nothing and
+        # keeps the conservative ceiling rather than widening on a config nothing else agrees with.
+        _stub_model_config_probe(monkey, info, heads=20)
+        assert (
+            geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40, certify=True) == 4
+        )
+        # a pin that omits the field entirely certifies nothing either.
+        _stub_model_config_probe(monkey, info, heads=0)
+        assert (
+            geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40, certify=True) == 4
+        )
+    finally:
+        monkey.undo()
+
+
+def test_a_pin_without_parameter_metadata_certifies_nothing():
+    """A commit exposing no parameter count must not widen a run.
+
+    Sizing rejects that pin outright, but the schema preflight asks for the CAP before it sizes
+    anything, so the cap cannot lean on sizing having run first -- it has to fail closed itself.
+    """
+    import flash.engine.plan.model_config_probe as model_config_probe
+    import flash.engine.plan.vram as vram
+    from flash.core.catalog import MODELS
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    info = MODELS["Qwen/Qwen3.5-9B"]
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
+        monkey.setattr(
+            vram,
+            "fetch_hf_model_geometry",
+            # no safetensors.total, but a perfectly readable config with matching heads.
+            lambda *_a, **_k: (
+                None,
+                info.vocab_size,
+                info.hidden_size,
+                info.num_layers,
+                info.num_attention_heads,
+            ),
+        )
+        assert (
+            geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40, certify=True) == 4
+        )
+    finally:
+        monkey.undo()
+
+
+def test_a_drifted_pin_head_count_is_rejected_by_sizing():
+    """Head count joins the fail-closed geometry cross-check, not just the width decision.
+
+    The pin's config is already validated against the catalog for params/vocab/hidden/layers. Heads
+    now decide how wide the run is rented, so a commit that disagrees on heads has to be rejected by
+    the same gate rather than silently sizing one shape and renting another.
+    """
+    import flash.engine.plan.vram as vram
+    from flash.core.catalog import MODELS
+
+    info = MODELS["Qwen/Qwen3.5-9B"]
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        _stub_model_config_probe(monkey, info, heads=20)
+        with pytest.raises(ValueError, match="attention head count"):
+            vram.model_required_vram_gb("Qwen/Qwen3.5-9B", "sft", model_revision="a" * 40)
+        # a config that simply omits the field is not a CONFLICT, so it must not be rejected here.
+        _stub_model_config_probe(monkey, info, heads=0)
+        vram.model_required_vram_gb("Qwen/Qwen3.5-9B", "sft", model_revision="a" * 40)
+    finally:
+        monkey.undo()
+
+
+def test_a_pinned_head_lookup_is_not_repeated_or_cached_on_failure():
+    """The pin is read once per quote, and a hub blip must not become permanent.
+
+    `geometry_safe_gpu_cap` is called several times per quote (schema preflight, offline shape,
+    allocation). An uncached lookup turns one quote into repeated hub round trips; a CACHED failure
+    would pin the run to four cards until the plane restarted.
+    """
+    import flash.engine.plan.model_config_probe as model_config_probe
+    import flash.engine.plan.vram as vram
+    from flash.core.catalog import MODELS
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    info = MODELS["Qwen/Qwen3.5-9B"]
+    rev = "a" * 40
+    calls: list[str] = []
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
+
+        def _blip(*_a, **_k):
+            calls.append("fail")
+            raise RuntimeError("transient hub error")
+
+        monkey.setattr(vram, "fetch_hf_model_geometry", _blip)
+        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev, certify=True) == 4
+        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev, certify=True) == 4
+        assert model_config_probe._CONFIG_PROBE_MEMO == {}, "a hub failure must not be cached"
+        assert len(calls) == 2, "a failed lookup must stay retryable"
+
+        calls.clear()
+
+        def _ok(_model_id, revision="", strict=False):
+            calls.append(revision)
+            return (
+                info.params_b,
+                info.vocab_size,
+                info.hidden_size,
+                info.num_layers,
+                info.num_attention_heads,
+            )
+
+        monkey.setattr(vram, "fetch_hf_model_geometry", _ok)
+        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev, certify=True) == 8
+        before = len(calls)
+        assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision=rev, certify=True) == 8
+        assert len(calls) == before, f"pinned head lookup hit the hub {len(calls)} times"
+    finally:
+        monkey.undo()
+
+
+def test_only_immutable_complete_pin_reads_are_memoized():
+    """The memo may only hold what is genuinely immutable AND complete.
+
+    Two things that look immutable are not, and caching either one strands a valid pin until the
+    plane restarts:
+
+    - A REF is not a commit. `spec_from_dict` passes the AUTHORED `model_revision` through, so
+      `main` or a tag reaches the memo before `_resolve_model_revision` resolves it to a sha. Cached
+      under a moving name, a ref that later advances keeps serving the old geometry forever.
+    - A COMPLETE read is not any read. `params_b` is None when the hub omits `safetensors.total` --
+      hub metadata, not commit-immutable `config.json` geometry. Cached, `_validated_revision_
+      geometry` raises from the memo on every later call and the pin stays rejected.
+    """
+    import flash.engine.plan.model_config_probe as model_config_probe
+    import flash.engine.plan.vram as vram
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        calls: list[str] = []
+
+        def _answer(params_b):
+            def _fetch(_model_id, revision="", strict=False):
+                calls.append(revision)
+                return (params_b, 248320, 4096, 32, 16)
+
+            return _fetch
+
+        # an incomplete read stays retryable rather than becoming a permanent rejection.
+        monkey.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
+        monkey.setattr(vram, "fetch_hf_model_geometry", _answer(None))
+        vram._memoized_config_probe("M", "a" * 40)
+        vram._memoized_config_probe("M", "a" * 40)
+        assert model_config_probe._CONFIG_PROBE_MEMO == {}, "an incomplete read must not be cached"
+        assert len(calls) == 2, "an incomplete read must stay retryable"
+
+        # a moving ref is re-read every time, because it can point somewhere else tomorrow.
+        calls.clear()
+        monkey.setattr(vram, "fetch_hf_model_geometry", _answer(9.0))
+        vram._memoized_config_probe("M", "main")
+        vram._memoized_config_probe("M", "main")
+        assert model_config_probe._CONFIG_PROBE_MEMO == {}, "a moving ref must not be cached"
+        assert len(calls) == 2, "a moving ref must be re-read"
+
+        # a complete sha read IS shared -- that is the whole point of the memo.
+        calls.clear()
+        vram._memoized_config_probe("M", "b" * 40)
+        vram._memoized_config_probe("M", "b" * 40)
+        assert len(calls) == 1, "a complete sha read must be shared, not repeated"
+        assert list(model_config_probe._CONFIG_PROBE_MEMO) == [("M", "b" * 40)]
+    finally:
+        monkey.undo()
+
+
+def test_only_the_submission_path_certifies_a_pin():
+    """Every OFFLINE caller of the cap must leave `certify` off, so a hub blip cannot narrow a run.
+
+    Certification is network i/o whose failure degrades to the four-card ceiling. That is a safe
+    answer at submission, which already does i/o and can retry. It is not safe on the offline paths:
+    `spec_from_dict` feeds this cap to `provisional_gpu`, which RAISES to reject an unplaceable run,
+    and `_offline_gpu_shape` is contractually structural. On either, a transient hub error would turn
+    a 35B that genuinely needs eight cards into a terminal "does not fit" rejection.
+
+    Asserted by reading the call sites, because the defect is a keyword argument at a call site: a
+    behavioral test of the submit path passes just as well when an offline path also certifies.
+    """
+    import ast
+    import inspect
+
+    import flash.cost.analytical as analytical
+    import flash.providers.allocator as allocator
+    import flash.schema as schema
+
+    def _certifying_calls(module) -> list[bool]:
+        tree = ast.parse(inspect.getsource(module))
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if name != "geometry_safe_gpu_cap":
+                continue
+            found.append(
+                any(
+                    kw.arg == "certify" and getattr(kw.value, "value", False) is True
+                    for kw in node.keywords
+                )
+            )
+        return found
+
+    offline = _certifying_calls(schema) + _certifying_calls(analytical)
+    assert offline, "expected to find the offline geometry-cap call sites"
+    assert not any(offline), (
+        "an offline path opted into pin certification: a hub outage there rejects a run that fits"
+    )
+
+    submit = _certifying_calls(allocator)
+    assert submit, "expected to find the allocator's geometry-cap call sites"
+    assert all(submit), "the submission path must certify the pin; that is where widening happens"
+
+
+def test_a_low_ceiling_pin_does_not_reach_the_hub():
+    """Parse-time validation stays offline at EVERY ceiling, not just where widening is impossible.
+
+    `spec_from_dict` calls the cap while parsing a config, so certification is opt-in and parse time
+    does not opt in. An earlier version skipped the hub only at `cap <= 4` (where a certified head
+    count could not raise the ceiling anyway); that left the widenable case reaching the network from
+    an otherwise-offline path, where a hub timeout blocks config validation and a transient failure
+    narrows the run to four and gets it rejected as unplaceable.
+
+    Certification still happens where it belongs, under `certify=True`, which is asserted at the end
+    here and covered in ``test_only_the_submission_path_certifies_a_pin``.
+    """
+    import flash.engine.plan.model_config_probe as model_config_probe
+    import flash.engine.plan.vram as vram
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        calls: list[str] = []
+
+        def _fetch(_model_id, revision="", strict=False):
+            calls.append(revision)
+            raise RuntimeError("hub must not be reached")
+
+        monkey.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
+        monkey.setattr(vram, "fetch_hf_model_geometry", _fetch)
+
+        # every ceiling, including the widenable ones -- an offline caller never reaches the hub.
+        for ceiling in (1, 2, 3, 4, 8):
+            geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", ceiling, model_revision="a" * 40)
+        assert calls == [], f"parse-time cap reached the hub {len(calls)} times"
+
+        # opting in is what permits the round trip, and only above the uncertified ceiling.
+        geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 4, model_revision="a" * 40, certify=True)
+        assert calls == [], "certification cannot widen at or below the uncertified cap"
+        geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8, model_revision="a" * 40, certify=True)
+        assert len(calls) == 1, "a widenable ceiling must certify the pin when asked to"
+    finally:
+        monkey.undo()
+
+
+def test_a_blip_after_sizing_cannot_narrow_an_already_validated_pin():
+    """Sizing and the cap must share one geometry read, or an eight-card run dies mid-allocation.
+
+    `allocate()` sizes the run first (`required_vram_gb` -> `_validated_revision_geometry`, which
+    fetches and validates this exact pin) and only then asks for the head cap. With two independent
+    lookups, a hub blip landing between them narrowed a just-validated pin to four cards -- and for a
+    run that only FITS at eight, `_structurally_fits` then reports it as terminally unplaceable
+    rather than retryable. A pinned commit's geometry is immutable, so one success settles it.
+    """
+    import flash.engine.plan.model_config_probe as model_config_probe
+    import flash.engine.plan.vram as vram
+    from flash.core.catalog import MODELS
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    model = "Qwen/Qwen3.5-9B"
+    info = MODELS[model]
+    rev = "a" * 40
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
+        _stub_model_config_probe(monkey, info)
+        monkey.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
+
+        # 1. sizing succeeds and validates the pin, exactly as `allocate()` does first.
+        assert vram.model_required_vram_gb(model, "sft", model_revision=rev) > 0
+
+        # 2. the hub dies immediately afterwards.
+        def _blip(*_a, **_k):
+            raise RuntimeError("transient hub error")
+
+        monkey.setattr(vram, "fetch_hf_model_geometry", _blip)
+
+        # 3. the cap must still certify 8 from the geometry step 1 already read and validated.
+        # `certify=True` is what makes this test mean anything: without it the cap never consults
+        # the memo, so the blip stub above is dead and a lost memo-reuse regression still passes.
+        assert geometry_safe_gpu_cap(model, 8, model_revision=rev, certify=True) == 8
+    finally:
+        monkey.undo()
 
 
 def test_geometry_cap_narrows_a_row_whose_heads_do_not_divide_eight():
@@ -897,13 +1270,68 @@ def test_geometry_cap_narrows_a_row_whose_heads_do_not_divide_eight():
         monkey.undo()
 
 
-def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
-    """Schema preview must size a pinned run on four cards, not the authored eight.
+def test_an_uncertified_pin_still_narrows_below_the_four_card_ceiling():
+    """The four-card ceiling for an uncertified pin must NARROW the divisor search, not replace it.
 
-    Sizing against a count the allocator will never rent picks the wrong per-card class: the
-    provisional class is chosen FOR the ceiling, so an eight-card preview of a run the cap holds to
-    four quotes a class the run never gets.
+    A ceiling is a bound, not a divisibility proof: 4 divides 24 but not 6. Returning the ceiling
+    directly once a pin fails to certify skips the row's own head check, so a row whose heads do not
+    divide 4 gets rented at 4 and aborts in Ulysses init -- the exact failure the cap exists to
+    prevent, reintroduced on the uncertified path.
+
+    No current row exercises this (all six are 8/8/16/16/24/16), so it is proven against a synthetic
+    6-head row rather than left as an invariant that only a future model would discover.
     """
+    from dataclasses import replace
+
+    from flash.core.catalog import MODELS
+    from flash.providers.allocator import geometry_safe_gpu_cap
+
+    six = replace(MODELS["Qwen/Qwen3.5-9B"], id="Qwen/Fake-6-Head", num_attention_heads=6)
+    patched = dict(MODELS)
+    patched["Qwen/Fake-6-Head"] = six
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        import flash.engine.plan.model_config_probe as model_config_probe
+        import flash.engine.plan.vram as vram
+
+        monkey.setattr("flash.core.catalog.MODELS", patched)
+        monkey.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
+
+        def _unreadable(*_a, **_k):
+            raise RuntimeError("transient hub error")
+
+        monkey.setattr(vram, "fetch_hf_model_geometry", _unreadable)
+
+        # `certify=True` is required for the stub above to fire at all: without it the cap never
+        # reaches the hub, the pin is never uncertified, and this asserts the unpinned path twice.
+        # 6 % 4 != 0 and 6 % 2 == 0, so an uncertified pin must land on 2, not on the bare ceiling.
+        assert (
+            geometry_safe_gpu_cap("Qwen/Fake-6-Head", 8, model_revision="a" * 40, certify=True) == 2
+        )
+        # the unpinned path already checked the row and must be unchanged by this.
+        assert geometry_safe_gpu_cap("Qwen/Fake-6-Head", 8) == 2
+    finally:
+        monkey.undo()
+
+
+def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
+    """Schema preview sizes a pinned run WITHOUT reaching the hub, in either hub state.
+
+    The provisional class is chosen FOR the ceiling, so previewing a width the cap would not allow
+    quotes a class the run never gets. Parse-time preview is offline, so it does not certify: it
+    previews on the catalog row's own head count and a hub outage cannot change the answer.
+
+    That the two branches agree is the point. `provisional_gpu` RAISES to reject an unplaceable run,
+    so if a transient hub error narrowed the preview to four, a 35B that genuinely needs eight cards
+    would be rejected as unplaceable during config parsing that is otherwise entirely offline --
+    a network blip turned into a terminal, wrong, user-facing rejection. Certification (which can
+    legitimately narrow to four) belongs on the submission path, where a healthy retry exists; see
+    ``test_only_the_submission_path_certifies_a_pin``.
+    """
+    import flash.engine.plan.model_config_probe as model_config_probe
+    import flash.engine.plan.vram as vram
+    from flash.core.catalog import MODELS
     from flash.schema import spec_from_dict
 
     seen: list[int] = []
@@ -912,24 +1340,65 @@ def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
         seen.append(gpu_count)
         return "H100"
 
+    def _spec():
+        spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-0.8B",
+                "model_revision": "a" * 40,
+                "algorithm": "sft",
+                "environment": {"id": "owner/env"},
+                "train": {"max_examples": 1},
+                "gpu": {"count": 8},
+            }
+        )
+
     monkey = pytest.MonkeyPatch()
     try:
         monkey.setattr("flash.schema.provisional_gpu", _preview)
-        raw = {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "model_revision": "a" * 40,
-            "algorithm": "sft",
-            "environment": {"id": "owner/env"},
-            "train": {"max_examples": 1},
-            "gpu": {"count": 8},
-        }
-        spec_from_dict(raw)
+        monkey.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
 
-        # an unset count must cross the same boundary already capped. force a floor that would need
-        # eight cards without the unvalidated-revision cap; the schema may still preview only four.
+        def _unreadable(*_a, **_k):
+            raise RuntimeError("transient hub error")
+
+        monkey.setattr(vram, "fetch_hf_model_geometry", _unreadable)
+        _spec()
+        # the 0.8B row records 8 heads, so an offline preview reaches 8 even while the hub is down.
+        assert seen == [8], "a hub outage must not narrow an offline parse-time preview"
+
+        info = MODELS["Qwen/Qwen3.5-0.8B"]
+        assert info.num_attention_heads == 8
+
+        def _readable(_mid, revision="", strict=False):
+            return (
+                info.params_b,
+                info.vocab_size,
+                info.hidden_size,
+                info.num_layers,
+                info.num_attention_heads,
+            )
+
+        seen.clear()
+        monkey.setattr(vram, "fetch_hf_model_geometry", _readable)
+        monkey.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
+        _spec()
+        assert seen == [8]
+
+        # an unset count must cross the same boundary (dev's auto-sizing case). parse time is
+        # offline, so the 8-head row previews at 8 here too -- the pre-fix expectation of 4 came
+        # from parse-time certification, which a hub outage could flip.
+        seen.clear()
         monkey.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 700)
-        spec_from_dict({**raw, "gpu": {}})
-        assert seen == [4, 4]
+        spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-0.8B",
+                "model_revision": "a" * 40,
+                "algorithm": "sft",
+                "environment": {"id": "owner/env"},
+                "train": {"max_examples": 1},
+                "gpu": {},
+            }
+        )
+        assert seen == [8], "an unset count previews on the row, offline, in either hub state"
     finally:
         monkey.undo()
 
