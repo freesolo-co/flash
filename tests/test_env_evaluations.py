@@ -4020,3 +4020,59 @@ def test_env_eval_strips_reasoning_from_the_state_a_thinking_episode_scores() ->
     assert results[0].score == 1.0
     # and the caller's environment is left as it was found
     assert environment.thinking is False
+
+
+def test_loaded_suite_still_receives_episode_state_through_the_scope_wrapper(tmp_path) -> None:
+    """The loader's scope wrapper must not hide a sidecar's episode-state parameter.
+
+    `load_evaluation_suites` wraps every suite to bind it to its package directory. That wrapper
+    is what callers inspect, so a fixed `(case, response)` signature on it made EVERY real
+    sidecar look like a two-argument scorer: `grades_episodes` still forwarded through
+    `__getattr__` and promised transcript grading, while the state was silently dropped and the
+    suite raised on the state it was told to expect. Only a suite constructed directly in a test
+    escaped it, which is why unit coverage passed while the shipped path did not.
+    """
+    from flash.cli.commands.env.episode import _grades_episodes, _state_argument
+    from flash.envs.evaluations import load_evaluation_suites
+
+    package = tmp_path / "env_pkg"
+    package.mkdir()
+    (package / "environment.py").write_text(
+        "def load_environment(**kwargs):\n    return object()\n"
+    )
+    (package / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "\n"
+        "class EpisodeSuite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self):\n"
+        "        return [EvalCase(input='go', expected='1,3,6', id='c1')]\n"
+        "    def score(self, case, response, state=None):\n"
+        "        return 1.0 if ','.join((state or {}).get('turns', [])) == case.expected else 0.0\n"
+        "\n"
+        "class PlainSuite:\n"
+        "    name = 'plain'\n"
+        "    def cases(self):\n"
+        "        return [EvalCase(input='go', expected='x', id='c1')]\n"
+        "    def score(self, case, response):\n"
+        "        return 1.0 if response == case.expected else 0.0\n"
+        "\n"
+        "def load_evaluations(environment=None, **kwargs):\n"
+        "    return [EpisodeSuite(), PlainSuite()]\n"
+    )
+
+    episode_suite, plain_suite = load_evaluation_suites(str(package / "environment.py"))
+
+    # the opt-in survives the wrapper, and so does the parameter that makes it meaningful
+    assert _grades_episodes(episode_suite) is True
+    assert _state_argument(episode_suite.score) == "keyword"
+    # and the state actually arrives, rather than being dropped by a fixed-arity delegate
+    case = episode_suite.cases()[0]
+    assert episode_suite.score(case, "6", state={"turns": ["1", "3", "6"]}) == 1.0
+
+    # a two-argument suite must NOT be reported as taking state, or it gets an argument it
+    # cannot accept -- forwarding *args/**kwargs alone would report every suite as accepting it
+    assert _grades_episodes(plain_suite) is False
+    assert _state_argument(plain_suite.score) is None
+    assert plain_suite.score(plain_suite.cases()[0], "x") == 1.0
