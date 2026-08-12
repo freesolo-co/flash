@@ -447,6 +447,69 @@ def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
     assert _on_policy_prompts_per_step(spec, spec.train.max_examples) == 2
 
 
+def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for():
+    """The quote a run is BILLED from must price the batch the ranker sized the card for.
+
+    `runconfig_from_spec` fed `RunConfig.batch_size` the raw authored `prompts_per_step`, so a run
+    with `prompts_per_step = 128, max_examples = 2` was quoted for a batch of 128 while training on
+    2. The persisted quote is what a completed or cancelled run is charged against
+    (`flash/runner/costs.py`), and it also gates the pre-submit affordability check, so the gap both
+    overcharges and can reject an affordable run.
+
+    Internally inconsistent too: `spec_steps` already counted steps against the CAPPED batch, so one
+    quote mixed a capped step count with an uncapped per-step price.
+    """
+    from flash.core.spec import JobSpec
+    from flash.cost.spec import runconfig_from_spec
+    from flash.providers.base import run_config_for_ranking
+
+    base = {
+        "model": "Qwen/Qwen3.5-4B",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "gpu": {"type": "H100", "count": 1},
+    }
+    for algorithm in ("grpo", "opd"):
+        for label, train in (
+            (
+                "authored above the pool",
+                {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 2},
+            ),
+            ("unauthored, small pool", {"epochs": 1, "group_size": 4, "max_examples": 2}),
+            ("authored, no pool", {"epochs": 1, "group_size": 4, "prompts_per_step": 32}),
+            (
+                "authored below the pool",
+                {"epochs": 1, "group_size": 4, "prompts_per_step": 2, "max_examples": 128},
+            ),
+            (
+                "uncapped pool",
+                {"epochs": 1, "group_size": 4, "prompts_per_step": 8, "max_examples": 0},
+            ),
+        ):
+            spec = JobSpec.from_dict(
+                {**base, "algorithm": algorithm, "run_id": "q", "train": train}
+            )
+            quoted = runconfig_from_spec(spec).normalized().batch_size
+            ranked = (
+                run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+                .normalized()
+                .batch_size
+            )
+            # compared after normalization: the two reach the recipe default by different routes,
+            # and it is the effective number that has to match, not how each got there.
+            assert quoted == ranked, (algorithm, label, quoted, ranked)
+
+    # the headline shape, pinned to its literal value so a change to BOTH sides cannot pass silently.
+    capped = JobSpec.from_dict(
+        {
+            **base,
+            "algorithm": "grpo",
+            "run_id": "q",
+            "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 2},
+        }
+    )
+    assert runconfig_from_spec(capped).normalized().batch_size == 2
+
+
 def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     """The ranking config carries NO provider, so reading it off the config alone was inert.
 

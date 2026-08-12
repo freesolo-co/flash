@@ -227,12 +227,23 @@ def runconfig_from_spec(spec) -> RunConfig:
         completion_len=t.max_completion_tokens if has_rollout else None,
         # RunConfig.batch_size is the cost model's own name for "examples per optimizer update", and
         # each algorithm reaches it by a different key: sft through the measured profile, grpo/opd
-        # straight from prompts_per_step. reading t.batch_size for rl would always find None now and
+        # through the retained-prompt cap. reading t.batch_size for rl would always find None now and
         # silently price the recipe default, ignoring an authored batch.
+        #
+        # the cap matters because the workers apply it: they retain at most `max_examples` rows and
+        # then clamp the batch to what is left, so `prompts_per_step = 128` against `max_examples = 2`
+        # trains on 2. pricing the raw 128 charges a completed or cancelled run for ~64x the work it
+        # performed, and can reject an affordable run on the pre-submit affordability check.
+        # `spec_steps` above already counts steps against the capped batch, so taking it here also
+        # stops one quote from mixing a capped step COUNT with an uncapped per-step PRICE.
         batch_size=(
             profile.examples_per_update
             if profile is not None
-            else (t.prompts_per_step if has_rollout else t.batch_size)
+            else (
+                _on_policy_prompts_per_step(spec, _on_policy_example_count(spec))
+                if has_rollout
+                else t.batch_size
+            )
         ),
         group_size=t.group_size if has_rollout else None,
         lora_rank=t.lora_rank,
