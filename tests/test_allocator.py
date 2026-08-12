@@ -2204,6 +2204,55 @@ def test_exact_pin_on_a_fixed_count_provider_still_names_a_width_to_check():
     assert "`--gpus 4`" in str(combo.value)
 
 
+def test_the_obstacle_never_contradicts_the_remedy_printed_after_it():
+    """Whenever dropping the pin is the fix, the diagnosis must blame the PIN.
+
+    The message states an obstacle and then a remedy in adjacent sentences. Claiming "no available
+    provider is confirmed to sell" this shape while the remedy offers to drop the pin and rent
+    exactly that shape is a self-contradiction: the run is one or two flags from working, not
+    unsellable. The fixed-count catalog wording is only true when nothing behind the pin fits.
+    """
+    from flash.providers.fit_errors import vram_fit_error_message
+
+    def message(need, *, requested, widenable):
+        return vram_fit_error_message(
+            "sft",
+            need,
+            requested_gpu_count=requested,
+            effective_gpu_count=requested,
+            max_gpu_count=8,
+            gpu_names=("H100",),
+            providers=("vast",),
+            widenable_without_pin=widenable,
+        )
+
+    # dropping the pin unlocks a WIDER freely-rented shape: blame the pin, not the market.
+    wider = message(188.0, requested=1, widenable=("H200",))
+    assert "Drop the provider pin" in wider
+    assert "no available provider is confirmed to sell" not in wider
+    assert "the pinned provider is not confirmed to sell" in wider
+
+    # dropping the pin unlocks a bigger card at the SAME count: no width has to change.
+    same = message(100.0, requested=1, widenable=("H200",))
+    assert "Drop the provider pin" in same
+    assert "at 1 card:" in same
+    assert "fits only on a multi-card shape" not in same
+
+    # nothing behind the pin fits: the catalog wording is now the honest diagnosis.
+    catalog = message(188.0, requested=1, widenable=())
+    assert "Drop the provider pin" not in catalog
+    assert "fits only on a multi-card shape" in catalog
+
+    # the invariant itself: a drop-pin remedy never rides a claim that the shape is unsellable
+    # OUTRIGHT. the same-width branch does say "no available provider is confirmed to sell at 1
+    # card", which is compatible with its remedy -- it is scoped to the authored count and the very
+    # next clause names the excluded providers that do sell it. what must never appear alongside a
+    # drop-pin remedy is the unscoped "exists only if their live catalog lists one".
+    for msg in (wider, same, catalog):
+        if "Drop the provider pin" in msg:
+            assert "exists only if their live catalog lists one" not in msg
+
+
 def test_unreachable_class_reports_the_configuration_not_the_vram_shortfall():
     """One root cause must not produce two different errors depending on the run's size.
 

@@ -180,27 +180,33 @@ def vram_fit_error_message(
                 if catalog_width > requested_gpu_count
                 else "Configure a provider that rents card counts directly (RunPod)"
             )
-        # the shape the user must reach is only WIDER when the fitting width exceeds the one they
-        # authored. dropping a pin can instead reveal a BIGGER CARD at the same count (Vast tops out
-        # at 80 GB/card while RunPod has H200/B200), and then "fits only on a multi-card shape"
-        # contradicts the remedy printed right after it, which offers a single-card fallback.
-        fits_at_authored_width = unpinned_width is not None and unpinned_width <= (
-            requested_gpu_count or 0
-        )
-        obstacle = (
-            (
+        # the obstacle must agree with the remedy printed right after it. whenever an unpinned width
+        # exists, the PIN is what blocks the run -- saying "no available provider is confirmed to
+        # sell" contradicts a remedy that offers to drop the pin and rent exactly that shape. only
+        # when nothing behind the pin fits is the fixed-count catalog wording the true diagnosis.
+        if unpinned_width is None:
+            obstacle = (
+                "which fits only on a multi-card shape that no available provider is confirmed to "
+                "sell: they offer fixed card counts as distinct instance types, so a wider shape "
+                "exists only if their live catalog lists one"
+            )
+        elif unpinned_width <= (requested_gpu_count or 0):
+            # dropping the pin reveals a BIGGER CARD at the count already authored (Vast tops out
+            # at 80 GB/card while RunPod has H200/B200), so no width has to change at all.
+            obstacle = (
                 "which no available provider is confirmed to sell at "
                 f"{requested_gpu_count} {'card' if requested_gpu_count == 1 else 'cards'}: the "
                 "pinned provider's largest card is too small, and the classes that would fit are "
                 "sold by providers this pin excludes"
             )
-            if fits_at_authored_width
-            else (
-                "which fits only on a multi-card shape that no available provider is confirmed to "
-                "sell: they offer fixed card counts as distinct instance types, so a wider shape "
-                "exists only if their live catalog lists one"
+        else:
+            # the pinned pool cannot reach it at any purchasable width, but the fleet behind the
+            # pin rents this shape directly -- so the run is two flags from working, not unsellable.
+            obstacle = (
+                f"which needs {unpinned_width} cards that the pinned provider is not confirmed to "
+                "sell: they offer fixed card counts as distinct instance types, while a provider "
+                "this pin excludes rents that shape directly"
             )
-        )
         return (
             f"{algorithm} needs >= {need:g} GB VRAM, {obstacle}. "
             f"{remedy}, or {vram_knob_advice(algorithm)}."
