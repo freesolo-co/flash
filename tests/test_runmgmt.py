@@ -2257,6 +2257,71 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
     assert "persisted spec is malformed" in (status.error or "")
 
 
+def test_recover_runs_fails_a_legacy_workload_profile_run_instead_of_resubmitting_it(
+    monkeypatch, tmp_path
+):
+    # a profile job left in flight by a pre-#1095 plane. its spec still parses, but the job it
+    # describes no longer exists and it carries no accepted sft workload profile, so resubmitting
+    # would rent a gpu only to fail. before the removal, JobSpec.phase reported "profile" and kept
+    # these out of the training path; workload_profile_kind is a dropped key now, so recovery has to
+    # read the marker off the raw record.
+    import flash.providers as providers
+    import flash.runner as runner
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    rid = "recover-legacy-profile"
+    remote = {"provider": "runpod", "endpoint_id": "ep-profile", "attempt": 0}
+    runner._save_status(
+        runner.RunStatus(
+            run_id=rid,
+            state="running",
+            spec=JobSpec(run_id=rid, model="Qwen/Qwen3.5-4B", algorithm="sft").to_dict(),
+            remote=dict(remote),
+        )
+    )
+    # the old plane stamped the marker on the persisted spec; this build's _save_status would drop
+    # it, so write it the way the older plane left it on disk.
+    stored_path = runner.runs_file_path(rid, ".json")
+    with open(stored_path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["workload_profile_kind"] = "sft"
+    with open(stored_path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": rid}])
+    monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(providers, "configured_providers", list)
+    torn: list[tuple[dict, str]] = []
+
+    def fake_teardown(handle, run_id):
+        torn.append((dict(handle), run_id))
+        return True
+
+    monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
+    attached: list[str] = []
+    monkeypatch.setattr(runner, "attach_run", lambda r: attached.append(r))
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    # never reattached, never resubmitted, and the rented worker is released
+    assert attached == []
+    assert torn == [(remote, rid)]
+    status = runner.get_status(rid)
+    assert status.state == "failed"
+    assert "workload-profile job was removed" in (status.error or "")
+
+
 def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):
     # when `_strict_teardown_handle` cannot confirm the delete, the handle is recorded for the
     # cleanup drain -- but this run's drain was already dispatched at the top of the loop and had
