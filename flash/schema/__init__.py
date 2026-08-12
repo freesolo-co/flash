@@ -321,15 +321,18 @@ def _validate_top_level(
     raw: dict[str, Any], project_required: bool
 ) -> tuple[str, str, str, str, bool]:
     """Validate the top-level config section."""
-    if "model_revision" in raw:
+    revision_raw = raw.get("model_revision")
+    # released clients serialize an unpinned spec as model_revision="". tolerate that legacy wire
+    # artifact, including whitespace-only strings, while continuing to reject every authored pin.
+    if "model_revision" in raw and (not isinstance(revision_raw, str) or revision_raw.strip()):
         raise ConfigError(
             "config key `model_revision` was removed because Flash-managed serving loads a "
             "pre-quantized FP8 checkpoint resolved per base model, so it cannot honor an arbitrary "
-            "upstream commit and an authored pin made the run undeployable. If you need a fixed "
-            f"upstream base, use `{CLI_NAME} models export`; the exported adapter records Flash's "
-            "resolved base revision for Hugging Face loading."
+            "upstream commit and an authored pin made the run undeployable. Remove the key. "
+            f"`{CLI_NAME} models export` publishes the adapter, but for a fresh GRPO or OPD run it "
+            "does not turn the moving upstream default into a fixed base revision."
         )
-    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
+    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS - {"model_revision"})
     if unknown:
         hint = ""
         if {"grpo", "sft", "opd"} & set(unknown):

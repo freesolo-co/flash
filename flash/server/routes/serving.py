@@ -256,12 +256,14 @@ def _validate_deploy_request(
     # from one, permanently undeployable, which also blocks `flash models chat` and `flash env eval`,
     # since both require a deployment.
     #
-    # provenance is read from the INTERNAL worker spec, not `spec`: to_dict() strips the marker and
-    # revision from new public specs. `_internal_spec_from_status` prefers the persisted worker spec
-    # and falls back to the public one, which reads False for pre-upgrade runs without provenance.
-    # Those historical authored pins must keep failing closed.
-    auto_pinned = _internal_spec_from_status(status).model_revision_auto
-    if spec.model_revision and not auto_pinned:
+    # provenance and the pin are read from the INTERNAL worker spec, not `spec`: to_dict() strips both
+    # from new public specs. that includes a new child inheriting a legacy authored source pin, which
+    # must remain rejected just like its parent. `_internal_spec_from_status` falls back to the public
+    # spec for pre-upgrade runs without a worker snapshot, so historical authored pins also fail closed.
+    internal_spec = _internal_spec_from_status(status)
+    if (
+        spec.model_revision or internal_spec.model_revision
+    ) and not internal_spec.model_revision_auto:
         raise HTTPException(
             status_code=400,
             detail=(

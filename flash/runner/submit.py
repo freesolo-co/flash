@@ -45,7 +45,7 @@ def prepare_job(
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
     # before _resolve_model_revision, and before every sizing step below: a warm start inherits its
-    # source's runner-assigned pin, and `resolve_model`/`_with_model_disk` size against whatever
+    # source's pin and provenance, and `resolve_model`/`_with_model_disk` size against whatever
     # revision the spec carries by then.
     spec = _runner()._inherit_warmstart_revision(
         spec,

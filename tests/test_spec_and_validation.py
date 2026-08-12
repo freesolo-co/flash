@@ -1194,16 +1194,19 @@ def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
         _job_from_dict({"gpu": {"type": "RTX A6000"}})
 
 
-def test_removed_model_revision_config_key_has_targeted_remedy() -> None:
+def test_removed_model_revision_config_key_tolerates_only_the_legacy_blank_wire_value() -> None:
     message = (
         "config key `model_revision` was removed because Flash-managed serving loads a "
         "pre-quantized FP8 checkpoint resolved per base model, so it cannot honor an arbitrary "
-        "upstream commit and an authored pin made the run undeployable. If you need a fixed "
-        "upstream base, use `flash models export`; the exported adapter records Flash's resolved "
-        "base revision for Hugging Face loading."
+        "upstream commit and an authored pin made the run undeployable. Remove the key. "
+        "`flash models export` publishes the adapter, but for a fresh GRPO or OPD run it does not "
+        "turn the moving upstream default into a fixed base revision."
     )
 
-    for value in ("main", "", None, 123, False, ["main"], {"revision": "main"}):
+    for value in ("", "   \t"):
+        assert spec_from_dict(_raw(model_revision=value)).model_revision == ""
+
+    for value in ("main", " refs/pr/123 ", None, 123, False, ["main"], {"revision": "main"}):
         with pytest.raises(ConfigError) as exc_info:
             spec_from_dict(_raw(model_revision=value))
         assert str(exc_info.value) == message

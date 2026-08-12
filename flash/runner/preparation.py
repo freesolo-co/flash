@@ -50,18 +50,21 @@ def _require_supported_adapter_continuation(spec: JobSpec) -> None:
 
 
 def _adopted_warmstart_revision(spec: JobSpec, src_spec: JobSpec) -> JobSpec:
-    """Take the warm-start source's pin when the runner, not the author, chose it.
+    """Take the warm-start source's pin and preserve who chose it.
 
-    SFT is always force-pinned by ``_resolve_model_revision(required=True)``, and the warm-start
-    check demands the child's revision equal the source's. Satisfying it meant the AUTHOR writing
-    the sha into rl.toml, which makes the child's pin author-supplied, which deploy refuses. So a
-    warm start off SFT could pass that check or be deployable, never both. Inheriting the pin AND
-    its provenance gives the child the same immutable base its parent trained against and keeps it
-    deployable for the same reason the parent is.
+    The child must train against the exact immutable base its source adapter used. For an SFT source,
+    the runner chose the pin, so inheriting ``model_revision_auto=True`` keeps the child deployable.
+    A pre-removal source may instead carry an author-supplied pin; the removed public key means the
+    child cannot repeat it, so it inherits that pin with ``model_revision_auto=False`` and remains
+    rejected at deploy for the same reason as its parent.
     """
-    if spec.model_revision or not src_spec.model_revision or not src_spec.model_revision_auto:
+    if spec.model_revision or not src_spec.model_revision:
         return spec
-    return replace(spec, model_revision=src_spec.model_revision, model_revision_auto=True)
+    return replace(
+        spec,
+        model_revision=src_spec.model_revision,
+        model_revision_auto=src_spec.model_revision_auto,
+    )
 
 
 def _warmstart_source_is_authorized(
@@ -92,7 +95,7 @@ def _inherit_warmstart_revision(
     owner_org_id: str = "",
     owner_key_id: int | None = None,
 ) -> JobSpec:
-    """Adopt a warm-start source's runner-assigned pin BEFORE the spec is sized against it.
+    """Adopt a warm-start source's pin BEFORE the spec is sized against it.
 
     Sizing reads the revision: ``resolve_model`` re-derives params/vocab/disk from the pinned
     commit's geometry, and ``min_disk_gb`` becomes ``params_b * 2 + 64``, which for half of today's
@@ -490,13 +493,14 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         "workload_profile",
     ):
         effective[managed_top] = public.get(managed_top)
-    # the pin VALUE travels with its marker: `to_dict()` drops a runner-assigned revision so the
-    # public spec cannot advertise a SHA it has no way to label, which leaves the halves legitimately
-    # asymmetric. exclude the value only in that case -- an AUTHORED pin is still compared, so a
-    # tampered authored revision keeps failing here. the auto-pinned value is not left unguarded:
-    # it is hashed into the preparation digest, and `effective_spec_from_status` now verifies that
-    # digest whenever the marker is set.
-    if worker_spec.model_revision_auto and not public.get("model_revision"):
+    # the pin value is stripped from every new public spec. a runner-assigned pin is asymmetric by
+    # design, as is an authored pin inherited by a new warm-start child after the public key's removal.
+    # exclude those two cases only. a historical authored source still carries its public revision and
+    # remains structurally compared. both asymmetric shapes are digest-protected: the marker triggers
+    # verification for auto pins, and every warm start verifies its complete preparation snapshot.
+    if not public.get("model_revision") and (
+        worker_spec.model_revision_auto or public.get("train", {}).get("init_from_adapter")
+    ):
         effective["model_revision"] = public.get("model_revision")
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])
