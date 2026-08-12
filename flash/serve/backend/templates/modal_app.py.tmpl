@@ -64,7 +64,13 @@ CACHE_MOUNT = "/vol/flash-serving"
 ADAPTER_DIR = f"{{CACHE_MOUNT}}/adapters"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    # A CUDA *devel* base, not debian_slim: vLLM's FlashInfer sampler JIT-COMPILES a kernel during
+    # engine init, so the container needs `nvcc` and a toolchain at RUNTIME, not just at build time.
+    # Without them init dies with "Could not find nvcc and default cuda_home='/usr/local/cuda'
+    # doesn't exist" -- after the weights have loaded and the model has compiled, so it reads as a
+    # mid-boot crash rather than a missing dependency. This is the image Freesolo runs in production.
+    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
+    .apt_install("build-essential", "git", "ninja-build")
     .pip_install(
         f"vllm=={{VLLM_VERSION}}",
         "fastapi[standard]",
@@ -82,6 +88,9 @@ image = (
             # Let the CUDA allocator grow allocations instead of fragmenting into small blocks.
             # Multi-LoRA load/unload creates exactly that allocation pressure.
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            # MoE only, and harmless elsewhere: keep the FP8 fused-MoE backend off the DeepGEMM
+            # path, which crash-looped the MoE model in production. `auto` picks a working one.
+            "VLLM_MOE_USE_DEEP_GEMM": "0",
         }}
     )
 )

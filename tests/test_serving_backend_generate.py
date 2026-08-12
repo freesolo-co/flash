@@ -275,3 +275,27 @@ def test_durable_state_is_read_and_written_without_blocking_the_event_loop(model
         if "adapter_records." in line and not line.lstrip().startswith("#") and ".aio" not in line
     ]
     assert not blocking, f"blocking Dict calls: {blocking}"
+
+
+@pytest.mark.parametrize("model_id", _MODEL_IDS)
+def test_image_carries_the_cuda_toolchain_the_engine_jits_against(model_id):
+    """vLLM's FlashInfer sampler JIT-compiles a kernel during engine init, so the RUNTIME container
+    needs nvcc and a toolchain.
+
+    Caught on a real Modal deploy: on `debian_slim` the weights loaded, the model compiled, and then
+    init died with "Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist" --
+    late enough to read as a mid-boot crash rather than a missing dependency, and invisible to any
+    test that stubs the GPU.
+    """
+    source = render_app(MODELS[model_id])
+    # on the AST, so the comment explaining why debian_slim is wrong is not read as the defect
+    called = {
+        node.func.attr
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "debian_slim" not in called
+    assert "from_registry" in called
+    assert "nvidia/cuda:12.8.0-devel-ubuntu22.04" in source
+    for tool in ("build-essential", "ninja-build"):
+        assert tool in source, tool

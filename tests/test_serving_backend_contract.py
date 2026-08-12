@@ -140,8 +140,15 @@ def _stub_modal(monkeypatch, engine_methods):
 
     class _Image(_Named):
         @classmethod
+        def from_registry(cls, *args, **kwargs):
+            return cls()
+
+        @classmethod
         def debian_slim(cls, *args, **kwargs):
             return cls()
+
+        def apt_install(self, *args, **kwargs):
+            return self
 
         def pip_install(self, *args, **kwargs):
             return self
