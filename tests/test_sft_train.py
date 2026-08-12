@@ -1745,6 +1745,21 @@ def _stub_sft_run(
 
     monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
 
+    # the fake run_verl_training each test supplies never executes the rendered sitecustomize, so
+    # stand in for the child's marker writes: record every expected fragment as applied. the real
+    # verifier still runs against this file, so a test that wants the missing-marker failure
+    # restores the real _prepare_sft_child.
+    real_prepare_child = sft_train._prepare_sft_child
+
+    def prepare_child_with_applied_shims(*args, **kwargs):
+        child = real_prepare_child(*args, **kwargs)
+        with open(child.shim_markers, "w", encoding="utf-8") as handle:
+            handle.write("".join(name + "\n" for name in child.expected_shims))
+        captured["child"] = child
+        return child
+
+    monkeypatch.setattr(sft_train, "_prepare_sft_child", prepare_child_with_applied_shims)
+
     return spec, captured
 
 

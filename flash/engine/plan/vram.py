@@ -562,6 +562,31 @@ def _sizing_value(obj, key):
     return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
 
 
+def _optimizer_batch_value(train, algorithm: str):
+    """Return the authored optimizer batch under whichever key this algorithm accepts.
+
+    The optimizer batch is one sizing input here but two config keys: sft authors `batch_size`,
+    grpo/opd author `prompts_per_step`, and the schema rejects each name under the other algorithm.
+    Reading only `batch_size` therefore sized every rl run on the recipe default no matter what the
+    user wrote, because an rl spec's `batch_size` is always None -- so a wide `prompts_per_step`
+    silently under-provisioned the card instead of escalating it.
+
+    Sizing runs before the train validators, so a spec carrying both keys cannot be assumed
+    rejected yet; take the larger rather than trusting one, since under-sizing is the failure that
+    OOMs a paid run and over-sizing only costs a bigger card.
+    """
+    from flash.core.catalog import optimizer_batch_key
+
+    # the algorithm's OWN key comes from the one helper the writers use too (`RunConfig.train_knobs`
+    # emits under it, ranking reads under it), so the read and write sides cannot drift apart.
+    own = optimizer_batch_key(algorithm)
+    names = (own, "batch_size") if own != "batch_size" else ("batch_size",)
+    values = [
+        v for v in (_positive_int_or_default(_sizing_value(train, n), None) for n in names) if v
+    ]
+    return max(values) if values else None
+
+
 def _positive_int_or_default(v, default):
     """Return a positive integer or the provided fallback."""
     try:
@@ -828,11 +853,7 @@ def model_required_vram_gb(
         batch_size_default = _sft_per_device_bs()
         group_size_default = 8
     group_size = _positive_int_or_default(_sizing_value(train, "group_size"), group_size_default)
-    from flash.core.catalog import optimizer_batch_key
-
-    batch_size = _positive_int_or_default(
-        _sizing_value(train, optimizer_batch_key(_algo)), batch_size_default
-    )
+    batch_size = _positive_int_or_default(_optimizer_batch_value(train, _algo), batch_size_default)
 
     from flash.core.catalog import MODELS, vocab_size_for
 

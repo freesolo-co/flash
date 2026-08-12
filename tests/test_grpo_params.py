@@ -418,7 +418,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
     # omitted optimizer knobs stay None so the worker applies its recipe defaults
     bare = spec_from_dict({**raw, "train": {"max_examples": 8}}, run_id="grpo-w")
     assert bare.train.learning_rate is None
-    assert bare.train.batch_size is None
+    assert bare.train.prompts_per_step is None
     assert bare.train.stop_sequences == ()
     # a bare-string stop_sequences is ONE stop, never split into characters
     one = spec_from_dict(
