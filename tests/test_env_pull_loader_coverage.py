@@ -198,6 +198,30 @@ def test_parse_github_ref_from_https_urls():
     assert loader._parse_github_environment_ref("https://github.com/owner") is None
 
 
+def test_managed_hub_package_root_is_one_environment_not_the_project():
+    """The package root is `<org>/<project>/<name>`, the directory of a single environment.
+
+    `<org>/<project>` is the project directory holding every environment the project has
+    published, and the package root is what gets downloaded and copied into the cache, so
+    stopping a segment short fetches all of a project's environments to import one.
+    """
+    ref = loader._parse_github_environment_ref(
+        loader.managed_slug_to_github_ref("acme/checkout-bot/math")
+    )
+    assert ref.path == "acme/checkout-bot/math/environment.py"
+    assert loader._managed_hub_package_root(ref) == "acme/checkout-bot/math"
+
+    # A managed ref that stops at the project has no environment to root on.
+    two_segment = loader._parse_github_environment_ref(
+        "github:freesolo-co/environment-hub@main:acme/environment.py"
+    )
+    assert loader._managed_hub_package_root(two_segment) == ""
+
+    # Outside the managed hub the layout is the user's own, so there is no root to derive.
+    foreign = loader._parse_github_environment_ref("github:owner/repo@main:a/b/c/environment.py")
+    assert loader._managed_hub_package_root(foreign) == ""
+
+
 def test_resolve_path_arg_variants(tmp_path):
     # Non-string / empty values pass through unchanged.
     assert loader._resolve_path_arg(123, tmp_path) == 123
