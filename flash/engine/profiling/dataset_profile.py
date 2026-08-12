@@ -30,6 +30,8 @@ from flash.envs.loader import _load_contract_text, _resolve_environment_referenc
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
 _MAX_PROFILE_DATASET_BYTES = 32 * 1024 * 1024
+# the contract rides in every row, so it is bounded far tighter than the dataset that carries it.
+_MAX_PROFILE_CONTRACT_BYTES = 256 * 1024
 
 
 class PackagedDatasetUnavailable(ValueError):
@@ -121,9 +123,12 @@ def _copied_messages(value: object, *, field: str) -> list[dict[str, Any]]:
 
 
 def _contract_text(base_dir: Path, params: dict[str, Any]) -> str:
+    # the contract is rendered into the system turn of EVERY selected row, so its size is
+    # multiplied across the dataset before tokenization. the package allows far more than the
+    # plane should hold, and unlike the dataset file this text has no other bound.
     authored = params.get("contract_text")
     if authored:
-        return str(authored)
+        return _bounded_contract_text(str(authored), source="[environment.params] contract_text")
     configured_path = params.get("contract_path")
     contract_path = _resolve_path_arg(configured_path, base_dir)
     if not isinstance(contract_path, str):
@@ -138,7 +143,27 @@ def _contract_text(base_dir: Path, params: dict[str, Any]) -> str:
             f"[environment.params] contract_path {configured_path!r} is outside the environment "
             "package. Package the contract file with the environment."
         )
-    return str(_load_contract_text(contract_path))
+    try:
+        oversized = path.is_file() and path.stat().st_size > _MAX_PROFILE_CONTRACT_BYTES
+    except OSError:
+        oversized = False
+    if oversized:
+        raise PackagedDatasetUnavailable(
+            f"environment training contract {path.name!r} exceeds the "
+            f"{_MAX_PROFILE_CONTRACT_BYTES // 1024} KiB control-plane profiling limit. Shorten the "
+            "packaged training contract."
+        )
+    return _bounded_contract_text(str(_load_contract_text(contract_path)), source=path.name)
+
+
+def _bounded_contract_text(text: str, *, source: str) -> str:
+    if len(text.encode("utf-8", errors="ignore")) > _MAX_PROFILE_CONTRACT_BYTES:
+        raise PackagedDatasetUnavailable(
+            f"environment training contract {source!r} exceeds the "
+            f"{_MAX_PROFILE_CONTRACT_BYTES // 1024} KiB control-plane profiling limit. Shorten the "
+            "training contract."
+        )
+    return text
 
 
 def _selected_dataset_path(base_dir: Path, params: dict[str, Any]) -> Path:

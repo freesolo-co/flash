@@ -356,6 +356,28 @@ def test_profile_prices_the_training_contract_as_the_system_prompt(tmp_path) -> 
     assert long_contract.real_tokens_per_epoch > short.real_tokens_per_epoch
 
 
+def test_profile_refuses_an_oversized_packaged_contract(tmp_path) -> None:
+    # the contract is rendered into every row's system turn, so an unbounded one is multiplied
+    # across the dataset inside the shared plane process.
+    entrypoint = _package(
+        tmp_path,
+        {
+            "dataset/train.jsonl": '{"input":"a","output":"b"}\n',
+            "TRAINING_CONTRACT.md": "x" * (256 * 1024 + 1),
+        },
+    )
+
+    with pytest.raises(PackagedDatasetUnavailable, match="control-plane profiling limit"):
+        _profile(entrypoint)
+
+
+def test_profile_refuses_an_oversized_authored_contract(tmp_path) -> None:
+    entrypoint = _package(tmp_path, {"dataset/train.jsonl": '{"input":"a","output":"b"}\n'})
+
+    with pytest.raises(PackagedDatasetUnavailable, match="control-plane profiling limit"):
+        _profile(entrypoint, params={"contract_text": "x" * (256 * 1024 + 1)})
+
+
 def test_profile_rejects_dataset_path_outside_the_package(tmp_path) -> None:
     outside = tmp_path / "outside.jsonl"
     outside.write_text('{"input":"outside","output":"no"}\n', encoding="utf-8")
