@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shlex
 
 import pytest
 
@@ -81,25 +82,33 @@ def _is_same_path(left, right) -> bool:
         return left == right
 
 
-def _trust_failure_text(exc) -> str:
-    """The trust-check message inside ``exc``, or "" if there is none.
+def _trust_failure_texts(exc) -> list[str]:
+    """Every trust-check message inside ``exc``, outermost first.
 
     A fixture finalizer that raises alongside another one does not reach the hook as itself:
     pytest bundles teardown errors into a ``BaseExceptionGroup`` whose ``str()`` is only
     ``errors while tearing down <Function ...> (2 sub-exceptions)`` -- the trust message is in a
     member, not the summary. Matching on the top-level text alone therefore drops the diagnostic
     for exactly the multi-finalizer teardown this hook claims to cover. Recurse; groups nest.
+
+    ALL of them, not the first: two finalizers can each hit the trust check for different reasons,
+    one on a directory the test made unsafe on purpose and one on the temp root's own ancestor.
+    Stopping at the first would let the deliberate failure hide the actionable one, which is the
+    same silence this hook exists to end -- so the caller tests each message and uses any that
+    passes the causality checks.
     """
     if isinstance(exc, BaseExceptionGroup):
-        for member in exc.exceptions:
-            found = _trust_failure_text(member)
-            if found:
-                return found
-        return ""
+        return [text for member in exc.exceptions for text in _trust_failure_texts(member)]
     text = str(exc)
-    if "env cache root ancestor" in text and "sticky bit" in text:
-        return text
-    return ""
+    return [text] if "env cache root ancestor" in text and "sticky bit" in text else []
+
+
+def _blames_the_temp_root(text: str, base, ancestor) -> bool:
+    """True when THIS refusal is the temp root's fault: refused root inside it, and same ancestor."""
+    failing_root, blamed = _failing_cache_root(text), _named_ancestor(text)
+    if failing_root is None or not _is_within(failing_root, base):
+        return False
+    return blamed is not None and _is_same_path(blamed, ancestor)
 
 
 def _untrusted_tmpdir_ancestor(base):
@@ -156,8 +165,8 @@ def pytest_runtest_makereport(item, call):
     excinfo = getattr(call, "excinfo", None)
     if excinfo is None:
         return
-    text = _trust_failure_text(excinfo.value)
-    if not text:
+    texts = _trust_failure_texts(excinfo.value)
+    if not texts:
         return
     # a diagnostic must never be able to replace the failure it is explaining. `getbasetemp()`
     # CREATES the root on first call, so a failure that happened before any `tmp_path` fixture ran
@@ -186,19 +195,20 @@ def pytest_runtest_makereport(item, call):
     #
     # requiring the refused root to be under the temp tree AND the blamed ancestor to be the temp
     # root's own leaves only the case where the temp root is genuinely why the check refused.
-    failing_root, blamed = _failing_cache_root(text), _named_ancestor(text)
-    if failing_root is None or not _is_within(failing_root, base):
-        return
-    if blamed is None or not _is_same_path(blamed, ancestor):
+    if not any(_blames_the_temp_root(text, base, ancestor) for text in texts):
         return
     # `chmod +t` on the offending ancestor is the only fix that always works. moving the temp root
     # to a private directory does NOT, if that directory is still under the same bad ancestor --
     # every parent is checked, so 0700 below a 0775 parent fails identically. say "outside", not
     # "private".
+    #
+    # shell-quoted: a temp root under a directory with a space is ordinary, and `chmod +t /tmp/team
+    # temp` silently addresses two paths that do not exist. this line is meant to be pasted.
+    quoted = shlex.quote(str(ancestor))
     detail = (
         f"pytest's temp root is {base}, and its ancestor {ancestor} is group/other-writable "
         f"without the sticky bit (mode {mode:04o}), which the env cache trust checks refuse. "
-        f"fix with `chmod +t {ancestor}`, or {_temp_root_lever(item.config)} -- one whose whole "
+        f"fix with `chmod +t {quoted}`, or {_temp_root_lever(item.config)} -- one whose whole "
         f"parent chain is trusted, so not another directory under {ancestor}."
     )
     report.sections.append(("the temp dir, not the code under test, caused this", detail))
