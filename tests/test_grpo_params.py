@@ -400,7 +400,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "gpu": {},
         "train": {
             "learning_rate": 3e-5,
-            "batch_size": 16,
+            "prompts_per_step": 16,
             "max_context_tokens": 2048,
             "save_every": 5,
             "max_completion_tokens": 512,
@@ -410,7 +410,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
     spec = spec_from_dict(raw, run_id="grpo-z")
     for s in (spec, JobSpec.from_dict(spec.to_dict())):  # server parse + worker re-parse
         assert s.train.learning_rate == 3e-5
-        assert s.train.batch_size == 16
+        assert s.train.prompts_per_step == 16
         assert s.train.max_context_tokens == 2048
         assert s.train.save_every == 5
         assert s.train.max_completion_tokens == 512
@@ -418,7 +418,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
     # omitted optimizer knobs stay None so the worker applies its recipe defaults
     bare = spec_from_dict({**raw, "train": {"max_examples": 8}}, run_id="grpo-w")
     assert bare.train.learning_rate is None
-    assert bare.train.batch_size is None
+    assert bare.train.prompts_per_step is None
     assert bare.train.stop_sequences == ()
     # a bare-string stop_sequences is ONE stop, never split into characters
     one = spec_from_dict(
