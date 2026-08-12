@@ -1984,6 +1984,39 @@ def test_worker_uses_the_accepted_unpacked_quote_when_its_stack_can_pack(monkeyp
     assert model.update_horizon == data.profile.authoritative_steps
 
 
+def test_the_child_caps_at_the_quoted_horizon_without_an_authored_max_steps(monkeypatch):
+    """the accepted step count binds even when the user never authored max_steps.
+
+    the plane profiles raw records without running environment.py, so an environment that expands
+    the rows makes the realized epoch longer than the quote assumed. verl stops at
+    total_training_steps, so leaving it unset would run past the horizon the run was priced for.
+    """
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    # the shared fixture authors max_steps; this test is about the path where the user did not.
+    spec.train.max_steps = 0
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    assert options.max_steps <= 0
+
+    data = sft_train_runner._prepare_sft_data(options)
+    model = sft_train_runner._prepare_sft_model(options, data)
+    capabilities = sft_train_runner._SftCapabilities(
+        python_bin="/venv/bin/python", caps={}, gdn_hybrid=False, gdn_module=""
+    )
+    child = sft_train_runner._prepare_sft_child(options, data, model, capabilities, True, None)
+
+    # the horizon reaches verl as a rendered hydra override, so assert on what the child is
+    # actually launched with rather than an intermediate dict. before this cap it rendered as
+    # null whenever the user left max_steps unauthored, leaving the realized epoch as the only
+    # bound; verl stops at whichever of the two limits it reaches first.
+    horizon = data.profile.authoritative_steps
+    assert f"trainer.total_training_steps={horizon}" in child.command
+    assert "trainer.total_training_steps=null" not in child.command
+
+
 def test_a_packed_quote_fails_closed_when_environment_filtering_leaves_less_than_one_batch(
     monkeypatch,
 ):

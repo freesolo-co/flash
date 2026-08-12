@@ -570,8 +570,14 @@ def _prepare_sft_child(
         **_sft_train._sft_liger_config(),
         "gradient_checkpointing": model.gradient_checkpointing
         and not model.reentrant_gradient_checkpointing,
-        "total_training_steps": model.update_horizon if options.max_steps > 0 else None,
-        "total_epochs": options.epochs if options.max_steps <= 0 else None,
+        # the accepted quote's step count binds whether or not the user authored max_steps. the
+        # plane profiles raw records without running environment.py, so an environment that expands
+        # or replaces rows makes steps_per_epoch larger than the quote assumed; without an explicit
+        # cap the loop would run a full realized epoch past the horizon the run was priced and
+        # wall-budgeted for. build_sft_overrides rejects setting both, so the horizon replaces the
+        # epoch count rather than joining it -- loop_epochs already covers the authored epochs.
+        "total_training_steps": model.update_horizon,
+        "total_epochs": None,
         "use_remove_padding": use_remove_padding,
         # resolved from the out-of-process capability probe, never by opening cuda in this parent.
         "fused_ce_backend": _sft_train._resolve_sft_fused_ce_backend(capabilities.caps),

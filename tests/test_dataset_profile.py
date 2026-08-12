@@ -371,6 +371,16 @@ def test_profile_refuses_an_oversized_packaged_contract(tmp_path) -> None:
         _profile(entrypoint)
 
 
+def test_profile_refuses_oversized_inline_records(tmp_path) -> None:
+    # inline records bypass the packaged-file size guard: they arrive in the request body.
+    entrypoint = _package(tmp_path, {})
+    row = {"input": "x" * 4096, "output": "y"}
+    records = [dict(row) for _ in range(32 * 1024 * 1024 // 4096 + 8)]
+
+    with pytest.raises(PackagedDatasetUnavailable, match="control-plane profiling limit"):
+        _profile(entrypoint, params={"records": records})
+
+
 def test_profile_refuses_an_oversized_authored_contract(tmp_path) -> None:
     entrypoint = _package(tmp_path, {"dataset/train.jsonl": '{"input":"a","output":"b"}\n'})
 

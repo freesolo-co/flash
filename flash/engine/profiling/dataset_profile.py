@@ -156,6 +156,19 @@ def _contract_text(base_dir: Path, params: dict[str, Any]) -> str:
     return _bounded_contract_text(str(_load_contract_text(contract_path)), source=path.name)
 
 
+def _reject_oversized_records(records: object) -> None:
+    try:
+        encoded = len(json.dumps(records, default=str).encode("utf-8", errors="ignore"))
+    except (TypeError, ValueError):
+        return
+    if encoded > _MAX_PROFILE_DATASET_BYTES:
+        raise PackagedDatasetUnavailable(
+            "[environment.params] records exceed the "
+            f"{_MAX_PROFILE_DATASET_BYTES // (1024 * 1024)} MiB control-plane profiling limit. "
+            "Package the dataset as dataset/train.jsonl instead of inlining it."
+        )
+
+
 def _bounded_contract_text(text: str, *, source: str) -> str:
     if len(text.encode("utf-8", errors="ignore")) > _MAX_PROFILE_CONTRACT_BYTES:
         raise PackagedDatasetUnavailable(
@@ -318,6 +331,10 @@ def profile_packaged_sft_dataset(
     records = params.pop("records", None)
     max_examples = int(spec.train.max_examples or 0)
     if records is not None:
+        # inline records arrive in the request body rather than the package, so the packaged-file
+        # size guard never sees them. bound them by the same limit before anything is copied or
+        # tokenized in the shared plane process.
+        _reject_oversized_records(records)
         selection = select_dataset_source(params, base_dir, records, _resolve_path_arg)
         source_examples, rows = _validate_dataset_rows(
             selection.source,
