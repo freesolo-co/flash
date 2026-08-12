@@ -83,7 +83,10 @@ def _resolve_opd_knobs() -> OpdKnobs:
         ),
         top_p=d.sampling_top_p,
         max_completion=opd_completion_len(opt("max_completion_tokens", 0), _w.THINKING),
-        prompts_per_step=int(opt("batch_size", 0) or d.prompts_per_step),
+        # reads prompts_per_step, NOT batch_size: opd rejects batch_size at parse time, so an opd
+        # spec carries the optimizer batch only under this key. reading the old name found None on
+        # every run and trained the recipe default no matter what the user authored.
+        prompts_per_step=int(opt("prompts_per_step", 0) or d.prompts_per_step),
         group_size=int(opt("group_size", 0) or d.group_size),
         kl_coef=kl_coef,
         save_every=int(opt("save_every", 0) or 20),

@@ -415,7 +415,7 @@ class _QuotableTrain(_Train):
     """`_Train` plus the fields the quote path reads. Kept separate so the digest tests above keep
     exercising the minimal spec surface they were written against."""
 
-    batch_size = 8
+    prompts_per_step = 8
     lora_rank = 32
     save_at_steps: ClassVar[list] = []
 

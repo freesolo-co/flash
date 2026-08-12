@@ -15,6 +15,9 @@ _BASE_OVERHEAD_GB = 4.0
 _ACT_COEF = 0.12
 _SFT_PER_DEVICE_BS_DEFAULT = 4
 _VOCAB_DEFAULT = 248_320
+# algorithms that author the optimizer batch as `prompts_per_step`. "rl" is the legacy spelling of
+# grpo this module already accepts everywhere else it branches on the algorithm.
+_ROLLOUT_ALGOS = frozenset({"grpo", "rl", "opd"})
 # must track verl's `FusedLinearForPPO(chunk_size=...)` default
 # (verl/utils/experimental/torch_functional.py). the child projects the vocab in chunks of this
 # many token rows, so a smaller value here under-reserves and admits a job that then OOMs.
@@ -562,6 +565,26 @@ def _sizing_value(obj, key):
     return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
 
 
+def _optimizer_batch_value(train, algorithm: str):
+    """Return the authored optimizer batch under whichever key this algorithm accepts.
+
+    The optimizer batch is one sizing input here but two config keys: sft authors `batch_size`,
+    grpo/opd author `prompts_per_step`, and the schema rejects each name under the other algorithm.
+    Reading only `batch_size` therefore sized every rl run on the recipe default no matter what the
+    user wrote, because an rl spec's `batch_size` is always None -- so a wide `prompts_per_step`
+    silently under-provisioned the card instead of escalating it.
+
+    Sizing runs before the train validators, so a spec carrying both keys cannot be assumed
+    rejected yet; take the larger rather than trusting one, since under-sizing is the failure that
+    OOMs a paid run and over-sizing only costs a bigger card.
+    """
+    names = ("prompts_per_step", "batch_size") if algorithm in _ROLLOUT_ALGOS else ("batch_size",)
+    values = [
+        v for v in (_positive_int_or_default(_sizing_value(train, n), None) for n in names) if v
+    ]
+    return max(values) if values else None
+
+
 def _positive_int_or_default(v, default):
     """Return a positive integer or the provided fallback."""
     try:
@@ -828,7 +851,7 @@ def model_required_vram_gb(
         batch_size_default = _sft_per_device_bs()
         group_size_default = 8
     group_size = _positive_int_or_default(_sizing_value(train, "group_size"), group_size_default)
-    batch_size = _positive_int_or_default(_sizing_value(train, "batch_size"), batch_size_default)
+    batch_size = _positive_int_or_default(_optimizer_batch_value(train, _algo), batch_size_default)
 
     from flash.core.catalog import MODELS, vocab_size_for
 
