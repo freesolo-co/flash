@@ -141,10 +141,10 @@ def managed_slug_to_github_ref(value: str) -> str:
     parsed = _parse_managed_environment_slug(value)
     if parsed is None:
         raise ValueError(f"not a Freesolo environment slug: {value!r}")
-    namespace, name = parsed
+    namespace, project, name = parsed
     return (
         f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
-        f"{namespace}/{name}/{_DEFAULT_ENVIRONMENT_PATH}"
+        f"{namespace}/{project}/{name}/{_DEFAULT_ENVIRONMENT_PATH}"
     )
 
 
@@ -163,12 +163,12 @@ def canonical_managed_environment_slug(value: str) -> str | None:
     parts = parsed.path.split("/")
     if (
         parsed.ref != _DEFAULT_GITHUB_REF
-        or len(parts) != 3
-        or parts[2] != _DEFAULT_ENVIRONMENT_PATH
-        or not _is_safe_github_path_parts(tuple(parts[:2]))
+        or len(parts) != 4
+        or parts[3] != _DEFAULT_ENVIRONMENT_PATH
+        or not _is_safe_github_path_parts(tuple(parts[:3]))
     ):
         raise ValueError(_managed_environment_ref_error())
-    return "/".join(parts[:2])
+    return "/".join(parts[:3])
 
 
 def _targets_managed_environment_repo(value: str) -> bool:
@@ -184,11 +184,16 @@ def _managed_environment_ref_error() -> str:
     return (
         "managed environment GitHub reference must be "
         f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
-        f"<namespace>/<name>/{_DEFAULT_ENVIRONMENT_PATH}"
+        f"<namespace>/<project>/<name>/{_DEFAULT_ENVIRONMENT_PATH}"
     )
 
 
-def _parse_managed_environment_slug(value: str) -> tuple[str, str] | None:
+def _parse_managed_environment_slug(value: str) -> tuple[str, str, str] | None:
+    """Split a managed env id into ``(namespace, project, name)``.
+
+    Environment names are unique per PROJECT, so the owning project is part of the identity and
+    of the hub directory path: ``<org-slug>/<project-slug>/<name>``.
+    """
     text = (value or "").strip()
     if not text or ":" in text:
         return None
@@ -196,9 +201,9 @@ def _parse_managed_environment_slug(value: str) -> tuple[str, str] | None:
     if parsed.scheme or parsed.netloc:
         return None
     parts = text.split("/")
-    if len(parts) != 2 or not _is_safe_github_path_parts(tuple(parts)):
+    if len(parts) != 3 or not _is_safe_github_path_parts(tuple(parts)):
         return None
-    return parts[0], parts[1]
+    return parts[0], parts[1], parts[2]
 
 
 def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
@@ -808,7 +813,7 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     package_root = _managed_hub_package_root(parsed)
     if parsed.repo_full_name.lower() == _DEFAULT_MANAGED_ENV_REPO.lower() and not package_root:
         raise ValueError(
-            "managed environment hub refs must include a namespace/name environment path"
+            "managed environment hub refs must include a namespace/project/name environment path"
         )
     cache_scope = "managed-hub" if package_root else "github"
     cache_key = hashlib.sha256(

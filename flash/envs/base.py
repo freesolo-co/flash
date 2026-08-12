@@ -151,7 +151,7 @@ class BaseEnvironment:
         return bool(gold) and gold in (completion or "")
 
 
-FREESOLO_WORKER_SPEC = "freesolo>=0.4.0"
+FREESOLO_WORKER_SPEC = "freesolo>=0.4.1"
 
 
 def worker_pip_for_env(env_id: str) -> list[str]:
@@ -186,7 +186,7 @@ def load_environment(
         raise ValueError(
             "no environment specified: set [environment] id to the id returned by "
             f"`{CLI_NAME} env push --project <project-uuid> --name <name>` "
-            "(for example 'your-name/your-env')"
+            "(for example 'your-org/your-project/your-env')"
         )
     # resolved_sha is positional-only so a user param named "resolved_sha" can't shadow it.
     return load_freesolo_environment(env_id, resolved_sha or None, **params)

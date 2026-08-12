@@ -11,7 +11,7 @@ _LIST_READ_BUDGET = {"timeout": 20.0, "max_rate_limit_retries": 1}
 
 
 def list_managed_namespace_slugs(namespace: str) -> list[str]:
-    """Return sorted ``namespace/name`` slugs with an ``environment.py`` marker."""
+    """Return sorted ``namespace/project/name`` slugs with an ``environment.py`` marker."""
     from flash.envs import loader
 
     if not loader._is_safe_github_path_parts((namespace,)):
@@ -62,7 +62,7 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
                 f"GitHub tree entry in environment namespace {namespace!r} has no usable path"
             )
         parts = path.split("/")
-        if len(parts) != 2 or parts[1] != loader._DEFAULT_ENVIRONMENT_PATH:
+        if len(parts) != 3 or parts[2] != loader._DEFAULT_ENVIRONMENT_PATH:
             continue
         kind = entry.get("type")
         if not isinstance(kind, str) or not kind:
@@ -70,6 +70,6 @@ def list_managed_namespace_slugs(namespace: str) -> list[str]:
                 f"GitHub tree entry {path!r} in environment namespace {namespace!r} "
                 "has an unusable type"
             )
-        if kind == "blob" and loader._is_safe_github_path_parts((parts[0],)):
-            slugs.add(f"{namespace}/{parts[0]}")
+        if kind == "blob" and loader._is_safe_github_path_parts(tuple(parts[:2])):
+            slugs.add(f"{namespace}/{parts[0]}/{parts[1]}")
     return sorted(slugs)
