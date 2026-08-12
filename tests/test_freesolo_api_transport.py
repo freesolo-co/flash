@@ -157,8 +157,43 @@ def test_request_translates_a_socket_timeout_into_request_timeout_error(monkeypa
         _freesolo_request("GET", "/api/projects", "fslo-user", timeout=12.5)
 
     message = str(excinfo.value)
-    assert "https://freesolo.test/api/projects" in message
+    assert "https://freesolo.test" in message
+    assert "/api/projects" in message
     assert "12.5" in message
+
+
+def test_timeout_message_names_the_backend_without_reconstructing_a_route(monkeypatch):
+    """The base is reduced to scheme and host, and the path is named separately.
+
+    Two reasons the message is built this way, and a plain f"{base}{path}" would break both: a
+    base URL may carry credentials in its authority, and a base carrying a reverse-proxy prefix
+    would print an endpoint that was never requested.
+    """
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://user:secret@freesolo.test/proxy")
+    monkeypatch.setattr("urllib.request.urlopen", _raise(TimeoutError("timed out")))
+
+    with pytest.raises(RequestTimeoutError) as excinfo:
+        _freesolo_request("GET", "/api/projects", "fslo-user")
+
+    message = str(excinfo.value)
+    assert "secret" not in message
+    # the proxy prefix belongs to the base, so the message must not read as /proxy/api/projects
+    # nor as a bare https://freesolo.test/api/projects that was never the requested URL.
+    assert "https://freesolo.test/api/projects" not in message
+    assert "https://freesolo.test" in message
+    assert "/api/projects" in message
+
+
+def test_unreachable_backend_message_also_hides_credentials_in_the_base(monkeypatch):
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://user:secret@freesolo.test")
+    monkeypatch.setattr("urllib.request.urlopen", _raise(urllib.error.URLError("no route")))
+
+    with pytest.raises(ClientError) as excinfo:
+        _freesolo_request("GET", "/api/projects", "fslo-user")
+
+    message = str(excinfo.value)
+    assert "secret" not in message
+    assert "no route" in message
 
 
 def test_request_timeout_error_is_catchable_as_client_error():
