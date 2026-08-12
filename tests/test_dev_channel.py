@@ -420,6 +420,108 @@ def test_windows_interpreter_paths_are_quoted_for_cmd_not_for_sh():
         assert "'" not in resolved, f"single quotes are not quoting to cmd.exe: {resolved}"
 
 
+def test_cmd_metacharacters_in_an_interpreter_path_are_quoted_not_just_spaces():
+    """`list2cmdline` quotes for the C runtime, which is a later stage than cmd.exe's own splitting.
+
+    So `C:\\Tools&SDK\\python.exe` comes back bare -- correct argv, useless command line: cmd.exe
+    has already treated `&` as a statement separator, ending the command at `C:\\Tools` and running
+    `SDK\\python.exe -m flash.cli ...` as a second one. The operator sees an error from a command
+    they did not type while the run they meant to cancel keeps billing.
+
+    Double quotes make every one of these inert, so force them when whitespace alone would not.
+    """
+    import sys
+    from unittest import mock
+
+    from flash._internal import channel
+
+    for exe in (
+        r"C:\Tools&SDK\python.exe",  # `&` runs a second command
+        r"C:\a|b\python.exe",  # `|` pipes into one
+        r"C:\a^b\python.exe",  # `^` escapes the next character
+        r"C:\Py(3.12)\python.exe",  # unspaced parens, which list2cmdline also leaves bare
+    ):
+        with (
+            mock.patch.object(channel, "_on_windows", return_value=True),
+            mock.patch.object(sys, "executable", exe),
+            mock.patch.object(sys, "orig_argv", [exe, "-m", "flash.cli"]),
+            mock.patch.object(sys, "argv", ["-m"]),
+        ):
+            resolved = channel._invoked_cli_name()
+        assert resolved == f'"{exe}" -m flash.cli', exe
+
+
+def test_the_attached_dash_m_form_is_recognised_as_a_module_launch():
+    """`python -mflash.cli` is the same launch as `python -m flash.cli`, and must read the same.
+
+    A short option may carry its value attached, and CPython accepts it; the only difference is
+    that `sys.orig_argv` holds one token, `-mflash.cli`, instead of two. Matching the separated
+    spelling alone sends this form to the `flash` fallback -- on the host where `flash` may be
+    RunPod's console script, so the printed cancel exits 0 without cancelling. That is the exact
+    failure this module exists to prevent, reached through a spelling rather than a bug.
+    """
+    import sys
+    from unittest import mock
+
+    from flash._internal import channel
+
+    exe = sys.executable
+    for orig_argv, argv in (
+        (["python3", "-mflash.cli"], ["-m"]),
+        (["python3", "-mflash.cli", "runs", "cancel", "abc"], ["-m", "runs", "cancel", "abc"]),
+        (["python3", "-W", "ignore", "-mflash.cli"], ["-m"]),
+    ):
+        with (
+            mock.patch.object(sys, "orig_argv", orig_argv),
+            mock.patch.object(sys, "argv", argv),
+        ):
+            assert channel._invoked_cli_name() == "python3 -m flash.cli", orig_argv
+
+    # ...and the attached form of a DIFFERENT module is still not us
+    for orig_argv in (["python3", "-mpytest"], ["python3", "-mflash.cliX"]):
+        with (
+            mock.patch.object(sys, "orig_argv", orig_argv),
+            mock.patch.object(sys, "argv", ["-m"]),
+        ):
+            assert channel._invoked_cli_name() == "flash", orig_argv
+
+    assert exe  # the real executable is untouched by the patches above
+
+
+def test_windows_console_script_names_match_case_insensitively():
+    """Windows filenames are case-insensitive, so `FLASH-CLI.EXE` IS the script we installed.
+
+    Rejecting it falls back to `flash` -- which on the `[server]` install may be RunPod's, so the
+    operator is pointed at the shadowed name the alias exists to escape. `.EXE` also survives a
+    lowercase-only suffix strip, so the name then fails the membership test for a second reason.
+
+    POSIX must NOT fold: there `FLASH-CLI` is a different file, and echoing it back names a command
+    the operator does not have.
+    """
+    import sys
+    from unittest import mock
+
+    from flash._internal import channel
+
+    # bare filenames, not `C:\...` paths: `os.path.basename` is posixpath on the test host and does
+    # not split on backslashes, so a full Windows path would test that accident instead of the
+    # case-folding under test. Windows supplies the basename through `ntpath` at run time.
+    for argv0, on_windows, expected in (
+        ("FLASH-CLI.EXE", True, "flash-cli"),
+        ("Flash-Cli.exe", True, "flash-cli"),
+        ("FLASH.EXE", True, "flash"),
+        ("flash-cli.exe", True, "flash-cli"),
+        # on posix, case is identity: a differently-cased name is not our script
+        ("/usr/local/bin/FLASH-CLI", False, "flash"),
+        ("/usr/local/bin/flash-cli", False, "flash-cli"),
+    ):
+        with (
+            mock.patch.object(channel, "_on_windows", return_value=on_windows),
+            mock.patch.object(sys, "argv", [argv0]),
+        ):
+            assert channel._invoked_cli_name() == expected, argv0
+
+
 def test_the_wordmark_does_not_follow_the_invoked_entry_point():
     """BRAND_NAME identifies the product; CLI_NAME says what to type. Only the latter varies.
 

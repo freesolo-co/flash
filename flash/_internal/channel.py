@@ -46,13 +46,19 @@ def _entered_via_dash_m() -> bool:
     arguments, so the module sits one slot before them, at ``orig_argv[-len(sys.argv)]``. Scanning
     for ``"-m"`` instead would mistake a script's own ``-m`` argument for the interpreter flag, and
     would miss the real one behind interpreter flags that take values (``python -W ignore -m ...``).
+
+    That slot holds either ``flash.cli`` or ``-mflash.cli``: a short option may be written with its
+    value attached, and ``python -mflash.cli`` is an ordinary invocation, not a curiosity. Reading
+    only the separated form makes the attached one fall back to ``flash`` -- on precisely the host
+    where that name may be RunPod's CLI, which is the failure this function exists to prevent.
     """
     if not sys.argv or sys.argv[0] != "-m":
         return False
     orig = getattr(sys, "orig_argv", None) or []  # absent when embedded, or before 3.10
     if len(orig) < len(sys.argv) + 1:
         return False
-    return orig[-len(sys.argv)] == _CLI_MODULE
+    slot = orig[-len(sys.argv)]
+    return slot == _CLI_MODULE or slot == f"-m{_CLI_MODULE}"
 
 
 def _on_windows() -> bool:
@@ -66,6 +72,13 @@ def _on_windows() -> bool:
     return os.name == "nt"
 
 
+# cmd.exe's own command separators, all of which are legal in a Windows path and all of which
+# double quotes render inert. `%` and `!` are deliberately absent: they are variable expansion, not
+# splitting, and quoting does not stop either -- but neither breaks the command into two, which is
+# the failure this guards. `"` cannot appear in a Windows path at all.
+_CMD_METACHARACTERS = frozenset("&|<>^()")
+
+
 def _quote_interpreter(path: str) -> str:
     """Quote an interpreter path as one token for the shell it will be pasted into.
 
@@ -77,12 +90,20 @@ def _quote_interpreter(path: str) -> str:
 
     `list2cmdline` is the Windows counterpart: it leaves that path bare and double-quotes only when
     a space or tab makes it necessary, which both cmd.exe and PowerShell honour.
+
+    Whitespace is not the only thing that needs the quotes, though. `list2cmdline` quotes for the C
+    runtime's argv parser, which runs AFTER cmd.exe has already split on its own metacharacters, so
+    `C:\\Tools&SDK\\python.exe` comes back bare and the `&` ends the command -- running `SDK\\...`
+    as a second one. Force the quotes when any of those are present.
     """
     if _on_windows():
         # deferred rather than top-level: unused off Windows, and this module is imported early
         import subprocess
 
-        return subprocess.list2cmdline([path])
+        quoted = subprocess.list2cmdline([path])
+        if quoted == path and _CMD_METACHARACTERS & set(path):
+            return f'"{path}"'
+        return quoted
     return shlex.quote(path)
 
 
@@ -127,6 +148,13 @@ def _invoked_cli_name() -> str:
     if _entered_via_dash_m():
         return f"{_module_launch_interpreter()} -m {_CLI_MODULE}"
     argv0 = os.path.basename((sys.argv[0] or "").strip()) if sys.argv else ""
+    # Windows filenames are case-insensitive, so `FLASH-CLI.EXE` is the same file our installer
+    # wrote and must be recognised as ours; the suffix and the name are folded together, since
+    # `.EXE` survives a lowercase-only strip and then fails the match for a second reason. POSIX
+    # keeps both exact: there `FLASH-CLI` is a DIFFERENT file, and naming it back would print a
+    # command the operator does not have.
+    if _on_windows():
+        argv0 = argv0.lower()
     if argv0.endswith(".exe"):  # windows console scripts
         argv0 = argv0[: -len(".exe")]
     return argv0 if argv0 in _CLI_SCRIPT_NAMES else _DEFAULT_CLI_NAME
