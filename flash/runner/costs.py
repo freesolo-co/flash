@@ -88,6 +88,47 @@ def _spec_pinned_to_horizon(spec, steps: int):
     return _replace(spec, train=_replace(spec.train, max_steps=max(1, int(steps))))
 
 
+def _spec_with_legacy_pool_horizon(spec):
+    """``spec`` with a legacy ``[environment.params] max_examples`` restated as ``[train]``, for PRORATION ONLY.
+
+    A run accepted before flash stopped reading that key was quoted from it, and cancelling it now
+    has to answer "what fraction of the accepted work happened" -- a question about the OLD work
+    model, not about what flash would quote today. Without this the full-work reprice raises (no
+    stated pool) while the partial pins ``max_steps`` and prices the uncapped batch, so the fraction
+    dies and the charge falls through to the quote cap: a legacy 10-step run cancelled after ONE
+    step bills 100% of its quote instead of 10%.
+
+    Restating it under ``[train]`` reproduces the horizon the accepted quote was computed from,
+    which is exactly what the ratio needs. Safe here in a way it is not at submit: both sides of
+    ``partial / full`` are repriced through this same shape, so the value only ever sets a fraction
+    between two numbers that share it -- it never becomes a price a customer is quoted, and the
+    result stays capped by the quote they accepted. Specs that state ``[train] max_examples`` or
+    ``max_steps`` already have a horizon and are returned untouched.
+    """
+    from dataclasses import replace as _replace
+
+    if getattr(spec, "algorithm", "") not in ("grpo", "opd"):
+        return spec
+    train = getattr(spec, "train", None)
+    if train is None or int(getattr(train, "max_examples", 0) or 0) > 0:
+        return spec
+    if int(getattr(train, "max_steps", 0) or 0) > 0:
+        return spec
+    params = getattr(getattr(spec, "environment", None), "params", {}) or {}
+    if not isinstance(params, dict):
+        return spec
+    try:
+        legacy_pool = int(params.get("max_examples") or 0)
+    except (TypeError, ValueError, OverflowError):
+        # same unreadable-value cases _env_max_examples guarded: `int(inf)` raises OverflowError,
+        # `int(nan)` ValueError. an unreadable pool is no horizon, so leave the spec alone and let
+        # the caller's own unpriceable-fraction branch handle it.
+        return spec
+    if legacy_pool <= 0:
+        return spec
+    return _replace(spec, train=_replace(train, max_examples=legacy_pool))
+
+
 def charge_usd_for_spec(
     spec,
     *,
@@ -272,8 +313,9 @@ def cancelled_charge_usd(
         # billing retry predicate (cost_usd > 0) can never settle, silently stranding the run
         # unbilled, so the fallback propagates and the caller records the pricing failure.
         return float(fallback)
+    prorated_spec = _spec_with_legacy_pool_horizon(spec)
     partial = runner.charge_usd_for_spec(
-        spec,
+        prorated_spec,
         steps=n,
         fallback=float("nan"),
         provider=provider,
@@ -281,7 +323,11 @@ def cancelled_charge_usd(
         gpu_count=gpu_count,
     )
     full = runner.charge_usd_for_spec(
-        spec, fallback=float("nan"), provider=provider, gpu_type=gpu_type, gpu_count=gpu_count
+        prorated_spec,
+        fallback=float("nan"),
+        provider=provider,
+        gpu_type=gpu_type,
+        gpu_count=gpu_count,
     )
     if math.isfinite(partial) and math.isfinite(full) and full > 0:
         return quote * min(1.0, partial / full)

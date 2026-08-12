@@ -9,6 +9,7 @@ import pytest
 
 from flash.engine.worker import rl_train
 from flash.engine.worker.runtime.pkg_proxy import W
+from flash.engine.worker.score_batcher import ScoreBatcher
 
 
 @pytest.fixture
@@ -72,7 +73,7 @@ def test_score_batcher_wrong_length_fails_every_waiter_without_partial_scatter()
         batch_sizes.append(len(requests))
         return [1.0] * max(0, len(requests) - 1)
 
-    batcher = rl_train._ScoreBatcher(
+    batcher = ScoreBatcher(
         short_batch,
         max_batch_size=8,
         flush_wait_s=0.1,
@@ -84,7 +85,7 @@ def test_score_batcher_wrong_length_fails_every_waiter_without_partial_scatter()
 
     def score(request):
         try:
-            batcher.score(request)
+            batcher.submit(request)
         except Exception as exc:
             outcome = str(exc)
         else:
@@ -114,7 +115,7 @@ def test_score_batcher_close_releases_an_inflight_waiter_after_the_join_bound():
         release.wait(timeout=30)
         return [1.0 for _ in requests]
 
-    batcher = rl_train._ScoreBatcher(
+    batcher = ScoreBatcher(
         blocked_batch,
         max_batch_size=8,
         flush_wait_s=0.01,
@@ -125,7 +126,7 @@ def test_score_batcher_close_releases_an_inflight_waiter_after_the_join_bound():
 
     def score():
         try:
-            batcher.score("request")
+            batcher.submit("request")
         except Exception as exc:
             outcomes.append(str(exc))
 
@@ -139,7 +140,7 @@ def test_score_batcher_close_releases_an_inflight_waiter_after_the_join_bound():
         batcher._thread.join(timeout=2)
 
     assert not waiter.is_alive(), "shutdown left an in-flight waiter blocked"
-    assert outcomes == ["test score batcher shut down"]
+    assert outcomes == ["test shut down"]
 
 
 @pytest.mark.usefixtures("_identity_graded")

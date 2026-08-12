@@ -448,7 +448,7 @@ def test_alias_chains_resolve_without_rescanning_every_binding() -> None:
     """
     import ast
 
-    from flash.cli.commands.env import push as envpush
+    from flash.cli.commands.env import imports as envimports
 
     n = 300
 
@@ -480,7 +480,7 @@ def test_alias_chains_resolve_without_rescanning_every_binding() -> None:
             node.value.__class__ = CountingName
 
     reads = 0
-    names = envpush._dynamic_import_callees(tree)
+    names = envimports._dynamic_import_callees(tree)
 
     # every link resolved, in either declaration order
     assert {f"a{i}" for i in range(n)} <= set(names)
