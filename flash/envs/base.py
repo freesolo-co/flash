@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
@@ -157,6 +157,22 @@ FREESOLO_WORKER_SPEC = "freesolo>=0.4.0"
 def worker_pip_for_env(env_id: str) -> list[str]:
     """Pip deps the GPU worker needs to run a Freesolo environment."""
     return [FREESOLO_WORKER_SPEC]
+
+
+def worker_pip_with_extras(env_id: str, extras: Iterable[str] | None) -> list[str]:
+    """Worker requirements plus the author's ``[environment] pip``, in install order.
+
+    The worker requirement stays first and is never displaced: a scorer's third-party dependency is
+    additional to what Flash's own worker needs, not a replacement for it. Exact repeats are dropped
+    so restating the worker spec cannot install it twice; a conflicting version pin is left for pip
+    to resolve and report, which it does with a clearer message than a guard here could.
+    """
+    combined = list(worker_pip_for_env(env_id))
+    for item in extras or ():
+        requirement = str(item).strip()
+        if requirement and requirement not in combined:
+            combined.append(requirement)
+    return combined
 
 
 def load_environment(

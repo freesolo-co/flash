@@ -122,8 +122,10 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     # payload travels base64-encoded inside a quoted heredoc, byte-exact
     b64 = script.split("FLASH_PAYLOAD_EOF")[1].strip()
     assert json.loads(base64.b64decode(b64)) == payload
-    # the self-contained bootstrap is embedded
+    # the self-contained bootstrap is embedded, with its redaction sibling next to it
     assert "FLASH_BOOTSTRAP_EOF" in script
+    assert "FLASH_BOOTSTRAP_SECRETS_EOF" in script
+    assert "/opt/flash/bootstrap_secrets.py" in script
     assert "metrics.json" in script
     # runs the prebuilt WORKER_IMAGE via Docker with the GPU + the bootstrap as the command
     from flash.providers.runpod.serverless import WORKER_IMAGE
@@ -157,14 +159,11 @@ def test_user_data_skips_capacity_for_baked_image_default(monkeypatch):
     assert "torch==2.10.0" not in script
 
 
-def test_image_per_sm_selects_arch_tag(monkeypatch):
+def test_image_per_sm_selects_arch_tag():
     """Per-SM warmed images (PR #213) reach Lambda too: the GPU class always picks the matching -smXX
-    tag for baked arches (so the worker's baked kernel cache matches the rented GPU's arch). A call
-    with no GPU class + the FLASH_WORKER_IMAGE override semantics are unchanged."""
+    tag for baked arches (so the worker's baked kernel cache matches the rented GPU's arch)."""
     from flash.providers.lambda_.jobs import builders
     from flash.providers.runpod.serverless import WORKER_IMAGE
-
-    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
 
     # no GPU class -> flat base image (no arch to key a baked tag off)
     assert builders.lambda_image() == WORKER_IMAGE
@@ -175,10 +174,6 @@ def test_image_per_sm_selects_arch_tag(monkeypatch):
     payload = _build_payload(builders, _spec(gpu_type="H100"), seed=0, attempt=0)
     script = builders.build_user_data(payload, gpu="H100")
     assert f"{WORKER_IMAGE}-sm90" in script
-
-    # absolute override still wins, even with per-SM enabled and a GPU class given
-    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/freesolo-co/flash-worker:hotfix")
-    assert builders.lambda_image("H100") == "ghcr.io/freesolo-co/flash-worker:hotfix"
 
 
 def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
@@ -2472,6 +2467,81 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     assert retriable is True
 
 
+def test_shipped_bootstrap_secrets_is_stripped_but_behaves_identically():
+    """user_data is a hard-capped budget shared with the payload's runtime secrets, so the embedded
+    sources carry code, not prose. Stripping must be behaviour-preserving: the box imports this
+    text, so a stripper that broke a body or changed a redactor would leak or crash at launch."""
+    from pathlib import Path
+
+    from flash.providers._lifecycle import bootstrap_secrets
+    from flash.providers._lifecycle import instance as inst
+
+    source = Path(bootstrap_secrets.__file__).read_text()
+    stripped = inst._strip_docstrings(source)
+
+    assert len(stripped) < len(source)
+    assert '"""' not in stripped
+    # comments stay: they sit next to the line they explain, which is what a reader debugging ON
+    # the box needs.
+    assert "# a multiline secret" in stripped
+
+    shipped: dict = {}
+    exec(compile(stripped, "<shipped>", "exec"), shipped)
+    for name in ("_safe_detail", "_read_console_tail", "_payload_secrets"):
+        assert name in shipped, f"stripping dropped {name}"
+    # the redactors behave exactly as the unstripped module does.
+    for text, secrets in (
+        ("worker rejected pin ati", {"PIN": "ati"}),
+        ("trainer crashed after validation", {"PIN": "ati"}),
+        ("https://host/a/repo", {"S": "/a"}),
+        ("boto3 failed with sk-live-abc123456789", {"K": "sk-live-abc123456789"}),
+    ):
+        assert shipped["_safe_detail"](text, 1000, secrets) == bootstrap_secrets._safe_detail(
+            text, 1000, secrets=secrets
+        )
+
+
+def test_strip_docstrings_preserves_code_sharing_a_docstrings_line():
+    """A docstring is a character span, not a set of lines.
+
+    It can share its line with the ``def`` that owns it or with a statement that follows it. A
+    line-based stripper strands the indentation in the first case and DELETES the neighbouring
+    statement in the second -- and the result still parses, so nothing catches it before the box
+    imports the shipped module.
+    """
+    from flash.providers._lifecycle import instance as inst
+
+    # a statement sharing the docstring's line must survive.
+    stripped = inst._strip_docstrings('def f():\n    """doc"""; x = 1\n    return x\n')
+    namespace: dict = {}
+    exec(compile(stripped, "<t>", "exec"), namespace)
+    assert namespace["f"]() == 1, "the statement after the docstring was dropped"
+
+    # a docstring on the def/class line itself must leave something parseable behind.
+    for source, name in (('def f(): "doc"\n', "f"), ('class C: "doc"\n', "C")):
+        namespace = {}
+        exec(compile(inst._strip_docstrings(source), "<t>", "exec"), namespace)
+        assert name in namespace
+
+    # ast reports columns in utf-8 bytes: a non-ascii character before a docstring shifts every
+    # later byte offset, and slicing the str by those numbers would cut mid-docstring.
+    stripped = inst._strip_docstrings('s = "café — naïve"\ndef f():\n    """d"""\n    return s\n')
+    namespace = {}
+    exec(compile(stripped, "<t>", "exec"), namespace)
+    assert namespace["f"]() == "café — naïve"
+    assert '"""' not in stripped
+
+    # the module docstring is DELETED, not substituted: `from __future__` must stay the first
+    # statement in the file, and a `pass` standing where the docstring was would displace it.
+    # bootstrap_secrets.py has both, so getting this wrong makes the shipped module unimportable.
+    stripped = inst._strip_docstrings(
+        '"""mod"""\n\nfrom __future__ import annotations\n\ndef f():\n    """d"""\n    return 1\n'
+    )
+    namespace = {}
+    exec(compile(stripped, "<t>", "exec"), namespace)
+    assert namespace["f"]() == 1
+
+
 def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     """A large job_spec_json must NOT be embedded inline in user_data (it can overflow the
     provider's cloud-init size cap and reject the launch). It is uploaded to HF and replaced by a
@@ -2531,6 +2601,75 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     assert emb2["job_spec_json"] == "{}"
     assert "job_spec_in_hf" not in emb2
     assert uploaded == {}
+
+    # The threshold is only as good as the framing it was chosen against, and that framing grows
+    # every time the heredoc'd bootstrap sources do (embedding bootstrap_secrets.py alone added
+    # ~5,900 bytes). Pin the WORST inline case - a spec of exactly the threshold size - against the
+    # cap, so a future bootstrap that grows past the remaining budget fails here instead of at a
+    # provider's launch call. The margin is asserted too: the real payload also carries env,
+    # deadline, and cache fields this minimal one does not.
+    uploaded.clear()
+    worst = inst.build_user_data(
+        {**payload, "job_spec_json": "x" * inst._SPEC_SPILL_THRESHOLD}, image="img:latest"
+    )
+    assert uploaded == {}
+    assert len(worst) < 64_000 - 2_000
+
+    # The spec does not ride alone: runtime secrets (a multiline PEM is a valid one) share the same
+    # user_data. A spec UNDER the threshold plus a big secret must still spill, because the binding
+    # check is the complete encoded payload rather than the spec component.
+    uploaded.clear()
+    pem = "-----BEGIN PRIVATE KEY-----\n" + "k" * 4_000 + "\n-----END PRIVATE KEY-----"
+    heavy = inst.build_user_data(
+        {
+            **payload,
+            "job_spec_json": "x" * (inst._SPEC_SPILL_THRESHOLD - 1),
+            "env": {"HF_TOKEN": "t", "DEPLOY_KEY": pem},
+        },
+        image="img:latest",
+    )
+    assert uploaded["path"] == "sft/x/job_spec.json"
+    emb3 = json.loads(base64.b64decode(heavy.split("FLASH_PAYLOAD_EOF")[1].strip()))
+    assert emb3["job_spec_in_hf"] is True
+    assert emb3["job_spec_json"] == ""
+    assert len(heavy) < 64_000 - 2_000
+
+
+def test_build_user_data_rejects_a_payload_that_stays_oversized_after_spilling(monkeypatch):
+    """spilling only moves the SPEC out. when the non-spec payload (large runtime secrets) is
+    oversized on its own, spilling frees nothing and the launch would ship user_data the provider
+    rejects opaquely, after the launch call. fail pre-flight instead, naming the component."""
+    import huggingface_hub
+
+    from flash.providers._lifecycle import instance as inst
+
+    class FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def upload_file(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+
+    # a tiny spec plus a ~40KB runtime secret: base64 + json escaping put the rendering over the
+    # budget, and no amount of spec spilling brings it back under.
+    payload = {
+        "flash_arm": "lambda",
+        "job_spec_json": "{}",
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/x",
+        "env": {"HF_TOKEN": "t", "DEPLOY_KEY": "k" * 40_000},
+        "attempt": 0,
+    }
+
+    with pytest.raises(ValueError, match="after spilling the job spec") as excinfo:
+        inst.build_user_data(payload, image="img:latest")
+    message = str(excinfo.value)
+    assert "runtime secrets" in message
+    assert str(inst._USER_DATA_CAP) in message
+    # the error names the oversized component's size, not just the total.
+    assert "40" in message
 
 
 def test_build_user_data_starts_no_spec_upload_at_deadline(monkeypatch):

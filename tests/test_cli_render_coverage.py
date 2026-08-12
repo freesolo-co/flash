@@ -16,6 +16,7 @@ import types
 
 import pytest
 
+from flash.cli.ui import heartbeat as ui_heartbeat
 from flash.cli.ui import render
 
 
@@ -259,7 +260,10 @@ def test_humanize_age_buckets(monkeypatch) -> None:
         return render._humanize_age_seconds(render._heartbeat_age_seconds(value))
 
     now = 1_000_000.0
-    monkeypatch.setattr(render.time, "time", lambda: now)
+    # patch the clock in the module that READS it: both helpers live in `flash.cli.ui.heartbeat`
+    # and are re-exported through `render`, so patching a `time` on `render` would miss them (and
+    # `render` no longer imports `time` at all).
+    monkeypatch.setattr(ui_heartbeat.time, "time", lambda: now)
     assert humanize(now - 30) == "30s ago"  # < 90s
     assert humanize(now - 600) == "10m ago"  # < 5400s -> minutes
     assert humanize(now - 7200) == "2.0h ago"  # >= 5400s -> hours

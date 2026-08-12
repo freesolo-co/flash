@@ -11,15 +11,21 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from flash._internal.channel import CLI_NAME
 from flash.client.config import load_credentials_with_source
+from flash.client.shapes import RequireSpec, matches_require
+from flash.client.streaming import (
+    ProgressCallback,
+    _capped_timeout,
+    _ProgressReader,
+    _read_capped_response,
+    _read_response_body,
+)
 from flash.core.spec import require_project_id
 from flash.serve.urls import is_freesolo_hosted_url
-
-ProgressCallback = Callable[[int, int], None]
 
 
 class ClientError(RuntimeError):
@@ -57,7 +63,18 @@ FREESOLO_PROJECTS_PATH = "/api/projects"
 FREESOLO_TRACE_PROJECTS_PATH = "/api/traces/projects"
 FREESOLO_TRACES_EXPORT_PATH = "/api/traces/export"
 FREESOLO_EVAL_RUNS_PATH = "/api/evals/runs"
-_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+
+# the server performs two github reads with one retry and one bounded backoff per read.
+_ENV_LIST_GITHUB_READS = 2
+_ENV_LIST_ATTEMPTS_PER_READ = 2
+_ENV_LIST_SOCKET_TIMEOUT_SECONDS = 20.0
+_ENV_LIST_MAX_BACKOFF_PER_READ_SECONDS = 45.0
+ENV_LIST_SERVER_BUDGET_SECONDS = _ENV_LIST_GITHUB_READS * (
+    _ENV_LIST_ATTEMPTS_PER_READ * _ENV_LIST_SOCKET_TIMEOUT_SECONDS
+    + _ENV_LIST_MAX_BACKOFF_PER_READ_SECONDS
+)
+ENV_LIST_CLIENT_TIMEOUT_SECONDS = ENV_LIST_SERVER_BUDGET_SECONDS + 60.0
+ENV_LIST_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 
 
 def freesolo_base_url(override: str | None = None) -> str:
@@ -129,248 +146,31 @@ def _api_error(exc: urllib.error.HTTPError) -> ApiError:
     return ApiError(exc.code, str(detail), detail=detail)
 
 
-def _read_capped_response(resp: object, max_bytes: int) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > max_bytes:
-            raise ClientError(
-                f"response body exceeded the maximum allowed size ({max_bytes} bytes); "
-                "download aborted"
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
+def _unexpected_response(api_url: str, path: str, problem: str) -> ClientError:
+    """The one error for a 2xx body this client cannot use.
 
-
-def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
-    """Verify a freesolo API key; raises ClientError/ApiError on failure."""
-    base = freesolo_base_url(base_url)
-    url = f"{base}{FREESOLO_AUTH_VERIFY_PATH}"
-    req = urllib.request.Request(
-        url,
-        method="GET",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    A body that is not JSON and valid JSON of the wrong shape are the same user state (something
+    other than a Flash control plane answered), so both carry the hint ``flash login`` already
+    gives, see ``_verify_key_against_plane``. Nothing in the CLI turns a raw
+    ``json.JSONDecodeError`` or ``KeyError`` into an error message, so neither may escape.
+    """
+    return ClientError(
+        f"{api_url}{path} {problem}. Check that --api-url points at your Flash control plane "
+        '(its /v1/health should report "service": "flash") rather than at a proxy or another '
+        "service."
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            resp.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
-            raise ClientError(
-                "freesolo rejected this API key — create or copy a valid key at "
-                f"https://freesolo.co/sign-in and pass it with `{CLI_NAME} login --api-key` "
-                "(or FREESOLO_API_KEY)"
-            ) from exc
-        raise _api_error(exc) from exc
-    except urllib.error.URLError as exc:
-        raise ClientError(
-            f"cannot reach the freesolo backend at {base} ({exc.reason}); "
-            "check your network connection and FREESOLO_BASE_URL"
-        ) from exc
 
 
-def _freesolo_request(
-    method: str,
-    path: str,
-    api_key: str,
-    base_url: str | None = None,
-    *,
-    body: dict[str, Any] | None = None,
-    timeout: float = 60.0,
-):
-    """Call a Freesolo bearer endpoint directly and return parsed JSON."""
-    base = freesolo_base_url(base_url)
-    req = urllib.request.Request(
-        f"{base}{path}",
-        method=method,
-        data=json.dumps(body).encode("utf-8") if body is not None else None,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            raise ClientError(
-                f"freesolo rejected this API key — run `{CLI_NAME} login` with a valid key "
-                "(or set FREESOLO_API_KEY)"
-            ) from exc
-        raise _api_error(exc) from exc
-    # a socket timeout surfaces as a bare TimeoutError rather than a URLError, so without this
-    # it escapes as an unexpected exception. callers catch ClientError to report a failure
-    # without changing their own verdict; a traceback instead would lose that.
-    except TimeoutError as exc:
-        raise RequestTimeoutError(f"request to {base}{path} timed out after {timeout}s") from exc
-    except urllib.error.URLError as exc:
-        raise ClientError(
-            f"cannot reach the freesolo backend at {base} ({exc.reason}); "
-            "check your network connection and FREESOLO_BASE_URL"
-        ) from exc
-    try:
-        return json.loads(raw) if raw else {}
-    except (TypeError, ValueError) as exc:
-        raise ClientError(f"freesolo returned invalid JSON for {path}") from exc
-
-
-def _freesolo_get(path: str, api_key: str, base_url: str | None = None, timeout: float = 60.0):
-    return _freesolo_request("GET", path, api_key, base_url, timeout=timeout)
-
-
-def list_projects(api_key: str, base_url: str | None = None) -> list[dict[str, Any]]:
-    """List projects in the authenticated caller's Freesolo organization."""
-    payload = _freesolo_get(FREESOLO_PROJECTS_PATH, api_key, base_url)
-    if not isinstance(payload, list) or any(not isinstance(project, dict) for project in payload):
-        raise ClientError("freesolo returned an invalid project list")
-    return payload
-
-
-def get_project(project_id: str, api_key: str, base_url: str | None = None) -> dict[str, Any]:
-    """Fetch one project and require the requested canonical UUID in the response."""
-    try:
-        project_id = require_project_id(project_id)
-    except (TypeError, ValueError) as exc:
-        raise ClientError(str(exc).replace("project", "project id", 1)) from exc
-    quoted = urllib.parse.quote(project_id, safe="")
-    payload = _freesolo_get(f"{FREESOLO_PROJECTS_PATH}/{quoted}", api_key, base_url)
-    project = payload.get("project") if isinstance(payload, dict) else None
-    if not isinstance(project, dict):
-        project = payload if isinstance(payload, dict) else None
-    returned_id = project.get("id") if isinstance(project, dict) else None
-    try:
-        returned_id = require_project_id(returned_id)
-    except (TypeError, ValueError) as exc:
-        raise ClientError(f"freesolo returned no valid project for {project_id}") from exc
-    if returned_id != project_id:
-        raise ClientError(f"freesolo returned a mismatched project id for {project_id}")
-    return {**project, "id": returned_id}
-
-
-def create_project(
-    name: str,
-    description: str | None,
-    api_key: str,
-    base_url: str | None = None,
-) -> dict[str, Any]:
-    """Create a project in the authenticated caller's organization."""
-    name = str(name or "").strip()
-    if not name:
-        raise ClientError("project name must be nonblank")
-    normalized_description = None
-    if description is not None:
-        normalized_description = str(description).strip() or None
-    payload = _freesolo_request(
-        "POST",
-        FREESOLO_PROJECTS_PATH,
-        api_key,
-        base_url,
-        body={"name": name, "description": normalized_description},
-    )
-    if not isinstance(payload, dict):
-        raise ClientError("freesolo returned an invalid project response")
-    try:
-        project_id = require_project_id(payload.get("id"))
-    except (TypeError, ValueError) as exc:
-        raise ClientError("freesolo returned an invalid project id") from exc
-    return {**payload, "id": project_id}
-
-
-def list_trace_projects(api_key: str, base_url: str | None = None) -> list[dict[str, Any]]:
-    """Projects in the caller's org that traces can be exported from."""
-    payload = _freesolo_get(FREESOLO_TRACE_PROJECTS_PATH, api_key, base_url)
-    projects = payload.get("projects")
-    return projects if isinstance(projects, list) else []
-
-
-def export_trace_records(
-    project_id: str,
-    api_key: str,
-    base_url: str | None = None,
-    limit: int | None = None,
-    export_format: str | None = None,
-) -> dict[str, Any]:
-    """A project's traces in the requested shape, converted server-side.
-
-    Returns ``{"records": [...], "traces": N, "skipped": N, "format": name}``. The
-    shape of each record depends on ``export_format`` (see EXPORT_FORMATS); the
-    conversion runs server-side, matching what the web app's export downloads."""
-    query = {"project_id": project_id}
-    if limit is not None:
-        query["limit"] = str(int(limit))
-    if export_format is not None:
-        query["format"] = export_format
-    path = f"{FREESOLO_TRACES_EXPORT_PATH}?{urllib.parse.urlencode(query)}"
-    # a whole project's traces can be a large read; give it room beyond the default.
-    return _freesolo_get(path, api_key, base_url, timeout=300.0)
-
-
-def upload_eval_run(
-    *,
-    project_id: str,
-    suite_name: str,
-    environment_reference: str,
-    model: str | None,
-    status: str,
-    error: str | None,
-    started_at: str | None,
-    cases: list[dict[str, Any]],
-    api_key: str,
-    base_url: str | None = None,
-) -> dict[str, Any]:
-    """Record one `flash env eval` suite run against one explicit Freesolo project.
-
-    The project id is required and never inferred: an API key identifies an org, not a
-    project, and picking a default here would file results under a project the caller
-    never named."""
-    try:
-        project_id = require_project_id(project_id)
-    except (TypeError, ValueError) as exc:
-        raise ClientError(str(exc).replace("project", "project id", 1)) from exc
-    body: dict[str, Any] = {
-        "project_id": project_id,
-        "suite_name": suite_name,
-        "environment_reference": environment_reference,
-        "model": model,
-        "status": status,
-        "error": error,
-        "started_at": started_at,
-        "cases": cases,
-    }
-    # a large suite is a bigger write than a normal control-plane call; give it room.
-    payload = _freesolo_request(
-        "POST", FREESOLO_EVAL_RUNS_PATH, api_key, base_url, body=body, timeout=300.0
-    )
-    if not isinstance(payload, dict):
-        raise ClientError("freesolo returned an invalid eval run response")
-    return payload
-
-
-class _ProgressReader:
-    """File-like wrapper over in-memory bytes that fires a progress callback on each read()."""
-
-    def __init__(self, data: bytes, progress: ProgressCallback):
-        self._data = data
-        self._total = len(data)
-        self._pos = 0
-        self._progress = progress
-
-    def __len__(self) -> int:
-        return self._total
-
-    def read(self, size: int = -1) -> bytes:
-        if size is None or size < 0:
-            chunk = self._data[self._pos :]
-        else:
-            chunk = self._data[self._pos : self._pos + size]
-        self._pos += len(chunk)
-        # a rendering hiccup must never abort an in-flight upload
-        with contextlib.suppress(Exception):
-            self._progress(self._pos, self._total)
-        return chunk
-
+# re-export the extracted freesolo helpers from their established import location.
+from flash.client.freesolo_api import _freesolo_get as _freesolo_get  # noqa: E402
+from flash.client.freesolo_api import _freesolo_request as _freesolo_request  # noqa: E402
+from flash.client.freesolo_api import create_project as create_project  # noqa: E402
+from flash.client.freesolo_api import export_trace_records as export_trace_records  # noqa: E402
+from flash.client.freesolo_api import get_project as get_project  # noqa: E402
+from flash.client.freesolo_api import list_projects as list_projects  # noqa: E402
+from flash.client.freesolo_api import list_trace_projects as list_trace_projects  # noqa: E402
+from flash.client.freesolo_api import upload_eval_run as upload_eval_run  # noqa: E402
+from flash.client.freesolo_api import verify_freesolo_key as verify_freesolo_key  # noqa: E402
 
 _CHAT_STEP_SELECTOR_CAPABILITY = "chat_step_selector_v1"
 
@@ -491,6 +291,56 @@ class ApiClient:
                 "check your network connection and FLASH_API_URL"
             ) from exc
 
+    def _decode_response(
+        self,
+        path: str,
+        raw: bytes,
+        content_type: str = "",
+        *,
+        require: Mapping[str, RequireSpec] | None = None,
+    ) -> Any:
+        """Parse a 2xx body and require the top-level keys, and value types, the caller reads.
+
+        Every response body this client reads goes through here, so a proxy answering
+        ``200 text/html`` and a plane answering the wrong shape both surface as the same
+        ``ClientError``. An empty body decodes to ``{}``.
+
+        The type is required alongside the key because a present-but-unusable value is the same
+        user state: ``{"logs": "x", "offset": null}`` passes a presence check and then raises a
+        bare ``TypeError`` out of ``int(None)``, which nothing in the CLI translates either. A
+        ``[dict]`` spec extends that one level into a list, because ``{"runs": [null]}`` is the
+        same story one element down.
+        """
+        try:
+            payload = json.loads(raw) if raw else {}
+        except ValueError as exc:
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                f"did not return JSON (Content-Type: {content_type or 'unset'})",
+            ) from exc
+        # every consumer of this decoder reads an object; a bare list or scalar from a proxy
+        # or wrong service would otherwise surface as an AttributeError several frames later.
+        if not isinstance(payload, dict):
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                f"returned JSON that is not an object ({type(payload).__name__})",
+            )
+        bad = [
+            key
+            for key, expected in (require or {}).items()
+            if key not in payload or not matches_require(payload[key], expected)
+        ]
+        if bad:
+            raise _unexpected_response(
+                self.api_url,
+                path,
+                "returned an unexpected response shape "
+                f"(missing or malformed {', '.join(repr(key) for key in bad)})",
+            )
+        return payload
+
     def _request(
         self,
         method: str,
@@ -499,6 +349,9 @@ class ApiClient:
         timeout: float | None = None,
         progress: ProgressCallback | None = None,
         extra_headers: dict[str, str] | None = None,
+        require: Mapping[str, RequireSpec] | None = None,
+        max_bytes: int | None = None,
+        body_deadline: float | None = None,
     ) -> Any:
         headers = {
             "Content-Type": "application/json",
@@ -517,12 +370,19 @@ class ApiClient:
             data=data,
             headers=headers,
         )
+        deadline = time.monotonic() + body_deadline if body_deadline is not None else None
         with (
             self._translate_http_errors(),
-            urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
+            urllib.request.urlopen(
+                req, timeout=_capped_timeout(timeout or self.timeout, deadline)
+            ) as resp,
         ):
-            raw = resp.read()
-            return json.loads(raw) if raw else {}
+            raw = _read_response_body(
+                resp, max_bytes=max_bytes, deadline=deadline, path=f"{self.api_url}{path}"
+            )
+            return self._decode_response(
+                path, raw, resp.headers.get("Content-Type", ""), require=require
+            )
 
     def _request_bytes(
         self,
@@ -598,6 +458,38 @@ class ApiClient:
         body = {"name": name, "package_b64": package_b64, "project_id": project_id}
         return self._request("POST", "/v1/envs", body=body, timeout=1800.0, progress=progress)
 
+    def list_envs(self) -> list[str]:
+        """Return the published environment ids owned by the authenticated organization."""
+        payload = self._request(
+            "GET",
+            "/v1/envs",
+            timeout=ENV_LIST_CLIENT_TIMEOUT_SECONDS,
+            max_bytes=ENV_LIST_MAX_RESPONSE_BYTES,
+            body_deadline=ENV_LIST_CLIENT_TIMEOUT_SECONDS,
+        )
+        rows = payload.get("environments") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise ClientError("control plane returned a malformed environment list")
+        # the ids are printed as values the user can paste straight into `[environment]`, so a
+        # nonblank but unusable one (`my-env`, `acme/env/extra`, unsafe path characters) would be
+        # advertised as usable and then fail at submit. Validated with the managed parser itself
+        # rather than a second predicate here, so the two cannot drift apart.
+        from flash.envs.loader import _parse_managed_environment_slug
+
+        ids: list[str] = []
+        for row in rows:
+            env_id = row.get("id") if isinstance(row, dict) else None
+            if not isinstance(env_id, str) or not env_id.strip():
+                raise ClientError("control plane returned an environment without an id")
+            env_id = env_id.strip()
+            if _parse_managed_environment_slug(env_id) is None:
+                raise ClientError(
+                    f"control plane returned an unusable environment id {env_id!r}; "
+                    "expected <namespace>/<name>"
+                )
+            ids.append(env_id)
+        return ids
+
     def delete_env(self, env_id: str, *, project_id: str) -> dict:
         """Delete a published Freesolo environment from one explicit project.
 
@@ -622,6 +514,7 @@ class ApiClient:
             f"/v1/envs/{quoted}",
             timeout=1800.0,
             extra_headers={"X-Freesolo-Project-Id": project_id},
+            require={"deleted": bool},
         )
 
     def download_env_package(self, env_id: str) -> bytes:
@@ -661,16 +554,20 @@ class ApiClient:
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema
-        return self._request("POST", "/v1/runs", body=body)
+        return self._request("POST", "/v1/runs", body=body, require={"run_id": str})
 
     def list_runs(self) -> list[dict]:
-        return self._request("GET", "/v1/runs")["runs"]
+        return self._request("GET", "/v1/runs", require={"runs": [dict]})["runs"]
 
     def get_run(self, run_id: str) -> dict:
         return self._request("GET", f"/v1/runs/{run_id}")
 
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
-        return self._request("GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}")
+        return self._request(
+            "GET",
+            f"/v1/runs/{run_id}/logs?offset={int(offset)}",
+            require={"logs": str, "offset": int},
+        )
 
     def get_worker_output(self, run_id: str) -> dict[str, str]:
         try:
@@ -685,7 +582,9 @@ class ApiClient:
         # server may still have accepted the cancel and later persisted a terminal state. Resolve
         # that by polling the authoritative run status instead of surfacing a raw timeout.
         try:
-            return self._request("POST", f"/v1/runs/{run_id}/cancel", timeout=60.0)
+            return self._request(
+                "POST", f"/v1/runs/{run_id}/cancel", timeout=60.0, require={"state": str}
+            )
         except RequestTimeoutError as exc:
             return self._poll_cancel_status(run_id, cause=exc)
 
@@ -721,7 +620,9 @@ class ApiClient:
 
     def checkpoints(self, run_id: str) -> list[dict]:
         """Deployable per-step RL checkpoints for a run (serve one with `flash models deploy RUN/step-N`)."""
-        return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
+        return self._request(
+            "GET", f"/v1/runs/{run_id}/checkpoints", require={"checkpoints": [dict]}
+        )["checkpoints"]
 
     def deploy(
         self,
@@ -758,7 +659,9 @@ class ApiClient:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
 
     def deployments(self, timeout: float | None = None) -> list[dict]:
-        return self._request("GET", "/v1/deployments", timeout=timeout)["deployments"]
+        return self._request(
+            "GET", "/v1/deployments", timeout=timeout, require={"deployments": [dict]}
+        )["deployments"]
 
     def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
         """The current deployment record for one run, or None when it is not listed.
@@ -862,7 +765,12 @@ class ApiClient:
         ):
             content_type = resp.headers.get("Content-Type", "")
             if "application/json" in content_type:
-                payload = json.loads(resp.read() or b"{}")
+                payload = self._decode_response(
+                    f"/v1/runs/{base_run_id}/chat",
+                    resp.read(),
+                    content_type,
+                    require={"choices": [dict]},
+                )
                 content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
                 if content:
                     yield str(content)

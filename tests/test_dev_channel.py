@@ -195,6 +195,7 @@ def test_operator_hints_follow_flash_cli_invocation():
     from unittest import mock
 
     from flash._internal import channel
+    from flash.cli.ui import env_panels as env_panels_module
     from flash.cli.ui import render as render_module
     from flash.cli.ui import tables as tables_module
 
@@ -202,13 +203,18 @@ def test_operator_hints_follow_flash_cli_invocation():
     outputs: dict[str, str] = {}
     try:
         with mock.patch.object(sys, "argv", ["/usr/local/bin/flash-cli"]):
+            # env_panels before render: it binds CLI_NAME with a from-import, so reloading it
+            # after channel is what re-reads the name, and render re-exports its `env_list`.
             importlib.reload(channel)
             importlib.reload(tables_module)
+            importlib.reload(env_panels_module)
             render = importlib.reload(render_module)
             outputs = {
                 "flash/cli/ui/render.py:login_ok": render.login_ok(None),
                 "flash/cli/ui/render.py:login_failed": render.login_failed("bad key"),
-                "flash/cli/ui/render.py:_QUIET_HEARTBEAT_HINT": render._QUIET_HEARTBEAT_HINT,
+                # _QUIET_HEARTBEAT_HINT is deliberately absent: it now points at the age on the
+                # panel rather than at `flash runs log`, so it names no command to rename. Add it
+                # back here only if it starts spelling one again.
                 "flash/cli/ui/render.py:env_setup": render.env_setup(
                     ["environment.py"], "11111111-1111-4111-8111-111111111111"
                 ),
@@ -224,6 +230,7 @@ def test_operator_hints_follow_flash_cli_invocation():
         with mock.patch.object(sys, "argv", original_argv):
             importlib.reload(channel)
             importlib.reload(tables_module)
+            importlib.reload(env_panels_module)
             importlib.reload(render_module)
 
     bare_command = re.compile(

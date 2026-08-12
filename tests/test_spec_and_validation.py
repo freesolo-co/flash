@@ -137,6 +137,10 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     # re-introduced as a user knob after being managed-and-derived; gated on the release that
     # restored it, not on lora_rank's original 0.2.0.
     assert TRAIN_KEY_MIN_VERSIONS["lora_alpha"] == "1.1.35"
+    # the rl half of the optimizer-batch split. batch_size keeps its 0.2.0 gate because sft still
+    # takes it; only the new rl name is gated on the release that introduced the split.
+    assert TRAIN_KEY_MIN_VERSIONS["prompts_per_step"] == "1.1.43"
+    assert TRAIN_KEY_MIN_VERSIONS["batch_size"] == "0.2.0"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
@@ -152,6 +156,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "credit_assignment",
             "entropy_quantile",
             "lora_alpha",
+            "prompts_per_step",
         }
     } == {"0.2.0"}
 
@@ -275,8 +280,10 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     baseline = {"epochs", "hf_repo", "max_examples"}
 
     # historical snapshots remain exact to their commits, including fields now managed or removed.
-    # current adds save_at_steps, credit_assignment, and entropy_quantile; opd eos is removed.
-    # lora_alpha is in both: authorable then, managed in between, and a user knob again now.
+    # current adds save_at_steps, credit_assignment, entropy_quantile, and prompts_per_step; opd eos
+    # is removed. lora_alpha is in both: authorable then, managed in between, a user knob again now.
+    # prompts_per_step is current-only: the rl half of the optimizer-batch split, which those
+    # snapshots predate because back then batch_size still carried both meanings.
     assert historical_shapes["861571e7"] - {
         "opd_eos_loss_coef",
         "hf_repo",
@@ -285,6 +292,7 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
         "credit_assignment",
         "save_at_steps",
         "entropy_quantile",
+        "prompts_per_step",
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert "advantage_clip" not in TRAIN_SCHEMA_KEYS
@@ -695,22 +703,153 @@ def test_jobspec_still_rejects_train_keys_that_were_never_tolerated() -> None:
         JobSpec.from_dict({"train": {"seeds": [0, 1]}})
 
 
-def test_environment_pip_is_platform_managed() -> None:
+def test_environment_pip_is_authorable() -> None:
+    """A scorer's third-party imports have no other declaration path onto the worker."""
     raw = _raw()
-    raw["environment"]["pip"] = ["freesolo==1.2.3"]
-    with pytest.raises(ConfigError, match=r"\[environment\] unknown key\(s\): pip"):
+    raw["environment"]["pip"] = ["pymongo>=4.6", "rapidfuzz"]
+    assert spec_from_dict(raw).environment.pip == ("pymongo>=4.6", "rapidfuzz")
+
+
+def test_environment_pip_rejects_malformed_entries() -> None:
+    """Malformed requirements must fail at parse, not mid-install with the GPU already billing."""
+    raw = _raw()
+    raw["environment"]["pip"] = "pymongo"
+    with pytest.raises(ConfigError, match=r"not a string: use \[\"pymongo\"\]"):
+        spec_from_dict(raw)
+
+    raw = _raw()
+    raw["environment"]["pip"] = ["pymongo", 7]
+    with pytest.raises(ConfigError, match="non-empty requirement strings"):
+        spec_from_dict(raw)
+
+    raw = _raw()
+    raw["environment"]["pip"] = ["pymongo", "   "]
+    with pytest.raises(ConfigError, match="non-empty requirement strings"):
         spec_from_dict(raw)
 
 
-def test_submit_payload_round_trips_without_a_pip_key() -> None:
+def test_environment_pip_rejects_pip_options() -> None:
+    """Entries are spliced into `python -m pip install`, so an option flag is not a requirement.
+
+    `--no-deps` would suppress the dependencies of the mandatory freesolo worker requirement, and
+    `--target` would redirect where it lands -- both reachable from a field that only names packages.
+    """
+    for option in ("--no-deps", "--target=/tmp/deps", "-e ."):
+        raw = _raw()
+        raw["environment"]["pip"] = ["pymongo>=4.6", option]
+        with pytest.raises(ConfigError, match="must be requirements, not pip options"):
+            spec_from_dict(raw)
+
+
+def test_environment_pip_accepts_spaced_requirements() -> None:
+    """Whitespace inside an entry is not a defect: both install paths pass one entry as one argv.
+
+    ``subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip])`` never goes through a
+    shell, so a spaced PEP 508 requirement arrives at pip as a single operand and installs. Version
+    specs, parenthesized clauses, spaced extras, markers and direct references all rely on this.
+    """
+    for entry in (
+        "pymongo >= 4.6",
+        "pkg (>=1.0)",
+        "pkg [extra1, extra2] >=1.0",
+        'pkg; python_version < "3.12"',
+        "pkg @ https://host/a-1.0.whl",
+    ):
+        raw = _raw()
+        raw["environment"]["pip"] = [entry]
+        assert spec_from_dict(raw).environment.pip == (entry,)
+
+
+def test_environment_pip_rejection_messages_never_echo_a_url() -> None:
+    """Every rejection path must redact a URL, including the ones the credential guard never sees.
+
+    These messages are printed by the CLI and returned verbatim as the server's HTTP error detail
+    (``flash/server/platform/deps.py`` raises ``HTTPException(400, detail=str(exc))``), so quoting a
+    value back copies it into terminals, CI output and API logs. The scalar, non-string and
+    pip-option branches all raise BEFORE the URL credential guard is reached, so each has to redact
+    on its own -- an option is credential-bearing in its own right via
+    ``--extra-index-url=https://user:token@host``.
+    """
+    secret = "ghp_SECRETTOKEN"
+    for value in (
+        f"git+https://{secret}@github.com/org/repo.git",  # scalar: rejected as "not a list"
+        [f"--extra-index-url=https://user:{secret}@host/simple"],  # pip option
+        [f"git+https://{secret}@h/r.git".encode()],  # non-string entry
+        [{"url": f"https://{secret}@h"}],  # non-string entry, nested
+        [f"git+https://{secret}@github.com/o/r.git"],  # reaches the credential guard
+        [f"https://h/p-1.0.whl?private_token={secret}"],  # query-string credential
+    ):
+        raw = _raw()
+        raw["environment"]["pip"] = value
+        with pytest.raises(ConfigError) as caught:
+            spec_from_dict(raw)
+        assert secret not in str(caught.value)
+
+    # redaction is scoped to URL-shaped input: an ordinary typo still names itself, or the message
+    # would stop being actionable for the mistakes that are not credentials.
+    raw = _raw()
+    raw["environment"]["pip"] = ["--no-deps"]
+    with pytest.raises(ConfigError, match="--no-deps"):
+        spec_from_dict(raw)
+
+
+def test_environment_pip_rejects_url_credentials() -> None:
+    """A spec is not a secret store: pip entries are persisted and uploaded verbatim.
+
+    ``RunStatus.spec`` keeps the authored value and the worker's ``metrics.json`` carries it inside
+    ``notes.job_spec``, so a token in a direct or VCS URL would land on disk and in the run log.
+    """
+    for url in (
+        "git+https://user:ghp_SECRETTOKEN@github.com/org/repo.git#egg=pkg",
+        "https://tok:s3cret@example.com/pkg-1.0.tar.gz",
+        "pkg @ https://x:y@host/a.whl",
+        "git+ssh://git:deploykey@host/repo.git",
+        # ANY nonempty userinfo, not just `user:password`. a github token is conventionally passed
+        # username-only, so requiring a literal colon would miss the most likely leak outright...
+        "git+https://ghp_SECRETTOKEN@github.com/org/repo.git",
+        # ...and the separator can arrive percent-encoded, which is the same credential.
+        "git+https://user%3As3cret@github.com/org/repo.git",
+        # a query string carries credentials just as well as userinfo does, and naming a package
+        # never needs one: a private-index token and a presigned object-store signature.
+        "pkg @ https://host/pkg-1.0.whl?private_token=s3cret",
+        "https://host/pkg-1.0.whl?X-Amz-Signature=deploykey",
+    ):
+        raw = _raw()
+        raw["environment"]["pip"] = [url]
+        with pytest.raises(ConfigError, match="must not embed credentials") as caught:
+            spec_from_dict(raw)
+        # the message must not quote the requirement back -- that would copy the credential into
+        # the very logs this rejection exists to keep it out of.
+        for secret in ("ghp_SECRETTOKEN", "s3cret", "deploykey"):
+            assert secret not in str(caught.value)
+
+    # unauthenticated direct and VCS URLs stay usable; only inline userinfo is refused.
+    for url in (
+        "pkg @ https://host/a-1.0.whl",
+        "git+https://github.com/org/repo.git#egg=pkg",
+        "pymongo>=4.6",
+        # a VCS ref pin puts `@` AFTER the authority, so it must not read as userinfo.
+        "git+https://github.com/org/repo.git@v1.2.3",
+    ):
+        raw = _raw()
+        raw["environment"]["pip"] = [url]
+        assert spec_from_dict(raw).environment.pip == (url,)
+
+
+def test_submit_payload_carries_the_pip_key() -> None:
     """spec_payload is what the CLI actually sends, and the server re-parses it with this parser."""
     from flash.client.specs import spec_payload
 
-    spec = spec_from_dict(_raw())
+    raw = _raw()
+    raw["environment"]["pip"] = ["pymongo>=4.6"]
+    spec = spec_from_dict(raw)
     payload = spec_payload(spec, authored_train_keys=frozenset({"epochs"}))
 
-    assert "pip" not in payload["environment"]
-    assert spec_from_dict(payload).environment.id == spec.environment.id
+    # dropping it here would strand the requirement on the client: the worker installs from payload.
+    # a tuple in memory, a JSON array on the wire, exactly as the sibling `secrets` field travels.
+    assert tuple(payload["environment"]["pip"]) == ("pymongo>=4.6",)
+    assert json.loads(json.dumps(payload))["environment"]["pip"] == ["pymongo>=4.6"]
+    assert spec_from_dict(payload).environment.pip == ("pymongo>=4.6",)
 
 
 def test_environment_must_be_a_table() -> None:
@@ -832,7 +971,7 @@ def test_environment_subfields_accept_valid_and_missing() -> None:
     }
     spec = spec_from_dict(raw)
     assert spec.environment.params == {"k": "v"}
-    # pip is platform-managed: never authored, so it stays at its default here.
+    # pip is authorable but omitted here, so it stays at its default.
     assert spec.environment.pip == ()
     assert spec.environment.secrets == ("SERPAPI_API_KEY", "OPENAI_API_KEY")
     # An explicit None (e.g. JSON `null`) is treated as missing -> default, NOT rejected.
@@ -1049,7 +1188,12 @@ def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() 
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
     worker_payload.pop("model_revision_auto", None)
-    public_payload = unmarked.to_dict()  # to_dict() already strips the marker
+    worker_payload.pop("gpu_count_auto", None)
+    public_payload = unmarked.to_dict()  # to_dict() already strips the markers
+    # the old plane popped `[environment] pip` from every public payload, so its bytes carried no
+    # such key. mirrors _preparation_digest's drop-when-empty for the same reason as the list above.
+    if not public_payload["environment"].get("pip"):
+        public_payload["environment"].pop("pip", None)
 
     payload = json.dumps(
         {
@@ -1534,17 +1678,55 @@ def test_coerce_bool(value, expected) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gpu_count_defaults_to_one() -> None:
-    assert spec_from_dict(_raw()).gpu.count == 1
+def test_unset_gpu_count_keeps_the_digest_stable_integer_placeholder() -> None:
+    parsed = spec_from_dict(_raw())
+    assert parsed.gpu.count == 1
+    assert parsed.gpu_count_auto is True
     assert GpuSpec().count == 1
 
+    # public serialization is part of the preparation digest. keep the historical integer key shape;
+    # only the internal marker may distinguish this placeholder from an authored count=1.
+    assert parsed.to_dict()["gpu"]["count"] == 1
+    assert isinstance(parsed.to_dict()["gpu"]["count"], int)
+    assert "gpu_count_auto" not in parsed.to_dict()
 
-def test_gpu_count_parses_and_roundtrips() -> None:
+    internal = _job_from_dict(parsed.to_internal_dict())
+    assert internal.gpu.count == 1
+    assert internal.gpu_count_auto is True
+    assert JobSpec.from_json(parsed.to_json()).gpu_count_auto is True
+
+    from flash.runner.supervise.lifecycle import _spec_with_gpu
+
+    # the marker is PROVENANCE ("the author omitted gpu.count"), so it survives the resolved shape.
+    # it is the only surviving record of that fact -- the public halves of an auto-sized and an
+    # authored single-card run are byte-identical -- so clearing it here made a recovered
+    # auto-sized run re-allocate hard-pinned to one card.
+    resolved = _spec_with_gpu(internal, "H200", 2)
+    assert resolved.gpu.count == 2
+    assert resolved.gpu_count_auto is True
+    with pytest.raises(ConfigError, match=r"unknown config key\(s\): gpu_count_auto"):
+        spec_from_dict(_raw(gpu_count_auto=True))
+
+
+def test_authored_gpu_count_parses_and_roundtrips() -> None:
     parsed = spec_from_dict(_raw(**{"gpu.count": 4}))
     assert parsed.gpu.count == 4
+    assert parsed.gpu_count_auto is False
     # count survives both serialization hops (asdict-based to_dict / to_json).
     assert _job_from_dict(parsed.to_dict()).gpu.count == 4
     assert JobSpec.from_json(parsed.to_json()).gpu.count == 4
+
+
+def test_explicit_gpu_count_one_is_not_auto() -> None:
+    parsed = spec_from_dict(_raw(**{"gpu.count": 1}))
+    assert parsed.gpu.count == 1
+    assert parsed.gpu_count_auto is False
+
+
+def test_gpu_type_without_count_keeps_the_single_card_pin() -> None:
+    parsed = spec_from_dict(_raw(**{"gpu.type": "B200"}))
+    assert parsed.gpu.count == 1
+    assert parsed.gpu_count_auto is False
 
 
 @pytest.mark.parametrize("good", [1, 8])
@@ -1578,3 +1760,50 @@ def test_gpu_count_of_reads_spec_and_defaults() -> None:
         gpu_count_of(JobSpec(project="11111111-1111-4111-8111-111111111111", gpu=GpuSpec(count=3)))
         == 3
     )
+
+
+# ---------------------------------------------------------------------------
+# the optimizer batch is a different quantity per algorithm, so it has a different name
+# ---------------------------------------------------------------------------
+
+
+def test_sft_batch_size_is_rejected_on_rl_and_names_the_right_key() -> None:
+    """The trap this split exists to close.
+
+    `batch_size = 1` is the standard sft out-of-memory workaround. Copied into a grpo/opd config it
+    used to parse and silently mean one prompt per optimizer update -- the run trained, logged and
+    billed, and nothing errored. It must now fail at parse and say which key to use instead.
+    """
+    for algorithm in ("grpo", "opd"):
+        with pytest.raises(ConfigError) as excinfo:
+            spec_from_dict(_raw(algorithm=algorithm, **{"train.batch_size": 1}))
+
+        message = str(excinfo.value)
+        assert "batch_size does not apply to" in message
+        assert "prompts_per_step" in message  # the remedy names the key that works
+
+
+def test_rl_prompts_per_step_is_rejected_on_sft_and_names_the_right_key() -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        spec_from_dict(_raw(algorithm="sft", **{"train.prompts_per_step": 8}))
+
+    message = str(excinfo.value)
+    assert "prompts_per_step does not apply to sft" in message
+    assert "batch_size" in message
+
+
+def test_each_algorithm_still_accepts_its_own_optimizer_batch_key() -> None:
+    """The rejection is per-algorithm, not a blanket ban on either name."""
+    assert spec_from_dict(_raw(algorithm="sft", **{"train.batch_size": 4})).train.batch_size == 4
+    for algorithm in ("grpo", "opd"):
+        spec = spec_from_dict(_raw(algorithm=algorithm, **{"train.prompts_per_step": 16}))
+        assert spec.train.prompts_per_step == 16
+        assert spec.train.batch_size is None
+
+
+def test_neither_optimizer_batch_key_is_required() -> None:
+    """Both are optional; an unset key leaves the worker's tuned recipe default in place."""
+    for algorithm in ("sft", "grpo", "opd"):
+        spec = spec_from_dict(_raw(algorithm=algorithm))
+        assert spec.train.batch_size is None
+        assert spec.train.prompts_per_step is None

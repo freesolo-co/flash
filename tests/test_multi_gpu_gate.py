@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests._helpers.profile import satisfy_sft_profile
+from tests._helpers.teacher import configure_managed_teacher
 
 _PROVIDERS = ("runpod", "lambda", "vast")
 # the only managed class all three providers stock. a parity test needs one class every provider can
@@ -137,6 +138,7 @@ def test_submit_accepts_multi_gpu_on_every_provider(
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm, count=4, provider=provider)
         satisfy_sft_profile(runner, monkeypatch, spec)
+        configure_managed_teacher(monkeypatch, spec)
         status = runner.submit_job(spec, dry_run=True)
         assert status is not None
 
@@ -753,6 +755,7 @@ def test_submit_records_the_resolved_backend(monkeypatch, algorithm):
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm)
         satisfy_sft_profile(runner, monkeypatch, spec)
+        configure_managed_teacher(monkeypatch, spec)
         status = runner.submit_job(spec, dry_run=True)
         assert (status.effective_preparation or {}).get("backend") == expected
 
@@ -912,17 +915,21 @@ def test_schema_preflight_applies_the_geometry_cap_to_provisional_sizing():
     monkey = pytest.MonkeyPatch()
     try:
         monkey.setattr("flash.schema.provisional_gpu", _preview)
-        spec_from_dict(
-            {
-                "model": "Qwen/Qwen3.5-0.8B",
-                "model_revision": "a" * 40,
-                "algorithm": "sft",
-                "environment": {"id": "owner/env"},
-                "train": {"max_examples": 1},
-                "gpu": {"count": 8},
-            }
-        )
-        assert seen == [4]
+        raw = {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "model_revision": "a" * 40,
+            "algorithm": "sft",
+            "environment": {"id": "owner/env"},
+            "train": {"max_examples": 1},
+            "gpu": {"count": 8},
+        }
+        spec_from_dict(raw)
+
+        # an unset count must cross the same boundary already capped. force a floor that would need
+        # eight cards without the unvalidated-revision cap; the schema may still preview only four.
+        monkey.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 700)
+        spec_from_dict({**raw, "gpu": {}})
+        assert seen == [4, 4]
     finally:
         monkey.undo()
 

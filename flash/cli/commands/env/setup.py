@@ -55,6 +55,13 @@ def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult
 
 
 class StarterEnv(EnvironmentSingleTurn):
+    # Each dataset row's `output` does double duty: the scorer's expected answer, AND the gold
+    # assistant turn SFT trains on. With no `sft_completion` hook defined, `flash env test` and
+    # SFT both replay `output` verbatim as the model's response. So write it as the full text
+    # the model should emit -- if `score_response` requires a wrapper (\\boxed{}, a JSON object,
+    # a tag), the wrapper belongs in `output` too, or SFT trains the model to emit exactly what
+    # the reward punishes. Per-row state the scorer needs but the model must not see goes in
+    # `metadata`, never in `output`.
     dataset = load_jsonl(DEFAULT_DATASET_PATH)
 
     def build_prompt_messages(self, example: TaskExample, prompt_text: str):

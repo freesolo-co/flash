@@ -6,6 +6,7 @@ import base64
 import gzip
 import io
 import json
+import logging
 import subprocess
 import tarfile
 import tracemalloc
@@ -783,6 +784,170 @@ def test_require_environment_project_backfill_failure_is_502(monkeypatch):
     assert excinfo.value.status_code == 502
     assert excinfo.value.detail == (
         "environment package exists, but its project association could not be repaired"
+    )
+
+
+def _validate_http_error(code: int, body: bytes):
+    import urllib.error
+
+    return urllib.error.HTTPError(
+        "https://backend.test/api/flash/environments/validate/internal",
+        code,
+        "error",
+        {},
+        io.BytesIO(body),
+    )
+
+
+def test_record_published_environment_raises_on_a_cross_project_name_conflict(monkeypatch):
+    """A 409 must reach the caller as a conflict, not collapse into the best-effort ``False``.
+
+    ``False`` is indistinguishable from a transient write failure, which is what made the publish
+    route advise a retry for a conflict no retry can clear.
+    """
+    from flash.server.domain import environment_registry
+    from flash.server.platform import internal_client
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        internal_client.urllib.request,
+        "urlopen",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            _validate_http_error(409, b'{"detail":"flash environment belongs to another project"}')
+        ),
+    )
+
+    with pytest.raises(environment_registry.EnvironmentProjectConflict) as excinfo:
+        environment_registry.record_published_environment(
+            slug="acme/example",
+            name="example",
+            key={"org_id": "org-A"},
+            project_id="22222222-2222-4222-8222-222222222222",
+        )
+
+    assert "belongs to another project" in str(excinfo.value)
+
+
+def test_record_published_environment_keeps_other_failures_best_effort(monkeypatch):
+    """Only the conflict is promoted; a 500 stays a ``False`` so the retry advice still applies."""
+    from flash.server.domain import environment_registry
+    from flash.server.platform import internal_client
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        internal_client.urllib.request,
+        "urlopen",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            _validate_http_error(500, b'{"detail":"failed to persist flash environment"}')
+        ),
+    )
+
+    assert (
+        environment_registry.record_published_environment(
+            slug="acme/example",
+            name="example",
+            key={"org_id": "org-A"},
+            project_id="22222222-2222-4222-8222-222222222222",
+        )
+        is False
+    )
+
+
+def test_raise_if_owned_by_another_project_blocks_only_a_real_conflict(monkeypatch):
+    """409 blocks the publish; 404 (first publish of a new name) does not."""
+    from flash.server.domain import environment_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            _validate_http_error(409, b'{"detail":"flash environment belongs to another project"}')
+        ),
+    )
+    with pytest.raises(environment_registry.EnvironmentProjectConflict):
+        environment_registry.raise_if_owned_by_another_project(
+            slug="acme/example",
+            project_id="22222222-2222-4222-8222-222222222222",
+            org_id="org-A",
+        )
+
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            _validate_http_error(404, b'{"detail":"flash environment not found"}')
+        ),
+    )
+    environment_registry.raise_if_owned_by_another_project(
+        slug="acme/brand-new",
+        project_id="22222222-2222-4222-8222-222222222222",
+        org_id="org-A",
+    )
+
+
+def test_raise_if_owned_by_another_project_does_not_block_when_the_backend_is_down(monkeypatch):
+    """The guard prevents a destructive overwrite; it must not become a new uptime dependency.
+
+    An unreachable backend leaves publishing exactly as available as it was before the guard --
+    the association step afterwards still reports that failure.
+    """
+    from flash.server.domain import environment_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("connection refused")),
+    )
+
+    environment_registry.raise_if_owned_by_another_project(
+        slug="acme/example",
+        project_id="22222222-2222-4222-8222-222222222222",
+        org_id="org-A",
+    )
+
+
+def test_ownership_probe_does_not_log_an_ordinary_first_publish_as_a_failure(monkeypatch, caplog):
+    """A 404 here means "that name is free" -- the answer every first publish gets.
+
+    The probe shares the best-effort transport, whose default is to log any HTTP error as
+    "failed to <subject>". For this one caller that would put a warning in the logs on the most
+    common SUCCESSFUL path, which is how operators learn to ignore the warning that matters. A
+    genuine fault must still warn, so both directions are asserted here.
+    """
+    from flash.server.domain import environment_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+
+    def _respond(status: int, payload: bytes):
+        monkeypatch.setattr(
+            environment_registry.urllib.request,
+            "urlopen",
+            lambda *_a, **_k: (_ for _ in ()).throw(_validate_http_error(status, payload)),
+        )
+
+    _respond(404, b'{"detail":"flash environment not found"}')
+    with caplog.at_level(logging.DEBUG, logger="flash.server.environments"):
+        environment_registry.raise_if_owned_by_another_project(
+            slug="acme/brand-new",
+            project_id="22222222-2222-4222-8222-222222222222",
+            org_id="org-A",
+        )
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "an ordinary first publish must not warn"
+    )
+
+    caplog.clear()
+    _respond(500, b'{"detail":"backend exploded"}')
+    with caplog.at_level(logging.DEBUG, logger="flash.server.environments"):
+        environment_registry.raise_if_owned_by_another_project(
+            slug="acme/brand-new",
+            project_id="22222222-2222-4222-8222-222222222222",
+            org_id="org-A",
+        )
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "a real backend fault must still warn"
     )
 
 
