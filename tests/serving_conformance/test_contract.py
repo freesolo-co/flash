@@ -34,7 +34,18 @@ IDENTITY_FIELDS = (
     "base_model",
     "checkpoint",
     "thinking",
+    # Compared by the client too, on every readiness poll. Only meaningful because registrations
+    # here carry a nonempty org: with both sides None the check cannot fail.
+    "org_id",
 )
+
+# The provenance metadata `_matches_revision_identity` cross-checks when the backend advertises
+# `revision_provenance`. Asserted only in that case, matching the client's own `require_provenance`
+# -- a backend that does not claim the capability is not expected to echo it.
+PROVENANCE_FIELDS = ("record_type", "run_id", "checkpoint_step", "hf_revision")
+
+# Any nonempty value works: the contract is that whatever was sent comes back unchanged.
+CONFORMANCE_ORG_ID = "conformance-org"
 
 
 def _record(payload: object) -> dict:
@@ -60,6 +71,11 @@ def _registration(run_id: str, source: dict, *, step: int | None = 10) -> dict:
         "subfolder": source["subfolder"],
         "repo_type": source["repo_type"],
         "checkpoint": checkpoint,
+        # A NONEMPTY org, because the client compares `(record.get("org_id") or None)` against the
+        # same on the request. Registering without one makes both sides None and the comparison
+        # passes for a backend that drops the field entirely -- which then rejects every ordinary
+        # managed-plane deploy, where the org is always set, as a different immutable identity.
+        "org_id": CONFORMANCE_ORG_ID,
         "metadata": {
             "record_type": "revision",
             "run_id": run_id,
@@ -145,6 +161,20 @@ def test_readback_echoes_the_identity_the_client_cross_checks(http, deployed):
     for field in IDENTITY_FIELDS:
         assert record.get(field) == deployed.get(field), (
             f"read-back {field}={record.get(field)!r}, registered {deployed.get(field)!r}"
+        )
+    # Provenance only when it is claimed. The client gates the same cross-check on the capability,
+    # so requiring it unconditionally would fail a backend that is behaving correctly -- and
+    # skipping it for one that DOES advertise it certifies a backend the client will refuse.
+    capabilities = set(http.get("/healthz").json().get("capabilities") or [])
+    if "revision_provenance" not in capabilities:
+        return
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    expected = deployed.get("metadata") or {}
+    for field in PROVENANCE_FIELDS:
+        assert metadata.get(field) == expected.get(field), (
+            f"this backend advertises revision_provenance, but read-back metadata.{field}="
+            f"{metadata.get(field)!r} while {expected.get(field)!r} was registered. the client "
+            f"cross-checks these on every readiness poll and refuses the deploy on a mismatch."
         )
 
 

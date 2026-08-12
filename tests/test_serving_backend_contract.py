@@ -2019,3 +2019,205 @@ def test_a_registration_for_another_base_model_is_refused(client):
     """One app serves one base model; its engine cannot load an adapter trained on a different one."""
     response = client.post("/adapters", json={**REGISTRATION, "base_model": "Qwen/Qwen3.6-27B"})
     assert response.status_code == 409
+
+
+def test_a_failed_eviction_keeps_the_lora_claim(client, monkeypatch):
+    """A `remove_lora` that raises must not release the claim.
+
+    The exception is suppressed because eviction must never fail an undeploy, but suppressing it
+    does not make the adapter gone: it is still resident under this int id. Releasing anyway lets a
+    colliding adapter claim the id and load while the old weights still occupy it, which is the
+    wrong-run's-weights outcome the claim exists to prevent.
+    """
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._loaded = {REVISION: object()}
+    int_id = module._lora_int_id(REVISION)
+    instance._int_ids = {int_id: REVISION}
+
+    async def _refuse(_int_id):
+        raise RuntimeError("engine is wedged")
+
+    instance.engine = types.SimpleNamespace(remove_lora=_refuse)
+    key = module._lora_id_key(int_id)
+    module.adapter_records[key] = REVISION
+
+    _run_awaitable_result(engine_class.unregister(instance, REVISION))
+
+    assert dict.get(module.adapter_records, key) == REVISION, (
+        "an eviction that failed still released the lora id claim, so a colliding adapter can "
+        "claim the id while the old weights are still resident under it"
+    )
+
+
+def test_an_engine_rpc_failure_settles_the_record_as_failed(client):
+    """A dead Engine container must not leave the record at `registered`.
+
+    The raise happens outside `Engine.register`'s own handler, and settle runs detached so nothing
+    observes it. Unhandled, the record stays `registered` forever and the client polls its whole
+    readiness budget, reporting a timeout that reads as a slow GPU rather than an engine that never
+    answered.
+    """
+    module = client.app.state.generated_module
+
+    async def _die(_record):
+        raise RuntimeError("engine container exited during startup")
+
+    module.Engine = lambda: types.SimpleNamespace(
+        register=types.SimpleNamespace(remote=types.SimpleNamespace(aio=_die)),
+        unregister=types.SimpleNamespace(
+            remote=types.SimpleNamespace(aio=lambda *a, **k: _noop_coroutine())
+        ),
+    )
+    assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
+
+    assert _lifecycle(client, REVISION) == "failed", (
+        "an engine rpc that never answered left the record at `registered`, so the client polls "
+        "its full readiness budget and reports a timeout instead of the real failure"
+    )
+    failure = client.get(f"/adapters/{REVISION}").json()["adapter"]["metadata"]["failure"]
+    assert "did not answer" in failure
+
+
+def test_a_stale_enqueue_failure_does_not_overwrite_a_newer_attempt(client):
+    """Only this request's attempt may be marked `failed` when its handoff fails.
+
+    Two identical registrations overlap by design. If the first one's spawn fails after the second
+    has already stamped a new attempt and queued it, an unconditional write restores the first's
+    stale record as `failed` -- and the live settle then finds a token mismatch and cannot commit
+    its result at all, pinning a run whose load succeeded to `failed` permanently.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    ready = dict(client.get(f"/adapters/{REVISION}").json()["adapter"])
+    # Put the record back to `registered` so a re-registration reaches the spawn at all: a `ready`
+    # record is a genuine no-op that never enqueues, so the failure under test is unreachable
+    # without this. The token stays the CURRENT one, which the failing request will not carry.
+    module.adapter_records[module._record_key(REVISION)] = {
+        **ready,
+        "status": "registered",
+        "metadata": {**ready["metadata"], "lifecycle_state": "registered"},
+    }
+
+    def _refuse(_record):
+        raise RuntimeError("queue unavailable")
+
+    # The re-registration stamps a NEW token, writes it, and then fails to enqueue. Meanwhile the
+    # concurrent settle this simulates has already committed `ready` under a different token: the
+    # durable record is rewritten to that state between the stamp and the spawn.
+    spawned_with: list = []
+
+    def _refuse_after_a_newer_attempt_lands(record):
+        spawned_with.append(record)
+        module.adapter_records[module._record_key(REVISION)] = {
+            **ready,
+            "status": "ready",
+            "metadata": {**ready["metadata"], "lifecycle_state": "ready"},
+        }
+        raise RuntimeError("queue unavailable")
+
+    original = module.settle_adapter
+    module.settle_adapter = types.SimpleNamespace(spawn=_refuse_after_a_newer_attempt_lands)
+    try:
+        # TestClient re-raises what a deployed app returns as a 500, so the raise itself is expected.
+        with pytest.raises(RuntimeError, match="queue unavailable"):
+            client.post("/adapters", json=REGISTRATION)
+    finally:
+        module.settle_adapter = original
+
+    assert spawned_with, "the registration never reached the enqueue, so nothing was under test"
+    record = dict.get(module.adapter_records, module._record_key(REVISION))
+    assert record["status"] == "ready", (
+        "a superseded request's failed enqueue overwrote the newer attempt's `ready` record, so "
+        "the settle that actually succeeded can no longer commit its result"
+    )
+
+
+def test_undeploy_reports_when_registrations_outran_its_passes(client):
+    """A run that keeps receiving registrations must not report a complete undeploy.
+
+    The pass budget is bounded, so a revision appended during the final pass is read but never
+    processed. Returning 200 there leaves it `ready` and directly callable by its immutable id
+    while the client believes the run is gone.
+    """
+    module = client.app.state.generated_module
+    _register_and_ready(client)
+
+    members_key = module._members_key(RUN_ID)
+    original_read = module._run_members
+    calls = {"n": 0}
+
+    async def _always_growing(run_id):
+        calls["n"] += 1
+        existing = list(dict.get(module.adapter_records, members_key) or [])
+        fresh = f"{RUN_ID}@final.{calls['n']:040d}"
+        module.adapter_records[module._record_key(fresh)] = {
+            "adapter_id": fresh,
+            "status": "ready",
+            "metadata": {"run_id": RUN_ID, "record_type": "revision", "lifecycle_state": "ready"},
+        }
+        return [*existing, fresh]
+
+    module._run_members = _always_growing
+    try:
+        response = client.delete(f"/adapters/{RUN_ID}")
+    finally:
+        module._run_members = original_read
+
+    assert response.status_code == 409, (
+        f"undeploy returned {response.status_code} while revisions it never disabled were still "
+        f"ready and callable by their immutable ids"
+    )
+
+
+def test_a_colliding_load_evicts_a_stale_local_resident(client, monkeypatch):
+    """A replica that missed the undeploy eviction must not keep two adapters on one int id.
+
+    Undeploy's eviction is one remote call and Modal routes it to a single replica, so another
+    replica can still hold the old adapter under this int. The claim was released, so the id is
+    legitimately re-claimable -- loading over it without evicting first leaves two adapters mapped
+    to one int, which is exactly what vLLM cannot represent.
+    """
+    lora = types.ModuleType("vllm.lora.request")
+    lora.LoRARequest = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora)
+
+    module = client.app.state.generated_module
+    engine_class = module.engine_classes[0]
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._loaded = {}
+    instance._int_ids = {}
+
+    removed: list[int] = []
+
+    async def _remove(int_id):
+        removed.append(int_id)
+
+    async def _path(record):
+        return "/cache/adapter"
+
+    async def _add(request):
+        return None
+
+    instance._adapter_path = _path
+    instance.engine = types.SimpleNamespace(add_lora=_add, remove_lora=_remove)
+    monkeypatch.setattr(module, "_lora_int_id", lambda adapter_id: 4242)
+
+    # The old adapter is still resident on THIS replica; its claim was already released elsewhere.
+    old = "run-old@final." + "a" * 40
+    instance._loaded[old] = object()
+    instance._int_ids[4242] = old
+
+    newcomer = {"adapter_id": "run-new@final." + "b" * 40}
+    _run_awaitable(engine_class._lora_request(instance, newcomer))
+
+    assert removed == [4242], (
+        "the newcomer loaded over a stale local resident without evicting it, so two adapters are "
+        "mapped to one vllm int id on this container"
+    )
+    assert old not in instance._loaded

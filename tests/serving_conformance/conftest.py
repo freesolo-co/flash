@@ -101,7 +101,17 @@ def ready_timeout(request) -> float:
 @pytest.fixture(scope="session")
 def http(serving_url, internal_key):
     """A client bound to the target, carrying the internal key exactly as flash sends it."""
-    httpx = pytest.importorskip("httpx")
+    # FAILS rather than skips. Reaching this fixture means the suite was explicitly enabled with
+    # --serving-url, and a skip there is a false green: pytest exits 0 having checked not one
+    # endpoint, which reads as "the backend conforms". The whole point of this suite is that its
+    # green means something.
+    try:
+        import httpx
+    except ImportError as exc:
+        pytest.fail(
+            "the conformance suite needs httpx to talk to the backend, and it is not installed: "
+            f"{exc}. install it with `pip install httpx`, or drop --serving-url to skip the suite."
+        )
     headers = {"X-Freesolo-Internal-Key": internal_key} if internal_key else {}
     with httpx.Client(base_url=serving_url, headers=headers, timeout=120.0) as client:
         yield client

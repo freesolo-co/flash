@@ -228,6 +228,13 @@ def cmd_serve_setup(args) -> int:
         return _err(str(exc))
     except ValueError as exc:
         return _err(str(exc))
+    # Every other filesystem refusal: --output naming an existing directory, an unwritable parent,
+    # a read-only volume, no space. These reach the top-level handler otherwise, which re-raises on
+    # the non-styled path, so an ordinary permissions problem prints a traceback instead of the
+    # `error:` line every other failure in this command produces. Listed after FileExistsError,
+    # which is an OSError subclass and keeps its own more specific message.
+    except OSError as exc:
+        return _err(f"could not write {destination}: {exc}")
     print(f"wrote {destination}")
     print(f"  model  {info.id}")
     print(f"  gpu    {gpu.name}  (~${gpu.usd_hr:.2f}/hr while serving, $0 idle)")

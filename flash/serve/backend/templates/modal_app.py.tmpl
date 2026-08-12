@@ -503,6 +503,20 @@ class Engine:
             # `put(skip_if_exists=True)` is atomic across containers, so exactly one adapter wins
             # the id, and it wins before either has spent minutes downloading.
             owner = await _claim_lora_int_id(int_id, adapter_id)
+            if owner == adapter_id:
+                # Evict a stale local resident of this int id before loading over it. Undeploy's
+                # eviction is one remote call and Modal routes it to ONE replica, so any other
+                # replica that had served the old adapter still holds it under this int -- and
+                # having released the claim, the id is legitimately re-claimable. Loading here
+                # without evicting first would leave two adapters mapped to one int on this
+                # container, which is precisely what vLLM cannot represent. Cheap: the map is
+                # empty for this int on every replica that never served the old adapter.
+                stale = self._int_ids.get(int_id)
+                if stale is not None and stale != adapter_id:
+                    self._loaded.pop(stale, None)
+                    self._int_ids.pop(int_id, None)
+                    with contextlib.suppress(Exception):
+                        await self.engine.remove_lora(int_id)
             if owner != adapter_id:
                 raise RuntimeError(
                     f"lora id collision: {{adapter_id}} and {{owner}} both hash to {{int_id}}, and "
@@ -564,9 +578,21 @@ class Engine:
                 # Drop it from vLLM too, not just from this dict. The LoRA cache is bounded by
                 # max_loras, so repeated deploy/undeploy cycles would otherwise keep disabled
                 # adapters resident until the container restarts and start evicting live ones.
-                with contextlib.suppress(Exception):  # best effort, never fails an undeploy
+                #
+                # The claim is released ONLY on a confirmed eviction. `remove_lora` failing is
+                # suppressed because it must never fail an undeploy, but suppressing it does not
+                # make the adapter gone: it is still resident under this int id. Releasing anyway
+                # would let a colliding adapter claim the id and load while the old weights still
+                # occupy it, which is the wrong-run's-weights outcome the claim exists to prevent.
+                # Keeping the claim instead costs one reserved id on a container that is about to
+                # recycle, and the record is already `disabled` so nothing routes to it.
+                evicted = True
+                try:
                     await self.engine.remove_lora(int_id)
-                await _release_lora_int_id(int_id, adapter_id)
+                except Exception:  # best effort, never fails an undeploy
+                    evicted = False
+                if evicted:
+                    await _release_lora_int_id(int_id, adapter_id)
         return {{"ok": True}}
 
     async def _prepare(self, payload: dict[str, Any], record: dict[str, Any]):
@@ -691,7 +717,16 @@ async def settle_adapter(record: dict[str, Any]) -> None:
     metadata = record.get("metadata") or {{}}
     attempt = metadata.get("settle_attempt")
     run_id = metadata.get("run_id") or adapter_id
-    result = await Engine().register.remote.aio(record)
+    # The RPC ITSELF is caught, not just the load inside it. A container that dies during startup,
+    # a timeout, or any Modal-side failure raises here, outside `Engine.register`'s own handler --
+    # and settle runs detached, so nothing observes that raise. The record then stays `registered`
+    # forever, the client polls it for its full readiness budget, and the deploy reports a timeout
+    # that reads as a slow GPU rather than as an engine that never answered. Turned into the same
+    # failure envelope a load error produces, so the commit below records it as `failed`.
+    try:
+        result = await Engine().register.remote.aio(record)
+    except Exception as exc:
+        result = {{"ok": False, "failure": f"the serving engine did not answer: {{exc}}"}}
     stand_down = False
     # The load ran OUTSIDE the lock -- it takes minutes, and the lock's TTL only holds because
     # nothing slow runs under it. But the decision of whether this result may be committed, and
@@ -786,10 +821,28 @@ def api():
         `failed` is the honest terminal state and the useful one: it is what the client treats as a
         real failure, and re-registering is what clears it, so the operator's natural next move is
         the one that fixes it.
+
+        Written only when the durable record still carries THIS request's attempt token. Two
+        identical registrations overlap by design -- the second stamps a new `settle_attempt` and
+        queues its own settle -- so an unconditional write here would restore this request's stale
+        record as `failed` over the newer one, and the live settle would then find a token mismatch
+        and be unable to commit its result at all. The run whose load actually succeeds would sit
+        at `failed` permanently.
+
+        The token is re-read WITHOUT taking the run lock: one caller already holds it (the
+        identical-registration path), so acquiring it here would deadlock against itself. A plain
+        read is the right amount of care anyway -- the failure this guards is a newer attempt
+        already durably recorded, which a read sees, and losing a race to an attempt stamped in the
+        same instant costs a spurious `failed` that re-registering clears.
         """
         try:
             settle_adapter.spawn(record)
         except Exception as exc:
+            attempt = (record.get("metadata") or {{}}).get("settle_attempt")
+            current = await _read(record["adapter_id"])
+            if attempt is not None and isinstance(current, dict):
+                if (current.get("metadata") or {{}}).get("settle_attempt") != attempt:
+                    raise
             record["status"] = "failed"
             record["metadata"] = {{
                 **(record.get("metadata") or {{}}),
@@ -1111,6 +1164,20 @@ def api():
                     else:
                         disabled_revisions.append(candidate["adapter_id"])
                 members = list(dict.fromkeys([*members, *await _run_members(run_id)]))
+            # The pass budget is bounded, so it can run out with members still unvisited: a
+            # registration landing during the final pass is appended by the read above and then
+            # never processed. Reported rather than swallowed -- returning 200 with a revision
+            # still `ready` and directly callable by its immutable id is the one outcome an
+            # operator cannot detect. 409 says the run is in flux and the retry is theirs to make;
+            # the passes that DID land stay disabled, so a retry converges.
+            stragglers = [member for member in members if member not in seen]
+            if stragglers:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"{{run_id}} kept receiving registrations while it was being undeployed "
+                    f"({{len(stragglers)}} still active). the rest of the run is disabled; "
+                    f"repeat the delete once deploys to this run have stopped.",
+                )
         # Outside the lock: evicting from the GPU is slow and best effort, and the records are
         # already durably disabled, so holding the lock across it would only block other deploys.
         #
