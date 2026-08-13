@@ -444,11 +444,14 @@ def _chat_prompt(payload: Any) -> str | None:
     if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
         return None
     for field in _INSTRUCTION_CONTEXT_FIELDS:
-        value = payload.get(field)
+        if field not in payload or payload[field] is None:
+            continue
+        value = payload[field]
         if field == "response_format" and value == {"type": "text"}:
             continue
-        if value:
-            return None
+        if field in {"tools", "functions"} and value == []:
+            continue
+        return None
     messages = payload["messages"]
     if len(messages) != 1:
         return None
@@ -480,7 +483,8 @@ def _chat_reply(payload: Any) -> str | None:
     message = choice["message"]
     # absent roles remain accepted for providers and older envelopes that omit them. an explicit
     # non-assistant role is different: its text is not a desired assistant completion.
-    if message.get("role") not in {None, "assistant"}:
+    role = message.get("role")
+    if role is not None and (not isinstance(role, str) or role != "assistant"):
         return None
     if message.get("tool_calls") or message.get("function_call"):
         # a training target must contain the whole assistant action. exporting only the accompanying

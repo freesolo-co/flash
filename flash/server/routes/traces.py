@@ -208,10 +208,38 @@ def _is_schema_definition(value: Any) -> bool:
 
 def _redact_schema_literal(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: _redact_schema_literal(item) for key, item in value.items()}
+        return {
+            "[redacted]" if _is_secret_key(key) else key: _redact_schema_literal(item)
+            for key, item in value.items()
+        }
     if isinstance(value, list | tuple):
         return [_redact_schema_literal(item) for item in value]
     return "[redacted]"
+
+
+def _secret_schema_definition_refs(value: Any) -> set[tuple[str, str]]:
+    if not isinstance(value, dict) or not isinstance(value.get("properties"), dict):
+        return set()
+    refs: set[tuple[str, str]] = set()
+
+    def collect(node: Any) -> None:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str):
+                for container, prefix in (("$defs", "#/$defs/"), ("definitions", "#/definitions/")):
+                    name = ref.removeprefix(prefix) if ref.startswith(prefix) else ""
+                    if name and "/" not in name:
+                        refs.add((container, name))
+            for item in node.values():
+                collect(item)
+        elif isinstance(node, list | tuple):
+            for item in node:
+                collect(item)
+
+    for key, schema in value["properties"].items():
+        if _is_secret_key(key) and _is_schema_definition(schema):
+            collect(schema)
+    return refs
 
 
 def _redact_secret_fields(
@@ -224,11 +252,19 @@ def _redact_secret_fields(
     choice: bool = False,
     logprobs: bool = False,
     logprob_entries: bool = False,
+    secret_schema_refs: set[tuple[str, str]] | None = None,
+    schema_definition_container: str | None = None,
 ) -> Any:
     if isinstance(value, dict):
+        local_secret_schema_refs = _secret_schema_definition_refs(value)
+        active_secret_schema_refs = (secret_schema_refs or set()) | local_secret_schema_refs
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
             schema_definition = schema_property_map and _is_schema_definition(item)
+            referenced_secret_definition = (
+                schema_definition_container is not None
+                and (schema_definition_container, str(key)) in active_secret_schema_refs
+            )
             if secret_schema_definition and key in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                 redacted[key] = _redact_schema_literal(item)
             elif _is_secret_key(key, allow_token=logprob_entries) and not schema_definition:
@@ -240,13 +276,18 @@ def _redact_secret_fields(
                         key in {"properties", "$defs", "definitions"} and isinstance(item, dict)
                     ),
                     secret_schema_definition=secret_schema_definition
-                    or (schema_definition and _is_secret_key(key)),
+                    or (schema_definition and _is_secret_key(key))
+                    or referenced_secret_definition,
                     response_root=False,
                     choice_list=response_root and key == "choices" and isinstance(item, list),
                     choice=choice_list,
                     logprobs=choice and key == "logprobs" and isinstance(item, dict),
                     logprob_entries=logprob_entries
                     or (logprobs and key in {"content", "refusal", "top_logprobs"}),
+                    secret_schema_refs=active_secret_schema_refs,
+                    schema_definition_container=(
+                        key if key in {"$defs", "definitions"} and isinstance(item, dict) else None
+                    ),
                 )
         return redacted
     if isinstance(value, list | tuple):
@@ -258,6 +299,8 @@ def _redact_secret_fields(
                 choice=choice_list,
                 logprobs=logprobs,
                 logprob_entries=logprob_entries,
+                secret_schema_refs=secret_schema_refs,
+                schema_definition_container=schema_definition_container,
             )
             for item in value
         ]
@@ -430,6 +473,7 @@ async def _stream_response(
 ) -> AsyncIterator[bytes]:
     accumulator = SseAccumulator(max_accumulated_bytes=MAX_PAYLOAD_TOTAL_BYTES)
     raw_output = bytearray()
+    raw_output_truncated = False
     # a body is parsed as SSE only if it says it is one. an error status is one way to get a
     # non-SSE body, but a 2xx gateway envelope is another, and feeding either to the accumulator
     # stores None in place of the bytes the caller actually received.
@@ -451,8 +495,11 @@ async def _stream_response(
                     # of it lets one response grow the plane's memory without limit. a SUCCESSFUL
                     # non-SSE body keeps exactly the aggregate bound persistence accepts, so a body
                     # that could be stored whole is not pre-truncated into undecodable JSON.
-                    if len(raw_output) < raw_output_limit:
-                        raw_output.extend(chunk[: raw_output_limit - len(raw_output)])
+                    remaining = raw_output_limit - len(raw_output)
+                    if remaining > 0:
+                        raw_output.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        raw_output_truncated = True
                 else:
                     accumulator.feed(chunk)
             if done_gate is None:
@@ -487,7 +534,7 @@ async def _stream_response(
                     if raw_body:
                         try:
                             output_payload: Any = json.loads(raw_output)
-                        except (json.JSONDecodeError, UnicodeDecodeError):
+                        except (ValueError, UnicodeDecodeError):
                             output_payload = bytes(raw_output).decode(errors="replace")
                     else:
                         accumulator.finish()
@@ -511,7 +558,9 @@ async def _stream_response(
                         context,
                         output_payload=output_payload,
                         error=error,
-                        output_truncated=accumulator.truncated if not raw_body else False,
+                        output_truncated=(
+                            raw_output_truncated if raw_body else accumulator.truncated
+                        ),
                     )
     if not client_disconnected and done_gate is not None:
         if context.record_failed:
@@ -667,7 +716,7 @@ async def chat_completions(
     raw_body = await _bounded_request_body(request)
     try:
         parsed_body = json.loads(raw_body)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
     if not isinstance(parsed_body, dict):
         raise HTTPException(status_code=400, detail="Request body must be a JSON object")

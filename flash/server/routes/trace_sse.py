@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+_POST_DONE_SUFFIX_LIMIT = 1024
+
 
 class SseDoneGate:
     def __init__(self) -> None:
@@ -17,6 +19,8 @@ class SseDoneGate:
         return self.done_event is not None
 
     def feed(self, chunk: bytes) -> list[bytes]:
+        if self.done_event is not None:
+            return []
         self._buffer += chunk
         if self._done:
             self._consume_done_suffix()
@@ -57,15 +61,32 @@ class SseDoneGate:
         return [forwarded] if forwarded else []
 
     def _consume_done_suffix(self) -> None:
-        newline = self._buffer.find(b"\n")
-        if newline < 0:
-            return
-        if self._buffer[:newline].rstrip(b"\r"):
-            return
-        self._done.extend(self._buffer[: newline + 1])
-        self._buffer = self._buffer[newline + 1 :]
+        # a `data: [DONE]` line can be followed by further lines of the SAME event: in SSE only a
+        # blank line ends one. those continuation lines belong to the terminator and are relayed
+        # with it, so they are retained rather than dropped -- dropping them made the relay lossy.
+        while True:
+            if len(self._done) + len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
+                # an upstream that sends `[DONE]` and then never delimits it would otherwise grow
+                # this buffer without bound, outside the accumulator's budget. settle on what the
+                # terminator already is and stop retaining the rest.
+                self._settle_done()
+                return
+            newline = self._buffer.find(b"\n")
+            if newline < 0:
+                return
+            blank = not self._buffer[:newline].rstrip(b"\r")
+            self._done.extend(self._buffer[: newline + 1])
+            self._buffer = self._buffer[newline + 1 :]
+            if blank:
+                # the delimiter closed the event; anything past it is post-terminator data that
+                # this gate has already decided to stop at, so it must not be relayed later.
+                self._settle_done()
+                return
+
+    def _settle_done(self) -> None:
         self.done_event = bytes(self._done)
         self._done.clear()
+        self._buffer = b""
 
 
 def _could_be_done_line(line: bytes) -> bool:
@@ -333,7 +354,7 @@ class SseAccumulator:
             return
         try:
             payload = json.loads(data)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError):
             self._note_defect("stream contained an unparseable data event")
             return
         if not isinstance(payload, dict):
@@ -434,11 +455,13 @@ class SseAccumulator:
                 self._note_defect("stream tool_calls contained a non-object entry")
                 continue
             raw_index = tool_call.get("index", position)
-            index = (
-                raw_index
-                if isinstance(raw_index, int) and not isinstance(raw_index, bool)
-                else position
-            )
+            if raw_index is None:
+                index = position
+            elif not isinstance(raw_index, int) or isinstance(raw_index, bool):
+                self._note_defect("stream tool_call contained a non-integer index")
+                continue
+            else:
+                index = raw_index
             target = accumulated_calls.setdefault(index, {})
             _merge_fragment_dict(
                 target,
