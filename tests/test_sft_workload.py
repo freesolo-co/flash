@@ -522,27 +522,33 @@ class ThinkingTokenizer(FakeTokenizer):
             elif message.get("role") == "assistant" and "</think>" in content:
                 reasoning = content.split("</think>")[0].split("<think>")[-1].strip()
                 content = content.split("</think>")[-1].lstrip("\n")
+            # the assistant HEADER is part of the reasoning layout, not decoration: the template
+            # only ever opens a <think> block straight after it, which is what distinguishes a
+            # block it owns from the same tag sitting in ordinary content. a fake that drops the
+            # header renders spans no structural parser can find.
             if message.get("role") == "assistant" and index > last_query:
-                parts.append(f"<think>\n{reasoning}\n</think>\n\n{content}")
+                parts.append(f"<|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{content}")
+            elif message.get("role") == "assistant":
+                parts.append(f"<|im_start|>assistant\n{content}")
             else:
                 parts.append(content)
         text = "".join(parts)
-        return text + ("<think>\n" if add_generation_prompt else "")
+        return text + ("<|im_start|>assistant\n<think>\n" if add_generation_prompt else "")
 
 
 class ThinkingEnvironment(FakeEnvironment):
     multi_turn = True
 
-    def __init__(self, completion):
+    def __init__(self, completion, prompt="board"):
         super().__init__()
-        self._rows = [{"prompt": "board", "answer": "ignored"}]
+        self._rows = [{"prompt": prompt, "answer": "ignored"}]
         self._completion = completion
 
     def sft_completion(self, row):
         return [dict(message) for message in self._completion]
 
 
-def _thinking_prepared(completion):
+def _thinking_prepared(completion, prompt="board"):
     spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
     spec = replace(
         spec,
@@ -555,7 +561,7 @@ def _thinking_prepared(completion):
     )
     return prepare_sft_workload(
         spec,
-        ThinkingEnvironment(completion),
+        ThinkingEnvironment(completion, prompt=prompt),
         tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
         producer_version="1.2.3",
         packing_support=lambda _model, _revision: ("pure-attention", True),
@@ -1030,6 +1036,62 @@ def test_an_earlier_surviving_block_is_not_reported_lost_when_a_later_one_is_tru
     assert "max_context_tokens cut 1 rendered reasoning block" in err
     assert "1 of 2 authored reasoning blocks reach the loss" in err
     assert "the chat template dropped" not in err
+
+
+def test_a_think_tag_quoted_in_the_prompt_does_not_swallow_the_turns_that_follow(capsys) -> None:
+    """A bare ``<think>`` in the PROMPT is content, and must not consume the blocks after it.
+
+    A user asking what the tag means renders a literal unmatched opener into the prompt. Tracking
+    delimiters by depth leaves that opener permanently unclosed, so the template's own closer
+    completes nothing and every later block reads as stripped -- a total-loss warning for a row the
+    template kept whole. The reasoning layout is what identifies a block, not the raw tags.
+    """
+    completion = [{"role": "assistant", "content": "<think>real reasoning</think>an answer"}]
+    prepared = _thinking_prepared(completion, prompt="what does the <think> tag mean?")
+
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 1
+    assert prepared.truncated_reasoning_spans == 0
+    assert "reasoning" not in capsys.readouterr().err
+
+
+def test_a_closing_tag_quoted_inside_reasoning_does_not_end_the_block_early(capsys) -> None:
+    """The block ends at the closer the TEMPLATE emits, not at one the reasoning happens to quote.
+
+    Reasoning that discusses the delimiter renders an unmatched ``</think>`` inside its own body.
+    Ending the span there puts its end before the real one, so a cap falling between the two calls
+    a cut block retained and overstates what reaches the loss. The cap here sits past the quoted
+    tag but before the template's closer, so an early end would report zero truncation.
+    """
+    completion = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "the </think> tag closes it " + "rest " * 12,
+        }
+    ]
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=40, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        ThinkingEnvironment(completion),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    # the cap cuts the block, and measuring to the real closer is what sees that
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.truncated_reasoning_spans == 1
+    assert "max_context_tokens cut 1 rendered reasoning" in capsys.readouterr().err
 
 
 def test_reasoning_containing_a_balanced_tag_is_measured_to_its_real_end(capsys) -> None:

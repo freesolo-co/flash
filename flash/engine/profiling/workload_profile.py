@@ -59,38 +59,44 @@ def sft_sample_policy(max_examples: object) -> str:
 
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
-_THINK_DELIMITER = re.compile(f"{_THINK_OPEN}|{_THINK_CLOSE}")
+# the template emits reasoning in exactly one place: straight after an assistant header, as
+# `<think>\n<body>\n</think>\n\n`. anchoring on that whole shape is what separates a block the
+# template OWNS from the same characters appearing as ordinary text somewhere else.
+_TEMPLATE_REASONING = re.compile(
+    rf"<\|im_start\|>assistant\n(?P<open>{_THINK_OPEN})\n(?P<body>.*?)\n{_THINK_CLOSE}\n\n",
+    re.DOTALL,
+)
 
 
 def reasoning_spans(text: str) -> list[tuple[int, int]]:
-    """``(start, end)`` of each NON-EMPTY ``<think>`` span in rendered text, outermost only.
+    """``(start, end)`` of each NON-EMPTY reasoning block the TEMPLATE owns, in rendered text.
 
     Non-empty because Qwen3.5's template opens a ``<think>`` block on every trailing assistant turn
     whether or not that turn authored reasoning: a transcript whose reasoning was entirely stripped
     still renders one EMPTY block, and counting it would score full survival for the exact case
     this measurement exists to catch.
 
-    Scanned rather than matched by regex because reasoning can CONTAIN a balanced
-    ``<think>...</think>`` -- a turn reasoning about the tag format -- and the template renders that
-    verbatim inside the outer block. No regular expression tracks that nesting: it either ends the
-    span at the inner closer, understating where the block really ends, or lets an unguarded body
-    run through a closing tag and merge two adjacent empty blocks into a phantom survivor. Depth
-    counting gets both right, and the outermost span is the one the template treats as this turn's
-    reasoning.
+    Anchored on the template's own layout rather than on free-floating delimiters, because
+    ``<think>`` and ``</think>`` are ordinary characters that a transcript may contain anywhere --
+    a user asking what the tag means, or reasoning that discusses the delimiter. Neither scanning
+    for the tags nor counting their depth can tell those apart from structure:
+
+    * an unmatched ``<think>`` in an EARLIER turn leaves the depth permanently positive, so the
+      template's own closer never completes a block and every later survivor reads as stripped --
+      a total-loss warning for a transcript that lost nothing;
+    * an unmatched ``</think>`` INSIDE the reasoning ends the block early, so a cap falling between
+      that literal tag and the real closer scores the block as fully retained when the cap in fact
+      removed its tail.
+
+    The template resolves both: reasoning is the text between the ``<think>`` that immediately
+    follows an assistant header and the ``</think>`` that is followed by the blank line before the
+    answer. Delimiters anywhere else are content, and content cannot be mistaken for structure.
     """
-    spans: list[tuple[int, int]] = []
-    depth = 0
-    start = 0
-    for match in _THINK_DELIMITER.finditer(text):
-        if match.group() == _THINK_OPEN:
-            if depth == 0:
-                start = match.start()
-            depth += 1
-        elif depth:
-            depth -= 1
-            if depth == 0 and text[start + len(_THINK_OPEN) : match.start()].strip():
-                spans.append((start, match.end()))
-    return spans
+    return [
+        (match.start("open"), match.end())
+        for match in _TEMPLATE_REASONING.finditer(text)
+        if match.group("body").strip()
+    ]
 
 
 # why a run resolved to `exact-unpacked`, keyed by the architecture label the packing decision
