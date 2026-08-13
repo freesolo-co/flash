@@ -27,6 +27,7 @@ import io
 import lzma
 import os
 import re
+import tarfile
 import time
 import zipfile
 import zlib
@@ -86,24 +87,39 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     ("a Slack token", re.compile(rb"(?:xox[baprs]|xapp)-([A-Za-z0-9-]{10,%d})" % _MAX_BODY)),
 )
 
-# Credentials with no issuer prefix, anchored on the ASSIGNMENT that names them instead. A W&B key
-# is 40 undifferentiated hex characters, and `WANDB_API_KEY` is this repository's default runtime
-# secret (`flash/client/runtime_secrets.py`), so a training environment is exactly where one sits
-# beside the config. Matching bare 40-hex would refuse every dataset carrying a git sha; the
-# variable name is what makes these bytes a credential rather than a hash.
+# Credentials with no issuer prefix, anchored on the ASSIGNMENT that names them instead. Both are
+# names this repository already treats as runtime secrets (`WANDB_API_KEY` is the default in
+# `flash/client/runtime_secrets.py`, and `AWS_SECRET_ACCESS_KEY` is its documented example), so a
+# training environment is exactly the directory where one sits beside the config.
+#
+# The NAME matches case-insensitively: the same key sits in an env file as `WANDB_API_KEY` and in a
+# yaml or python config as `wandb_api_key`, and it is equally live in both. The BODY is what bounds
+# the false positives, not the casing of the name.
+#
+# Bodies are deliberately not pinned to one length. W&B issued 40-hex keys historically and now
+# issues much longer ones (the SDK's own `API key must be 40 characters long, yours was 86` error
+# is that migration), and both remain live -- a new-format key does not revoke an existing legacy
+# one. Matching only 40-hex would have caught the legacy form and published every currently-issued
+# key. AWS secret access keys are 40 characters of base64 alphabet with no prefix at all.
+#
+# The variable name is what makes these bytes a credential: bare 40-hex is a git sha and bare
+# 40-base64 is any digest, and refusing those would block ordinary dataset publishes. So the
+# assignment is required, and a `${VAR}` or `$(...)` indirection matches nothing because it is not
+# a key-shaped body.
 #
 # These skip `_is_high_entropy`, which exists to spare hand-written placeholders in a body that is
 # otherwise unmistakably a key. Here the variable name already carries that meaning, and a hex body
-# can legitimately be all-letters (`abcdef...`), which the placeholder heuristic would reject. A
-# literal `${WANDB_API_KEY}` reference is not matched, since it is not 40 hex characters.
-#
-# The NAME matches case-insensitively: the same key sits in an env file as `WANDB_API_KEY` and in a
-# yaml or python config as `wandb_api_key`, and it is equally live in both. The 40-hex body is what
-# bounds the false positives, not the casing of the name.
+# can legitimately be all-letters (`abcdef...`), which the placeholder heuristic would reject.
 _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     (
         "a Weights & Biases API key",
-        re.compile(rb"(?i:wandb_api_key)[\"']?\s*[:=]\s*[\"']?([0-9a-fA-F]{40})"),
+        re.compile(rb"(?i:wandb_api_key)[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_-]{40,%d})" % _MAX_BODY),
+    ),
+    (
+        "an AWS secret access key",
+        re.compile(
+            rb"(?i:aws_secret_access_key)[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])"
+        ),
     ),
 )
 
@@ -134,12 +150,24 @@ _SCAN_CHUNK_BYTES = 1 << 20
 # inside some window rather than merely likely to be.
 _SCAN_OVERLAP_BYTES = 1024
 
-# Leading bytes of the compressed containers worth expanding. Only *compressed* ones are listed:
-# inside a plain `.tar` the member bytes appear literally, so the ordinary scan already reads them,
-# whereas a deflated zip member or a gzipped dataset shard does not contain its credential anywhere
-# in the file. Detected by magic rather than by extension, since the extension is the publisher's
-# choice and a renamed archive is still an archive.
+# Leading bytes of the compressed containers worth expanding. Detected by magic rather than by
+# extension, since the extension is the publisher's choice and a renamed archive is still an
+# archive.
+#
+# A plain `.tar` is NOT here and does not need to be: its member bytes appear literally, so the
+# ordinary scan already reads them. But a tar whose MEMBER is compressed does need expanding --
+# `tar > shard.gz` is as ordinary as `zip > shard.gz`, and only the latter was reached. Tar is
+# enumerated by `_credential_in_tar` instead, which is entered on structure rather than on magic
+# (a tar's magic sits 257 bytes in, and an uncompressed tar has no leading signature at all).
 _COMPRESSED_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00")
+
+# The end-of-central-directory signature, and how much of a stream's tail to keep so it can be
+# found. A zip's end record is last in the file, within 64 KiB of the end (the comment field is
+# 16-bit), so this window always contains it. Used only to tell "an archive went past the buffer
+# cap" from "an ordinary large member did", which decides refuse-versus-pass on content the scan
+# could not reopen.
+_ZIP_END_RECORD = b"PK\x05\x06"
+_ZIP_TAIL_BYTES = (64 << 10) + 64
 
 # A base64 run long enough to hold the shortest credential a pattern admits. The lower bound makes
 # the scan walk past ordinary prose rather than decoding every word it meets. There is deliberately
@@ -175,7 +203,18 @@ _MAX_NESTED_BUFFER_BYTES = 64 << 20
 # So the whole stream is scanned, chunk by chunk with bounded memory, and the budget bounds TIME.
 # A pathological archive costs a bounded wait rather than an unbounded one, while every real member
 # -- the largest here expands in about 3 seconds -- finishes long inside it.
+#
+# The budget covers a whole PACKAGE, not one file. Per-file it multiplied: a package may hold 5,000
+# members (`ARCHIVE_MEMBER_LIMIT`), so a caller could split compression bombs across them and buy
+# 5,000 x 60s of expansion from an authenticated `POST /v1/envs` while every individual file stayed
+# inside the apparent one-minute limit.
 _MAX_DECOMPRESS_SECONDS = 60.0
+# How many members of ONE archive to enumerate. `ZipFile` reads the entire central directory up
+# front, so a nested archive of millions of empty entries materialises millions of `ZipInfo`
+# objects before any per-member budget is consulted -- and empty members never enter the read loop
+# that checks the deadline, so neither bound could stop it. The package extractor counts such an
+# archive as a single ordinary file, so this is the only place the inner count is bounded.
+_MAX_ARCHIVE_MEMBERS = 100_000
 
 # Everything the standard library raises for an archive it cannot read. There is no single base
 # class to catch, and most of these are not OSError, so each omission crashed `flash env push` with
@@ -349,21 +388,34 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     """
     carry = b""
     buffered = bytearray()
-    nested = False
+    tail = b""
+    compressed_head = False
+    overflowed = False
     while chunk := handle.read(_SCAN_CHUNK_BYTES):
         if deadline is not None and time.monotonic() > deadline:
             raise _Unscannable("takes too long to decompress")
         if not carry and depth:
-            nested = _looks_compressed(chunk[:6])
-        if nested:
-            if len(buffered) > _MAX_NESTED_BUFFER_BYTES:
-                raise _Unscannable("contains a compressed member too large to inspect")
+            compressed_head = _looks_compressed(chunk[:6])
+        if depth and not overflowed:
             buffered.extend(chunk)
+            if len(buffered) > _MAX_NESTED_BUFFER_BYTES:
+                if compressed_head:
+                    raise _Unscannable("contains a compressed member too large to inspect")
+                # Not a compressed container by its head, so the literal scan below is complete
+                # coverage and the buffer is only needed to REOPEN a container. Dropping it keeps
+                # memory bounded on an ordinary large member; `tail` still decides at the end
+                # whether what went past was a zip hiding behind a preamble.
+                overflowed = True
+                buffered = bytearray()
+        if depth:
+            tail = (tail + chunk)[-_ZIP_TAIL_BYTES:]
         window = carry + chunk
         if kind := _credential_kind(window):
             return kind
         carry = window[-_SCAN_OVERLAP_BYTES:]
-    if nested and buffered:
+    if overflowed and _ZIP_END_RECORD in tail:
+        raise _Unscannable("contains an archive too large to inspect")
+    if buffered and _looks_like_container(bytes(buffered)):
         return _credential_in_container(bytes(buffered), deadline=deadline or 0.0, depth=depth + 1)
     return None
 
@@ -371,6 +423,42 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
 def _looks_compressed(head: bytes) -> bool:
     """Whether `head` begins a compressed container this scan can expand."""
     return head.startswith(_COMPRESSED_MAGIC)
+
+
+def _looks_like_tar(source: Path | bytes) -> bool:
+    """Whether `source` is a tar, by its ustar magic at offset 257.
+
+    A tar has no leading signature -- the first 257 bytes are the first member's name and mode --
+    so this cannot be a leading-magic test like every other container here. `tarfile.is_tarfile`
+    would be the obvious call, but it accepts COMPRESSED tars too, and those are already routed to
+    the right opener above; entering here on a `.tar.gz` would decompress it twice.
+    """
+    try:
+        if isinstance(source, Path):
+            with source.open("rb") as handle:
+                handle.seek(257)
+                magic = handle.read(8)
+        else:
+            magic = source[257:265]
+    except OSError:
+        return False
+    return magic.startswith((b"ustar\x0000", b"ustar  \x00", b"ustar\x00"))
+
+
+def _looks_like_container(data: bytes) -> bool:
+    """Whether `data` is a container worth reopening, by magic OR by zip structure.
+
+    Nested members were tested on LEADING magic alone while top-level files got `is_zipfile`, so a
+    self-extracting zip one layer in -- whose first bytes are `MZ` -- was treated as final content
+    and the credential in its deflated payload published. `is_zipfile` scans for the end-of-central
+    -directory record, so it recognises a zip behind any preamble; applying it here makes a nested
+    member as well covered as the same bytes published directly.
+
+    Gating the recursion on this rather than recursing unconditionally keeps `_MAX_CONTAINER_DEPTH`
+    honest: the depth cap raises, so calling it for an ordinary deeply-nested *file* would refuse a
+    legitimate publish over nesting that never expanded anything.
+    """
+    return _looks_compressed(data[:6]) or zipfile.is_zipfile(io.BytesIO(data))
 
 
 def _credential_in_container(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
@@ -403,6 +491,8 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
         # are `MZ`, not `PK`. Testing the magic alone left that whole class unexpanded.
         if zipfile.is_zipfile(source if isinstance(source, Path) else io.BytesIO(source)):
             return _credential_in_zip(source, deadline=deadline, depth=depth)
+        if _looks_like_tar(source):
+            return _credential_in_tar(source, deadline=deadline, depth=depth)
         head = source[:6] if isinstance(source, bytes) else source.open("rb").read(6)
         opener = {b"BZh": bz2.open, b"\xfd7zXZ\x00": lzma.open}.get(
             next((magic for magic in (b"BZh", b"\xfd7zXZ\x00") if head.startswith(magic)), b""),
@@ -418,7 +508,11 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
 def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
     """The kind of credential in any readable member of a zip, or None."""
     with zipfile.ZipFile(source if isinstance(source, Path) else io.BytesIO(source)) as archive:
-        for info in archive.infolist():
+        for count, info in enumerate(archive.infolist(), 1):
+            if count > _MAX_ARCHIVE_MEMBERS:
+                raise _Unscannable("contains an archive with too many members to inspect")
+            if time.monotonic() > deadline:
+                raise _Unscannable("takes too long to decompress")
             if info.is_dir():
                 continue
             try:
@@ -430,12 +524,56 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
     return None
 
 
-def credential_in_file(path: Path) -> str | None:
+def _credential_in_tar(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
+    """The kind of credential in any readable member of a tar, or None.
+
+    A tar is not itself compressed, so its members' bytes are read by the ordinary scan already --
+    but a COMPRESSED member inside one is not: `tar > shard.gz` holds the credential nowhere a
+    pattern can see, exactly like `zip > shard.gz`, and only the zip form was ever expanded.
+    Enumerating members hands each one to `_scan_stream`, which expands it if it is a container.
+
+    Streamed with `r|*` rather than `r:*`: the streaming reader does not seek back over the archive,
+    so a member's data is read once, in order. Members are guarded separately for the same reason
+    they are in a zip -- one unreadable entry must not abandon the entries behind it.
+    """
+    handle = source.open("rb") if isinstance(source, Path) else io.BytesIO(source)
+    try:
+        with tarfile.open(fileobj=handle, mode="r|*") as archive:
+            for count, info in enumerate(archive, 1):
+                if count > _MAX_ARCHIVE_MEMBERS:
+                    raise _Unscannable("contains an archive with too many members to inspect")
+                if time.monotonic() > deadline:
+                    raise _Unscannable("takes too long to decompress")
+                if not info.isfile():
+                    continue
+                # the member NAME is checked too: a tar entry called `fslo_<key>.json` publishes
+                # the key in the archive's listing whatever its contents are.
+                if kind := credential_in_name(info.name):
+                    return kind
+                try:
+                    member = archive.extractfile(info)
+                    if member is None:
+                        continue
+                    if kind := _scan_stream(member, deadline=deadline, depth=depth):
+                        return kind
+                except _UNREADABLE_ARCHIVE:
+                    continue
+    finally:
+        handle.close()
+    return None
+
+
+def credential_in_file(path: Path, *, deadline: float | None = None) -> str | None:
     """The kind of credential publishing `path` would leak, or None.
 
     Scanned as raw bytes, binary members included. Skipping binaries would be a hole rather than a
     saving: a credential sitting in a sqlite state file or a pickle is as published as one in a
     shell script, and the prefixes above cannot realistically collide with random bytes.
+
+    `deadline` is the expansion budget, shared across a whole package when one is being scanned.
+    A per-file budget multiplied by the member limit, which let an authenticated caller split
+    compression bombs across thousands of files and buy hours of expansion. Left unset, one file
+    gets its own budget, which is the right behaviour for a standalone call.
 
     Raises `_Unscannable` if an archive is too expensive to finish expanding, which the
     caller turns into a refusal: unverifiable is not the same as clean.
@@ -445,7 +583,8 @@ def credential_in_file(path: Path) -> str | None:
         if kind := _scan_stream(handle):
             return kind
     # `is_zipfile` is consulted inside, so a self-extracting archive is expanded despite its stub
-    deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
     return _credential_in_container(path, deadline=deadline, depth=1)
 
 
@@ -474,8 +613,18 @@ def _redacted(name: str) -> str:
         return match.group(0)[: match.start(body) - match.start()] + b"***"
 
     masked = name.encode("utf-8", "surrogateescape")
-    for _kind, pattern in _TOKEN_PATTERNS:
+    for _kind, pattern in _TOKEN_PATTERNS + _ASSIGNED_PATTERNS:
         masked = pattern.sub(_mask, masked)
+    # A name detected only through base64 has no plaintext body to mask, so masking cannot help:
+    # printing any of it prints the encoded key. Withhold the name and give the author the
+    # directory instead, which is enough to find a file they just tried to publish.
+    if _match_base64(masked):
+        parent = name.rsplit("/", 1)[0] if "/" in name else ""
+        return (
+            f"{parent}/<a file whose name encodes a credential>"
+            if parent
+            else ("<a file whose name encodes a credential>")
+        )
     return masked.decode("utf-8", "replace")
 
 
@@ -491,7 +640,12 @@ def reject_credential_bearing_package(package_root: Path, *, display: dict[str, 
     Raises ValueError naming the member and the credential kind. Refusing rather than quietly
     dropping the file is deliberate: the author needs to rotate a key that has been sitting in a
     directory they just tried to publish, and a silent drop teaches them nothing.
+
+    One expansion budget covers the whole package. Giving each file its own multiplied it by the
+    member limit, so splitting compression bombs across thousands of members bought hours of work
+    while every individual file looked well inside the limit.
     """
+    deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
     # sorted so the member named in the refusal is the same one on every machine.
     for root, dirs, files in os.walk(package_root):
         dirs.sort()
@@ -503,7 +657,7 @@ def reject_credential_bearing_package(package_root: Path, *, display: dict[str, 
                 # the NAME is checked too, directories included: a file called `fslo_<key>.json`
                 # publishes the key in the repository's file tree whatever its contents are.
                 kind = credential_in_name(relative) or (
-                    credential_in_file(member) if member.is_file() else None
+                    credential_in_file(member, deadline=deadline) if member.is_file() else None
                 )
             except _Unscannable as exc:
                 raise ValueError(

@@ -2302,14 +2302,183 @@ def test_an_assigned_key_with_no_prefix_is_caught_by_its_variable_name(tmp_path)
     for form in (b'WANDB_API_KEY: "' + key + b'"', b"wandb_api_key = '" + key + b"'"):
         assert _credential_kind(form) == "a Weights & Biases API key", form
 
+    # W&B issued 40-hex keys historically and now issues much longer ones, and a new key does not
+    # revoke an existing legacy one -- so both are live and both must be caught. Pinning the body
+    # to 40 hex caught only the legacy form and published every currently-issued key.
+    current = b"abcdefgh1234" * 7 + b"ab"
+    assert len(current) == 86
+    assert _credential_kind(b"WANDB_API_KEY=" + current) == "a Weights & Biases API key"
+
+    # AWS secret access keys have no prefix at all, so the variable name is the only context. The
+    # public `AKIA...` access key ID is deliberately NOT matched: it appears in signed URLs in the
+    # clear and turns up verbatim in scraped datasets.
+    aws = b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert _credential_kind(b"AWS_SECRET_ACCESS_KEY=" + aws) == "an AWS secret access key"
+
     # the near misses that must stay publishable
     for benign in (
         b"commit: " + key,
         b"WANDB_API_KEY=${WANDB_API_KEY}\n",
         b"WANDB_API_KEY=$(pass show wandb)\n",
         b"sha256: " + key + b"\n",
+        b"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n",
+        b"AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}\n",
+        b"digest: " + aws,
     ):
         assert _credential_kind(benign) is None, benign
+
+
+def test_a_compressed_member_inside_a_plain_tar_is_expanded(tmp_path):
+    """`tar > shard.gz` hides a credential exactly as `zip > shard.gz` does.
+
+    A plain tar was skipped because its own member bytes appear literally, which is true of an
+    UNCOMPRESSED member and false of a compressed one. Shipping a dataset as a tar of gzipped
+    shards is ordinary, and the key inside published with exit 0.
+    """
+    import gzip
+    import io
+    import tarfile
+
+    from flash.env_secrets import credential_in_file
+
+    secret = f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode()
+
+    def _tar(name: str, members: dict[str, bytes]):
+        path = tmp_path / name
+        with tarfile.open(path, "w") as archive:  # the tar itself is NOT compressed
+            for member, body in members.items():
+                info = tarfile.TarInfo(member)
+                info.size = len(body)
+                archive.addfile(info, io.BytesIO(body))
+        return path
+
+    packed = _tar("dataset.tar", {"shard.jsonl.gz": gzip.compress(secret)})
+    # the premise: the credential survives nowhere in the tar's own bytes
+    assert f"fslo_{_FAKE_KEY_BODY}".encode() not in packed.read_bytes()
+    assert credential_in_file(packed) == "a Freesolo API key"
+
+    # a member NAME that is the key leaks through the archive listing even with empty contents
+    assert credential_in_file(_tar("named.tar", {f"fslo_{_FAKE_KEY_BODY}.json": b""}))
+
+    # the control: an ordinary tar of source files stays publishable
+    assert (
+        credential_in_file(_tar("clean.tar", {"env.py": b"def load_environment(**k):\n    x\n"}))
+        is None
+    )
+
+
+def test_a_nested_self_extracting_zip_is_recognised_by_structure(tmp_path):
+    """Nested members were tested on leading magic, so an `MZ` stub hid a zip one layer in.
+
+    Top-level files got `is_zipfile`, which finds the end-of-central-directory record behind any
+    preamble. Nested ones did not, so the same bytes were covered when published directly and
+    invisible when wrapped in a gzip.
+    """
+    import gzip
+    import io
+    import zipfile
+
+    from flash.env_secrets import credential_in_file
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("env.sh", f'export KEY="fslo_{_FAKE_KEY_BODY}"\n')
+    stub = b"MZ\x90\x00" + b"\x00" * 2000 + payload.getvalue()
+
+    # the premise: it does not lead with zip magic, but it is a zip
+    assert not stub.startswith(b"PK")
+    assert zipfile.is_zipfile(io.BytesIO(stub))
+
+    wrapped = tmp_path / "installer.gz"
+    wrapped.write_bytes(gzip.compress(stub))
+    assert credential_in_file(wrapped) == "a Freesolo API key"
+
+
+def test_an_archive_of_many_empty_members_is_refused(tmp_path, monkeypatch):
+    """`ZipFile` reads the whole central directory up front, before any per-member budget applies.
+
+    A nested archive of millions of empty entries materialises a `ZipInfo` each, and empty members
+    never enter the read loop that checks the deadline -- so neither existing bound could stop it,
+    while the package extractor counted the whole archive as one ordinary file.
+    """
+    import zipfile
+
+    from flash import env_secrets as secrets
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    monkeypatch.setattr(secrets, "_MAX_ARCHIVE_MEMBERS", 500)
+    crowded = tmp_path / "many.zip"
+    with zipfile.ZipFile(crowded, "w", zipfile.ZIP_STORED) as archive:
+        for index in range(600):
+            archive.writestr(f"{index}", b"")
+    with pytest.raises(_Unscannable, match="too many members"):
+        credential_in_file(crowded)
+
+    # the control: an archive inside the bound is still scanned to a verdict
+    modest = tmp_path / "few.zip"
+    with zipfile.ZipFile(modest, "w", zipfile.ZIP_DEFLATED) as archive:
+        for index in range(10):
+            archive.writestr(f"{index}.txt", "harmless")
+        archive.writestr("env.sh", f'export KEY="fslo_{_FAKE_KEY_BODY}"\n')
+    assert credential_in_file(modest) == "a Freesolo API key"
+
+
+def test_one_expansion_budget_covers_the_whole_package(tmp_path, monkeypatch):
+    """A per-file budget multiplied by the member limit into hours of permitted expansion.
+
+    A package may hold 5,000 members, so splitting compression bombs across them bought
+    5,000 x 60s from an authenticated publish while every individual file stayed inside the
+    apparent one-minute limit.
+    """
+    import gzip
+    import time
+
+    from flash import env_secrets as secrets
+    from flash.env_secrets import reject_credential_bearing_package
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    bomb = gzip.compress(b"\0" * (200 << 20))
+    for index in range(6):
+        (package / f"bomb{index}.gz").write_bytes(bomb)
+
+    monkeypatch.setattr(secrets, "_MAX_DECOMPRESS_SECONDS", 1.0)
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="too long to decompress"):
+        reject_credential_bearing_package(package, display={})
+    elapsed = time.monotonic() - started
+
+    # the whole package shares the budget, so this cannot approach 6 x 1s
+    assert elapsed < 3.0, f"budget appears to reset per file ({elapsed:.1f}s)"
+
+
+def test_a_refusal_never_echoes_a_credential_in_a_filename(tmp_path):
+    """Masking covered only prefixed tokens, so the newer credential forms printed in full.
+
+    The refusal names the member so the author can find it, and when the credential IS that name,
+    printing it re-leaks the key into a terminal and whatever collects its output -- the one thing
+    the rest of this module is careful never to do.
+    """
+    import base64
+
+    from flash.env_secrets import _redacted, credential_in_name
+
+    body = "0123456789abcdef" * 2 + "01234567"
+    assigned = f"cache/wandb_api_key={body}.json"
+    assert credential_in_name(assigned) == "a Weights & Biases API key"
+    assert body not in _redacted(assigned)
+    assert "wandb_api_key" in _redacted(assigned), "the author still needs to find the file"
+
+    # a base64 name has no plaintext body to mask, so the name is withheld and the directory given
+    encoded = base64.b64encode(f"fslo_{_FAKE_KEY_BODY}".encode()).decode().replace("=", "")
+    nested = f"cache/{encoded}.bin"
+    assert credential_in_name(nested) == "a Freesolo API key"
+    assert encoded[:20] not in _redacted(nested)
+    assert "cache/" in _redacted(nested)
+
+    # an ordinary path is returned untouched
+    assert _redacted("src/environment.py") == "src/environment.py"
 
 
 def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
