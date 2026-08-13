@@ -34,6 +34,9 @@ _SECRET_DETAIL = re.compile(
     r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
     r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)"
 )
+# component lines of a multiline credential shorter than this are punctuation such as ``}``, not
+# secrets; redacting them would erase innocent text. Matches `bootstrap_secrets._MIN_SECRET_COMPONENT`.
+_MIN_SECRET_COMPONENT = 8
 
 
 def _plugin():
@@ -228,11 +231,45 @@ def _secret_env_name(name: str) -> bool:
     )
 
 
+def _secret_needles(secret: str) -> set[str]:
+    """Every textual form of ``secret`` worth searching for, mirroring `bootstrap_secrets`.
+
+    A multiline credential (a PEM key, a pasted service-account blob) reaches a diagnostic one
+    component line at a time, so the whole value never matches and only its registered components
+    do. Percent-escapes are case-insensitive and either case is emitted in the wild, so the encoded
+    form is registered in both. The 8-character floor keeps a short component such as ``}`` from
+    erasing innocent text.
+    """
+    forms = {secret}
+    if "\n" in secret:
+        forms.update(
+            line for raw in secret.splitlines() if len(line := raw.strip()) >= _MIN_SECRET_COMPONENT
+        )
+    needles: set[str] = set()
+    for form in forms:
+        encoded = urllib.parse.quote(form, safe="")
+        needles.update(
+            {form, encoded, re.sub(r"%[0-9A-Fa-f]{2}", lambda m: m.group(0).lower(), encoded)}
+        )
+    return needles
+
+
 def _safe_child_failure_detail(error: Exception) -> str:
-    message = str(error)
+    """``error`` rendered with credentials removed, never raising.
+
+    ``str(error)`` runs user-supplied ``__str__`` and ``__repr__`` code, which can raise. This
+    function is only ever called while recording why the child is about to die, so letting that
+    escape would replace the real exception's type, message and stage with the stringification
+    error's -- destroying the diagnostic instead of writing it. The class name is always available
+    without executing user code, so an unrenderable message degrades to that rather than to nothing.
+    """
+    try:
+        message = str(error)
+    except Exception:
+        message = "<unrenderable message>"
     secrets = {value for name, value in os.environ.items() if value and _secret_env_name(name)}
     for secret in sorted(secrets, key=len, reverse=True):
-        for needle in {secret, urllib.parse.quote(secret, safe="")}:
+        for needle in sorted(_secret_needles(secret), key=len, reverse=True):
             if len(needle) >= 8:
                 message = message.replace(needle, "<redacted>")
                 continue
@@ -240,8 +277,18 @@ def _safe_child_failure_detail(error: Exception) -> str:
             right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
             message = re.sub(f"{left}{re.escape(needle)}{right}", "<redacted>", message)
     message = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", message)
+    # shape redaction stays as the fail-closed net for a credential this process cannot know by
+    # value -- one minted at runtime (a presigned url, a broker capability) is in neither the
+    # environment nor any payload, so it contributes no needle above. the numeric exemption is the
+    # one place that net misfires on THIS path: `token: 151643` is a vocabulary id, and a bad eos or
+    # token-boundary id is often the entire diagnostic the record exists to carry. a bare integer
+    # cannot be a credential, so exempting it costs no coverage.
     return _SECRET_DETAIL.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        lambda match: (
+            match.group(0)
+            if match.group(3).isdigit()
+            else f"{match.group(1)}{match.group(2)}<redacted>"
+        ),
         message,
     )
 

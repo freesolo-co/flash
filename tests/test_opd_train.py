@@ -4524,6 +4524,136 @@ def test_multiturn_catch_all_writes_stage_type_and_message_before_exit(
     assert bridge_token not in record
 
 
+def test_child_failure_record_survives_cancellation_during_the_close_request(monkeypatch, tmp_path):
+    """Cancelling the rollout task must not cost us the reason it was failing.
+
+    `CancelledError` is a BaseException, so it escapes both the catch-all and the
+    `suppress(Exception)` around the close request, and the exit block after the `finally` never
+    runs. A close that merely stalls delays it just as long. Recording before cleanup is what makes
+    the evidence survive -- and a cancelled or stalled run is exactly the one whose console upload
+    is also lost, so this record is then the only account of the failure.
+    """
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.child.multiturn import build_flash_multi_turn_agent_loop
+    from flash.engine.worker.train.opd.child.plugin import _write_child_failure_fallback
+
+    child_failure_path = str(tmp_path / "child-failure")
+    monkeypatch.setenv("FLASH_OPD_CHILD_FAILURE_PATH", child_failure_path)
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_URL", "http://127.0.0.1:4444")
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", "bridge-secret-token")
+    monkeypatch.setenv("FLASH_OPD_SEED", "42")
+    monkeypatch.setenv("FLASH_OPD_MAX_TURNS", "2")
+    monkeypatch.setenv("FLASH_OPD_MAX_MODEL_LEN", "128")
+    monkeypatch.setenv(
+        "FLASH_OPD_ENV_CAPABILITIES",
+        json.dumps(["new_rollout_state", "record_model_turn", "env_reply", "rollout_done"]),
+    )
+
+    close_started = threading.Event()
+    exits = []
+
+    def post_json(_url, _token, path, _payload):
+        if path == "/multiturn/start":
+            return {"max_turns": 1}
+        if path == "/multiturn/close":
+            # the close the task is cancelled inside of.
+            close_started.set()
+            time.sleep(3)
+            return {"ok": True}
+        raise AssertionError(path)
+
+    def register(name):
+        return lambda cls: cls
+
+    class AgentLoopBase:
+        def __init__(self):
+            self.loop = asyncio.get_running_loop()
+
+        async def apply_chat_template(self, _messages):
+            return [10, 11]
+
+        async def _run_turns(self, _sampling_params, _outputs, **_kwargs):
+            raise ValueError("multi-turn rollout prompt ids do not match the frozen flash prompt")
+
+    loop_type = build_flash_multi_turn_agent_loop(
+        register=register,
+        agent_loop_base=AgentLoopBase,
+        agent_loop_output=SimpleNamespace,
+        post_json=post_json,
+        score_failure_handler=lambda error: (_ for _ in ()).throw(error),
+        child_failure_handler=_write_child_failure_fallback,
+        deterministic_seed=lambda *_args, **_kwargs: 1,
+        process_exit=exits.append,
+    )
+    loop_type._run_turns = AgentLoopBase._run_turns
+
+    async def run_loop():
+        task = asyncio.ensure_future(
+            loop_type().run(
+                {},
+                raw_prompt=[{"role": "user", "content": "q"}],
+                global_steps=1,
+                index=0,
+                session_id=0,
+            )
+        )
+        await asyncio.get_running_loop().run_in_executor(None, close_started.wait, 5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run_loop())
+
+    # the exit never runs on this path -- that is the point: the record is the only survivor.
+    assert exits == []
+    assert _read_classified_failure_fallback(child_failure_path) == (
+        "permanent",
+        "[stage=generate] ValueError: multi-turn rollout prompt ids do not match "
+        "the frozen flash prompt",
+    )
+
+
+def test_child_failure_detail_survives_an_exception_whose_str_raises():
+    """A broken ``__str__`` must not replace the real failure with its own.
+
+    ``str(error)`` runs user code. If it raises inside the recorder, the outer catch-all treats the
+    stringification error as the child failure, relabels the stage, and the true type, message and
+    stage are gone -- the exact evidence this record exists to preserve.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    class Unrenderable:
+        def __str__(self):
+            raise RuntimeError("stringification broke")
+
+    assert _safe_child_failure_detail(ValueError(Unrenderable())) == "<unrenderable message>"
+
+
+def test_child_failure_sanitizer_keeps_token_ids_and_redacts_encoded_and_multiline_secrets(
+    monkeypatch,
+):
+    """Shape redaction must not eat vocabulary ids, and value redaction must cover every form."""
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    monkeypatch.setenv("WANDB_API_KEY", "first-component-123\nsecond-component-456")
+    monkeypatch.setenv("FLASH_TEST_API_KEY", "abc/defghijkl")
+
+    # a bad eos or token-boundary id is often the whole diagnostic; a bare integer is not a secret.
+    kept = _safe_child_failure_detail(ValueError("unexpected token: 151643 while decoding"))
+    assert kept == "unexpected token: 151643 while decoding"
+    # a non-numeric value in credential shape is still redacted.
+    shaped = _safe_child_failure_detail(ValueError("expected access token: hunter2 but got verb"))
+    assert "hunter2" not in shaped
+
+    # a multiline credential reaches a diagnostic one component line at a time.
+    multiline = _safe_child_failure_detail(ValueError("auth failed for second-component-456"))
+    assert "second-component-456" not in multiline
+
+    # percent escapes are case-insensitive and either case is emitted in the wild.
+    for encoded in ("abc%2Fdefghijkl", "abc%2fdefghijkl"):
+        assert "defghijkl" not in _safe_child_failure_detail(ValueError(f"url ?auth={encoded}"))
+
+
 def test_explicit_multiturn_score_rejection_bypasses_delivery_handler():
     from flash.engine.worker.train.opd.child.multiturn import _post_multiturn_score
 

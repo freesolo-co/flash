@@ -255,6 +255,17 @@ async def _opd_run(
             if getattr(error, "classification", None) == "transient"
             else permanent_teacher_exit
         )
+        # recorded HERE rather than beside the exit below, because the exit is not guaranteed to
+        # run. cancelling this Ray task raises CancelledError out of the close request in the
+        # `finally` -- a BaseException, so neither this `except` nor that `suppress(Exception)`
+        # catches it -- and the block after the `finally` is then skipped entirely. a close that
+        # merely stalls delays it just as long. both are precisely the runs whose console upload is
+        # also lost, so the record has to be on disk before any awaited cleanup begins.
+        child_failure_handler(
+            "transient" if failure_exit_code == transient_teacher_exit else "permanent",
+            failure_stage,
+            failure_error,
+        )
     finally:
         if start_attempted:
             with contextlib.suppress(Exception):
@@ -268,8 +279,6 @@ async def _opd_run(
                     ),
                 )
     if failure_error is not None and failure_exit_code is not None:
-        classification = "transient" if failure_exit_code == transient_teacher_exit else "permanent"
-        child_failure_handler(classification, failure_stage, failure_error)
         exit_process(failure_exit_code)
         raise AssertionError("multi-turn OPD process exit returned unexpectedly")
     return outputs

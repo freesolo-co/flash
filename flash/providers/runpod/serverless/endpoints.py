@@ -510,16 +510,28 @@ def _train_body(input_data: dict) -> dict:
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
 
+        console_upload_lock = threading.Lock()
+
         def _upload_console(mode: str) -> None:
             """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
             console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
             from both the subprocess-failure path and the missing-metrics crash path: a worker killed
             without a Python exception (OOM/SIGKILL, segfault, or a silent early exit) writes NO
             ``error_<mode>.txt``, so the captured console is then the only root-cause record — and a
-            crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque."""
+            crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque.
+
+            Serialized against itself: the periodic uploader is a daemon thread joined with a
+            timeout, so a slow snapshot can still be running when the final one begins. Both write
+            the same ``.tail`` file and commit to the same repo path, and if the older call landed
+            last it would replace the terminal console with bytes captured BEFORE the failure --
+            destroying the record. The lock makes the last caller the last writer."""
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
                 return
+            with console_upload_lock:
+                _upload_console_locked(mode, console)
+
+        def _upload_console_locked(mode: str, console: str) -> None:
             try:
                 from huggingface_hub import HfApi
 

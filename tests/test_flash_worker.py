@@ -1116,6 +1116,54 @@ def test_instance_console_upload_loop_snapshots_before_the_first_full_interval(m
     assert uploads == ["train", "train", "train"]
 
 
+def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots():
+    """The final snapshot must be the last writer, even if a periodic one is still uploading.
+
+    The periodic uploader is a daemon thread joined with a 10s timeout, so a slow snapshot outlives
+    the join and races the final upload. Both write the same ``.tail`` file and commit to the same
+    repo path; if the older call landed last it would REPLACE the terminal console with bytes
+    captured before the failure -- destroying the evidence. Moving the first snapshot to 600s made
+    this reachable for an ordinary run, where the hourly-only cadence had made it rare.
+    """
+    import ast
+    import inspect
+    import textwrap
+    import threading
+    import types
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
+    )
+    order: list[str] = []
+    started = threading.Event()
+
+    def _upload_console_locked(mode: str, _console: str) -> None:
+        started.set()
+        order.append(f"begin:{mode}")
+        time.sleep(0.3)
+        order.append(f"end:{mode}")
+
+    namespace: dict = {
+        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
+        "console_upload_lock": threading.Lock(),
+        "_upload_console_locked": _upload_console_locked,
+    }
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    upload_console = namespace["_upload_console"]
+
+    periodic = threading.Thread(target=upload_console, args=("periodic",), daemon=True)
+    periodic.start()
+    started.wait(5.0)
+    upload_console("final")  # the terminal snapshot, racing the one already in flight
+    periodic.join(timeout=5.0)
+
+    # never interleaved: each upload completes before the next begins, so the last call wins.
+    assert order == ["begin:periodic", "end:periodic", "begin:final", "end:final"]
+
+
 def test_instance_console_upload_loop_never_waits_longer_than_the_interval():
     """A caller passing an interval shorter than the first-snapshot delay must not be lengthened."""
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
