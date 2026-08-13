@@ -266,6 +266,61 @@ def test_liveness_heartbeat_dumps_stacks_once_when_progress_stale(monkeypatch):
     assert len(dumped) == 1, f"must dump exactly once on a stall, got {len(dumped)}"
 
 
+def test_liveness_heartbeat_sets_the_stall_event_at_the_silence_threshold(monkeypatch):
+    """The daemon SETS an event; it must never raise.
+
+    This loop runs on a daemon thread, so an exception here would die with the thread while the main
+    thread stayed blocked reading a dead child's pipe -- the run would keep billing exactly as if
+    nothing had been detected.
+    """
+    hb, w, _ = _liveness_env(monkeypatch)
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: None)
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_TICKS", 3)
+    stall = threading.Event()
+    ticks = iter([0, 1, 2, 3, 3, 3])
+
+    with hb.liveness_heartbeat(
+        "opd_step",
+        fields=lambda: {"child_tail_silent_ticks": next(ticks, 3)},
+        child_tail_stall_event=stall,
+    ):
+        deadline = time.time() + 5
+        while not stall.is_set() and time.time() < deadline:
+            time.sleep(0.01)
+
+    assert stall.is_set(), "the child crossed the silence threshold and was never condemned"
+
+
+def test_liveness_heartbeat_does_not_condemn_a_child_below_the_threshold(monkeypatch):
+    # a child that goes quiet and speaks again resets its own counter, so the ticks never reach the
+    # threshold. this is the legitimate case -- a 600s teacher call, shard loading, a long first step
+    # -- and killing it would turn this watchdog into the thing that breaks healthy runs.
+    hb, w, _ = _liveness_env(monkeypatch)
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: None)
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_TICKS", 5)
+    stall = threading.Event()
+    ticks = iter([0, 1, 2, 0, 1, 2, 0, 1, 2])
+
+    with hb.liveness_heartbeat(
+        "opd_step",
+        fields=lambda: {"child_tail_silent_ticks": next(ticks, 0)},
+        child_tail_stall_event=stall,
+    ):
+        time.sleep(0.3)
+
+    assert not stall.is_set(), "a child that keeps producing new output was condemned as wedged"
+
+
+def test_child_tail_stall_ignores_a_malformed_counter():
+    # the counter arrives from a caller-supplied fields() callback, and bool is an int subclass. a
+    # malformed payload must not be able to tear down a paid run.
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    for bogus in (True, "60", None, 3.5, [60]):
+        stall = threading.Event()
+        hb._observe_child_tail_stall(bogus, stall)
+        assert not stall.is_set(), f"{bogus!r} was treated as a silence count"
+
+
 def test_liveness_heartbeat_join_is_bounded_even_if_emit_wedges(monkeypatch):
     """The exit join must be BOUNDED: a wedged heartbeat() upload can't hang the worker at block exit."""
     hb, w, _ = _liveness_env(monkeypatch)

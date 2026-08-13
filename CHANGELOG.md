@@ -29,6 +29,18 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- A training run whose child process stops making progress now fails instead of billing a rented
+  GPU indefinitely at 0% utilisation. The worker already counted consecutive heartbeat ticks with
+  no new child output and published them as `child_tail_silent_ticks`, but nothing consumed the
+  signal: the run stayed `running` with `error: null` until a human noticed and cancelled it. Two
+  changes make it terminate. The counter now ignores a line identical to the one before it, so a
+  wedged child re-printing one frozen status line reads as no progress rather than as activity
+  (previously it reset the counter and capped it around 9, which is why the published value never
+  climbed). After 60 consecutive ticks (30 minutes) with no new content and no completed optimizer
+  step, the child's process group is torn down and the run fails with a message naming what was
+  observed. Genuinely new output resets the counter, so the 600s teacher bridge request and the
+  warmup-dominated first step are unaffected.
+
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always
   `flash`. On a host where `runpod-flash` owns the `flash` script, the printed

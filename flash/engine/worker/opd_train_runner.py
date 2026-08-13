@@ -9,6 +9,7 @@ import math
 import os
 import random
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any
 
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
+from flash.engine.worker.io import heartbeat as _heartbeat
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 
@@ -91,6 +93,10 @@ class _ChildCallbacks:
     progress: dict[str, Any]
     wandb_link: dict[str, str | None]
     child_tail: Any
+    # one event shared by the liveness daemon that DETECTS a wedged child and the subprocess
+    # watchdog that ACTS on it. they run on different threads around a main thread blocked reading
+    # the child's pipe, which is why the verdict travels as an event rather than an exception.
+    child_tail_stall_event: Any
 
 
 @dataclass(frozen=True)
@@ -646,7 +652,19 @@ def _build_child_callbacks(
         progress,
         wandb_link,
         child_tail,
+        threading.Event(),
     )
+
+
+# says what was OBSERVED and nothing more. silence localises the failure to the child's progress
+# boundary; it does not prove which component stopped, so this must not read as an oom, a capacity
+# fault or a named ray defect. built once at import so the training call carries no attribute lookup
+# that could fail inside the try whose finally decides whether the run counts as complete.
+_CHILD_STALL_ABORT_REASON = (
+    f"opd child produced no new output for {_heartbeat.CHILD_TAIL_STALL_TICKS} liveness ticks "
+    f"(~{round(_heartbeat.CHILD_TAIL_STALL_TICKS * _heartbeat._LIVENESS_TICK_S / 60)} minutes) and "
+    "had not completed its first optimizer step; the process group was torn down to release the gpu"
+)
 
 
 def _run_child(
@@ -676,6 +694,7 @@ def _run_child(
                 progress=lambda: int(callbacks.progress["step"] or 0),
                 progress_step=True,
                 fields=callbacks.liveness_fields,
+                child_tail_stall_event=callbacks.child_tail_stall_event,
             ):
                 return_code = _opd_train.run_verl_training(
                     command,
@@ -684,6 +703,8 @@ def _run_child(
                     on_line=callbacks.on_line,
                     heartbeat=callbacks.child_heartbeat,
                     tail=callbacks.child_tail,
+                    abort_event=callbacks.child_tail_stall_event,
+                    abort_reason=_CHILD_STALL_ABORT_REASON,
                 )
                 training_completed = return_code == 0
     finally:

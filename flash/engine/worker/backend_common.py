@@ -478,6 +478,8 @@ def run_verl_training(
     step_pattern: str = r"step:\s*(\d+)",
     heartbeat_interval_s: float = 20.0,
     tail: ChildOutputTail | None = None,
+    abort_event: threading.Event | None = None,
+    abort_reason: str | None = None,
 ) -> int:
     """run a verl trainer subprocess, streaming stdout and surfacing step progress.
 
@@ -485,6 +487,11 @@ def run_verl_training(
     receives every line, ``on_step`` receives each parsed training step, and ``heartbeat`` is called
     at most once per ``heartbeat_interval_s``. callback failures terminate the child before they are
     re-raised so a failed required checkpoint upload cannot leave paid training running unattended.
+
+    ``abort_event`` lets a watcher outside this loop condemn a child that is alive but doing nothing.
+    the read loop below cannot notice that itself: it is blocked on a pipe that a wedged child never
+    writes to and never closes, so the only way out is for the group to be torn down underneath it.
+    ``abort_reason`` becomes the failure the caller sees.
     """
     step_re = re.compile(step_pattern)
     child_tail = tail if tail is not None else ChildOutputTail()
@@ -509,7 +516,10 @@ def run_verl_training(
         # pipe open after the trainer dies would otherwise keep the loop below running forever, on a
         # paid gpu, having already lost the process whose output it is waiting for.
         with _ChildExitWatchdog(
-            proc, process_group_id=process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
+            proc,
+            process_group_id=process_group_id,
+            grace_s=_ORPHANED_PIPE_GRACE_S,
+            abort_event=abort_event,
         ) as watchdog:
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -556,6 +566,17 @@ def run_verl_training(
             "holding the gpu"
         )
     return_code = int(collected)
+    if watchdog.aborted:
+        # BEFORE any exit-code reasoning: the group was signalled, so this child's status describes
+        # the teardown rather than the run, and every classifier below would name the signal instead
+        # of the reason the signal was sent. a plain RuntimeError deliberately -- a RetriableInfraError
+        # here would put the run back through the infra retry floor and bill the same wedge again on
+        # up to five more gpus, which is most of what this detection exists to stop.
+        raise RuntimeError(
+            abort_reason
+            or f"verl subprocess {proc.pid} was torn down after making no progress; its process "
+            "group was killed to release the gpu"
+        )
     if watchdog.tore_down and return_code == 0:
         # the child exited 0 but a descendant held the pipe open past the grace, so the group was
         # killed to release it. reporting success here would upload whatever partial artifacts exist
@@ -590,15 +611,31 @@ class _ChildExitWatchdog:
     """Tears the group down when the direct child exits but a descendant holds the pipe open.
 
     this prevents an EngineCore-held pipe from blocking teardown forever (PR #730). it arms only after
-    child exit, so ordinary trainer silence remains ``ChildTailStaleness``'s responsibility.
+    child exit, so ordinary trainer silence is never grounds for teardown on its own -- judging that
+    is ``ChildTailStaleness``'s job, and when it does condemn a child the verdict arrives here as
+    ``abort_event`` rather than as a second timer inside this class.
     """
 
-    def __init__(self, proc: subprocess.Popen, *, process_group_id: int, grace_s: float) -> None:
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        *,
+        process_group_id: int,
+        grace_s: float,
+        abort_event: threading.Event | None = None,
+    ) -> None:
         self._proc = proc
         self._process_group_id = process_group_id
         self._grace_s = grace_s
         self._done = threading.Event()
         self._thread: threading.Thread | None = None
+        # set by a watcher outside the read loop when the child is alive but making no progress. the
+        # loop cannot self-rescue there: it is blocked on a pipe a wedged child never writes to and
+        # never closes, so tearing the group down is what unblocks it.
+        self._abort_event = abort_event
+        # read by the caller after the loop ends, to tell an abort apart from an ordinary exit. the
+        # child dies on a signal either way, so its status alone cannot distinguish them.
+        self.aborted = False
         # bumped by the reader for every line it takes off the pipe. the exit of the child alone is
         # NOT sufficient evidence of a leak: a child can exit having left a full pipe behind, and a
         # reader working through that backlog -- an on_step callback uploading a checkpoint takes
@@ -650,6 +687,12 @@ class _ChildExitWatchdog:
         # on the child. both collect the status, and CPython guards that with `_waitpid_lock`, so
         # whichever of the two threads gets there first is the one that sets `returncode`.
         while not self._done.wait(0.5):
+            # checked before the exit branch below, and on the same cadence: the child this answers
+            # for is still RUNNING, so every condition further down is false for it forever.
+            if self._abort_event is not None and self._abort_event.is_set():
+                self.aborted = True
+                kill_process_group(self._proc, process_group_id=self._process_group_id)
+                return
             if self._proc.poll() is None:
                 continue
             # the child is gone. that is necessary but not sufficient: require the reader to also be

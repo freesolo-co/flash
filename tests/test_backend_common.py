@@ -2037,6 +2037,51 @@ def test_child_tail_silence_is_measured_from_the_childs_first_line():
     assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
 
 
+def test_a_frozen_repeated_line_counts_as_no_progress():
+    """The wedge is not silent, and that is exactly why it was survivable for so long.
+
+    Every observed step-0 wedge had a verl TransferQueue timer re-printing an UNCHANGED
+    `Total success requests: 299` every five minutes, forever. Each reprint is a new line, so a
+    staleness measured from lines-written resets on it: at a 30s tick a five-minute reprint pins the
+    counter under 10 and no threshold above that can ever fire, while any threshold below it kills
+    healthy runs. Judging the CONTENT is what makes the signal usable at all.
+    """
+    tail = vc.ChildOutputTail()
+    staleness = vc.ChildTailStaleness()
+    tail.record("Total success requests: 299\n")
+
+    # ten ticks, with the frozen line re-printed halfway through exactly as the wedge does.
+    for tick in range(1, 11):
+        if tick == 5:
+            tail.record("Total success requests: 299\n")
+        silent = vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"]
+
+    # ten observations, the first of which is the baseline 0, so an uninterrupted count reaches 9.
+    # what matters is that the reprint at tick 5 did NOT knock it back to zero.
+    assert silent == 9, (
+        f"the reprint reset the silence counter to {silent}; a run repeating one frozen line is "
+        "billing a gpu to do nothing, and counting that as output is what made a wedged run look "
+        "alive for its whole 50-minute setup grace and every retry after it"
+    )
+    # the retained tail still carries BOTH copies: what the child last said is the diagnostic, and
+    # the repetition is the finding rather than a reason to drop the line.
+    assert tail.tail() == ["Total success requests: 299"] * 2
+    assert tail.written == 1, "a reprint is retained but must not count as content"
+
+
+def test_new_content_still_clears_the_silence_counter():
+    # the counterpart guard: only REPEATS are discounted. a child emitting genuinely new lines is
+    # working, however slowly, and must never be judged stalled.
+    tail = vc.ChildOutputTail()
+    staleness = vc.ChildTailStaleness()
+    tail.record("loading checkpoint shards 1/4\n")
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 1
+
+    tail.record("loading checkpoint shards 2/4\n")
+    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+
+
 def test_stall_tail_fields_omits_silence_when_no_tracker_is_supplied():
     # the field must not appear as a fabricated 0 for callers that do not track staleness: absent and
     # "zero ticks silent" are different claims.
@@ -2570,9 +2615,47 @@ def test_child_exit_watchdog_leaves_a_healthy_quiet_child_alone(quick_teardown_g
         [sys.executable, "-c", script],
         env=dict(os.environ),
         heartbeat_interval_s=0.1,
+        # an abort event that never gets set: quiet alone must still not be grounds for teardown,
+        # so the only thing that can end this run is the child's own exit.
+        abort_event=threading.Event(),
     )
 
     assert code == 0, "a healthy child that was merely quiet was torn down as if it had leaked"
+
+
+@_needs_process_teardown
+def test_an_abort_event_tears_down_a_child_that_is_alive_but_doing_nothing():
+    """The read loop cannot rescue itself, so someone outside it has to condemn the child.
+
+    A wedged trainer keeps its pipe open and never writes to it, so every existing exit is
+    unreachable: the child has not exited, its stdout has not closed, and no line arrives to carry a
+    callback exception. Without this the attempt bills a gpu until the provider's grace expires and
+    then gets retried against the infra retry floor on up to five more.
+    """
+    # alive, one line, then nothing for far longer than the test may run.
+    script = "import time,sys; print('AgentLoopWorkerTQ ready', flush=True); time.sleep(300)"
+    abort = threading.Event()
+    threading.Timer(1.0, abort.set).start()
+    started = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="no new output") as caught:
+        vc.run_verl_training(
+            [sys.executable, "-c", script],
+            env=dict(os.environ),
+            abort_event=abort,
+            abort_reason="opd child produced no new output for 60 liveness ticks",
+        )
+
+    elapsed = time.monotonic() - started
+    assert elapsed < 60, (
+        f"stayed in the read loop {elapsed:.1f}s after the child was condemned; the whole point is "
+        "that a wedged child never closes the pipe this loop is blocked on"
+    )
+    # NOT retriable: a RetriableInfraError here would feed the same wedge back through the infra
+    # retry floor and bill it again on up to five more gpus.
+    assert not isinstance(caught.value, RetriableInfraError), (
+        "a no-progress teardown was reported as retriable infrastructure, which re-bills the wedge"
+    )
 
 
 @_needs_process_teardown

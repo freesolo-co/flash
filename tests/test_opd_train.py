@@ -5289,6 +5289,7 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
         child_heartbeat=lambda: None,
         liveness_fields=dict,
         child_tail=None,
+        child_tail_stall_event=threading.Event(),
         wandb_link={"wandb_url": None, "wandb_id": None},
     )
     reconciled = []
@@ -6669,6 +6670,113 @@ def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
     ]
     assert "parse_verl_metric" in calls
     assert "_metric_value" not in calls
+
+
+def test_opd_child_shares_one_stall_event_between_detector_and_teardown(monkeypatch):
+    """The detector and the killer are different threads; they must hold the SAME event.
+
+    `liveness_heartbeat` is the only thing that samples the silence counter, and only
+    `run_verl_training` owns the process group. Two separate events would leave a detection with
+    nothing to act on, which is the state this whole change exists to end. Uses the real
+    `_build_child_callbacks` so the event's construction is covered too.
+    """
+    from contextlib import nullcontext
+
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    class ProgressState:
+        def __init__(self, _resume_state):
+            pass
+
+        def start_training(self):
+            pass
+
+        def final_state(self, _bridge):
+            return {"loss_curve": [0.5], "train_wall_seconds": 1.0}
+
+    class Watcher:
+        def start(self):
+            pass
+
+        def stop(self, *, require_complete):
+            pass
+
+    class GpuSampler:
+        def start(self):
+            return self
+
+        def stop_gb(self):
+            return 0.0
+
+    seen: dict[str, object] = {}
+
+    def fake_liveness(*_args, **kwargs):
+        seen["detector"] = kwargs.get("child_tail_stall_event")
+        return nullcontext()
+
+    def fake_run(*_args, **kwargs):
+        seen["teardown"] = kwargs.get("abort_event")
+        return 0
+
+    monkeypatch.setattr(opd_runner._opd_train, "build_opd_overrides", lambda _config: [])
+    monkeypatch.setattr(opd_runner._opd_train, "_OpdProgressState", ProgressState)
+    monkeypatch.setattr(opd_runner, "_build_checkpoint_watcher", lambda *_args: Watcher())
+    monkeypatch.setattr(opd_runner, "_build_child_env", lambda *_args: {})
+    monkeypatch.setattr(opd_runner._opd_train, "_NvidiaSmiPeakSampler", GpuSampler)
+    monkeypatch.setattr(opd_runner._opd_train, "liveness_heartbeat", fake_liveness)
+    monkeypatch.setattr(opd_runner._opd_train, "run_verl_training", fake_run)
+    monkeypatch.setattr(
+        opd_runner,
+        "_reconcile_child_failures",
+        lambda *_args, truncation_window: None,
+    )
+    monkeypatch.setattr(
+        opd_runner._opd_train,
+        "latest_global_step_dir",
+        lambda _path: ("/actor", 1),
+    )
+    monkeypatch.setattr(opd_runner, "_validate_checkpoint_progress", lambda *_args: None)
+
+    opd_runner._run_child(
+        SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
+        object(),
+        SimpleNamespace(update_horizon=1, local_dir="/unused"),
+        SimpleNamespace(
+            resume_state=None,
+            resume_step=0,
+            python_bin="python",
+            entry_path="entry.py",
+            bridge=object(),
+        ),
+        {},
+        (),
+    )
+
+    assert isinstance(seen.get("detector"), threading.Event), (
+        "the liveness daemon was given no event to set, so nothing can ever detect a wedge"
+    )
+    assert seen["detector"] is seen.get("teardown"), (
+        "the detector and the process teardown hold different events, so a detected wedge would "
+        "set a flag nobody is watching and the run would bill on exactly as before"
+    )
+
+
+def test_opd_stall_abort_reason_states_only_what_was_observed():
+    # silence localises the failure to the child's progress boundary. it does NOT identify which
+    # component stopped, so the message users and the run log get must not name a cause.
+    import flash.engine.worker.io.heartbeat as hb
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    reason = opd_runner._CHILD_STALL_ABORT_REASON
+    assert "no new output" in reason
+    assert "optimizer step" in reason
+    assert str(hb.CHILD_TAIL_STALL_TICKS) in reason, (
+        "the threshold that fired belongs in the message; a bare 'no progress' leaves the reader "
+        "unable to tell a wedge from an impatient watchdog"
+    )
+    assert not any(word in reason.lower() for word in ("oom", "capacity", "ray")), (
+        f"the abort reason claims a cause that silence does not establish: {reason}"
+    )
 
 
 def test_transfer_queue_init_passes_the_config_through_and_returns():
