@@ -1235,14 +1235,18 @@ prefix, and the offset then leaks the demo back in silently.
 Parse the transcript instead, and parse it the same way on both paths:
 
 ```python
-from flash.content.thinking import strip_think
-
 ACTION = re.compile(r"<move>(.*?)</move>", re.DOTALL)  # your own action syntax
 
 
+def answer_of(content: str) -> str:
+    """The committed answer: everything after reasoning, or "" if reasoning never closed."""
+    if "</think>" in content:
+        return content.rsplit("</think>", 1)[1]
+    return "" if "<think>" in content else content
+
+
 def action_of(content: str) -> str:
-    # strip_think drops the reasoning span, so an action named inside <think> cannot win
-    found = ACTION.search(strip_think(content) or "")
+    found = ACTION.search(answer_of(content))
     if found is None:  # a generated turn carrying no action is a bug worth seeing
         raise ValueError(f"no action in assistant turn: {content[:120]!r}")
     return found.group(1)
@@ -1260,9 +1264,13 @@ exactly as the model emitted it, so a prior action reaches you as
 loop silently rebuilds nothing but the newest move. Searching the raw text is not the fix
 either: a model that weighs `<move>left</move>` in its reasoning before committing to
 `<move>right</move>` hands the first match to a plain search, and the wrong action is then
-replayed as history on every later call. `strip_think` removes the reasoning span first, and it
-also returns `""` for a turn truncated before `</think>`, so unfinished reasoning raises here
-rather than being mined for an action the model never committed to.
+replayed as history on every later call.
+
+`answer_of` above mirrors how Flash itself splits a turn for grading: the **last** `</think>`
+wins, and a turn truncated before its closing tag yields no answer at all, so unfinished
+reasoning raises here rather than being mined for an action the model never committed to. If
+your prompt pre-opens the reasoning block, the turn arrives with a closing tag and no opener,
+which this handles as written.
 
 **Give `apply` one representation.** The replayed turns and `assistant_response` have to arrive
 in the same shape. Passing the unwrapped payload for replayed turns and the raw text for the
