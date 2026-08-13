@@ -6898,6 +6898,9 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
         "stop-sequences",
         "exact-save-steps",
         "kl-ref-adapter",
+        # unconditional: every flash rollout is a lora rollout, so there is no configuration in
+        # which a base-model fallback is the intended behavior.
+        "lora-rollout-guard",
     ]
     source = Path(files["shim_py"]).read_text()
     # the wrap indents whole fragments into try blocks; a syntax slip would turn the child's

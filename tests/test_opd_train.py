@@ -5251,7 +5251,7 @@ def test_no_signal_failure_does_not_blame_cap_without_dominant_truncation():
     assert str(parent_error.value) == "verl OPD subprocess exited with status 1"
 
 
-def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
+def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch, tmp_path):
     from contextlib import nullcontext
 
     import flash.engine.worker.opd_train_runner as opd_runner
@@ -5320,10 +5320,13 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
     )
     monkeypatch.setattr(opd_runner, "_validate_checkpoint_progress", lambda *_args: None)
 
+    # the child proved the rollout guard applied, which is what the success path verifies.
+    (tmp_path / "applied_shims.txt").write_text("lora-rollout-guard\n")
+
     result = opd_runner._run_child(
         SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
         object(),
-        SimpleNamespace(update_horizon=1, local_dir="/unused"),
+        SimpleNamespace(update_horizon=1, local_dir="/unused", shim_dir=str(tmp_path)),
         SimpleNamespace(
             resume_state=None,
             resume_step=0,
@@ -7079,3 +7082,55 @@ def test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction():
     # rather than a second gradient path, so moving it changes the objective, not just the value.
     assert "flat_student.detach()" in source
     assert source.count(".detach()") == 1
+
+
+def test_opd_wraps_the_lora_rollout_guard_fail_closed_and_verifies_it():
+    """opd's sitecustomize was a raw concatenation with no marker channel, so a fragment that
+    failed to apply was swallowed by cpython's execsitecustomize and the child trained on. the
+    rollout guard is the one fragment whose absence is undetectable afterwards -- the run simply
+    distils the base model -- so it has to prove it applied."""
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    writer = inspect.getsource(opd_runner._write_child_shims)
+    assert "wrap_shim_fragment" in writer
+    assert "render_lora_rollout_guard_shim()" in writer
+    # the prologue defines the recorder the wrapper calls; without it the fragment raises on every
+    # child and the wrapper turns that into a hard exit.
+    assert "render_shim_marker_prologue" in writer
+
+    runner = inspect.getsource(opd_runner._run_child)
+    assert "verify_applied_shim_markers" in runner
+    assert opd_runner._LORA_ROLLOUT_GUARD_SHIM == "lora-rollout-guard"
+
+
+def test_opd_sitecustomize_composes_into_valid_python_with_the_guard(tmp_path, monkeypatch):
+    """the wrapper indents a whole rendered fragment into a try block; a syntax slip there would
+    turn every opd child patch into a silent no-op, so compiling the composed file is the gate."""
+    import flash.engine.worker.opd_train_runner as opd_runner
+    from flash.engine.worker import backend_common
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    monkeypatch.setattr(opd_runner.shutil, "copy2", lambda *_args: None)
+
+    opd_runner._write_child_shims(
+        SimpleNamespace(knobs=SimpleNamespace(save_at_steps=(3,))),
+        SimpleNamespace(shim_dir=str(shim_dir), update_horizon=3),
+        None,
+        [],
+    )
+
+    source = (shim_dir / "sitecustomize.py").read_text()
+    compile(source, "sitecustomize.py", "exec")
+    assert "_flash_record_applied_shim('lora-rollout-guard')" in source
+    assert f"_flash_shim_os._exit({backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE})" in source
+
+
+def test_opd_fails_a_completed_run_whose_rollout_guard_never_applied(tmp_path):
+    """a child that finished without recording the marker never ran its sitecustomize, so every
+    rollout in that run could have come from the base model. the run must not be reported as a
+    successful distillation."""
+    with pytest.raises(RuntimeError, match=r"never proved.*lora-rollout-guard"):
+        opd_train.verify_applied_shim_markers(
+            opd_train.shim_marker_file(str(tmp_path)), ("lora-rollout-guard",)
+        )

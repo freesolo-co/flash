@@ -23,6 +23,7 @@ from flash.engine.worker.backend_common import (
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
+    render_lora_rollout_guard_shim,
     render_shim_marker_prologue,
     render_tf32_shim,
     render_tilelang_cudart_shim,
@@ -223,6 +224,9 @@ def _write_rl_shim(inp, files) -> list[str]:
                 bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0
             ),
         ),
+        # unconditional: every flash rollout is a lora rollout, and a rollout that silently falls
+        # back to the base model is indistinguishable from a working run in the metrics.
+        ("lora-rollout-guard", render_lora_rollout_guard_shim()),
     ]
     shim_source = "".join(
         part

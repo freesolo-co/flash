@@ -244,6 +244,122 @@ except Exception:
 
 FLASH_GDN_VARLEN_MARKER = "[flash-verl] gdn packed-boundary resets active"
 
+FLASH_LORA_ROLLOUT_MARKER = "[flash-verl] lora rollout guard active"
+
+_LORA_ROLLOUT_TARGET = "verl.workers.rollout.vllm_rollout.vllm_async_server"
+
+
+# Why this fragment exists at all.
+#
+# verl's `vLLMHttpServer.generate` builds a LoRARequest only when `lora_as_adapter` is set AND
+# `VLLM_LORA_INT_ID` is already in `await self.engine.list_loras()`; it then passes whatever it has
+# to `self.engine.generate(..., lora_request=lora_request, ...)`.
+#
+# when the adapter is missing, `lora_request` stays None and generation proceeds FROM THE BASE
+# MODEL. there is no raise, no warning and no counter, so the run completes and the loss descends
+# while every rollout came from a different policy than the one being trained. for opd that silently
+# turns on-policy distillation into off-policy distillation from the stock base model; for grpo it
+# scores trajectories the policy never produced. the symptom is "the method did not beat sft", which
+# reads as a failed experiment rather than a broken run, and no loss curve can distinguish the two.
+#
+# the shim supplies the else-branch verl omits: with lora_as_adapter set, an absent adapter is a
+# hard error. that is safe on flash's paths because every flash rollout is a lora rollout
+# (train.lora_rank has a minimum of 1) and generation only ever runs after a weight sync has added
+# the adapter -- both opd and grpo set trainer.val_before_train=false, so there is no pre-sync
+# validation pass that would legitimately generate from the base model. `lora_as_adapter` is false
+# for a merged-lora rollout, so this never fires on a path where base-model generation is intended.
+def render_lora_rollout_guard_shim() -> str:
+    """child-side sitecustomize fragment that fails a rollout whose lora never reached the engine.
+
+    deferred through a meta_path finder for the same reason as the gdn shim: importing the target at
+    interpreter startup pulls in vllm and torch, initializing cuda against every visible gpu before
+    ray narrows the actor to its own card.
+    """
+    return f'''
+import sys as _flash_lora_sys
+
+_FLASH_LORA_TARGET = {_LORA_ROLLOUT_TARGET!r}
+
+
+def _flash_patch_lora_rollout(module):
+    server = module.vLLMHttpServer
+    if getattr(server.generate, "_flash_lora_guarded", False):
+        return
+    original = server.generate
+
+    async def generate(self, *args, **kwargs):
+        # mirror verl's own condition: a merged-lora rollout serves the adapter through the base
+        # weights and legitimately carries no LoRARequest.
+        if self.lora_as_adapter:
+            loaded = await self.engine.list_loras()
+            if module.VLLM_LORA_INT_ID not in loaded:
+                raise RuntimeError(
+                    "[flash-verl] refusing to roll out from the base model: this run trains a lora "
+                    f"adapter, but adapter id {{module.VLLM_LORA_INT_ID}} is not loaded in the vllm "
+                    f"engine (loaded: {{sorted(loaded)}}). verl would silently generate from the "
+                    "base model here, which trains the adapter on tokens a different policy "
+                    "produced and cannot be detected from the loss curve."
+                )
+        return await original(self, *args, **kwargs)
+
+    generate._flash_lora_guarded = True
+    server.generate = generate
+    print({FLASH_LORA_ROLLOUT_MARKER!r}, flush=True)
+
+
+class _FlashLoraLoader:
+    """patch after the real loader finishes, so the class the caller receives is the patched one."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def create_module(self, spec):
+        return self._inner.create_module(spec)
+
+    def exec_module(self, module):
+        self._inner.exec_module(module)
+        _flash_lora_uninstall()
+        _flash_patch_lora_rollout(module)
+
+    def __getattr__(self, name):  # keep the rest of the loader protocol intact
+        return getattr(self._inner, name)
+
+
+class _FlashLoraFinder:
+    """intercept the first import of the rollout server module, then get out of the way."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != _FLASH_LORA_TARGET:
+            return None
+        # delegate only to finders positioned AFTER this one: skipping every flash finder would let
+        # a sibling shim's patch be dropped while its marker still recorded success, and skipping
+        # only our own class recurses when two flash finders sit on the same module.
+        here = [i for i, f in enumerate(_flash_lora_sys.meta_path) if f is self]
+        rest = _flash_lora_sys.meta_path[here[0] + 1 :] if here else _flash_lora_sys.meta_path
+        for finder in rest:
+            find = getattr(finder, "find_spec", None)
+            if find is None:
+                continue
+            spec = find(fullname, path, target)
+            if spec is not None and spec.loader is not None:
+                spec.loader = _FlashLoraLoader(spec.loader)
+                return spec
+        return None
+
+
+def _flash_lora_uninstall():
+    _flash_lora_sys.meta_path[:] = [
+        f for f in _flash_lora_sys.meta_path if not isinstance(f, _FlashLoraFinder)
+    ]
+
+
+_flash_lora_loaded = _flash_lora_sys.modules.get(_FLASH_LORA_TARGET)
+if _flash_lora_loaded is not None:
+    _flash_patch_lora_rollout(_flash_lora_loaded)
+else:
+    _flash_lora_sys.meta_path.insert(0, _FlashLoraFinder())
+'''
+
 
 # Why the shim below defers every import to the moment the child imports the modeling module.
 #

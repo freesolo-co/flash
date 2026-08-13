@@ -4842,3 +4842,206 @@ def test_wrapping_the_real_rendered_fragments_stays_valid_python(tmp_path):
     compile(source, "sitecustomize.py", "exec")
     # and the empty fragment stays empty: a feature that is off has nothing to prove.
     assert vc.wrap_shim_fragment("off-feature", "") == ""
+
+
+def _lora_rollout_server_module(loaded, *, lora_as_adapter=True):
+    """a stub shaped like the pinned verl module the guard patches.
+
+    at freesolo-co/verl@32d6200d, ``vLLMHttpServer.generate`` is an async method whose first
+    positional argument is ``prompt_ids`` and which carries several keyword-only extras, and
+    ``VLLM_LORA_INT_ID`` is a module-level constant the guard reads back rather than hardcoding.
+    """
+    import types as _types
+
+    module = _types.ModuleType("verl.workers.rollout.vllm_rollout.vllm_async_server")
+    module.VLLM_LORA_INT_ID = 123
+
+    class _Engine:
+        def __init__(self, ids):
+            self._ids = set(ids)
+
+        async def list_loras(self):
+            return set(self._ids)
+
+    # name matched to verl's own class: the shim looks it up by this exact attribute.
+    class vLLMHttpServer:  # noqa: N801
+        def __init__(self):
+            self.lora_as_adapter = lora_as_adapter
+            self.engine = _Engine(loaded)
+
+        async def generate(
+            self,
+            prompt_ids,
+            sampling_params,
+            request_id,
+            image_data=None,
+            priority=0,
+            **kwargs,
+        ):
+            return ("generated", list(prompt_ids), request_id, priority)
+
+    module.vLLMHttpServer = vLLMHttpServer
+    return module
+
+
+def _apply_lora_rollout_guard(module, monkeypatch):
+    """exec the fragment against an already-imported module, the way a ray actor re-import hits it."""
+    import sys as _sys
+
+    for name in (
+        "verl",
+        "verl.workers",
+        "verl.workers.rollout",
+        "verl.workers.rollout.vllm_rollout",
+    ):
+        stub = type(_sys)(name)
+        stub.__path__ = []
+        monkeypatch.setitem(_sys.modules, name, stub)
+    monkeypatch.setitem(_sys.modules, module.__name__, module)
+    exec(compile(vc.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+
+
+def test_the_lora_rollout_guard_refuses_to_generate_from_the_base_model(monkeypatch):
+    """the defect this guard exists for: verl leaves ``lora_request`` None when the adapter is not
+    in the engine's loaded set and generates from the base model anyway -- no raise, no counter.
+    an opd run then distils a policy it never rolled out, and the loss curve looks fine."""
+    import asyncio
+
+    module = _lora_rollout_server_module(set())
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="refusing to roll out from the base model"):
+        asyncio.run(module.vLLMHttpServer().generate([1, 2, 3], {}, "req-1"))
+
+
+def test_the_lora_rollout_guard_names_the_adapter_and_what_the_engine_holds(monkeypatch):
+    """the message has to be actionable from the child log alone: which id was expected, and what
+    the engine actually had."""
+    import asyncio
+
+    module = _lora_rollout_server_module({7, 9})
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-1"))
+    message = str(excinfo.value)
+    assert "123" in message
+    assert "[7, 9]" in message
+
+
+def test_the_lora_rollout_guard_passes_the_call_through_once_the_adapter_is_loaded(monkeypatch):
+    """the guard must be inert on the healthy path, preserving verl's real signature and return."""
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    result = asyncio.run(
+        module.vLLMHttpServer().generate([1, 2], {}, "req-9", image_data=None, priority=3)
+    )
+
+    assert result == ("generated", [1, 2], "req-9", 3)
+
+
+def test_the_lora_rollout_guard_stays_out_of_a_merged_lora_rollout(monkeypatch):
+    """``lora_as_adapter`` is false when the adapter is merged into the base weights, and such a
+    rollout legitimately carries no LoRARequest. mirroring verl's own condition keeps the guard
+    from failing a run that is behaving correctly."""
+    import asyncio
+
+    module = _lora_rollout_server_module(set(), lora_as_adapter=False)
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    assert asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-2"))[0] == "generated"
+
+
+def test_the_lora_rollout_guard_does_not_wrap_itself_twice(monkeypatch):
+    """every ray actor imports the same sitecustomize; stacking wrappers would add a
+    ``list_loras`` round trip per layer to every request."""
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+    first = module.vLLMHttpServer.generate
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    assert module.vLLMHttpServer.generate is first
+    assert asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-3"))[0] == "generated"
+
+
+def test_the_lora_rollout_guard_patches_the_module_on_a_real_deferred_import(tmp_path, monkeypatch):
+    """the production path: sitecustomize runs before verl is importable, so the guard arms a
+    meta_path finder and must patch the module object the caller actually receives."""
+    import asyncio
+    import importlib
+    import sys as _sys
+
+    package = tmp_path / "verl" / "workers" / "rollout" / "vllm_rollout"
+    package.mkdir(parents=True)
+    for parent in (
+        tmp_path / "verl",
+        tmp_path / "verl" / "workers",
+        tmp_path / "verl" / "workers" / "rollout",
+        package,
+    ):
+        (parent / "__init__.py").write_text("")
+    (package / "vllm_async_server.py").write_text(
+        textwrap.dedent(
+            """
+            VLLM_LORA_INT_ID = 123
+
+
+            class _Engine:
+                async def list_loras(self):
+                    return set()
+
+
+            class vLLMHttpServer:
+                def __init__(self):
+                    self.lora_as_adapter = True
+                    self.engine = _Engine()
+
+                async def generate(self, prompt_ids, sampling_params, request_id, **kwargs):
+                    return "generated"
+            """
+        )
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    target = "verl.workers.rollout.vllm_rollout.vllm_async_server"
+    for name in list(_sys.modules):
+        if name == "verl" or name.startswith("verl."):
+            monkeypatch.delitem(_sys.modules, name, raising=False)
+    # importing the fake tree ADDS entries monkeypatch never recorded, so undoing its deletions
+    # would leave this tmp_path package shadowing the real verl for every later test in the run.
+    imported = set(_sys.modules)
+    armed = list(_sys.meta_path)
+    monkeypatch.setattr(_sys, "meta_path", armed)
+
+    exec(compile(vc.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+    try:
+        module = importlib.import_module(target)
+
+        with pytest.raises(RuntimeError, match="refusing to roll out from the base model"):
+            asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-4"))
+        # the finder removes itself once it has fired, so it never sits on later imports.
+        assert not [f for f in _sys.meta_path if type(f).__name__ == "_FlashLoraFinder"]
+    finally:
+        for name in set(_sys.modules) - imported:
+            if name == "verl" or name.startswith("verl."):
+                del _sys.modules[name]
+
+
+def test_the_lora_rollout_guard_imports_nothing_heavy_at_interpreter_startup():
+    """sitecustomize runs before ray narrows the actor's CUDA_VISIBLE_DEVICES. importing vllm or
+    torch here would initialize cuda against every visible gpu and strand each rank on device 0."""
+    import sys as _sys
+
+    before = set(_sys.modules)
+    exec(compile(vc.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+    heavy = {
+        name
+        for name in set(_sys.modules) - before
+        if name.split(".")[0] in {"torch", "vllm", "transformers", "ray"}
+    }
+
+    assert heavy == set()

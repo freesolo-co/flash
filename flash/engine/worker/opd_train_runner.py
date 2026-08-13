@@ -18,6 +18,10 @@ from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
+# the one fragment opd wraps fail-closed and verifies. named here because both the writer and the
+# post-run verification need it.
+_LORA_ROLLOUT_GUARD_SHIM = "lora-rollout-guard"
+
 
 @dataclass(frozen=True)
 class _OpdRequest:
@@ -523,10 +527,19 @@ def _write_child_shims(
     )
     if gdn_reset_arch is not None:
         opd_shim_source += _opd_train.render_gdn_varlen_shim(gdn_reset_arch)
+    # wrapped fail-closed: a rollout that quietly falls back to the base model produces a run that
+    # completes with a descending loss while distilling the wrong policy, so a guard that failed to
+    # apply must stop the child rather than let it train unguarded.
+    opd_shim_source += _opd_train.wrap_shim_fragment(
+        _LORA_ROLLOUT_GUARD_SHIM, _opd_train.render_lora_rollout_guard_shim()
+    )
     if "wandb" in loggers:
         opd_shim_source += _opd_train.render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(opd_shim_source)
+        file.write(
+            _opd_train.render_shim_marker_prologue(_opd_train.shim_marker_file(shim_dir))
+            + opd_shim_source
+        )
     return entry_path, reward_path
 
 
@@ -686,6 +699,14 @@ def _run_child(
                     tail=callbacks.child_tail,
                 )
                 training_completed = return_code == 0
+                if training_completed:
+                    # a child that trained to completion must have proved the rollout guard applied.
+                    # a missing marker means its sitecustomize never ran, so every rollout in this
+                    # run could have come from the base model with nothing in the logs to show it.
+                    _opd_train.verify_applied_shim_markers(
+                        _opd_train.shim_marker_file(workload.shim_dir),
+                        (_LORA_ROLLOUT_GUARD_SHIM,),
+                    )
     finally:
         watcher.stop(require_complete=training_completed)
     peak_gpu_gb = gpu_sampler.stop_gb()
