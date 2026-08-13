@@ -213,14 +213,24 @@ def _write_cycle_commit_failure_fallback(classification: str, message: str) -> N
     )
 
 
+def _secret_env_name(name: str) -> bool:
+    """Whether ``name`` names a credential, by the same rule as `bootstrap_secrets`.
+
+    Suffix and exact matches only, never a substring: the child's environment carries
+    `TOKENIZERS_PARALLELISM` and `FLASH_OPD_EOS_TOKEN_IDS`, whose values are `false` and a list of
+    token ids. A substring rule treats both as credentials and rewrites every occurrence of those
+    values, so an ordinary word or id list in the failure message becomes `<redacted>` -- corrupting
+    the diagnostic this record exists to carry.
+    """
+    upper = str(name).upper()
+    return upper in {"AUTHORIZATION", "HF_TOKEN"} or upper.endswith(
+        ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
+    )
+
+
 def _safe_child_failure_detail(error: Exception) -> str:
     message = str(error)
-    secrets = {
-        value
-        for name, value in os.environ.items()
-        if value
-        and any(marker in name.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
-    }
+    secrets = {value for name, value in os.environ.items() if value and _secret_env_name(name)}
     for secret in sorted(secrets, key=len, reverse=True):
         for needle in {secret, urllib.parse.quote(secret, safe="")}:
             if len(needle) >= 8:

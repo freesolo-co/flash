@@ -4374,6 +4374,35 @@ def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(monk
         )
 
 
+def test_child_failure_sanitizer_redacts_credentials_without_eating_ordinary_values(monkeypatch):
+    """Redaction must not corrupt the diagnostic it exists to carry.
+
+    The child's environment holds `TOKENIZERS_PARALLELISM=false` and `FLASH_OPD_EOS_TOKEN_IDS`, so a
+    substring rule over KEY/TOKEN/SECRET/PASSWORD classifies both as credentials and rewrites every
+    occurrence of `false` and of the id list. Match the suffix/exact rule `bootstrap_secrets` uses:
+    `FLASH_OPD_BRIDGE_TOKEN` still redacts because it ENDS with `_TOKEN`.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    secret = "s3cr3t-bridge-token-abcdef123456"
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", secret)
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
+    monkeypatch.setenv("FLASH_OPD_EOS_TOKEN_IDS", "[151643,151645]")
+
+    kept = _safe_child_failure_detail(
+        ValueError("parallelism was false and eos ids [151643,151645] mismatched")
+    )
+    assert kept == "parallelism was false and eos ids [151643,151645] mismatched"
+
+    for error in (
+        ValueError(f"HTTP 403 Authorization: Bearer {secret}"),
+        RuntimeError(f"token={secret} rejected"),
+    ):
+        redacted = _safe_child_failure_detail(error)
+        assert secret not in redacted
+        assert "<redacted>" in redacted
+
+
 @pytest.mark.parametrize(
     ("stage", "failure_path"),
     [("multiturn_start", "/multiturn/start"), ("score", "/multiturn/score")],
