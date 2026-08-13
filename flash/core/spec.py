@@ -186,12 +186,20 @@ def persisted_gpu_head(spec: dict[str, Any] | None) -> str:
     'strip'``. Every one of those sites swallows exceptions to protect its caller, so the failure is
     silent: a paid endpoint is simply never torn down.
 
-    Returns the HEAD rather than joining, since these callers name a concrete resource. The head is
-    the right one for endpoint names: ``endpoint_name`` is derived per attempt from the class that
-    attempt actually rented, and the first attempt of an ordered pin always rents the head (the
-    allocator ranks the authored classes and the head is the author's first preference, tried
-    first). Later attempts stamp ``remote.allocated_gpu``, which every one of these call sites
-    already prefers when present.
+    Returns the HEAD rather than joining, since these callers name a concrete resource, and a joined
+    label is not one. It is a BEST GUESS, not a derivation: authored order is preference, and
+    ``_cheapest_allocation`` re-ranks the acceptable classes on dollars-per-step, so an ordered pin
+    whose second class is cheaper per step rents that one first and its endpoint carries that name.
+    The head is right whenever the classes rank in authored order (including every scalar pin, where
+    it is exact), and wrong otherwise.
+
+    That is acceptable here only because of what the callers do with it. All of them prefer
+    ``remote.allocated_gpu`` -- the class actually rented -- and reach this reader only when it is
+    absent, which is the narrow submit-to-handle-persist window. A wrong guess there names an
+    endpoint that does not exist, and every one of these sites is already best-effort about a name
+    that resolves to nothing: the reaper protects a name that is not listed, teardown deletes
+    nothing. That is strictly better than today's list, which raises before naming anything at all
+    and so protects and deletes nothing in EVERY case, ordered-pin runs included.
     """
     gpu = (spec or {}).get("gpu")
     raw = gpu.get("type") if isinstance(gpu, dict) else None
