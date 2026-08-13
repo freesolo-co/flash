@@ -498,7 +498,7 @@ class SseAccumulator:
             return
         if not line.startswith(b"data:"):
             return
-        data = line[len(b"data:") :].strip()
+        data = _sse_data_value(line)
         added_bytes = len(data) + (1 if self._event_data else 0)
         if self._max_accumulated_bytes is not None and added_bytes > (
             self._max_accumulated_bytes - self._event_data_bytes
@@ -561,6 +561,12 @@ class SseAccumulator:
             if index not in self._choices and not self._reserve(b"x" * choice_entry_bytes):
                 continue
             state = self._choice_state(index)
+            message = choice.get("message")
+            if message is not None:
+                if isinstance(message, dict):
+                    self._consume_delta(state, message)
+                else:
+                    self._note_defect("stream choice contained a non-object message")
             for key, value in choice.items():
                 if key in {"index", "delta", "logprobs", "finish_reason", "message"}:
                     continue

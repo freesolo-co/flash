@@ -52,6 +52,19 @@ def _reply_envelope(content: str) -> dict:
     return {"choices": [{"message": {"role": "assistant", "content": content}}]}
 
 
+@pytest.mark.parametrize("standalone", [False, True], ids=["managed", "standalone"])
+def test_app_registers_trace_routes_only_in_standalone(monkeypatch, standalone: bool) -> None:
+    from flash.server import app as app_mod
+
+    monkeypatch.setenv("FLASH_STANDALONE", "1" if standalone else "0")
+
+    schema = app_mod.create_app().openapi()
+    paths = set(schema["paths"])
+
+    assert ("/v1/chat/completions" in paths) is standalone
+    assert ("/api/traces/export" in paths) is standalone
+
+
 @pytest.fixture
 def trace_api(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
@@ -711,6 +724,54 @@ def test_done_gate_relays_events_after_a_whitespace_suffixed_done_value() -> Non
     assert gate.done_event == b"data: [DONE]\n\n"
 
 
+@pytest.mark.parametrize(
+    "event",
+    [
+        b"data: [DONE]\n\n",
+        b"data:[DONE]\n\n",
+        b"data: [DONE]   \n\n",
+        b"data:  [DONE]\n\n",
+        b"data: [DONE]\t\n\n",
+        b"data: [DONE]x\n\n",
+    ],
+    ids=["canonical", "no-space", "trailing-spaces", "two-leading-spaces", "tab", "junk"],
+)
+def test_done_gate_and_accumulator_agree_on_sentinel_values(event: bytes) -> None:
+    gate = trace_sse.SseDoneGate()
+    accumulator = trace_sse.SseAccumulator()
+
+    relayed = gate.feed(event)
+    relayed.extend(gate.finish())
+    accumulator.feed(event)
+    accumulator.finish()
+
+    assert gate.terminated is accumulator._done
+    if gate.terminated:
+        assert relayed == []
+        assert gate.done_event == event
+    else:
+        assert b"".join(relayed) == event
+        assert gate.done_event is None
+
+
+def test_padded_done_does_not_hide_later_stream_content() -> None:
+    stream = (
+        b'data: [DONE]   \n\ndata: {"choices":[{"index":0,"delta":{"content":"REAL"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    gate = trace_sse.SseDoneGate()
+    accumulator = trace_sse.SseAccumulator()
+
+    relayed = gate.feed(stream)
+    relayed.extend(gate.finish())
+    accumulator.feed(stream)
+    accumulator.finish()
+
+    assert b"REAL" in b"".join(relayed)
+    assert accumulator.output()["choices"][0]["message"]["content"] == "REAL"
+    assert gate.terminated is accumulator._done is True
+
+
 def test_done_gate_bounds_an_unterminated_done_candidate() -> None:
     gate = trace_sse.SseDoneGate()
 
@@ -1337,6 +1398,36 @@ def test_a_streamed_trace_keeps_response_envelope_fields(trace_api, monkeypatch)
     assert output["choices"][0]["message"]["content"] == "world"
 
 
+def test_streamed_full_message_is_accumulated_within_the_budget() -> None:
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=100_000)
+    event = json.dumps(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop",
+                }
+            ]
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    accumulator.feed(b"data: " + event + b"\n\n")
+    accumulator.feed(b"data: [DONE]\n\n")
+
+    assert accumulator.defect is None
+    assert accumulator.truncated is False
+    assert accumulator.output()["choices"][0]["message"] == {
+        "role": "assistant",
+        "content": "hello",
+    }
+
+    bounded = trace_sse.SseAccumulator(max_accumulated_bytes=64)
+    bounded.feed(b"data: " + event + b"\n\n")
+    assert bounded.truncated is True
+
+
 def test_streaming_records_accumulated_response(trace_api, monkeypatch) -> None:
     _StreamingAsyncClient.requests = []
     _StreamingAsyncClient.status_code = 200
@@ -1412,6 +1503,64 @@ async def test_streaming_client_disconnect_stores_partial_trace(tmp_path, monkey
     assert span["error"] == "client disconnected"
     assert span["status_code"] == "ERROR"
     assert span["output_payload"]["choices"][0]["message"]["content"] == "partial"
+    assert body.closed is True
+    assert client.closed is True
+
+
+@pytest.mark.anyio
+async def test_unrecorded_stream_stops_reading_after_done_event() -> None:
+    context = traces._UpstreamRequestContext(
+        url="https://api.openai.com/v1/chat/completions",
+        headers={},
+        body={**_REQUEST, "stream": True},
+        provider="openai",
+        model="gpt-test",
+        key_id=1,
+        project_id=None,
+        metadata=None,
+        secrets=(),
+        started_at=traces.time.perf_counter(),
+        record_trace=False,
+    )
+
+    class _PostDoneBlockingBody(_BlockingStreamingBody):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield self.first
+            self.blocked.set()
+            await asyncio.Event().wait()
+
+    body = _PostDoneBlockingBody(b"data: [DONE]\n\n")
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=body,
+        request=httpx.Request("POST", context.url),
+    )
+    client = _StaticAsyncClient()
+
+    async def consume() -> list[bytes]:
+        return [
+            chunk
+            async for chunk in traces._stream_response(
+                client=client, upstream_response=response, context=context
+            )
+        ]
+
+    consume_task = asyncio.create_task(consume())
+    blocked_task = asyncio.create_task(body.blocked.wait())
+    completed, pending = await asyncio.wait(
+        {consume_task, blocked_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+    try:
+        assert consume_task in completed
+        chunks = await consume_task
+    finally:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    assert chunks == [body.first]
+    assert body.blocked.is_set() is False
     assert body.closed is True
     assert client.closed is True
 
@@ -2462,6 +2611,47 @@ def test_a_string_truncated_payload_is_skipped_by_converted_exports(trace_api) -
     assert prompts["skipped"] == 1
 
 
+@pytest.mark.anyio
+async def test_a_redaction_depth_clipped_payload_is_marked_and_skipped(
+    trace_api, monkeypatch
+) -> None:
+    owner = db.ensure_standalone_owner()
+    nested: object = "leaf"
+    for _ in range(platform_traces._MAX_PAYLOAD_DEPTH + 10):
+        nested = {"level": nested}
+    context = traces._UpstreamRequestContext(
+        url="https://api.openai.com/v1/chat/completions",
+        headers={},
+        body={"model": "gpt-test", "messages": [{"role": "user", "content": nested}]},
+        provider="openai",
+        model="gpt-test",
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        metadata=None,
+        secrets=(),
+        started_at=traces.time.perf_counter(),
+        record_trace=True,
+    )
+
+    await traces._record_trace(
+        context,
+        output_payload=_reply_envelope("reply"),
+        error=None,
+    )
+
+    raw = _raw(trace_api)
+    span = raw["records"][0]["spans"][0]
+    records = trace_api.get(
+        "/api/traces/export",
+        headers={"Authorization": f"Bearer {_KEY}"},
+        params={"project_id": _PROJECT_ID, "format": "records"},
+    ).json()
+
+    assert span["attributes"] == {"payload_truncated": ["input"]}
+    assert records["records"] == []
+    assert records["skipped"] == 1
+
+
 def test_a_collection_clipped_payload_is_marked_and_skipped(trace_api, monkeypatch) -> None:
     """Dropping a collection tail changes the request just as surely as shortening a string. Without
     the marker, the bounded prefix looked intact and converted into a prompt the model never received.
@@ -3452,6 +3642,50 @@ def test_percent_encoded_secret_schema_refs_are_redacted(trace_api, monkeypatch,
     assert stored["$defs"]["Alpha"]["default"] == "[redacted]"
     assert stored["$defs"]["Alpha"]["const"] == "[redacted]"
     assert stored["$defs"]["Alpha"]["enum"] == ["[redacted]"]
+
+
+def test_embedded_schema_resource_id_refs_redact_the_local_target() -> None:
+    assert traces._is_secret_key("Widget") is False
+    schema = {
+        "$id": "https://example/root",
+        "properties": {"api_key": {"$ref": "https://example/cred"}},
+        "$defs": {
+            "Widget": {
+                "$id": "https://example/cred",
+                "default": "SECRET-EMBEDDED",
+                "enum": ["SECRET-E2"],
+            }
+        },
+    }
+    control = {
+        **schema,
+        "properties": {"api_key": {"$ref": "#/$defs/Widget"}},
+    }
+
+    stored = traces._redact_secret_fields(schema)["$defs"]["Widget"]
+    control_stored = traces._redact_secret_fields(control)["$defs"]["Widget"]
+
+    nested = {
+        "$id": "https://example/root",
+        "$defs": {
+            "Scope": {
+                "$id": "https://example/resources/",
+                "properties": {"api_key": {"$ref": "cred"}},
+                "$defs": {
+                    "Widget": {
+                        "$id": "cred",
+                        "default": "SECRET-RELATIVE",
+                    }
+                },
+            }
+        },
+    }
+    nested_stored = traces._redact_secret_fields(nested)["$defs"]["Scope"]["$defs"]["Widget"]
+
+    assert stored["default"] == "[redacted]"
+    assert stored["enum"] == ["[redacted]"]
+    assert control_stored["default"] == "[redacted]"
+    assert nested_stored["default"] == "[redacted]"
 
 
 def test_document_id_schema_refs_redact_only_local_targets() -> None:

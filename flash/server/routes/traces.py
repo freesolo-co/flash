@@ -9,7 +9,7 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any
-from urllib.parse import unquote, urldefrag, urljoin
+from urllib.parse import urljoin
 
 import anyio
 import httpx
@@ -18,7 +18,6 @@ from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from flash.core.spec import require_project_id
-from flash.server.platform import traces as platform_traces
 from flash.server.platform.deps import require_key
 from flash.server.platform.traces import (
     MAX_EXPORT_TRACES,
@@ -27,6 +26,21 @@ from flash.server.platform.traces import (
     export_traces,
     list_projects,
     store_trace,
+)
+from flash.server.routes.trace_redaction import (  # noqa: F401
+    _MIN_SECRET_SUBSTRING_LENGTH,
+    _is_schema_definition,
+    _is_secret_key,
+    _local_schema_pointer,
+    _redact_schema_literal,
+    _redact_secret_fields,
+    _redact_secret_string,
+    _redact_secret_values,
+    _SanitizationFlag,
+    _sanitize_for_trace,
+    _schema_anchor_pointers,
+    _schema_resource_pointers,
+    _secret_schema_definition_refs,
 )
 from flash.server.routes.trace_sse import SseAccumulator, SseDoneGate
 
@@ -38,9 +52,6 @@ _UPSTREAM_TIMEOUT_SECONDS = 300.0
 # copy is truncated to, so the recorded message is never the part that got cut, while still bounding
 # what one response can hold in memory.
 _MAX_RECORDED_ERROR_BYTES = 64 * 1024
-# short strings occur naturally in prompts and object keys. treating one as a global substring
-# secret corrupts unrelated training text, while real bearer credentials are comfortably longer.
-_MIN_SECRET_SUBSTRING_LENGTH = 16
 _UPSTREAM_TOO_LARGE_ERROR = "upstream response exceeded the 8 MiB relay limit"
 _UPSTREAM_TOO_LARGE_BODY = b'{"detail":"Upstream response was too large to relay"}'
 # told to the caller when the provider call succeeded but persisting its trace did not, so a
@@ -72,96 +83,6 @@ _SAFE_PROVIDER_RESPONSE_HEADERS = frozenset(
     {"request-id", "x-request-id", "retry-after", "retry-after-ms"}
 )
 _SAFE_PROVIDER_RESPONSE_HEADER_PREFIXES = ("x-ratelimit-", "anthropic-ratelimit-")
-_SECRET_KEY_EXACT = frozenset({"authorization", "proxyauthorization"})
-_SECRET_KEY_SUFFIXES = (
-    "apikey",
-    # conventional cloud credential fields end in these normalized forms. bare `key` is deliberately
-    # excluded because JSON schemas and tool arguments use it pervasively for harmless data.
-    "accesskeyid",
-    "secretkey",
-    "accesskey",
-    "secret",
-    "token",
-    "password",
-    "passwd",
-    "credential",
-    "credentials",
-    "privatekey",
-)
-_JSON_SCHEMA_STRUCTURAL_KEYWORDS = frozenset(
-    {
-        "type",
-        "properties",
-        "items",
-        "prefixItems",
-        "additionalItems",
-        "contains",
-        "enum",
-        "const",
-        "$ref",
-        "$id",
-        "$schema",
-        "$anchor",
-        "$dynamicRef",
-        "$dynamicAnchor",
-        "anyOf",
-        "allOf",
-        "oneOf",
-        "not",
-        "format",
-        "additionalProperties",
-        "patternProperties",
-        "propertyNames",
-        "unevaluatedProperties",
-        "unevaluatedItems",
-        "dependentRequired",
-        "dependentSchemas",
-        "discriminator",
-        "required",
-        "$defs",
-        "definitions",
-        "if",
-        "then",
-        "else",
-        "contentSchema",
-    }
-)
-_JSON_SCHEMA_ANNOTATION_KEYWORDS = frozenset(
-    {
-        "description",
-        "title",
-        "default",
-        "examples",
-        "deprecated",
-        "readOnly",
-        "writeOnly",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "multipleOf",
-        "minLength",
-        "maxLength",
-        "pattern",
-        "minItems",
-        "maxItems",
-        "uniqueItems",
-        "minProperties",
-        "maxProperties",
-        "minContains",
-        "maxContains",
-        "contentEncoding",
-        "contentMediaType",
-        "nullable",
-        "example",
-        "$comment",
-    }
-)
-_JSON_SCHEMA_KEYWORDS = _JSON_SCHEMA_STRUCTURAL_KEYWORDS | _JSON_SCHEMA_ANNOTATION_KEYWORDS
-_JSON_SCHEMA_VALUE_KEYWORDS = frozenset({"default", "examples", "example"})
-_JSON_SCHEMA_SECRET_LITERAL_KEYWORDS = frozenset(
-    {"default", "const", "enum", "examples", "example"}
-)
 
 
 @dataclass
@@ -180,271 +101,6 @@ class _UpstreamRequestContext:
     # set when persistence raised, so the response can tell the caller the call was NOT recorded
     # instead of leaving the gap to be discovered at export time.
     record_failed: bool = False
-
-
-def _is_secret_key(key: Any, *, allow_token: bool = False) -> bool:
-    normalized = str(key).casefold().replace("_", "").replace("-", "")
-    return normalized in _SECRET_KEY_EXACT or (
-        not (allow_token and normalized == "token")
-        and any(normalized.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES)
-    )
-
-
-def _is_schema_definition(value: Any) -> bool:
-    if isinstance(value, bool):
-        return True
-    if not isinstance(value, dict):
-        return False
-    if not value:
-        # `{}` is the permissive JSON Schema ("any value"), so under a `properties` map it is a
-        # declaration, not a secret. Treating it as one rewrote `{"password": {}}` into the string
-        # "[redacted]" and turned a valid schema into an invalid one.
-        return True
-    keys = [key for key in value if not (isinstance(key, str) and key.startswith("x-"))]
-    if any(key not in _JSON_SCHEMA_KEYWORDS for key in keys):
-        return False
-    if any(key in _JSON_SCHEMA_STRUCTURAL_KEYWORDS for key in keys):
-        return True
-    return bool(keys) and all(key not in _JSON_SCHEMA_VALUE_KEYWORDS for key in keys)
-
-
-def _redact_schema_literal(value: Any, *, depth: int) -> Any:
-    if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-        return "[redacted]"
-    if isinstance(value, dict):
-        return {
-            "[redacted]" if _is_secret_key(key) else key: _redact_schema_literal(
-                item, depth=depth + 1
-            )
-            for key, item in value.items()
-        }
-    if isinstance(value, list | tuple):
-        return [_redact_schema_literal(item, depth=depth + 1) for item in value]
-    return "[redacted]"
-
-
-def _local_schema_pointer(
-    ref: str,
-    anchors: Mapping[str, frozenset[tuple[str, ...]]],
-    *,
-    base_uri: str = "",
-) -> frozenset[tuple[str, ...]]:
-    if not ref.startswith("#"):
-        ref_base, fragment = urldefrag(urljoin(base_uri, ref))
-        document_base = urldefrag(base_uri)[0]
-        if not document_base or ref_base != document_base:
-            return frozenset()
-        ref = f"#{fragment}"
-    ref = unquote(ref)
-    if ref == "#":
-        return frozenset({()})
-    if ref.startswith("#/"):
-        segments = tuple(
-            segment.replace("~1", "/").replace("~0", "~") for segment in ref[2:].split("/")
-        )
-        return frozenset({segments}) if segments else frozenset()
-    if ref.startswith("#") and len(ref) > 1:
-        return anchors.get(ref[1:], frozenset())
-    return frozenset()
-
-
-def _schema_anchor_pointers(value: Any, *, depth: int = 0) -> dict[str, frozenset[tuple[str, ...]]]:
-    anchors: dict[str, set[tuple[str, ...]]] = {}
-    keywords = ("$anchor", "$dynamicAnchor")
-
-    def collect(node: Any, path: tuple[str, ...], depth: int) -> None:
-        if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-            return
-        if isinstance(node, dict):
-            for keyword in keywords:
-                anchor = node.get(keyword)
-                if isinstance(anchor, str):
-                    anchors.setdefault(anchor, set()).add(path)
-            for key, item in node.items():
-                if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
-                    collect(item, (*path, str(key)), depth + 1)
-        elif isinstance(node, list | tuple):
-            for index, item in enumerate(node):
-                collect(item, (*path, str(index)), depth + 1)
-
-    collect(value, (), depth)
-    return {name: frozenset(paths) for name, paths in anchors.items()}
-
-
-def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[str, ...]]:
-    if not isinstance(value, dict):
-        return set()
-    refs: set[tuple[str, ...]] = set()
-    document_id = value.get("$id")
-    base_uri = document_id if isinstance(document_id, str) else ""
-    # `$dynamicAnchor` also declares an ordinary plain-name fragment, so a static `$ref` resolves
-    # to it as well. one map serves both keywords: splitting them let `{"$ref": "#Name"}` miss a
-    # `$dynamicAnchor: "Name"` target and persist its literals.
-    anchors = _schema_anchor_pointers(value, depth=depth)
-
-    def collect_refs(node: Any, node_depth: int) -> set[tuple[str, ...]]:
-        if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-            return set()
-        found: set[tuple[str, ...]] = set()
-        if isinstance(node, dict):
-            for keyword in ("$ref", "$dynamicRef"):
-                ref = node.get(keyword)
-                if isinstance(ref, str):
-                    found.update(_local_schema_pointer(ref, anchors, base_uri=base_uri))
-            for key, item in node.items():
-                if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
-                    found.update(collect_refs(item, node_depth + 1))
-        elif isinstance(node, list | tuple):
-            for item in node:
-                found.update(collect_refs(item, node_depth + 1))
-        return found
-
-    def collect_secret_properties(node: Any, node_depth: int) -> None:
-        if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-            return
-        if isinstance(node, dict):
-            properties = node.get("properties")
-            if isinstance(properties, dict):
-                for key, schema in properties.items():
-                    if _is_secret_key(key) and _is_schema_definition(schema):
-                        refs.update(collect_refs(schema, 0))
-                    collect_secret_properties(schema, node_depth + 1)
-            for key, item in node.items():
-                if key != "properties":
-                    collect_secret_properties(item, node_depth + 1)
-        elif isinstance(node, list | tuple):
-            for item in node:
-                collect_secret_properties(item, node_depth + 1)
-
-    def resolve(pointer: tuple[str, ...]) -> Any:
-        target: Any = value
-        for segment in pointer:
-            if isinstance(target, dict) and segment in target:
-                target = target[segment]
-            elif isinstance(target, list | tuple) and segment.isdigit():
-                index = int(segment)
-                if index >= len(target):
-                    return None
-                target = target[index]
-            else:
-                return None
-        return target
-
-    collect_secret_properties(value, depth)
-    pending = list(refs)
-    while pending:
-        target = resolve(pending.pop())
-        for pointer in collect_refs(target, 0):
-            if pointer not in refs:
-                refs.add(pointer)
-                pending.append(pointer)
-    return refs
-
-
-def _redact_secret_fields(
-    value: Any,
-    *,
-    depth: int = 0,
-    schema_property_map: bool = False,
-    secret_schema_definition: bool = False,
-    response_root: bool = False,
-    choice_list: bool = False,
-    choice: bool = False,
-    logprobs: bool = False,
-    logprob_entries: bool = False,
-    secret_schema_refs: set[tuple[str, ...]] | None = None,
-    schema_definition_path: tuple[str, ...] = (),
-) -> Any:
-    if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-        return "[redacted]"
-    if isinstance(value, dict):
-        local_secret_schema_refs = {
-            (*schema_definition_path, *pointer)
-            for pointer in _secret_schema_definition_refs(value, depth=depth)
-        }
-        active_secret_schema_refs = (secret_schema_refs or set()) | local_secret_schema_refs
-        secret_schema_definition = secret_schema_definition or (
-            schema_definition_path in active_secret_schema_refs
-        )
-        redacted: dict[Any, Any] = {}
-        for key, item in value.items():
-            schema_definition = schema_property_map and _is_schema_definition(item)
-            current_schema_path = (*schema_definition_path, str(key))
-            referenced_secret_definition = current_schema_path in active_secret_schema_refs
-            if secret_schema_definition and key in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
-                redacted[key] = _redact_schema_literal(item, depth=depth + 1)
-            elif _is_secret_key(key, allow_token=logprob_entries) and not schema_definition:
-                redacted[key] = "[redacted]"
-            else:
-                redacted[key] = _redact_secret_fields(
-                    item,
-                    depth=depth + 1,
-                    schema_property_map=(
-                        key in {"properties", "$defs", "definitions"} and isinstance(item, dict)
-                    ),
-                    secret_schema_definition=secret_schema_definition
-                    or (schema_definition and _is_secret_key(key))
-                    or referenced_secret_definition,
-                    response_root=False,
-                    choice_list=response_root and key == "choices" and isinstance(item, list),
-                    choice=choice_list,
-                    logprobs=choice and key == "logprobs" and isinstance(item, dict),
-                    logprob_entries=logprob_entries
-                    or (logprobs and key in {"content", "refusal", "top_logprobs"}),
-                    secret_schema_refs=active_secret_schema_refs,
-                    schema_definition_path=current_schema_path,
-                )
-        return redacted
-    if isinstance(value, list | tuple):
-        return [
-            _redact_secret_fields(
-                item,
-                depth=depth + 1,
-                schema_property_map=schema_property_map,
-                secret_schema_definition=(
-                    secret_schema_definition
-                    or (*schema_definition_path, str(index)) in (secret_schema_refs or set())
-                ),
-                choice=choice_list,
-                logprobs=logprobs,
-                logprob_entries=logprob_entries,
-                secret_schema_refs=secret_schema_refs,
-                schema_definition_path=(*schema_definition_path, str(index)),
-            )
-            for index, item in enumerate(value)
-        ]
-    return value
-
-
-def _redact_secret_string(value: str, secrets: tuple[str, ...]) -> str:
-    for secret in secrets:
-        if len(secret) >= _MIN_SECRET_SUBSTRING_LENGTH:
-            value = value.replace(secret, "[redacted]")
-    return value
-
-
-def _redact_secret_values(value: Any, secrets: tuple[str, ...], *, depth: int = 0) -> Any:
-    if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-        return "[redacted]"
-    if isinstance(value, dict):
-        # keys are redacted too. a credential used as an object key -- `{"sk-live-...": "seen"}` --
-        # is still the credential, and a key-blind pass would write it into the span verbatim and
-        # hand it back through `format=raw`.
-        return {
-            (_redact_secret_string(key, secrets) if isinstance(key, str) else key): (
-                _redact_secret_values(item, secrets, depth=depth + 1)
-            )
-            for key, item in value.items()
-        }
-    if isinstance(value, list | tuple):
-        return [_redact_secret_values(item, secrets, depth=depth + 1) for item in value]
-    if isinstance(value, str):
-        return _redact_secret_string(value, secrets)
-    return value
-
-
-def _sanitize_for_trace(value: Any, secrets: tuple[str, ...], *, response: bool = False) -> Any:
-    return _redact_secret_values(_redact_secret_fields(value, response_root=response), secrets)
 
 
 def _safe_provider_response_headers(
@@ -529,11 +185,26 @@ async def _record_trace(
         return
     try:
         duration_ms = max(0, round((time.perf_counter() - context.started_at) * 1000))
-        sanitized_output = _sanitize_for_trace(output_payload, context.secrets, response=True)
+        input_sanitization = _SanitizationFlag()
+        output_sanitization = _SanitizationFlag()
+        sanitized_output = _sanitize_for_trace(
+            output_payload, context.secrets, response=True, flag=output_sanitization
+        )
         sanitized_usage = _sanitize_for_trace(usage, context.secrets, response=True)
+        sanitized_input = _sanitize_for_trace(
+            context.body, context.secrets, flag=input_sanitization
+        )
         prompt_tokens, completion_tokens = _usage_tokens(
             sanitized_output if sanitized_output is not None else {"usage": sanitized_usage}
         )
+        truncated_sides = [
+            side
+            for side, truncated in (
+                ("input", input_sanitization.hit),
+                ("output", output_truncated or output_sanitization.hit),
+            )
+            if truncated
+        ]
         span = TraceSpan(
             name="chat.completions",
             provider=context.provider,
@@ -541,9 +212,9 @@ async def _record_trace(
             duration_ms=duration_ms,
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
-            input_payload=_sanitize_for_trace(context.body, context.secrets),
+            input_payload=sanitized_input,
             output_payload=sanitized_output,
-            attributes={"payload_truncated": ["output"]} if output_truncated else None,
+            attributes={"payload_truncated": truncated_sides} if truncated_sides else None,
             status_code="ERROR" if error else "OK",
             error=_sanitize_for_trace(error, context.secrets) if error else None,
         )
@@ -612,7 +283,7 @@ async def _stream_response(
         if _is_error_status(upstream_response.status_code)
         else MAX_PAYLOAD_TOTAL_BYTES
     )
-    done_gate = SseDoneGate() if context.record_trace and not raw_body else None
+    done_gate = SseDoneGate() if not raw_body else None
     error = _error_for_status(upstream_response.status_code)
     client_disconnected = False
     try:
