@@ -856,7 +856,6 @@ class Engine:
         # This adapter's own lock, so an undeploy cannot race its own in-flight load, and does not
         # block loads or generations for any OTHER adapter on this container.
         async with self._locks.setdefault(adapter_id, asyncio.Lock()):
-            self._loaded.pop(adapter_id, None)
             int_id = _lora_int_id(adapter_id)
             # Both the map entry and the eviction are conditional on THIS adapter owning the int
             # id, and they must stay that way together. vLLM addresses a LoRA only by the int, so
@@ -882,9 +881,18 @@ class Engine:
             # successful engine response while nothing is resident and the id is free for a
             # collider. Re-registration is an explicit request to serve this revision again, so a
             # record that is no longer disabled is exactly the signal to leave the GPU alone.
+            #
+            # Checked BEFORE `_loaded` is touched, which is the whole point of standing down. The
+            # pop used to run first, so the early return left the revived revision evicted from
+            # this replica's hot path while its record read `ready`: the next generate missed the
+            # cache and re-downloaded and re-`add_lora`d weights that were already resident. That
+            # is a milder version of the very race this guard exists to leave alone, so dropping
+            # the cache entry has to be part of the undeploy rather than something that happens on
+            # the way to deciding whether to undeploy at all.
             current = await adapter_records.get.aio(_record_key(adapter_id))
             if isinstance(current, dict) and current.get("status") != "disabled":
                 return {{"ok": True}}
+            self._loaded.pop(adapter_id, None)
             if await _owns_lora_int_id(int_id, adapter_id):
                 self._int_ids.pop(int_id, None)
                 # Drop it from vLLM too, not just from this dict. The LoRA cache is bounded by
@@ -1823,26 +1831,35 @@ def api():
             # invariant intact.
             async with _run_lock(run_id):
                 for revision_id in disabled_revisions:
+                    # The DOWNLOAD, not only the claim. The warm branch reclaims the disk as part
+                    # of `Engine.unregister`; skipping the engine skipped that too, so a cold
+                    # undeploy of a healthy run left its directory on the volume with nothing that
+                    # would ever revisit it. `reclaimable` is populated only from revisions that
+                    # were ALREADY disabled carrying a marker, and a revision this pass disables is
+                    # neither, so no later DELETE collects it either -- successful cold undeploys
+                    # grew paid storage without bound.
+                    #
+                    # Appended rather than deleted inline for the reason the deferred path exists:
+                    # `rmtree` is filesystem work, this loop holds the run lock, and the lock's
+                    # lease does not renew. The dispatch below already runs whether or not anything
+                    # is warm, is outside the lock, and re-checks the record before deleting, so
+                    # joining that list is the whole fix.
+                    #
+                    # OUTSIDE the suppress, and before the release rather than after it. Inside, a
+                    # transient Dict failure in `_release_lora_int_id` also skipped the append --
+                    # and since this path sets no `cache_reclaim_pending`, nothing else would ever
+                    # schedule that directory, which is exactly the leak the append closes. The two
+                    # are independent recoveries for one undeploy, so a failure in either must not
+                    # cancel the other. Scheduling a reclaim for a revision whose release failed is
+                    # harmless: `_discard_cached_adapter` re-reads the record and declines to
+                    # delete anything that is no longer disabled.
+                    if revision_id not in reclaimable:
+                        reclaimable.append(revision_id)
                     with contextlib.suppress(Exception):  # releasing is best effort, like eviction
                         current = await adapter_records.get.aio(_record_key(revision_id))
                         if isinstance(current, dict) and current.get("status") != "disabled":
                             continue  # revived under this lock's protection; its claim is not ours
                         await _release_lora_int_id(_lora_int_id(revision_id), revision_id)
-                        # And the DOWNLOAD, not only the claim. The warm branch reclaims the disk
-                        # as part of `Engine.unregister`; skipping the engine skipped that too, so
-                        # a cold undeploy of a healthy run left its directory on the volume with
-                        # nothing that would ever revisit it. `reclaimable` is populated only from
-                        # revisions that were ALREADY disabled carrying a marker, and a revision
-                        # this pass disables is neither, so no later DELETE collects it either --
-                        # successful cold undeploys grew paid storage without bound.
-                        #
-                        # Appended rather than deleted inline for the reason the deferred path
-                        # exists: `rmtree` is filesystem work, this loop holds the run lock, and
-                        # the lock's lease does not renew. The dispatch below already runs whether
-                        # or not anything is warm, is outside the lock, and re-checks the record
-                        # before deleting, so joining that list is the whole fix.
-                        if revision_id not in reclaimable:
-                            reclaimable.append(revision_id)
         # The deferred reclaims, run whether or not anything is warm. Unlike eviction, this has no
         # cheaper time to happen: undeploy is the last event in the run's life, so skipping here
         # leaves the directory on the volume for good. It is also bounded -- one `rmtree` per

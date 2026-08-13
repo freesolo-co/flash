@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -1549,6 +1550,61 @@ def test_a_cold_undeploy_reclaims_the_download_it_disabled(client):
     )
 
 
+def test_a_cold_reclaim_is_scheduled_even_when_the_claim_release_fails(client, monkeypatch):
+    """The claim and the disk are independent recoveries; one failing must not cancel the other.
+
+    Both live in the cold branch and the release is best effort, so putting the reclaim inside the
+    release's `suppress` made a transient Dict error skip the download too. This path sets no
+    `cache_reclaim_pending`, so nothing else would ever schedule that directory -- the leak the
+    append was added to close, reintroduced through the error path.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    module.runners.count = 0
+    module.discarded.clear()
+    module.adapter_records[module._lora_id_key(module._lora_int_id(REVISION))] = REVISION
+
+    async def _fails(int_id, adapter_id):
+        raise RuntimeError("dict unavailable")
+
+    monkeypatch.setattr(module, "_release_lora_int_id", _fails)
+
+    assert client.delete(f"/adapters/{RUN_ID}").status_code == 200
+    assert REVISION in module.discarded, (
+        "a failed claim release also skipped the download reclaim, so the directory stays on the "
+        "volume with nothing that would ever collect it"
+    )
+
+
+def test_a_revived_revision_keeps_its_files_even_once_a_reclaim_is_scheduled(
+    client, monkeypatch, tmp_path
+):
+    """Scheduling a reclaim is safe for a revision that comes back, because the delete re-checks.
+
+    The cold branch appends before it knows whether the revision is still disabled, so a revision
+    revived in the gap can reach `reclaim_adapter_cache`. That must not delete weights a live load
+    is using: `_discard_cached_adapter` re-reads the durable record and only deletes what is still
+    disabled. This pins that, since the append now runs unconditionally.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
+    directory = Path(module.ADAPTER_DIR) / module._adapter_digest(REVISION)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "adapter_model.safetensors").write_bytes(b"weights")
+    # Revived: the record reads `ready` by the time the deferred reclaim runs.
+    module.adapter_records[module._record_key(REVISION)]["status"] = "ready"
+
+    # `_discard_cached_adapter` directly: it is the boundary that decides, and the fixture wraps it
+    # for recording, so this is the same call `reclaim_adapter_cache` makes.
+    _run_awaitable(module._discard_cached_adapter(REVISION))
+
+    assert directory.exists(), (
+        "a scheduled reclaim deleted the download of a revision that had been re-registered, so a "
+        "live load loses its weights and fails at the next cold start"
+    )
+
+
 def test_undeploy_still_evicts_from_a_warm_engine(client):
     """The skip above must not become "never evict".
 
@@ -1608,6 +1664,10 @@ def test_a_warm_eviction_stands_down_for_a_revision_that_was_re_registered(clien
     assert dict.get(module.adapter_records, module._lora_id_key(int_id)) == REVISION, (
         "the stale undeploy released the claim the new settle had already verified, so a colliding "
         "revision can take the int id while this one still reads `ready`"
+    )
+    assert REVISION in instance._loaded, (
+        "standing down still dropped the adapter from `_loaded`, so this replica misses its hot "
+        "path and re-downloads weights it already has resident while the record reads `ready`"
     )
 
 
