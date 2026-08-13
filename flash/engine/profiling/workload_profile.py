@@ -161,25 +161,53 @@ def reasoning_marker_prefix(text: str) -> str:
     return prefix
 
 
+def _reasoning_body_offset(text: str) -> int | None:
+    """Where this turn's reasoning BODY starts, by the template's own rule.
+
+    The template takes the reasoning as the text after the LAST ``<think>`` that precedes the first
+    ``</think>``, over the whole concatenated message text. Stamping the first opener instead puts
+    the marker outside the block the template keeps whenever an extra opener precedes the real one,
+    and the marker then never reaches the render -- reporting a drop for reasoning that survived.
+    """
+    close = text.find("</think>")
+    if close < 0:
+        return None
+    open_at = text.rfind("<think>", 0, close)
+    return None if open_at < 0 else open_at + len("<think>")
+
+
 def _marked_inline_reasoning(content: object, marker: str) -> object:
-    """``content`` with ``marker`` placed just inside its first ``<think>`` opener."""
+    """``content`` with ``marker`` placed at the start of the reasoning the template will keep."""
     if isinstance(content, str):
-        return content.replace("<think>", f"<think>{marker}", 1)
+        offset = _reasoning_body_offset(content)
+        return content if offset is None else content[:offset] + marker + content[offset:]
     if not isinstance(content, list):
         return content
+    # the template concatenates the text blocks before splitting, so the delimiters are found on the
+    # joined text and can straddle a block boundary. the offset is resolved there and then mapped
+    # back into whichever block contains it.
+    texts = [
+        block["text"]
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+        else None
+        for block in content
+    ]
+    offset = _reasoning_body_offset("".join(text or "" for text in texts))
+    if offset is None:
+        return content
     marked: list = []
+    consumed = 0
     placed = False
-    for block in content:
-        if (
-            not placed
-            and isinstance(block, dict)
-            and block.get("type") == "text"
-            and isinstance(block.get("text"), str)
-            and "<think>" in block["text"]
-        ):
-            marked.append(
-                {**block, "text": block["text"].replace("<think>", f"<think>{marker}", 1)}
-            )
+    for block, text in zip(content, texts, strict=True):
+        if text is None or placed:
+            marked.append(block)
+            continue
+        local = offset - consumed
+        consumed += len(text)
+        if 0 <= local <= len(text):
+            marked.append({**block, "text": text[:local] + marker + text[local:]})
             placed = True
         else:
             marked.append(block)

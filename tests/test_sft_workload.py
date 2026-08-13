@@ -1022,6 +1022,36 @@ def test_an_earlier_surviving_block_is_not_reported_lost_when_a_later_one_is_tru
     assert "dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("label", "content"),
+    [
+        # an extra opener before the real block: the template takes the LAST <think> before the
+        # first </think>, so stamping the first one puts the marker outside the kept span
+        ("extra opener", "<think>outer <think>real reasoning</think>a"),
+        # the template concatenates text blocks before splitting, so a delimiter can straddle a
+        # block boundary and exists in neither block on its own
+        (
+            "split delimiter",
+            [{"type": "text", "text": "<thi"}, {"type": "text", "text": "nk>r</think>a"}],
+        ),
+    ],
+)
+def test_reasoning_the_template_keeps_is_marked_wherever_its_delimiters_sit(
+    label: str, content, capsys
+) -> None:
+    """The marker must land inside the block the template keeps, not merely near a ``<think>``.
+
+    If it lands outside, the marker never reaches the render, and the row reports a drop for
+    reasoning that in fact reached the loss -- a false warning telling the user to restructure a
+    dataset that was fine.
+    """
+    prepared = _thinking_prepared([{"role": "assistant", "content": content}])
+
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 1, label
+    assert "authored reasoning blocks" not in capsys.readouterr().err
+
+
 def test_a_quoting_answer_on_a_dropped_turn_is_not_credited_as_a_survivor(capsys) -> None:
     """A turn whose reasoning the template dropped stays dropped, however its answer is written.
 
