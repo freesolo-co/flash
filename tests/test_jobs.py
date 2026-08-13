@@ -751,6 +751,25 @@ def test_queued_line_explains_the_larger_budget_without_claiming_a_pin(monkeypat
     assert not any("escalation" in ln for ln in not_last), not_last
 
 
+def test_queued_line_reports_the_deadline_that_will_actually_fire(monkeypatch):
+    # Several graces govern a queued job and they are NOT the same length. An unhealthy worker is
+    # killed by unhealthy_grace_s (240s, which stall_kwargs never widens), so quoting the 900s
+    # capacity grace would tell the operator they have many minutes left immediately before the
+    # poll fails as `stalled` -- the same false-reassurance defect this whole change exists to fix.
+    res, lines = _queued_forever_log(
+        monkeypatch, lambda eid, _fp, **_kw: {"workers": {"unhealthy": 1}}
+    )
+    assert res.failure == "stalled", res
+    queued = [ln for ln in lines if "queued; workers:" in ln]
+    assert queued, lines
+    counted = [ln for ln in queued if "waited " in ln]
+    assert counted, queued
+    # the binding timer is named, and the longer one it is NOT waiting on is never quoted.
+    assert all("unhealthy grace" in ln for ln in counted), counted
+    assert not any("capacity grace" in ln for ln in counted), counted
+    assert not any("900s" in ln for ln in counted), counted
+
+
 def test_queued_line_omits_a_capacity_countdown_while_a_worker_is_coming_up(monkeypatch):
     # A worker that is initializing is governed by the much larger setup grace, not the capacity
     # timer -- which is why the timer is not armed here. Printing a capacity countdown anyway would

@@ -495,19 +495,22 @@ def _classify_queue_state(
         state.worker_coming_up_at = now if (usable or recovering) else None
         if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
             # name the budget this wait is spending, so a queued line separates "still inside its
-            # grace" from "wedged". only a starved wait has a countdown to report: a worker that is
-            # coming up is governed by the much larger setup grace instead. gate on
-            # `usable or recovering` -- the same evidence that clears the timer two lines above --
-            # and not on the timer's `since`, which is still armed from the classify pass that ran
-            # BEFORE this health read, so a normal cold start would advertise a capacity deadline
-            # that evaporates one poll later.
+            # grace" from "wedged". a worker that is coming up is governed by the much larger setup
+            # grace and has no countdown to report -- gate on `usable or recovering`, the same
+            # evidence that clears the timer two lines above, rather than on the timers' `since`,
+            # which is still armed from the classify pass that ran BEFORE this health read.
             budget = ""
-            if state.queued_timer.since is not None and not (usable or recovering):
-                budget = "; " + _jobs.queue_wait_note(
-                    now - state.queued_timer.since,
+            if not (usable or recovering):
+                note = _jobs.queue_wait_note(
+                    bool(workers.get("unhealthy")),
+                    state.unhealthy_timer.since,
+                    state.queued_timer.since,
+                    now,
+                    context.unhealthy_grace_s,
                     context.queue_grace_s,
                     context.on_last_gpu,
                 )
+                budget = f"; {note}" if note else ""
             context.say(f"queued; workers: {workers}{budget}")
         if state.unhealthy_timer.expired(
             workers.get("unhealthy") and not usable and not recovering,
