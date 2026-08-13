@@ -4643,6 +4643,30 @@ def test_bridge_step_stops_before_asking_a_finished_env_for_a_reply():
     }
 
 
+def test_an_env_hook_that_raises_still_releases_the_parent_busy_mark():
+    """A leaked busy mark is worse than a missing one: it disarms the watchdog permanently.
+
+    User env code raising is ordinary -- a tool call 500s, a parse error on a malformed action. If
+    the guard released only on the success path, that one raise would pin the parent "busy" for the
+    rest of the run, silence would reset on every tick, and no wedge could ever be named again.
+    """
+    observability = RewardObservabilityBuffer()
+
+    class ExplodingEnv(_BridgeEnv):
+        def env_reply(self, messages, state):
+            raise ValueError("the user's tool call blew up")
+
+    bridge = _bridge(ExplodingEnv(done_after=99), grading=observability.grading)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="blew up"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+    assert not observability.reward_grading_in_flight(), (
+        "a raising env hook leaked the busy mark; the parent would report busy forever and the "
+        "silence watchdog could never name another wedge"
+    )
+
+
 def test_bridge_step_on_an_unknown_session_raises_rather_than_scoring_a_blank_episode():
     with pytest.raises(KeyError, match="unknown multi-turn session"):
         _bridge(_BridgeEnv()).step({"session_id": "ghost", "completion_text": "x"})
