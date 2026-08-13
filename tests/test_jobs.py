@@ -825,6 +825,18 @@ def test_queued_line_reports_the_no_progress_limit_when_it_is_the_nearest():
     assert "capacity grace" in not_binding, not_binding
 
 
+def test_capacity_is_still_reported_in_the_window_where_its_timer_is_rearming():
+    # _classify_queue_state clears queued_timer.since using the PREVIOUS probe's still-recent worker
+    # sighting, one step before the fresh probe finds no worker at all. The caller only asks for a
+    # note once it has confirmed no usable or recovering worker, so a cleared timer there means zero
+    # elapsed, not "not applicable" -- it re-arms next poll. Dropping the candidate would quote the
+    # 3000s no-progress limit while the 300s capacity grace is what actually ends the run.
+    rearming = _note(100.0, queued_since=None, queue_grace_s=300.0, stall_limit_s=3000.0)
+    assert "capacity grace" in rearming, rearming
+    assert "waited 0s of 300s" in rearming, rearming
+    assert "no-progress" not in rearming, rearming
+
+
 def test_longer_capacity_explanation_is_gated_on_the_grace_actually_in_force():
     # poll_job exposes on_last_gpu and queue_grace_s independently and never ties the flag to
     # LAST_GPU_CAPACITY_GRACE_S, so a caller can set on_last_gpu while overriding the grace DOWN.

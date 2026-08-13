@@ -352,21 +352,26 @@ def queue_wait_note(
     if throttled:
         waited = 0.0 if throttled_since is None else now - throttled_since
         candidates.append((throttled_grace_s - waited, waited, throttled_grace_s, "throttled", ""))
-    if queued_since is not None:
-        waited = now - queued_since
-        # the escalation fact ONLY, like `capacity_escalation_note`: on_last_gpu is also true when
-        # the infra retry budget is exhausted with GPU classes still untried, so it must never be
-        # reported as "this GPU class is pinned". derive "is given longer" from the grace ACTUALLY
-        # in force, not from the flag: poll_job exposes on_last_gpu and queue_grace_s independently
-        # and never ties them, so a caller can set the flag while overriding the grace down.
-        clause = (
-            " (no further GPU-class escalation follows, so capacity is given longer)"
-            if on_last_gpu and queue_grace_s > 300.0
-            else " (no further GPU-class escalation follows)"
-            if on_last_gpu
-            else ""
-        )
-        candidates.append((queue_grace_s - waited, waited, queue_grace_s, "capacity", clause))
+    # the caller only asks for a note when it has just confirmed no usable or recovering worker, so
+    # the capacity timer is either running or about to re-arm on the next poll. a cleared `since`
+    # therefore means zero elapsed, not "not applicable": _classify_queue_state clears it via the
+    # PREVIOUS probe's still-recent worker sighting, one step before the fresh probe below finds no
+    # worker at all. dropping the candidate there would quote the 3000s no-progress limit while the
+    # 300s capacity grace is what actually terminates the run.
+    waited = 0.0 if queued_since is None else now - queued_since
+    # the escalation fact ONLY, like `capacity_escalation_note`: on_last_gpu is also true when the
+    # infra retry budget is exhausted with GPU classes still untried, so it must never be reported
+    # as "this GPU class is pinned". derive "is given longer" from the grace ACTUALLY in force, not
+    # from the flag: poll_job exposes on_last_gpu and queue_grace_s independently and never ties
+    # them, so a caller can set the flag while overriding the grace down.
+    clause = (
+        " (no further GPU-class escalation follows, so capacity is given longer)"
+        if on_last_gpu and queue_grace_s > 300.0
+        else " (no further GPU-class escalation follows)"
+        if on_last_gpu
+        else ""
+    )
+    candidates.append((queue_grace_s - waited, waited, queue_grace_s, "capacity", clause))
     # the no-progress limit, checked one call after the queue classifier in the same iteration.
     # setup_grace_s normally dwarfs the queue graces, but poll_job accepts both independently, so a
     # short stall_after_s can be the real deadline while the capacity grace is still wide open.
