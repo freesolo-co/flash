@@ -769,7 +769,14 @@ class _SftProgressCallbacks:
         self.progress.step_clock.note_if_blocked(time.time() - started)
 
     def step_timing_fields(self) -> dict[str, float | bool]:
-        """Steady-state step timing for one heartbeat; empty until a whole step has been measured."""
+        """Steady-state step timing for one heartbeat; empty until a whole step has been measured.
+
+        Read by three publishers, all for the same reason: an upload REPLACES the published snapshot
+        rather than merging into it. The liveness daemon and the child ping share this stage's
+        throttled slot, and the checkpoint heartbeat is unthrottled while arming that same throttle.
+        A publisher that omitted these fields would blank a measured pace off live status, reading
+        as the measurement having been lost rather than simply not re-sent.
+        """
         return step_timing.step_timing_fields(
             self.progress.step_clock,
             current_step=int(self.progress.values["step"] or 0),

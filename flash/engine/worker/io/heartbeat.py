@@ -15,6 +15,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from flash.engine.result.rollout_samples import (
@@ -66,6 +67,41 @@ _HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAG
 # latest per-step GRPO backlog, exposed so a top-level error heartbeat can preserve it
 # for `flash runs log -f` when a short run raises before the throttled rl_step ping committed
 LATEST_GRPO_METRICS_LAST: list = []
+# the running trainer's step-timing fields, read by heartbeats that are not themselves step pings.
+# an upload REPLACES the published snapshot, and `checkpoint_uploaded` is unthrottled while it arms
+# the 900s throttle the step stages share -- so a save that published no timing would blank the
+# measured pace off live status and block every ping that could restore it until the throttle opens.
+# a callable rather than a copied dict so the value is current at emission, not at registration.
+LATEST_STEP_TIMING_FIELDS: list = []
+
+
+def step_timing_fields_now() -> dict:
+    """Whatever the trainer's clock currently reports, or {} when nothing is registered/measured."""
+    if not LATEST_STEP_TIMING_FIELDS:
+        return {}
+    try:
+        fields = LATEST_STEP_TIMING_FIELDS[-1]()
+    except Exception:
+        # never let an observability read break a checkpoint upload.
+        return {}
+    return fields if isinstance(fields, dict) else {}
+
+
+@contextlib.contextmanager
+def publishing_step_timing(fields: Callable[[], dict]):
+    """Let non-step heartbeats read this trainer's step timing for the duration of the block.
+
+    Scoped rather than set once: a worker runs one training job, but leaving a dead trainer's clock
+    registered would let a later stage publish a pace nothing is measuring any more.
+    """
+    LATEST_STEP_TIMING_FIELDS.append(fields)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(ValueError):
+            LATEST_STEP_TIMING_FIELDS.remove(fields)
+
+
 # throttle these stages to protect the hf repository commit budget; terminal transitions are never throttled.
 # opd_filtering_prompts emits a real heartbeat on each scan tick, while opd_prompt_scan and
 # opd_image_prep emit one when progress advances. opd_finalizing emits one on every keepalive tick.

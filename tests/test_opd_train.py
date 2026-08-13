@@ -5288,6 +5288,7 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
         on_line=lambda _line: None,
         child_heartbeat=lambda: None,
         liveness_fields=dict,
+        step_timing_fields=dict,
         child_tail=None,
         wandb_link={"wandb_url": None, "wandb_id": None},
     )

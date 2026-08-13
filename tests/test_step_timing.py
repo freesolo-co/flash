@@ -181,12 +181,50 @@ def test_a_spurious_step_number_does_not_suppress_every_later_step():
     assert clock.intervals() == [92.0, 92.0, 92.0, 92.0]
     assert clock.step_seconds() == 92.0
 
-    # a resumed run replaying its resume step is still excluded: that repeat is immediate.
+    # a resumed run replaying its resume step is still excluded: that repeat is immediate. the
+    # replay's own arrival becomes the baseline, so step 6 measures 142-50 and not 142-0 -- merely
+    # dropping the repeat would leave the stale timestamp and charge step 6 for the replay too.
     resumed = step_timing.StepClock()
     resumed.record(0.0, 5)
     resumed.record(50.0, 5)
     resumed.record(142.0, 6)
-    assert resumed.intervals() == [142.0]
+    assert resumed.intervals() == [92.0]
+
+
+def test_a_reprint_becomes_the_baseline_for_the_step_after_it():
+    """Dropping a repeat is not enough -- the NEXT step must not be charged for it either.
+
+    Discarding the repeat and keeping the earlier timestamp leaves the following interval spanning
+    the whole replay: the pre-repeat line to the next real step. The repeat's own arrival is when
+    that step actually began, so it becomes the baseline instead.
+    """
+    resumed = step_timing.StepClock()
+    resumed.record(0.0, 5)
+    resumed.record(50.0, 5)  # the replay: 50s of resume init, no optimizer update
+    resumed.record(142.0, 6)
+    assert resumed.intervals() == [92.0]  # 142-50, not 142-0
+
+    # a mid-run validation reprint behaves the same, and the steps around it stay measurable.
+    validated = step_timing.StepClock()
+    for arrival, step in ((0.0, 1), (92.0, 2), (140.0, 2), (232.0, 3), (324.0, 4)):
+        validated.record(arrival, step)
+    assert validated.intervals() == [92.0, 92.0, 92.0]
+    assert validated.step_seconds() == 92.0
+
+
+def test_blocking_work_leaves_no_baseline_the_way_a_reprint_does():
+    """The two breaks are not the same, and only one carries a timestamp forward.
+
+    A reprint marks a boundary the next step starts from. Blocking work does not: the step was
+    already running while we blocked, so no timestamp in that span bounds it and seeding one would
+    invent a start time. The span is simply dropped.
+    """
+    clock = step_timing.StepClock()
+    clock.record(0.0, 0)
+    clock.note_blocking_work()
+    clock.record(300.0, 1)  # 92s of step plus a slow upload
+    clock.record(392.0, 2)
+    assert clock.intervals() == [92.0]  # only the clean span, no 300.0 and no invented start
 
 
 def test_a_span_containing_blocking_work_is_not_timed():
@@ -411,3 +449,75 @@ def test_a_superseded_attempts_pace_is_not_shown_as_this_runs():
 
     live = {**status, "last_heartbeat": {**status["last_heartbeat"], "attempt": 2}}
     assert "pace" in dict(_heartbeat_pairs(live))
+
+
+def test_the_checkpoint_heartbeat_carries_the_pace_it_would_otherwise_blank():
+    """A save must not erase the measured pace from live status.
+
+    An upload REPLACES the published snapshot, and ``checkpoint_uploaded`` is unthrottled while
+    arming the 900s throttle the step stages share. Publishing it without timing would blank the
+    pace and then block every ping that could restore it, for up to the throttle interval after
+    every save -- on exactly the long runs this measurement exists for.
+    """
+    from flash.engine.worker.io import heartbeat as worker_heartbeat
+
+    assert worker_heartbeat.step_timing_fields_now() == {}
+    measured = {"step_duration_s": 92.0, "projected_remaining_s": 17204.0}
+    with worker_heartbeat.publishing_step_timing(lambda: measured):
+        assert worker_heartbeat.step_timing_fields_now() == measured
+    # scoped: a finished trainer's clock must not keep answering for a later stage.
+    assert worker_heartbeat.step_timing_fields_now() == {}
+    assert worker_heartbeat.LATEST_STEP_TIMING_FIELDS == []
+
+
+def test_an_observability_read_never_breaks_a_checkpoint_upload():
+    """This runs inside the upload's success path, so it fails closed to no fields.
+
+    A checkpoint that uploaded correctly must not be reported as failed because a pace could not be
+    read, and a malformed value must not be splatted into the heartbeat payload.
+    """
+    from flash.engine.worker.io import heartbeat as worker_heartbeat
+
+    def raises() -> dict:
+        raise RuntimeError("clock exploded")
+
+    with worker_heartbeat.publishing_step_timing(raises):
+        assert worker_heartbeat.step_timing_fields_now() == {}
+
+    with worker_heartbeat.publishing_step_timing(lambda: "not a dict"):
+        assert worker_heartbeat.step_timing_fields_now() == {}
+
+    assert worker_heartbeat.LATEST_STEP_TIMING_FIELDS == []
+
+
+def test_the_upload_actually_sends_the_pace_on_the_checkpoint_ping(monkeypatch, tmp_path):
+    """The wiring, driven through the real upload rather than the registry alone.
+
+    ``upload_resume_checkpoint`` is where the blanking would happen, so a test of the registry in
+    isolation would still pass with the call site publishing nothing.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker.io import heartbeat as worker_heartbeat
+    from flash.engine.worker.io import hf as worker_hf
+
+    sent: list[tuple[str, dict]] = []
+
+    class Api:
+        def upload_folder(self, **_kwargs):
+            return None
+
+        def list_repo_files(self, **_kwargs):
+            return []
+
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker, "heartbeat", lambda stage, **kw: sent.append((stage, kw)))
+
+    measured = {"step_duration_s": 92.0, "projected_remaining_s": 17204.0}
+    with worker_heartbeat.publishing_step_timing(lambda: measured):
+        assert worker_hf.upload_resume_checkpoint(4, str(tmp_path))
+
+    uploaded = [kw for stage, kw in sent if stage == "checkpoint_uploaded"]
+    assert uploaded, [stage for stage, _ in sent]
+    assert uploaded[0]["step_duration_s"] == 92.0
+    assert uploaded[0]["projected_remaining_s"] == 17204.0

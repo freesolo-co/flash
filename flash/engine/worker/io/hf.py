@@ -487,6 +487,7 @@ def upload_resume_checkpoint(
         return True
 
     from flash.engine.worker.io.heartbeat import liveness_heartbeat
+    from flash.engine.worker.io.heartbeat import step_timing_fields_now as _step_timing_fields_now
 
     before_completed = before_upload is None
     resume_completed = False
@@ -531,7 +532,11 @@ def upload_resume_checkpoint(
                         after_completed = True
                     if emit_heartbeat:
                         failure_stage = "heartbeat"
-                        _w.heartbeat("checkpoint_uploaded", step=step)
+                        # carries the step timing because this ping is unthrottled AND arms the
+                        # throttle the step stages share: publishing it without them would blank the
+                        # measured pace off live status for up to the throttle interval after every
+                        # save, exactly when a long run is most worth watching.
+                        _w.heartbeat("checkpoint_uploaded", step=step, **_step_timing_fields_now())
                     return True
                 except RequiredSaveError:
                     raise

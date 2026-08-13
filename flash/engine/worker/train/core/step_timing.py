@@ -85,6 +85,8 @@ class StepClock:
         self._segments: list[list[float]] = []
         self._last_step: int | None = None
         self._break_after_last = False
+        # a reprint's own arrival, held as the start of the next segment (see record).
+        self._pending_baseline: float | None = None
 
     def note_blocking_work(self) -> None:
         """Declare that the caller is about to block, so the span in progress is not a step.
@@ -120,11 +122,16 @@ class StepClock:
     def record(self, now: float, step: int | None = None) -> None:
         """Note that a step line for ``step`` arrived at ``now``.
 
-        A repeated step number is ignored rather than timed. verl reprints a step on a validation
-        pass and a resumed run replays its resume step -- ``append_step_metrics`` dedupes exactly
-        these repeats for the metrics backlog -- and no optimizer update happened between the two
-        lines. Timing them would measure the validation pass or the resume init and publish it as
-        the cost of a step, which is the same class of error as counting warmup.
+        A repeated step number closes the segment instead of extending it. verl reprints a step on a
+        validation pass and a resumed run replays its resume step -- ``append_step_metrics`` dedupes
+        exactly these repeats for the metrics backlog -- and no optimizer update happened between the
+        two lines. Timing that span would measure the validation pass or the resume init and publish
+        it as the cost of a step, which is the same class of error as counting warmup.
+
+        The repeat's OWN timestamp becomes the baseline for the step that follows. Merely discarding
+        it would leave the pre-repeat timestamp in place, so the next real step's interval would
+        still swallow the whole replay: a resume printing step 5 at t=0 and again at t=50, then step
+        6 at t=142, must measure 92s for step 6 and not 142s.
 
         Only an IMMEDIATE repeat is skipped, not every non-advancing number. The step patterns these
         callers scan with differ -- SFT and OPD use ``run_verl_training``'s looser ``step:\\s*(\\d+)``,
@@ -138,14 +145,22 @@ class StepClock:
         """
         if step is not None:
             if self._last_step is not None and int(step) == self._last_step:
+                # the span up to here is not a step, but this timestamp is where the next one starts.
+                self._break_after_last = True
+                self._pending_baseline = float(now)
                 return
             self._last_step = int(step)
         if self._break_after_last and self._times:
-            # this line closes a span that contained blocking work, so it opens a new segment
-            # instead of extending the current one -- the span itself is never an interval.
+            # this line closes a span that is not a step -- it held blocking work, or a reprint --
+            # so it opens a new segment instead of extending the current one.
             self._segments.append(self._times)
-            self._times = []
+            # a reprint leaves a baseline: the repeat's own arrival is when the next step began, so
+            # the new segment starts there rather than discarding it and measuring from this line
+            # back to before the repeat. blocking work leaves none, because the step was already
+            # running while we blocked and no timestamp in that span bounds it.
+            self._times = [self._pending_baseline] if self._pending_baseline is not None else []
         self._break_after_last = False
+        self._pending_baseline = None
         self._times.append(float(now))
         self._trim()
 

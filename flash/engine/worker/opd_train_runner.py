@@ -89,6 +89,9 @@ class _ChildCallbacks:
     on_step: Any
     child_heartbeat: Any
     liveness_fields: Any
+    # timing alone, without the stall-tail fields liveness_fields adds: the checkpoint heartbeat
+    # wants the pace it would otherwise blank, not this stage's liveness diagnostics.
+    step_timing_fields: Any
     progress: dict[str, Any]
     wandb_link: dict[str, str | None]
     child_tail: Any
@@ -674,6 +677,7 @@ def _build_child_callbacks(
         on_step,
         child_heartbeat,
         liveness_fields,
+        step_timing_fields,
         progress,
         wandb_link,
         child_tail,
@@ -708,11 +712,16 @@ def _run_child(
     try:
         if runtime.resume_step < workload.update_horizon:
             progress_state.start_training()
-            with _opd_train.liveness_heartbeat(
-                "opd_step",
-                progress=lambda: int(callbacks.progress["step"] or 0),
-                progress_step=True,
-                fields=callbacks.liveness_fields,
+            with (
+                # also read by the checkpoint heartbeat, which is unthrottled and arms the throttle
+                # this stage shares -- see publishing_step_timing.
+                _opd_train.publishing_step_timing(callbacks.step_timing_fields),
+                _opd_train.liveness_heartbeat(
+                    "opd_step",
+                    progress=lambda: int(callbacks.progress["step"] or 0),
+                    progress_step=True,
+                    fields=callbacks.liveness_fields,
+                ),
             ):
                 return_code = _opd_train.run_verl_training(
                     command,
