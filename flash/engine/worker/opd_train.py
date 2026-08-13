@@ -159,7 +159,11 @@ class _OpdProgressState:
             truncation_rate = (
                 min(1.0, max(0.0, d_truncated / d_samples_seen)) if d_samples_seen > 0 else 0.0
             )
-            discarded_rollouts = max(0, d_truncated)
+            # bound by this step's own sample delta for the same reason the rate clamps to 1.0: an
+            # in-flight snapshot can read truncated_rollouts and samples_seen from different steps,
+            # and an unbounded count would report more discards than the step drew and steal the
+            # next step's truncations.
+            discarded_rollouts = max(0, min(d_truncated, d_samples_seen))
             # the per-step values are returned for the heartbeat and deliberately kept OUT of the
             # snapshot: this dict is spread verbatim into the persisted opd_state.json resume
             # contract, whose schema is fail-closed and holds cumulative counters. per-step display

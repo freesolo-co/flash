@@ -2916,7 +2916,9 @@ def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
     )
 
     assert [high_rate, low_rate] == pytest.approx([1.0, 0.0])
-    assert [high_discarded, low_discarded] == [8, 0]
+    # the count is bounded by the step's own sample delta (8 -> 12 is 4 samples), so a split
+    # snapshot reporting 8 truncations cannot attribute more discards than the step drew.
+    assert [high_discarded, low_discarded] == [4, 0]
 
 
 def test_opd_failure_accounting_defaults_optional_no_signal_counter():

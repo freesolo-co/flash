@@ -1079,8 +1079,9 @@ in a sensible value, so only override with a reason.
 For thinking models, each turn's `max_completion_tokens` is shared between `<think>` reasoning and
 its final answer or action, so undersizing it can truncate the action and teach the model to stop
 reasoning. In multi-turn runs, also size `max_context_tokens` for the accumulated transcript or later
-turns can run out of context. Watch `truncation_rate` and `discarded_rollouts`; truncation counts model
-turns not ending in EOS or a configured stop and is not strictly `finish_reason=length`.
+turns can run out of context. Watch `truncation_rate`; truncation counts model turns not ending in
+EOS or a configured stop and is not strictly `finish_reason=length`. OPD runs also report a
+per-step `discarded_rollouts` count alongside that rate.
 
 > **On a derived horizon, `prompts_per_step` buys optimizer steps cheaply.** `prompts_per_step`
 > overrides the tuned prompts-per-step. Total generated tokens are
