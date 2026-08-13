@@ -9,6 +9,7 @@ Split out of `flash.engine.worker.backend_common` to keep that module under the 
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -18,6 +19,24 @@ import subprocess
 
 class MergeDiskHeadroomError(RuntimeError):
     """the merged model this export must write does not fit beside the checkpoint it reads."""
+
+
+class MergeDiskExhaustedError(RuntimeError):
+    """the merge started with room and then ran the disk out partway through writing its output."""
+
+
+# free bytes below which the filesystem the merge was writing to counts as exhausted. the merger
+# needs gigabytes and stops the instant it cannot get another block, so a genuine ENOSPC leaves
+# essentially nothing; a merge that died of something else partway through leaves far more than
+# this. deliberately an absolute floor rather than a fraction of the requirement: the partially
+# written merge tree is still on the disk when this is sampled, so anything proportional to the
+# expected output would read a normal 90%-complete failure as exhaustion.
+_MERGE_DISK_EXHAUSTED_FREE_BYTES = 64 * 1024 * 1024
+
+# ENOSPC as it reaches this process in text form. the merger is a subprocess, so its safetensors
+# and torch errors arrive as printed output rather than as exceptions -- but a failure raised in
+# THIS process (an os.replace of the merged files, say) still carries the string or the errno.
+_ENOSPC_MARKERS = ("no space left on device", "errno 28", "os error 28")
 
 
 def _model_shard_bytes(path: str) -> int:
@@ -92,8 +111,82 @@ def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
     raise MergeDiskHeadroomError(
         f"cannot export the adapter: merging {ckpt_actor_dir} needs about "
         f"{need / 1e9:.1f} GB beside it but only {free / 1e9:.1f} GB is free. "
-        "raise [gpu] disk_gb, or save fewer checkpoints with a larger save_every."
+        # deliberately does NOT suggest raising [gpu] disk_gb: that key is in MANAGED_GPU_KEYS
+        # (flash/core/spec.py), so the public schema rejects it with "unknown key(s): disk_gb" and
+        # anyone following that advice just loses time. disk is sized by the runner from the
+        # model's catalog min_disk_gb. save_every is the only lever a config can actually reach.
+        "save fewer checkpoints with a larger train.save_every (save_every == the run's total "
+        "steps publishes only the final adapter)."
     )
+
+
+def _free_bytes(path: str) -> int | None:
+    """free bytes on the filesystem holding ``path``, or none when it cannot be read."""
+    try:
+        return shutil.disk_usage(os.path.dirname(path.rstrip("/")) or ".").free
+    except OSError:
+        return None
+
+
+def _enospc_error(error: BaseException) -> bool:
+    """whether ``error`` (or anything it wraps) is a full disk reported in this process."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno == errno.ENOSPC:
+            return True
+        # safetensors' SafetensorError is not an OSError and carries no errno: it renders the
+        # underlying failure only in its message ("I/O error: No space left on device (os error
+        # 28)"), so the text is the sole evidence for that writer.
+        if any(marker in str(current).lower() for marker in _ENOSPC_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def raise_for_merge_disk_exhaustion(
+    error: BaseException, ckpt_actor_dir: str, merge_out: str
+) -> None:
+    """Re-raise a merge failure as a disk-exhaustion error when a full disk is what killed it.
+
+    A merge that runs the disk out does not report itself as one. `verl.model_merger` writes the
+    full base model through safetensors, and when the volume fills the failure surfaces as whichever
+    writer noticed first -- most often `torch.save`, whose message is
+    `unexpected pos <N> vs <N-112>`. That reads as a corrupt tensor or a serialization bug in torch,
+    so the next person debugs the wrong subsystem entirely; the real cause,
+    `SafetensorError: ... No space left on device (os error 28)`, is several hundred lines earlier in
+    the child's output and is gone by the time the run's error is written (ISSUE-016, VERL-154).
+
+    `unexpected pos <N> vs <M>` is not corruption in the first place, it is a SHORT WRITE: torch's
+    zip serializer asserts that the offset it just wrote matches the offset it computed, and a write
+    that could not get another block leaves the file ending early. So the classification here is not
+    a guess from the message -- it is a question asked of the filesystem the merge was writing to,
+    at the moment it failed and BEFORE the caller's cleanup deletes the merge tree and frees the
+    evidence.
+
+    Two independent signals, either sufficient. An ENOSPC that reached this process (an errno, or
+    safetensors' message-only form) is conclusive on its own. Otherwise the disk is sampled: the
+    merger's output is the largest transient on the volume, so a merge that died for any other
+    reason leaves its partial output in place and the disk far from empty. Sampling alone would be
+    weak evidence on a disk that was merely tight, which is why the free-space floor is small.
+
+    Deliberately not raised when the disk has room: a merge can fail for reasons that have nothing
+    to do with space (a layout change, an OOM in the child), and relabelling those as a full disk
+    would send the next diagnosis somewhere just as wrong as the one this exists to prevent.
+    """
+    free = _free_bytes(merge_out)
+    if not _enospc_error(error) and (free is None or free > _MERGE_DISK_EXHAUSTED_FREE_BYTES):
+        return
+    free_text = "unknown" if free is None else f"{free / 1e9:.2f} GB"
+    raise MergeDiskExhaustedError(
+        f"ran out of disk while merging {ckpt_actor_dir} into {merge_out}: "
+        f"{free_text} free on that filesystem. publishing a checkpoint materializes the FULL base "
+        "model beside the checkpoint it reads, so a small lora adapter still needs room for a whole "
+        "model copy. the underlying error is a short write, not a corrupt checkpoint. save fewer "
+        "checkpoints with a larger train.save_every (save_every == the run's total steps publishes "
+        "only the final adapter)."
+    ) from error
 
 
 def resolve_checkpoint_actor_dir(step_dir: str) -> str:
@@ -335,6 +428,13 @@ def export_peft_adapter(
         # still-undeleted merge tree, a peak this function's own headroom check does not budget for.
         for name in os.listdir(lora_dir):
             os.replace(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
+    except BaseException as error:
+        # classified before the `finally` below deletes the merge tree: that cleanup frees tens of
+        # gb, so once it has run the disk has room again and the evidence for "this died of a full
+        # disk" is gone. re-raises as MergeDiskExhaustedError only when the filesystem agrees, so a
+        # merge that failed for any other reason keeps its own error.
+        raise_for_merge_disk_exhaustion(error, ckpt_actor_dir, merge_out)
+        raise
     finally:
         shutil.rmtree(merge_out, ignore_errors=True)
 

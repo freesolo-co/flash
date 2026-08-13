@@ -3218,6 +3218,201 @@ def test_optimizer_state_is_not_counted_against_the_merge(tmp_path):
     )
 
 
+def _enospc_merge_setup(monkeypatch, tmp_path, *, free_bytes, error):
+    """a checkpoint whose merger fails with `error`, on a disk reporting `free_bytes`."""
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "global_step_350"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+
+    free = {"value": 1 << 40}
+
+    def fake_merge(*args, **kwargs):
+        # the real merger fills the disk as it writes, so the free space the classifier samples is
+        # the space left AFTER the failure, not before it.
+        free["value"] = free_bytes
+        raise error
+
+    monkeypatch.setattr(verl_checkpoints.subprocess, "run", fake_merge)
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=0, free=free["value"]),
+    )
+    return verl_checkpoints, actor_dir
+
+
+def test_a_full_disk_is_reported_as_a_full_disk_not_a_torch_corruption(monkeypatch, tmp_path):
+    """the run's error must name the disk, not the serializer that noticed it first.
+
+    When the volume fills mid-merge, the exception that escapes is whichever writer hit the wall --
+    usually `torch.save`, whose message is `unexpected pos <N> vs <N-112>`. That reads as a corrupt
+    tensor or a torch bug, and a real 0.8B run (ISSUE-016) was debugged as serialization corruption
+    on the strength of it. It is neither: `<N> vs <N-112>` is a SHORT WRITE, the file ending early
+    because the disk could not give another block. The real cause sits several hundred lines earlier
+    in the child's output as `SafetensorError: ... No space left on device (os error 28)`, and is
+    gone by the time the run's error is recorded.
+
+    Asserted on the wrapped error rather than on a log line: the log is what already failed to carry
+    this. `__cause__` must still hold the original so the underlying traceback is not lost.
+    """
+    short_write = RuntimeError(
+        "[enforce fail at inline_container.cc:668] . unexpected pos 221967808 vs 221967696"
+    )
+    verl_checkpoints, actor_dir = _enospc_merge_setup(
+        monkeypatch, tmp_path, free_bytes=0, error=short_write
+    )
+
+    with pytest.raises(verl_checkpoints.MergeDiskExhaustedError) as caught:
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+
+    assert "ran out of disk" in str(caught.value)
+    assert caught.value.__cause__ is short_write, "the original traceback was discarded"
+
+
+def test_a_merge_failure_with_room_to_spare_keeps_its_own_error(monkeypatch, tmp_path):
+    """paired control: only a full disk may be relabelled as one.
+
+    A merge can fail for reasons that have nothing to do with space -- a layout change, an OOM in
+    the child, a missing dependency. Reporting those as disk exhaustion would send the next
+    diagnosis somewhere just as wrong as the misdirection this classification exists to remove, so
+    the disk is asked rather than assumed. Without this control, a classifier that fired
+    unconditionally would pass the test above.
+    """
+    unrelated = RuntimeError("CUDA out of memory")
+    verl_checkpoints, actor_dir = _enospc_merge_setup(
+        monkeypatch, tmp_path, free_bytes=1 << 40, error=unrelated
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+
+    assert caught.value is unrelated
+    assert not isinstance(caught.value, verl_checkpoints.MergeDiskExhaustedError)
+
+
+def test_enospc_is_recognized_even_when_the_disk_reads_free(monkeypatch, tmp_path):
+    """an ENOSPC that reached this process is conclusive on its own.
+
+    The disk sample is a second signal, not the only one, and it is inherently racy: by the time the
+    classifier looks, a concurrent writer may have freed space, or the merge tree may have been
+    partially rolled back. An error that already says "no space left on device" needs no
+    corroboration -- and safetensors is exactly that case, since `SafetensorError` is not an OSError
+    and carries no errno, so its message is the only evidence it ever provides.
+    """
+    safetensors_style = RuntimeError(
+        "Error while serializing: I/O error: No space left on device (os error 28)"
+    )
+    verl_checkpoints, actor_dir = _enospc_merge_setup(
+        monkeypatch, tmp_path, free_bytes=1 << 40, error=safetensors_style
+    )
+
+    with pytest.raises(verl_checkpoints.MergeDiskExhaustedError):
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+
+
+def test_the_disk_is_sampled_before_the_merge_tree_is_freed(monkeypatch, tmp_path):
+    """the classification must happen while the evidence still exists.
+
+    `export_peft_adapter` deletes `<adapter>_merge` in a `finally`, and that tree holds the full
+    model copy -- tens of GB. Once it is gone the disk has room again, so a classifier that ran
+    after cleanup would sample a healthy filesystem and conclude the merge died of something else.
+    The ordering IS the behavior here, which a free-space assertion alone cannot pin.
+    """
+    verl_checkpoints, actor_dir = _enospc_merge_setup(
+        monkeypatch, tmp_path, free_bytes=0, error=RuntimeError("unexpected pos 100 vs 88")
+    )
+    merge_out = tmp_path / "adapter_merge"
+    merge_out.mkdir()
+
+    events: list[str] = []
+    real_rmtree = verl_checkpoints.shutil.rmtree
+    failing_merge = verl_checkpoints.subprocess.run
+    merged = {"started": False}
+
+    def marking_merge(*args, **kwargs):
+        # wraps the helper's fake so the disk still shrinks; the flag only separates the pre-merge
+        # rmtree from the post-failure one.
+        merged["started"] = True
+        return failing_merge(*args, **kwargs)
+
+    monkeypatch.setattr(verl_checkpoints.subprocess, "run", marking_merge)
+
+    def watching_rmtree(path, *args, **kwargs):
+        # the function also clears any stale merge tree BEFORE running the merger; only the cleanup
+        # that follows the failure can destroy this failure's evidence.
+        if str(path) == str(merge_out) and merged["started"]:
+            events.append("cleanup")
+        return real_rmtree(path, *args, **kwargs)
+
+    real_classify = verl_checkpoints.raise_for_merge_disk_exhaustion
+
+    def watching_classify(*args, **kwargs):
+        events.append("classify")
+        return real_classify(*args, **kwargs)
+
+    monkeypatch.setattr(verl_checkpoints.shutil, "rmtree", watching_rmtree)
+    monkeypatch.setattr(verl_checkpoints, "raise_for_merge_disk_exhaustion", watching_classify)
+
+    with pytest.raises(verl_checkpoints.MergeDiskExhaustedError):
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+
+    assert events.index("classify") < events.index("cleanup"), (
+        "the merge tree was freed before the disk was sampled, so the evidence was already gone"
+    )
+    assert not merge_out.exists(), "classifying the failure stranded the merge tree on the disk"
+
+
+def test_the_headroom_guard_does_not_suggest_an_unreachable_config_key(monkeypatch, tmp_path):
+    """the remedy the error names has to be one a user can actually apply.
+
+    The guard used to advise raising `[gpu] disk_gb`. That key is in `MANAGED_GPU_KEYS`, so the
+    public schema rejects it outright (`unknown key(s): disk_gb`) and anyone following the advice
+    just loses time before discovering there is no such lever. Disk is sized by the runner from the
+    model's catalog `min_disk_gb`; `save_every` is the only knob a config can reach.
+    """
+    from flash.core.spec import MANAGED_GPU_KEYS
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    assert "disk_gb" in MANAGED_GPU_KEYS, "disk_gb became user-authorable; revisit this advice"
+
+    actor_dir = tmp_path / "global_step_9"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=1 << 40, free=1024),
+    )
+
+    with pytest.raises(verl_checkpoints.MergeDiskHeadroomError) as caught:
+        verl_checkpoints.require_merge_headroom(str(actor_dir), str(tmp_path / "adapter_merge"))
+
+    assert "disk_gb" not in str(caught.value)
+    assert "save_every" in str(caught.value)
+
+
 def test_the_adapter_is_moved_out_of_the_merge_tree_not_copied(monkeypatch, tmp_path):
     """the export must never hold two copies of the adapter at once.
 
@@ -3336,6 +3531,139 @@ def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypa
 
     left = sorted(p for p in os.listdir(export_root) if p.startswith("step-"))
     assert left == [], f"8 failed saves left {len(left)} adapters on disk: {left}"
+
+
+def _publishing_watcher(monkeypatch, tmp_path, *, steps, required_steps):
+    """an sft watcher over `steps` completed checkpoints that records what it publishes."""
+    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+
+    local_dir = tmp_path / "ckpts"
+    local_dir.mkdir()
+    for step in steps:
+        (local_dir / f"global_step_{step}" / "huggingface").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text(str(max(steps)))
+
+    published: list[int] = []
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        sft_checkpoints._w,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (published.append(step), kwargs["before_upload"](), True)[2],
+    )
+    monkeypatch.setattr(sft_checkpoints._w, "publish_deployable_checkpoint", lambda *a, **kw: None)
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=required_steps,
+    )
+    return watcher, published
+
+
+def test_a_lagging_publisher_skips_periodic_saves_a_newer_one_superseded(monkeypatch, tmp_path):
+    """the backlog must not be worked through one full-model merge at a time.
+
+    Publishing is asynchronous and slower than training, so the watcher falls behind and a sweep can
+    find several completed checkpoints at once. Exporting each in turn materializes a FULL base model
+    copy per step onto the same disk the trainer is still writing to, which is how a 0.8B LoRA run
+    filled a 60 GB volume and died at `step-350_merge` while `global_step_350/400/450` all sat on
+    disk (ISSUE-016). Worse, `_staged_source` hardlinks each published checkpoint so verl's retention
+    cannot prune it, so publishing a stale step PINS bytes verl already wanted to delete.
+
+    Only the newest is published. Nothing is lost: these are optional periodic saves, and the run's
+    final deployable comes from the finalization path, not from this watcher.
+    """
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(350, 400, 450), required_steps=()
+    )
+
+    for step, checkpoint_dir in watcher._publishable(watcher._pending()):
+        watcher._publish(step, checkpoint_dir)
+
+    assert published == [450], (
+        f"the publisher worked through the backlog instead of skipping: {published}"
+    )
+    assert watcher.processed_steps == {350, 400, 450}, (
+        "the skipped steps were left pending, so the next sweep would publish them anyway"
+    )
+
+
+def test_a_publisher_keeping_up_still_publishes_every_periodic_save(monkeypatch, tmp_path):
+    """paired control: the skip is for a BACKLOG, not for periodic saves in general.
+
+    A watcher that keeps pace sees one checkpoint per sweep, and each of those is the newest at the
+    time it is found. Without this control, an implementation that published only the final step
+    would pass the test above while quietly discarding every mid-run checkpoint of a healthy run.
+    """
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(50, 100), required_steps=()
+    )
+
+    # one sweep per checkpoint, which is what "keeping up" means.
+    for step in (50, 100):
+        pathlib.Path(watcher.local_dir, "latest_checkpointed_iteration.txt").write_text(str(step))
+        for pending_step, checkpoint_dir in watcher._publishable(watcher._pending()):
+            watcher._publish(pending_step, checkpoint_dir)
+
+    assert published == [50, 100], "a publisher that was keeping up still lost a checkpoint"
+
+
+def test_required_saves_are_never_skipped_even_when_the_publisher_lags(monkeypatch, tmp_path):
+    """an exact save the customer asked for is published however far behind the watcher is.
+
+    `save_at_steps` is a promise about specific steps, so trading one away for disk headroom would
+    be silently breaking the contract the run was submitted under -- and `stop(require_complete=...)`
+    would then fail the run for a missing save the watcher itself dropped. The bound applies only to
+    optional periodic saves.
+    """
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(350, 400, 450), required_steps=(350, 450)
+    )
+
+    for step, checkpoint_dir in watcher._publishable(watcher._pending()):
+        watcher._publish(step, checkpoint_dir)
+
+    assert published == [350, 450], f"a required save was dropped as superseded: {published}"
+
+
+def test_the_opd_watcher_publishes_every_step_despite_the_sft_bound(monkeypatch, tmp_path):
+    """the sft backlog skip must not reach opd, whose every step is a resume point.
+
+    `_OpdVerlCheckpointWatcher` subclasses the sft watcher and OPD permits an empty
+    `save_at_steps`, which is exactly the case the sft bound acts on -- so an unoverridden hook
+    would silently start dropping OPD checkpoints. It cannot: each OPD publish also stages that
+    step's retry contract with its own optimizer state, rng state, and accounting, so a skipped step
+    is a resume point and an accounting record that never existed.
+    """
+    from flash.engine.worker.train.opd import failures as opd_failures
+
+    watcher = opd_failures._OpdVerlCheckpointWatcher(
+        local_dir=str(tmp_path / "ckpts"),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+        seed=0,
+        prompt_pool_fingerprint="fp",
+        prompts_per_step=1,
+        group_size=1,
+        accounting_state=lambda step: None,
+    )
+    pending = [(1, "/ckpts/global_step_1"), (2, "/ckpts/global_step_2")]
+
+    assert watcher._publishable(pending) == pending, (
+        "the opd watcher inherited the sft backlog skip, dropping a resume point"
+    )
+    assert watcher.processed_steps == set(), "opd marked a step processed without publishing it"
 
 
 def test_the_opd_watcher_still_keeps_its_export(monkeypatch, tmp_path):

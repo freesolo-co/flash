@@ -281,6 +281,20 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
     def _should_publish(self, step: int) -> bool:
         return True
 
+    def _publishable(self, pending: list[tuple[int, str]]) -> list[tuple[int, str]]:
+        """publish every completed checkpoint, including ones a newer save has overtaken.
+
+        The sft watcher drops superseded OPTIONAL periodic saves to bound the disk peak, and reaches
+        that path whenever ``required_steps`` is empty -- which OPD allows. OPD cannot take it: each
+        publish also stages that step's retry contract (`_stage_retry_contract`) with its own
+        optimizer state, rng state, and per-step accounting, so a skipped step is a resume point and
+        an accounting record that never existed rather than merely an unpublished adapter.
+
+        Bounding OPD's publisher the same way would need that contract to be skippable too, which is
+        a separate change to the resume contract and not this one.
+        """
+        return pending
+
     def _publish(self, step: int, checkpoint_dir: str) -> None:
         actor_dir = os.path.join(checkpoint_dir, "actor")
         adapter_dir = os.path.join(self.export_root, f"step-{step}")

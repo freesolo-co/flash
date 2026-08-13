@@ -141,6 +141,41 @@ class _VerlCheckpointWatcher:
     def _should_publish(self, step: int) -> bool:
         return not self.required_steps or step in self.required_steps
 
+    def _publishable(self, pending: list[tuple[int, str]]) -> list[tuple[int, str]]:
+        """drop optional checkpoints a newer completed checkpoint has already superseded.
+
+        Publishing is asynchronous and slower than training, so the watcher falls behind: exporting
+        one checkpoint materializes the FULL base model (see `require_merge_headroom`), which takes
+        long enough that verl writes several more saves meanwhile. A run that died at `step-350_merge`
+        with `global_step_350/400/450` all on disk is the shape of it (ISSUE-016).
+
+        Working through that backlog in order is what makes the disk peak unbounded, and the cost is
+        not merely one merge per step. `_staged_source` hardlinks the checkpoint being published so
+        verl's retention cannot prune it mid-export, so publishing a lagging step PINS a checkpoint
+        verl has already deleted -- its bytes stay on the disk on top of the newest checkpoint verl
+        is keeping (`max_ckpt_to_keep=1`) and the merge tree itself. Publishing the newest one
+        instead hardlinks what verl is retaining anyway, so the staged copy costs no extra bytes and
+        the peak drops by a whole checkpoint. Falling behind is also self-sustaining: every extra
+        merge is time the publisher spends getting further behind.
+
+        Only OPTIONAL periodic saves are dropped. When `required_steps` is set, the customer asked
+        for those exact steps and every one is published -- that path is untouched, and the older
+        steps it skips are already skipped by `_should_publish`. Nothing is lost for the run either
+        way: the deployable for the last step is published by the finalization path in `sft_train`,
+        which exports from `latest_global_step_dir` and does not consult this watcher.
+        """
+        if self.required_steps or len(pending) <= 1:
+            return pending
+        superseded = pending[:-1]
+        self.processed_steps.update(step for step, _ in superseded)
+        print(
+            f"[ckpt] publishing step {pending[-1][0]} and skipping superseded periodic "
+            f"checkpoint(s) {', '.join(str(step) for step, _ in superseded)}: the publisher is "
+            "behind training, and each export writes a full model copy to the same disk",
+            flush=True,
+        )
+        return pending[-1:]
+
     def _staged_source(self, step: int, checkpoint_dir: str) -> str:
         """hardlink a completed checkpoint before verl retention can prune it.
 
@@ -220,7 +255,7 @@ class _VerlCheckpointWatcher:
     def _run(self) -> None:
         try:
             while True:
-                for step, checkpoint_dir in self._pending():
+                for step, checkpoint_dir in self._publishable(self._pending()):
                     self._publish(step, checkpoint_dir)
                 # re-read rather than reusing the sweep above: verl advances the tracker right up to
                 # the moment the child exits, so a step can become visible during that sweep.
