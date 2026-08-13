@@ -12,6 +12,7 @@ import time
 import urllib.request
 
 from flash import runner
+from flash.core.spec import persisted_gpu_head
 from flash.providers.realized import realized_cost_for_remote
 from flash.server.platform.auth import freesolo_base_url
 from flash.server.platform.internal_client import internal_key
@@ -111,7 +112,8 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
         "runId": status.run_id,
         "realizedCostUsd": realized.realized_usd,
         "provider": realized.provider,
-        "gpu": remote.get("allocated_gpu") or (spec.get("gpu") or {}).get("type"),
+        # head rather than the raw list, for the reason given in billing/charges.py
+        "gpu": remote.get("allocated_gpu") or persisted_gpu_head(spec),
         "costByResource": realized.by_resource,
         "wallSeconds": realized.wall_seconds,
         "costBasis": "realized",

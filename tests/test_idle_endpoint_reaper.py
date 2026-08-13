@@ -59,6 +59,32 @@ def test_protected_names_cover_live_runs_only(monkeypatch):
     assert _derived("RTX 5090", "flash-done") not in names
 
 
+def test_ordered_gpu_pin_is_protected_before_its_handle_is_persisted(monkeypatch):
+    """An ordered pin persists `gpu.type` as a LIST, and the reaper reads raw status.
+
+    The spec-derived name exists precisely to cover the submit-to-handle-persist window. Passing the
+    raw list to `canonical_gpu` raises `AttributeError: 'list' object has no attribute 'strip'`, and
+    the call sits under `contextlib.suppress`, so the run silently contributes NO name at all: with
+    no `remote.endpoint_name` either, its live endpoint is outside the protected set and reapable
+    while the run is still provisioning. The head is the right class here because the first attempt
+    of an ordered pin rents the author's first preference."""
+    rows = [{"run_id": "flash-ordered"}]
+    statuses = {
+        "flash-ordered": RunStatus(
+            run_id="flash-ordered",
+            state="provisioning",
+            spec={"gpu": {"type": ["A100 PCIe", "A100 SXM"]}},
+        )
+    }
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
+    monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
+
+    names = app_mod._protected_train_endpoint_names()
+
+    assert names, "an ordered-pin run contributed no protected name at all"
+    assert _derived("A100 PCIe", "flash-ordered") in names
+
+
 def test_reap_once_passes_protected_set_and_grace(monkeypatch):
     monkeypatch.setattr(app_mod, "_protected_train_endpoint_names", lambda: {"flash-live"})
     # The reaper also passes the KNOWN set (every run this plane has a record of) so it only reaps

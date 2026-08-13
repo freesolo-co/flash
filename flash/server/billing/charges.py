@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from decimal import ROUND_HALF_UP, Decimal
 
+from flash.core.spec import persisted_gpu_head
 from flash.server.platform.internal_client import (
     DEFAULT_TIMEOUT_S,
     build_internal_request,
@@ -98,7 +99,10 @@ def _charge_run(
         raise BillingError(400, "missing billing org id for training run")
     spec = status.spec or {}
     remote = status.remote or {}
-    gpu = remote.get("allocated_gpu") or (spec.get("gpu") or {}).get("type")
+    # the head, not the raw value: an ordered pin persists `gpu.type` as a list, and this fallback
+    # runs exactly when `allocated_gpu` is missing, so the list would reach the billing backend as a
+    # JSON array in a field that has always been a scalar string.
+    gpu = remote.get("allocated_gpu") or persisted_gpu_head(spec)
     provider = remote.get("provider")
     total_usd = float(total_usd or 0.0)
     body = {

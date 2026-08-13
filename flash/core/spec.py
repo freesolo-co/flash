@@ -171,6 +171,35 @@ def _parse_persisted_gpu_types(gpu: dict) -> tuple[str, tuple[str, ...]]:
     )
 
 
+def persisted_gpu_head(spec: dict[str, Any] | None) -> str:
+    """The one GPU class name to use when reading a persisted spec WITHOUT parsing it.
+
+    ``to_dict()`` writes an ordered pin as ``gpu.type = ["A100 PCIe", "A100 SXM"]``, because the
+    public parser owns the head/fallbacks split and rejects ``type_fallbacks`` as unauthorable, so
+    the list spelling is what makes a resubmitted payload round-trip. That leaves the raw persisted
+    record holding a list where a handful of callers need a single class name.
+
+    Those callers exist precisely BECAUSE the spec may be unparseable -- endpoint teardown after
+    ``JobSpec.from_dict`` has already failed, the idle reaper walking every stored run, billing that
+    must stay chargeable on a stale record. They cannot route through the parser by definition, and
+    handing a list to ``canonical_gpu`` raises ``AttributeError: 'list' object has no attribute
+    'strip'``. Every one of those sites swallows exceptions to protect its caller, so the failure is
+    silent: a paid endpoint is simply never torn down.
+
+    Returns the HEAD rather than joining, since these callers name a concrete resource. The head is
+    the right one for endpoint names: ``endpoint_name`` is derived per attempt from the class that
+    attempt actually rented, and the first attempt of an ordered pin always rents the head (the
+    allocator ranks the authored classes and the head is the author's first preference, tried
+    first). Later attempts stamp ``remote.allocated_gpu``, which every one of these call sites
+    already prefers when present.
+    """
+    gpu = (spec or {}).get("gpu")
+    raw = gpu.get("type") if isinstance(gpu, dict) else None
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else None
+    return raw if isinstance(raw, str) else ""
+
+
 def _opt_int(value: Any) -> int | None:
     """Parse optional int; rejects bools (bool is int subclass — int(True)==1 is a footgun)."""
     if value is None:

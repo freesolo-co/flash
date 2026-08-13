@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from flash.core.spec import JobSpec
+from flash.core.spec import JobSpec, persisted_gpu_head
 from flash.providers._lifecycle.deadline import deadline_kwargs
 from flash.providers._lifecycle.poll import _attempt_int
 
@@ -555,7 +555,7 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
         _record_cleanup_remote(run_id, persisted_remote)
     _compare_and_fail_remote(run_id, persisted_remote, detail)
     with contextlib.suppress(Exception):
-        gpu_type = (status.spec.get("gpu") or {}).get("type")
+        gpu_type = persisted_gpu_head(status.spec)
         if gpu_type:
             from flash.providers.runpod.serverless import terminate_endpoint
 

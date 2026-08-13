@@ -12,7 +12,7 @@ import os
 import threading
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
-from flash.core.spec import JobSpec
+from flash.core.spec import JobSpec, persisted_gpu_head
 from flash.runner import adapter_prefix, get_status, runs_file_path
 from flash.server.platform import db
 
@@ -711,7 +711,7 @@ def _classify_recoverable_runs(
                 # persisted status without parsing the spec. Terminate by that reconstructed
                 # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
                 with contextlib.suppress(Exception):
-                    gpu_type = (status.spec.get("gpu") or {}).get("type")
+                    gpu_type = persisted_gpu_head(status.spec)
                     if gpu_type:
                         from flash.providers.runpod.serverless import terminate_endpoint
 

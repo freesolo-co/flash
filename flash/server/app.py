@@ -89,6 +89,7 @@ def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
     scope
     reaping to this control plane.
     """
+    from flash.core.spec import persisted_gpu_head
     from flash.providers.base import canonical_gpu
     from flash.providers.runpod.jobs import canonical_endpoint_name
     from flash.providers.runpod.serverless import _run_suffix, endpoint_name
@@ -108,7 +109,7 @@ def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
         if not include_terminal and status.state in TERMINAL_STATES:
             continue
         _add((status.remote or {}).get("endpoint_name"))
-        gpu = ((status.spec or {}).get("gpu") or {}).get("type")
+        gpu = persisted_gpu_head(status.spec)
         if gpu:
             with contextlib.suppress(Exception):
                 _add(endpoint_name(canonical_gpu(gpu), _run_suffix(status.run_id)))

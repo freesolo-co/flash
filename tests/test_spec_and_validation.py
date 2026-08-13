@@ -12,7 +12,13 @@ from dataclasses import fields, replace
 
 import pytest
 
-from flash.core.spec import GpuSpec, JobSpec, TrainSpec, load_job_spec_from_env
+from flash.core.spec import (
+    GpuSpec,
+    JobSpec,
+    TrainSpec,
+    load_job_spec_from_env,
+    persisted_gpu_head,
+)
 from flash.schema import (
     TRAIN_KEY_MIN_VERSIONS,
     TRAIN_SCHEMA_KEYS,
@@ -1294,6 +1300,34 @@ def test_persisted_ordered_gpu_pin_survives_a_status_reload() -> None:
         _job_from_dict({"gpu": {"type": ["H100", "B200"], "type_fallbacks": ["A100 SXM"]}})
     with pytest.raises(ValueError, match=r"at least one gpu"):
         _job_from_dict({"gpu": {"type": []}})
+
+
+def test_persisted_gpu_head_reads_an_unparseable_spec_without_raising() -> None:
+    """The reader for callers that CANNOT go through `JobSpec.from_dict`.
+
+    Endpoint teardown after a parse failure, the idle reaper walking every stored run, and billing
+    on a stale record all read `status.spec` raw, and an ordered pin puts a list where they expect
+    one class name. Handing that list to `canonical_gpu` raises `AttributeError: 'list' object has
+    no attribute 'strip'`; every one of those sites suppresses exceptions to protect its caller, so
+    the failure is silent and a paid endpoint is simply never torn down.
+
+    It must therefore be total over malformed input as well: these callers are reached BECAUSE the
+    record is suspect, so a raise here would reintroduce the same silent skip it exists to remove.
+    """
+    assert persisted_gpu_head({"gpu": {"type": ["A100 PCIe", "A100 SXM"]}}) == "A100 PCIe"
+    assert persisted_gpu_head({"gpu": {"type": "H200"}}) == "H200"
+    # malformed or absent -> "" (falsey), which every call site already guards on. no raise.
+    for malformed in (
+        None,
+        {},
+        {"gpu": {}},
+        {"gpu": {"type": ""}},
+        {"gpu": {"type": []}},
+        {"gpu": {"type": None}},
+        {"gpu": "not-a-dict"},
+        {"gpu": {"type": 7}},
+    ):
+        assert persisted_gpu_head(malformed) == ""
 
 
 def test_removed_gpu_pin_key_is_rejected_as_unknown() -> None:
