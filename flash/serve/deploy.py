@@ -54,15 +54,21 @@ READBACK_MAX_DELAY_SECONDS = 2.0
 # succeeding in ~4.6 minutes against the now-warm one, so 5 minutes did not even cover the warm case
 # with margin. the floor is doubled to 10 and the per-B term covers a bigger base on top.
 #
-# the cap is the real constraint: this wait is followed by `_SMOKE_BUDGET_SECONDS` (600s) of smoke
-# inside the same deployment attempt, and `_DEPLOYMENT_STALE_SECONDS` (1800s) is when the control
-# plane declares an in-flight attempt abandoned. readiness + smoke must stay under that or a deploy
-# that is still progressing gets reaped, so readiness is capped at 1080s (1080 + 600 = 1680 < 1800).
+# the cap is the real constraint, and readiness is only one leg of the attempt. the same deploy also
+# spends time BEFORE this wait (resolving the hub revision, downloading the adapter config to read
+# its rank, the capability check, registration) and AFTER it (`_SMOKE_BUDGET_SECONDS` = 600s of
+# smoke, then activation). the whole attempt must finish inside BOTH `_DEPLOYMENT_STALE_SECONDS`
+# (1800s, when the plane declares an in-flight attempt abandoned) and the CLI's 1800s default
+# `--wait`, or a deploy that is still progressing is reaped or reported as failed.
+#
+# so the cap leaves real slack rather than just clearing smoke: 900 + 600 = 1500, keeping 300s for
+# the surrounding hub reads, registration, activation, and poll latency, none of which share a
+# wall-clock bound with this one.
 #
 # a longer budget costs little: an adapter serving REJECTS raises as soon as the revision reports
 # `failed`, so only a revision that is genuinely still loading waits out the clock.
 REVISION_READY_MIN_BUDGET_SECONDS = 10 * 60.0
-REVISION_READY_MAX_BUDGET_SECONDS = 18 * 60.0
+REVISION_READY_MAX_BUDGET_SECONDS = 15 * 60.0
 REVISION_READY_SECONDS_PER_PARAM_B = 20.0
 ACTIVATION_READBACK_ATTEMPTS = 3
 ACTIVATION_READBACK_DELAY_SECONDS = 2.0
@@ -687,20 +693,37 @@ def _wait_revision_ready(
     # revision "remained 'registered'", which reads as a serving fault and sent readers to the wrong
     # subsystem. say which of the two happened, what the clock actually was, and that a retry is the
     # correct response to THIS one.
-    details = [f"waited {budget:g}s", f"last state {last_state!r}"]
-    if not observed_record:
-        # serving never returned the record at all: 404 for the whole budget. that is registration
+    details = [f"waited {budget:g}s"]
+    if observed_record:
+        details.append(f"last state {last_state!r}")
+    else:
+        # serving never returned a record: every completed poll 404ed. that is registration
         # visibility, not a slow load, and it points at a different failure than a stuck loader.
-        details.append("serving never returned the revision record (404 for the whole budget)")
+        # no lifecycle state was ever observed, so do not quote the initial one as if it were read.
+        details.append("serving never returned the revision record (every completed poll 404ed)")
     if last_failure:
         details.append(f"loader reported: {last_failure}")
+    # the advice depends on WHICH timeout this is. a loader that named a failure while leaving the
+    # revision un-failed has already told us the artifact or config is wrong, and that survives a
+    # warm engine, so prescribing a retry there would send the reader into a futile loop -- the same
+    # wrong-direction problem this message exists to fix.
+    if last_failure:
+        remedy = (
+            "serving reported that failure without failing the revision, so this is unlikely to be "
+            "a cold-engine timeout: fix what the loader reported before retrying, because a retry "
+            "against a warm engine will hit the same artifact."
+        )
+    else:
+        remedy = (
+            "serving may still be loading, so retrying this deploy is the correct response: a cold "
+            "engine loading a large base model can exceed the budget, and the retry usually "
+            "succeeds against the now-warm engine."
+        )
     raise ServingError(
         f"revision_ready_timeout: adapter revision {revision} did not become ready in time "
-        f"({'; '.join(details)}). the previous alias remains available and serving may still be "
-        "loading, so retrying this deploy is the correct response: a cold engine loading a large "
-        "base model can exceed the budget, and the retry usually succeeds against the now-warm "
-        "engine. this is NOT the same as serving rejecting the adapter, which fails the deployment "
-        "with 'serving failed to load adapter revision'."
+        f"({'; '.join(details)}). the previous alias remains available and {remedy} this is NOT "
+        "the same as serving rejecting the adapter, which fails the deployment with 'serving "
+        "failed to load adapter revision'."
     )
 
 

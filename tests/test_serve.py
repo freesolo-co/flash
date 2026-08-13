@@ -896,17 +896,33 @@ def test_revision_ready_budget_unknown_model_keeps_the_floor():
         assert d.revision_ready_budget_seconds(unknown) == d.REVISION_READY_MIN_BUDGET_SECONDS
 
 
-def test_revision_ready_budget_leaves_room_for_smoke_before_the_stale_sweep():
-    """Readiness + smoke must finish before the control plane declares the attempt abandoned.
+def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
+    """Readiness is one leg of the attempt, and the other legs have no wall-clock bound of their own.
 
-    Raising the readiness budget is only safe while that sum stays under the stale threshold; past
-    it a deploy that is still progressing gets reaped mid-flight.
+    The same deploy resolves the hub revision, downloads the adapter config to read its rank, checks
+    capabilities and registers BEFORE this wait, then runs the smoke budget and activates after it.
+    All of that has to finish before the control plane declares the attempt abandoned and before the
+    CLI's default `--wait` gives up, so the cap must reserve time rather than merely clear smoke.
     """
     import flash.serve.deploy as d
+
+    # take the CLI default from the parser rather than restating it, so the two cannot drift apart
+    # silently: shrinking bare `--wait` must fail here, not in a deploy.
+    from flash.cli import _build_parser
     from flash.server.routes.serving import _DEPLOYMENT_STALE_SECONDS
     from flash.server.routes.serving_smoke import _SMOKE_BUDGET_SECONDS
 
-    assert d.REVISION_READY_MAX_BUDGET_SECONDS + _SMOKE_BUDGET_SECONDS < _DEPLOYMENT_STALE_SECONDS
+    cli_default_wait = float(
+        _build_parser().parse_args(["models", "deploy", "run-1", "--wait"]).wait
+    )
+
+    bounded = d.REVISION_READY_MAX_BUDGET_SECONDS + _SMOKE_BUDGET_SECONDS
+    assert bounded < _DEPLOYMENT_STALE_SECONDS
+    # and the CLI must not call a still-progressing deploy failed before the plane reaps it.
+    assert bounded < cli_default_wait
+    # the unbudgeted hub reads, registration, activation and poll latency get a real reserve.
+    reserve = min(_DEPLOYMENT_STALE_SECONDS, cli_default_wait) - bounded
+    assert reserve >= 300.0
 
 
 def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_path):
@@ -1001,8 +1017,17 @@ def test_revision_ready_timeout_reports_the_loader_failure(monkeypatch):
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
-    with pytest.raises(d.ServingError, match="adapter tensors truncated"):
+    with pytest.raises(d.ServingError) as excinfo:
         d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
+
+    message = str(excinfo.value)
+    assert "adapter tensors truncated" in message
+    # and it must NOT prescribe a retry. a truncated artifact survives a warm engine, so the
+    # cold-engine advice would send the reader into a futile loop -- the same wrong-direction
+    # failure this message exists to fix.
+    assert "retrying this deploy is the correct response" not in message
+    assert "succeeds against the now-warm engine" not in message
+    assert "fix what the loader reported before retrying" in message
 
 
 def test_revision_ready_timeout_distinguishes_a_never_visible_record(monkeypatch):
