@@ -103,6 +103,9 @@ def test_a_pre_upgrade_snapshot_still_passes_its_integrity_digest(tmp_path, monk
         }
     )
     public, worker = spec.to_dict(), spec.to_internal_dict()
+    # `gpu.type_fallbacks` postdates this snapshot too, so its bytes carried no such key --
+    # same replay rule as the top-level drops below.
+    worker["gpu"].pop("type_fallbacks", None)
 
     # Recompute the digest exactly as the OLD plane did: its worker payload carried model_policy,
     # it dropped empty workload_profile_* keys (the version-1 omission rule) before hashing, and its
@@ -180,6 +183,9 @@ def test_a_pre_upgrade_worker_env_snapshot_still_passes_its_integrity_digest(tmp
         }
     )
     public, worker = spec.to_dict(), spec.to_internal_dict()
+    # `gpu.type_fallbacks` postdates this snapshot too, so its bytes carried no such key --
+    # same replay rule as the top-level drops below.
+    worker["gpu"].pop("type_fallbacks", None)
 
     # what the OLD plane wrote and hashed: asdict emitted worker_env into both payloads. its public
     # spec also had no lora_alpha (alpha was managed-and-derived, so to_dict() stripped it), so drop
@@ -268,6 +274,9 @@ def test_a_pre_upgrade_environment_pip_snapshot_still_passes_its_integrity_diges
         }
     )
     worker = spec.to_internal_dict()
+    # `gpu.type_fallbacks` postdates this snapshot too, so its bytes carried no such key --
+    # same replay rule as the top-level drops below.
+    worker["gpu"].pop("type_fallbacks", None)
     # the OLD plane's public bytes: to_dict() stripped pip entirely, and alpha was still managed.
     old_public = spec.to_dict()
     old_public = {

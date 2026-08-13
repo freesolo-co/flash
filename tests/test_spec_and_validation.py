@@ -1430,6 +1430,7 @@ def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() 
             worker_payload.pop(key, None)
     worker_payload.pop("model_revision_auto", None)
     worker_payload.pop("gpu_count_auto", None)
+    worker_payload["gpu"].pop("type_fallbacks", None)
     public_payload = unmarked.to_dict()  # to_dict() already strips the markers
     # the old plane popped `[environment] pip` from every public payload, so its bytes carried no
     # such key. mirrors _preparation_digest's drop-when-empty for the same reason as the list above.
@@ -1455,6 +1456,69 @@ def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() 
     # a marked run still binds the marker into its digest, so tampering remains detectable
     marked = replace(unmarked, model_revision_auto=True)
     assert _preparation_digest(marked, marked, None) != legacy
+
+
+def test_ordered_gpu_pin_field_does_not_change_pre_existing_preparation_digests() -> None:
+    """A snapshot prepared before `gpu.type_fallbacks` existed must still rehash to its digest.
+
+    Same contract as the marker test above, one level down: `to_internal_dict()` now emits the key
+    for every spec, so without an omission every in-flight warm-start or auto-pinned run fails
+    integrity validation on the first recovery after the upgrade.
+    """
+    import hashlib
+
+    from flash.runner.preparation import _preparation_digest
+
+    scalar = JobSpec(
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        model_revision="c" * 40,
+        gpu=GpuSpec(type="A100 PCIe", count=1, provider="runpod"),
+    )
+
+    # the pre-upgrade bytes: today's payload minus the key that did not exist then. mirrors
+    # _preparation_digest's own omissions rather than re-deriving them, so the control cannot drift.
+    worker_payload = scalar.to_internal_dict()
+    for key in (
+        "model_revision_auto",
+        "gpu_count_auto",
+        "workload_profile_input_digest",
+        "workload_profile_producer_version",
+        "workload_profile",
+    ):
+        if not worker_payload.get(key):
+            worker_payload.pop(key, None)
+    worker_payload["gpu"].pop("type_fallbacks", None)
+    public_payload = scalar.to_dict()  # to_dict() already strips the fallbacks
+    if not public_payload["environment"].get("pip"):
+        public_payload["environment"].pop("pip", None)
+
+    legacy = hashlib.sha256(
+        json.dumps(
+            {
+                "version": 1,
+                "public_spec": public_payload,
+                "worker_spec": worker_payload,
+                "adapter_identity": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert _preparation_digest(scalar, scalar, None) == legacy
+
+    # an ordered pin is non-empty, so it stays bound: a tampered fallback list is still caught, and
+    # it does not collide with the bare head it was widened from.
+    ordered = replace(
+        scalar,
+        gpu=GpuSpec(type="A100 PCIe", type_fallbacks=("A100 SXM",), count=1, provider="runpod"),
+    )
+    other = replace(
+        scalar, gpu=GpuSpec(type="A100 PCIe", type_fallbacks=("H100",), count=1, provider="runpod")
+    )
+    assert _preparation_digest(ordered, ordered, None) != legacy
+    assert _preparation_digest(ordered, ordered, None) != _preparation_digest(other, other, None)
 
 
 def test_resubmitting_a_public_spec_gets_a_fresh_runner_pin(monkeypatch) -> None:

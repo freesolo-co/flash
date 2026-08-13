@@ -427,6 +427,14 @@ def _preparation_digest(
     ):
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
+    # `gpu.type_fallbacks` is new, so to_internal_dict() now emits it for every spec -- including
+    # the pre-upgrade snapshots that were hashed with no such key. Same reason as the top-level
+    # omissions above, one level down: absent and empty are the same single-class pin, so they must
+    # hash alike, and without this every warm-start or auto-pinned run in flight fails integrity
+    # validation on the first recovery after the upgrade. An ordered pin is non-empty and stays
+    # bound, so tampering with a persisted fallback list is still caught.
+    if not worker_payload.get("gpu", {}).get("type_fallbacks"):
+        worker_payload.get("gpu", {}).pop("type_fallbacks", None)
     # Restore since-removed keys the STORED payload carried, for the same reason as the omissions
     # above: the digest has to reproduce the bytes that were hashed, not today's serialization. A
     # pre-upgrade snapshot hashed `model_policy` in (to_internal_dict was asdict, so it emitted the
