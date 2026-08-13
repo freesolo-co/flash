@@ -860,7 +860,14 @@ class AllocationConstraints:
 
     disk_gb: float = 0.0
     max_wall_seconds: float = 0.0
+    # One class to narrow the market query to, or empty for an unrestricted search. Set only when
+    # exactly one class is acceptable: a provider treats it as "nothing else can win", which is
+    # false for an ordered list. `gpu_types` carries the full acceptable set, and the allocator's own
+    # filter in `_gather_candidates` is what actually enforces it — this field is a query hint.
     gpu_type: str = ""
+    # Every acceptable class, in authored preference order; empty for an unpinned search. A provider
+    # that can narrow its lookup to a set should read this; ignoring it is always safe.
+    gpu_types: tuple[str, ...] = ()
     # Whole-run fit floor before the allocator reduces it to a per-card market query. Capacity-aware
     # providers use this to distinguish a missing rentable shape from a sold-out one.
     required_vram_gb: int = 0

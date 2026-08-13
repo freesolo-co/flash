@@ -252,7 +252,14 @@ _REMOVED_TOP_LEVEL_KEYS = frozenset({"model_revision"})
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
-_GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - MANAGED_GPU_KEYS
+# `type_fallbacks` is DERIVED, not authored: an ordered pin is written as `type = ["A", "B"]`, and
+# the parser splits it into the head plus these. Accepting both spellings would let a config name a
+# head that contradicts its own fallback list, so only the list form is public.
+_GPU_KEYS = (
+    frozenset(item.name for item in dataclass_fields(GpuSpec))
+    - MANAGED_GPU_KEYS
+    - {"type_fallbacks"}
+)
 # [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
 # is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
 # pip is authorable: worker_pip_for_env returns only Flash's own worker requirement, so a scorer that
@@ -422,6 +429,46 @@ def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, An
     return train_raw
 
 
+def _authored_gpu_types(raw: Any) -> tuple[str, ...]:
+    """Canonicalize `[gpu] type`, which is either one class or an ordered list of acceptable ones.
+
+    A list narrows allocation to those classes in preference order instead of collapsing it to one,
+    so a capacity shortage on the first can fail over to the next rather than re-queueing on a class
+    the provider has already said it cannot serve. A one-element list is exactly a scalar pin.
+    Duplicates are dropped (the second mention asks for nothing new) but an empty list is rejected:
+    it reads as a pin while meaning auto-allocation, and silently treating it as auto would hand back
+    the cheapest-fit behaviour the author was trying to override.
+    """
+    if isinstance(raw, str):
+        entries = [raw] if raw.strip() else []
+    elif isinstance(raw, (list, tuple)):
+        entries = list(raw)
+        if not entries:
+            raise ConfigError(
+                "[gpu] type must not be an empty list; omit the key for managed allocation, "
+                'or name the classes to allow, e.g. type = ["A100 PCIe", "A100 SXM"]'
+            )
+    else:
+        raise ConfigError("gpu.type must be a string or a list of strings")
+
+    canonical_types: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise ConfigError("gpu.type entries must be strings")
+        if not entry.strip():
+            raise ConfigError("gpu.type entries must not be empty")
+        try:
+            canonical = canonical_gpu(entry)
+        except UnsupportedGpuError as exc:
+            raise ConfigError(f"gpu.type: {exc}") from exc
+        gpu_info = GPU_INFO.get(canonical)
+        if gpu_info is None or not gpu_info.validated:
+            raise ConfigError(f"gpu.type {canonical!r} must name an active validated GPU class")
+        if canonical not in canonical_types:
+            canonical_types.append(canonical)
+    return tuple(canonical_types)
+
+
 def _validate_gpu_section(
     raw: dict[str, Any],
     *,
@@ -430,7 +477,7 @@ def _validate_gpu_section(
     algorithm: str,
     train_raw: dict[str, Any],
     thinking: bool,
-) -> tuple[str, str, dict[str, int]]:
+) -> tuple[str, str, dict[str, Any]]:
     """Validate the gpu section."""
     gpu_raw = raw.get("gpu")
     if gpu_raw is None:
@@ -458,22 +505,13 @@ def _validate_gpu_section(
             f"gpu.provider must be one of {', '.join(PROVIDER_NAMES)}; got {provider_raw!r}"
         )
 
-    gpu_type_raw = gpu_raw.get("type", "")
-    if not isinstance(gpu_type_raw, str):
-        raise ConfigError("gpu.type must be a string")
-    gpu_type = ""
-    if gpu_type_raw.strip():
-        try:
-            gpu_type = canonical_gpu(gpu_type_raw)
-        except UnsupportedGpuError as exc:
-            raise ConfigError(f"gpu.type: {exc}") from exc
-        gpu_info = GPU_INFO.get(gpu_type)
-        if gpu_info is None or not gpu_info.validated:
-            raise ConfigError(f"gpu.type {gpu_type!r} must name an active validated GPU class")
-        if gpu_provider and gpu_provider not in providers_for(gpu_type):
+    gpu_types = _authored_gpu_types(gpu_raw.get("type", ""))
+    for candidate in gpu_types:
+        if gpu_provider and gpu_provider not in providers_for(candidate):
             raise ConfigError(
-                f"gpu.provider {gpu_provider!r} cannot provision gpu.type {gpu_type!r}"
+                f"gpu.provider {gpu_provider!r} cannot provision gpu.type {candidate!r}"
             )
+    gpu_type = gpu_types[0] if gpu_types else ""
 
     requested_gpu_count = authored_gpu_ceiling(gpu_type, gpu_count)
     preflight_gpu_count = provisional_gpu_count(
@@ -485,7 +523,7 @@ def _validate_gpu_section(
         gpu_count=requested_gpu_count,
     )
     try:
-        if gpu_type and preflight_gpu_count <= 1 and not model_revision:
+        if gpu_types and preflight_gpu_count <= 1 and not model_revision:
             from flash.providers.allocator import required_vram_gb
 
             required_vram = required_vram_gb(
@@ -494,11 +532,16 @@ def _validate_gpu_section(
                 train=train_raw,
                 thinking=thinking,
             )
-            if get_gpu_info(gpu_type).vram_gb < required_vram:
-                raise ConfigError(
-                    f"gpu.type {gpu_type!r} has {get_gpu_info(gpu_type).vram_gb} GB VRAM, "
-                    f"but this run requires at least {required_vram} GB"
-                )
+            # every authored class is checked, not just the head: a fallback too small to hold the
+            # run is one allocation would never rent, so accepting it here would advertise failover
+            # the run does not actually have and surface the shortfall only after the head ran out
+            # of capacity.
+            for candidate in gpu_types:
+                if get_gpu_info(candidate).vram_gb < required_vram:
+                    raise ConfigError(
+                        f"gpu.type {candidate!r} has {get_gpu_info(candidate).vram_gb} GB VRAM, "
+                        f"but this run requires at least {required_vram} GB"
+                    )
         # called for its rejection, not its return: it raises when no validated class can hold the
         # run, which is the parse-time "this is unplaceable" gate. every count reaches this boundary
         # after the geometry cap, so an unsafe eight-card width cannot leak into sizing.
@@ -513,6 +556,8 @@ def _validate_gpu_section(
         )
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
+    if len(gpu_types) > 1:
+        gpu_options["type_fallbacks"] = tuple(gpu_types[1:])
     return gpu_type, gpu_provider, gpu_options
 
 
@@ -797,17 +842,19 @@ _ALGO_VALIDATORS = {
 
 
 def _validate_spec(spec: JobSpec) -> None:
-    if spec.gpu.type:
+    # every acceptable class, not just the head: an ordered pin is only as valid as its worst entry,
+    # and a fallback that fails here would otherwise be caught at allocation on a live run.
+    for gpu_type in spec.gpu.acceptable_types:
         try:
-            canonical_gpu(spec.gpu.type)
+            canonical_gpu(gpu_type)
         except UnsupportedGpuError as exc:
             raise ConfigError(str(exc)) from exc
-        gpu_info = GPU_INFO.get(spec.gpu.type)
+        gpu_info = GPU_INFO.get(gpu_type)
         if gpu_info is None or not gpu_info.validated:
             raise ConfigError("gpu.type must name an active validated GPU class")
-        if spec.gpu.provider and spec.gpu.provider not in providers_for(spec.gpu.type):
+        if spec.gpu.provider and spec.gpu.provider not in providers_for(gpu_type):
             raise ConfigError(
-                f"gpu.provider {spec.gpu.provider!r} cannot provision gpu.type {spec.gpu.type!r}"
+                f"gpu.provider {spec.gpu.provider!r} cannot provision gpu.type {gpu_type!r}"
             )
     if spec.gpu.provider and spec.gpu.provider not in PROVIDER_NAMES:
         raise ConfigError(f"unknown gpu.provider {spec.gpu.provider!r}")

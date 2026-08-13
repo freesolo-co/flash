@@ -527,7 +527,15 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
             effective_environment["resolved_sha"] = ""
     effective["environment"] = effective_environment
     public_gpu = dict(public["gpu"])
-    effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
+    # `type` is excluded for the same reason `count` is below: _spec_with_gpu writes the SELECTED
+    # class onto the worker spec. the fallbacks ride with it -- they qualify `type`, so comparing
+    # them against a public half whose head has not been rewritten would fail every ordered pin
+    # that allocated to anything but its first class.
+    effective_gpu = {
+        **effective["gpu"],
+        "type": public_gpu["type"],
+        "type_fallbacks": public_gpu.get("type_fallbacks", ()),
+    }
     # _spec_with_gpu writes the SELECTED count onto the worker spec -- the worker sizes its
     # rank count from it and the provider payload rents it -- so comparing it against the
     # authored ceiling would fail every narrowed run here, before any provider is reached.

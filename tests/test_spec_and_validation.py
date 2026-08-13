@@ -1187,6 +1187,93 @@ def test_gpu_type_pins_and_unset_stays_auto(capsys) -> None:
     assert capsys.readouterr().err == ""
 
 
+def test_gpu_type_accepts_an_ordered_list_of_acceptable_classes() -> None:
+    """A list narrows allocation to those classes instead of collapsing it to one, so a capacity
+    shortage on the first has somewhere to go. The head stays a single concrete class because every
+    worker and provider submit path reads `gpu.type` as one."""
+    spec = spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", "A100 SXM"]}))
+
+    assert spec.gpu.type == "A100 PCIe"
+    assert spec.gpu.type_fallbacks == ("A100 SXM",)
+    assert spec.gpu.acceptable_types == ("A100 PCIe", "A100 SXM")
+
+    # aliases canonicalize per entry, exactly as the scalar form does.
+    assert spec_from_dict(_raw(**{"gpu.type": [" a100 pcie ", "h100"]})).gpu.acceptable_types == (
+        "A100 PCIe",
+        "H100",
+    )
+    # a one-element list is exactly a scalar pin, fallbacks included (there are none).
+    lone = spec_from_dict(_raw(**{"gpu.type": ["B200"]}))
+    assert (lone.gpu.type, lone.gpu.type_fallbacks) == ("B200", ())
+    assert (
+        lone.gpu.acceptable_types
+        == spec_from_dict(_raw(**{"gpu.type": "B200"})).gpu.acceptable_types
+    )
+    # a repeat asks for nothing the first mention did not, and the FIRST position is preference.
+    assert spec_from_dict(
+        _raw(**{"gpu.type": ["H100", "A100 PCIe", "H100"]})
+    ).gpu.acceptable_types == ("H100", "A100 PCIe")
+
+
+def test_gpu_type_list_rejects_empty_and_unusable_entries() -> None:
+    """Every named class is validated, not just the head: a fallback allocation would never rent is
+    dead weight, and catching it at parse time beats surfacing it once the head runs out."""
+    with pytest.raises(ConfigError, match=r"must not be an empty list"):
+        spec_from_dict(_raw(**{"gpu.type": []}))
+    with pytest.raises(ConfigError, match=r"unsupported gpu"):
+        spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", "Tesla T4"]}))
+    with pytest.raises(ConfigError, match=r"gpu\.type entries must be strings"):
+        spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", 1]}))
+    with pytest.raises(ConfigError, match=r"gpu\.type entries must not be empty"):
+        spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", "  "]}))
+    # the VRAM floor applies to the whole list, so a fallback too small to hold the run is refused.
+    with pytest.raises(ConfigError, match="requires at least"):
+        spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", **{"gpu.type": ["A100 PCIe", "RTX 4090"]}))
+    # and so does provider compatibility.
+    with pytest.raises(ConfigError, match="cannot provision"):
+        spec_from_dict(_raw(**{"gpu.provider": "lambda", "gpu.type": ["H100", "RTX 4090"]}))
+
+
+def test_gpu_type_list_round_trips_through_the_public_payload() -> None:
+    """The public spec carries the AUTHORED spelling. The head/fallbacks split is derived, and the
+    parser rejects `type_fallbacks` as unauthorable, so emitting it would fail the resubmit round
+    trip and emitting only the head would silently drop the failover classes."""
+    from flash.client.specs import spec_payload
+
+    spec = spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", "A100 SXM"]}), run_id="gpu-list")
+    payload = spec_payload(spec)
+
+    assert payload["gpu"]["type"] == ["A100 PCIe", "A100 SXM"]
+    assert "type_fallbacks" not in payload["gpu"]
+
+    reparsed = spec_from_dict(payload, run_id="server-reparse")
+    assert reparsed.gpu.acceptable_types == spec.gpu.acceptable_types
+
+
+def test_authoring_gpu_type_fallbacks_directly_is_rejected() -> None:
+    """`type_fallbacks` is derived from the list form. Accepting both spellings would let a config
+    name a head that contradicts its own fallback list."""
+    raw = _raw()
+    raw["gpu"]["type_fallbacks"] = ["A100 SXM"]
+
+    with pytest.raises(ConfigError, match=r"\[gpu\] unknown key"):
+        spec_from_dict(raw)
+
+
+def test_persisted_gpu_type_fallbacks_are_canonicalized_and_require_a_head() -> None:
+    """The internal boundary re-reads a persisted record on every recovery hop, so an unvalidated
+    fallback would only fail once allocation reached it."""
+    assert _job_from_dict(
+        {"gpu": {"type": "h100", "type_fallbacks": [" a100 pcie "]}}
+    ).gpu.acceptable_types == ("H100", "A100 PCIe")
+    with pytest.raises(ValueError, match=r"unsupported gpu"):
+        _job_from_dict({"gpu": {"type": "H100", "type_fallbacks": ["H10O"]}})
+    with pytest.raises(TypeError, match=r"must be a list of strings"):
+        _job_from_dict({"gpu": {"type": "H100", "type_fallbacks": "A100 PCIe"}})
+    with pytest.raises(ValueError, match=r"requires gpu\.type"):
+        _job_from_dict({"gpu": {"type_fallbacks": ["H100"]}})
+
+
 def test_removed_gpu_pin_key_is_rejected_as_unknown() -> None:
     removed_key = "exact" + "_type"
     raw = _raw()

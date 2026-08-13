@@ -911,12 +911,18 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     assert "walking past the cheapest class" in log.getvalue()
 
 
-def test_pinned_gpu_retry_says_there_is_no_untried_class_left(orch, monkeypatch):
-    """A pinned gpu.type gives the picker a ONE-ENTRY candidate list, so a no_capacity retry
-    re-selects the same unavailable class and burns another full capacity grace on it. That is the
-    right call (never strand a run), but it used to be silent: the walk line only prints when the
-    class CHANGES, so the operator saw two identical attempts and no reason for either. The fix the
-    log has to point at is unpinning gpu.type, not waiting longer."""
+def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_class(
+    orch, monkeypatch
+):
+    """A pinned gpu.type gives the picker a ONE-ENTRY candidate list, so a no_capacity retry used to
+    re-select the same unavailable class and burn another full capacity grace on it -- five times,
+    at 900s each, for up to 75 minutes of wall clock with every attempt guaranteed to fail for the
+    reason the last one did. `no_capacity` is a verdict about the CLASS, not the host, so once the
+    same shape has refused TWICE the market has answered: stop and name the fix.
+
+    Two, not one: `no_capacity` also covers a transient search flake and an exhausted provider pool,
+    and a dry market frees cards, so the second refusal is what separates a blip from a wall (see
+    `test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up`)."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -933,27 +939,101 @@ def test_pinned_gpu_retry_says_there_is_no_untried_class_left(orch, monkeypatch)
     def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         submitted_gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
-        if attempt == 0:
-            return PollResult(
-                False,
-                failure="no_capacity",
-                detail="never scheduled: job stuck IN_QUEUE for 903s",
-            )
-        return PollResult(True, metrics={"train_tokens": 4096})
+        return PollResult(
+            False,
+            failure="no_capacity",
+            detail="never scheduled: job stuck IN_QUEUE for 903s",
+        )
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     spec = _spec(run_id="flash-pinned-gpu-nowalk", type="H200")
     _seed_status(orch, spec)
     log = io.StringIO()
-    orch._submit_seed_supervised(spec, spec.seed, log)
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, log)
 
-    # the retry re-picked the SAME class, so the walk line cannot fire...
+    # TWO submissions, not the budget's five: the class refused, the retry confirmed it, and the
+    # remaining attempts would each have re-asked the settled question at a full capacity grace.
     assert submitted_gpus == ["H200", "H200"]
     out = log.getvalue()
     assert "walking past the cheapest class" not in out
-    # ...and the operator is told why, plus that the pin is what made the list a singleton.
+    # and the operator is pointed at the two things that actually widen the search.
+    assert "every GPU class this run can use is out of capacity" in out
+    assert "drop the gpu.type pin" in out
+    assert 'type = ["A100 PCIe", "A100 SXM"]' in out
+
+
+def test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up(orch, monkeypatch):
+    """One `no_capacity` is a data point, not a verdict, so it must not end the run.
+
+    The label covers a transient search flake and an exhausted provider pool as well as the 900s
+    queue-grace expiry, and capacity that was gone a minute ago comes back. Stopping on the first
+    refusal would convert every momentary shortage into a failed run -- the opposite defect from the
+    75-minute loop, and the more expensive one, because the work is already paid for."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (Candidate("runpod", "H200", 4.0, 141),)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
+
+    submitted_gpus = []
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        if attempt == 0:
+            return PollResult(False, failure="no_capacity", detail="search flaked")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(run_id="flash-pinned-gpu-blip", type="H200")
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert metrics["train_tokens"] == 4096
+    assert submitted_gpus == ["H200", "H200"], "the blip must cost a retry, not the run"
+    assert "every GPU class this run can use is out of capacity" not in log.getvalue()
+
+
+def test_pinned_gpu_still_retries_a_stall_on_the_same_class(orch, monkeypatch):
+    """The capacity stop is narrow ON PURPOSE. A stall is a sick-HOST verdict, not a class one: a
+    fresh box of the same class routinely clears it, which is why the run keeps its full retry budget
+    for everything that is not `no_capacity`."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (Candidate("runpod", "H200", 4.0, 141),)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
+
+    submitted_gpus = []
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        if attempt == 0:
+            return PollResult(False, failure="stalled", detail="no worker progress")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(run_id="flash-pinned-gpu-stall", type="H200")
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert submitted_gpus == ["H200", "H200"]
+    out = log.getvalue()
     assert "no untried class left; re-selecting H200" in out
     assert "gpu.type is pinned" in out
+    assert "every GPU class this run can use is out of capacity" not in out
 
 
 def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monkeypatch):
@@ -1596,7 +1676,7 @@ def test_retry_message_admits_when_the_projected_provider_already_failed(orch, m
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt < 2:
-            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -1643,7 +1723,7 @@ def test_retry_message_does_not_deny_a_provider_that_is_in_the_candidate_list(or
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt < 2:
-            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
+            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)

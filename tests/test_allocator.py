@@ -274,6 +274,77 @@ def test_allocate_gpu_type_never_widens_or_escalates(monkeypatch):
     assert {candidate.gpu for candidate in allocation.candidates} == {"H100"}
 
 
+def test_allocate_gpu_type_fallbacks_widen_the_search_without_dictating_the_winner(monkeypatch):
+    """An ordered pin restricts allocation to the named classes and no others, which is what gives a
+    pinned run somewhere to go when its first class is out of capacity. Order is preference, not
+    priority: the survivors still compete on cost, so naming a class first does not make the run pay
+    more for it."""
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import Candidate
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    monkeypatch.setattr(
+        get_provider("runpod"),
+        "live_candidates",
+        lambda need, constraints: [
+            Candidate("runpod", "RTX 4090", 0.50, 24),
+            Candidate("runpod", "A100 PCIe", 1.19, 80),
+            Candidate("runpod", "H100", 3.29, 80),
+        ],
+    )
+
+    allocation = allocator.allocate(
+        "Qwen/Qwen3.5-0.8B",
+        "grpo",
+        gpu_type="H100",
+        gpu_type_fallbacks=("A100 PCIe",),
+    )
+
+    # only the named classes survive; RTX 4090 is offered and fitting but was not asked for.
+    assert {candidate.gpu for candidate in allocation.candidates} == {"H100", "A100 PCIe"}
+    # and the cheaper of the two wins despite H100 being named first.
+    assert allocation.gpu == "A100 PCIe"
+
+
+def test_allocate_drops_an_unsatisfiable_fallback_but_still_fails_on_the_authored_class(
+    monkeypatch,
+):
+    """Naming alternatives says "any of these will do", so one that cannot be satisfied is dropped
+    rather than failing the run. When NONE can be, the first class's error is the one raised: it is
+    what the author asked for, so its remedy is the one worth acting on."""
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import Candidate, UnsupportedGpuError
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    monkeypatch.setattr(
+        get_provider("runpod"),
+        "live_candidates",
+        lambda need, constraints: [Candidate("runpod", "H100", 3.29, 80)],
+    )
+
+    # RTX 4090 cannot hold an 80 GB run, so it is dropped and the H100 still allocates.
+    allocation = allocator.allocate(
+        "Qwen/Qwen3.5-9B",
+        "grpo",
+        gpu_type="H100",
+        gpu_type_fallbacks=("RTX 4090",),
+        max_gpu_count=1,
+    )
+    assert allocation.gpu == "H100"
+
+    # with every class unsatisfiable the run is unplaceable, and the message names the authored one.
+    with pytest.raises(UnsupportedGpuError, match=r"RTX 4090.*requires at least 80 GB"):
+        allocator.allocate(
+            "Qwen/Qwen3.5-9B",
+            "grpo",
+            gpu_type="RTX 4090",
+            gpu_type_fallbacks=("RTX 5090",),
+            max_gpu_count=1,
+        )
+
+
 def test_allocate_gpu_type_enforces_vram_and_provider_support(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError

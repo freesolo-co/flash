@@ -118,6 +118,28 @@ def _validated_gpu_type(value: Any, *, field_name: str) -> str:
     return canonical
 
 
+def _validated_gpu_type_fallbacks(value: Any, *, head: str) -> tuple[str, ...]:
+    """Canonicalize the alternatives after `gpu.type`, preserving authored order.
+
+    Duplicates are dropped rather than rejected: the same class named twice asks for nothing the
+    first entry did not already ask for, and allocation walks a set. Order is the author's stated
+    preference, so the FIRST occurrence is the one kept.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise TypeError("gpu.type_fallbacks must be a list of strings")
+    seen = {head} if head else set()
+    fallbacks: list[str] = []
+    for entry in value:
+        canonical = _validated_gpu_type(entry, field_name="gpu.type_fallbacks entry")
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        fallbacks.append(canonical)
+    return tuple(fallbacks)
+
+
 def _opt_int(value: Any) -> int | None:
     """Parse optional int; rejects bools (bool is int subclass — int(True)==1 is a footgun)."""
     if value is None:
@@ -373,7 +395,9 @@ class TrainSpec:
 
 @dataclass(frozen=True)
 class GpuSpec:
-    # empty selects managed auto-allocation; a set value hard-pins that validated gpu class.
+    # empty selects managed auto-allocation; a set value restricts allocation to `acceptable_types`
+    # (this class plus `type_fallbacks`), preferred in authored order. a lone `type` is therefore a
+    # hard pin to exactly that class, unchanged.
     type: str = ""
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
@@ -385,10 +409,26 @@ class GpuSpec:
     # number of cards of `type` a single training worker occupies (1..8). count > 1 provisions a
     # multi-gpu pod; the training loop shards across them in the sft/opd multi-gpu paths.
     count: int = 1
+    # the authored alternatives AFTER `type`, when `[gpu] type` was written as an ordered list.
+    # `type` stays a single concrete class because every worker, provider submit path, and endpoint
+    # name reads it as one; only allocation looks at the wider set. empty for a scalar pin.
+    type_fallbacks: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # coerce/validate here so every path (from_dict and direct construction) is guarded.
         object.__setattr__(self, "count", _gpu_count(self.count))
+        object.__setattr__(self, "type_fallbacks", tuple(self.type_fallbacks))
+        if self.type_fallbacks and not self.type:
+            raise ValueError("gpu.type_fallbacks requires gpu.type")
+
+    @property
+    def acceptable_types(self) -> tuple[str, ...]:
+        """Classes allocation may rent, in authored preference order; empty means auto-allocate.
+
+        The single source of "what did the author pin", so a caller never has to remember to union
+        `type` with `type_fallbacks` and accidentally narrow an ordered list back to its head.
+        """
+        return (self.type, *self.type_fallbacks) if self.type else ()
 
 
 # platform-managed [gpu] fields: the runner assigns disk sizing, the shared weight-cache volume, and
@@ -576,6 +616,12 @@ class JobSpec:
         gpu = data["gpu"]
         for managed in MANAGED_GPU_KEYS:
             gpu.pop(managed, None)
+        # an ordered pin round-trips in the AUTHORED spelling -- `type` is the list, and the derived
+        # head/fallbacks split does not appear. the public parser owns that split and rejects
+        # `type_fallbacks` as unauthorable, so emitting it would fail the resubmit round trip.
+        fallbacks = gpu.pop("type_fallbacks", ())
+        if fallbacks:
+            gpu["type"] = [gpu["type"], *fallbacks]
         data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
         # [environment] pip stays in the payload: it is the author's own scorer dependencies, which
         # only they can declare. The submit paths append it to worker_pip_for_env, so what travels
@@ -630,6 +676,13 @@ class JobSpec:
         gpu_type = (
             _validated_gpu_type(gpu_type_raw, field_name="gpu.type") if gpu_type_raw.strip() else ""
         )
+        # an ordered `[gpu] type` list is split by the public parser into a concrete head plus these
+        # fallbacks, so this internal boundary still sees one class per field. every entry is
+        # canonicalized and validated exactly like the head: a persisted record is re-read here on
+        # every recovery hop, and an unvalidated fallback would only fail once allocation reached it.
+        gpu_type_fallbacks = _validated_gpu_type_fallbacks(
+            gpu.get("type_fallbacks", ()), head=gpu_type
+        )
         provider = gpu.get("provider", "")
         if not isinstance(provider, str):
             raise TypeError("gpu.provider must be a string")
@@ -640,10 +693,14 @@ class JobSpec:
 
             if provider and provider not in PROVIDER_NAMES:
                 raise ValueError(f"unknown gpu.provider {provider!r}")
-            if gpu_type and provider and provider not in providers_for(gpu_type):
-                raise ValueError(
-                    f"gpu.provider {provider!r} cannot provision gpu.type {gpu_type!r}"
-                )
+            # every acceptable class has to be provisionable by the pinned provider, not just the
+            # head: a fallback the provider cannot carry is dead weight that would silently narrow
+            # the list back to one class at allocation time.
+            for candidate in (gpu_type, *gpu_type_fallbacks):
+                if candidate and provider and provider not in providers_for(candidate):
+                    raise ValueError(
+                        f"gpu.provider {provider!r} cannot provision gpu.type {candidate!r}"
+                    )
         project_raw = data.get("project", "")
         if not isinstance(project_raw, str):
             raise TypeError("project must be a string")
@@ -707,6 +764,7 @@ class JobSpec:
                 network_volume=gpu.get("network_volume"),
                 network_volume_gb=_volume_gb(gpu.get("network_volume_gb")),
                 count=gpu.get("count", 1),
+                type_fallbacks=gpu_type_fallbacks,
             ),
             run_id=data.get("run_id", "local"),
             thinking=coerce_bool(data.get("thinking", False)),
