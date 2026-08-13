@@ -570,7 +570,6 @@ def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
 
 
 def test_multimodal_algorithm_validation_requires_a_vision_teacher_after_model_validation():
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft", None)
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", None)
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", "qwen3-vl-235b")
     with pytest.raises(
@@ -859,3 +858,66 @@ def test_catalog_image_capability_does_not_change_public_rows():
     assert not supports_image_training("meta-llama/Llama-3.2-1B")
     forbidden = {"modalities", "multimodal", "supports_images", "image_training"}
     assert all(not (forbidden & set(row)) for row in public_model_rows())
+
+
+def test_image_sft_is_rejected_while_image_grpo_and_opd_stay_supported():
+    """The capability gate answers per algorithm, because the answer differs per algorithm.
+
+    The model is image-capable either way -- what sft lacks is a control plane that can tokenize an
+    image row for the mandatory workload profile. Rejecting on the model would take grpo and opd
+    down with it, which is why this is asserted as a three-way split rather than a flag.
+    """
+    with pytest.raises(ValueError, match="image-bearing SFT is not supported"):
+        mm.validate_multimodal_training("Qwen/Qwen3.6-27B", "sft", None)
+
+    mm.validate_multimodal_training("Qwen/Qwen3.6-27B", "grpo", None)
+    mm.validate_multimodal_training("Qwen/Qwen3.6-27B", "opd", "qwen3-vl-235b")
+
+
+def test_image_sft_rejection_names_the_algorithms_that_do_train_on_images():
+    """The remediation has to be in the message: the catalog still calls these models image-capable.
+
+    Without the pointer to grpo/opd a user reads "not supported" as "this model cannot see images"
+    and picks a different checkpoint, which is the wrong fix.
+    """
+    with pytest.raises(ValueError, match="image-bearing SFT is not supported") as excinfo:
+        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft", None)
+
+    message = str(excinfo.value)
+    assert "grpo" in message
+    assert "opd" in message
+    assert "text-only SFT records" in message
+
+
+def test_packaged_image_sft_profiling_reports_the_same_unsupported_message(tmp_path):
+    """One string for one limit, asserted through the path a submission actually takes.
+
+    The profiler rejects image rows before `validate_multimodal_training` is reached on the packaged
+    path, so both sites are reachable and must not describe the limit differently. Asserting the
+    constant alone would pass even if the profiler stopped using it.
+    """
+    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.engine.profiling.dataset_profile import (
+        PackagedDatasetUnavailable,
+        profile_packaged_sft_dataset,
+    )
+
+    package, _image = _package(tmp_path)
+    (package / "environment.py").write_text("", encoding="utf-8")
+    (package / "dataset" / "train.jsonl").write_text(
+        json.dumps({"input": "describe", "output": "red", "image": "dataset/red.png"}) + "\n",
+        encoding="utf-8",
+    )
+    spec = JobSpec(
+        model="Qwen/Qwen3.6-27B",
+        model_revision="a" * 40,
+        algorithm="sft",
+        project="11111111-1111-1111-1111-111111111111",
+        environment=EnvironmentSpec(id=str(package / "environment.py"), resolved_sha="b" * 40),
+        train=TrainSpec(epochs=1),
+    )
+
+    with pytest.raises(PackagedDatasetUnavailable) as excinfo:
+        profile_packaged_sft_dataset(spec, producer_version="1.2.3")
+
+    assert str(excinfo.value) == mm.IMAGE_SFT_UNSUPPORTED

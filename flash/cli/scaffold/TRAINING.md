@@ -815,6 +815,11 @@ explicitly inspect the separated completion, reasoning, or original raw model ou
 
 Pick SFT when you already have good answers and want the model to imitate them.
 
+- **SFT records must be text-only.** Flash quotes every SFT run from a workload profile that
+  tokenizes your exact rows on the control plane, and that measurement cannot process images.
+  An image-bearing SFT record is rejected at submit, and an image in the assistant completion is
+  rejected too. The image-capable models are still image-capable: train them on images with `grpo`
+  or `opd`, whose rollouts tokenize on the GPU worker.
 - **Data quality is the ceiling.** SFT can only be as good as the answers you show it.
   A small set of high-quality examples beats a large mediocre one. Keep response format
   consistent (if you want JSON, _every_ example is JSON) and keep the prompt format the

@@ -487,7 +487,7 @@ def test_control_plane_profile_refuses_image_rows_before_loading_a_processor(
         lambda *_args: (_ for _ in ()).throw(AssertionError("processor loader reached")),
     )
 
-    with pytest.raises(PackagedDatasetUnavailable, match="torch-free control plane"):
+    with pytest.raises(PackagedDatasetUnavailable, match="image-bearing SFT is not supported"):
         profile_packaged_sft_dataset(
             spec,
             producer_version="1.2.3",

@@ -25,6 +25,15 @@ IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
 # the model's real image-expansion token, as opposed to the placeholder above. one definition so
 # the renderer's rejection and the teacher client's drop guard cannot drift apart.
 IMAGE_PAD_TOKEN = "<|image_pad|>"
+# one definition of "image sft is not supported" so the capability gate and the profiler that
+# would otherwise be reached cannot describe the same limit differently. it names the algorithms
+# that DO train on images, because the models themselves are image-capable and the reader's next
+# question is which path to take.
+IMAGE_SFT_UNSUPPORTED = (
+    "image-bearing SFT is not supported. SFT is quoted from a workload profile measured on the "
+    "control plane, which cannot tokenize images. Use text-only SFT records, or train on images "
+    "with grpo or opd."
+)
 
 
 @dataclass(frozen=True)
@@ -619,6 +628,15 @@ def validate_multimodal_training(model_id: str, algorithm: str, teacher_model: s
 
     if not supports_image_training(model_id):
         raise ValueError(f"{model_id} does not support image-bearing training records")
+    if algorithm == "sft":
+        # the control plane must quote every sft run from a workload profile, and profiling
+        # tokenizes the exact rows. an image row needs the vl AutoProcessor and its
+        # `return_tensors="pt"` output, which needs torch -- and the `[server]` extra installs
+        # transformers and pillow but never torch, so the plane raises ImportError rather than
+        # measuring. images are rejected HERE, at the capability gate the other algorithms already
+        # pass through, so the failure names the unsupported combination instead of surfacing as a
+        # profiling-internals error. grpo and opd tokenize on the gpu worker and are unaffected.
+        raise ValueError(IMAGE_SFT_UNSUPPORTED)
     if algorithm == "opd":
         teacher = resolve_teacher(teacher_model)
         if not teacher_supports_images(teacher.alias):

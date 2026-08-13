@@ -23,7 +23,13 @@ _IMAGE_TRAINING_MODELS = frozenset(
 
 
 def supports_image_training(model: str | ModelInfo | None) -> bool:
-    """Return whether a curated model supports image-bearing SFT, GRPO, and OPD."""
+    """Return whether a curated model supports image-bearing GRPO and OPD.
+
+    A property of the MODEL, not of every algorithm. SFT is excluded: it is quoted from a workload
+    profile measured on the control plane, and profiling an image row needs the VL processor's
+    torch output, which the plane cannot produce. `validate_multimodal_training` owns that
+    algorithm rule; this predicate answers only whether the checkpoint can see images at all.
+    """
     model_id = model.id if isinstance(model, ModelInfo) else model
     return bool(model_id and model_id in _IMAGE_TRAINING_MODELS)
 
@@ -452,7 +458,8 @@ MODELS: dict[str, ModelInfo] = {
             gpu_memory_utilization=0.90,
         ),
         thinking="hybrid",
-        notes="Dense 27B multimodal VL checkpoint with image-capable bf16 LoRA training. SFT fits "
+        notes="Dense 27B multimodal VL checkpoint with image-capable bf16 LoRA training on grpo "
+        "and opd; sft trains this model on text-only records. SFT fits "
         "the 80GB A100 (~54GB weights); colocated GRPO needs the B200 (trainer + vLLM rollout = two "
         "~54GB copies). Serves the owned VL-preserving FP8 on an H100 tier (dense, so no MoE expert "
         "LoRA-buffer multiplier).",
