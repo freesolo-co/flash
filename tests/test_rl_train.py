@@ -4683,26 +4683,51 @@ def test_bridge_marks_the_parent_busy_while_a_slow_judge_scores_a_batch():
     assert not observability.reward_grading_in_flight()
 
 
-def test_bridge_marks_the_parent_busy_while_the_env_takes_a_turn():
-    """`env_reply` is parent-side env work the child is BLOCKED on, and it records nothing.
+def test_bridge_marks_the_parent_busy_inside_every_env_hook():
+    """Every env hook is parent-side work the child is BLOCKED on, and none of them record anything.
 
-    A slow tool call or api inside a turn is indistinguishable from a wedge on the child's tail
-    alone, exactly like a slow judge, so it needs the same busy mark. Scoring is not reached at all
-    on this path: the episode is still mid-rollout.
+    A slow tool call or api inside ANY of them is indistinguishable from a wedge on the child's tail
+    alone, exactly like a slow judge, so they all need the same busy mark. Scoring is not reached on
+    this path: the episode is still mid-rollout.
+
+    Asserted hook by hook rather than in aggregate: whichever one is left unwrapped is the one a
+    user's slow implementation will sit in, and a single-hook test passes while the rest are bare.
     """
     observability = RewardObservabilityBuffer()
-    seen = []
+    seen: dict[str, list[bool]] = {}
 
-    class SlowTurnEnv(_BridgeEnv):
+    class ObservingEnv(_BridgeEnv):
+        """each hook reports what the gauge said from INSIDE its own call."""
+
+        def _note(self, hook):
+            seen.setdefault(hook, []).append(observability.reward_grading_in_flight())
+
+        def new_rollout_state(self, example):
+            self._note("new_rollout_state")
+            return super().new_rollout_state(example)
+
+        def record_model_turn(self, state, text):
+            self._note("record_model_turn")
+            return super().record_model_turn(state, text)
+
+        def rollout_done(self, state, max_turns):
+            self._note("rollout_done")
+            return super().rollout_done(state, max_turns)
+
         def env_reply(self, messages, state):
-            seen.append(observability.reward_grading_in_flight())
+            self._note("env_reply")
             return super().env_reply(messages, state)
 
-    bridge = _bridge(SlowTurnEnv(done_after=99), grading=observability.grading)
+    bridge = _bridge(ObservingEnv(done_after=99), grading=observability.grading)
     bridge.start({"index": 0, "session_id": "a"})
     bridge.step({"session_id": "a", "completion_text": "answer"})
 
-    assert seen == [True], "the parent was not marked busy while the env took its turn"
+    for hook in ("new_rollout_state", "record_model_turn", "rollout_done", "env_reply"):
+        assert seen.get(hook), f"{hook} never ran, so this asserts nothing about it"
+        assert all(seen[hook]), (
+            f"the parent was not marked busy inside {hook}; a slow user implementation there "
+            "would read as child silence and the watchdog would kill a healthy run"
+        )
     assert not observability.reward_grading_in_flight()
 
 

@@ -154,7 +154,10 @@ class MultiTurnBridge:
             reaped = self._reap_abandoned_sessions()
             if session_id in self._sessions:
                 raise KeyError(f"duplicate multi-turn session {session_id}")
-            state = self._env.new_rollout_state(example)
+            # user code the child blocks on, same as the hooks in `step`: an env that builds its
+            # episode from a slow api spends that time here, recording nothing.
+            with self._grading():
+                state = self._env.new_rollout_state(example)
             # new_rollout_state calls start_episode again after dataset preparation. adopt the dataset's
             # prompt so randomized envs do not generate for episode a and score episode b; keep the
             # remaining state created by the env.
@@ -196,16 +199,18 @@ class MultiTurnBridge:
                     "content": str(payload.get("completion_text") or ""),
                 }
                 return {"terminal": True, "messages": []}
-            self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
-            if self._env.rollout_done(state, self._max_turns):
-                return {"terminal": True, "messages": []}
-            # the env's turn reply is parent-side work the child is BLOCKED on, and it records
-            # nothing: a slow tool call or api here looks exactly like a wedge to the tail alone.
-            # marked busy for the same reason scoring is, and equally inside the lock so a thread
-            # queued behind someone else's slow turn does not report itself as working.
+            # every env hook here is parent-side work the child is BLOCKED on, and none of them
+            # record anything: a slow tool call or api in ANY of them looks exactly like a wedge to
+            # the tail alone. `env_reply` is the usual offender, but `record_model_turn` and
+            # `rollout_done` run the same user code on the same critical path. marked busy for the
+            # same reason scoring is, and equally inside the lock so a thread queued behind someone
+            # else's slow turn does not report itself as working.
             with self._grading():
+                self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
+                if self._env.rollout_done(state, self._max_turns):
+                    return {"terminal": True, "messages": []}
                 replies = self._env.env_reply(list(state.get("messages") or ()), state)
-            terminal = bool(self._env.rollout_done(state, self._max_turns))
+                terminal = bool(self._env.rollout_done(state, self._max_turns))
         return {
             "terminal": terminal,
             "messages": [
