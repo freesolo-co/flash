@@ -85,10 +85,13 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "model": spec.get("model") if isinstance(spec.get("model"), str) else None,
         "algorithm": spec.get("algorithm") if isinstance(spec.get("algorithm"), str) else None,
         "phase": spec.get("phase") if isinstance(spec.get("phase"), str) else None,
-        # via the head reader, so an ordered pin reports its first-preference class. the bare
-        # isinstance(str) guard silently sent `null` for the list spelling, dropping GPU attribution
-        # on exactly the queued-status report that runs before allocation stamps `allocated_gpu`.
-        "gpuType": persisted_gpu_head(spec) or None,
+        # the class actually rented, falling back to the authored head only before allocation
+        # stamps one. reading the spec alone was already lossy (a policy GPU can be reallocated)
+        # and an ordered pin makes it wrong outright, since the allocator ranks the acceptable
+        # classes on cost-per-step and may rent a fallback rather than the head. the bare
+        # isinstance(str) guard also sent `null` for the list spelling, dropping GPU attribution
+        # entirely on the queued-status report.
+        "gpuType": (status.remote or {}).get("allocated_gpu") or persisted_gpu_head(spec) or None,
         "costUsd": status.cost_usd,
         "realizedCostUsd": status.realized_cost_usd,
         "adapterRef": status.to_dict().get("adapter_ref"),
