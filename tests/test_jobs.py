@@ -900,6 +900,92 @@ def test_a_worker_that_stays_placed_does_not_renew_its_setup_budget_forever(monk
     )
 
 
+def test_one_flaky_job_status_does_not_prove_a_worker_grant(monkeypatch):
+    # The grant latch must be an allowlist of statuses that PROVE the job left the queue, never
+    # `!= "IN_QUEUE"` -- that shape also matches None and any unrecognized string, so a single flaky
+    # job_status response would permanently "prove" a grant on a job RunPod never scheduled. The
+    # queued-wait exemption would then drop, and a genuine capacity wait would die as `stalled`
+    # instead of `no_capacity`, losing the weight-cache fallback that only `no_capacity` triggers.
+    #
+    # `flash/providers/artifacts/preload_runpod.py` hit this first; its comment warns against
+    # exactly this pattern.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    reads = {"n": 0}
+
+    def job_status(_eid, _jid, **_kw):
+        reads["n"] += 1
+        # never granted -- except one garbled reading partway through.
+        if reads["n"] == 3:
+            return {"status": "SOMETHING_WEIRD"}
+        return {"status": "IN_QUEUE"}
+
+    monkeypatch.setattr(runpod_api, "job_status", job_status)
+    monkeypatch.setattr(
+        runpod_api, "endpoint_health_for_fingerprint", lambda *a, **k: {"workers": {}}
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        deadline_at=500_000.0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "no_capacity", (
+        f"a never-granted job reported {res.failure!r} after one unrecognized status; only an "
+        f"allowlisted status may prove a grant ({res.detail})"
+    )
+
+
+def test_a_current_attempt_heartbeat_proves_a_grant_on_the_reattach_path(monkeypatch):
+    # Reattach starts with `ever_saw_worker` false and, if RunPod already requeued the job before
+    # recovery attached, never gets to observe the earlier IN_PROGRESS. With health also unreadable
+    # the job looked never-granted: exempt from the stall check forever, then reported `no_capacity`
+    # despite a heartbeat for THIS attempt proving a worker ran and wrote it.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+
+    def dead_health(_eid, _fp, **_kw):
+        raise RuntimeError("health endpoint unavailable")
+
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", dead_health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    # one setup heartbeat for the current attempt (attempt 0), then silence: the worker ran, wrote
+    # it, and was taken away. `stage` non-None with a None step keeps this pre-training, so the
+    # setup grace (not the training limit) is the one that must bound the wait.
+    beats = iter([{"stage": "setup", "step": None, "ts": 100.0, "attempt": 0}])
+
+    def heartbeat_reader():
+        return next(beats, None)
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=heartbeat_reader,
+        deadline_at=500_000.0,
+        current_attempt=0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", (
+        f"a job with a current-attempt heartbeat reported {res.failure!r}; the heartbeat proves a "
+        f"worker ran, so this is a lost worker, not absent capacity ({res.detail})"
+    )
+
+
 def test_a_requeued_job_that_already_ran_is_not_reported_as_no_capacity(monkeypatch):
     # `ever_saw_worker` was latched only from endpoint-health snapshots, which go quiet whenever the
     # health endpoint is unreachable (`_probe_worker_coming_up_at` swallows the error, and the

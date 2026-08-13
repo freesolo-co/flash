@@ -34,6 +34,13 @@ from flash.providers.runpod.serverless import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+# Job statuses that PROVE RunPod took the job out of the queue and therefore granted it a worker.
+# Kept as an allowlist because the complement (`!= "IN_QUEUE"`) also matches None and any status
+# this code does not recognise, which would let one flaky reading stand in as proof of a grant.
+_GRANT_PROVING_STATUSES = frozenset(
+    {"IN_PROGRESS", "COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}
+)
+
 
 @dataclass
 class _DeployContext:
@@ -544,6 +551,12 @@ def _update_heartbeat(context: _PollContext, state: _PollState) -> None:
     if hb_attempt != context.current_attempt:
         # non-current heartbeat: ignore so stale progress never tightens the stall window.
         return
+    # a heartbeat for THIS attempt was written by a worker that ran, so it proves a grant on its own.
+    # that matters on the reattach path: recovery starts with `ever_saw_worker` false and, if the job
+    # was already requeued before attaching, never gets to observe the earlier IN_PROGRESS. with
+    # health also unreadable the job would look never-granted, stay exempt from the stall check, and
+    # finally be reported `no_capacity` despite having demonstrably run.
+    state.ever_saw_worker = True
     if hb_attempt > state.last_hb_attempt:
         # fresh attempt: reset ts baseline and re-derive seen_training_hb so cold-start grace rearms.
         state.last_hb_attempt = hb_attempt
@@ -695,12 +708,18 @@ def poll_job(
         if provider_status is None:
             continue
         status = provider_status.get("status")
-        if status is not None and status != "IN_QUEUE":
+        if status in _GRANT_PROVING_STATUSES:
             # leaving the queue proves RunPod granted a worker, whatever health says. the two
             # health-derived latch sites go quiet when the health endpoint is unreachable (both
             # swallow their errors), and RunPod can requeue a job that already ran -- which would
             # otherwise leave the requeued job looking never-granted, exempt from the setup-stall
             # check forever.
+            #
+            # an allowlist, never `!= "IN_QUEUE"`: that shape also matches None and any unrecognized
+            # string, so a single flaky job_status response would permanently "prove" a grant, drop
+            # the queued-wait exemption, and let a genuine capacity wait die as `stalled` -- losing
+            # the weight-cache fallback that only `no_capacity` triggers. `preload_runpod.py` hit
+            # this first and its comment warns against exactly this pattern.
             state.ever_saw_worker = True
         if status != state.last_status:
             say(f"job {handle.job_id}: {status}")
