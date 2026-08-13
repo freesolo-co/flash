@@ -18,9 +18,11 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import sys
 import time
 import types
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -212,8 +214,8 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
             # Transient by the client's own rules. Backing off rather than hammering a backend that
             # is plainly still warming up. Same compute-then-sleep order as the tail of the loop; a
             # timed-out request carries no response and so no `Retry-After`.
-            attempt += 1
             delay = _readback_delay(attempt)
+            attempt += 1
             time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             continue
         if deadline - time.monotonic() <= 0:
@@ -244,8 +246,16 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
         # the sleep applied the PREVIOUS response's delay: a first `Retry-After: 2` was answered
         # with a 0.5s sleep here and a 2s one there. Near the deadline that lets the suite make a
         # poll the real client never would and certify a backend the client cannot drive.
-        attempt += 1
+        #
+        # And computed with the CURRENT `attempt`, incrementing after -- not with the incremented
+        # one. The client counts reads and backs off on `attempt - 1`, so its first no-header sleep
+        # is 0.5s and its second 1s; computing on the post-increment value here started at 1s and
+        # stayed one step ahead forever. That is the same defect as the ordering above, in the same
+        # direction: fewer polls inside one budget than the client makes, so a revision that goes
+        # ready late is seen by a real deploy and missed here. `Retry-After` short-circuits before
+        # the exponent, so only the no-header path drifted.
         delay = _readback_delay(attempt, retry_after)
+        attempt += 1
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
     pytest.fail(
         f"revision {revision} never reached ready within {timeout}s (last state {last!r}). "
@@ -354,6 +364,64 @@ def test_the_readiness_backoff_still_matches_the_client():
             f"the mirrored readiness backoff disagrees with the client for "
             f"attempt={attempt} retry_after={retry_after!r}"
         )
+
+
+def test_the_readiness_backoff_is_driven_through_the_same_attempt_sequence(monkeypatch):
+    """Sharing the helper is not enough; the two loops must FEED it the same attempts.
+
+    The guard above compares `_readback_delay` against the client's copy for a fixed set of
+    arguments, and that is blind to the defect this test exists for: both loops can hold identical
+    constants and an identical clamp while passing different `attempt` values, and the mirrored
+    backoff is then wrong at every poll. Which is what happened -- the client counts reads and
+    backs off on `attempt - 1`, this suite briefly computed on the post-increment value, and its
+    first no-header sleep was 1s against the client's 0.5s and stayed one step ahead.
+
+    Recorded as ARGUMENTS rather than as delays, deliberately. `tests/conftest.py` zeroes the
+    backoff constants so the offline suite does not sleep, so comparing sleep durations would
+    compare 0.0 with 0.0 and pass for any sequence at all.
+
+    Takes no live fixtures, so it runs in CI where every `--serving-url` test skips.
+    """
+    from flash.serve import deploy
+
+    class _Response:
+        status_code = 404
+        headers: ClassVar[dict[str, str]] = {}
+        text = ""
+
+    class _Stop(Exception):
+        """Ends a loop that would otherwise poll until its budget expires."""
+
+    def _recorder(into: list[int]):
+        def _delay(attempt: int, retry_after: str | None = None) -> float:
+            into.append(attempt)
+            if len(into) >= 5:
+                raise _Stop
+            return 0.0  # no real sleeping; the sequence is what is under test
+
+        return _delay
+
+    suite_attempts: list[int] = []
+    monkeypatch.setattr(
+        sys.modules[__name__], "_readback_delay", _recorder(suite_attempts), raising=True
+    )
+    with pytest.raises(_Stop):
+        _wait_ready(types.SimpleNamespace(get=lambda *a, **k: _Response()), "rev", timeout=30.0)
+
+    client_attempts: list[int] = []
+    monkeypatch.setattr(deploy, "_readback_delay", _recorder(client_attempts), raising=True)
+    monkeypatch.setattr(
+        deploy, "_registered_adapter_response", lambda *a, **k: (None, _Response()), raising=True
+    )
+    with pytest.raises(_Stop):
+        deploy._wait_revision_ready("rev", None, budget_s=30.0)
+
+    assert suite_attempts == client_attempts, (
+        f"the suite backs off through attempts {suite_attempts} where the client uses "
+        f"{client_attempts}. the delays are computed by the same helper, so a different sequence "
+        f"means a different backoff at every poll -- and a suite that sleeps longer polls fewer "
+        f"times inside one budget, missing a revision the client would have seen go ready"
+    )
 
 
 def test_healthz_advertises_the_required_capabilities(http):
