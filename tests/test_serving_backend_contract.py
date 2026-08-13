@@ -28,6 +28,7 @@ from flash.serve.backend.generate import render_app
 
 pytest.importorskip("fastapi")
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 REVISION = "run-abc@step-10." + "a" * 40
@@ -4293,4 +4294,111 @@ def test_undeploy_repairs_a_partial_index_left_by_an_older_version(client):
     assert module.adapter_records[module._record_key(legacy)]["status"] == "disabled", (
         "undeploy answered 200 while a legacy sibling stayed `ready` -- it is still resident on "
         "the gpu and directly callable by its immutable id, so the run keeps serving after delete"
+    )
+
+
+def test_a_later_undeploy_retries_an_eviction_a_dead_rpc_left_unfinished(client):
+    """A claim stranded by a dead eviction RPC must be released by the next undeploy.
+
+    `Engine.unregister` releases the durable `loraid:` claim only on a confirmed eviction, and
+    `disabled_revisions` holds only what the current pass transitioned -- so a revision whose RPC
+    died on an earlier DELETE is never re-dispatched by a later one. The claim then outlives the
+    run and refuses any future adapter that collides on those 31 bits, for the life of the app.
+    The `cache_reclaim_pending` marker is the only trace of that revision, so it drives the retry.
+    """
+    module = client.app.state.generated_module
+    run_id = "restrand-retry"
+    revision = f"{run_id}@final." + "9" * 40
+    int_id = module._lora_int_id(revision)
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "revision", "lifecycle_state": "ready"},
+    }
+    module.adapter_records[module._record_key(run_id)] = {
+        "adapter_id": run_id,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "alias", "alias_of": revision},
+    }
+    module.adapter_records[module._members_key(run_id)] = [run_id, revision]
+    module.adapter_records[module._lora_id_key(int_id)] = revision
+    module.runners.count = 1
+
+    async def _rpc_dies(adapter_id):
+        raise RuntimeError("connection reset mid unregister")
+
+    module.engine_methods["unregister"] = _rpc_dies
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) == revision, (
+        "precondition: the dead rpc must leave the claim held, since releasing without a "
+        "confirmed eviction is what the claim exists to prevent"
+    )
+
+    # The next undeploy, with a healthy engine. The revision is already `disabled`, so only its
+    # marker can put it back in reach.
+    retried: list[str] = []
+
+    async def _rpc_works(adapter_id):
+        retried.append(adapter_id)
+        await module._release_lora_int_id(module._lora_int_id(adapter_id), adapter_id)
+        return {"ok": True}
+
+    module.engine_methods["unregister"] = _rpc_works
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+
+    assert revision in retried, (
+        "the later undeploy never re-dispatched the eviction for a revision an earlier dead rpc "
+        "left disabled, so nothing ever releases its claim"
+    )
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) is None, (
+        "the stranded claim is still held after a healthy undeploy, so a future adapter colliding "
+        "on those 31 bits is refused by a ghost for the life of the app"
+    )
+
+
+def test_a_lock_conflict_while_marking_does_not_fail_the_undeploy(client, monkeypatch):
+    """Marking is best effort; a contended run lock must not turn it into a failed DELETE.
+
+    `_mark_cache_reclaim_pending` and `_mark_lora_release_pending` both take the run lock, which
+    answers `409` when another operation on the run holds it. Awaiting either unguarded aborts a
+    DELETE whose records are ALREADY disabled -- the client sees a failure for an undeploy that
+    durably happened -- and skips the `reclaimable` append that was this call's own recovery.
+    """
+    module = client.app.state.generated_module
+    run_id = "mark-contention"
+    revision = f"{run_id}@final." + "c" * 40
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "revision", "lifecycle_state": "ready"},
+    }
+    module.adapter_records[module._record_key(run_id)] = {
+        "adapter_id": run_id,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "alias", "alias_of": revision},
+    }
+    module.adapter_records[module._members_key(run_id)] = [run_id, revision]
+    module.runners.count = 1
+
+    async def _rpc_dies(adapter_id):
+        raise RuntimeError("connection reset mid unregister")
+
+    async def _mark_conflicts(adapter_id):
+        raise HTTPException(409, f"another operation on {run_id} is in progress")
+
+    module.engine_methods["unregister"] = _rpc_dies
+    monkeypatch.setattr(module, "_mark_cache_reclaim_pending", _mark_conflicts)
+    monkeypatch.setattr(module, "_mark_lora_release_pending", _mark_conflicts)
+    module.discarded.clear()
+
+    response = client.delete(f"/adapters/{run_id}")
+
+    assert response.status_code == 200, (
+        f"a contended run lock during a best-effort mark failed the undeploy with "
+        f"{response.status_code}, but the records are already disabled -- the client is told the "
+        f"undeploy failed for a run that is durably down"
+    )
+    assert revision in module.discarded, (
+        "the failed mark also skipped the reclaim append, so the download is stranded even though "
+        "the two recoveries are independent"
     )

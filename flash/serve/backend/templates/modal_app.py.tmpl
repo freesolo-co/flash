@@ -357,6 +357,63 @@ async def _discard_cached_adapter(adapter_id: str) -> None:
             await asyncio.to_thread(shutil.rmtree, directory)
 
 
+async def _mark_lora_release_pending(adapter_id: str) -> None:
+    """Flag a disabled revision whose durable claim a failed eviction could not release.
+
+    A SEPARATE marker from `cache_reclaim_pending`, because the two recoveries finish at different
+    times. A successful disk reclaim clears the cache marker -- correctly, there is nothing left to
+    collect -- and if the claim rode on that same flag, clearing it erased the only trace that an
+    int id is still held by a revision resident nowhere. The claim is released only on a confirmed
+    eviction inside `Engine.unregister`, so nothing else would ever retry it and the id would refuse
+    a future collider for the life of the app.
+
+    Same re-read-under-the-lock discipline as the cache marker, and for the same reason: the caller
+    has usually already committed and released this record, so a blind put would undo whatever
+    landed since, and a revision re-registered in the meantime owns its claim legitimately.
+    """
+    record = await adapter_records.get.aio(_record_key(adapter_id))
+    if not isinstance(record, dict) or record.get("status") != "disabled":
+        return
+    run_id = (record.get("metadata") or {{}}).get("run_id") or adapter_id
+    async with _run_lock(run_id):
+        current = await adapter_records.get.aio(_record_key(adapter_id))
+        if not isinstance(current, dict) or current.get("status") != "disabled":
+            return
+        current["metadata"] = {{
+            **(current.get("metadata") or {{}}),
+            "lora_release_pending": True,
+        }}
+        await adapter_records.put.aio(_record_key(adapter_id), current)
+
+
+async def _clear_lora_release_pending(adapter_id: str) -> None:
+    """Drop the claim marker once an eviction round trip has completed.
+
+    Only after `Engine.unregister` RETURNED. It releases the claim when it still owns it and is a
+    no-op when it does not, so a completed call means there is nothing left for a later undeploy to
+    retry; leaving the marker would make every subsequent DELETE re-dispatch an eviction forever.
+
+    Re-read under the run lock and only for a record still `disabled`, matching the marker's own
+    discipline: a revision re-registered in the meantime owns its claim legitimately, and rewriting
+    its record from a stale copy would undo whatever its registration landed.
+    """
+    record = await adapter_records.get.aio(_record_key(adapter_id))
+    if not isinstance(record, dict):
+        return
+    run_id = (record.get("metadata") or {{}}).get("run_id") or adapter_id
+    async with _run_lock(run_id):
+        current = await adapter_records.get.aio(_record_key(adapter_id))
+        if not isinstance(current, dict) or current.get("status") != "disabled":
+            return
+        metadata = current.get("metadata") or {{}}
+        if not metadata.get("lora_release_pending"):
+            return
+        current["metadata"] = {{
+            key: value for key, value in metadata.items() if key != "lora_release_pending"
+        }}
+        await adapter_records.put.aio(_record_key(adapter_id), current)
+
+
 async def _mark_cache_reclaim_pending(adapter_id: str) -> None:
     """Flag a disabled revision's download for a later undeploy to collect.
 
@@ -1647,6 +1704,9 @@ def api():
         # response: they were disabled by an earlier call, so reporting them here would tell the
         # client this undeploy disabled something it did not.
         reclaimable: list[str] = []
+        # Revisions a previous undeploy disabled but could not finish evicting -- their marker is
+        # the only trace, and the claim they still hold is released nowhere else.
+        restranded: list[str] = []
         # Repair BEFORE the lock, because the scan is unbounded and the lease is not renewable.
         #
         # Unioning `adapter_id` into the members below is not enough on its own: flash's client
@@ -1759,6 +1819,22 @@ def api():
                             and candidate["adapter_id"] not in reclaimable
                         ):
                             reclaimable.append(candidate["adapter_id"])
+                        if metadata.get("lora_release_pending"):
+                            # Re-dispatched for EVICTION, a different recovery from the disk one
+                            # above and tracked by its own marker. A warm `Engine.unregister` whose
+                            # RPC died left the durable `loraid:` claim held by a revision resident
+                            # nowhere, and nothing else retries it: the claim is released only on a
+                            # confirmed eviction inside `unregister`, and this branch is the one
+                            # path that revisits an already-disabled revision. Without the
+                            # re-dispatch the claim outlives the run and refuses any future adapter
+                            # colliding on those 31 bits for the life of the app.
+                            #
+                            # Safe to repeat against a revision that has nothing resident:
+                            # `unregister` re-reads the record, finds it still `disabled`, and its
+                            # `_owns_lora_int_id` check makes the release a no-op when the claim is
+                            # already gone or has since been taken by somebody else.
+                            if candidate["adapter_id"] not in restranded:
+                                restranded.append(candidate["adapter_id"])
                         continue
                     candidate["status"] = "disabled"
                     candidate["metadata"] = {{**metadata, "lifecycle_state": "disabled"}}
@@ -1821,8 +1897,13 @@ def api():
         # of paid GPU time against the 30-minute request timeout, to remove an adapter that is not
         # loaded anywhere. A container that starts later loads from the durable records, which are
         # already `disabled`, so it never brings the adapter back.
-        if disabled_revisions and await _engine_is_warm():
-            for revision_id in disabled_revisions:
+        # `restranded` joins the dispatch: those are revisions an EARLIER undeploy disabled but
+        # could not finish evicting, so they carry a marker and still hold their claim. They are
+        # not in `disabled_revisions` -- that list holds only what THIS pass transitioned -- so
+        # without unioning them here nothing ever retries their eviction.
+        evictable = list(dict.fromkeys([*disabled_revisions, *restranded]))
+        if evictable and await _engine_is_warm():
+            for revision_id in evictable:
                 try:
                     await engine.unregister.remote.aio(revision_id)
                 except Exception:  # gpu eviction is best effort, never fails an undeploy
@@ -1840,9 +1921,34 @@ def api():
                     # reclaim below plus the next undeploy's `reclaimable` sweep both key off that
                     # marker. Appending here as well retries the disk in THIS call rather than
                     # waiting for a DELETE that may never come.
-                    await _mark_cache_reclaim_pending(revision_id)
+                    #
+                    # The mark is SUPPRESSED, like every other mark site, and the append happens
+                    # whether or not it landed. `_mark_cache_reclaim_pending` takes the run lock,
+                    # which raises `HTTPException(409)` on contention -- so an unguarded await here
+                    # aborts a DELETE whose records are already disabled, turning a best-effort
+                    # eviction failure into a failed undeploy, and skips the append that was this
+                    # call's own recovery. The two are independent: the append retries the disk
+                    # now, the marker is what a LATER delete keys off, and a failure in either must
+                    # not cancel the other.
+                    with contextlib.suppress(Exception):  # marking is itself best effort
+                        await _mark_cache_reclaim_pending(revision_id)
+                    # BOTH markers, because the two recoveries finish independently. The disk can
+                    # be reclaimed by the deferred pass below -- which clears the cache marker on
+                    # success -- while the claim is still held, since only a confirmed eviction
+                    # inside `Engine.unregister` releases it. Riding the claim on the cache marker
+                    # let a successful reclaim erase the only trace that the id was still taken.
+                    with contextlib.suppress(Exception):
+                        await _mark_lora_release_pending(revision_id)
                     if revision_id not in reclaimable:
                         reclaimable.append(revision_id)
+                else:
+                    # Cleared only on a round trip that actually returned. `unregister` releases
+                    # the claim when it owns it and is a no-op when it does not, so either way
+                    # there is nothing left for a later undeploy to retry -- and leaving the marker
+                    # would make every subsequent DELETE re-dispatch an eviction for a revision
+                    # that is already done with.
+                    with contextlib.suppress(Exception):
+                        await _clear_lora_release_pending(revision_id)
         else:
             # The COLD counterpart, and it is not optional. `Engine.unregister` is the only
             # successful-undeploy path that releases the durable `loraid:` claim, so skipping it
@@ -1869,7 +1975,7 @@ def api():
             # stays outside it. That keeps the "no unbounded work under a non-renewable lease"
             # invariant intact.
             async with _run_lock(run_id):
-                for revision_id in disabled_revisions:
+                for revision_id in evictable:
                     # The DOWNLOAD, not only the claim. The warm branch reclaims the disk as part
                     # of `Engine.unregister`; skipping the engine skipped that too, so a cold
                     # undeploy of a healthy run left its directory on the volume with nothing that
