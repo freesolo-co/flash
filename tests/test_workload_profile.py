@@ -129,7 +129,12 @@ def test_content_digest_covers_every_measured_field() -> None:
     contract never moved. Nothing is authorized off them: they only choose whether a warning prints.
     """
     base = _profile()
-    provenance = {"created_at", "authored_reasoning_turns", "rendered_reasoning_spans"}
+    provenance = {
+        "created_at",
+        "authored_reasoning_turns",
+        "rendered_reasoning_spans",
+        "truncated_reasoning_spans",
+    }
 
     for name in SftWorkloadProfile.__dataclass_fields__:
         if name in provenance:

@@ -210,9 +210,15 @@ def _print_reasoning_loss_warning(status: object) -> None:
     if isinstance(rendered, bool) or not isinstance(rendered, int):
         return
     rows = profile.get("retained_examples")
+    truncated = profile.get("truncated_reasoning_spans")
     message = rendered_reasoning_loss_warning(
         authored_turns=authored,
         rendered_spans=rendered,
+        # absent on a profile from an older producer, where the two causes were not yet separated.
+        # zero reads as "none were truncated", which is the pre-split behaviour.
+        truncated_spans=truncated
+        if isinstance(truncated, int) and not isinstance(truncated, bool)
+        else 0,
         rows=rows if isinstance(rows, int) and not isinstance(rows, bool) else 0,
     )
     if not message:

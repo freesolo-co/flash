@@ -16,8 +16,10 @@ ROLLOUT_PROFILE_KINDS = ("grpo", "opd")
 # absent from identity. old cached profiles use a different identity shape, so reject them and
 # re-profile. 5 serializes the reasoning-loss counts so the submitting client can render that
 # warning; they are digest-free, but `from_dict` requires an exact field set, so a profile cached
-# under 4 cannot be rebuilt and has to re-profile.
-WORKLOAD_PROFILE_SCHEMA_VERSION = 5
+# under 4 cannot be rebuilt and has to re-profile. 6 adds truncated_reasoning_spans, splitting
+# cap-truncated reasoning out from template-stripped reasoning so the warning names the right
+# remedy; same exact-field-set reason a 5 profile cannot be rebuilt.
+WORKLOAD_PROFILE_SCHEMA_VERSION = 6
 # 2 lets a gdn hybrid pack when the installed stack proves it can reset example boundaries, where 1
 # always answered exact-unpacked. the same config therefore resolves to a different packing_mode and
 # examples_per_update, so a profile cached under 1 quotes a step count this policy would not: it has
@@ -55,19 +57,40 @@ def sft_sample_policy(max_examples: object) -> str:
     return SFT_SAMPLE_POLICY_PREFIX if cap > 0 else SFT_SAMPLE_POLICY_FULL
 
 
-# a <think> span carrying actual reasoning. the closing tag is required and the body must hold a
-# non-space character: the thinking template emits `<think>\n\n</think>` on a trailing assistant
-# turn that authored no reasoning, and counting that as surviving reasoning would report 100%
-# survival for a transcript whose reasoning was entirely stripped.
-#
-# the body may not cross either delimiter. a plain `\s*\S.*?` body lets the required non-space
-# character be the `<` of the closing tag, so two ADJACENT EMPTY blocks -- what consecutive
-# trailing assistant turns render -- merge into one match and count as a survivor. that failure
-# lands exactly on the transcript that lost the most, which is the one this must not miss.
-_NON_EMPTY_THINK = re.compile(
-    r"<think>(?:(?!</think>|<think>).)*?\S(?:(?!</think>|<think>).)*?</think>",
-    re.DOTALL,
-)
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+_THINK_DELIMITER = re.compile(f"{_THINK_OPEN}|{_THINK_CLOSE}")
+
+
+def reasoning_spans(text: str) -> list[tuple[int, int]]:
+    """``(start, end)`` of each NON-EMPTY ``<think>`` span in rendered text, outermost only.
+
+    Non-empty because Qwen3.5's template opens a ``<think>`` block on every trailing assistant turn
+    whether or not that turn authored reasoning: a transcript whose reasoning was entirely stripped
+    still renders one EMPTY block, and counting it would score full survival for the exact case
+    this measurement exists to catch.
+
+    Scanned rather than matched by regex because reasoning can CONTAIN a balanced
+    ``<think>...</think>`` -- a turn reasoning about the tag format -- and the template renders that
+    verbatim inside the outer block. No regular expression tracks that nesting: it either ends the
+    span at the inner closer, understating where the block really ends, or lets an unguarded body
+    run through a closing tag and merge two adjacent empty blocks into a phantom survivor. Depth
+    counting gets both right, and the outermost span is the one the template treats as this turn's
+    reasoning.
+    """
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    start = 0
+    for match in _THINK_DELIMITER.finditer(text):
+        if match.group() == _THINK_OPEN:
+            if depth == 0:
+                start = match.start()
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0 and text[start + len(_THINK_OPEN) : match.start()].strip():
+                spans.append((start, match.end()))
+    return spans
 
 
 # why a run resolved to `exact-unpacked`, keyed by the architecture label the packing decision
@@ -168,12 +191,17 @@ def _reasoning_body_offset(text: str) -> int | None:
     ``</think>``, over the whole concatenated message text. Stamping the first opener instead puts
     the marker outside the block the template keeps whenever an extra opener precedes the real one,
     and the marker then never reaches the render -- reporting a drop for reasoning that survived.
+
+    An OPENER-LESS ``reasoned</think>answer`` is reasoning too. The prompt supplies the opening tag,
+    so a sampled completion carries only the close, and ``flash.serve.thinking`` recognises the same
+    shape. Requiring a balanced pair would score such a turn as authoring nothing, leaving it out of
+    the denominator and understating -- or entirely suppressing -- the warning.
     """
-    close = text.find("</think>")
-    if close < 0:
+    close = text.find(_THINK_CLOSE)
+    if close < 0 or not text[:close].strip():
         return None
-    open_at = text.rfind("<think>", 0, close)
-    return None if open_at < 0 else open_at + len("<think>")
+    open_at = text.rfind(_THINK_OPEN, 0, close)
+    return 0 if open_at < 0 else open_at + len(_THINK_OPEN)
 
 
 def _marked_inline_reasoning(content: object, marker: str) -> object:
@@ -255,7 +283,7 @@ def reasoning_span_end_offsets(text: str) -> list[int]:
     A truncated row keeps a rendered span only when the whole block fits inside the retained
     tokens, so the caller needs where each span ENDS to compare against the cap.
     """
-    return [match.end() for match in _NON_EMPTY_THINK.finditer(text)]
+    return [end for _start, end in reasoning_spans(text)]
 
 
 def reasoning_span_texts(text: str) -> list[str]:
@@ -264,7 +292,7 @@ def reasoning_span_texts(text: str) -> list[str]:
     Paired positionally with ``reasoning_span_end_offsets`` of the UNMARKED render: the marked text
     says which turn owns each span, the real text says where that span ends.
     """
-    return _NON_EMPTY_THINK.findall(text)
+    return [text[start:end] for start, end in reasoning_spans(text)]
 
 
 def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:
@@ -277,7 +305,13 @@ def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:
     * the same span inside ``[{"type": "text", "text": ...}]`` content blocks, which
       ``flash.content.multimodal.text_only_prompt_messages`` flattens for rendering;
     * a separate ``reasoning_content`` field, which the template reads in preference to an inline
-      span.
+      span;
+    * an opener-less ``reasoned</think>answer``, the shape a completion sampled against a
+      prompt-supplied opening tag carries.
+
+    Inline detection asks ``_reasoning_body_offset`` -- the same rule that places the marker -- so a
+    shape counted as authored is always a shape that can be marked. Were the two to disagree, the
+    turn would enter the denominator with no way to prove it survived, and report a false drop.
     """
     turns = 0
     for message in messages:
@@ -287,7 +321,7 @@ def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:
         if isinstance(reasoning, str) and reasoning.strip():
             turns += 1
             continue
-        if _NON_EMPTY_THINK.search(_message_text(message.get("content"))):
+        if _reasoning_body_offset(_message_text(message.get("content"))) is not None:
             turns += 1
     return turns
 
@@ -300,7 +334,7 @@ def count_rendered_reasoning_spans(text: str) -> int:
     transcript whose reasoning was entirely stripped still renders one EMPTY block and would score
     as one surviving block instead of zero -- the exact case the warning exists to catch.
     """
-    return len(_NON_EMPTY_THINK.findall(text))
+    return len(reasoning_spans(text))
 
 
 def rendered_reasoning_loss_warning(
@@ -308,29 +342,51 @@ def rendered_reasoning_loss_warning(
     authored_turns: int,
     rendered_spans: int,
     rows: int,
+    truncated_spans: int = 0,
 ) -> str | None:
-    """One user-facing line when the chat template drops authored reasoning at render time.
+    """One user-facing line when authored reasoning does not reach the loss.
 
     Qwen3.5's template keeps reasoning only on assistant turns AFTER the last real user query and
     strips it from earlier history, so a K-turn gold transcript delivers roughly 1/K of its
     reasoning to the loss. Nothing else reports this: the rendered text is what trains, the stored
     messages were never wrong, and ``flash env test`` passes either way.
 
+    Reasoning can also be lost a second way, with the OPPOSITE remedy: the template renders the
+    block but ``max_context_tokens`` cuts it off the end of the row. Telling that user to split
+    their transcript would be wrong advice for a dataset whose structure is fine, so the two causes
+    are counted separately and each names its own fix. ``rendered_spans`` counts what the template
+    kept; ``truncated_spans`` is how many of those the cap then removed.
+
     Silent when nothing was authored (the existing thinking-mode check owns that case) and when
     everything survived. Reports the measurement rather than a fixed threshold: any drop is real
     lost supervision, and the count is exact rather than sampled.
     """
-    if authored_turns <= 0 or rendered_spans >= authored_turns:
+    if authored_turns <= 0:
         return None
-    lost = authored_turns - rendered_spans
+    stripped = authored_turns - rendered_spans
+    if stripped <= 0 and truncated_spans <= 0:
+        return None
+    reaching = rendered_spans - truncated_spans
+    causes = []
+    if stripped > 0:
+        causes.append(
+            f"the chat template dropped {stripped} of {authored_turns} authored reasoning blocks "
+            "-- it keeps <think> only on assistant turns after the last user message and strips it "
+            "from earlier history, so a multi-turn transcript trains on a fraction of its reasoning "
+            "and on a tag layout inference never produces. split each K-turn transcript into K "
+            "single-turn rows, so every turn's reasoning sits in the final assistant target where "
+            "the template keeps it"
+        )
+    if truncated_spans > 0:
+        causes.append(
+            f"max_context_tokens cut {truncated_spans} rendered reasoning "
+            f"{'block' if truncated_spans == 1 else 'blocks'} off the end of the row -- the "
+            "template kept these, so raise max_context_tokens or shorten the rows rather than "
+            "restructuring the transcript"
+        )
     return (
-        f"the chat template dropped {lost} of {authored_turns} authored reasoning blocks across "
-        f"{rows} SFT rows; only {rendered_spans} reach the loss "
-        f"({rendered_spans / authored_turns:.0%}). this template keeps <think> only on assistant "
-        "turns after the last user message and strips it from earlier history, so a multi-turn "
-        "transcript trains on a fraction of its reasoning and on a tag layout inference never "
-        "produces. split each K-turn transcript into K single-turn rows, so every turn's reasoning "
-        "sits in the final assistant target where the template keeps it."
+        f"{'; '.join(causes)}. across {rows} SFT rows, {reaching} of {authored_turns} authored "
+        f"reasoning blocks reach the loss ({reaching / authored_turns:.0%})."
     )
 
 
@@ -489,6 +545,7 @@ class SftWorkloadProfile:
     # would fire the drift warning on a run whose billing contract never moved.
     authored_reasoning_turns: int = field(default=0, compare=False)
     rendered_reasoning_spans: int = field(default=0, compare=False)
+    truncated_reasoning_spans: int = field(default=0, compare=False)
     schema_version: int = WORKLOAD_PROFILE_SCHEMA_VERSION
     kind: str = SFT_PROFILE_KIND
     # unix seconds stamped by the control-plane profile producer. 0.0 on worker recomputation.
@@ -531,6 +588,7 @@ class SftWorkloadProfile:
             "authoritative_steps": self.authoritative_steps,
             "authored_reasoning_turns": self.authored_reasoning_turns,
             "rendered_reasoning_spans": self.rendered_reasoning_spans,
+            "truncated_reasoning_spans": self.truncated_reasoning_spans,
         }
         for name, value in counts.items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -612,6 +670,7 @@ class SftWorkloadProfile:
             # the quote without the counts entering the frozen contract
             "authored_reasoning_turns": int(self.authored_reasoning_turns),
             "rendered_reasoning_spans": int(self.rendered_reasoning_spans),
+            "truncated_reasoning_spans": int(self.truncated_reasoning_spans),
             "content_digest": self.content_digest,
         }
 

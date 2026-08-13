@@ -927,9 +927,14 @@ def test_a_truncated_row_does_not_claim_reasoning_the_cap_removed(capsys) -> Non
     assert prepared.profile.retained_examples == 1
     assert prepared.profile.truncated_examples == 1
     assert prepared.authored_reasoning_turns == 2
-    # so it claims no survivors, rather than the 1 the untruncated render showed
-    assert prepared.rendered_reasoning_spans == 0
-    assert "dropped 2 of 2 authored reasoning blocks" in capsys.readouterr().err
+    # the template kept one block and stripped the other; the cap then cut the one it kept, so
+    # nothing reaches the loss -- but the two causes stay separate because the remedies differ
+    assert prepared.rendered_reasoning_spans == 1
+    assert prepared.truncated_reasoning_spans == 1
+    err = capsys.readouterr().err
+    assert "the chat template dropped 1 of 2 authored reasoning blocks" in err
+    assert "max_context_tokens cut 1 rendered reasoning block" in err
+    assert "0 of 2 authored reasoning blocks reach the loss" in err
 
 
 def test_a_reasoned_assistant_turn_in_the_prompt_does_not_cancel_a_surviving_target_block(
@@ -1017,9 +1022,75 @@ def test_an_earlier_surviving_block_is_not_reported_lost_when_a_later_one_is_tru
     )
 
     assert prepared.authored_reasoning_turns == 2
-    # the first block fits and is supervised; only the second is cut away by the cap
+    # the template kept BOTH (they are consecutive trailing turns); the cap then cut only the
+    # second, so exactly one block reaches the loss and the remedy named is the cap, not splitting
+    assert prepared.rendered_reasoning_spans == 2
+    assert prepared.truncated_reasoning_spans == 1
+    err = capsys.readouterr().err
+    assert "max_context_tokens cut 1 rendered reasoning block" in err
+    assert "1 of 2 authored reasoning blocks reach the loss" in err
+    assert "the chat template dropped" not in err
+
+
+def test_reasoning_containing_a_balanced_tag_is_measured_to_its_real_end(capsys) -> None:
+    """A span's end is the OUTER closer, even when the reasoning quotes a balanced pair inside it.
+
+    A turn reasoning about the tag format renders `<think>start <think>x</think> rest</think>`.
+    Reading the span as ending at the INNER closer would place its end well before the real one, so
+    a cap falling between the two would call a cut block retained and overstate what reaches the
+    loss. Here the cap sits past the inner closer but before the outer one.
+    """
+    completion = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "start <think>x</think> " + "rest " * 12,
+        }
+    ]
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=40, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        ThinkingEnvironment(completion),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    assert prepared.authored_reasoning_turns == 1
     assert prepared.rendered_reasoning_spans == 1
-    assert "dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
+    # measured to the outer closer, so the cap is correctly seen to cut it
+    assert prepared.truncated_reasoning_spans == 1
+    assert "max_context_tokens cut 1 rendered reasoning block" in capsys.readouterr().err
+
+
+def test_reasoning_sampled_without_an_opening_tag_still_counts_as_authored(capsys) -> None:
+    """``reasoned</think>answer`` is reasoning: the PROMPT supplied the opening tag.
+
+    ``flash/serve/thinking.py`` recognises the same shape. Requiring a balanced pair would leave
+    such a turn out of the authored denominator entirely, so an early turn whose reasoning the
+    template strips would be lost with nothing reporting it.
+    """
+    completion = [
+        {"role": "assistant", "content": "early reasoning</think>a1"},
+        {"role": "user", "content": "next"},
+        {"role": "assistant", "content": "<think>late</think>a2"},
+    ]
+    prepared = _thinking_prepared(completion)
+
+    # both turns authored reasoning, and the opener-less one is the turn the template strips
+    assert prepared.authored_reasoning_turns == 2
+    assert prepared.rendered_reasoning_spans == 1
+    assert prepared.truncated_reasoning_spans == 0
+    assert "the chat template dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -1174,6 +1245,8 @@ def test_an_image_rows_visual_tokens_are_charged_against_the_reasoning_cap() -> 
     )
 
     # the block closes 40 characters into the text render, well inside the 200-token cap, but the
-    # image's 180 visual tokens are charged first and leave it past the end of the supervised span
+    # image's 180 visual tokens are charged first and leave it past the end of the supervised span.
+    # the template rendered it, so the loss is attributed to the CAP, not to the transcript shape
     assert prepared.authored_reasoning_turns == 1
-    assert prepared.rendered_reasoning_spans == 0
+    assert prepared.rendered_reasoning_spans == 1
+    assert prepared.truncated_reasoning_spans == 1

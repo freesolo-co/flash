@@ -49,6 +49,7 @@ class PreparedSftWorkload:
     coerced_singleturn_targets: int
     authored_reasoning_turns: int
     rendered_reasoning_spans: int
+    truncated_reasoning_spans: int
 
 
 def _serialize_multimodal_inputs(values: dict) -> bytes:
@@ -265,7 +266,7 @@ class _TokenizedSftRows:
     sampled_texts: list[str]
     multiturn_targets: int
     coerced_singleturn_targets: int
-    reasoning_by_index: dict[int, tuple[int, int]]
+    reasoning_by_index: dict[int, _RowReasoning]
     dropped: int
 
 
@@ -275,6 +276,7 @@ class _RetainedSftRows:
     untruncated_lengths: list[int]
     authored_reasoning_turns: int
     rendered_reasoning_spans: int
+    truncated_reasoning_spans: int
     dropped: int
 
 
@@ -318,6 +320,21 @@ def _encoded_length(tokenizer, text: str) -> int:
     return len(ids)
 
 
+@dataclass(frozen=True)
+class _RowReasoning:
+    """One row's reasoning accounting, with the two causes of loss kept apart.
+
+    They have opposite remedies: reasoning the TEMPLATE dropped is fixed by splitting a K-turn
+    transcript into K single-turn rows, while reasoning the CAP cut is fixed by raising
+    ``max_context_tokens``. Folding both into one survivor count makes the warning prescribe
+    restructuring for a dataset whose only problem is that the row is too long.
+    """
+
+    authored_turns: int
+    rendered_spans: int
+    truncated_spans: int
+
+
 def _row_reasoning(
     prompt_messages: list[dict],
     completion_messages: list[dict],
@@ -326,7 +343,7 @@ def _row_reasoning(
     render: Callable[[list[dict]], str],
     tokenizer,
     max_length: int,
-) -> tuple[int, int]:
+) -> _RowReasoning:
     """One row's (authored reasoning turns, reasoning spans that survive into the SUPERVISED span).
 
     Survival is answered by IDENTITY, not by counting: the row is rendered a second time with each
@@ -359,7 +376,7 @@ def _row_reasoning(
     if not authored:
         # nothing authored means nothing to lose, and the marked render would equal the full one.
         # skipped rather than rendered so a dataset with no reasoning pays nothing for this check.
-        return 0, 0
+        return _RowReasoning(0, 0, 0)
     ends = reasoning_span_end_offsets(full_text)
     prefix = reasoning_marker_prefix(full_text)
     marked_spans = reasoning_span_texts(
@@ -369,12 +386,16 @@ def _row_reasoning(
         # marking changed the span sequence, so the two renders no longer address the same spans.
         # unreachable by construction; treated as "cannot tell" rather than guessed at, because a
         # wrong survivor count here silently mis-states how much reasoning reaches the loss.
-        return authored, 0
-    survivors = 0
+        return _RowReasoning(authored, 0, 0)
+    rendered = 0
+    truncated = 0
     for span, end in zip(marked_spans, ends, strict=True):
-        if prefix in span and _encoded_length(tokenizer, full_text[:end]) <= max_length:
-            survivors += 1
-    return authored, survivors
+        if prefix not in span:
+            continue  # the template dropped this turn's reasoning before the cap ever applied
+        rendered += 1
+        if _encoded_length(tokenizer, full_text[:end]) > max_length:
+            truncated += 1
+    return _RowReasoning(authored, rendered, truncated)
 
 
 def _tokenize_prompt_rows(
@@ -404,7 +425,7 @@ def _tokenize_prompt_rows(
     # lose their whole completion to the cap are dropped below, and folding their reasoning into a
     # running total would report loss from rows the run never trains on against a retained-row
     # denominator. summed after filtering instead.
-    reasoning_by_index: dict[int, tuple[int, int]] = {}
+    reasoning_by_index: dict[int, _RowReasoning] = {}
 
     def render_transcript(messages: list[dict]) -> str:
         return tokenizer.apply_chat_template(
@@ -525,6 +546,7 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
     retained_untruncated: list[int] = []
     authored_reasoning = 0
     rendered_reasoning = 0
+    truncated_reasoning = 0
     dropped = tokenized.dropped
     for row_index in sorted(tokenized.row_by_index):
         row = tokenized.row_by_index[row_index]
@@ -536,9 +558,11 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
             # summed here for the same reason, so the reasoning-loss warning describes the rows the
             # run trains on. a dropped row contributes neither its authored reasoning nor its
             # survivors, which would otherwise be reported against a retained-row denominator.
-            row_authored, row_rendered = tokenized.reasoning_by_index.get(row_index, (0, 0))
-            authored_reasoning += row_authored
-            rendered_reasoning += row_rendered
+            row_reasoning = tokenized.reasoning_by_index.get(row_index)
+            if row_reasoning is not None:
+                authored_reasoning += row_reasoning.authored_turns
+                rendered_reasoning += row_reasoning.rendered_spans
+                truncated_reasoning += row_reasoning.truncated_spans
         else:
             dropped += 1
     if not rows:
@@ -551,6 +575,7 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
         untruncated_lengths=retained_untruncated,
         authored_reasoning_turns=authored_reasoning,
         rendered_reasoning_spans=rendered_reasoning,
+        truncated_reasoning_spans=truncated_reasoning,
         dropped=dropped,
     )
 
@@ -682,7 +707,44 @@ def _build_sft_profile(
         sample_policy=sft_sample_policy(max_examples),
         authored_reasoning_turns=retained.authored_reasoning_turns,
         rendered_reasoning_spans=retained.rendered_reasoning_spans,
+        truncated_reasoning_spans=retained.truncated_reasoning_spans,
     )
+
+
+def _print_workload_warnings(
+    profile: SftWorkloadProfile,
+    retained: _RetainedSftRows,
+    *,
+    batch_size: object,
+) -> None:
+    """Emit the pre-allocation warnings a finished run's metrics would report too late.
+
+    Both run for the control-plane estimate and again on the training worker, so they land in both
+    logs -- before a GPU is paid for, while the config or dataset can still be changed.
+    """
+    # one example per update instead of the authored batch is an optimization-semantics change
+    # whose only other trace is `notes["packing"]` in the finished run's metrics, which is not
+    # visible until after the run is paid for. pass the authored batch_size rather than
+    # `effective_batch`: the helper resolves None to the same recipe default but keeps the value's
+    # source, so an omitted knob is not reported to the user as one they configured.
+    warning = unpacked_batch_warning(
+        packing_mode=profile.packing_mode,
+        architecture_mode=profile.architecture_mode,
+        examples_per_update=profile.examples_per_update,
+        configured_batch_size=batch_size,
+    )
+    if warning:
+        print(f"warning: [train] {warning}", file=sys.stderr)
+    # every retained row is counted rather than sampled, so a cheap row cannot hide an expensive
+    # one, and dropped rows are excluded so the figures describe what the run actually trains on.
+    reasoning_warning = rendered_reasoning_loss_warning(
+        authored_turns=retained.authored_reasoning_turns,
+        rendered_spans=retained.rendered_reasoning_spans,
+        truncated_spans=retained.truncated_reasoning_spans,
+        rows=len(retained.rows),
+    )
+    if reasoning_warning:
+        print(f"warning: [train] {reasoning_warning}", file=sys.stderr)
 
 
 def prepare_sft_workload(
@@ -797,32 +859,7 @@ def prepare_sft_workload(
         measurements=measurements,
         horizon=horizon,
     )
-    # one example per update instead of the authored batch is an optimization-semantics change
-    # whose only other trace is `notes["packing"]` in the finished run's metrics, which is not
-    # visible until after the run is paid for. this function runs for the control-plane estimate and
-    # again on the training worker, so the warning lands in both logs. pass the authored batch_size
-    # rather than `effective_batch`: the helper resolves None to the same recipe default but keeps the
-    # value's source, so an omitted knob is not reported to the user as one they configured.
-    warning = unpacked_batch_warning(
-        packing_mode=profile.packing_mode,
-        architecture_mode=profile.architecture_mode,
-        examples_per_update=profile.examples_per_update,
-        configured_batch_size=train_spec.batch_size,
-    )
-    if warning:
-        print(f"warning: [train] {warning}", file=sys.stderr)
-    # emitted from here rather than the training worker so it reaches the estimate too: by the time
-    # the worker logs it the gpu is already allocated, and the whole point is to let the user
-    # restructure the dataset before paying for a run that trains on a fraction of its reasoning.
-    # every retained row is counted rather than a sample, so a cheap row cannot hide an expensive
-    # one, and dropped rows are excluded so the figures describe what the run actually trains on.
-    reasoning_warning = rendered_reasoning_loss_warning(
-        authored_turns=retained.authored_reasoning_turns,
-        rendered_spans=retained.rendered_reasoning_spans,
-        rows=len(retained.rows),
-    )
-    if reasoning_warning:
-        print(f"warning: [train] {reasoning_warning}", file=sys.stderr)
+    _print_workload_warnings(profile, retained, batch_size=train_spec.batch_size)
     return PreparedSftWorkload(
         rows=retained.rows,
         profile=profile,
@@ -834,4 +871,5 @@ def prepare_sft_workload(
         coerced_singleturn_targets=tokenized.coerced_singleturn_targets,
         authored_reasoning_turns=retained.authored_reasoning_turns,
         rendered_reasoning_spans=retained.rendered_reasoning_spans,
+        truncated_reasoning_spans=retained.truncated_reasoning_spans,
     )
