@@ -1337,9 +1337,9 @@ def _save_steps_inputs(monkeypatch, *, save_at_steps=None, save_every=None, max_
 
 
 def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
-    # verl only saves when global_step % save_freq == 0, so it cannot hit an arbitrary set directly.
-    # the gcd is the largest interval every required step divides, so verl writes a superset of the
-    # checkpoints and the uploader publishes deployables at exactly the requested ones.
+    # periodic saves land only when global_step % save_freq == 0, so they cannot hit an arbitrary set
+    # directly. the gcd is the largest interval every required step divides, so verl writes a superset
+    # of the checkpoints and the uploader publishes deployables at exactly the requested ones.
     inp = _save_steps_inputs(monkeypatch, save_at_steps=(10, 25, 100))
     assert inp["save_freq"] == 5
     assert inp["save_at_steps"] == (10, 25, 100)
@@ -1348,10 +1348,22 @@ def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
 
 
 def test_save_freq_falls_back_to_save_every_without_exact_steps(monkeypatch):
-    # no exact steps: periodic saves are preserved on the customer's own interval.
+    # a long run preserves the customer's interval, so the clamp never increases normal frequency.
     inp = _save_steps_inputs(monkeypatch, save_every=15)
+    assert inp["steps"] == 100
     assert inp["save_freq"] == 15
     assert inp["save_at_steps"] == ()
+
+
+def test_short_derived_horizon_clamps_save_freq_to_the_final_step(monkeypatch):
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(example_count=800),
+        train={"max_examples": 800, "epochs": 1, "prompts_per_step": 64},
+    )
+    assert inp["steps"] == 13
+    assert inp["save_freq"] == 13
+    assert inp["steps"] % inp["save_freq"] == 0
 
 
 def test_save_steps_reach_the_horizon_they_were_validated_against(monkeypatch):
@@ -3845,7 +3857,7 @@ def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
 # each test pins one rejection message so deleting a guard cannot pass via another raise.
 
 
-def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
+def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None, example_count=8):
     """a minimal single-turn text env, optionally flipped to a shape verl grpo handles differently.
 
     ``image_uri`` must be a source the normalizer accepts offline (a data uri): a remote https url
@@ -3862,7 +3874,7 @@ def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
             self.max_turns = 3 if multi_turn else 0
 
         def dataset(self):
-            return [{"index": i} for i in range(8)]
+            return [{"index": i} for i in range(example_count)]
 
         # the four calls the multi-turn bridge drives an env through. defined unconditionally so a
         # test can delete one and assert the capability gate catches it.

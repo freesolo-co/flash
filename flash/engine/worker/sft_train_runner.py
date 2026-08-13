@@ -356,7 +356,11 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     update_horizon = data.profile.authoritative_steps
     validate_save_steps(options.save_at_steps, update_horizon)
     loop_epochs = max(options.epochs, math.ceil(update_horizon / steps_per_epoch))
-    save_freq = reduce(gcd, options.save_at_steps) if options.save_at_steps else options.save_every
+    save_freq = (
+        reduce(gcd, options.save_at_steps)
+        if options.save_at_steps
+        else max(1, min(options.save_every, update_horizon))
+    )
 
     card_vram_gb = float(options.gpu_probe.get("memory_gb") or 0.0)
     raw_capability = options.gpu_probe.get("capability")
