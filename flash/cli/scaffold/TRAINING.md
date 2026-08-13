@@ -1197,6 +1197,52 @@ every hook call. That is correct whether the episode ended by succeeding, by an 
 done, or by hitting the cap, and it also means concurrent rollouts sharing one environment
 instance cannot corrupt each other.
 
+### `messages` already ends with the turn you are being asked to apply
+
+Replaying the transcript is the right pattern, but it has one sharp edge worth stating
+explicitly, because getting it wrong produces an environment that looks healthy and trains
+on nothing.
+
+In `step_episode(example, messages, assistant_response)`, the action to apply arrives in
+`assistant_response`, and `messages[-1]` is **that same turn, already appended**. The worker
+records the model's turn onto the transcript first, then steps the environment with the full
+list. The two arguments describe one action, not two.
+
+So a replaying environment must stop before the final message, and take the newest action
+from `assistant_response`:
+
+```python
+def step_episode(self, example, messages, assistant_response):
+    state = self.initial_state(example)
+    # every assistant turn EXCEPT the newest: messages[-1] is assistant_response
+    for message in messages[:-1]:
+        if message["role"] == "assistant":
+            state = self.apply(state, message["content"])
+    state = self.apply(state, assistant_response)   # the newest action, exactly once
+    ...
+```
+
+Replaying all of `messages` and then applying `assistant_response` again double-applies every
+action. How loudly that fails depends entirely on the action: if applying an action twice is
+not the same as applying it once, you tend to notice quickly. If it **is** the same, you do
+not notice at all. Any toggle, any parity or XOR update, any set insert, any idempotent write
+absorbs the duplicate silently, and the episode simply never advances: the terminal condition
+is never reached, `done` never fires, and every rollout burns the full turn cap.
+
+That failure is invisible to the usual checks. `flash env test` can report `overall: PASS`
+with every contract check green, because it does not require a gold trajectory to terminate,
+only to outscore a junk answer, and a partially-credited stuck episode clears that bar. Your
+own unit tests can miss it too, in the opposite direction: a test that calls `step_episode`
+directly with `messages[:-1]` is exercising a call shape the trainer never produces, so it
+passes on an environment training cannot solve.
+
+The reliable signal is the turn count, not the verdict. Check that a gold trajectory both
+terminates and takes the number of turns it should: an episode that always runs to the cap on
+a task with a short known solution is the symptom, and a `PASS` beside it does not make it
+less wrong. Drive that check through the real rollout path (`flash env test`, or the loader
+plus the adapter hooks) rather than by calling `step_episode` yourself, so the convention
+under test is the one training uses.
+
 **Measure efficiency against each example's own optimum, not the turn budget.** A reward
 like `1 - turns_taken / max_turns` makes perfect play unreachable: an example whose best
 solution needs 5 turns caps at `1 - 5/12 = 0.58` even when played perfectly, so "perfect
