@@ -160,6 +160,79 @@ def _error_for_status(status_code: int) -> str | None:
     return f"upstream returned status {status_code}" if _is_error_status(status_code) else None
 
 
+def _build_trace_record(
+    context: _UpstreamRequestContext,
+    *,
+    output_payload: Any,
+    error: str | None,
+    output_truncated: bool,
+    usage: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    duration_ms = max(0, round((time.perf_counter() - context.started_at) * 1000))
+    input_sanitization = _SanitizationFlag()
+    output_sanitization = _SanitizationFlag()
+    sanitized_output = _sanitize_for_trace(
+        output_payload, context.secrets, response=True, flag=output_sanitization
+    )
+    sanitized_usage = _sanitize_for_trace(usage, context.secrets, response=True)
+    sanitized_input = _sanitize_for_trace(context.body, context.secrets, flag=input_sanitization)
+    prompt_tokens, completion_tokens = _usage_tokens(
+        sanitized_output if sanitized_output is not None else {"usage": sanitized_usage}
+    )
+    truncated_sides = [
+        side
+        for side, truncated in (
+            ("input", input_sanitization.hit),
+            ("output", output_truncated or output_sanitization.hit),
+        )
+        if truncated
+    ]
+    span = TraceSpan(
+        name="chat.completions",
+        provider=context.provider,
+        model=_sanitize_for_trace(context.model, context.secrets),
+        duration_ms=duration_ms,
+        input_tokens=prompt_tokens,
+        output_tokens=completion_tokens,
+        input_payload=sanitized_input,
+        output_payload=sanitized_output,
+        attributes={"payload_truncated": truncated_sides} if truncated_sides else None,
+        status_code="ERROR" if error else "OK",
+        error=_sanitize_for_trace(error, context.secrets) if error else None,
+    )
+    metadata = {
+        "source": "recording_proxy",
+        "route": context.provider,
+        "tags": _sanitize_for_trace(context.metadata or {}, context.secrets),
+    }
+    return metadata, {"spans": [span]}
+
+
+def _store_trace_record(
+    context: _UpstreamRequestContext,
+    *,
+    project_id: str,
+    output_payload: Any,
+    error: str | None,
+    output_truncated: bool,
+    usage: Any,
+) -> None:
+    metadata, record = _build_trace_record(
+        context,
+        output_payload=output_payload,
+        error=error,
+        output_truncated=output_truncated,
+        usage=usage,
+    )
+    store_trace(
+        key_id=context.key_id,
+        project_id=project_id,
+        trace_title="chat.completions",
+        metadata=metadata,
+        **record,
+    )
+
+
 def _is_event_stream(response: httpx.Response) -> bool:
     """Whether a streamed response's body is actually SSE.
 
@@ -184,52 +257,14 @@ async def _record_trace(
     if not context.record_trace or context.project_id is None:
         return
     try:
-        duration_ms = max(0, round((time.perf_counter() - context.started_at) * 1000))
-        input_sanitization = _SanitizationFlag()
-        output_sanitization = _SanitizationFlag()
-        sanitized_output = _sanitize_for_trace(
-            output_payload, context.secrets, response=True, flag=output_sanitization
-        )
-        sanitized_usage = _sanitize_for_trace(usage, context.secrets, response=True)
-        sanitized_input = _sanitize_for_trace(
-            context.body, context.secrets, flag=input_sanitization
-        )
-        prompt_tokens, completion_tokens = _usage_tokens(
-            sanitized_output if sanitized_output is not None else {"usage": sanitized_usage}
-        )
-        truncated_sides = [
-            side
-            for side, truncated in (
-                ("input", input_sanitization.hit),
-                ("output", output_truncated or output_sanitization.hit),
-            )
-            if truncated
-        ]
-        span = TraceSpan(
-            name="chat.completions",
-            provider=context.provider,
-            model=_sanitize_for_trace(context.model, context.secrets),
-            duration_ms=duration_ms,
-            input_tokens=prompt_tokens,
-            output_tokens=completion_tokens,
-            input_payload=sanitized_input,
-            output_payload=sanitized_output,
-            attributes={"payload_truncated": truncated_sides} if truncated_sides else None,
-            status_code="ERROR" if error else "OK",
-            error=_sanitize_for_trace(error, context.secrets) if error else None,
-        )
-        metadata = {
-            "source": "recording_proxy",
-            "route": context.provider,
-            "tags": _sanitize_for_trace(context.metadata or {}, context.secrets),
-        }
         await run_in_threadpool(
-            store_trace,
-            key_id=context.key_id,
+            _store_trace_record,
+            context,
             project_id=context.project_id,
-            trace_title="chat.completions",
-            metadata=metadata,
-            spans=[span],
+            output_payload=output_payload,
+            error=error,
+            output_truncated=output_truncated,
+            usage=usage,
         )
     except Exception:
         # the provider call already happened and the caller was already billed, so failing the
@@ -352,7 +387,7 @@ async def _stream_response(
                             if accumulator.received or accumulator.has_error
                             else None
                         )
-                        if error is None and accumulator.received and not accumulator.terminal:
+                        if error is None and not accumulator.terminal:
                             error = "upstream stream ended before completion"
                         # a defect outranks a clean finish: a stream can drop a fragment or carry
                         # an error envelope and still deliver `[DONE]`, which would otherwise
@@ -370,7 +405,10 @@ async def _stream_response(
                     )
     if not client_disconnected and done_gate is not None:
         if context.record_failed:
-            yield b": freesolo-record-failed\n\n"
+            comment = b": freesolo-record-failed\n"
+            if not done_gate.done_event_has_relayed_prefix:
+                comment += b"\n"
+            yield comment
         if done_gate.done_event is not None:
             yield done_gate.done_event
     elif not client_disconnected and context.record_failed:

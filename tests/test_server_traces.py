@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 import time
 from collections.abc import AsyncIterator
 from typing import ClassVar
@@ -643,6 +644,33 @@ def test_done_gate_accepts_bare_cr_and_preserves_split_crlf() -> None:
     split_forwarded.extend(split_gate.feed(b"\n"))
     split_forwarded.extend(split_gate.finish())
     assert b"".join(split_forwarded) == b'data: {"choices":[]}\r\n\r\n'
+
+
+def test_sse_accumulator_discards_unterminated_data_event_at_eof() -> None:
+    event = b'data: {"choices":[{"index":0,"delta":{"content":"GHOST"},"finish_reason":"stop"}]}\n'
+    accumulator = trace_sse.SseAccumulator()
+
+    accumulator.feed(event)
+    accumulator.finish()
+
+    assert accumulator.received is False
+    assert accumulator.terminal is False
+    assert accumulator.output()["choices"] == []
+    assert accumulator.defect == "stream ended with an unterminated data event"
+
+
+def test_sse_accumulator_dispatches_blank_line_terminated_control() -> None:
+    event = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"GHOST"},"finish_reason":"stop"}]}\n\n'
+    )
+    accumulator = trace_sse.SseAccumulator()
+
+    accumulator.feed(event)
+    accumulator.finish()
+
+    assert accumulator.output()["choices"][0]["message"]["content"] == "GHOST"
+    assert accumulator.terminal is True
+    assert accumulator.defect is None
 
 
 def test_sse_accumulator_accepts_bare_cr_and_preserves_split_crlf() -> None:
@@ -1516,9 +1544,14 @@ def test_sse_accumulator_assembles_multiline_data_events(
     accumulator.feed(event)
     accumulator.finish()
 
-    assert accumulator.defect is None
-    assert accumulator.output()["choices"][0]["message"]["content"] == "world"
-    assert accumulator.terminal is True
+    if terminated:
+        assert accumulator.defect is None
+        assert accumulator.output()["choices"][0]["message"]["content"] == "world"
+        assert accumulator.terminal is True
+    else:
+        assert accumulator.defect == "stream ended with an unterminated data event"
+        assert accumulator.output()["choices"] == []
+        assert accumulator.terminal is False
 
     bounded = trace_sse.SseAccumulator(max_accumulated_bytes=10)
     bounded.feed(b"data: 12345\ndata: 67890")
@@ -1554,6 +1587,47 @@ def test_streaming_client_disconnect_before_any_event_records_no_output(
     ).json()
     assert records["records"] == []
     assert records["skipped"] == 1
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [[], [b'data: {"choices":[],"usage":{"prompt_tokens":3}}\n\n']],
+    ids=["empty", "usage-only"],
+)
+def test_unterminated_stream_without_choices_is_recorded_as_incomplete(
+    trace_api, monkeypatch, chunks: list[bytes]
+) -> None:
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(chunks)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == "upstream stream ended before completion"
+    assert span["output_payload"] is None
+
+
+def test_a_completed_empty_stream_remains_ok(trace_api, monkeypatch) -> None:
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody([b"data: [DONE]\n\n"])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "OK"
+    assert span["error"] is None
+    assert span["output_payload"] is None
 
 
 def test_streamed_trace_stops_accumulating_at_done(trace_api, monkeypatch) -> None:
@@ -2650,6 +2724,36 @@ def test_a_reply_with_text_and_tool_calls_is_not_exported_as_text_only(
 
     assert export["records"] == []
     assert export["skipped"] == 1
+
+
+@pytest.mark.parametrize(
+    ("action_key", "action"),
+    [("tool_calls", {}), ("function_call", "")],
+    ids=["tool-calls-dict", "function-call-string"],
+)
+def test_a_wrong_typed_action_container_is_not_exported_as_text(
+    action_key: str, action: object
+) -> None:
+    response = _reply_envelope("partial")
+    response["choices"][0]["finish_reason"] = "stop"
+    response["choices"][0]["message"][action_key] = action
+
+    assert platform_traces._chat_reply(response) is None
+
+
+@pytest.mark.parametrize(
+    ("tool_calls", "expected"),
+    [([], "ok"), ([{"id": "call-1", "type": "function"}], None)],
+    ids=["empty-list", "real-tool-call"],
+)
+def test_tool_call_action_controls_remain_distinct(
+    tool_calls: list[dict], expected: str | None
+) -> None:
+    response = _reply_envelope("ok")
+    response["choices"][0]["finish_reason"] = "stop"
+    response["choices"][0]["message"]["tool_calls"] = tool_calls
+
+    assert platform_traces._chat_reply(response) == expected
 
 
 @pytest.mark.parametrize("tool_calls", [None, [], {}])
@@ -3765,6 +3869,43 @@ def test_a_bare_key_field_is_not_mistaken_for_a_credential(trace_api, monkeypatc
     assert stored["tools"][0]["function"]["parameters"]["properties"]["key"] == {"type": "string"}
 
 
+def test_custom_vocabulary_keeps_confirmed_schema_property_shaped() -> None:
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "login",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "password": {
+                                "type": "string",
+                                "vendorKeyword": True,
+                                "default": "SECRET",
+                            }
+                        },
+                    },
+                },
+            }
+        ]
+    }
+
+    stored = traces._redact_secret_fields(payload)
+
+    assert stored["tools"][0]["function"]["parameters"]["properties"]["password"] == {
+        "type": "string",
+        "vendorKeyword": True,
+        "default": "[redacted]",
+    }
+
+
+def test_bare_properties_with_custom_vocabulary_remains_instance_data() -> None:
+    payload = {"properties": {"password": {"type": "text", "value": "SECRET"}}}
+
+    assert traces._redact_secret_fields(payload)["properties"]["password"] == "[redacted]"
+
+
 def test_an_empty_schema_under_a_secret_name_survives_redaction(trace_api, monkeypatch) -> None:
     """`{}` is the permissive JSON Schema, so `{"password": {}}` is a declaration, not a secret.
     Replacing it with the string "[redacted]" turns a valid schema into an invalid one."""
@@ -4045,6 +4186,62 @@ def test_percent_encoded_secret_schema_refs_are_redacted(trace_api, monkeypatch,
     assert stored["$defs"]["Alpha"]["default"] == "[redacted]"
     assert stored["$defs"]["Alpha"]["const"] == "[redacted]"
     assert stored["$defs"]["Alpha"]["enum"] == ["[redacted]"]
+
+
+def test_percent_encoded_unreserved_schema_resource_uri_matches() -> None:
+    schema = {
+        "$id": "https://example.com/schema",
+        "type": "object",
+        "properties": {
+            "api_key": {"$ref": "https://example.com/%73chema#/$defs/Cred"},
+        },
+        "$defs": {
+            "Cred": {
+                "default": "SECRET-PCT",
+                "const": "SECRET-C",
+                "enum": ["SECRET-E"],
+            }
+        },
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["$defs"]["Cred"] == {
+        "default": "[redacted]",
+        "const": "[redacted]",
+        "enum": ["[redacted]"],
+    }
+    assert trace_redaction._canonical_resource_uri("https://example.com/%73chema/%7e") == (
+        "https://example.com/schema/~"
+    )
+
+
+def test_percent_encoded_reserved_schema_resource_uri_stays_distinct() -> None:
+    schema = {
+        "$id": "https://example.com/root",
+        "type": "object",
+        "properties": {
+            "api_key": {"$ref": "https://example.com/a%2fb#/$defs/Cred"},
+        },
+        "$defs": {
+            "Encoded": {
+                "$id": "https://example.com/a%2Fb",
+                "$defs": {"Cred": {"default": "SECRET-ENCODED"}},
+            },
+            "Slash": {
+                "$id": "https://example.com/a/b",
+                "$defs": {"Cred": {"default": "PUBLIC-SLASH"}},
+            },
+        },
+    }
+
+    stored = traces._redact_secret_fields(schema)["$defs"]
+
+    assert stored["Encoded"]["$defs"]["Cred"]["default"] == "[redacted]"
+    assert stored["Slash"]["$defs"]["Cred"]["default"] == "PUBLIC-SLASH"
+    assert trace_redaction._canonical_resource_uri("https://example.com/a%2fb") == (
+        "https://example.com/a%2Fb"
+    )
 
 
 def test_secret_schema_ref_with_extension_keyword_redacts_neutral_target() -> None:
@@ -4987,6 +5184,59 @@ def test_non_schema_secret_fields_in_lists_remain_redacted() -> None:
     assert traces._redact_secret_fields(payload) == {"a": [{"password": "[redacted]"}]}
 
 
+@pytest.mark.parametrize(
+    ("message_field", "action"),
+    [
+        (
+            "tool_calls",
+            [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "login",
+                        "arguments": '{"password":"HUNTER2","user":"bob"}',
+                    },
+                }
+            ],
+        ),
+        (
+            "function_call",
+            {"name": "login", "arguments": '{"api_key":"AKIA-SECRET","user":"bob"}'},
+        ),
+    ],
+    ids=["tool-calls", "function-call"],
+)
+def test_json_encoded_function_arguments_are_redacted(message_field: str, action: object) -> None:
+    payload = {"messages": [{"role": "assistant", message_field: action}]}
+
+    stored = traces._redact_secret_fields(payload)
+    stored_action = stored["messages"][0][message_field]
+    function = stored_action[0]["function"] if message_field == "tool_calls" else stored_action
+    arguments = json.loads(function["arguments"])
+
+    assert arguments == {
+        "password" if message_field == "tool_calls" else "api_key": "[redacted]",
+        "user": "bob",
+    }
+
+
+def test_unparseable_function_arguments_are_unchanged() -> None:
+    arguments = '{"password":"unterminated"'
+    payload = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [{"function": {"name": "login", "arguments": arguments}}],
+            }
+        ]
+    }
+
+    stored = traces._redact_secret_fields(payload)
+
+    assert stored["messages"][0]["tool_calls"][0]["function"]["arguments"] == arguments
+
+
 def test_a_request_token_field_is_redacted(trace_api, monkeypatch) -> None:
     """A request-side `token` can hold an unrelated third-party credential. Exempting that key
     globally because response logprobs also call generated text `token` persists the credential and
@@ -5268,6 +5518,39 @@ def test_an_unrecorded_call_says_so_in_its_response(trace_api, monkeypatch) -> N
     assert _raw(trace_api)["traces"] == 0
 
 
+@pytest.mark.anyio
+async def test_trace_redaction_runs_in_the_worker_thread(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+    owner = db.ensure_internal_key(_KEY)
+    context = traces._UpstreamRequestContext(
+        url="https://api.openai.com/v1/chat/completions",
+        headers={},
+        body=_REQUEST,
+        provider="openai",
+        model="gpt-test",
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        metadata=None,
+        secrets=(),
+        started_at=traces.time.perf_counter(),
+        record_trace=True,
+    )
+    caller_thread = threading.get_ident()
+    redaction_threads: list[int] = []
+    sanitize_for_trace = traces._sanitize_for_trace
+
+    def _capture_thread(value, *args, **kwargs):
+        redaction_threads.append(threading.get_ident())
+        return sanitize_for_trace(value, *args, **kwargs)
+
+    monkeypatch.setattr(traces, "_sanitize_for_trace", _capture_thread)
+
+    await traces._record_trace(context, output_payload=_RESPONSE, error=None)
+
+    assert redaction_threads
+    assert all(thread_id != caller_thread for thread_id in redaction_threads)
+
+
 def test_redaction_failure_does_not_break_the_relay(trace_api, monkeypatch) -> None:
     class _Untouched(dict):
         def items(self):
@@ -5415,6 +5698,40 @@ def test_a_failed_recording_does_not_corrupt_a_streamed_json_error(trace_api, mo
     assert response.content == error_body
     assert response.json() == {"error": {"message": "rate limited"}}
     assert _raw(trace_api)["traces"] == 0
+
+
+@pytest.mark.parametrize(
+    "terminator",
+    [b"data: [DONE]\n\n", b"event: end\ndata: [DONE]\n\n"],
+    ids=["plain", "metadata-bearing"],
+)
+def test_a_streamed_recording_failure_preserves_the_done_event_structure(
+    trace_api, monkeypatch, terminator: bytes
+) -> None:
+    completion = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}\n\n'
+    )
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody([completion + terminator])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+    monkeypatch.setattr(
+        traces,
+        "store_trace",
+        lambda **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+    )
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    if terminator.startswith(b"event:"):
+        assert response.content == (
+            completion + b"event: end\n" + b": freesolo-record-failed\n" + b"data: [DONE]\n\n"
+        )
+        assert b"event: end\n\n" not in response.content
+    else:
+        assert response.content == completion + b": freesolo-record-failed\n\n" + terminator
 
 
 def test_a_streamed_recording_failure_arrives_before_the_split_terminator(

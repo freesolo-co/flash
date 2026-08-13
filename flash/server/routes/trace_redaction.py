@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -144,7 +145,7 @@ def _is_secret_key(key: Any, *, allow_token: bool = False) -> bool:
     )
 
 
-def _is_schema_definition(value: Any) -> bool:
+def _is_schema_definition(value: Any, *, allow_custom_vocabulary: bool = False) -> bool:
     if isinstance(value, bool):
         return True
     if not isinstance(value, dict):
@@ -155,6 +156,8 @@ def _is_schema_definition(value: Any) -> bool:
         # "[redacted]" and turned a valid schema into an invalid one.
         return True
     keys = [key for key in value if not (isinstance(key, str) and key.startswith("x-"))]
+    if allow_custom_vocabulary and any(key in _JSON_SCHEMA_KEYWORDS for key in keys):
+        return True
     if any(key in _JSON_SCHEMA_STRUCTURAL_KEYWORDS for key in keys):
         return True
     return bool(keys) and all(key in _JSON_SCHEMA_KEYWORDS for key in keys)
@@ -255,6 +258,26 @@ def _local_schema_pointer(
     return frozenset()
 
 
+def _normalize_percent_encoding(value: str) -> str:
+    unreserved = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
+    normalized: list[str] = []
+    index = 0
+    while index < len(value):
+        if index + 2 < len(value) and value[index] == "%":
+            escaped = value[index + 1 : index + 3]
+            try:
+                decoded = chr(int(escaped, 16))
+            except ValueError:
+                pass
+            else:
+                normalized.append(decoded if decoded in unreserved else f"%{escaped.upper()}")
+                index += 3
+                continue
+        normalized.append(value[index])
+        index += 1
+    return "".join(normalized)
+
+
 def _canonical_resource_uri(uri: str) -> str:
     scheme, netloc, path, query, fragment = urlsplit(uri)
     normalized_scheme = scheme.casefold()
@@ -272,7 +295,15 @@ def _canonical_resource_uri(uri: str) -> str:
         else:
             hostport = f"{host.casefold()}:{port}" if port_separator else hostport.casefold()
     normalized_netloc = f"{userinfo}@{hostport}" if user_separator else hostport
-    return urlunsplit((normalized_scheme, normalized_netloc, path, query, fragment))
+    return urlunsplit(
+        (
+            normalized_scheme,
+            normalized_netloc,
+            _normalize_percent_encoding(path),
+            _normalize_percent_encoding(query),
+            _normalize_percent_encoding(fragment),
+        )
+    )
 
 
 def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[str, ...]]:
@@ -454,8 +485,14 @@ def _redact_secret_fields(
     response_root: bool = False,
     choice_list: bool = False,
     choice: bool = False,
+    confirmed_schema: bool = False,
     logprobs: bool = False,
     logprob_entries: bool = False,
+    function_arguments: bool = False,
+    function_container: bool = False,
+    schema_wrapper: bool = False,
+    tool_call_list: bool = False,
+    tool_call: bool = False,
     secret_schema_refs: set[tuple[str, ...]] | None = None,
     schema_definition_path: tuple[str, ...] = (),
     flag: _SanitizationFlag | None = None,
@@ -465,7 +502,7 @@ def _redact_secret_fields(
             flag.hit = True
         return "[redacted]"
     if isinstance(value, dict):
-        schema_context = schema_context or _has_schema_context(value)
+        schema_context = schema_context or schema_wrapper or _has_schema_context(value)
         local_secret_schema_refs = {
             (*schema_definition_path, *pointer)
             for pointer in _secret_schema_definition_refs(value, depth=depth)
@@ -479,7 +516,9 @@ def _redact_secret_fields(
         redact_schema_literals = secret_schema_definition or secret_schema_property
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
-            schema_definition = schema_property_map and _is_schema_definition(item)
+            schema_definition = schema_property_map and _is_schema_definition(
+                item, allow_custom_vocabulary=schema_wrapper
+            )
             current_schema_path = (*schema_definition_path, str(key))
             referenced_secret_definition = current_schema_path in active_secret_schema_refs
             if redact_schema_literals and key in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
@@ -511,9 +550,20 @@ def _redact_secret_fields(
                     response_root=False,
                     choice_list=response_root and key == "choices" and isinstance(item, list),
                     choice=choice_list,
+                    confirmed_schema=confirmed_schema
+                    or (key in _JSON_SCHEMA_WRAPPER_KEYS and isinstance(item, dict))
+                    or schema_property_map,
                     logprobs=choice and key == "logprobs" and isinstance(item, dict),
                     logprob_entries=logprob_entries
                     or (logprobs and key in {"content", "refusal", "top_logprobs"}),
+                    function_arguments=function_container and key == "arguments",
+                    function_container=(
+                        key == "function_call" or (tool_call and key == "function")
+                    ),
+                    schema_wrapper=schema_wrapper
+                    or (key in _JSON_SCHEMA_WRAPPER_KEYS and isinstance(item, dict))
+                    or (schema_context and key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS),
+                    tool_call_list=key == "tool_calls" and isinstance(item, list),
                     secret_schema_refs=active_secret_schema_refs,
                     schema_definition_path=current_schema_path,
                     flag=flag,
@@ -532,14 +582,24 @@ def _redact_secret_fields(
                 ),
                 secret_schema_property=secret_schema_property,
                 choice=choice_list,
+                confirmed_schema=confirmed_schema,
                 logprobs=logprobs,
                 logprob_entries=logprob_entries,
+                tool_call=tool_call_list,
+                schema_wrapper=schema_wrapper,
                 secret_schema_refs=secret_schema_refs,
                 schema_definition_path=(*schema_definition_path, str(index)),
                 flag=flag,
             )
             for index, item in enumerate(value)
         ]
+    if function_arguments and isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (ValueError, RecursionError):
+            return value
+        redacted = _redact_secret_fields(parsed, depth=depth + 1, flag=flag)
+        return json.dumps(redacted, separators=(",", ":"))
     return value
 
 

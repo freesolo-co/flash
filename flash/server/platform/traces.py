@@ -493,14 +493,17 @@ def _chat_reply(payload: Any) -> str | None:
     role = message.get("role")
     if role is not None and (not isinstance(role, str) or role != "assistant"):
         return None
-    if message.get("tool_calls") or message.get("function_call"):
+    tool_calls = message.get("tool_calls")
+    if tool_calls is not None and (not isinstance(tool_calls, list) or tool_calls):
+        return None
+    if message.get("function_call") is not None:
         # a training target must contain the whole assistant action. exporting only the accompanying
         # text would silently discard the invocation, so skipping the row is the only faithful choice.
         #
         # this is not redundant with the finish-reason check above: the two catch opposite halves of
         # the same mismatch. that one rejects a response that SAYS it ended in a tool call; this one
         # rejects a response that CARRIES one while reporting `stop`, which is what a provider does
-        # when the model both answered and invoked.
+        # when the model both answered and invoked. wrong-typed present containers are malformed too.
         return None
     return _message_text(message.get("content"))
 

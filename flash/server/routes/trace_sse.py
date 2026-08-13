@@ -36,6 +36,7 @@ class SseDoneGate:
         self._event_in_progress = False
         self._partial_line_in_progress = False
         self._holding_done_candidate = False
+        self._event_prefix_relayed = False
         self._at_stream_start = True
         self._leading_bom = False
         self.done_event: bytes | None = None
@@ -43,6 +44,10 @@ class SseDoneGate:
     @property
     def terminated(self) -> bool:
         return self.done_event is not None
+
+    @property
+    def done_event_has_relayed_prefix(self) -> bool:
+        return self.done_event is not None and self._event_prefix_relayed
 
     def feed(self, chunk: bytes) -> list[bytes]:
         if self.done_event is not None:
@@ -83,6 +88,7 @@ class SseDoneGate:
                 self._line_start = 0
                 self._scan_start = 0
                 self._event_in_progress = False
+                self._event_prefix_relayed = False
                 continue
             if _is_data_field(content):
                 data = _sse_data_value(content)
@@ -95,6 +101,10 @@ class SseDoneGate:
                 self._event_in_progress = True
             if not self._holding_done_candidate:
                 forwarded.extend(self._buffer[:next_cursor])
+                if not _is_data_field(content):
+                    self._event_prefix_relayed = True
+                elif not self._event_in_progress:
+                    self._event_prefix_relayed = False
                 del self._buffer[:next_cursor]
                 self._line_start = 0
                 self._scan_start = 0
@@ -369,16 +379,17 @@ class SseAccumulator:
             self._max_accumulated_bytes is not None
             and len(self._buffer) > self._max_accumulated_bytes
         ):
-            self._buffer = b""
+            self._buffer.clear()
             self._scan_start = 0
             self.truncated = True
 
     def finish(self) -> None:
-        if self._buffer:
-            self._consume_line(bytes(self._buffer).rstrip(b"\r"))
-            self._buffer.clear()
-            self._scan_start = 0
-        self._consume_event()
+        self._buffer.clear()
+        self._scan_start = 0
+        if self._event_data:
+            self._event_data.clear()
+            self._event_data_bytes = 0
+            self._note_defect("stream ended with an unterminated data event")
 
     def _note_defect(self, reason: str) -> None:
         """Record the FIRST thing that went wrong; later ones are usually consequences of it."""
