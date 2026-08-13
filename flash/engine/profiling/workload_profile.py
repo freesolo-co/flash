@@ -59,13 +59,13 @@ def sft_sample_policy(max_examples: object) -> str:
 
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
-# the template emits reasoning in exactly one place: straight after an assistant header, as
-# `<think>\n<body>\n</think>\n\n`. anchoring on that whole shape is what separates a block the
-# template OWNS from the same characters appearing as ordinary text somewhere else.
-_TEMPLATE_REASONING = re.compile(
-    rf"<\|im_start\|>assistant\n(?P<open>{_THINK_OPEN})\n(?P<body>.*?)\n{_THINK_CLOSE}\n\n",
-    re.DOTALL,
-)
+_TURN_END = "<|im_end|>"
+# the template opens reasoning in exactly one place: straight after an assistant header. that
+# anchor is what separates a block the template OWNS from the same characters appearing as
+# ordinary text elsewhere, and it is where a block's start is taken from.
+_TEMPLATE_REASONING_START = re.compile(rf"<\|im_start\|>assistant\n(?P<open>{_THINK_OPEN})\n")
+# the block's own closer: the newline-delimited form the template emits before the answer.
+_TEMPLATE_REASONING_END = f"\n{_THINK_CLOSE}\n\n"
 
 
 def reasoning_spans(text: str) -> list[tuple[int, int]]:
@@ -76,27 +76,33 @@ def reasoning_spans(text: str) -> list[tuple[int, int]]:
     still renders one EMPTY block, and counting it would score full survival for the exact case
     this measurement exists to catch.
 
-    Anchored on the template's own layout rather than on free-floating delimiters, because
-    ``<think>`` and ``</think>`` are ordinary characters that a transcript may contain anywhere --
-    a user asking what the tag means, or reasoning that discusses the delimiter. Neither scanning
-    for the tags nor counting their depth can tell those apart from structure:
+    Both ENDS are anchored on the template's layout, because ``<think>`` and ``</think>`` are
+    ordinary characters a transcript may contain anywhere -- a user asking what the tag means, or
+    reasoning that quotes the thinking layout. Each half of the anchor answers a failure the other
+    cannot:
 
-    * an unmatched ``<think>`` in an EARLIER turn leaves the depth permanently positive, so the
-      template's own closer never completes a block and every later survivor reads as stripped --
-      a total-loss warning for a transcript that lost nothing;
-    * an unmatched ``</think>`` INSIDE the reasoning ends the block early, so a cap falling between
-      that literal tag and the real closer scores the block as fully retained when the cap in fact
-      removed its tail.
+    * the START is the ``<think>`` immediately following an assistant header. Tracking openers by
+      depth instead lets an unmatched ``<think>`` in an EARLIER turn hold the depth permanently
+      positive, so the template's own closer never completes a block and every later survivor reads
+      as stripped -- a total-loss warning for a transcript that lost nothing.
+    * the END is the LAST newline-delimited closer within the turn. Taking the first one instead
+      ends the span early whenever the reasoning quotes the layout it is reasoning about, and a cap
+      landing between that quoted closer and the real one then scores a cut block as fully
+      retained -- overstating what reaches the loss, the direction that hides the problem.
 
-    The template resolves both: reasoning is the text between the ``<think>`` that immediately
-    follows an assistant header and the ``</think>`` that is followed by the blank line before the
-    answer. Delimiters anywhere else are content, and content cannot be mistaken for structure.
+    Scanning to the last closer is safe because a turn ends at ``<|im_end|>`` and the template
+    strips reasoning from every turn but the kept one, so exactly one structural closer per turn
+    can follow the anchor: a later quoted closer belongs to the same block's body, never to another.
     """
-    return [
-        (match.start("open"), match.end())
-        for match in _TEMPLATE_REASONING.finditer(text)
-        if match.group("body").strip()
-    ]
+    spans: list[tuple[int, int]] = []
+    for match in _TEMPLATE_REASONING_START.finditer(text):
+        turn_end = text.find(_TURN_END, match.end())
+        limit = len(text) if turn_end < 0 else turn_end
+        close = text.rfind(_TEMPLATE_REASONING_END, match.end(), limit)
+        if close < 0 or not text[match.end() : close].strip():
+            continue
+        spans.append((match.start("open"), close + len(_TEMPLATE_REASONING_END)))
+    return spans
 
 
 # why a run resolved to `exact-unpacked`, keyed by the architecture label the packing decision

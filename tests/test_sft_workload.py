@@ -522,14 +522,18 @@ class ThinkingTokenizer(FakeTokenizer):
             elif message.get("role") == "assistant" and "</think>" in content:
                 reasoning = content.split("</think>")[0].split("<think>")[-1].strip()
                 content = content.split("</think>")[-1].lstrip("\n")
-            # the assistant HEADER is part of the reasoning layout, not decoration: the template
-            # only ever opens a <think> block straight after it, which is what distinguishes a
-            # block it owns from the same tag sitting in ordinary content. a fake that drops the
-            # header renders spans no structural parser can find.
+            # the assistant HEADER and the closing <|im_end|> are both part of the reasoning
+            # layout, not decoration: the template only opens a <think> block straight after the
+            # header, and <|im_end|> is what bounds one turn's reasoning from the next turn's. a
+            # fake that drops either renders a shape no structural parser can read -- without the
+            # header there is no anchor to find, and without the terminator one turn's block runs
+            # into the following turn's closer.
             if message.get("role") == "assistant" and index > last_query:
-                parts.append(f"<|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{content}")
+                parts.append(
+                    f"<|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{content}<|im_end|>"
+                )
             elif message.get("role") == "assistant":
-                parts.append(f"<|im_start|>assistant\n{content}")
+                parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
             else:
                 parts.append(content)
         text = "".join(parts)
@@ -1055,22 +1059,40 @@ def test_a_think_tag_quoted_in_the_prompt_does_not_swallow_the_turns_that_follow
     assert "reasoning" not in capsys.readouterr().err
 
 
-def test_a_closing_tag_quoted_inside_reasoning_does_not_end_the_block_early(capsys) -> None:
+@pytest.mark.parametrize(
+    ("label", "quoted"),
+    [
+        # inline, as prose about the tag
+        ("same line", "the </think> tag closes it "),
+        # quoting the LAYOUT reproduces the template's own delimiter shape, `\n</think>\n\n`, which
+        # is exactly what a structural end-marker matches. a rule that stops at the FIRST one ends
+        # here instead of at the template's closer, and only a newline-delimited quote can prove it
+        # does not: a same-line quote never produces that sequence.
+        ("own line", "the layout is:\n</think>\n\nlike that, "),
+    ],
+)
+def test_a_closing_tag_quoted_inside_reasoning_does_not_end_the_block_early(
+    capsys, label: str, quoted: str
+) -> None:
     """The block ends at the closer the TEMPLATE emits, not at one the reasoning happens to quote.
 
     Reasoning that discusses the delimiter renders an unmatched ``</think>`` inside its own body.
     Ending the span there puts its end before the real one, so a cap falling between the two calls
-    a cut block retained and overstates what reaches the loss. The cap here sits past the quoted
-    tag but before the template's closer, so an early end would report zero truncation.
+    a cut block retained and overstates what reaches the loss.
+
+    The cap has to sit BETWEEN the two candidate ends to discriminate them. Measured on this fake
+    (one token per character), an early end lands at 60 and the template's real closer at 132/141,
+    so 100 is truncated under the correct rule and retained under an early one. A cap below both --
+    40, as this test first used -- reports truncation either way and cannot fail.
     """
     completion = [
         {
             "role": "assistant",
             "content": "answer",
-            "reasoning_content": "the </think> tag closes it " + "rest " * 12,
+            "reasoning_content": quoted + "rest " * 12,
         }
     ]
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=40, max_examples=0))
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
     spec = replace(
         spec,
         thinking=True,
