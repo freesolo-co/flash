@@ -36,8 +36,11 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   operation on the first, and read as a serving regression rather than the deploy that caused
   it. The warning names both checkpoints and points at `flash models chat <run-id>/step-N`,
   which addresses a checkpoint directly and does not depend on where the id points. It is
-  advisory: the deploy still proceeds, and a control plane that cannot answer the pre-deploy
-  read does not fail the command.
+  advisory: the deploy still proceeds, the pre-deploy read is bounded well under the client's
+  default timeout so a stalled plane cannot hold a deploy behind it, and a control plane that
+  cannot answer (or answers with a checkpoint step this client cannot read) does not fail the
+  command. A deployment whose activation outcome was never settled is reported as one that _may_
+  be serving, rather than being assumed to serve nothing.
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always

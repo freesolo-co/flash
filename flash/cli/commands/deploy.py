@@ -57,6 +57,10 @@ _DEPLOY_FINAL_READ_FRACTION = 0.9
 # an auth or authorization rejection answers the same way every time; polling through it just
 # spends the whole timeout to arrive at the identical error.
 _PERMANENT_POLL_STATUSES = frozenset({401, 403})
+# the pre-deploy alias read is advisory, so it must not spend the client's default 60s budget
+# deciding whether to print a warning: a stalled read would delay every real deploy behind a
+# line nobody asked for. short enough to stay unnoticed, long enough for a healthy plane.
+_ALIAS_WARNING_READ_SECONDS = 5.0
 
 
 def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> dict:
@@ -189,9 +193,9 @@ def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
     return None
 
 
-def _served_step_label(step) -> str:
+def _served_step_label(step: int | None) -> str:
     """Name a deployment's checkpoint the way the user addressed it: `step-N`, or `final`."""
-    return "final" if step is None else f"step-{int(step)}"
+    return "final" if step is None else f"step-{step}"
 
 
 def _alias_move_warning(client, base_run_id: str, requested_step: int | None) -> str | None:
@@ -210,22 +214,38 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
     try:
         # not `deployment_for`: its step filter hides exactly the record this asks about, a
         # DIFFERENT checkpoint holding the alias.
-        current = client.deployed_checkpoint(base_run_id)
+        current = client.deployed_checkpoint(base_run_id, timeout=_ALIAS_WARNING_READ_SECONDS)
     except (ApiError, ClientError):
         # the deploy itself is the authority on whether it can proceed. failing it here would turn
         # a warning nobody asked for into an outage of the command it decorates.
         return None
     if current is None:
         return None
-    if str(current.get("state") or "") not in _DEPLOYMENT_READY_STATES:
+    # a `reconciling` record whose activation outcome was never recorded may ALREADY hold the
+    # alias. the plane permits replacing exactly that record rather than rejecting it as busy,
+    # and resolves the authoritative target through `_activation_predecessor` when it does
+    # (flash/server/routes/serving.py). reading it as "not serving" suppressed the warning in
+    # the very case the alias is most likely to move out from under someone.
+    unknown_activation = current.get("activation_outcome_unknown") is True
+    if str(current.get("state") or "") not in _DEPLOYMENT_READY_STATES and not unknown_activation:
         # nothing is being served off the alias yet, so nothing is lost by moving it.
         return None
-    served_step = current.get("checkpoint_step")
-    if (served_step if served_step is None else int(served_step)) == requested_step:
+    raw_step = current.get("checkpoint_step")
+    try:
+        served_step = None if raw_step is None else int(raw_step)
+    except (TypeError, ValueError):
+        # a proxy or older plane can answer 2xx with a step this client cannot read. that is an
+        # unreadable current record like any other, NOT a reason to fail the deploy: leaving the
+        # conversion unguarded let an advisory read traceback out of the command it decorates.
+        return None
+    if served_step == requested_step:
         return None
     cli = _commands().CLI_NAME
+    # an unsettled activation is not a claim about what is live: say "may serve", or the line
+    # asserts a checkpoint the plane itself has not confirmed.
+    serves = "may currently serve" if unknown_activation else "currently serves"
     return (
-        f"{base_run_id} currently serves {_served_step_label(served_step)}; deploying "
+        f"{base_run_id} {serves} {_served_step_label(served_step)}; deploying "
         f"{_served_step_label(requested_step)} moves that shared model id onto the new "
         f"checkpoint, so every client using bare `{base_run_id}` changes model. address a "
         f"specific checkpoint with `{cli} models chat {base_run_id}/step-N` to compare them."

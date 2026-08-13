@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 import flash.cli.commands as commands
+import flash.cli.commands.deploy as deploy_module
 from flash.cli.commands.deploy import _alias_move_warning, cmd_deploy
 from flash.client import ApiError, ClientError
 
@@ -25,9 +26,11 @@ class _Client:
         self._raises = raises
         self.deploy_calls: list[tuple] = []
         self.read_calls: list[tuple] = []
+        self.read_timeouts: list[float | None] = []
 
     def deployed_checkpoint(self, run_id, timeout=None):
         self.read_calls.append(run_id)
+        self.read_timeouts.append(timeout)
         if self._raises is not None:
             raise self._raises
         return self._current
@@ -102,10 +105,106 @@ def test_only_a_servable_revision_can_be_displaced(state: str) -> None:
     assert _alias_move_warning(_Client(current), "flash-1", 50) is None
 
 
+def test_an_unsettled_activation_may_already_hold_the_alias() -> None:
+    """`reconciling` + `activation_outcome_unknown` is the case the alias is MOST likely to move.
+
+    The plane permits replacing exactly that record instead of rejecting it as busy, and resolves
+    the authoritative target through `_activation_predecessor` when it does. Reading the state
+    alone as "not serving" silenced the warning precisely where it is needed.
+    """
+    current = {
+        "run_id": "flash-1",
+        "state": "reconciling",
+        "checkpoint_step": 100,
+        "activation_outcome_unknown": True,
+    }
+
+    warning = _alias_move_warning(_Client(current), "flash-1", 50)
+
+    assert warning is not None
+    # it is not confirmed live, so the line must not assert that it is.
+    assert "may currently serve step-100" in warning
+
+
+def test_an_unsettled_activation_on_the_same_step_still_displaces_nothing() -> None:
+    """Redeploying the step already being activated moves the alias onto what it is heading to."""
+    current = {
+        "run_id": "flash-1",
+        "state": "reconciling",
+        "checkpoint_step": 50,
+        "activation_outcome_unknown": True,
+    }
+
+    assert _alias_move_warning(_Client(current), "flash-1", 50) is None
+
+
+def test_a_settled_ready_record_is_stated_as_fact() -> None:
+    """A confirmed `ready` revision is hedged by nothing: it IS what the id serves."""
+    warning = _alias_move_warning(_Client(_ready(100)), "flash-1", 50)
+
+    assert warning is not None
+    assert "currently serves step-100" in warning
+    assert "may currently serve" not in warning
+
+
+def test_a_numeric_string_step_still_compares_as_a_number() -> None:
+    """A plane that JSON-encodes the step as a string must not read as a different checkpoint."""
+    current = {"run_id": "flash-1", "state": "ready", "checkpoint_step": "50"}
+
+    assert _alias_move_warning(_Client(current), "flash-1", 50) is None
+
+
 @pytest.mark.parametrize("failure", [ApiError(500, "boom"), ClientError("unreachable")])
 def test_an_unreadable_plane_produces_no_warning_instead_of_an_error(failure) -> None:
     """The read is advisory: a plane that cannot answer must not fail the deploy it decorates."""
     assert _alias_move_warning(_Client(raises=failure), "flash-1", 50) is None
+
+
+def test_the_advisory_read_is_bounded_well_under_the_client_default() -> None:
+    """An advisory line must not hold a real deploy for the client's full 60s default.
+
+    Unbounded, a stalled status GET delays every deploy behind a warning nobody asked for.
+    """
+    client = _Client(_ready(100))
+
+    _alias_move_warning(client, "flash-1", 50)
+
+    assert client.read_timeouts == [deploy_module._ALIAS_WARNING_READ_SECONDS]
+    assert deploy_module._ALIAS_WARNING_READ_SECONDS < 60.0
+
+
+@pytest.mark.parametrize("bad_step", ["abc", "", [], {}, object(), float("nan")])
+def test_an_unreadable_checkpoint_step_cannot_fail_the_deploy(bad_step) -> None:
+    """A 2xx carrying a step this client cannot parse is an unreadable record, not a crash.
+
+    A proxy or older plane can answer with a nonnumeric `checkpoint_step`. Converting it outside
+    the guarded read let the advisory warning traceback out of the command it decorates.
+    """
+    current = {"run_id": "flash-1", "state": "ready", "checkpoint_step": bad_step}
+
+    assert _alias_move_warning(_Client(current), "flash-1", 50) is None
+
+
+def test_a_numeric_string_step_is_still_compared_as_a_number() -> None:
+    """Normalizing must not turn `"100"` into a spurious warning against step 100."""
+    current = {"run_id": "flash-1", "state": "ready", "checkpoint_step": "100"}
+
+    assert _alias_move_warning(_Client(current), "flash-1", 100) is None
+    warning = _alias_move_warning(_Client(current), "flash-1", 50)
+    assert warning is not None
+    assert "serves step-100" in warning
+
+
+def test_a_malformed_step_does_not_stop_the_deploy_itself(monkeypatch, capsys) -> None:
+    """End to end: the deploy still goes through, with no traceback and no warning."""
+    client = _Client({"run_id": "flash-1", "state": "ready", "checkpoint_step": "abc"})
+    monkeypatch.setattr(commands, "client_from_config", lambda: client)
+    monkeypatch.setattr(commands.render, "styled", lambda: False)
+
+    assert cmd_deploy(_args("flash-1/step-50")) == 0
+
+    assert "currently serves" not in capsys.readouterr().err
+    assert client.deploy_calls == [("flash-1/step-50", False)]
 
 
 def test_deployed_state_counts_as_servable() -> None:
