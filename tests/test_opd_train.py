@@ -5295,7 +5295,7 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
     monkeypatch.setattr(opd_runner._opd_train, "build_opd_overrides", lambda _config: [])
     monkeypatch.setattr(opd_runner._opd_train, "_OpdProgressState", ProgressState)
     monkeypatch.setattr(opd_runner, "_build_checkpoint_watcher", lambda *_args: Watcher())
-    monkeypatch.setattr(opd_runner, "_build_child_callbacks", lambda *_args: callbacks)
+    monkeypatch.setattr(opd_runner, "_build_child_callbacks", lambda *_args, **_kw: callbacks)
     monkeypatch.setattr(opd_runner, "_build_child_env", lambda *_args: {})
     monkeypatch.setattr(opd_runner._opd_train, "_NvidiaSmiPeakSampler", GpuSampler)
     monkeypatch.setattr(

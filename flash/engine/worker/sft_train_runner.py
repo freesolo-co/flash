@@ -9,12 +9,13 @@ import math
 import os
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import reduce
 from math import gcd
 
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
 from flash.engine.worker import sft_train as _sft_train
+from flash.engine.worker.train.core import step_timing
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 from flash.providers.base import rentable_gpu_counts
 
@@ -143,6 +144,12 @@ class _SftProgress:
     shim_markers: str = ""
     expected_shims: tuple[str, ...] = ()
     shims_verified: bool = False
+    # when each optimizer step landed, so the heartbeat can publish what a step COSTS rather than
+    # only which one is current. sft measured whole-child wall time alone before this, which cannot
+    # be read mid-run and folds warmup into the average.
+    step_clock: step_timing.StepClock = field(default_factory=step_timing.StepClock)
+    # the update horizon this run is training toward, for the remaining-time projection.
+    total_steps: int = 0
 
 
 @dataclass(frozen=True)
@@ -732,6 +739,7 @@ def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, child: _SftChil
         # like loraplus_applied above: a resume already at the horizon never launches the child,
         # so there is no marker file to verify and nothing left for the shims to patch.
         shims_verified=resume_step >= model.update_horizon,
+        total_steps=model.update_horizon,
     )
 
 
@@ -741,6 +749,7 @@ class _SftProgressCallbacks:
 
     def on_step(self, step: int) -> None:
         self.progress.values["step"] = step
+        self.progress.step_clock.record(time.time())
         payload = {
             "step": step,
             "loss": self.progress.values["loss"],
@@ -748,7 +757,18 @@ class _SftProgressCallbacks:
             "learning_rate": self.progress.values["lr"],
         }
         _w.heartbeat(
-            "sft_step", **{key: value for key, value in payload.items() if value is not None}
+            "sft_step",
+            **{key: value for key, value in payload.items() if value is not None},
+            **self.step_timing_fields(),
+        )
+
+    def step_timing_fields(self) -> dict[str, float | bool]:
+        """Steady-state step timing for one heartbeat; empty until a whole step has been measured."""
+        return step_timing.step_timing_fields(
+            self.progress.step_clock,
+            current_step=int(self.progress.values["step"] or 0),
+            total_steps=self.progress.total_steps,
+            remaining_wall_seconds=_w._remaining_worker_wall_seconds(),
         )
 
     def child_heartbeat(self) -> None:

@@ -39,6 +39,7 @@ from flash.engine.worker.io.heartbeat import (
 )
 from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.train.core import step_timing
 from flash.engine.worker.train.rl.multi_turn import (
     MultiTurnBridge,
     copy_multi_turn_child_modules,
@@ -81,6 +82,10 @@ class _StepMetricState:
     step_line_times: list[float] = field(default_factory=list)
     metrics_last: list[dict] = field(default_factory=list)
     sent_first_metrics: bool = False
+    # the same step lines as ``step_line_times``, read live rather than at teardown. kept alongside
+    # it because that list is the post-run metadata's unbounded record, while this one is bounded to
+    # a recent window (see StepClock) so a long run's rate tracks what the trainer is doing now.
+    step_clock: step_timing.StepClock = field(default_factory=step_timing.StepClock)
 
 
 @dataclass
@@ -441,6 +446,22 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
     return env_for_verl
 
 
+def _rl_step_timing_fields(state: _StepMetricState, total_steps: int) -> dict:
+    """The step-timing fragment of one rl_step heartbeat, empty until a whole step is measured.
+
+    Read on the liveness path as well as the stdout one because that daemon shares the step
+    heartbeat's upload slot: a tick that wins it and dropped these fields would publish a step with
+    no timing beside one that had it, which reads as the measurement having been lost rather than
+    simply not re-sent.
+    """
+    return step_timing.step_timing_fields(
+        state.step_clock,
+        current_step=state.progress["step"],
+        total_steps=total_steps,
+        remaining_wall_seconds=_w._remaining_worker_wall_seconds(),
+    )
+
+
 def _ingest_step_metrics(
     line: str,
     inp,
@@ -450,7 +471,9 @@ def _ingest_step_metrics(
     sent_first_metrics = state.sent_first_metrics
     step_metrics = parse_verl_step_metrics(line)
     if step_metrics is not None:
-        state.step_line_times.append(time.time())
+        now = time.time()
+        state.step_line_times.append(now)
+        state.step_clock.record(now)
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]

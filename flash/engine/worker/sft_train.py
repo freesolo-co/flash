@@ -600,6 +600,10 @@ def run_sft_train(spec=None) -> None:
             with liveness_heartbeat(
                 "sft_step",
                 progress=lambda: int(progress["step"] or 0),
+                # this daemon shares the step heartbeat's upload slot, so a tick that wins it would
+                # otherwise publish a step with no timing beside one that had it -- reading as if
+                # the measurement had been lost rather than merely republished.
+                fields=callbacks.step_timing_fields,
                 progress_step=True,
             ):
                 return_code = _invoke_sft_child(child, callbacks, on_line)

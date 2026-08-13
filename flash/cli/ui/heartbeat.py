@@ -232,6 +232,75 @@ def _stale_setup_hint(
     )
 
 
+def _humanize_duration(seconds: float) -> str:
+    """A compact spoken duration ("92s", "13m", "4.8h") for a projected or remaining span."""
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def _humanize_step_cost(seconds: float) -> str:
+    """A per-step cost, kept in seconds far longer than a span would be.
+
+    This number's whole use is comparison -- against another run, another config, or the horizon
+    being multiplied by it -- and the minute rounding a span can afford would print 92s and 149s
+    identically as "2m", hiding a 60% difference in what the run costs.
+    """
+    if seconds < 600:
+        return f"{seconds:.0f}s"
+    return f"{seconds / 60:.1f}m"
+
+
+def _finite_positive(value: object) -> float | None:
+    """A strictly positive finite float, or None -- the worker's field may be absent or junk."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if number <= 0 or number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def step_timing_pairs(heartbeat: dict, *, running: bool) -> list[tuple[str, str]]:
+    """Rows for measured per-step cost and what it projects, when the worker has measured one.
+
+    Absent until a whole step has been timed, which is deliberate and is the entire point: the first
+    step carries engine init, the first weight sync and cache population, and extrapolating from it
+    over-estimated a measured run by 5.6x -- predicting 26.9h for a run that took 4.9h, and arguing
+    to cut ``max_examples`` on a run that fit comfortably. Showing nothing until there is a
+    steady-state number to show is what keeps that reading off the panel.
+
+    Only for a running run. On a finished one the real duration is on the record, so a projection
+    would be a worse answer to a question already settled.
+    """
+    if not running:
+        return []
+    per_step = _finite_positive(heartbeat.get("step_duration_s"))
+    if per_step is None:
+        return []
+    row = f"{_humanize_step_cost(per_step)}/step"
+    remaining = _finite_positive(heartbeat.get("projected_remaining_s"))
+    if remaining is not None:
+        row += f" · ~{_humanize_duration(remaining)} left at this rate"
+    pairs = [("pace", row)]
+    if heartbeat.get("wall_deadline_at_risk"):
+        wall = _finite_positive(heartbeat.get("remaining_wall_s"))
+        # the wall is named only when the worker sent it, so the warning never cites a number the
+        # panel cannot show. without it the warning still stands on the projection alone.
+        against = f" against {_humanize_duration(wall)} of wall time left" if wall else ""
+        warning = (
+            f"at this rate the remaining steps do not fit the run's wall limit{against}, so "
+            "training is expected to be cut off before the last step. checkpoints already "
+            "published at your save steps survive, but the steps after the cutoff never run - "
+            "so if you need the full horizon, relaunch with a smaller [train].max_steps or "
+            "max_examples rather than paying out the rest of this one"
+        )
+        pairs.append(("wall limit", warning))
+    return pairs
+
+
 def _stale_step_hint(
     heartbeat: dict,
     heartbeat_age_seconds: float | None,
@@ -374,6 +443,11 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         )
         if warmup:
             pairs.append(("warmup", warmup))
+    # measured pace, and what it projects. only for the live attempt: a superseded ping's rate was
+    # measured on a worker that no longer exists, and the replacement may be on different hardware
+    # entirely, so presenting it as this run's pace would be a confident wrong number.
+    if from_current_attempt:
+        pairs += step_timing_pairs(hb, running=running)
     age = _humanize_age_seconds(heartbeat_age_seconds)
     if age:
         # the progress row already explains this silence, and does it more precisely. show one or

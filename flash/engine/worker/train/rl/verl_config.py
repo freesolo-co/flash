@@ -9,7 +9,6 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 
 from __future__ import annotations
 
-import itertools
 import math
 import os
 import statistics
@@ -25,6 +24,7 @@ from flash.engine.worker.backend_common import (
 )
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.sft_train import _hydra_val, _verl_image_message_content
+from flash.engine.worker.train.core import step_timing
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 # the data_source every flash-generated row carries. verl routes scoring by this key, so it must
@@ -642,10 +642,10 @@ def _step_intervals(step_line_times: list[float]) -> list[float]:
     """measure step walls from consecutive metric arrival times.
 
     n lines bound n-1 steps; startup before the first and partial work after the last are excluded.
+    delegates to the shared definition so this post-run metadata and the live step heartbeat cannot
+    disagree about what a step costs.
     """
-    return [
-        later - earlier for earlier, later in itertools.pairwise(step_line_times) if later > earlier
-    ]
+    return step_timing.step_intervals(step_line_times)
 
 
 def _measured_idle_fraction(

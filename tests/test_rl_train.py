@@ -6143,8 +6143,18 @@ def test_the_first_sample_bearing_heartbeat_is_forced():
 def test_the_liveness_fields_hook_carries_reward_observability():
     # the rl_step liveness wrap is what publishes between stdout lines. without the fields hook
     # merging it, samples would only ever reach the wire on the one forced first-metrics heartbeat.
+    # asserted per-fragment rather than against the whole literal: the hook merges several
+    # independent signals now, and pinning its exact text made adding one a test failure without
+    # anything having regressed.
     src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    assert 'fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()}' in src
+    hook = src[src.index("fields=lambda: {") :]
+    hook = hook[: hook.index("}")]
+    assert '"metrics_last": list(metrics_last)' in hook
+    assert "**_reward_observability()" in hook
+    # the same hook carries step timing, for the same reason: the daemon can win the upload slot,
+    # and a payload without it publishes a step whose measured pace looks lost rather than merely
+    # not re-sent.
+    assert "**_rl_step_timing_fields(state, expected_steps)" in hook
 
 
 def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains():

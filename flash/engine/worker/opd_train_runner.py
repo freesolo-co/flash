@@ -16,6 +16,7 @@ from typing import Any
 
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
+from flash.engine.worker.train.core import step_timing
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 
@@ -585,6 +586,7 @@ def _build_child_callbacks(
     progress_state: Any,
     bridge: Any,
     resume_step: int,
+    total_steps: int = 0,
 ) -> _ChildCallbacks:
     progress = {
         "step": resume_step,
@@ -593,6 +595,17 @@ def _build_child_callbacks(
         "truncation_step": None,
     }
     wandb_link: dict[str, str | None] = {}
+    # opd tracked one training-start timestamp and a cumulative wall only, neither readable per
+    # step. this measures the spans between optimizer updates, which is what a projection needs.
+    step_clock = step_timing.StepClock()
+
+    def step_timing_fields() -> dict[str, float | bool]:
+        return step_timing.step_timing_fields(
+            step_clock,
+            current_step=int(progress["step"] or 0),
+            total_steps=total_steps,
+            remaining_wall_seconds=_opd_train._w._remaining_worker_wall_seconds(),
+        )
 
     def on_line(line: str) -> None:
         watcher.raise_if_failed()
@@ -618,12 +631,13 @@ def _build_child_callbacks(
 
     def on_step(step: int) -> None:
         progress["step"] = step
+        step_clock.record(time.time())
         payload = {"step": step}
         if progress["loss"] is not None:
             payload["loss"] = progress["loss"]
         if progress["truncation_step"] == step and progress["truncation_rate"] is not None:
             payload["truncation_rate"] = progress["truncation_rate"]
-        _opd_train._w.heartbeat("opd_step", **payload)
+        _opd_train._w.heartbeat("opd_step", **payload, **step_timing_fields())
 
     def child_heartbeat() -> None:
         _opd_train._w.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
@@ -634,9 +648,14 @@ def _build_child_callbacks(
     tail_staleness = _opd_train.ChildTailStaleness()
 
     def liveness_fields() -> dict[str, object]:
-        return _opd_train.stall_tail_fields(
-            int(progress["step"] or 0), child_tail, staleness=tail_staleness
-        )
+        # this daemon shares the step heartbeat's upload slot, so a tick that wins it must carry the
+        # step timing too, or a published step alternates between having the measurement and not.
+        return {
+            **_opd_train.stall_tail_fields(
+                int(progress["step"] or 0), child_tail, staleness=tail_staleness
+            ),
+            **step_timing_fields(),
+        }
 
     return _ChildCallbacks(
         on_line,
@@ -660,7 +679,13 @@ def _run_child(
     overrides = _opd_train.build_opd_overrides(config)
     progress_state = _opd_train._OpdProgressState(runtime.resume_state)
     watcher = _build_checkpoint_watcher(request, workload, runtime, progress_state)
-    callbacks = _build_child_callbacks(watcher, progress_state, runtime.bridge, runtime.resume_step)
+    callbacks = _build_child_callbacks(
+        watcher,
+        progress_state,
+        runtime.bridge,
+        runtime.resume_step,
+        total_steps=workload.update_horizon,
+    )
     child_env = _build_child_env(request, prompt_state, workload, runtime, eos_token_ids)
     command = [runtime.python_bin, runtime.entry_path, *overrides]
     gpu_sampler = _opd_train._NvidiaSmiPeakSampler().start()

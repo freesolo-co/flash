@@ -392,7 +392,12 @@ def run_rl_train():
         with liveness_heartbeat(
             "rl_step",
             progress=_progress,
-            fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
+            fields=lambda: {
+                "metrics_last": list(metrics_last),
+                **_reward_observability(),
+                # steady-state per-step timing; empty until a whole step has been measured.
+                **_rl_step_timing_fields(state, expected_steps),
+            },
             progress_step=True,
         ):
             rc = _execute_rl_child(
@@ -496,6 +501,7 @@ from flash.engine.worker.rl_train_runner import (  # noqa: E402,F401
     _prepare_rl_runtime,
     _resolve_training_settings,
     _RewardRuntime,
+    _rl_step_timing_fields,
     _start_resume_uploader,
     _start_reward_runtime,
     _StepMetricState,
