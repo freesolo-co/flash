@@ -14,7 +14,6 @@ import atexit
 import contextlib
 import ctypes
 import os
-import re
 import signal
 import subprocess
 import threading
@@ -475,7 +474,6 @@ def run_verl_training(
     on_step: Callable[[int], None] | None = None,
     on_line: Callable[[str], None] | None = None,
     heartbeat: Callable[[], None] | None = None,
-    step_pattern: str = r"step:\s*(\d+)",
     heartbeat_interval_s: float = 20.0,
     tail: ChildOutputTail | None = None,
 ) -> int:
@@ -485,8 +483,14 @@ def run_verl_training(
     receives every line, ``on_step`` receives each parsed training step, and ``heartbeat`` is called
     at most once per ``heartbeat_interval_s``. callback failures terminate the child before they are
     re-raised so a failed required checkpoint upload cannot leave paid training running unattended.
+
+    Steps come from ``verl_step_number``, the same gate ``on_line`` consumers use. This used to scan
+    with a looser ``step:\\s*(\\d+)`` of its own, which also matched ``global_step:9`` inside a
+    checkpoint path and read step 1 out of ``timing/step:1.25`` -- so a save or a metrics line could
+    fabricate a step that no optimizer update produced. One gate rather than two also means a change
+    to verl's line format (VERL-134) has one place to be fixed rather than two that can disagree.
     """
-    step_re = re.compile(step_pattern)
+    # imported here rather than at module scope: child_io is imported at the bottom of this module.
     child_tail = tail if tail is not None else ChildOutputTail()
     # before the child exists, so any grandchild it orphans reparents here and can actually be
     # reaped. this process is not pid 1 -- the runpod handler is -- so without it every wait below
@@ -520,9 +524,9 @@ def run_verl_training(
                     child_tail.record(line)
                     if on_line is not None:
                         on_line(line)
-                    m = step_re.search(line)
-                    if m and on_step is not None:
-                        on_step(int(m.group(1)))
+                    step = verl_step_number(line)
+                    if step is not None and on_step is not None:
+                        on_step(step)
                     if heartbeat is not None:
                         now = time.monotonic()
                         if now - last_hb >= heartbeat_interval_s:

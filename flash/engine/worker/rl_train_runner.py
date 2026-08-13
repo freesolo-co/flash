@@ -36,8 +36,6 @@ from flash.engine.worker.io.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
     LATEST_GRPO_METRICS_LAST,
     RewardObservabilityBuffer,
-    liveness_heartbeat,
-    publishing_step_timing,
 )
 from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.runtime.pkg_proxy import W as _w
@@ -448,54 +446,6 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
     return env_for_verl
 
 
-def _run_rl_child_under_heartbeat(
-    *,
-    progress: Callable[[], int],
-    metrics_last: list,
-    reward_observability: Callable[[], dict],
-    state: _StepMetricState,
-    expected_steps: int,
-    python_bin,
-    overrides,
-    env_for_verl,
-    inp,
-    reward_runtime,
-    files,
-) -> int:
-    """Run the verl child with the rl_step heartbeat and its step timing published around it.
-
-    The timing reader is registered twice on purpose. ``liveness_heartbeat`` carries it on the
-    daemon ticks that share this stage's upload slot, and ``publishing_step_timing`` exposes the same
-    reader to the unthrottled ``checkpoint_uploaded`` ping -- which arms that very throttle, so a
-    save publishing no timing would blank the measured pace off live status and leave every ping
-    that could restore it throttled behind it.
-    """
-    step_timing_now = _rl_step_timing_publisher(state, expected_steps)
-    with (
-        publishing_step_timing(step_timing_now),
-        liveness_heartbeat(
-            "rl_step",
-            progress=progress,
-            fields=lambda: {
-                "metrics_last": list(metrics_last),
-                **reward_observability(),
-                **step_timing_now(),
-            },
-            progress_step=True,
-        ),
-    ):
-        return _execute_rl_child(
-            python_bin=python_bin,
-            overrides=overrides,
-            env_for_verl=env_for_verl,
-            inp=inp,
-            state=state,
-            reward_runtime=reward_runtime,
-            _reward_observability=reward_observability,
-            files=files,
-        )
-
-
 def _rl_step_timing_publisher(state: _StepMetricState, total_steps: int) -> Callable[[], dict]:
     """A no-argument reader of this run's step timing, for the hooks that publish it.
 
@@ -699,6 +649,18 @@ def _validate_rl_child(rc, state, resume_step, expected_steps, resume_uploader, 
     if resume_uploader is not None and resume_uploader.required_steps:
         resume_uploader.stop()
         resume_uploader.raise_if_incomplete()
+
+
+def _require_complete_rl_run(steps_run: int, expected_steps: int) -> None:
+    """Fail a run that trained fewer optimizer updates than were asked for.
+
+    A short run still leaves a loadable adapter on disk, so without this the worker would publish it
+    as a completed run of the requested length.
+    """
+    if steps_run < expected_steps:
+        raise RuntimeError(
+            f"grpo completed {steps_run}/{expected_steps} requested optimizer updates"
+        )
 
 
 def _prepare_final_adapter(local_dir: str, t_train: float):

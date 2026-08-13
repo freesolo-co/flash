@@ -570,3 +570,33 @@ def test_every_step_timestamp_comes_from_a_clock_that_cannot_jump():
     # every trainer records and two of them also time their heartbeat; a passing assertion loop that
     # visited nothing would be the failure this guards against.
     assert checked == 5, checked
+
+
+def test_a_checkpoint_path_is_not_timed_as_a_step(tmp_path):
+    """SFT and OPD used to scan stdout with a looser pattern than the gate their siblings use.
+
+    ``step:\\s*(\\d+)`` also matches ``global_step:9`` inside a checkpoint path and reads step 1 out
+    of ``timing/step:1.25``, so a save or a metrics line could fabricate a step no optimizer update
+    produced -- splitting one real interval into two shorter samples and biasing the pace, the ETA
+    and the wall-risk warning low. Both now gate on ``verl_step_number``.
+    """
+    import os
+    import sys
+
+    from flash.engine.worker import backend_common
+
+    lines = [
+        "step:1 - train/loss:0.5",
+        "Saving checkpoint to /ckpt/global_step:9/actor",
+        "timing/step:1.25",
+        "val/global_step:12",
+        "step:2 - train/loss:0.4",
+    ]
+    script = "import sys\n" + "".join(f"print({line!r}, flush=True)\n" for line in lines)
+
+    seen: list[int] = []
+    code = backend_common.run_verl_training(
+        [sys.executable, "-c", script], env=dict(os.environ), on_step=seen.append
+    )
+    assert code == 0
+    assert seen == [1, 2], seen

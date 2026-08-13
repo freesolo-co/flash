@@ -6166,8 +6166,11 @@ def test_the_liveness_fields_hook_carries_reward_observability():
     assert "**_reward_observability()" in hook
     # the same hook carries step timing, for the same reason: the daemon can win the upload slot,
     # and a payload without it publishes a step whose measured pace looks lost rather than merely
-    # not re-sent.
-    assert "**_rl_step_timing_fields(state, expected_steps)" in hook
+    # not re-sent. the reader is shared with publishing_step_timing (which serves the unthrottled
+    # checkpoint ping) rather than each closing over the state separately, so both publish one view.
+    assert "**_step_timing()" in hook
+    assert "_step_timing = _rl_step_timing_publisher(state, expected_steps)" in src
+    assert "publishing_step_timing(_step_timing)" in src
 
 
 def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains():

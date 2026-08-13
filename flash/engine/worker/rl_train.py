@@ -48,7 +48,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     verl_device_capability,
     wrap_shim_fragment,
 )
-from flash.engine.worker.io.heartbeat import liveness_heartbeat
+from flash.engine.worker.io.heartbeat import liveness_heartbeat, publishing_step_timing
 
 # no call site in this module since the uploader moved to `.train.rl.checkpoints`, but it is kept
 # imported here on purpose: the resume tests patch `rl_train._deployable_adapter_on_hf`, and the
@@ -389,16 +389,19 @@ def run_rl_train():
             """return reward metrics and sampled completions for one heartbeat."""
             return reward_runtime.observability.heartbeat_fields()
 
-        with liveness_heartbeat(
-            "rl_step",
-            progress=_progress,
-            fields=lambda: {
-                "metrics_last": list(metrics_last),
-                **_reward_observability(),
-                # steady-state per-step timing; empty until a whole step has been measured.
-                **_rl_step_timing_fields(state, expected_steps),
-            },
-            progress_step=True,
+        _step_timing = _rl_step_timing_publisher(state, expected_steps)
+        with (
+            publishing_step_timing(_step_timing),
+            liveness_heartbeat(
+                "rl_step",
+                progress=_progress,
+                fields=lambda: {
+                    "metrics_last": list(metrics_last),
+                    **_reward_observability(),
+                    **_step_timing(),
+                },
+                progress_step=True,
+            ),
         ):
             rc = _execute_rl_child(
                 python_bin=python_bin,
@@ -436,10 +439,7 @@ def run_rl_train():
     actor_dir, adapter_dir, steps_run, train_wall = _prepare_final_adapter(
         files["local_dir"], configured["t_train"]
     )
-    if steps_run < expected_steps:
-        raise RuntimeError(
-            f"grpo completed {steps_run}/{expected_steps} requested optimizer updates"
-        )
+    _require_complete_rl_run(steps_run, expected_steps)
     with liveness_heartbeat(
         "rl_finalizing",
         progress=lambda: steps_run,
@@ -499,9 +499,11 @@ from flash.engine.worker.rl_train_runner import (  # noqa: E402,F401
     _prepare_rl_files,
     _prepare_rl_inputs,
     _prepare_rl_runtime,
+    _require_complete_rl_run,
     _resolve_training_settings,
     _RewardRuntime,
     _rl_step_timing_fields,
+    _rl_step_timing_publisher,
     _start_resume_uploader,
     _start_reward_runtime,
     _StepMetricState,
