@@ -321,6 +321,10 @@ class _PollState:
     throttled_timer: Any
     queued_timer: Any
     worker_coming_up_at: float | None
+    # latched once RunPod has ever granted a worker. `worker_coming_up_at` is a TTL'd sighting and
+    # so goes false again on any health gap; this never does. The queued-wait stall exemption keys
+    # on it so a flapping health read cannot keep rearming the cold-start budget.
+    ever_saw_worker: bool
 
 
 def _wall_deadline_result(context: _PollContext) -> PollResult | None:
@@ -455,6 +459,7 @@ def _classify_queue_state(
         coming_up = _worker_is_coming_up(_probe_worker_coming_up_at(context, now), now)
         if coming_up:
             state.worker_coming_up_at = now
+            state.ever_saw_worker = True
     if state.queued_timer.expired(
         status == "IN_QUEUE" and not coming_up, now, context.queue_grace_s
     ):
@@ -492,6 +497,8 @@ def _classify_queue_state(
         # flag: a probe that starts failing must not leave a stale true suppressing the
         # capacity timer forever, so it expires after WORKER_COMING_UP_TTL_S.
         state.worker_coming_up_at = now if (usable or recovering) else None
+        if usable or recovering:
+            state.ever_saw_worker = True
         if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
             context.say(f"queued; workers: {workers}")
         if state.unhealthy_timer.expired(
@@ -574,7 +581,14 @@ def _classify_stall(context: _PollContext, state: _PollState, status: Any) -> Po
         # capacity grace -- would be declared stalled on its very first poll, having been given no
         # time to boot at all. Roll the anchor forward while the exemption holds so the grant
         # starts the cold-start budget from zero, exactly as an immediate grant does.
-        state.last_progress = now
+        #
+        # Only until the FIRST grant, though. `worker_coming_up_at` is a TTL'd sighting, so health
+        # that alternates between a placed worker and an empty snapshot re-enters this branch on
+        # every gap; rolling the anchor there would rearm the cold start indefinitely and let a
+        # wedged paid worker run to the outer wall deadline instead of the setup grace. Past the
+        # first grant the wait is a cold start, and the setup grace owns it.
+        if not state.ever_saw_worker:
+            state.last_progress = now
         return None
     if now - state.last_progress <= stall_limit:
         return None
@@ -663,6 +677,7 @@ def poll_job(
         # while a worker is initializing or usable; carry that observation forward so the capacity
         # timer gets it too, and a heavy image can never self-report as no_capacity.
         worker_coming_up_at=None,
+        ever_saw_worker=False,
     )
     while True:
         terminal = _wall_deadline_result(context)

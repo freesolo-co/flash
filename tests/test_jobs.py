@@ -900,6 +900,49 @@ def test_a_worker_that_stays_placed_does_not_renew_its_setup_budget_forever(monk
     )
 
 
+def test_flapping_health_cannot_rearm_the_cold_start_budget_forever(monkeypatch):
+    # The queued-wait stall exemption keys on `worker_coming_up_at`, which is a TTL'd SIGHTING and
+    # therefore goes false again on any health gap. So endpoint health that alternates between a
+    # placed worker and an empty snapshot re-entered the exemption on every gap and rolled
+    # `last_progress` forward each time, while the placed polls in between disarmed the queue timer
+    # -- neither timer could ever fire, and a wedged PAID worker ran to the run's outer wall
+    # deadline. Latching the first grant bounds it at the setup grace instead.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    flip = {"n": 0}
+
+    def health(_eid, _fp, **_kw):
+        flip["n"] += 1
+        return {"workers": {"initializing": 1} if flip["n"] % 2 == 0 else {}}
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    # 120s steps so every poll clears the 90s health-probe throttle and actually re-reads health.
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    wall = 200_000.0
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        deadline_at=wall,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", res.detail
+    # the wall deadline is the backstop, never the intended bound -- reaching it means both timers
+    # were held off for the run's entire lifetime while a granted worker sat wedged and billing.
+    assert "wall deadline" not in res.detail, (
+        "flapping health held off both timers to the wall deadline; the first-grant latch is not "
+        f"bounding the cold start ({res.detail})"
+    )
+    assert "limit 3000s" in res.detail, res.detail
+
+
 def test_a_worker_that_is_coming_up_still_gets_the_unscaled_setup_grace(monkeypatch):
     # The capacity timer is suppressed once RunPod grants a worker, so from there the wait is a
     # cold start, not starvation -- and a cold start's budget has nothing to do with how scarce the
