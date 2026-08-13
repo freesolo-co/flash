@@ -527,9 +527,25 @@ def cmd_serve_status(args) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            # 404 for this made-up id is the expected answer and proves the key got past
-            # authentication. Any other 4xx is the backend answering on its own terms, not a
-            # rejection of the key. Nothing to report.
+            # 404 for this made-up id is the expected answer and the ONLY one that proves the read
+            # -back route works: the key got past authentication and the route resolved the id to
+            # "no such record".
+            #
+            # Any other 4xx is not a pass. A 400/405/422 says the backend did not answer this route
+            # the way the contract requires -- a missing route, a rejected path shape, a handler
+            # that wants query parameters -- and `models deploy` polls this exact route, where
+            # `_registered_adapter_response` treats a non-404 4xx as fatal. Falling through to
+            # `ready` here means the operator is told the backend is good and then loses the deploy
+            # to the same status, after registration has already started.
+            if exc.code != 404:
+                print(
+                    f"\nthe backend at {shown} answered {exc.code} for a read-back of an unknown "
+                    f"adapter id, where the contract requires 404. `{CLI_NAME} models deploy` polls "
+                    f"this route and fails on any non-404 4xx, so deploys will not work against "
+                    f"this backend.",
+                    file=sys.stderr,
+                )
+                return 1
         except Exception as exc:
             # The backend answered /healthz a moment ago, so a transport failure here is a real
             # inconsistency worth surfacing rather than swallowing. Reported without claiming to

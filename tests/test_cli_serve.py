@@ -792,6 +792,49 @@ def test_status_does_not_report_ready_when_the_key_probe_errors(monkeypatch, cap
     assert "500" in out.err, f"the failure did not name the status it got: {out.err!r}"
 
 
+@pytest.mark.parametrize("status_code", [400, 405, 422])
+def test_status_does_not_report_ready_on_a_non_404_read_back(monkeypatch, capsys, status_code):
+    """Only 404 proves the read-back route works. Any other 4xx is not a pass.
+
+    404 for an id that cannot exist means two things at once: the key got past authentication, and
+    the route resolved the id to "no such record". A 400/405/422 proves neither -- it is the backend
+    saying it does not answer this route the way the contract requires (missing route, rejected path
+    shape, a handler wanting query parameters).
+
+    Which matters because `models deploy` polls this exact route: `_registered_adapter_response`
+    passes `ok_statuses=(404,)` and `_wait_revision_ready` re-raises any status below 500, so a
+    non-404 4xx is fatal there. Falling through to `ready` tells the operator the backend is good
+    and then loses the deploy to the same status, after registration has already started.
+    """
+    import urllib.error
+
+    from flash.serve import urls as urls_mod
+
+    def _fake_request(url, headers, path="/healthz"):
+        if path == "/healthz":
+            return {
+                "ok": True,
+                "requires_key": True,
+                "base_models": ["Qwen/Qwen3.5-4B"],
+                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
+            }
+        raise urllib.error.HTTPError(url, status_code, "unexpected", {}, None)
+
+    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "right")
+    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+
+    code = serve_cmd.cmd_serve_status(_args())
+    out = capsys.readouterr()
+    assert code == 1, (
+        f"a {status_code} read-back was reported as ready, but deploy polls this same route and "
+        f"treats any non-404 4xx as fatal -- so the operator is told to deploy against a backend "
+        f"that cannot complete one"
+    )
+    assert "ready. deploy a run" not in out.out
+    assert str(status_code) in out.err, f"the failure did not name the status it got: {out.err!r}"
+
+
 def test_status_reports_ready_when_the_serving_key_is_accepted(monkeypatch, capsys):
     """The probe must pass a CORRECT key through.
 

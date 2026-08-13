@@ -119,12 +119,26 @@ def _register(http, body: dict):
 
 
 def _wait_ready(http, revision: str, timeout: float) -> dict:
-    """Poll to a settled state, honoring Retry-After exactly as the client does."""
+    """Poll to a settled state, honoring Retry-After exactly as the client does.
+
+    The deadline bounds each REQUEST and is re-checked after it, not only before. Checked only
+    beforehand, a backend that long-polls the read-back is accepted for a `ready` that arrived after
+    the budget was gone -- and the shipped client would not accept it: `_wait_revision_ready` passes
+    the remaining budget as the per-request timeout and breaks on a read that completes past the
+    deadline. A backend with slow status reads would otherwise pass conformance and then fail every
+    real deploy, which is the one thing this suite exists to rule out.
+    """
     deadline = time.monotonic() + timeout
     delay = 1.0
     last = "registered"
-    while time.monotonic() < deadline:
-        response = http.get(f"/adapters/{revision}")
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        response = http.get(f"/adapters/{revision}", timeout=remaining)
+        if deadline - time.monotonic() <= 0:
+            # Completed, but not in time. Not honored, for the same reason the client does not.
+            break
         if response.status_code != 404:
             assert response.status_code == 200, (
                 f"read-back returned {response.status_code}: {response.text[:400]}"
@@ -142,7 +156,12 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
                     delay = max(0.5, min(float(retry_after), 30.0))
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
         delay = min(delay * 2, 15.0)
-    pytest.fail(f"revision {revision} never reached ready (last state {last!r})")
+    pytest.fail(
+        f"revision {revision} never reached ready within {timeout}s (last state {last!r}). "
+        "a read-back that only completes after the budget is spent does not count: the client "
+        "bounds each poll by its remaining budget and discards a late response, so a backend that "
+        "needs longer than this fails every deploy"
+    )
 
 
 @pytest.fixture
