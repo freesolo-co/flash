@@ -518,6 +518,9 @@ def _message_text(content: Any) -> str | None:
     for part in content:
         if not isinstance(part, dict):
             return None
+        part_type = part.get("type")
+        if part_type is not None and part_type != "text":
+            return None
         text = part.get("text")
         if not isinstance(text, str):
             return None

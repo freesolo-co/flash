@@ -313,6 +313,48 @@ def test_huge_integer_request_body_returns_invalid_json(trace_api) -> None:
     assert response.json() == {"detail": "Invalid JSON body"}
 
 
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_json_request_body_returns_invalid_json_without_creating_a_client(
+    trace_api, monkeypatch, constant: str
+) -> None:
+    created = 0
+
+    class _CountingClient(_StreamingAsyncClient):
+        def __init__(self, *args, **kwargs) -> None:
+            nonlocal created
+            created += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _CountingClient)
+    body = f'{{"model":"gpt-test","stream":true,"temperature":{constant}}}'.encode()
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, content=body)
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid JSON body"}
+    assert created == 0
+
+
+def test_streaming_request_encoding_failure_closes_the_client(trace_api, monkeypatch) -> None:
+    clients = []
+
+    class _EncodingFailureClient(_StreamingAsyncClient):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            clients.append(self)
+
+        def build_request(self, method, url, *, headers, json) -> httpx.Request:
+            raise ValueError("encoding failed")
+
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _EncodingFailureClient)
+
+    with pytest.raises(ValueError, match="encoding failed"):
+        trace_api.post("/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True})
+
+    assert len(clients) == 1
+    assert clients[0].closed is True
+
+
 def test_streamed_json_value_conversion_failure_records_text(trace_api, monkeypatch) -> None:
     body = b'{"number":' + b"9" * 4_301 + b"}"
 
@@ -545,6 +587,22 @@ def test_sse_accumulator_accepts_bare_cr_and_preserves_split_crlf() -> None:
     assert split_accumulator.output()["choices"][0]["message"]["content"] == "split"
 
 
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n", b"\r"], ids=["lf", "crlf", "cr"])
+def test_done_gate_does_not_terminate_on_done_inside_multiline_data_event(
+    line_ending: bytes,
+) -> None:
+    first = line_ending.join([b'data: {"notice":1}', b"data: [DONE]", b""])
+    later = b'data: {"choices":[{"delta":{"content":"LATER"}}]}' + line_ending * 2
+    gate = trace_sse.SseDoneGate()
+
+    forwarded = gate.feed(first)
+    forwarded.extend(gate.feed(later))
+    forwarded.extend(gate.finish())
+
+    assert b"".join(forwarded) == first + later
+    assert gate.terminated is False
+
+
 def test_done_gate_bounds_an_unterminated_done_candidate() -> None:
     gate = trace_sse.SseDoneGate()
 
@@ -691,6 +749,55 @@ def test_distinct_sse_envelope_field_names_count_toward_the_stream_budget() -> N
     assert accumulator.truncated is True
     assert accumulator.defect is None
     assert len(accumulator._envelope) < 2_000
+    assert len(json.dumps(accumulator.output()).encode()) <= budget + 200
+
+
+def test_large_choice_indices_count_toward_the_stream_budget() -> None:
+    budget = 5_000
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=budget)
+    index = int("9" * 4_001)
+
+    for offset in range(50):
+        accumulator.feed(
+            b"data: "
+            + json.dumps({"choices": [{"index": index + offset, "delta": {}}]}).encode()
+            + b"\n\n"
+        )
+        if accumulator.truncated:
+            break
+
+    assert accumulator.truncated is True
+    assert accumulator.defect is None
+    assert len(json.dumps(accumulator.output()).encode()) <= budget
+
+
+def test_choice_level_extension_fields_survive_stream_accumulation() -> None:
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=1_000)
+    accumulator.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"hello"},'
+        b'"native_finish_reason":"STOP","safety":{"a":1},"finish_reason":"stop"}]}\n\n'
+    )
+
+    choice = accumulator.output()["choices"][0]
+    assert choice["native_finish_reason"] == "STOP"
+    assert choice["safety"] == {"a": 1}
+    assert choice["message"]["content"] == "hello"
+    assert choice["finish_reason"] == "stop"
+
+
+def test_choice_level_extension_fields_count_toward_the_stream_budget() -> None:
+    budget = 1_000
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=budget)
+
+    for index in range(2_000):
+        field = f"choice_extension_{index}_" + "x" * 100
+        event = json.dumps({"choices": [{"index": 0, "delta": {}, field: "x" * 100}]}).encode()
+        accumulator.feed(b"data: " + event + b"\n\n")
+        if accumulator.truncated:
+            break
+
+    assert accumulator.truncated is True
+    assert accumulator.defect is None
     assert len(json.dumps(accumulator.output()).encode()) <= budget + 200
 
 
@@ -1531,6 +1638,48 @@ def test_a_contextual_chat_envelope_is_preserved_only_in_raw_export(trace_api) -
     span = raw["records"][0]["spans"][0]
     assert span["input_payload"] == request
     assert span["output_payload"] == response
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ([{"type": "image_url", "image_url": {"url": "u"}, "text": "caption"}], None),
+        (
+            [
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "d"},
+                    "text": "transcript",
+                }
+            ],
+            None,
+        ),
+        ([{"type": "file", "file": {"id": "f"}, "text": "filename"}], None),
+        (
+            [
+                {"type": "text", "text": "look: "},
+                {"type": "image_url", "image_url": {"url": "u"}, "text": "cap"},
+            ],
+            None,
+        ),
+        ([{"type": "image_url", "image_url": {"url": "u"}}], None),
+        ([{"type": "text", "text": "plain"}], "plain"),
+        ([{"text": "bare"}], "bare"),
+        ("hello", "hello"),
+    ],
+    ids=[
+        "image-with-text",
+        "audio-with-text",
+        "file-with-text",
+        "mixed-text-image",
+        "image-without-text",
+        "typed-text",
+        "untyped-text",
+        "string",
+    ],
+)
+def test_message_text_rejects_explicit_non_text_parts(content, expected) -> None:
+    assert platform_traces._message_text(content) == expected
 
 
 def test_a_non_chat_response_body_is_skipped_not_exported_as_the_target(trace_api) -> None:
@@ -3261,6 +3410,108 @@ def test_schema_reference_resolution_regressions(trace_api, monkeypatch) -> None
     assert definitions["ExamplesTarget"]["default"] == "EXAMPLES-KEEP"
 
 
+@pytest.mark.parametrize("applicator", ["allOf", "anyOf", "oneOf"])
+def test_applicator_only_secret_schema_refs_are_redacted(
+    trace_api, monkeypatch, applicator: str
+) -> None:
+    schema = {
+        "type": "object",
+        applicator: [{"properties": {"password": {"$ref": "#/$defs/Cred"}}}],
+        "$defs": {
+            "Cred": {"default": "S-APP"},
+            "Other": {"default": "KEEP"},
+        },
+    }
+
+    definitions = _recorded_response_schema(trace_api, monkeypatch, schema)["$defs"]
+
+    assert definitions["Cred"]["default"] == "[redacted]"
+    assert definitions["Other"]["default"] == "KEEP"
+
+
+def test_secret_schema_pointer_into_top_level_array_is_redacted(trace_api, monkeypatch) -> None:
+    schema = {
+        "properties": {"password": {"$ref": "#/allOf/0"}},
+        "allOf": [{"default": "S-ARR", "$ref": "#/$defs/Linked"}],
+        "$defs": {"Linked": {"default": "S-LINKED"}},
+    }
+
+    stored = _recorded_response_schema(trace_api, monkeypatch, schema)
+
+    assert stored["allOf"][0]["default"] == "[redacted]"
+    assert stored["$defs"]["Linked"]["default"] == "[redacted]"
+
+
+def test_secret_schema_pointer_with_deep_array_segment_is_redacted(trace_api, monkeypatch) -> None:
+    schema = {
+        "properties": {"password": {"$ref": "#/$defs/Wrapper/anyOf/0"}},
+        "$defs": {
+            "Wrapper": {"anyOf": [{"default": "S-DEEP", "$ref": "#/$defs/Linked"}]},
+            "Linked": {"default": "S-DEEP-LINKED"},
+        },
+    }
+
+    stored = _recorded_response_schema(trace_api, monkeypatch, schema)
+
+    assert stored["$defs"]["Wrapper"]["anyOf"][0]["default"] == "[redacted]"
+    assert stored["$defs"]["Linked"]["default"] == "[redacted]"
+
+
+def test_secret_schema_pointer_into_definition_array_is_redacted(trace_api, monkeypatch) -> None:
+    schema = {
+        "properties": {"password": {"$ref": "#/$defs/List/0"}},
+        "$defs": {
+            "List": [{"default": "S-DL", "$ref": "#/$defs/Linked"}],
+            "Linked": {"default": "S-DL-LINKED"},
+        },
+    }
+
+    stored = _recorded_response_schema(trace_api, monkeypatch, schema)
+
+    assert stored["$defs"]["List"][0]["default"] == "[redacted]"
+    assert stored["$defs"]["Linked"]["default"] == "[redacted]"
+
+
+def test_out_of_range_secret_schema_array_pointer_does_not_over_redact(
+    trace_api, monkeypatch
+) -> None:
+    schema = {
+        "properties": {"password": {"$ref": "#/allOf/9"}},
+        "allOf": [{"default": "KEEP"}],
+    }
+
+    stored = _recorded_response_schema(trace_api, monkeypatch, schema)
+
+    assert stored["allOf"][0]["default"] == "KEEP"
+
+
+def test_secret_schema_anchor_inside_array_element_is_redacted(trace_api, monkeypatch) -> None:
+    schema = {
+        "properties": {"password": {"$ref": "#Credential"}},
+        "allOf": [
+            {"default": "KEEP"},
+            {"$anchor": "Credential", "default": "S-ANCHOR"},
+        ],
+    }
+
+    stored = _recorded_response_schema(trace_api, monkeypatch, schema)
+
+    assert stored["allOf"][0]["default"] == "KEEP"
+    assert stored["allOf"][1]["default"] == "[redacted]"
+
+
+def test_non_schema_choice_list_content_survives_list_path_tracking() -> None:
+    payload = {"choices": [{"message": {"role": "assistant", "content": "hello"}}]}
+
+    assert traces._redact_secret_fields(payload, response_root=True) == payload
+
+
+def test_non_schema_secret_fields_in_lists_remain_redacted() -> None:
+    payload = {"a": [{"password": "pw"}]}
+
+    assert traces._redact_secret_fields(payload) == {"a": [{"password": "[redacted]"}]}
+
+
 def test_a_request_token_field_is_redacted(trace_api, monkeypatch) -> None:
     """A request-side `token` can hold an unrelated third-party credential. Exempting that key
     globally because response logprobs also call generated text `token` persists the credential and
@@ -4072,6 +4323,45 @@ def test_a_present_malformed_stream_role_marks_the_stream_errored(
     span = _raw(trace_api)["records"][0]["spans"][0]
     assert span["status_code"] == "ERROR"
     assert span["error"] == "stream choice contained a non-string role"
+
+
+@pytest.mark.parametrize("content", [123, {}, True], ids=["integer", "object", "boolean"])
+def test_present_malformed_stream_content_marks_the_stream_errored(content) -> None:
+    accumulator = trace_sse.SseAccumulator()
+    malformed = json.dumps({"choices": [{"index": 0, "delta": {"content": content}}]}).encode()
+    accumulator.feed(b"data: " + malformed + b"\n\n")
+    accumulator.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}]}\n\n'
+    )
+
+    assert accumulator.defect == "stream choice contained malformed content"
+    assert accumulator.output()["choices"][0]["message"]["content"] == "hello"
+
+
+@pytest.mark.parametrize("content", [{}, {"content": None}])
+def test_absent_or_null_stream_content_is_not_a_defect(content: dict) -> None:
+    accumulator = trace_sse.SseAccumulator()
+    delta = {**content, "role": "assistant"}
+    event = json.dumps(
+        {"choices": [{"index": 0, "delta": delta, "finish_reason": "stop"}]}
+    ).encode()
+
+    accumulator.feed(b"data: " + event + b"\n\n")
+
+    assert accumulator.defect is None
+
+
+def test_stream_content_list_is_preserved() -> None:
+    accumulator = trace_sse.SseAccumulator()
+    content = [{"type": "text", "text": "hello"}]
+    event = json.dumps(
+        {"choices": [{"index": 0, "delta": {"content": content}, "finish_reason": "stop"}]}
+    ).encode()
+
+    accumulator.feed(b"data: " + event + b"\n\n")
+
+    assert accumulator.defect is None
+    assert accumulator.output()["choices"][0]["message"]["content"] == content
 
 
 def test_a_non_object_delta_marks_the_stream_errored(trace_api, monkeypatch) -> None:

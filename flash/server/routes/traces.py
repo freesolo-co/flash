@@ -235,7 +235,7 @@ def _local_schema_pointer(
     return frozenset()
 
 
-def _schema_anchor_pointers(value: Any) -> dict[str, frozenset[tuple[str, ...]]]:
+def _schema_anchor_pointers(value: Any, *, depth: int = 0) -> dict[str, frozenset[tuple[str, ...]]]:
     anchors: dict[str, set[tuple[str, ...]]] = {}
 
     def collect(node: Any, path: tuple[str, ...], depth: int) -> None:
@@ -249,18 +249,18 @@ def _schema_anchor_pointers(value: Any) -> dict[str, frozenset[tuple[str, ...]]]
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                     collect(item, (*path, str(key)), depth + 1)
         elif isinstance(node, list | tuple):
-            for item in node:
-                collect(item, path, depth + 1)
+            for index, item in enumerate(node):
+                collect(item, (*path, str(index)), depth + 1)
 
-    collect(value, (), 0)
+    collect(value, (), depth)
     return {name: frozenset(paths) for name, paths in anchors.items()}
 
 
-def _secret_schema_definition_refs(value: Any) -> set[tuple[str, ...]]:
-    if not isinstance(value, dict) or not isinstance(value.get("properties"), dict):
+def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[str, ...]]:
+    if not isinstance(value, dict):
         return set()
     refs: set[tuple[str, ...]] = set()
-    anchors = _schema_anchor_pointers(value)
+    anchors = _schema_anchor_pointers(value, depth=depth)
 
     def collect_refs(node: Any, node_depth: int) -> set[tuple[str, ...]]:
         if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
@@ -298,12 +298,18 @@ def _secret_schema_definition_refs(value: Any) -> set[tuple[str, ...]]:
     def resolve(pointer: tuple[str, ...]) -> Any:
         target: Any = value
         for segment in pointer:
-            if not isinstance(target, dict) or segment not in target:
+            if isinstance(target, dict) and segment in target:
+                target = target[segment]
+            elif isinstance(target, list | tuple) and segment.isdigit():
+                index = int(segment)
+                if index >= len(target):
+                    return None
+                target = target[index]
+            else:
                 return None
-            target = target[segment]
         return target
 
-    collect_secret_properties(value, 0)
+    collect_secret_properties(value, depth)
     pending = list(refs)
     while pending:
         target = resolve(pending.pop())
@@ -332,7 +338,8 @@ def _redact_secret_fields(
         return "[redacted]"
     if isinstance(value, dict):
         local_secret_schema_refs = {
-            (*schema_definition_path, *pointer) for pointer in _secret_schema_definition_refs(value)
+            (*schema_definition_path, *pointer)
+            for pointer in _secret_schema_definition_refs(value, depth=depth)
         }
         active_secret_schema_refs = (secret_schema_refs or set()) | local_secret_schema_refs
         redacted: dict[Any, Any] = {}
@@ -370,14 +377,17 @@ def _redact_secret_fields(
                 item,
                 depth=depth + 1,
                 schema_property_map=schema_property_map,
-                secret_schema_definition=secret_schema_definition,
+                secret_schema_definition=(
+                    secret_schema_definition
+                    or (*schema_definition_path, str(index)) in (secret_schema_refs or set())
+                ),
                 choice=choice_list,
                 logprobs=logprobs,
                 logprob_entries=logprob_entries,
                 secret_schema_refs=secret_schema_refs,
-                schema_definition_path=schema_definition_path,
+                schema_definition_path=(*schema_definition_path, str(index)),
             )
-            for item in value
+            for index, item in enumerate(value)
         ]
     return value
 
@@ -811,6 +821,10 @@ def _request_context(
     )
 
 
+def _reject_json_constant(constant: str) -> None:
+    raise ValueError(f"non-finite JSON constant {constant!r} is not allowed")
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -818,7 +832,7 @@ async def chat_completions(
 ) -> Response:
     raw_body = await _bounded_request_body(request)
     try:
-        parsed_body = json.loads(raw_body)
+        parsed_body = json.loads(raw_body, parse_constant=_reject_json_constant)
     except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
     if not isinstance(parsed_body, dict):
@@ -899,6 +913,9 @@ async def chat_completions(
         except httpx.HTTPError:
             await client.aclose()
             return await _upstream_failure_response(context)
+        except Exception:
+            await client.aclose()
+            raise
         response_headers = _safe_provider_response_headers(
             upstream_response.headers, status_code=upstream_response.status_code
         )

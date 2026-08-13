@@ -25,6 +25,7 @@ class SseDoneGate:
     def __init__(self) -> None:
         self._buffer = b""
         self._done = bytearray()
+        self._event_has_data = False
         self.done_event: bytes | None = None
 
     @property
@@ -43,12 +44,17 @@ class SseDoneGate:
         while (line_end := _line_end(self._buffer, cursor)) is not None:
             line, next_cursor = line_end
             content = self._buffer[cursor:line]
-            if content.startswith(b"data:") and content[len(b"data:") :].strip() == b"[DONE]":
-                forwarded = self._buffer[:cursor]
-                self._done.extend(self._buffer[cursor:next_cursor])
-                self._buffer = self._buffer[next_cursor:]
-                self._consume_done_suffix()
-                return [forwarded] if forwarded else []
+            if not content:
+                self._event_has_data = False
+            elif content.startswith(b"data:"):
+                data = content[len(b"data:") :].strip()
+                if not self._event_has_data and data == b"[DONE]":
+                    forwarded = self._buffer[:cursor]
+                    self._done.extend(self._buffer[cursor:next_cursor])
+                    self._buffer = self._buffer[next_cursor:]
+                    self._consume_done_suffix()
+                    return [forwarded] if forwarded else []
+                self._event_has_data = True
             cursor = next_cursor
 
         trailing = self._buffer[cursor:]
@@ -333,6 +339,7 @@ class SseAccumulator:
                     _materialize_fragments(tool_calls[i]) for i in sorted(tool_calls)
                 ]
             choice = {
+                **state["extensions"],
                 "index": index,
                 "message": message,
                 "finish_reason": state["finish_reason"],
@@ -349,6 +356,7 @@ class SseAccumulator:
                 "message": {"role": "assistant"},
                 "tool_calls": {},
                 "logprobs": {},
+                "extensions": {},
                 "finish_reason": None,
             },
         )
@@ -418,9 +426,16 @@ class SseAccumulator:
                 continue
             else:
                 index = raw_index
-            if index not in self._choices and not self._reserve(b"x" * 64):
+            choice_entry_bytes = max(64, self._value_size(index) + 12)
+            if index not in self._choices and not self._reserve(b"x" * choice_entry_bytes):
                 continue
             state = self._choice_state(index)
+            for key, value in choice.items():
+                if key in {"index", "delta", "logprobs", "finish_reason", "message"}:
+                    continue
+                retained_key = key if key not in state["extensions"] else None
+                if self._reserve(value, retained_key=retained_key):
+                    state["extensions"][key] = value
             if "delta" in choice:
                 delta = choice["delta"]
                 if isinstance(delta, dict):
@@ -455,6 +470,9 @@ class SseAccumulator:
         # dropped them, so a streamed trace held less than the identical non-streaming call.
         for key, value in delta.items():
             if key in {"role", "function_call", "tool_calls"}:
+                continue
+            if key == "content" and value is not None and not isinstance(value, str | list):
+                self._note_defect("stream choice contained malformed content")
                 continue
             retained_key = key if key not in message else None
             if not self._reserve(value, retained_key=retained_key):
