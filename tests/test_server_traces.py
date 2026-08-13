@@ -718,6 +718,44 @@ def test_done_gate_does_not_terminate_when_done_precedes_multiline_data(
     assert gate.terminated is False
 
 
+def test_done_gate_treats_colonless_data_as_an_empty_data_field() -> None:
+    stream = (
+        b"data: [DONE]\ndata\n\n"
+        b'data: {"choices":[{"index":0,"delta":{"content":"AFTER"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    gate = trace_sse.SseDoneGate()
+
+    relayed = gate.feed(stream)
+    relayed.extend(gate.finish())
+
+    assert len(stream) == 94
+    assert b"".join(relayed) + (gate.done_event or b"") == stream
+    assert len(b"".join(relayed)) == 80
+    assert b"AFTER" in b"".join(relayed)
+    assert gate.done_event == b"data: [DONE]\n\n"
+
+
+@pytest.mark.parametrize("field", [b"event", b"database", b"datax"])
+def test_done_gate_does_not_treat_other_colonless_fields_as_data(field: bytes) -> None:
+    stream = b"data: [DONE]\n" + field + b"\n\n"
+    gate = trace_sse.SseDoneGate()
+
+    relayed = gate.feed(stream)
+    relayed.extend(gate.finish())
+
+    assert relayed == []
+    assert gate.terminated is True
+    assert gate.done_event == stream
+
+    accumulator = trace_sse.SseAccumulator()
+    accumulator.feed(stream)
+    accumulator.finish()
+
+    assert accumulator._done is True
+    assert accumulator.defect is None
+
+
 @pytest.mark.parametrize(
     ("event", "terminated"),
     [
@@ -761,18 +799,29 @@ def test_done_gate_relays_events_after_a_whitespace_suffixed_done_value() -> Non
 
 
 @pytest.mark.parametrize(
-    "event",
+    ("event", "terminated"),
     [
-        b"data: [DONE]\n\n",
-        b"data:[DONE]\n\n",
-        b"data: [DONE]   \n\n",
-        b"data:  [DONE]\n\n",
-        b"data: [DONE]\t\n\n",
-        b"data: [DONE]x\n\n",
+        (b"data: [DONE]\n\n", True),
+        (b"data: [DONE]\ndata\n\n", False),
+        (b"data\ndata: [DONE]\n\n", False),
+        (b"data: [DONE]   \n\n", False),
+        (b"data:[DONE]\n\n", True),
+        (b"data:  [DONE]\n\n", False),
+        (b"data: [DONE]\t\n\n", False),
+        (b"data: [DONE]x\n\n", False),
     ],
-    ids=["canonical", "no-space", "trailing-spaces", "two-leading-spaces", "tab", "junk"],
+    ids=[
+        "canonical",
+        "colonless-after",
+        "colonless-before",
+        "trailing-spaces",
+        "no-space",
+        "two-leading-spaces",
+        "tab",
+        "junk",
+    ],
 )
-def test_done_gate_and_accumulator_agree_on_sentinel_values(event: bytes) -> None:
+def test_done_gate_and_accumulator_agree_on_sentinel_values(event: bytes, terminated: bool) -> None:
     gate = trace_sse.SseDoneGate()
     accumulator = trace_sse.SseAccumulator()
 
@@ -781,8 +830,8 @@ def test_done_gate_and_accumulator_agree_on_sentinel_values(event: bytes) -> Non
     accumulator.feed(event)
     accumulator.finish()
 
-    assert gate.terminated is accumulator._done
-    if gate.terminated:
+    assert gate.terminated is accumulator._done is terminated
+    if terminated:
         assert relayed == []
         assert gate.done_event == event
     else:
@@ -988,10 +1037,35 @@ def test_done_gate_releases_oversized_closed_comment_before_later_data() -> None
     accumulator.finish()
 
     assert b"".join(relayed) + (gate.done_event or b"") == stream
-    assert len(b"".join(relayed) + (gate.done_event or b"")) == 1_290
+    assert len(b"".join(relayed)) == 1_276
+    assert len(gate.done_event or b"") == 14
     assert b"AFTER" in b"".join(relayed)
-    assert accumulator.output()["choices"][0]["message"]["content"] == "AFTER"
-    assert accumulator.defect is None
+    assert accumulator.received is False
+    assert accumulator.output()["choices"] == []
+    assert accumulator.defect == "stream contained an unparseable data event"
+
+
+def test_accumulator_marks_a_multiline_leading_done_event_unparseable() -> None:
+    event = b'data: [DONE]\ndata: {"choices":[{"index":0,"delta":{"content":"X"}}]}\n\n'
+    accumulator = trace_sse.SseAccumulator()
+
+    accumulator.feed(event)
+    accumulator.finish()
+
+    assert accumulator.received is False
+    assert accumulator.output()["choices"] == []
+    assert accumulator.defect == "stream contained an unparseable data event"
+
+
+def test_accumulator_handles_two_done_lines_in_one_event() -> None:
+    accumulator = trace_sse.SseAccumulator()
+
+    accumulator.feed(b"data: [DONE]\ndata: [DONE]\n\n")
+    accumulator.finish()
+
+    assert accumulator.received is False
+    assert accumulator.output()["choices"] == []
+    assert accumulator.defect == "stream contained an unparseable data event"
 
 
 def test_done_gate_bounds_a_newline_free_non_data_suffix() -> None:
@@ -3825,6 +3899,60 @@ def test_secret_schema_ref_with_extension_keyword_redacts_neutral_target() -> No
     }
 
 
+@pytest.mark.parametrize(
+    ("schema_id", "ref"),
+    [
+        ("https://example.com/schema", "https://example.com:443/schema#/$defs/Widget"),
+        ("http://example.com/schema", "http://example.com:80/schema#/$defs/Widget"),
+    ],
+    ids=["https-443", "http-80"],
+)
+def test_schema_resource_uris_strip_scheme_default_ports(schema_id: str, ref: str) -> None:
+    assert traces._is_secret_key("Widget") is False
+    schema = {
+        "$id": schema_id,
+        "type": "object",
+        "properties": {"api_key": {"$ref": ref}},
+        "$defs": {
+            "Widget": {
+                "type": "string",
+                "default": "SECRET-N1",
+                "enum": ["SECRET-N1-ENUM"],
+            }
+        },
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["$defs"]["Widget"] == {
+        "type": "string",
+        "default": "[redacted]",
+        "enum": ["[redacted]"],
+    }
+
+
+def test_schema_resource_uris_preserve_nondefault_ports() -> None:
+    assert traces._is_secret_key("Widget") is False
+    schema = {
+        "$id": "https://example.com/schema",
+        "type": "object",
+        "properties": {
+            "api_key": {"$ref": "https://example.com:8443/schema#/$defs/Widget"},
+        },
+        "$defs": {"Widget": {"type": "string", "default": "PUBLIC-8443"}},
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["$defs"]["Widget"]["default"] == "PUBLIC-8443"
+    assert trace_redaction._canonical_resource_uri("https://example.com:/schema") == (
+        "https://example.com/schema"
+    )
+    assert trace_redaction._canonical_resource_uri("https://example.com:8443/schema") == (
+        "https://example.com:8443/schema"
+    )
+
+
 def test_schema_resource_uris_normalize_scheme_and_host_only() -> None:
     assert traces._is_secret_key("Widget") is False
     schema = {
@@ -4427,6 +4555,45 @@ def test_nested_definition_name_collision_preserves_unreferenced_literal(
 
     assert stored["$defs"]["Cred"]["default"] == "[redacted]"
     assert stored["properties"]["profile"]["$defs"]["Cred"]["default"] == "UNRELATED"
+
+
+def test_embedded_resource_anchor_refs_redact_only_the_selected_resource() -> None:
+    assert traces._is_secret_key("Widget") is False
+    schema = {
+        "$id": "https://example.com/root",
+        "type": "object",
+        "properties": {"api_key": {"$ref": "https://example.com/A#Widget"}},
+        "$defs": {
+            "A": {
+                "$id": "https://example.com/A",
+                "$defs": {"W": {"$anchor": "Widget", "type": "string", "default": "SECRET-IN-A"}},
+            },
+            "B": {
+                "$id": "https://example.com/B",
+                "$defs": {"W": {"$anchor": "Widget", "type": "string", "default": "PUBLIC-IN-B"}},
+            },
+        },
+    }
+
+    definitions = traces._redact_secret_fields(schema)["$defs"]
+
+    assert definitions["A"]["$defs"]["W"]["default"] == "[redacted]"
+    assert definitions["B"]["$defs"]["W"]["default"] == "PUBLIC-IN-B"
+
+
+def test_document_local_anchor_ref_still_redacts() -> None:
+    assert traces._is_secret_key("Widget") is False
+    schema = {
+        "type": "object",
+        "properties": {"api_key": {"$ref": "#Widget"}},
+        "$defs": {
+            "W": {"$anchor": "Widget", "type": "string", "default": "SECRET-LOCAL"},
+        },
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["$defs"]["W"]["default"] == "[redacted]"
 
 
 def test_duplicate_schema_anchor_declarations_are_all_redacted(trace_api, monkeypatch) -> None:

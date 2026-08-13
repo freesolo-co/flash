@@ -84,7 +84,7 @@ class SseDoneGate:
                 self._scan_start = 0
                 self._event_in_progress = False
                 continue
-            if content.startswith(b"data:"):
+            if _is_data_field(content):
                 data = _sse_data_value(content)
                 if not self._event_in_progress and data == b"[DONE]":
                     self._holding_done_candidate = True
@@ -98,7 +98,7 @@ class SseDoneGate:
                 del self._buffer[:next_cursor]
                 self._line_start = 0
                 self._scan_start = 0
-            elif not content.startswith(b"data:") and len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
+            elif not _is_data_field(content) and len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
                 if self._line_start < len(self._buffer):
                     forwarded.extend(self._buffer[: self._line_start])
                     del self._buffer[: self._line_start]
@@ -190,7 +190,13 @@ class SseDoneGate:
         self._holding_done_candidate = False
 
 
+def _is_data_field(line: bytes) -> bool:
+    return line == b"data" or line.startswith(b"data:")
+
+
 def _sse_data_value(line: bytes) -> bytes:
+    if line == b"data":
+        return b""
     data = line[len(b"data:") :]
     return data[1:] if data.startswith(b" ") else data
 
@@ -526,7 +532,7 @@ class SseAccumulator:
         if not line:
             self._consume_event()
             return
-        if not line.startswith(b"data:"):
+        if not _is_data_field(line):
             return
         data = _sse_data_value(line)
         added_bytes = len(data) + (1 if self._event_data else 0)
@@ -543,12 +549,7 @@ class SseAccumulator:
     def _consume_event(self) -> None:
         if not self._event_data:
             return
-        event_data = self._event_data
-        if len(event_data) > 1 and event_data[0] == b"[DONE]":
-            # a later data line proves the first one was not a terminal event. discard that candidate
-            # before parsing the remaining joined payload so an oversized open event stays recordable.
-            event_data = event_data[1:]
-        data = b"\n".join(event_data)
+        data = b"\n".join(self._event_data)
         self._event_data.clear()
         self._event_data_bytes = 0
         if not data:

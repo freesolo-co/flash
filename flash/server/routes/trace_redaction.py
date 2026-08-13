@@ -180,14 +180,22 @@ def _local_schema_pointer(
 
 def _canonical_resource_uri(uri: str) -> str:
     scheme, netloc, path, query, fragment = urlsplit(uri)
+    normalized_scheme = scheme.casefold()
+    default_port = {"http": "80", "https": "443"}.get(normalized_scheme)
     userinfo, user_separator, hostport = netloc.rpartition("@")
     if hostport.startswith("[") and (host_end := hostport.find("]")) >= 0:
-        hostport = f"[{hostport[1:host_end].casefold()}]{hostport[host_end + 1 :]}"
+        suffix = hostport[host_end + 1 :]
+        if suffix == ":" or (default_port is not None and suffix == f":{default_port}"):
+            suffix = ""
+        hostport = f"[{hostport[1:host_end].casefold()}]{suffix}"
     else:
         host, port_separator, port = hostport.rpartition(":")
-        hostport = f"{host.casefold()}:{port}" if port_separator else hostport.casefold()
+        if port_separator and (not port or port == default_port):
+            hostport = host.casefold()
+        else:
+            hostport = f"{host.casefold()}:{port}" if port_separator else hostport.casefold()
     normalized_netloc = f"{userinfo}@{hostport}" if user_separator else hostport
-    return urlunsplit((scheme.casefold(), normalized_netloc, path, query, fragment))
+    return urlunsplit((normalized_scheme, normalized_netloc, path, query, fragment))
 
 
 def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[str, ...]]:
@@ -278,7 +286,11 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
                         if resource_ref == "#" or resource_ref.startswith("#/"):
                             found.update((*resource_path, *pointer) for pointer in pointers)
                         else:
-                            found.update(pointers)
+                            found.update(
+                                pointer
+                                for pointer in pointers
+                                if pointer[: len(resource_path)] == resource_path
+                            )
                     else:
                         found.update(_local_schema_pointer(ref, anchors, base_uri=scope_uri))
             for key, item in node.items():
