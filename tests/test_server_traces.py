@@ -527,6 +527,20 @@ def test_sse_accumulator_accepts_bare_cr_and_preserves_split_crlf() -> None:
     assert split_accumulator.output()["choices"][0]["message"]["content"] == "split"
 
 
+def test_done_gate_bounds_an_unterminated_done_candidate() -> None:
+    gate = trace_sse.SseDoneGate()
+
+    assert gate.feed(b"data: [DONE]") == []
+    forwarded = []
+    for _ in range(5):
+        forwarded.extend(gate.feed(b" " * 100_000))
+
+    assert gate.terminated is False
+    assert gate.done_event is None
+    assert len(gate._buffer) <= trace_sse._POST_DONE_SUFFIX_LIMIT
+    assert b"".join(forwarded).startswith(b"data: [DONE]")
+
+
 def test_done_gate_bounds_an_unterminated_post_done_suffix() -> None:
     gate = trace_sse.SseDoneGate()
 
@@ -627,6 +641,20 @@ def test_repeated_sse_envelope_fields_do_not_consume_the_stream_budget() -> None
 
     assert accumulator.truncated is False
     assert accumulator.output()["choices"][0]["message"]["content"] == fragment * 512
+
+
+def test_finish_reasons_count_toward_the_stream_budget() -> None:
+    budget = 100_000
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=budget)
+
+    for index in range(50):
+        event = json.dumps(
+            {"choices": [{"index": index, "delta": {}, "finish_reason": "x" * 4_000}]}
+        ).encode()
+        accumulator.feed(b"data: " + event + b"\n\n")
+
+    assert accumulator.truncated is True
+    assert len(json.dumps(accumulator.output()).encode()) <= budget
 
 
 def test_unterminated_sse_line_is_bounded_by_the_accumulation_budget() -> None:
@@ -2752,6 +2780,51 @@ def test_secret_named_schema_ref_literals_are_redacted(trace_api, monkeypatch) -
     }
 
 
+@pytest.mark.parametrize(
+    ("ref", "definitions", "path"),
+    [
+        (
+            "#/$defs/Outer/$defs/Benign",
+            {"Outer": {"$defs": {"Benign": {"type": "string", "default": "nested-secret"}}}},
+            ("Outer", "$defs", "Benign"),
+        ),
+        (
+            "#/$defs/we~1ird",
+            {"we/ird": {"type": "string", "default": "escaped-secret"}},
+            ("we/ird",),
+        ),
+    ],
+    ids=["nested-pointer", "escaped-segment"],
+)
+def test_secret_schema_local_pointer_literals_are_redacted(
+    trace_api, monkeypatch, ref: str, definitions: dict, path: tuple[str, ...]
+) -> None:
+    schema = {
+        "type": "object",
+        "properties": {"password": {"$ref": ref}},
+        "$defs": definitions,
+    }
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions",
+        headers=_HEADERS,
+        json={
+            **_REQUEST,
+            "response_format": {"type": "json_schema", "json_schema": {"schema": schema}},
+        },
+    )
+
+    assert response.status_code == 200
+    stored = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]["response_format"][
+        "json_schema"
+    ]["schema"]["$defs"]
+    for segment in path:
+        stored = stored[segment]
+    assert stored["default"] == "[redacted]"
+
+
 def test_deeply_nested_secret_named_schema_ref_reaches_root_definitions(
     trace_api, monkeypatch
 ) -> None:
@@ -3165,6 +3238,65 @@ def test_an_unrecorded_call_says_so_in_its_response(trace_api, monkeypatch) -> N
     assert response.status_code == 200
     assert response.json() == _RESPONSE
     assert response.headers["x-freesolo-record-failed"] == "true"
+    assert _raw(trace_api)["traces"] == 0
+
+
+def test_redaction_failure_does_not_break_the_relay(trace_api, monkeypatch) -> None:
+    class _Untouched(dict):
+        def items(self):
+            raise AssertionError("redaction traversed beyond the payload depth bound")
+
+    bounded = _Untouched({"password": "must-not-be-read"})
+    nested = bounded
+    for _ in range(platform_traces._MAX_PAYLOAD_DEPTH):
+        nested = {"nested": nested}
+    sanitized = traces._sanitize_for_trace(nested, ())
+    for _ in range(platform_traces._MAX_PAYLOAD_DEPTH):
+        sanitized = sanitized["nested"]
+    assert sanitized == "[redacted]"
+
+    _StaticAsyncClient.requests = []
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+    sanitize_for_trace = traces._sanitize_for_trace
+
+    def _explode_on_request(value, *args, **kwargs):
+        if value is _StaticAsyncClient.requests[-1]["json"]:
+            raise RecursionError("redaction depth exceeded")
+        return sanitize_for_trace(value, *args, **kwargs)
+
+    monkeypatch.setattr(traces, "_sanitize_for_trace", _explode_on_request)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 200
+    assert response.json() == _RESPONSE
+    assert response.headers["x-freesolo-record-failed"] == "true"
+    assert _raw(trace_api)["traces"] == 0
+
+    completion = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}\n\n'
+    )
+    terminator = b"data: [DONE]\n\n"
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody([completion, terminator])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+    request_context = traces._request_context
+
+    def _stream_request_context(**kwargs):
+        context = request_context(**kwargs)
+        _StaticAsyncClient.requests.append({"json": context.body})
+        return context
+
+    monkeypatch.setattr(traces, "_request_context", _stream_request_context)
+
+    streamed = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert streamed.status_code == 200
+    assert streamed.content == completion + b": freesolo-record-failed\n\n" + terminator
     assert _raw(trace_api)["traces"] == 0
 
 

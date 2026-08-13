@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from flash.core.spec import require_project_id
+from flash.server.platform import traces as platform_traces
 from flash.server.platform.deps import require_key
 from flash.server.platform.traces import (
     MAX_EXPORT_TRACES,
@@ -206,56 +207,75 @@ def _is_schema_definition(value: Any) -> bool:
     return bool(keys) and all(key not in _JSON_SCHEMA_VALUE_KEYWORDS for key in keys)
 
 
-def _redact_schema_literal(value: Any) -> Any:
+def _redact_schema_literal(value: Any, *, depth: int) -> Any:
+    if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
+        return "[redacted]"
     if isinstance(value, dict):
         return {
-            "[redacted]" if _is_secret_key(key) else key: _redact_schema_literal(item)
+            "[redacted]" if _is_secret_key(key) else key: _redact_schema_literal(
+                item, depth=depth + 1
+            )
             for key, item in value.items()
         }
     if isinstance(value, list | tuple):
-        return [_redact_schema_literal(item) for item in value]
+        return [_redact_schema_literal(item, depth=depth + 1) for item in value]
     return "[redacted]"
 
 
-def _secret_schema_definition_refs(value: Any) -> set[tuple[str, str]]:
-    if not isinstance(value, dict) or not isinstance(value.get("properties"), dict):
-        return set()
-    refs: set[tuple[str, str]] = set()
+def _local_schema_pointer(ref: str) -> tuple[str, ...] | None:
+    if not ref.startswith("#/"):
+        return None
+    segments = tuple(
+        segment.replace("~1", "/").replace("~0", "~") for segment in ref[2:].split("/")
+    )
+    return segments if segments and segments[0] in {"$defs", "definitions"} else None
 
-    def collect_refs(node: Any) -> None:
+
+def _secret_schema_definition_refs(value: Any, *, depth: int) -> set[tuple[str, ...]]:
+    if (
+        depth >= platform_traces._MAX_PAYLOAD_DEPTH
+        or not isinstance(value, dict)
+        or not isinstance(value.get("properties"), dict)
+    ):
+        return set()
+    refs: set[tuple[str, ...]] = set()
+
+    def collect_refs(node: Any, node_depth: int) -> None:
+        if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
+            return
         if isinstance(node, dict):
             ref = node.get("$ref")
-            if isinstance(ref, str):
-                for container, prefix in (("$defs", "#/$defs/"), ("definitions", "#/definitions/")):
-                    name = ref.removeprefix(prefix) if ref.startswith(prefix) else ""
-                    if name and "/" not in name:
-                        refs.add((container, name))
+            if isinstance(ref, str) and (pointer := _local_schema_pointer(ref)) is not None:
+                refs.add(pointer)
             for item in node.values():
-                collect_refs(item)
+                collect_refs(item, node_depth + 1)
         elif isinstance(node, list | tuple):
             for item in node:
-                collect_refs(item)
+                collect_refs(item, node_depth + 1)
 
-    def collect_secret_properties(node: Any) -> None:
+    def collect_secret_properties(node: Any, node_depth: int) -> None:
+        if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
+            return
         if isinstance(node, dict):
             properties = node.get("properties")
             if isinstance(properties, dict):
                 for key, schema in properties.items():
                     if _is_secret_key(key) and _is_schema_definition(schema):
-                        collect_refs(schema)
+                        collect_refs(schema, node_depth + 1)
             for item in node.values():
-                collect_secret_properties(item)
+                collect_secret_properties(item, node_depth + 1)
         elif isinstance(node, list | tuple):
             for item in node:
-                collect_secret_properties(item)
+                collect_secret_properties(item, node_depth + 1)
 
-    collect_secret_properties(value)
+    collect_secret_properties(value, depth)
     return refs
 
 
 def _redact_secret_fields(
     value: Any,
     *,
+    depth: int = 0,
     schema_property_map: bool = False,
     secret_schema_definition: bool = False,
     response_root: bool = False,
@@ -263,26 +283,27 @@ def _redact_secret_fields(
     choice: bool = False,
     logprobs: bool = False,
     logprob_entries: bool = False,
-    secret_schema_refs: set[tuple[str, str]] | None = None,
-    schema_definition_container: str | None = None,
+    secret_schema_refs: set[tuple[str, ...]] | None = None,
+    schema_definition_path: tuple[str, ...] = (),
 ) -> Any:
+    if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
+        return "[redacted]"
     if isinstance(value, dict):
-        local_secret_schema_refs = _secret_schema_definition_refs(value)
+        local_secret_schema_refs = _secret_schema_definition_refs(value, depth=depth)
         active_secret_schema_refs = (secret_schema_refs or set()) | local_secret_schema_refs
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
             schema_definition = schema_property_map and _is_schema_definition(item)
-            referenced_secret_definition = (
-                schema_definition_container is not None
-                and (schema_definition_container, str(key)) in active_secret_schema_refs
-            )
+            current_schema_path = (*schema_definition_path, str(key))
+            referenced_secret_definition = current_schema_path in active_secret_schema_refs
             if secret_schema_definition and key in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
-                redacted[key] = _redact_schema_literal(item)
+                redacted[key] = _redact_schema_literal(item, depth=depth + 1)
             elif _is_secret_key(key, allow_token=logprob_entries) and not schema_definition:
                 redacted[key] = "[redacted]"
             else:
                 redacted[key] = _redact_secret_fields(
                     item,
+                    depth=depth + 1,
                     schema_property_map=(
                         key in {"properties", "$defs", "definitions"} and isinstance(item, dict)
                     ),
@@ -296,8 +317,10 @@ def _redact_secret_fields(
                     logprob_entries=logprob_entries
                     or (logprobs and key in {"content", "refusal", "top_logprobs"}),
                     secret_schema_refs=active_secret_schema_refs,
-                    schema_definition_container=(
-                        key if key in {"$defs", "definitions"} and isinstance(item, dict) else None
+                    schema_definition_path=(
+                        current_schema_path
+                        if schema_definition_path or key in {"$defs", "definitions"}
+                        else ()
                     ),
                 )
         return redacted
@@ -305,13 +328,14 @@ def _redact_secret_fields(
         return [
             _redact_secret_fields(
                 item,
+                depth=depth + 1,
                 schema_property_map=schema_property_map,
                 secret_schema_definition=secret_schema_definition,
                 choice=choice_list,
                 logprobs=logprobs,
                 logprob_entries=logprob_entries,
                 secret_schema_refs=secret_schema_refs,
-                schema_definition_container=schema_definition_container,
+                schema_definition_path=schema_definition_path,
             )
             for item in value
         ]
@@ -325,19 +349,21 @@ def _redact_secret_string(value: str, secrets: tuple[str, ...]) -> str:
     return value
 
 
-def _redact_secret_values(value: Any, secrets: tuple[str, ...]) -> Any:
+def _redact_secret_values(value: Any, secrets: tuple[str, ...], *, depth: int = 0) -> Any:
+    if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
+        return "[redacted]"
     if isinstance(value, dict):
         # keys are redacted too. a credential used as an object key -- `{"sk-live-...": "seen"}` --
         # is still the credential, and a key-blind pass would write it into the span verbatim and
         # hand it back through `format=raw`.
         return {
             (_redact_secret_string(key, secrets) if isinstance(key, str) else key): (
-                _redact_secret_values(item, secrets)
+                _redact_secret_values(item, secrets, depth=depth + 1)
             )
             for key, item in value.items()
         }
     if isinstance(value, list | tuple):
-        return [_redact_secret_values(item, secrets) for item in value]
+        return [_redact_secret_values(item, secrets, depth=depth + 1) for item in value]
     if isinstance(value, str):
         return _redact_secret_string(value, secrets)
     return value
@@ -423,31 +449,31 @@ async def _record_trace(
 ) -> None:
     if not context.record_trace or context.project_id is None:
         return
-    duration_ms = max(0, round((time.perf_counter() - context.started_at) * 1000))
-    sanitized_output = _sanitize_for_trace(output_payload, context.secrets, response=True)
-    sanitized_usage = _sanitize_for_trace(usage, context.secrets, response=True)
-    prompt_tokens, completion_tokens = _usage_tokens(
-        sanitized_output if sanitized_output is not None else {"usage": sanitized_usage}
-    )
-    span = TraceSpan(
-        name="chat.completions",
-        provider=context.provider,
-        model=_sanitize_for_trace(context.model, context.secrets),
-        duration_ms=duration_ms,
-        input_tokens=prompt_tokens,
-        output_tokens=completion_tokens,
-        input_payload=_sanitize_for_trace(context.body, context.secrets),
-        output_payload=sanitized_output,
-        attributes={"payload_truncated": ["output"]} if output_truncated else None,
-        status_code="ERROR" if error else "OK",
-        error=_sanitize_for_trace(error, context.secrets) if error else None,
-    )
-    metadata = {
-        "source": "recording_proxy",
-        "route": context.provider,
-        "tags": _sanitize_for_trace(context.metadata or {}, context.secrets),
-    }
     try:
+        duration_ms = max(0, round((time.perf_counter() - context.started_at) * 1000))
+        sanitized_output = _sanitize_for_trace(output_payload, context.secrets, response=True)
+        sanitized_usage = _sanitize_for_trace(usage, context.secrets, response=True)
+        prompt_tokens, completion_tokens = _usage_tokens(
+            sanitized_output if sanitized_output is not None else {"usage": sanitized_usage}
+        )
+        span = TraceSpan(
+            name="chat.completions",
+            provider=context.provider,
+            model=_sanitize_for_trace(context.model, context.secrets),
+            duration_ms=duration_ms,
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+            input_payload=_sanitize_for_trace(context.body, context.secrets),
+            output_payload=sanitized_output,
+            attributes={"payload_truncated": ["output"]} if output_truncated else None,
+            status_code="ERROR" if error else "OK",
+            error=_sanitize_for_trace(error, context.secrets) if error else None,
+        )
+        metadata = {
+            "source": "recording_proxy",
+            "route": context.provider,
+            "tags": _sanitize_for_trace(context.metadata or {}, context.secrets),
+        }
         await run_in_threadpool(
             store_trace,
             key_id=context.key_id,

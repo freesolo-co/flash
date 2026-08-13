@@ -53,8 +53,9 @@ class SseDoneGate:
 
         trailing = self._buffer[cursor:]
         if _could_be_done_line(trailing):
-            forwarded = self._buffer[:cursor]
-            self._buffer = trailing
+            retained = trailing[-_POST_DONE_SUFFIX_LIMIT:]
+            forwarded = self._buffer[:cursor] + trailing[: -len(retained)]
+            self._buffer = retained
         elif trailing.endswith(b"\r"):
             forwarded = self._buffer[:-1]
             self._buffer = b"\r"
@@ -430,7 +431,7 @@ class SseAccumulator:
                     self._note_defect("stream choice contained non-object logprobs")
             # explicit null is the ordinary provider spelling for "no fragment", just like absence.
             # only a present non-null value of the wrong type can have silently lost response data.
-            if choice.get("finish_reason") is not None:
+            if choice.get("finish_reason") is not None and self._reserve(choice["finish_reason"]):
                 state["finish_reason"] = choice["finish_reason"]
 
     def _consume_delta(self, state: dict[str, Any], delta: dict[str, Any]) -> None:
