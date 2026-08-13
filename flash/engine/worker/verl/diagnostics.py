@@ -15,6 +15,7 @@ import contextlib
 import math
 import os
 import threading
+import time
 from collections.abc import Callable
 from typing import Self
 
@@ -212,9 +213,11 @@ class ChildTailStaleness:
     line count here turns that into a number the first dump already carries.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._written = -1
         self._since = 0
+        self._clock = clock
+        self._silent_since: float | None = None
 
     def observe(self, written: int, *, active: bool = False) -> int:
         """record this tick's line count; return consecutive ticks with no new output.
@@ -225,7 +228,12 @@ class ChildTailStaleness:
         if active or written != self._written:
             self._written = written
             self._since = 0
+            self._silent_since = None
         else:
+            if self._silent_since is None:
+                # stamped on the FIRST silent observation, not on construction: the interval before
+                # a child has ever spoken is not silence this watchdog is counting.
+                self._silent_since = self._clock()
             self._since += 1
         return self._since
 
@@ -233,6 +241,17 @@ class ChildTailStaleness:
     def silent_ticks(self) -> int:
         """the consecutive silent ticks recorded by the most recent observation."""
         return self._since
+
+    @property
+    def silent_seconds(self) -> float:
+        """wall-clock seconds since the first silent observation in the current run of silence.
+
+        a tick COUNT is not a duration: each tick costs the loop's sleep plus whatever the work in
+        between takes, and `gpu_diagnostics` alone permits two 8s `nvidia-smi` subprocess timeouts.
+        forty nominal 30s ticks is 1200s but can really be 1886s -- past the provider's 1500s stall
+        window, so the provider tears the run down first and the wedge is never classified.
+        """
+        return 0.0 if self._silent_since is None else self._clock() - self._silent_since
 
 
 class VerlChildSilenceWatchdog:
@@ -246,16 +265,22 @@ class VerlChildSilenceWatchdog:
         baseline_step: int = 0,
         parent_activity: Callable[[], int] | None = None,
         parent_busy: Callable[[], bool] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._tail = tail
-        self._staleness = ChildTailStaleness()
+        self._staleness = ChildTailStaleness(clock)
         self._parent_activity = parent_activity
         # "the parent is inside a unit of work right now", as opposed to "it finished another one".
         # a long enough single call makes the count alone useless, so both are consulted.
         self._parent_busy = parent_busy
         self._parent_activity_count: int | None = None
         self._silent_tick_limit = max(1, math.ceil(VERL_CHILD_SILENCE_TIMEOUT_S / tick_s))
-        self._silence_seconds = self._silent_tick_limit * tick_s
+        # the tick count is the NOMINAL schedule; the elapsed clock is what the provider measures.
+        # whichever trips first fires, because a tick is not a fixed cost: the liveness loop sleeps
+        # `tick_s` and THEN runs `gpu_diagnostics`, which permits two 8s `nvidia-smi` timeouts, so
+        # 40 nominal 30s ticks can really be 1886s -- past the 1500s stall window, where the
+        # provider tears the run down first and this watchdog never gets to classify the wedge.
+        self._silence_seconds = min(VERL_CHILD_SILENCE_TIMEOUT_S, self._silent_tick_limit * tick_s)
         self._failure: RuntimeError | None = None
         self._teardown: Callable[[], None] | None = None
         self._is_running: Callable[[], bool] | None = None
@@ -312,11 +337,19 @@ class VerlChildSilenceWatchdog:
             # bind_process runs immediately after popen. before that there is no paid child to kill;
             # afterwards this check keeps normal exit and teardown from being reclassified as silence.
             running = self._is_running is not None and self._is_running()
-            if not training or not running or silent_ticks < self._silent_tick_limit:
+            # EITHER limit fires. the count alone runs past the provider's window whenever a tick
+            # costs more than its nominal sleep; the clock alone would never fire if the loop's
+            # sleep were shortened. the elapsed reading is what the provider is also measuring.
+            silent_seconds = self._staleness.silent_seconds
+            expired = (
+                silent_ticks >= self._silent_tick_limit
+                or silent_seconds >= VERL_CHILD_SILENCE_TIMEOUT_S
+            )
+            if not training or not running or not expired:
                 return silent_ticks
             self._failure = RuntimeError(
-                f"verl child produced no output for {self._silence_seconds:.0f}s while training was "
-                "running; the process group was torn down to release the gpu"
+                f"verl child produced no output for {max(silent_seconds, self._silence_seconds):.0f}s "
+                "while training was running; the process group was torn down to release the gpu"
             )
             teardown = self._teardown
         if teardown is not None:

@@ -1992,13 +1992,50 @@ def test_stall_tail_fields_is_empty_when_the_child_has_said_nothing():
     assert vc.stall_tail_fields(0, vc.ChildOutputTail()) == {}
 
 
-def _bound_silence_watchdog(tail, *, tick_s=30.0, baseline_step=0, parent_activity=None):
+def _bound_silence_watchdog(
+    tail, *, tick_s=30.0, baseline_step=0, parent_activity=None, clock=None
+):
+    kwargs = {} if clock is None else {"clock": clock}
     watchdog = vc.VerlChildSilenceWatchdog(
-        tail, tick_s=tick_s, baseline_step=baseline_step, parent_activity=parent_activity
+        tail,
+        tick_s=tick_s,
+        baseline_step=baseline_step,
+        parent_activity=parent_activity,
+        **kwargs,
     )
     torn_down = []
     watchdog.bind_process(teardown=lambda: torn_down.append(True), is_running=lambda: True)
     return watchdog, torn_down
+
+
+def test_a_tick_that_costs_more_than_its_sleep_still_fires_before_the_provider_window():
+    """The deadline the provider enforces is ELAPSED time, so this watchdog must measure the same.
+
+    A tick is not a fixed cost: the liveness loop sleeps `tick_s` and THEN runs `gpu_diagnostics`,
+    which permits two 8s `nvidia-smi` subprocess timeouts. Counting nominal ticks alone, 40 x 30s
+    reads as 1200s while really taking up to 1886s -- past the 1500s stall window, where the
+    provider tears the run down first and this watchdog never classifies the wedge at all.
+    """
+    now = [0.0]
+    tail = vc.ChildOutputTail()
+    tail.record("training has started")
+    watchdog, torn_down = _bound_silence_watchdog(tail, clock=lambda: now[0])
+
+    # each tick costs its 30s sleep PLUS both nvidia-smi timeouts, the real worst case.
+    per_tick = 30.0 + 16.0
+    fired_at = None
+    for _ in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0) + 5):
+        now[0] += per_tick
+        watchdog.observe(step=1)
+        if torn_down and fired_at is None:
+            fired_at = now[0]
+            break
+
+    assert fired_at is not None, "the watchdog never fired"
+    assert fired_at <= 1500.0, (
+        f"fired at {fired_at:.0f}s, past the provider's 1500s stall window: the provider tears the "
+        "run down first and the wedge is never classified"
+    )
 
 
 def test_verl_child_silence_timeout_stays_under_the_provider_stall_deadline():
