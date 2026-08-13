@@ -590,6 +590,42 @@ def test_done_gate_resolves_an_ambiguous_trailing_cr_from_the_next_byte(
         assert parked == b""
 
 
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [b"\xef\xbb\xbfdata: [DONE]\n\n"],
+        [b"\xef", b"\xbb\xbfdata: [DONE]\n\n"],
+    ],
+    ids=["whole-bom", "split-bom"],
+)
+def test_done_gate_parses_a_leading_bom_without_dropping_its_bytes(chunks: list[bytes]) -> None:
+    stream = b"".join(chunks)
+    gate = trace_sse.SseDoneGate()
+
+    relayed = [part for chunk in chunks for part in gate.feed(chunk)]
+    relayed.extend(gate.finish())
+    parked = gate.done_event or b""
+
+    assert gate.terminated is True
+    assert relayed == []
+    assert parked == stream
+    assert len(b"".join(relayed)) + len(parked) == len(stream)
+
+
+def test_done_gate_parses_a_done_after_a_bom_prefixed_first_event() -> None:
+    stream = b'\xef\xbb\xbfdata: {"choices":[]}\n\ndata: [DONE]\n\n'
+    gate = trace_sse.SseDoneGate()
+
+    relayed = gate.feed(stream)
+    relayed.extend(gate.finish())
+    parked = gate.done_event or b""
+
+    assert gate.terminated is True
+    assert b"".join(relayed) == b'\xef\xbb\xbfdata: {"choices":[]}\n\n'
+    assert parked == b"data: [DONE]\n\n"
+    assert len(b"".join(relayed)) + len(parked) == len(stream)
+
+
 def test_done_gate_accepts_bare_cr_and_preserves_split_crlf() -> None:
     bare_cr = b'data: {"choices":[]}\r\rdata: [DONE]\r\r'
     gate = trace_sse.SseDoneGate()
@@ -770,6 +806,42 @@ def test_padded_done_does_not_hide_later_stream_content() -> None:
     assert b"REAL" in b"".join(relayed)
     assert accumulator.output()["choices"][0]["message"]["content"] == "REAL"
     assert gate.terminated is accumulator._done is True
+
+
+def test_padded_done_preserves_a_complete_reply_without_a_defect() -> None:
+    stream = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}\n\n'
+        b"data: [DONE]   \n\n"
+        b'data: {"choices":[{"index":0,"delta":{"content":" world"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    accumulator = trace_sse.SseAccumulator()
+
+    accumulator.feed(stream)
+    accumulator.finish()
+
+    assert accumulator.output()["choices"][0]["message"]["content"] == "Hello world"
+    assert accumulator.defect is None
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        b'data: {"choices":[{"index":0,"delta":\n\ndata: [DONE]\n\n',
+        b"data: <html>oops</html>\n\ndata: [DONE]\n\n",
+        b"data: [DONE] and then some\n\ndata: [DONE]\n\n",
+        b"data: [DONEISH]\n\ndata: [DONE]\n\n",
+    ],
+    ids=["truncated-json", "junk-payload", "done-with-junk-suffix", "doneish"],
+)
+def test_corrupt_data_events_remain_defects(event: bytes) -> None:
+    accumulator = trace_sse.SseAccumulator()
+
+    accumulator.feed(event)
+    accumulator.finish()
+
+    assert accumulator.defect == "stream contained an unparseable data event"
+    assert accumulator._done is True
 
 
 def test_done_gate_bounds_an_unterminated_done_candidate() -> None:
@@ -2505,6 +2577,41 @@ def test_an_absent_or_assistant_reply_role_still_exports(trace_api, role) -> Non
 
     assert export["records"] == [{"input": "hello", "output": "complete"}]
     assert export["skipped"] == 0
+
+
+@pytest.mark.parametrize(
+    ("error", "exported"),
+    [
+        ({"message": "upstream model failure", "type": "server_error"}, False),
+        (None, True),
+        ({}, True),
+        (False, True),
+    ],
+    ids=["meaningful-error", "null", "empty-object", "false"],
+)
+def test_records_skip_only_meaningful_top_level_error_envelopes(
+    trace_api, error: object, exported: bool
+) -> None:
+    owner = db.ensure_standalone_owner()
+    response = _reply_envelope("good")
+    response["choices"][0]["finish_reason"] = "stop"
+    response["error"] = error
+    store_trace(
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        trace_title="response error envelope",
+        metadata=None,
+        spans=[TraceSpan(input_payload=_REQUEST, output_payload=response)],
+    )
+
+    raw = export_traces(key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000)
+    records = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="records", limit=1000
+    )
+
+    assert raw["records"][0]["spans"][0]["output_payload"] == response
+    assert records["records"] == ([{"input": "hello", "output": "good"}] if exported else [])
+    assert records["skipped"] == (0 if exported else 1)
 
 
 def test_a_text_only_reply_still_exports_after_tool_call_filtering(trace_api) -> None:

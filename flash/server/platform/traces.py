@@ -473,6 +473,8 @@ def _chat_reply(payload: Any) -> str | None:
     """
     if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
         return None
+    if payload.get("error"):
+        return None
     if not payload["choices"]:
         return None
     choice = payload["choices"][0]

@@ -36,6 +36,8 @@ class SseDoneGate:
         self._event_in_progress = False
         self._partial_line_in_progress = False
         self._holding_done_candidate = False
+        self._at_stream_start = True
+        self._leading_bom = False
         self.done_event: bytes | None = None
 
     @property
@@ -46,11 +48,19 @@ class SseDoneGate:
         if self.done_event is not None:
             return []
         self._buffer.extend(chunk)
+        if self._at_stream_start:
+            if len(self._buffer) < len(_UTF8_BOM) and _UTF8_BOM.startswith(self._buffer):
+                return []
+            self._at_stream_start = False
+            self._leading_bom = self._buffer.startswith(_UTF8_BOM)
         forwarded = bytearray()
 
         while (line_end := _line_end(self._buffer, self._scan_start)) is not None:
             line, next_cursor = line_end
             content = bytes(self._buffer[self._line_start : line])
+            if self._leading_bom:
+                content = content[len(_UTF8_BOM) :]
+                self._leading_bom = False
             continuing_partial_line = self._partial_line_in_progress
             self._partial_line_in_progress = False
             self._line_start = next_cursor
@@ -109,7 +119,12 @@ class SseDoneGate:
             return [bytes(forwarded)] if forwarded else []
 
         trailing = bytes(self._buffer)
-        if not self._event_in_progress and _could_be_done_line(trailing):
+        parsed_trailing = (
+            trailing[len(_UTF8_BOM) :]
+            if self._leading_bom and trailing.startswith(_UTF8_BOM)
+            else trailing
+        )
+        if not self._event_in_progress and _could_be_done_line(parsed_trailing):
             if len(trailing) > _POST_DONE_SUFFIX_LIMIT:
                 retained = trailing[-_POST_DONE_SUFFIX_LIMIT:]
                 forwarded.extend(trailing[: -len(retained)])
@@ -117,15 +132,16 @@ class SseDoneGate:
             self._scan_start = _resume_scan_at(self._buffer)
         elif trailing.endswith(b"\r"):
             partial_line = trailing[:-1]
-            if not self._event_in_progress and _could_be_done_line(partial_line):
+            parsed_partial_line = parsed_trailing[:-1]
+            if not self._event_in_progress and _could_be_done_line(parsed_partial_line):
                 self._scan_start = _resume_scan_at(self._buffer)
             else:
                 if partial_line:
                     forwarded.extend(partial_line)
                     del self._buffer[: len(partial_line)]
                     self._partial_line_in_progress = True
-                    self._event_in_progress = self._event_in_progress or partial_line.startswith(
-                        b"data:"
+                    self._event_in_progress = (
+                        self._event_in_progress or parsed_partial_line.startswith(b"data:")
                     )
                 self._line_start = 0
                 self._scan_start = 0
@@ -135,7 +151,10 @@ class SseDoneGate:
             self._line_start = 0
             self._scan_start = 0
             self._partial_line_in_progress = bool(trailing)
-            self._event_in_progress = self._event_in_progress or trailing.startswith(b"data:")
+            self._event_in_progress = self._event_in_progress or parsed_trailing.startswith(
+                b"data:"
+            )
+            self._leading_bom = False
         return [bytes(forwarded)] if forwarded else []
 
     def finish(self) -> list[bytes]:
@@ -167,6 +186,10 @@ class SseDoneGate:
 def _sse_data_value(line: bytes) -> bytes:
     data = line[len(b"data:") :]
     return data[1:] if data.startswith(b" ") else data
+
+
+def _is_padded_done_value(data: bytes) -> bool:
+    return data != b"[DONE]" and data.strip(b" \t") == b"[DONE]"
 
 
 def _could_be_done_line(line: bytes) -> bool:
@@ -520,6 +543,8 @@ class SseAccumulator:
             return
         if data == b"[DONE]":
             self._done = True
+            return
+        if _is_padded_done_value(data):
             return
         try:
             payload = json.loads(data)
