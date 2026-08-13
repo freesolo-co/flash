@@ -363,6 +363,18 @@ def _hf_repo_confirmed_to_exist(api: object, repository: str, token: str) -> boo
         return False
 
 
+def _hf_status_is_a_verdict(status: int | None) -> bool:
+    """Whether an HTTP status is the Hub answering the permission question about this token.
+
+    401/403/404 are answers: rejected, forbidden, or no such repo for this token. A missing status
+    (no response at all), 429, and 5xx are not -- they say the Hub was busy or broken, which is a
+    fact about the Hub rather than about the caller's access.
+    """
+    if status is None:
+        return False
+    return status < 500 and status != 429
+
+
 def _without_token(text: str, token: str) -> str:
     """`text` with the token removed, for the warnings that quote a hub exception.
 
@@ -405,11 +417,12 @@ def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
     try:
         identity = api.whoami(token=token)
     except Exception as exc:
-        # a rejected token is the Hub answering, so refuse. an unreachable Hub is not an answer: the
-        # copy runs on the control plane, not here, so a CLI host without Hub egress would otherwise
-        # be unable to export at all -- while the same command skips this check entirely when the
-        # package is simply absent. degrade to that behaviour rather than invent a new hard blocker.
-        if _hf_status_code(exc) is None:
+        # a rejected token is the Hub answering, so refuse. a Hub that was unreachable, rate limited
+        # or broken is not an answer: the copy runs on the control plane, not here, so a CLI host
+        # without Hub egress would otherwise be unable to export at all -- while the same command
+        # skips this check entirely when the package is simply absent. degrade to that behaviour
+        # rather than invent a new hard blocker.
+        if not _hf_status_is_a_verdict(_hf_status_code(exc)):
             print(
                 "warning: could not reach HuggingFace to verify the export namespace "
                 f"({_without_token(str(exc), token)}); proceeding without the check",
@@ -461,11 +474,12 @@ def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
             absent = bool(missing) and isinstance(exc, missing)
             if absent and isinstance(exc, _hub_repo_gated_errors()):
                 absent = False
-            if not absent and _hf_status_code(exc) is None:
-                # the Hub never answered -- a timeout, DNS or connection error rather than a
-                # verdict. reporting that as "cannot write" blames the user's permissions for a
-                # network fault, and the upload runs on the control plane anyway. warn and proceed,
-                # exactly as the whoami path above already does for the same class of failure.
+            if not absent and not _hf_status_is_a_verdict(_hf_status_code(exc)):
+                # no verdict about this token: a timeout or DNS failure (no status at all), a 429,
+                # or a 5xx. reporting any of those as "cannot write" blames the user's permissions
+                # for a transport fault, and the upload runs on the control plane anyway. warn and
+                # proceed, exactly as the whoami path above already does for the same class of
+                # failure. 401/403/404 DO answer the question and still fall through to the error.
                 print(
                     f"warning: could not verify write access to {repository} "
                     f"({_without_token(str(exc), token)}); proceeding without the check",

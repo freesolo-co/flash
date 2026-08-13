@@ -2888,6 +2888,63 @@ def test_export_warning_does_not_echo_the_token_from_a_hub_exception(
     assert "Illegal header value" in err
 
 
+def test_export_treats_a_rate_limit_or_outage_as_no_answer_but_still_obeys_a_verdict(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """429 and 5xx describe the Hub; 401/403 describe this token. Only the latter may block.
+
+    Rate limiting and outages are transport facts, so refusing the export on them blames the user's
+    access for the Hub being busy. The distinction is the whole reason the check keys on the status
+    rather than on "an exception happened", so both sides of the boundary are pinned here.
+    """
+    import sys
+    import types
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    def run_with(status):
+        class FakeHfApi:
+            def whoami(self, token):
+                return {
+                    "name": "alice",
+                    "orgs": [{"name": "acme", "role": "write"}],
+                    "auth": {"accessToken": {"role": "write"}},
+                }
+
+            def auth_check(self, repo_id, *, repo_type=None, token=None, write=False):
+                error = RuntimeError(f"hub said {status}")
+                error.response = Response(status)
+                raise error
+
+        monkeypatch.setitem(
+            sys.modules,
+            "huggingface_hub",
+            types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.27.0"),
+        )
+        fake_client.calls.clear()
+        code = _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        capsys.readouterr()
+        return code
+
+    for transient in (429, 500, 503):
+        assert run_with(transient) == 0, f"{transient} is about the Hub, not about this token"
+    for verdict in (401, 403):
+        assert run_with(verdict) == 1, f"{verdict} answers the permission question and must block"
+
+
 def test_export_refuses_a_gated_destination_instead_of_treating_it_as_creatable(
     fake_client, monkeypatch, capsys
 ) -> None:
