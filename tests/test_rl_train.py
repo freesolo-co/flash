@@ -654,11 +654,14 @@ def test_the_rank_device_assert_compares_uuids_after_verls_own_init():
     assert "raise RuntimeError(" in source
 
 
-def _run_rank_device_check(tmp_path, monkeypatch, bindings):
+def _run_rank_device_check(tmp_path, monkeypatch, bindings, *, env_rank=None):
     """run the rendered check once per (rank, ordinal, uuid), against a fake torch and verl.
 
     Returns the error each rank raised, or None. Ranks share one claims file exactly as they do on
     the worker, which is what lets a rank see a device another rank already took.
+
+    ``env_rank`` overrides what RANK says in the environment, so a test can drive the worker's own
+    rank and the environment's apart and see which one the check actually reads.
     """
     claims = tmp_path / "rank_device_claims.txt"
     monkeypatch.setenv("FLASH_RANK_DEVICE_CLAIMS", str(claims))
@@ -673,8 +676,10 @@ def _run_rank_device_check(tmp_path, monkeypatch, bindings):
         )
 
         class _Worker:
-            def __init__(self):
-                pass
+            def __init__(self, rank=rank):
+                # verl's Worker.__init__ stores the rank on the instance before it returns, so the
+                # wrapper that runs after it can read the same value verl will use downstream.
+                self._rank = rank
 
         worker_module = types.ModuleType("verl.single_controller.base.worker")
         worker_module.Worker = _Worker
@@ -688,7 +693,7 @@ def _run_rank_device_check(tmp_path, monkeypatch, bindings):
             "verl.single_controller.base.worker": worker_module,
         }.items():
             monkeypatch.setitem(sys.modules, name, module)
-        monkeypatch.setenv("RANK", str(rank))
+        monkeypatch.setenv("RANK", str(rank if env_rank is None else env_rank))
         monkeypatch.setenv("LOCAL_RANK", str(rank))
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(ordinal))
         with _defer_registry():
@@ -719,6 +724,32 @@ def test_the_rank_device_assert_refuses_when_two_ranks_land_on_one_card(tmp_path
     # value over the nccl abort it front-runs.
     assert "GPU-same" in errors[1]
     assert "[0, 1]" in errors[1]
+
+
+def test_the_rank_device_assert_reads_the_rank_verl_resolved_not_the_environment(
+    tmp_path, monkeypatch
+):
+    # the claims file is keyed by rank, so a rank that every actor agrees on collapses the set to
+    # one entry and the collision stops being visible. pin the source: RANK is held at 0 for both
+    # actors while the workers carry 0 and 1, and the check must still refuse.
+    errors = _run_rank_device_check(
+        tmp_path,
+        monkeypatch,
+        [(0, 0, "GPU-same"), (1, 0, "GPU-same")],
+        env_rank=0,
+    )
+    assert errors[0] is None
+    assert errors[1] is not None
+    assert "[0, 1]" in errors[1]
+
+
+def test_the_rank_device_assert_has_no_rank_zero_default_to_fall_back_on():
+    # a getenv("RANK", "0") would make an unset RANK report every actor as rank 0, which is the one
+    # value that turns this check into a no-op. verl reads os.environ["RANK"] unconditionally in the
+    # same __init__, so an absent RANK is already fatal there -- this keeps it fatal here too.
+    source = verl_shims.render_rank_device_assert_shim(2)
+    assert 'environ.get("RANK"' not in source
+    assert 'environ["RANK"]' in source
 
 
 def test_multimodal_rows_match_verl_placeholder_assertion():

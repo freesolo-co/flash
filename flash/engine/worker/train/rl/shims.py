@@ -220,7 +220,15 @@ def _flash_rank_check(self):
     if identity is None:
         return
     ordinal, uuid = identity
-    rank = int(_flash_rank_os.environ.get("RANK", "0"))
+    # prefer the rank the worker itself resolved. verl assigns self._rank from os.environ["RANK"]
+    # in the same __init__ this wrapper runs after, so the two agree today -- but reading the worker
+    # means this cannot silently collapse every actor onto one rank if that ever stops being true.
+    # the env fallback deliberately has NO default: a default of zero would make every claim line
+    # say rank 0, one uuid would map to one rank, and the collision would be hidden by the check.
+    rank = getattr(self, "_rank", None)
+    if rank is None:
+        rank = getattr(self, "rank", None)
+    rank = int(rank) if rank is not None else int(_flash_rank_os.environ["RANK"])
     local_rank = int(_flash_rank_os.environ.get("LOCAL_RANK", "0"))
     visible = _flash_rank_os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
     print(
