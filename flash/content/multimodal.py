@@ -250,11 +250,20 @@ def record_has_images(record: dict, messages: list[dict] | None = None) -> bool:
         return True
     for message in messages or []:
         content = message.get("content") if isinstance(message, dict) else None
-        if isinstance(content, list) and any(
-            isinstance(block, dict) and block.get("type") in _IMAGE_BLOCK_TYPES for block in content
-        ):
+        if content_has_images(content):
             return True
     return False
+
+
+def content_has_images(content: object) -> bool:
+    """Whether one message's ``content`` carries an image block.
+
+    The single definition of "this message shows the model an image", so a path that cannot carry
+    media (the multi-turn GRPO bridge) recognises exactly what the paths that can do.
+    """
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") in _IMAGE_BLOCK_TYPES for block in content
+    )
 
 
 def text_only_prompt_messages(messages: list[dict]) -> list[dict]:

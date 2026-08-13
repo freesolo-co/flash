@@ -4594,6 +4594,75 @@ def test_bridge_start_adopts_the_datasets_prompt_over_a_second_start_episode():
     assert scored["messages"][0] == dataset_prompt[0]
 
 
+def test_bridge_refuses_an_environment_reply_that_carries_an_image():
+    # the media a rollout conditions on is fixed from the INITIAL prompt, so an image returned
+    # mid-episode by step_episode cannot reach the model. the old code ran str() over the block list,
+    # which does not fail: the model read the literal "[{'type': 'image_url', ...}]" repr as its
+    # prompt text and every metric reported a healthy run. refusing is loud -- the reward server
+    # turns this into a 400 that fails the episode -- and silence is the defect being fixed.
+    env = _BridgeEnv(
+        replies=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what changed?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ],
+            }
+        ],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="image block"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+@pytest.mark.parametrize("block_type", ["image", "image_url", "input_image"])
+def test_bridge_refuses_every_image_block_spelling(block_type):
+    # three spellings reach the adapter from real environments, and a check that knew only one would
+    # leave the other two silently stringified -- the same defect, just rarer and harder to see.
+    env = _BridgeEnv(
+        replies=[{"role": "user", "content": [{"type": block_type, "image_url": "x"}]}],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="image block"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+def test_bridge_flattens_a_text_only_block_reply_instead_of_stringifying_it():
+    # text blocks ARE representable, so they must not become a repr either: an env that returns
+    # openai-style text blocks would otherwise train the model on "[{'type': 'text', ...}]".
+    env = _BridgeEnv(
+        replies=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": " second"},
+                ],
+            }
+        ],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    step = bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert step["messages"] == [{"role": "user", "content": "first second"}]
+
+
+def test_bridge_still_passes_a_plain_string_reply_through_unchanged():
+    # the control: the ordinary text path is what every existing multi-turn env uses, and it must be
+    # untouched by the block handling above.
+    env = _BridgeEnv(replies=[{"role": "user", "content": "next"}], done_after=99)
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    step = bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert step["messages"] == [{"role": "user", "content": "next"}]
+
+
 def test_bridge_rejects_prompts_that_do_not_align_with_its_examples():
     # the two are indexed by the SAME integer the child sends. a length mismatch means some index
     # reads the wrong row's prompt, or IndexErrors mid-rollout; both are worth failing at
@@ -6557,6 +6626,7 @@ def _drive_multi_turn_episode(
     monkeypatch=None,
     multi_modal_data=None,
     return_instance=False,
+    raw_prompt=None,
 ):
     """run the real child loop end to end against a real bridge, returning its agent loop output.
 
@@ -6611,6 +6681,11 @@ def _drive_multi_turn_episode(
             return {}
 
         async def process_multi_modal_info(self, messages):
+            # verl extracts media from the message CONTENT BLOCKS (rl_dataset.process_multi_modal_info
+            # keys off `item["type"] in {"image", "video"}`), so record what shape this was handed:
+            # a loop that flattened the prompt to text before extracting would arrive here with
+            # nothing left to find, and the images would be silently gone.
+            self.mm_info_contents = [message.get("content") for message in messages]
             return dict(multi_modal_data or {})
 
         async def apply_chat_template(self, messages, **kwargs):
@@ -6657,7 +6732,13 @@ def _drive_multi_turn_episode(
         # one actually running the coroutine.
         instance.loop = asyncio.get_running_loop()
         driven["instance"] = instance
-        await instance.run({}, raw_prompt=[{"role": "user", "content": "go"}], index=0)
+        await instance.run(
+            {},
+            raw_prompt=(
+                raw_prompt if raw_prompt is not None else [{"role": "user", "content": "go"}]
+            ),
+            index=0,
+        )
 
     asyncio.run(_go())
     if return_instance:
@@ -6690,6 +6771,64 @@ class _SpanEnv:
         from flash.envs.base import RolloutReward
 
         return [RolloutReward(episode=1.0, turns=tuple(0.5 for _ in self.recorded)) for _ in items]
+
+
+def test_an_image_prompt_survives_the_multi_turn_transcript_validator(monkeypatch):
+    # an image prompt does NOT reach the child as text. verl's RLHFDataset rewrites the parquet's
+    # string content into blocks -- it splits on the `<image>` placeholder and substitutes an image
+    # block (rl_dataset.py `_build_messages`) -- so raw_prompt arrives block-shaped for exactly the
+    # rows flash writes for a multimodal job. validating it as text-only rejected every image episode
+    # at turn one with "content must be text for multi-turn".
+    env = _SpanEnv()
+    out = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed")],
+        env=env,
+        monkeypatch=monkeypatch,
+        max_turns=1,
+        multi_modal_data={"images": ["PIXELS"]},
+        raw_prompt=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "/tmp/x.png"},
+                    {"type": "text", "text": "\nDescribe this image."},
+                ],
+            }
+        ],
+    )
+    # the episode ran rather than raising, and the decoded media is carried on the output so the
+    # training pass re-tokenizes against the same pixels the rollout conditioned on.
+    assert out["multi_modal_data"] == {"images": ["PIXELS"]}
+    assert env.recorded == ["ab"]
+
+
+def test_image_extraction_sees_the_blocks_not_the_flattened_text(monkeypatch):
+    # ORDER is the fix. flattening the transcript before extraction would hand verl's extractor plain
+    # strings, it would find no image blocks, and the run would train on the caption with the pixels
+    # silently dropped -- no error, no warning. so assert the extractor was handed the BLOCKS.
+    env = _SpanEnv()
+    _, instance = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed")],
+        env=env,
+        monkeypatch=monkeypatch,
+        max_turns=1,
+        multi_modal_data={"images": ["PIXELS"]},
+        return_instance=True,
+        raw_prompt=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "/tmp/x.png"},
+                    {"type": "text", "text": "hi"},
+                ],
+            }
+        ],
+    )
+    contents = instance.mm_info_contents
+    assert isinstance(contents[0], list), (
+        "media extraction was handed flattened text; the images are already gone by this point"
+    )
+    assert {"type": "image", "image": "/tmp/x.png"} in contents[0]
 
 
 def test_a_truncated_final_turn_still_earns_per_turn_credit_for_the_turns_before_it(monkeypatch):

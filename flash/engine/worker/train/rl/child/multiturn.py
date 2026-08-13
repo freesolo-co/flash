@@ -180,7 +180,12 @@ class _EpisodePrompt:
 
 
 async def _prepare_episode_prompt(loop_self, raw_prompt) -> _EpisodePrompt:
-    """decode the prompt's media and apply the chat template, in that order."""
+    """decode the prompt's media and apply the chat template, in that order.
+
+    both steps read the ORIGINAL content blocks, not the flattened text transcript: the media lives
+    in the image/video/audio blocks, and the chat template needs them in place to emit the
+    placeholder tokens the decoded pixels expand into.
+    """
     multi_modal_data = await loop_self.process_multi_modal_info(raw_prompt)
     images = multi_modal_data.get("images")
     videos = multi_modal_data.get("videos")
@@ -301,10 +306,20 @@ async def _grpo_run(
     agent_loop_output,
     **kwargs,
 ):
-    raw_prompt = validate_transcript_messages(
-        [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
-    )
+    # ORDER MATTERS. an image prompt does not arrive as text: verl's RLHFDataset rewrites the
+    # parquet's string content into blocks, splitting on the `<image>` placeholder and substituting
+    # an image block (rl_dataset.py `_build_messages`), so `raw_prompt` is
+    # [{"type": "image", ...}, {"type": "text", ...}] for exactly the rows flash writes for a
+    # multimodal job. the media has to come out of those ORIGINAL blocks before the transcript is
+    # flattened to text, or the pixels are gone by the time anything asks for them.
+    raw_prompt = [dict(message) for message in kwargs["raw_prompt"]]
     prompt = await _prepare_episode_prompt(self, raw_prompt)
+    # flattened only AFTER extraction, and only for the text-shaped uses that follow (the bridge
+    # transcript and the inter-turn glue). blocks are permitted here precisely because
+    # _prepare_episode_prompt already holds the decoded media and the block-rendered prompt ids.
+    raw_prompt = validate_transcript_messages(
+        raw_prompt, source="initial prompt", allow_content_blocks=True
+    )
     prompt_ids = prompt.prompt_ids
     mm_processor_kwargs = prompt.mm_processor_kwargs
     settings = _EpisodeSettings()

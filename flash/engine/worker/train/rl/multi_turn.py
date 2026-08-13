@@ -19,6 +19,7 @@ import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler
 
+from flash.content.multimodal import content_has_images, message_content_text
 from flash.engine.worker.backend_common import BoundedThreadingHTTPServer
 from flash.engine.worker.score_batcher import ScoreBatcher
 from flash.engine.worker.train.rl.scoring import RolloutScoreRequest, score_rollouts
@@ -38,6 +39,36 @@ _MULTI_TURN_SESSION_LEASE_S = 1800.0
 _SINGLE_TURN_SCORE_BATCH_SIZE = 64
 _SINGLE_TURN_SCORE_FLUSH_WAIT_S = 0.1
 _SINGLE_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
+
+
+def _env_reply_message(message: dict) -> dict:
+    """one environment reply message, as the role/content text the child transcript can carry.
+
+    the adapter lets an environment return arbitrary message dicts from ``step_episode``, so a reply
+    may carry openai-style content BLOCKS rather than a string. ``str()`` on a block list does not
+    fail -- it produces the python repr, and the model then reads a literal
+    ``[{'type': 'image_url', ...}]`` as its prompt text while every metric reports a healthy run.
+
+    an image block is refused outright instead. the media a rollout conditions on is fixed from the
+    initial prompt (see ``_EpisodePrompt``), so a mid-episode image cannot reach the engine no matter
+    what this returns; stringifying it would train on the repr of a dropped image. refusing is the
+    interim contract until per-turn media is threaded into the rollout, and it is LOUD -- the bridge
+    turns a raise into a 400 that fails the episode -- because silence is the actual defect here.
+    """
+    content = message.get("content")
+    if isinstance(content, list):
+        if content_has_images(content):
+            raise ValueError(
+                "environment reply carries an image block; multi-turn GRPO conditions every turn on "
+                "the media from the INITIAL prompt, so an image returned by step_episode cannot "
+                "reach the model. return text, or put the image in the initial prompt"
+            )
+        # text-only blocks are a shape this transcript CAN represent exactly, so flatten them
+        # through the same definition of "the text of a message" the graders and reward path use.
+        return {"role": str(message.get("role", "")), "content": message_content_text(content)}
+    # unchanged for every non-block reply, which is what every existing multi-turn env returns.
+    return {"role": str(message.get("role", "")), "content": str(message.get("content", ""))}
+
 
 # size the listen backlog for the full prompts_per_step * group_size connection burst.
 # socketserver's default of 5 resets overflowed clients, and bridge_post intentionally does not retry.
@@ -199,10 +230,7 @@ class MultiTurnBridge:
             terminal = bool(self._env.rollout_done(state, self._max_turns))
         return {
             "terminal": terminal,
-            "messages": [
-                {"role": str(message.get("role", "")), "content": str(message.get("content", ""))}
-                for message in replies
-            ],
+            "messages": [_env_reply_message(message) for message in replies],
         }
 
     def _score_batch(self, requests: list) -> list:
