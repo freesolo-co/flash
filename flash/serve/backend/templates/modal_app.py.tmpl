@@ -947,6 +947,32 @@ class Engine:
             owner = await _claim_lora_int_id(int_id, adapter_id)
             if owner == adapter_id:
                 self._int_ids[int_id] = adapter_id
+                # The claim is ours again; now check the cached entry's FILES still exist.
+                #
+                # Undeploy's eviction is one remote call Modal routes to ONE replica, so on a
+                # horizontally scaled Engine the peers keep their `_loaded` entries -- while the
+                # cache reclaim running alongside it deletes the shared volume directory those
+                # entries point at. A re-registration landing on such a peer took this path, re-took
+                # the claim, and reported `ready` over a `LoRARequest` whose weights are gone:
+                # correct on the surface, and broken whenever vLLM next reads that path.
+                #
+                # AFTER the claim, not before. The claim re-establishment is this method's whole
+                # purpose and is what refuses a colliding revision, so a missing directory must not
+                # skip it -- and the ordering keeps the loss branch below reachable for a peer that
+                # lost the id, which is a different and more urgent outcome than stale files.
+                #
+                # Dropping `_loaded` is the entire repair, because `register` calls this BEFORE
+                # `_lora_request`: that now takes its miss path and re-downloads the revision into
+                # the same digest directory. It re-claims an id this container already owns, which
+                # `_claim_lora_int_id` explicitly permits ("a re-registration of the same adapter
+                # re-reads its own claim and proceeds").
+                #
+                # The residency inside vLLM is left alone deliberately, and `_int_ids` with it:
+                # that entry is the breadcrumb `_lora_request`'s stale sweep reads, and the sweep
+                # is the ownership-correct place to evict -- it runs holding the claim and refuses
+                # to load over an eviction it could not confirm.
+                if not os.path.exists(f"{{ADAPTER_DIR}}/{{_adapter_digest(adapter_id)}}"):
+                    self._loaded.pop(adapter_id, None)
                 return
             # EVICT FIRST, CLEAR ONLY ON CONFIRMATION -- the same ordering `_lora_request`'s stale
             # sweep uses, and for the same two reasons.

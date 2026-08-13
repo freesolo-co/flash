@@ -3470,7 +3470,7 @@ def test_a_failed_reclaim_during_eviction_still_leaves_a_marker(client, engine, 
 
 
 def test_registering_an_already_resident_adapter_reestablishes_its_claim(
-    client, engine, monkeypatch
+    client, engine, monkeypatch, tmp_path
 ):
     """A cache hit during SETTLE must not report ready while holding no claim.
 
@@ -3499,6 +3499,11 @@ def test_registering_an_already_resident_adapter_reestablishes_its_claim(
     # undeploy that landed on replica A.
     instance._loaded = {REVISION: object()}
     instance._int_ids = {int_id: REVISION}
+    # And its DOWNLOAD still on the shared volume, which is what makes the cached entry usable.
+    # The reclaim validates this before trusting `_loaded`, so without the directory the cache hit
+    # is correctly discarded and the call falls through to a real download.
+    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
+    (tmp_path / module._adapter_digest(REVISION)).mkdir(parents=True)
     assert module._lora_id_key(int_id) not in module.adapter_records
 
     result = _run_awaitable_result(
@@ -3510,6 +3515,62 @@ def test_registering_an_already_resident_adapter_reestablishes_its_claim(
         "settle hit this replica's warm cache and answered ok without re-claiming the lora int "
         "id, so the record reads `ready` while the id is unowned and a colliding revision can "
         "take it and load alongside"
+    )
+
+
+def test_a_resident_adapter_whose_download_was_reclaimed_is_redownloaded(
+    client, engine, monkeypatch, tmp_path
+):
+    """A warm replica must not report ready over weights a peer's reclaim deleted.
+
+    Undeploy's eviction is ONE remote call Modal routes to ONE replica, but the cache reclaim it
+    performs deletes from the SHARED volume. So replica B keeps a `_loaded` entry whose
+    `LoRARequest` points at a directory replica A's undeploy removed. A re-registration landing on
+    B took the cache-hit path, re-claimed the id, and answered ok -- a record reading `ready` whose
+    weights are gone, which surfaces at the next cold start rather than at the deploy that caused
+    it.
+    """
+    module = client.app.state.generated_module
+    int_id = module._lora_int_id(REVISION)
+    downloaded: list[str] = []
+
+    async def _download(_self, record):
+        # The re-download the fix must reach. Returns a path without touching the network.
+        directory = tmp_path / module._adapter_digest(record["adapter_id"])
+        directory.mkdir(parents=True, exist_ok=True)
+        downloaded.append(record["adapter_id"])
+        return str(directory)
+
+    async def _add_lora(_request):
+        return None
+
+    vllm_lora = types.ModuleType("vllm.lora.request")
+    vllm_lora.LoRARequest = lambda *a, **k: types.SimpleNamespace(args=a)
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", vllm_lora)
+    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
+    monkeypatch.setattr(engine, "_adapter_path", _download)
+
+    instance = engine.__new__(engine)
+    instance._locks = {}
+    # Replica B: still resident, claim released by the undeploy on A -- and its download GONE,
+    # because that same undeploy reclaimed the shared directory. No directory is created here.
+    instance._loaded = {REVISION: object()}
+    instance._int_ids = {int_id: REVISION}
+    instance.engine = types.SimpleNamespace(add_lora=_add_lora)
+
+    result = _run_awaitable_result(
+        engine.register(instance, {**REGISTRATION, "adapter_id": REVISION})
+    )
+
+    assert result == {"ok": True}, f"the re-registration failed: {result}"
+    assert downloaded == [REVISION], (
+        "the cache hit was trusted over a directory a peer's undeploy reclaimed, so the record "
+        "reads ready while its weights are gone"
+    )
+    assert module.adapter_records.get(module._lora_id_key(int_id)) == REVISION, (
+        "the re-download did not leave the lora int id claimed"
     )
 
 
