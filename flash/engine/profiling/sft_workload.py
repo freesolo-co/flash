@@ -93,7 +93,7 @@ def _processor_tokenized_row(
     max_length: int,
     thinking: bool,
 ) -> tuple[list[int], list[int], bytes, int]:
-    from flash.engine.worker.model.packing import completion_mask_from_ids
+    from flash.engine.worker.model.packing import assistant_only_mask, completion_mask_from_ids
 
     prepared_prompt = _multimodal_messages_with_images(prompt_messages, images)
     full_messages = [*prepared_prompt, *completion_messages]
@@ -131,7 +131,12 @@ def _processor_tokenized_row(
     untruncated_length = len(untruncated_ids)
     input_ids = untruncated_ids[:max_length]
     prompt_ids = ids(prompt["input_ids"])[:max_length]
-    loss_mask = completion_mask_from_ids(prompt_ids, input_ids)
+    # the span reader needs the text tokenizer's vocabulary; a processor exposes it as .tokenizer.
+    loss_mask = assistant_only_mask(
+        completion_mask_from_ids(prompt_ids, input_ids),
+        input_ids,
+        getattr(processor, "tokenizer", processor),
+    )
     full.pop("attention_mask", None)
     return input_ids, loss_mask, _serialize_multimodal_inputs(full), untruncated_length
 

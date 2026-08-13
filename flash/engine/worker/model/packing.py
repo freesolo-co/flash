@@ -220,3 +220,87 @@ def completion_mask_from_ids(prompt_ids: list[int], full_ids: list[int]) -> list
     if n >= n_full:
         return [0] * n_full
     return [0] * n + [1] * (n_full - n)
+
+
+def _chatml_message_spans(full_ids: list[int], tokenizer) -> list[tuple[int, int, str]] | None:
+    """Split a rendered transcript into ``(start, end, role)`` per ChatML message.
+
+    Reads the ONE full render rather than re-rendering message prefixes. Re-rendering cannot be
+    trusted here: Qwen3.5/3.6 pick each assistant turn's ``<think>`` layout from ``last_query_index``,
+    computed over the WHOLE message list, so ``render(messages[:k])`` is not a prefix of
+    ``render(messages)`` -- a shorter list re-renders earlier turns with a different tag layout and
+    the derived offsets slide off the real turn boundaries.
+
+    Returns ``None`` when the render is not ChatML (no ``<|im_start|>``/``<|im_end|>`` pair, or no
+    message parsed), which is the signal for the caller to leave the mask untouched rather than
+    guess. Roles are lowercased; a header the tokenizer splits across several tokens is joined
+    before comparison so a multi-token role name still resolves.
+    """
+    to_id = getattr(tokenizer, "convert_tokens_to_ids", None)
+    decode = getattr(tokenizer, "decode", None)
+    if not callable(to_id) or not callable(decode):
+        return None
+    im_start = to_id("<|im_start|>")
+    im_end = to_id("<|im_end|>")
+    unk = getattr(tokenizer, "unk_token_id", None)
+    if im_start is None or im_end is None or im_start == unk or im_end == unk:
+        return None
+    if im_start not in full_ids or im_end not in full_ids:
+        return None
+
+    spans: list[tuple[int, int, str]] = []
+    index = 0
+    total = len(full_ids)
+    while index < total:
+        if full_ids[index] != im_start:
+            index += 1
+            continue
+        # the header runs from just after <|im_start|> to the newline that ends the role line.
+        cursor = index + 1
+        role_ids: list[int] = []
+        while cursor < total and full_ids[cursor] not in (im_start, im_end):
+            piece = tokenizer.decode([full_ids[cursor]])
+            if "\n" in piece:
+                break
+            role_ids.append(full_ids[cursor])
+            cursor += 1
+        role = tokenizer.decode(role_ids).strip().lower() if role_ids else ""
+        # the message body ends at its <|im_end|>; an unterminated final message runs to the end.
+        cursor = index + 1
+        while cursor < total and full_ids[cursor] != im_end:
+            cursor += 1
+        end = min(cursor + 1, total)
+        # the template writes a newline after <|im_end|>; it belongs to the message it closes.
+        if end < total and tokenizer.decode([full_ids[end]]) == "\n":
+            end += 1
+        spans.append((index, end, role))
+        index = end
+    return spans or None
+
+
+def assistant_only_mask(loss_mask: list[int], full_ids: list[int], tokenizer) -> list[int]:
+    """Clear supervision over every non-assistant span of a rendered transcript.
+
+    ``completion_mask_from_ids`` returns ONE contiguous supervised span, which is right for a
+    prompt -> completion row but wrong for a multi-turn target: everything after the prompt is
+    supervised, so the interleaved environment/tool/user observations between assistant turns train
+    the model to emit the environment's replies.
+
+    Strictly subtractive: it only ever turns a 1 into a 0, so the prompt boundary, the truncation
+    behaviour, and the pre-opened ``<think>\\n`` handling all stay exactly as they were. A row whose
+    target is a single assistant turn is returned unchanged. When the transcript does not parse as
+    ChatML the mask is returned unchanged -- narrowing supervision on a guess would silently drop
+    real training signal.
+    """
+    if not full_ids or not any(loss_mask):
+        return loss_mask
+    spans = _chatml_message_spans(full_ids, tokenizer)
+    if spans is None:
+        return loss_mask
+    masked = list(loss_mask)
+    for start, end, role in spans:
+        if role == "assistant":
+            continue
+        for position in range(start, min(end, len(masked))):
+            masked[position] = 0
+    return masked

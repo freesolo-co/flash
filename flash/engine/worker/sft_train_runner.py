@@ -271,8 +271,9 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
         )
     if multiturn_targets:
         print(
-            f"[sft] multi-turn SFT: {multiturn_targets}/{selected_count} rows train on a full "
-            "target transcript"
+            f"[sft] multi-turn SFT: {multiturn_targets}/{selected_count} rows train on the "
+            "assistant turns of a target transcript; interleaved environment/tool/user "
+            "observations are masked out of the loss"
         )
     elif getattr(options.env, "multi_turn", False):
         print(

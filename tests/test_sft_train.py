@@ -545,7 +545,59 @@ class _ExactTokenizer:
         return {"input_ids": [row[:max_length] for row in ids]}
 
 
+class _ExactChatMlTokenizer(_ExactTokenizer):
+    """``_ExactTokenizer`` that also speaks ChatML, so the role-aware mask can be exercised.
+
+    Ids stay one-per-character; the two ChatML control tokens take ids outside that range so a
+    span boundary is unambiguous, and ``decode`` is the inverse the span reader needs.
+    """
+
+    IM_START = 0x110000
+    IM_END = 0x110001
+
+    def convert_tokens_to_ids(self, token):
+        return {"<|im_start|>": self.IM_START, "<|im_end|>": self.IM_END}.get(token)
+
+    def decode(self, ids):
+        pieces = []
+        for token_id in ids:
+            if token_id == self.IM_START:
+                pieces.append("<|im_start|>")
+            elif token_id == self.IM_END:
+                pieces.append("<|im_end|>")
+            else:
+                pieces.append(chr(token_id))
+        return "".join(pieces)
+
+    def __call__(self, texts, *, truncation=False, max_length=None):
+        ids = []
+        for text in texts:
+            row = []
+            index = 0
+            while index < len(text):
+                if text.startswith("<|im_start|>", index):
+                    row.append(self.IM_START)
+                    index += len("<|im_start|>")
+                elif text.startswith("<|im_end|>", index):
+                    row.append(self.IM_END)
+                    index += len("<|im_end|>")
+                else:
+                    row.append(ord(text[index]))
+                    index += 1
+            ids.append(row)
+        if not truncation:
+            return {"input_ids": ids}
+        assert max_length is not None, "truncation=True requires an explicit max_length"
+        return {"input_ids": [row[:max_length] for row in ids]}
+
+
+def _chatml(role: str, content: str) -> str:
+    return f"<|im_start|>{role}\n{content}<|im_end|>\n"
+
+
 def test_exact_mask_keeps_prompt_assistant_history_masked_and_full_target_active():
+    # A NON-ChatML render has no role structure to read, so the mask stays the one contiguous
+    # post-prompt span: narrowing supervision on a guess would silently drop real training signal.
     tokenizer = _ExactTokenizer()
     prompt = "<user>q</user><assistant>history</assistant><assistant>"
     full = prompt + "first</assistant><user>tool</user><assistant>second</assistant>"
@@ -559,6 +611,65 @@ def test_exact_mask_keeps_prompt_assistant_history_masked_and_full_target_active
     assert rows[0]["completion_mask"][:split] == [0] * split
     assert all(rows[0]["completion_mask"][split:])
     assert len(rows[0]["input_ids"]) == len(rows[0]["completion_mask"])
+
+
+def test_multiturn_mask_excludes_observations_between_assistant_turns():
+    # The defect this covers: one contiguous post-prompt span supervises the interleaved
+    # environment/tool observations too, training the model to emit the environment's replies.
+    tokenizer = _ExactChatMlTokenizer()
+    prompt = _chatml("user", "q")
+    full = (
+        prompt
+        + _chatml("assistant", "ACT")
+        + _chatml("user", "OBSERVATION")
+        + _chatml("tool", "TOOLOUT")
+        + _chatml("assistant", "FINAL")
+    )
+    kept, rows, dropped = _pretokenize_completion_only(
+        [{"text": full, "prompt_text": prompt}], tokenizer, max_length=4096
+    )
+
+    assert kept
+    assert dropped == 0
+    row = rows[0]
+    supervised = tokenizer.decode(
+        [
+            token
+            for token, keep in zip(row["input_ids"], row["completion_mask"], strict=True)
+            if keep
+        ]
+    )
+    assert "ACT" in supervised
+    assert "FINAL" in supervised
+    # the whole point: the environment's turns are no longer trained on.
+    assert "OBSERVATION" not in supervised
+    assert "TOOLOUT" not in supervised
+    assert "q" not in supervised
+    assert len(row["completion_mask"]) == len(row["input_ids"])
+
+
+def test_multiturn_mask_is_subtractive_and_leaves_single_turn_rows_untouched():
+    # The role-aware pass may only turn a 1 into a 0. A single-turn prompt -> completion row is the
+    # shape completion-only masking was built for, so its mask must come out byte-identical.
+    from flash.engine.worker.model.packing import assistant_only_mask, completion_mask_from_ids
+
+    tokenizer = _ExactChatMlTokenizer()
+    prompt = _chatml("user", "q")
+    full = prompt + _chatml("assistant", "ONLY ANSWER")
+    full_ids = tokenizer([full])["input_ids"][0]
+    prompt_ids = tokenizer([prompt])["input_ids"][0]
+
+    base = completion_mask_from_ids(prompt_ids, full_ids)
+    narrowed = assistant_only_mask(base, full_ids, tokenizer)
+    assert narrowed == base
+
+    multi_full = full + _chatml("user", "OBS") + _chatml("assistant", "SECOND")
+    multi_ids = tokenizer([multi_full])["input_ids"][0]
+    multi_base = completion_mask_from_ids(prompt_ids, multi_ids)
+    multi_narrowed = assistant_only_mask(multi_base, multi_ids, tokenizer)
+    # strictly subtractive: never adds supervision, and here it must remove some.
+    assert all(a >= b for a, b in zip(multi_base, multi_narrowed, strict=True))
+    assert sum(multi_narrowed) < sum(multi_base)
 
 
 def test_exact_mask_drops_right_truncated_completion_and_handles_thinking_prefix():

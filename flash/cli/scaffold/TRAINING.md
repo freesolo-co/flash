@@ -829,6 +829,11 @@ Pick SFT when you already have good answers and want the model to imitate them.
   `max_context_tokens` that plausibly fits prompt + completion, and only raise it when you see
   truncation (outputs cut off mid-thought, degraded loss). A bigger context just costs
   more.
+- **Multi-turn targets train on the assistant turns only.** When `sft_completion` returns a
+  full target transcript (assistant turns interleaved with the environment's tool/user
+  observations), Flash supervises the assistant turns and masks the observations out of the
+  loss — the model is trained to produce its own replies, not to predict the environment's.
+  The run logs `[sft] multi-turn SFT: N/M rows ...` when any row carries such a target.
 - **For Qwen3.5 thinking multi-turn SFT, put reasoning only in the final assistant
   turn.** Qwen3.5's chat template strips literal `<think>` blocks from prior assistant
   history and pre-opens `<think>\n` in the next generation prompt. If every assistant

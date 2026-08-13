@@ -11,6 +11,7 @@ from __future__ import annotations
 import random
 
 from flash.engine.worker.model.packing import (
+    assistant_only_mask,
     completion_mask_from_ids,
     tokenize_for_packing,
     untruncated_lengths_for_packing,
@@ -48,7 +49,11 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
     pretok = [
         {
             "input_ids": ids,
-            "completion_mask": completion_mask_from_ids(pids, ids),
+            # role-aware: the prompt boundary alone would also supervise the environment's replies
+            # between assistant turns of a multi-turn target.
+            "completion_mask": assistant_only_mask(
+                completion_mask_from_ids(pids, ids), ids, tokenizer
+            ),
             "untruncated_length": length,
         }
         for ids, pids, length in zip(full_ids, prompt_ids, untruncated, strict=True)
