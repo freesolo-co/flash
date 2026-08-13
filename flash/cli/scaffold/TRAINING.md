@@ -1272,7 +1272,10 @@ In OPD, a model turn that reaches its cap without EOS or a configured stop is cl
 truncated, ends the episode, and is dropped before teacher scoring. If every rollout in a step is
 dropped, the step fails with `produced no aligned teacher signal`. Partial dropping is more dangerous:
 it can silently bias training toward shorter episodes, so monitor the per-step `truncation_rate` and
-`discarded_rollouts` metrics rather than relying on the loss alone.
+`discarded_rollouts` metrics rather than relying on the loss alone. Read them as a sampled indicator,
+not a ledger: heartbeats are throttled, so a step that finishes shortly after the previous one does
+not publish its own values, and a nonzero reading means truncation pressure around that point in the
+run rather than an exact count for that step.
 
 ---
 
