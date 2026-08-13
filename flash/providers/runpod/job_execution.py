@@ -565,17 +565,24 @@ def _classify_stall(context: _PollContext, state: _PollState, status: Any) -> Po
     #
     # Only for the no-worker case: once health shows one coming up, the queue timer is suppressed
     # and the setup grace legitimately governs the cold start, unscaled, as it always did.
-    if status == "IN_QUEUE" and not _worker_is_coming_up(
-        state.worker_coming_up_at, _jobs.time.time()
-    ):
+    now = _jobs.time.time()
+    if status == "IN_QUEUE" and not _worker_is_coming_up(state.worker_coming_up_at, now):
+        # The wait is exempt, so the clock this function measures has to be exempt with it: it
+        # anchors on the last status CHANGE, which for a job queued from the start is the moment it
+        # entered the queue. Leaving it there would bank the whole queued wait against the cold
+        # start, so a worker granted late -- after 3000s of queueing, but inside a 4-card's 3600s
+        # capacity grace -- would be declared stalled on its very first poll, having been given no
+        # time to boot at all. Roll the anchor forward while the exemption holds so the grant
+        # starts the cold-start budget from zero, exactly as an immediate grant does.
+        state.last_progress = now
         return None
-    if _jobs.time.time() - state.last_progress <= stall_limit:
+    if now - state.last_progress <= stall_limit:
         return None
     phase = "setup (pre-training)" if in_setup else "training"
     return PollResult(
         False,
         failure="stalled",
-        detail=f"no worker progress for {int(_jobs.time.time() - state.last_progress)}s "
+        detail=f"no worker progress for {int(now - state.last_progress)}s "
         f"during {phase} (job status {status}, limit {int(stall_limit)}s)",
     )
 
