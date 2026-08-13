@@ -122,6 +122,10 @@ class StepClock:
         self._break_after_last = True
         self._draining_backlog = True
         self._drained = 0
+        # a replay's baseline is the pre-block instant, so carrying it across would start the next
+        # segment before the block and measure the very upload this call exists to exclude -- a
+        # 900s stall behind a repeated step published 496s/step against a true 92s.
+        self._pending_baseline = None
 
     def note_if_blocked(self, elapsed_s: float) -> None:
         """Break the span when a call took long enough to have blocked the reader.

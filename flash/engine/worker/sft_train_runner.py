@@ -789,12 +789,19 @@ class _SftProgressCallbacks:
         # published snapshot, and this ping shares the step heartbeat's throttled slot. one that won
         # it without these fields would blank a measured pace off live status, which reads as the
         # measurement having been lost rather than simply not re-sent.
+        #
+        # timed like the on_step upload: this one runs inside run_verl_training's reader loop too,
+        # so an upload that blocks here defers the NEXT step line's timestamp just the same. it is
+        # reached from a non-step line, which is exactly why it needs its own guard -- the on_step
+        # path never sees this call.
+        started = time.monotonic()
         _w.heartbeat(
             "sft_step",
             liveness=True,
             step=int(self.progress.values["step"] or 0),
             **self.step_timing_fields(),
         )
+        self.progress.step_clock.note_if_blocked(time.monotonic() - started)
 
 
 def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_line) -> int:

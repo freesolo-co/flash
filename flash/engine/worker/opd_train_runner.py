@@ -650,12 +650,18 @@ def _build_child_callbacks(
     def child_heartbeat() -> None:
         # see liveness_fields below: an upload replaces the published snapshot, so every ping that
         # can win the shared step slot has to carry the timing or a measured pace disappears.
+        #
+        # and timed like the on_step upload above: this one also runs inside run_verl_training's
+        # reader loop, so blocking here defers the next step line's timestamp. it fires from a
+        # non-step line, so the on_step guard never covers it.
+        started = time.monotonic()
         _opd_train._w.heartbeat(
             "opd_step",
             liveness=True,
             step=int(progress["step"] or 0),
             **step_timing_fields(),
         )
+        step_clock.note_if_blocked(time.monotonic() - started)
 
     child_tail = _opd_train.ChildOutputTail()
     # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside

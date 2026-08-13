@@ -6,7 +6,6 @@ Split out of ``flash.engine.worker.rl_train`` to keep that module under the file
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -30,6 +29,7 @@ from flash.engine.worker.backend_common import (
     shim_marker_file,
     verify_applied_shim_markers,
     verl_device_capability,
+    verl_step_number,
     wrap_shim_fragment,
 )
 from flash.engine.worker.io.heartbeat import (
@@ -555,7 +555,6 @@ def _execute_rl_child(
         start_new_session=True,
     )
     child_stream = _rl_train()._GrpoSubprocessStream(proc)
-    step_re = re.compile(r"step:\s*(\d+)")
     progress, last_dump_step = state.progress, state.last_dump_step
     shim_markers = (files or {}).get("shim_markers")
     expected_shims = (files or {}).get("expected_shims", ())
@@ -566,9 +565,13 @@ def _execute_rl_child(
             link = parse_wandb_link(line)
             if link is not None:
                 reward_runtime.wandb_link.update(link)
-            m = step_re.search(line)
-            if m:
-                progress["step"] = int(m.group(1))
+            # the shared gate, not a looser scan of its own. this value is what the projection
+            # reports as the current step, and a scan that also matched `timing/step:1.25` or a
+            # `global_step:9` checkpoint path would reset it to 1 after a real step 20 -- which
+            # publishes an inflated remaining time and a false wall-limit warning beside it.
+            parsed_step = verl_step_number(line)
+            if parsed_step is not None:
+                progress["step"] = parsed_step
                 # the first step line is the training-start boundary: sitecustomize import is long
                 # finished by then, so a marker still missing means this child is training with no
                 # flash patch at all, so fail now rather than after the whole run is paid for. not

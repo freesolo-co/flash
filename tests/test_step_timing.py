@@ -567,9 +567,10 @@ def test_every_step_timestamp_comes_from_a_clock_that_cannot_jump():
                 f"{name}:{node.lineno} times a step off a clock that can jump: {timestamp}"
             )
             checked += 1
-    # every trainer records and two of them also time their heartbeat; a passing assertion loop that
-    # visited nothing would be the failure this guards against.
-    assert checked == 5, checked
+    # every trainer records, and SFT and OPD each time TWO uploads: the one on the step line and the
+    # one the child stream fires from a non-step line. a passing assertion loop that visited nothing
+    # would be the failure this guards against.
+    assert checked == 7, checked
 
 
 def test_a_failed_optional_checkpoint_does_not_blank_the_pace_either(monkeypatch, tmp_path):
@@ -795,3 +796,102 @@ def test_an_unnamed_wall_falls_back_to_the_stronger_warning():
     warning = dict(step_timing_pairs(no_wall, running=True))["wall limit"]
     assert "do not fit" in warning
     assert "only just fit" not in warning
+
+
+def test_a_block_discards_a_pending_replay_baseline():
+    """The two breaks can overlap, and the block has to win.
+
+    A validation reprint sets its own arrival as the baseline the next step starts from. If the
+    heartbeat issued for that same callback then blocks, that baseline is a pre-block instant:
+    carrying it forward starts the next segment BEFORE the upload and so measures the very stall
+    note_blocking_work exists to exclude. Seen end to end it published 496.5s/step against a
+    true 92.0 -- worse than not measuring at all, because it looks like a measurement.
+    """
+    clock = step_timing.StepClock()
+    clock.record(100.0, 5)
+    clock.record(192.0, 6)
+    clock.record(200.0, 6)  # validation reprint -> baseline 200.0
+    assert clock._pending_baseline == 200.0
+    clock.note_if_blocked(900.0)  # the heartbeat for that callback stalled
+    assert clock._pending_baseline is None
+    clock.record(1101.0, 7)
+    assert clock.intervals() == [92.0]  # not [92.0, 901.0]
+    assert clock.step_seconds() == 92.0
+
+
+def test_the_rl_projection_reads_the_step_from_the_shared_gate():
+    """The projection's current step decides how many steps remain, so a bad one is not cosmetic.
+
+    _execute_rl_child used to scan with a looser `step:\\s*(\\d+)` of its own, which reads 1 out of
+    `timing/step:1.25` and 9 out of a `global_step:9` checkpoint path. After a real step 20 that
+    resets the published step to 1, and the next liveness or checkpoint ping carries a remaining
+    time computed for 99 steps instead of 80 -- with a wall-limit warning that fires off it.
+    """
+    import inspect
+
+    from flash.engine.worker import rl_train
+    from flash.engine.worker.verl.child_io import verl_step_number
+
+    src = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
+    assert "parsed_step = verl_step_number(line)" in src
+    assert 'progress["step"] = parsed_step' in src
+    assert "step_re" not in src, "a second, looser step scan is back"
+
+    # and the gate itself rejects the shapes that caused the reset.
+    assert verl_step_number("step:20 - critic/rewards/mean:0.5") == 20
+    for noise in (
+        "(TaskRunner pid=1) timing/step:1.25",
+        "val/global_step:12 something",
+        "saved to /ckpt/global_step:9/actor",
+    ):
+        assert verl_step_number(noise) is None, noise
+
+    # the projection is what a contaminated step corrupts: same clock, same pace, wrong step.
+    clock = step_timing.StepClock()
+    for i in range(6):
+        clock.record(float(i) * 92.0)
+    truth = step_timing.step_timing_fields(
+        clock, current_step=20, total_steps=100, remaining_wall_seconds=10_000.0
+    )
+    contaminated = step_timing.step_timing_fields(
+        clock, current_step=1, total_steps=100, remaining_wall_seconds=10_000.0
+    )
+    assert truth["projected_remaining_s"] == 80 * 92.0
+    assert not truth.get("wall_deadline_at_risk")
+    assert contaminated["projected_remaining_s"] == 99 * 92.0
+    assert contaminated["wall_deadline_at_risk"] is True  # the false warning
+
+
+def test_the_child_stream_heartbeat_is_timed_like_the_step_one():
+    """Both uploads run inside run_verl_training's reader loop, so both defer the next timestamp.
+
+    The child ping fires from a NON-step line, which is exactly why it needs its own guard: the
+    on_step path never sees this call, so its note_if_blocked cannot cover it. Without one, a
+    900s stall on this ping lands whole inside the next interval and is published as a step cost.
+    """
+    import ast
+    from pathlib import Path
+
+    import flash
+
+    # read off disk, not through inspect: importing these runners directly raises on a circular
+    # import (see test_every_step_timestamp_comes_from_a_clock_that_cannot_jump).
+    worker_dir = Path(flash.__file__).parent / "engine" / "worker"
+    for name in ("sft_train_runner.py", "opd_train_runner.py"):
+        body = None
+        for node in ast.walk(ast.parse((worker_dir / name).read_text())):
+            if isinstance(node, ast.FunctionDef) and node.name == "child_heartbeat":
+                body = " ".join(ast.unparse(node).split())
+        assert body is not None, f"{name} has no child_heartbeat"
+        assert "started = time.monotonic()" in body, name
+        assert "note_if_blocked(time.monotonic() - started)" in body, name
+
+    # the guard's effect: the stalled span is dropped rather than published as what a step costs.
+    clock = step_timing.StepClock()
+    clock.record(0.0, 1)
+    clock.record(92.0, 2)
+    clock.note_if_blocked(900.0)  # the child ping blocked on a non-step line
+    clock.record(1084.0, 3)  # 900s upload + 92s step
+    clock.record(1176.0, 4)
+    assert clock.intervals() == [92.0, 92.0]
+    assert clock.step_seconds() == 92.0
