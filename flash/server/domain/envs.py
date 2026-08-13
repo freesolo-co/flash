@@ -504,6 +504,15 @@ def _reject_credentials(package_root: Path) -> None:
         reject_credential_bearing_package(package_root, display={})
     except ValueError as exc:
         raise EnvPublishError(str(exc)) from None
+    except OSError as exc:
+        # An uploaded tar can carry a regular file with mode 000, which extracts fine and then
+        # cannot be opened by a non-root control plane. Only `ValueError` was translated, and the
+        # route catches only `EnvPublishError`, so that package produced an uncontrolled 500
+        # instead of a 400. A member the scan cannot read is a refusal, not a server fault:
+        # unverifiable is not clean, and the same answer is what the CLI would have given.
+        raise EnvPublishError(
+            f"a file in the package could not be read to check it for credentials: {exc.strerror}"
+        ) from None
 
 
 _SLUG_SEGMENT_RE = re.compile(r"^[a-z0-9._-]+$")

@@ -33,12 +33,13 @@ import zipfile
 import zlib
 from collections.abc import Iterator
 from pathlib import Path
-from typing import IO
+from typing import IO, NoReturn
 
 from flash.env_formats import (
     _MAX_ARCHIVE_MEMBERS,
     _UNEXPANDABLE_MAGIC,
     _ZIP_TAIL_BYTES,
+    _after_skippable_frames,
     _has_zip_end_record,
     _is_openpgp_secret_key,
     _looks_compressed,
@@ -183,8 +184,15 @@ _LITERAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
             # The RFC 8410 OIDs are `1.3.101.{110,111,112,113}` = X25519, X448, Ed25519, Ed448,
             # whose final byte is 0x6e, 0x6f, 0x70, 0x71. Naming only the 25519 pair let a real
             # Ed448 or X448 key publish intact; the four are one contiguous range.
+            # DSA is `1.2.840.10040.4.1` (`2a 86 48 ce 38 04 01`). Its AlgorithmIdentifier is a
+            # SEQUENCE rather than the 1-byte length the others use, so the `\x30.` above does not
+            # cover it: `openssl pkcs8 -topk8 -nocrypt -outform DER` on a real 1024-bit DSA key
+            # produced a file every branch here passed as clean.
             rb"\x02\x01\x00\x30.\x06(?:\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
             rb"|\x03\x2b\x65[\x6e-\x71]|\x07\x2a\x86\x48\xce\x3d\x02\x01)"
+            rb"|\x02\x01\x00\x30\x82..\x06\x07\x2a\x86\x48\xce\x38\x04\x01"
+            rb"|\x02\x01\x00\x30\x81.\x06\x07\x2a\x86\x48\xce\x38\x04\x01"
+            rb"|\x02\x01\x00\x30[\x00-\x7f]\x06\x07\x2a\x86\x48\xce\x38\x04\x01"
             # PKCS#1 RSAPrivateKey: version 0 then the modulus INTEGER, whose length may be stated
             # in any of DER's three forms. Requiring `\x02\x82` recognised only 2048-bit and larger
             # keys: `openssl rsa -outform DER -traditional` writes `02 81 81` for a 1024-bit key
@@ -208,6 +216,24 @@ _LITERAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
             re.DOTALL,
         ),
     ),
+    # The same key as a JSON Web Key. Node's `privateKey.export({format: "jwk"})` and every JOSE
+    # library write this, `.json` and `.jwk` are ordinary publishable files, and the encoding
+    # carries neither a PEM header nor DER structure -- so a complete RSA or EC private key passed
+    # every check above as clean.
+    #
+    # Anchored on the PRIVATE members, not on JWK-ness: a public JWK is meant to be shared and
+    # differs only by their absence. `d` is the private exponent or scalar in every key type; for
+    # RSA the CRT parameters accompany it. Requiring a `kty` alongside keeps this off arbitrary
+    # JSON that happens to carry a short `"d"` field.
+    (
+        "a private key",
+        re.compile(
+            rb"\"kty\"\s*:\s*\"(?:RSA|EC|OKP|oct)\"[\s\S]{0,4096}?"
+            rb"\"(?:d|dp|dq|qi)\"\s*:\s*\"[A-Za-z0-9+/\-_]{20,}={0,2}\""
+            rb"|\"(?:d|dp|dq|qi)\"\s*:\s*\"[A-Za-z0-9+/\-_]{20,}={0,2}\"[\s\S]{0,4096}?"
+            rb"\"kty\"\s*:\s*\"(?:RSA|EC|OKP|oct)\""
+        ),
+    ),
 )
 
 # Read in bounded chunks so a large dataset member is never held in memory whole. This costs no
@@ -217,6 +243,11 @@ _SCAN_CHUNK_BYTES = 1 << 20
 # the longest possible match (`_MAX_BODY` plus the longest prefix), so every match is fully visible
 # inside some window rather than merely likely to be.
 _SCAN_OVERLAP_BYTES = 1024
+
+# How much of a chunk's head is walked for skippable frames. Generous for the handful a real
+# seekable stream carries, and bounded so a chain of crafted frame headers cannot make this walk a
+# cost of its own.
+_SKIPPABLE_SCAN_BYTES = 64 << 10
 
 # A base64 run long enough to hold the shortest credential a pattern admits. The lower bound makes
 # the scan walk past ordinary prose rather than decoding every word it meets. There is deliberately
@@ -234,6 +265,12 @@ _BASE64_RUN = re.compile(rb"[A-Za-z0-9+/\-_]{24,}={0,2}")
 # Maps the URL-safe alphabet onto the standard one so a single decoder handles both. A run mixing
 # the two is not valid base64 either way, and translating it simply fails to decode as before.
 _URL_SAFE_ALPHABET = bytes.maketrans(b"-_", b"+/")
+
+# Marks NUL as 1 and everything else as 0, so an unbroken stretch of padding bytes becomes a run
+# `_WIDE_RUN` can find. The length floor is the shortest credential body worth decoding; below it
+# a chance alignment of NULs cannot carry one anyway.
+_NUL_MARKER = bytes(1 if byte == 0 else 0 for byte in range(256))
+_WIDE_RUN = re.compile(rb"\x01{24,}")
 
 # A fixed-width wrapped base64 block: one or more full-width lines, then a final line of any
 # length. The widths are the two conventions in use -- 76 for MIME (`base64.encodebytes`, mail,
@@ -486,6 +523,13 @@ def _credential_kind(data: bytes) -> str | None:
     Narrowed text goes through the SAME checks as literal text, base64 included. Running only the
     plain patterns over it left the two supported encodings composable: a UTF-16 config file holding
     a base64 credential passed both gates individually and published.
+
+    Only the stretches that are ACTUALLY wide-encoded are narrowed, not the whole file. Taking
+    every second byte of arbitrary data invents text that was never written: machine code narrows
+    into plausible-looking tokens often enough that 5 of 500 ordinary system binaries were refused
+    as holding a credential -- `/usr/bin/bash` narrowed to `fslo_eietossvdrdrcsP3`. A real wide
+    character keeps its padding byte NUL, so requiring an unbroken NUL run alongside the candidate
+    costs nothing on genuine UTF-16/32 and leaves machine code with nothing long enough to match.
     """
     if kind := _decoded_kind(data):
         return kind
@@ -495,9 +539,25 @@ def _credential_kind(data: bytes) -> str | None:
         for offset in keep:
             # take every `width`-th byte: for UTF-16 that is the ASCII half of each code unit, in
             # whichever of the two byte orders the file used.
-            if kind := _decoded_kind(data[offset::width]):
-                return kind
+            for run in _wide_runs(data, width, offset):
+                if kind := _decoded_kind(run):
+                    return kind
     return None
+
+
+def _wide_runs(data: bytes, width: int, offset: int) -> Iterator[bytes]:
+    """The stretches of `data[offset::width]` whose discarded padding byte is NUL throughout.
+
+    Wide text pads every character with NULs, so the padding column is what separates a genuine
+    UTF-16/32 region from bytes that merely narrow into something readable. Only runs long enough
+    to hold a credential are yielded, which is why an ELF -- whose NULs are scattered rather than
+    columnar -- produces none while a wide file produces one run covering the whole of it.
+    """
+    pad = offset + 1 if offset + 1 < width else offset - 1
+    narrow = data[offset::width]
+    columns = data[pad::width].translate(_NUL_MARKER)
+    for match in _WIDE_RUN.finditer(columns, 0, min(len(narrow), len(columns))):
+        yield narrow[match.start() : match.end()]
 
 
 def _decoded_kind(data: bytes) -> str | None:
@@ -545,8 +605,12 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
             # every archive member reaches this, so the binary export is covered wherever it sits.
             return "a private key"
         if not carry:
+            # Past any skippable frames first: zstd and LZ4 both allow a metadata envelope before
+            # the real frame, and a head-only check saw that envelope's magic, matched neither
+            # list, and passed the compressed frame behind it through as ordinary content.
+            head = _after_skippable_frames(chunk[:_SKIPPABLE_SCAN_BYTES])
             for magic, fmt in _UNEXPANDABLE_MAGIC:
-                if chunk.startswith(magic):
+                if head.startswith(magic):
                     raise _Unscannable(f"contains a {fmt} archive this check cannot expand")
         if not carry and depth:
             # tar as well as the compressed magics: a tar's own members are literal, but a
@@ -672,7 +736,7 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
     # it spent before the per-member loop below ran once.
     if _zip_member_count(source, _MAX_ARCHIVE_MEMBERS) > _MAX_ARCHIVE_MEMBERS:
         raise _Unscannable("contains an archive with too many members to inspect")
-    encrypted = False
+    unreadable = ""
     with zipfile.ZipFile(source if isinstance(source, Path) else io.BytesIO(source)) as archive:
         for count, info in enumerate(archive.infolist(), 1):
             if count > _MAX_ARCHIVE_MEMBERS:
@@ -688,18 +752,30 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
             # Noted and raised AFTER the loop rather than here, because the members behind it must
             # still be scanned: refusing on sight would abandon the rest of the archive, and a
             # credential further down would go unreported in favour of a weaker message about an
-            # unreadable member. A found credential is the more specific answer, so it wins.
+            # unreadable member. A found credential is the more specific answer, so it wins. The
+            # same deferral covers members whose compression this Python cannot decode, below.
             if info.flag_bits & 0x01:
-                encrypted = True
+                unreadable = unreadable or "an encrypted archive member this check cannot read"
                 continue
             try:
                 with archive.open(info) as member:
                     if kind := _scan_stream(member, deadline=deadline, depth=depth):
                         return kind
+            except NotImplementedError:
+                # The member is valid but uses a compression method this Python has no decompressor
+                # for -- Deflate64 is the common one, and `zip -fd` writes it. Caught by the broad
+                # skip below it read as "opaque member, carry on" and the credential in its payload
+                # published. Recorded like an encrypted member: unverifiable is not clean.
+                #
+                # Reported distinctly from encryption because the remedy differs: a password is not
+                # what is missing, the archive has to be rewritten with a supported method.
+                unreadable = unreadable or (
+                    "an archive member compressed in a way this check cannot read"
+                )
             except _UNREADABLE_ARCHIVE:
                 continue  # this member is opaque; the rest of the archive still gets scanned
-    if encrypted:
-        raise _Unscannable("contains an encrypted archive member this check cannot read")
+    if unreadable:
+        raise _Unscannable(f"contains {unreadable}")
     return None
 
 
@@ -833,8 +909,25 @@ def reject_credential_bearing_package(package_root: Path, *, display: dict[str, 
     while every individual file looked well inside the limit.
     """
     deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
+
+    def unwalkable(error: OSError) -> NoReturn:
+        # `os.walk` swallows descent errors by default, so a directory the scan cannot enter --
+        # mode 000 in an uploaded tar, read by a non-root control plane -- had its contents skipped
+        # silently and a credential inside was published intact. The same tree with the directory
+        # readable is refused, so passing here was purely a function of what could be opened.
+        #
+        # Named relative to the package like every other refusal: the absolute path is the control
+        # plane's staging directory, which is the server's business rather than the publisher's.
+        failed = Path(str(error.filename or package_root))
+        relative = failed.relative_to(package_root).as_posix() if failed != package_root else "."
+        raise ValueError(
+            f"{_redacted(display.get(relative, relative))} could not be read to check it for "
+            "credentials, so publishing it would commit unscanned content to a shared environment "
+            "repository. Fix the permissions on it before publishing."
+        ) from None
+
     # sorted so the member named in the refusal is the same one on every machine.
-    for root, dirs, files in os.walk(package_root):
+    for root, dirs, files in os.walk(package_root, onerror=unwalkable):
         dirs.sort()
         for name in sorted(dirs) + sorted(files):
             member = Path(root) / name

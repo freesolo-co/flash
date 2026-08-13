@@ -1823,6 +1823,42 @@ def test_credential_scan_reads_wide_encodings(tmp_path):
     assert credential_in_file(padded) is None
 
 
+def test_narrowing_does_not_invent_a_credential_out_of_machine_code(tmp_path):
+    """Every second byte of a compiled binary is not text, and must not be read as though it were.
+
+    Narrowing the whole file unconditionally was the bug: an ELF holds no credential, but taking
+    every second byte of x86 instruction bytes spells plausible tokens often enough that 5 of 500
+    ordinary system binaries were refused -- `/usr/bin/bash` narrowed to a string matching the
+    Freesolo key pattern. Refusing a legitimate publish is the failure here, so the fixture is the
+    real thing rather than a hand-made one: a binary on this machine, chosen for having no
+    credential in its literal bytes.
+
+    Guarded by the wide encodings above, which must keep working; a gate that fixed this by simply
+    not narrowing would pass this test and lose the `env.ps1` case the narrowing exists for.
+    """
+    from pathlib import Path
+
+    from flash.env_secrets import _decoded_kind, credential_in_file
+
+    binaries = [
+        candidate
+        for candidate in sorted(Path("/usr/bin").iterdir())
+        if candidate.is_file() and not candidate.is_symlink()
+    ][:200]
+    # only binaries with nothing in their literal bytes: the rest may hold a real embedded key
+    # (`dockerd` ships one), and refusing those is correct rather than a false positive.
+    clean = [
+        binary
+        for binary in binaries
+        if binary.stat().st_size > 1 << 16 and not _decoded_kind(binary.read_bytes())
+    ]
+    if not clean:
+        pytest.skip("no suitable binary on this machine")
+
+    flagged = [binary.name for binary in clean if credential_in_file(binary)]
+    assert not flagged, f"narrowing invented a credential in {flagged}"
+
+
 def test_push_refuses_a_credential_used_as_a_filename(monkeypatch, tmp_path, capsys):
     """A file NAMED after a key publishes it in the repository's file tree, contents irrelevant.
 
@@ -1930,12 +1966,15 @@ def test_credential_scan_survives_archives_the_stdlib_refuses_to_read(tmp_path):
     with pytest.raises(_Unscannable, match="encrypted archive member"):
         credential_in_file(encrypted)
 
-    # method 99 is AES, which zipfile does not implement -> NotImplementedError
+    # method 99 is AES, which zipfile does not implement -> NotImplementedError. Refused for the
+    # same reason as the encrypted member: the payload cannot be decoded, so it cannot be cleared.
+    # This asserted None until a credential in a Deflate64 member was shown to publish intact.
     unsupported = tmp_path / "unsupported.zip"
     unsupported.write_bytes(
         _flip_zip_flags(source, offset_local=8, offset_central=10, value=struct.pack("<H", 99))
     )
-    assert credential_in_file(unsupported) is None
+    with pytest.raises(_Unscannable, match="compressed in a way this check cannot read"):
+        credential_in_file(unsupported)
 
     # a corrupt deflate stream under a valid gzip header -> zlib.error
     corrupt = tmp_path / "corrupt.gz"
@@ -3463,3 +3502,169 @@ def test_an_openpgp_packet_shorter_than_its_fields_is_not_a_key(tmp_path):
     # a packet whose declared length DOES cover its fields is still a key
     real = bytes([0xC5, 20]) + b"\x04" + b"\x6a\x7e\x24\x0a" + b"\x01" + b"\x00" * 16
     assert _is_openpgp_secret_key(real)
+
+
+def test_a_prepended_stub_does_not_hide_a_zips_real_member_count(tmp_path):
+    """A self-extracting zip shifts every recorded offset, including the directory's.
+
+    Reading the stored offset literally landed the member-count walk inside the stub, which is not
+    a directory record, so the walk gave up and the (attacker-controlled) count field in the end
+    record was trusted instead. `ZipFile` compensates for the prepended bytes and still
+    materializes every entry, so a 102-byte stub restored the exhaustion the bound exists to
+    prevent: 500 entries reported as one.
+    """
+    import struct
+    import zipfile
+
+    from flash.env_formats import _ZIP_END_RECORD, _zip_member_count
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        for index in range(500):
+            archive.writestr(f"m{index}.txt", f"payload {index}")
+    raw = bytearray(buf.getvalue())
+    end = raw.rfind(_ZIP_END_RECORD)
+    raw[end + 8 : end + 10] = struct.pack("<H", 1)
+    raw[end + 10 : end + 12] = struct.pack("<H", 1)
+    forged = bytes(raw)
+
+    # the honest archive counts correctly, with and without a stub
+    assert _zip_member_count(bytes(buf.getvalue()), 100) > 100
+    stub = b"MZ" + b"\x90" * 100
+    assert _zip_member_count(stub + bytes(buf.getvalue()), 100) > 100
+    # and the forged count is not believed just because a stub moved the directory
+    assert _zip_member_count(stub + forged, 100) > 100
+    assert len(zipfile.ZipFile(io.BytesIO(stub + forged)).infolist()) == 500
+
+
+def test_a_seven_zip_archive_is_refused_rather_than_published(tmp_path):
+    """7-Zip is as opaque to the stdlib as zstd, so its member bytes are unverifiable."""
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    archive = tmp_path / "shard.7z"
+    archive.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00\x04" + bytes(range(256)) * 4)
+    with pytest.raises(_Unscannable, match="7-zip"):
+        credential_in_file(archive)
+
+
+def test_text_beginning_with_rar_is_not_treated_as_an_archive(tmp_path):
+    """Four printable characters are prose. A real signature carries its version bytes."""
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    readme = tmp_path / "README.md"
+    readme.write_bytes(b"Rar! archives are not supported here; use tar instead.\n" * 4)
+    assert credential_in_file(readme) is None
+
+    real = tmp_path / "shard.rar"
+    real.write_bytes(b"Rar!\x1a\x07\x00" + b"\x00" * 512)
+    with pytest.raises(_Unscannable, match="rar"):
+        credential_in_file(real)
+
+
+def test_a_skippable_frame_does_not_hide_the_compressed_frame_behind_it(tmp_path):
+    """zstd and LZ4 both allow a metadata envelope before the real frame.
+
+    A head-only format check saw the skippable magic, matched neither the expandable nor the
+    unexpandable list, and passed the compressed frame behind it through as ordinary content --
+    where its credential is visible to nothing.
+    """
+    import struct
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    opaque = bytes((index * 7 + 13) % 251 for index in range(4096))
+    for magic, label in ((b"\x28\xb5\x2f\xfd", "zstd"), (b"\x04\x22\x4d\x18", "lz4")):
+        skippable = b"\x50\x2a\x4d\x18" + struct.pack("<I", 16) + b"\x00" * 16
+        shard = tmp_path / f"shard-{label}.bin"
+        shard.write_bytes(skippable + magic + opaque)
+        with pytest.raises(_Unscannable, match=label):
+            credential_in_file(shard)
+
+
+def test_a_zip_member_using_unsupported_compression_is_refused(tmp_path):
+    """`archive.open` raises NotImplementedError for Deflate64, which read as a clean member."""
+    import struct
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("secret.txt", f"fslo_{_FAKE_KEY_BODY}")
+    raw = bytearray(buf.getvalue())
+    for signature, offset in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
+        at = raw.find(signature)
+        while at >= 0:
+            raw[at + offset : at + offset + 2] = struct.pack("<H", 9)
+            at = raw.find(signature, at + 1)
+
+    shard = tmp_path / "shard.zip"
+    shard.write_bytes(bytes(raw))
+    with pytest.raises(_Unscannable, match="compressed in a way this check cannot read"):
+        credential_in_file(shard)
+
+
+def test_a_dsa_private_key_in_der_is_recognised(tmp_path):
+    """DSA's AlgorithmIdentifier is a SEQUENCE, so the 1-byte-length branches did not cover it."""
+    from flash.env_secrets import credential_in_file
+
+    # PKCS#8 PrivateKeyInfo: version 0, then AlgorithmIdentifier { OID 1.2.840.10040.4.1, params }
+    body = (
+        b"\x30\x82\x01\x5a\x02\x01\x00\x30\x82\x01\x33"
+        b"\x06\x07\x2a\x86\x48\xce\x38\x04\x01" + b"\x00" * 300
+    )
+    key = tmp_path / "dsa.der"
+    key.write_bytes(body)
+    assert credential_in_file(key) == "a private key"
+
+
+def test_a_private_key_stored_as_a_jwk_is_recognised(tmp_path):
+    """A JWK carries neither a PEM header nor DER structure, so every key branch passed it."""
+    import base64
+    import json
+
+    from flash.env_secrets import credential_in_file
+
+    def value(seed):
+        raw = bytes((index * seed + 11) % 251 for index in range(32))
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    private = {"kty": "EC", "crv": "P-256", "x": value(3), "y": value(5), "d": value(7)}
+    key = tmp_path / "key.jwk"
+    key.write_text(json.dumps(private, indent=2))
+    assert credential_in_file(key) == "a private key"
+
+    # the public half of the same key is meant to be shared, and must not be refused
+    public = tmp_path / "pub.jwk"
+    public.write_text(json.dumps({k: v for k, v in private.items() if k != "d"}, indent=2))
+    assert credential_in_file(public) is None
+
+    # nor is ordinary JSON that happens to carry a short `d`
+    ordinary = tmp_path / "row.json"
+    ordinary.write_text(json.dumps({"kty": "EC", "d": "short"}))
+    assert credential_in_file(ordinary) is None
+
+
+def test_a_directory_the_scan_cannot_enter_is_refused(tmp_path):
+    """`os.walk` swallows descent errors, so an unreadable directory hid its contents.
+
+    The same tree with the directory readable is refused, so passing was purely a function of what
+    could be opened -- a credential inside a mode-000 directory published intact.
+    """
+    from flash.env_secrets import reject_credential_bearing_package
+
+    package = tmp_path / "pkg"
+    hidden = package / "sub"
+    hidden.mkdir(parents=True)
+    (hidden / "key.txt").write_text(f"fslo_{_FAKE_KEY_BODY}")
+
+    # readable: refused by content, which is the behaviour the unreadable case must not escape
+    with pytest.raises(ValueError, match="Freesolo API key"):
+        reject_credential_bearing_package(package, display={})
+
+    hidden.chmod(0o000)
+    try:
+        with pytest.raises(ValueError, match="could not be read"):
+            reject_credential_bearing_package(package, display={})
+    finally:
+        hidden.chmod(0o755)

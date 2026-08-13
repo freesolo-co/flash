@@ -49,8 +49,41 @@ _COMPRESSED_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7z
 _UNEXPANDABLE_MAGIC = (
     (b"\x28\xb5\x2f\xfd", "zstd"),
     (b"\x04\x22\x4d\x18", "lz4"),
-    (b"Rar!", "rar"),
+    # The full RAR 4 and RAR 5 signatures, not the bare `Rar!` prefix. Four printable characters
+    # are ordinary prose -- a README opening "Rar! archives are not supported" was refused as an
+    # archive -- and a real signature always carries the version bytes that follow.
+    (b"Rar!\x1a\x07\x00", "rar"),
+    (b"Rar!\x1a\x07\x01\x00", "rar"),
+    # 7-Zip. Its body is opaque to the stdlib exactly like zstd, so a `.7z` holding a credential
+    # was neither expanded nor refused: the compressed bytes were scanned as if they were content
+    # and the archive published intact.
+    (b"7z\xbc\xaf\x27\x1c", "7-zip"),
 )
+
+# Skippable frames: a standardized envelope both zstd and LZ4 allow before the real frame, used by
+# seekable and metadata-bearing streams. The magic is `0x184D2A5x` little-endian for any low nibble
+# `x`, followed by a 4-byte payload length. A head-only format check saw the skippable magic,
+# matched neither list, and treated the compressed frame behind it as ordinary content.
+_SKIPPABLE_FRAME_MAGIC = tuple(bytes((0x50 | low, 0x2A, 0x4D, 0x18)) for low in range(16))
+_SKIPPABLE_FRAME_HEADER = 8
+
+# How many skippable frames are walked before the stream is given up on. A real stream carries a
+# handful; an unbounded walk over crafted headers would be a scan cost of its own.
+_MAX_SKIPPABLE_FRAMES = 16
+
+
+def _after_skippable_frames(head: bytes) -> bytes:
+    """`head` advanced past any leading zstd/LZ4 skippable frames.
+
+    Returned rather than mutated in place so the caller keeps the original bytes for the checks
+    that must see the true start of the file.
+    """
+    for _ in range(_MAX_SKIPPABLE_FRAMES):
+        if not head.startswith(_SKIPPABLE_FRAME_MAGIC) or len(head) < _SKIPPABLE_FRAME_HEADER:
+            return head
+        size = int.from_bytes(head[4:_SKIPPABLE_FRAME_HEADER], "little")
+        head = head[_SKIPPABLE_FRAME_HEADER + size :]
+    return head
 
 
 def _looks_compressed(head: bytes) -> bool:
@@ -209,6 +242,33 @@ def _has_zip_end_record(tail: bytes) -> bool:
     return False
 
 
+def _zip_concat_shift(
+    source: Path | bytes, tail: bytes, offset: int, size: int, start: int
+) -> int | None:
+    """How far the real central directory sits past the offset the end record states, or None.
+
+    Zero for an ordinary zip. Non-zero when bytes precede the archive -- a self-extracting stub, or
+    a zip appended to another file -- which shifts every recorded offset by the same amount. This
+    mirrors what `ZipFile` calls `concat`, so the walk reads the same directory the constructor
+    parses rather than the one the (attacker-controlled) offset field points at.
+    """
+    total = len(source) if isinstance(source, bytes) else _file_size(source)
+    if total is None:
+        return None
+    # where the end record actually is, in whole-file coordinates
+    record_at = total - len(tail) + offset
+    shift = record_at - size - start
+    return shift if shift >= 0 else None
+
+
+def _file_size(source: Path) -> int | None:
+    """`source`'s size in bytes, or None if it cannot be stat'd."""
+    try:
+        return source.stat().st_size
+    except OSError:
+        return None
+
+
 def _zip_directory_entries(
     source: Path | bytes, tail: bytes, offset: int, limit: int
 ) -> int | None:
@@ -224,6 +284,17 @@ def _zip_directory_entries(
     start = int.from_bytes(tail[offset + 16 : offset + 20], "little")
     if size == 0 or size == 0xFFFFFFFF or start == 0xFFFFFFFF:
         return None
+    # A self-extracting archive carries an executable stub before the zip, so every offset stored
+    # inside is short by the stub's length. `ZipFile` computes that shift and still materializes
+    # every entry; reading the recorded offset literally landed the walk in the stub, which is not
+    # a directory record, so the walk gave up and the forged count in the end record was trusted --
+    # a 102-byte stub made a 500-entry archive report one member.
+    #
+    # The shift is what the end record itself proves: the directory ends where the record begins,
+    # so its true start is that position minus its size.
+    if (shift := _zip_concat_shift(source, tail, offset, size, start)) is None:
+        return None
+    start += shift
     try:
         if isinstance(source, Path):
             with source.open("rb") as handle:
