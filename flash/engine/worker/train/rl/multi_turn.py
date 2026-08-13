@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler
 
 from flash.engine.worker.backend_common import BoundedThreadingHTTPServer
 from flash.engine.worker.score_batcher import ScoreBatcher
+from flash.engine.worker.train.core.child.glue import validate_transcript_messages
 from flash.engine.worker.train.rl.scoring import RolloutScoreRequest, score_rollouts
 
 # how many concurrently-finished episodes the multi-turn bridge scores in ONE env call. a whole
@@ -196,14 +197,21 @@ class MultiTurnBridge:
             if self._env.rollout_done(state, self._max_turns):
                 return {"terminal": True, "messages": []}
             replies = self._env.env_reply(list(state.get("messages") or ()), state)
+            # validate HERE, before the reply is serialized, exactly as the OPD bridge does at its
+            # own env_reply site. this used to be `str(message.get("content", ""))`, which stringified
+            # a multimodal content-block list into its python repr; the child's
+            # `validate_transcript_messages` then accepted that repr as ordinary text, so the model
+            # literally read "[{'type': 'image_url', ...}]" and trained on it with no warning and
+            # plausible-looking rollouts. the validator always rejected a non-string content --
+            # coercing first was what defeated it.
+            #
+            # the parent is also the only place the rejection can be legible: a raise here becomes a
+            # 400 the child re-raises WITH the detail, whereas a value that survived coercion but
+            # cannot be JSON-encoded (a PIL image) would break the response outside the handler's
+            # try and reach the user as an unexplained transport failure.
+            replies = validate_transcript_messages(replies, source="environment reply")
             terminal = bool(self._env.rollout_done(state, self._max_turns))
-        return {
-            "terminal": terminal,
-            "messages": [
-                {"role": str(message.get("role", "")), "content": str(message.get("content", ""))}
-                for message in replies
-            ],
-        }
+        return {"terminal": terminal, "messages": replies}
 
     def _score_batch(self, requests: list) -> list:
         """score a whole batch of terminal episodes in ONE env call. runs on the batcher thread.

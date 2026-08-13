@@ -4612,6 +4612,47 @@ def test_bridge_step_records_the_turn_and_returns_the_env_reply():
     assert out == {"terminal": False, "messages": [{"role": "user", "content": "again"}]}
 
 
+def test_bridge_step_rejects_an_image_reply_instead_of_stringifying_it():
+    # the bridge used to coerce content with `str()`, which turned a multimodal content-block list
+    # into its python repr. that repr is a valid string, so the child's own
+    # `validate_transcript_messages` accepted it and the model READ "[{'type': 'image_url', ...}]"
+    # as text -- training on stringified dictionaries with no warning and healthy-looking rollouts.
+    # a multi-turn rollout re-sends the media decoded from the OPENING prompt on every turn, so a
+    # mid-episode image reaches the model as nothing at all; this must be loud, not silent.
+    blocks = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+    env = _BridgeEnv(done_after=2, replies=[{"role": "user", "content": blocks}])
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="multimodal content-block list"):
+        bridge.step({"session_id": "a", "completion_text": "first"})
+
+
+def test_bridge_step_forwards_reply_content_without_coercion():
+    # the guard above must come from validation, NOT from re-coercing to a different type: a reply
+    # the contract allows has to arrive byte-identical, since these messages are rendered through
+    # the chat template to derive the exact inter-turn glue tokens.
+    env = _BridgeEnv(done_after=2, replies=[{"role": "user", "content": "plain text"}])
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    out = bridge.step({"session_id": "a", "completion_text": "first"})
+    assert out["messages"] == [{"role": "user", "content": "plain text"}]
+
+
+def test_bridge_step_rejects_a_non_serializable_reply_with_a_legible_error():
+    # the handler serializes the route's return value OUTSIDE its try block, so a content object
+    # that survived to that point (a PIL image) would surface as an unexplained transport failure.
+    # validating in the bridge keeps the rejection legible: it becomes a 400 the child re-raises
+    # with this detail attached.
+    class _Image:
+        pass
+
+    env = _BridgeEnv(done_after=2, replies=[{"role": "user", "content": _Image()}])
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="content must be text for multi-turn"):
+        bridge.step({"session_id": "a", "completion_text": "first"})
+
+
 def test_bridge_step_does_not_show_the_env_an_unusable_turn():
     # a truncated or skipped turn is terminal on the child side too. recording it would append a
     # cut-off assistant message to the transcript that then gets SCORED as if the model produced it.

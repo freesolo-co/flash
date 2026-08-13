@@ -62,6 +62,18 @@ def validate_transcript_messages(messages: list[dict], *, source: str) -> list[d
         content = message.get("content")
         if not isinstance(role, str) or not role.strip():
             raise ValueError(f"{source} message {position} has an invalid role")
+        if isinstance(content, list):
+            # a multimodal content-block list, the shape an env uses to show a NEW image mid-episode.
+            # name it specifically: the media a multi-turn rollout conditions on is decoded once from
+            # the opening prompt and re-sent on every turn, so a block list here would never reach the
+            # model as pixels. the generic "must be text" below reads like a type slip and sends the
+            # author looking for a stringify bug in their env instead.
+            raise ValueError(
+                f"{source} message {position} content is a multimodal content-block list; "
+                "multi-turn rollouts condition on the media decoded from the opening prompt, so an "
+                "image returned mid-episode is not shown to the model. return text, or present "
+                "every image in the opening prompt"
+            )
         if not isinstance(content, str):
             raise ValueError(f"{source} message {position} content must be text for multi-turn")
         normalized.append({"role": role, "content": content})

@@ -47,6 +47,24 @@ _TOML_NON_FINITE_WORDS = frozenset({"inf", "infinity", "nan"})
 _TOML_NULL_WORDS = frozenset({"null", "none", "nil"})
 
 
+def _check_env_reply_content(messages: list[dict]) -> None:
+    """Hold an ``env_reply`` to the narrower content rule the multi-turn rollout bridges enforce.
+
+    A content-block list is legitimate in an opening prompt and is why ``_check_messages`` permits
+    one, but a multi-turn rollout decodes its media once from that opening prompt and re-sends it
+    every turn. An image returned mid-episode therefore reaches the model as nothing at all, so both
+    bridges reject it and this gate must too.
+    """
+    for index, message in enumerate(messages):
+        if isinstance(message.get("content"), list):
+            raise ValueError(
+                f"env_reply is not well-formed: env_reply message {index} content is a "
+                "multimodal content-block list; multi-turn rollouts condition on the media "
+                "decoded from the opening prompt, so an image returned mid-episode is not "
+                "shown to the model. return text, or present every image in the opening prompt"
+            )
+
+
 def _check_messages(messages: object, label: str) -> list[dict]:
     """Validate that `messages` is a well-formed chat message list and return it."""
     if not isinstance(messages, list) or not messages:
@@ -286,6 +304,13 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
         # rollout, so validate their envelope here too: a malformed reply that would break
         # remotely must fail the episode instead of slipping through on a finite reward.
         _check_messages(env_msgs, "env_reply")
+        # and hold a reply to the NARROWER rule the rollout bridges enforce. `_check_messages`
+        # allows a content-block list because a multimodal opening PROMPT is legitimately one;
+        # a mid-episode reply is not, since the media a rollout conditions on is decoded once
+        # from that opening prompt. without this, an env that shows a new image each turn passes
+        # `flash env test` and then dies on the first paid rollout -- the gate exists to catch a
+        # contract break before a paid run does.
+        _check_env_reply_content(env_msgs)
         if env.rollout_done(state, max_turns=hard_cap):
             break
 

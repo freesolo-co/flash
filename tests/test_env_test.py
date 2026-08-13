@@ -215,6 +215,20 @@ class _MalformedReplyMultiTurnEnv(_MultiTurnEnv):
         return [reply]
 
 
+class _ImageReplyMultiTurnEnv(_MultiTurnEnv):
+    def env_reply(self, messages, state):
+        # an agentic env showing the model a NEW image each turn (a browser screenshot, a rendered
+        # board). the rollout re-sends only the media decoded from the opening prompt, so this
+        # image never reaches the model -- the gate must fail rather than send it to paid GPUs.
+        state["turn"] += 1
+        reply = {
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}],
+        }
+        messages.append(reply)
+        return [reply]
+
+
 def _environment_dir(tmp_path):
     env_dir = tmp_path / "local-env"
     env_dir.mkdir()
@@ -1109,6 +1123,22 @@ def test_env_test_multi_turn_malformed_env_reply_fails_contract(monkeypatch, tmp
     captured = capsys.readouterr()
     assert "0/1 episodes passed contract checks" in captured.out
     assert "env_reply is not well-formed" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_multi_turn_image_env_reply_fails_contract(monkeypatch, tmp_path, capsys):
+    # a content-block list is legitimate in an opening PROMPT, so the shared envelope check allows
+    # one. a mid-episode reply is different: the rollout condition on media decoded once from that
+    # opening prompt, so an image returned here is not shown to the model at all. this gate exists
+    # to catch a contract break before a paid run does, so it must fail rather than pass and then
+    # die on the first rollout.
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _ImageReplyMultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "0/1 episodes passed contract checks" in captured.out
+    assert "multimodal content-block list" in captured.err
     assert "overall: FAIL" in captured.err
 
 
