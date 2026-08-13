@@ -443,13 +443,8 @@ def cmd_train(args) -> int:
     # the warm-start context is resolved here too rather than read off the response: it is the part
     # that names WHICH context is being ignored, and moving the warning earlier without it would
     # trade the finding's headline scenario for the timing fix instead of getting both.
-    _print_rl_prompt_budget_warning(
-        {
-            "prompt_budget": rl_prompt_budget(
-                spec, warm_start_context=warmstart_source_context(client, spec)
-            )
-        }
-    )
+    local_budget = rl_prompt_budget(spec, warm_start_context=warmstart_source_context(client, spec))
+    _print_rl_prompt_budget_warning({"prompt_budget": local_budget})
     status = client.create_run(
         payload,
         runtime_secrets=runtime_secrets,
@@ -457,6 +452,19 @@ def cmd_train(args) -> int:
     )
     run_id = status["run_id"]
     _print_unpacked_batch_warning(status, spec)  # a real submit overrides batch_size the same way
+    # the cli reads the source run through GET /v1/runs/{id}, which is exact-key `owned_run`, while
+    # the server authorizes a warm start from any run in the submitter's org. so an org peer's
+    # source resolves server-side and not here, and only then does the response know a context the
+    # early warning could not. re-warn for exactly that case: it is late, but the alternative is
+    # that the org-shared warm start never learns which context it is ignoring. an owner-key submit
+    # already printed the full line above and takes this branch not at all.
+    served_budget = status.get("prompt_budget") if isinstance(status, dict) else {}
+    if not isinstance(served_budget, dict):
+        served_budget = {}
+    if served_budget.get("warm_start_context") and not (local_budget or {}).get(
+        "warm_start_context"
+    ):
+        _print_rl_prompt_budget_warning(status)
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,

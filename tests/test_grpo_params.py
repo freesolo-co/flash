@@ -985,3 +985,33 @@ def test_real_submit_names_the_warm_start_context_not_just_the_bare_budget() -> 
 
     body = getsource(commands_mod.cmd_train)
     assert "warm_start_context=warmstart_source_context(client, spec)" in body
+
+
+def test_org_peer_warm_start_recovers_the_context_the_cli_cannot_read() -> None:
+    """`GET /v1/runs/{id}` is exact-key `owned_run`, but the server authorizes a warm start from any
+    run in the submitter's org (`_warmstart_source_is_authorized`). So a teammate warm-starting from
+    an org peer's sft resolves server-side and NOT in the cli, and would see the source context in
+    --dry-run but lose it on a real submit -- the org-shared case never recovering the one sentence
+    that names what is being ignored.
+
+    The late re-warn is deliberately narrow: it fires only when the server knows a context the local
+    lookup did not. An owner-key submit already printed the full line before create_run and must not
+    print a second time, and a run with no warm start at all must not double-warn."""
+    from inspect import getsource
+
+    from flash.cli import commands as commands_mod
+
+    body = getsource(commands_mod.cmd_train)
+    guard = 'served_budget.get("warm_start_context") and not (local_budget or {}).get('
+    assert guard in body
+    # the re-warn must come AFTER create_run (it needs the response) while the primary warning
+    # stays before it -- otherwise this "fix" would quietly reintroduce the late-warning bug.
+    # anchored on the smallest string that encodes each invariant, so a reformat cannot fail this
+    # test in place of a real regression.
+    early = body.index("\n    _print_rl_prompt_budget_warning(")
+    submitted = body.index("\n    status = client.create_run(")
+    # searched FROM the submit: the dry-run branch earlier in this function contains a
+    # byte-identical `_print_rl_prompt_budget_warning(status)` line at the same indent, so a
+    # plain index() finds that one and would assert nothing about the re-warn.
+    late = body.index("_print_rl_prompt_budget_warning(status)", submitted)
+    assert early < submitted < late
