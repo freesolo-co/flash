@@ -167,8 +167,8 @@ def _build_trace_record(
     error: str | None,
     output_truncated: bool,
     usage: Any,
+    duration_ms: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    duration_ms = max(0, round((time.perf_counter() - context.started_at) * 1000))
     input_sanitization = _SanitizationFlag()
     output_sanitization = _SanitizationFlag()
     sanitized_output = _sanitize_for_trace(
@@ -216,6 +216,7 @@ def _store_trace_record(
     error: str | None,
     output_truncated: bool,
     usage: Any,
+    duration_ms: int,
 ) -> None:
     metadata, record = _build_trace_record(
         context,
@@ -223,6 +224,7 @@ def _store_trace_record(
         error=error,
         output_truncated=output_truncated,
         usage=usage,
+        duration_ms=duration_ms,
     )
     store_trace(
         key_id=context.key_id,
@@ -256,6 +258,7 @@ async def _record_trace(
 ) -> None:
     if not context.record_trace or context.project_id is None:
         return
+    duration_ms = max(0, round((time.perf_counter() - context.started_at) * 1000))
     try:
         await run_in_threadpool(
             _store_trace_record,
@@ -265,6 +268,7 @@ async def _record_trace(
             error=error,
             output_truncated=output_truncated,
             usage=usage,
+            duration_ms=duration_ms,
         )
     except Exception:
         # the provider call already happened and the caller was already billed, so failing the

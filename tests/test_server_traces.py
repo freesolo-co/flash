@@ -3906,6 +3906,35 @@ def test_bare_properties_with_custom_vocabulary_remains_instance_data() -> None:
     assert traces._redact_secret_fields(payload)["properties"]["password"] == "[redacted]"
 
 
+@pytest.mark.parametrize(
+    "wrapper",
+    ["schema", "parameters", "input_schema", "output_schema"],
+)
+def test_schema_wrapper_names_require_real_schema_evidence(wrapper: str) -> None:
+    instance = {wrapper: {"properties": {"password": {"type": "text", "value": "SECRET"}}}}
+    schema = {
+        wrapper: {
+            "type": "object",
+            "properties": {
+                "password": {
+                    "type": "string",
+                    "vendorKeyword": True,
+                    "default": "SECRET",
+                }
+            },
+        }
+    }
+
+    assert traces._redact_secret_fields(instance)[wrapper]["properties"]["password"] == (
+        "[redacted]"
+    )
+    assert traces._redact_secret_fields(schema)[wrapper]["properties"]["password"] == {
+        "type": "string",
+        "vendorKeyword": True,
+        "default": "[redacted]",
+    }
+
+
 def test_an_empty_schema_under_a_secret_name_survives_redaction(trace_api, monkeypatch) -> None:
     """`{}` is the permissive JSON Schema, so `{"password": {}}` is a declaration, not a secret.
     Replacing it with the string "[redacted]" turns a valid schema into an invalid one."""
@@ -5551,6 +5580,40 @@ async def test_trace_redaction_runs_in_the_worker_thread(tmp_path, monkeypatch) 
     assert all(thread_id != caller_thread for thread_id in redaction_threads)
 
 
+@pytest.mark.anyio
+async def test_trace_duration_excludes_threadpool_queue_delay(monkeypatch) -> None:
+    context = traces._UpstreamRequestContext(
+        url="https://api.openai.com/v1/chat/completions",
+        headers={},
+        body=_REQUEST,
+        provider="openai",
+        model="gpt-test",
+        key_id=1,
+        project_id=_PROJECT_ID,
+        metadata=None,
+        secrets=(),
+        started_at=100.0,
+        record_trace=True,
+    )
+    now = 100.125
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(traces.time, "perf_counter", lambda: now)
+    monkeypatch.setattr(traces, "store_trace", lambda **kwargs: captured.update(kwargs))
+
+    async def _delayed_dispatch(func, *args, **kwargs):
+        nonlocal now
+        now = 105.0
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(traces, "run_in_threadpool", _delayed_dispatch)
+
+    await traces._record_trace(context, output_payload=_RESPONSE, error=None)
+
+    span = captured["spans"][0]
+    assert span.duration_ms == 125
+
+
 def test_redaction_failure_does_not_break_the_relay(trace_api, monkeypatch) -> None:
     class _Untouched(dict):
         def items(self):
@@ -5732,6 +5795,31 @@ def test_a_streamed_recording_failure_preserves_the_done_event_structure(
         assert b"event: end\n\n" not in response.content
     else:
         assert response.content == completion + b": freesolo-record-failed\n\n" + terminator
+
+
+def test_a_streamed_recording_failure_preserves_a_split_event_prefix(
+    trace_api, monkeypatch
+) -> None:
+    completion = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}\n\n'
+    )
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody([completion, b"event: end", b"\ndata: [DONE]\n\n"])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+    monkeypatch.setattr(
+        traces,
+        "store_trace",
+        lambda **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+    )
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    expected = completion + b"event: end\n: freesolo-record-failed\ndata: [DONE]\n\n"
+    assert response.content == expected
+    assert b"event: end\n\n" not in response.content
 
 
 def test_a_streamed_recording_failure_arrives_before_the_split_terminator(

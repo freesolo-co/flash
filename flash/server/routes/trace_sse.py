@@ -72,6 +72,8 @@ class SseDoneGate:
             self._scan_start = next_cursor
             if continuing_partial_line:
                 forwarded.extend(self._buffer[:next_cursor])
+                if not self._event_in_progress:
+                    self._event_prefix_relayed = True
                 del self._buffer[:next_cursor]
                 self._line_start = 0
                 self._scan_start = 0

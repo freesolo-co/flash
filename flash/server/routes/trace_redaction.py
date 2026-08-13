@@ -216,6 +216,21 @@ def _is_unambiguous_schema_definition(value: Any) -> bool:
     )
 
 
+def _has_schema_wrapper_evidence(value: Any) -> bool:
+    if _has_schema_context(value):
+        return True
+    if not isinstance(value, dict):
+        return False
+    schema_type = value.get("type")
+    if isinstance(schema_type, str):
+        return schema_type in _JSON_SCHEMA_TYPES
+    return (
+        isinstance(schema_type, list)
+        and bool(schema_type)
+        and all(isinstance(item, str) and item in _JSON_SCHEMA_TYPES for item in schema_type)
+    )
+
+
 def _redact_schema_literal(value: Any, *, depth: int, flag: _SanitizationFlag | None = None) -> Any:
     if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
         if flag is not None:
@@ -485,7 +500,6 @@ def _redact_secret_fields(
     response_root: bool = False,
     choice_list: bool = False,
     choice: bool = False,
-    confirmed_schema: bool = False,
     logprobs: bool = False,
     logprob_entries: bool = False,
     function_arguments: bool = False,
@@ -532,7 +546,10 @@ def _redact_secret_fields(
                     or schema_property_map
                     or key in _JSON_SCHEMA_KEYWORDS
                 )
-                if key in _JSON_SCHEMA_WRAPPER_KEYS and _has_schema_context(item):
+                wrapper_has_schema = (
+                    key in _JSON_SCHEMA_WRAPPER_KEYS and _has_schema_wrapper_evidence(item)
+                )
+                if wrapper_has_schema:
                     child_schema_context = True
                 redacted[key] = _redact_secret_fields(
                     item,
@@ -550,9 +567,6 @@ def _redact_secret_fields(
                     response_root=False,
                     choice_list=response_root and key == "choices" and isinstance(item, list),
                     choice=choice_list,
-                    confirmed_schema=confirmed_schema
-                    or (key in _JSON_SCHEMA_WRAPPER_KEYS and isinstance(item, dict))
-                    or schema_property_map,
                     logprobs=choice and key == "logprobs" and isinstance(item, dict),
                     logprob_entries=logprob_entries
                     or (logprobs and key in {"content", "refusal", "top_logprobs"}),
@@ -561,7 +575,7 @@ def _redact_secret_fields(
                         key == "function_call" or (tool_call and key == "function")
                     ),
                     schema_wrapper=schema_wrapper
-                    or (key in _JSON_SCHEMA_WRAPPER_KEYS and isinstance(item, dict))
+                    or wrapper_has_schema
                     or (schema_context and key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS),
                     tool_call_list=key == "tool_calls" and isinstance(item, list),
                     secret_schema_refs=active_secret_schema_refs,
@@ -582,7 +596,6 @@ def _redact_secret_fields(
                 ),
                 secret_schema_property=secret_schema_property,
                 choice=choice_list,
-                confirmed_schema=confirmed_schema,
                 logprobs=logprobs,
                 logprob_entries=logprob_entries,
                 tool_call=tool_call_list,
