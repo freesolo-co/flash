@@ -120,7 +120,12 @@ class SseDoneGate:
                 self._scan_start = 0
                 self._partial_line_in_progress = True
             elif len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
-                self._settle_bounded_done()
+                forwarded.extend(self._buffer)
+                self._buffer.clear()
+                self._line_start = 0
+                self._scan_start = 0
+                self._partial_line_in_progress = True
+                self._holding_done_candidate = False
             else:
                 self._scan_start = _resume_scan_at(self._buffer)
             return [bytes(forwarded)] if forwarded else []
@@ -324,7 +329,7 @@ def _merge_fragment_dict(target: dict[str, Any], fragment: dict[str, Any]) -> No
 
 class SseAccumulator:
     def __init__(self, *, max_accumulated_bytes: int | None = None) -> None:
-        self._buffer = b""
+        self._buffer = bytearray()
         self._event_data: list[bytes] = []
         self._event_data_bytes = 0
         self._choices: dict[int, dict[str, Any]] = {}
@@ -348,23 +353,23 @@ class SseAccumulator:
     def feed(self, chunk: bytes) -> None:
         if self.truncated or self._done:
             return
-        self._buffer += chunk
+        self._buffer.extend(chunk)
         if self._at_stream_start:
             if len(self._buffer) < len(_UTF8_BOM) and _UTF8_BOM.startswith(self._buffer):
                 return
             self._at_stream_start = False
             if self._buffer.startswith(_UTF8_BOM):
-                self._buffer = self._buffer[len(_UTF8_BOM) :]
+                del self._buffer[: len(_UTF8_BOM)]
         while (line_end := _line_end(self._buffer, self._scan_start)) is not None:
             line, next_cursor = line_end
-            fragment = self._buffer[:line]
-            self._buffer = self._buffer[next_cursor:]
+            fragment = bytes(self._buffer[:line])
+            del self._buffer[:next_cursor]
             self._scan_start = 0
             if (
                 self._max_accumulated_bytes is not None
                 and len(fragment) > self._max_accumulated_bytes
             ):
-                self._buffer = b""
+                self._buffer.clear()
                 self._scan_start = 0
                 self.truncated = True
                 return
@@ -382,8 +387,8 @@ class SseAccumulator:
 
     def finish(self) -> None:
         if self._buffer:
-            self._consume_line(self._buffer.rstrip(b"\r"))
-            self._buffer = b""
+            self._consume_line(bytes(self._buffer).rstrip(b"\r"))
+            self._buffer.clear()
             self._scan_start = 0
         self._consume_event()
 

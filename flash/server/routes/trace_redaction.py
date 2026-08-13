@@ -45,6 +45,8 @@ _JSON_SCHEMA_STRUCTURAL_KEYWORDS = frozenset(
         "$anchor",
         "$dynamicRef",
         "$dynamicAnchor",
+        "$recursiveRef",
+        "$recursiveAnchor",
         "anyOf",
         "allOf",
         "oneOf",
@@ -99,7 +101,6 @@ _JSON_SCHEMA_ANNOTATION_KEYWORDS = frozenset(
     }
 )
 _JSON_SCHEMA_KEYWORDS = _JSON_SCHEMA_STRUCTURAL_KEYWORDS | _JSON_SCHEMA_ANNOTATION_KEYWORDS
-_JSON_SCHEMA_VALUE_KEYWORDS = frozenset({"default", "examples", "example"})
 _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS = frozenset(
     {"default", "const", "enum", "examples", "example"}
 )
@@ -131,9 +132,7 @@ def _is_schema_definition(value: Any) -> bool:
     keys = [key for key in value if not (isinstance(key, str) and key.startswith("x-"))]
     if any(key in _JSON_SCHEMA_STRUCTURAL_KEYWORDS for key in keys):
         return True
-    if any(key not in _JSON_SCHEMA_KEYWORDS for key in keys):
-        return False
-    return bool(keys) and all(key not in _JSON_SCHEMA_VALUE_KEYWORDS for key in keys)
+    return bool(keys) and all(key in _JSON_SCHEMA_KEYWORDS for key in keys)
 
 
 def _redact_schema_literal(value: Any, *, depth: int, flag: _SanitizationFlag | None = None) -> Any:
@@ -232,6 +231,8 @@ def _schema_anchor_pointers(value: Any, *, depth: int = 0) -> dict[str, frozense
                 anchor = node.get(keyword)
                 if isinstance(anchor, str):
                     anchors.setdefault(anchor, set()).add(path)
+            if node.get("$recursiveAnchor") is True:
+                anchors.setdefault("", set()).add(path)
             for key, item in node.items():
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                     collect(item, (*path, str(key)), depth + 1)
@@ -250,6 +251,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
     document_id = value.get("$id")
     base_uri = document_id if isinstance(document_id, str) else ""
     resources = _schema_resource_pointers(value, depth=depth)
+    resources.setdefault(_canonical_resource_uri(urldefrag(base_uri)[0]), ())
     resource_scopes = sorted(
         ((path, uri) for uri, path in resources.items()),
         key=lambda item: len(item[0]),
@@ -265,6 +267,10 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
             (uri for prefix, uri in resource_scopes if path[: len(prefix)] == prefix), base_uri
         )
 
+    def anchor_belongs_to_resource(pointer: tuple[str, ...], resource_uri: str) -> bool:
+        owner_uri = _canonical_resource_uri(urldefrag(scope_for(pointer))[0])
+        return owner_uri == _canonical_resource_uri(resource_uri)
+
     def collect_refs(
         node: Any, node_depth: int, path: tuple[str, ...], scope_uri: str
     ) -> set[tuple[str, ...]]:
@@ -275,22 +281,31 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
             resource_id = node.get("$id")
             if isinstance(resource_id, str):
                 scope_uri = urljoin(scope_uri, resource_id)
-            for keyword in ("$ref", "$dynamicRef"):
+            for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
                 ref = node.get(keyword)
                 if isinstance(ref, str):
                     resolved_base, fragment = urldefrag(urljoin(scope_uri, ref))
-                    resource_path = resources.get(_canonical_resource_uri(resolved_base))
+                    canonical_base = _canonical_resource_uri(resolved_base)
+                    resource_path = resources.get(canonical_base)
                     if resource_path is not None:
                         resource_ref = f"#{fragment}"
-                        pointers = _local_schema_pointer(resource_ref, anchors)
-                        if resource_ref == "#" or resource_ref.startswith("#/"):
-                            found.update((*resource_path, *pointer) for pointer in pointers)
-                        else:
+                        if keyword == "$recursiveRef" and resource_ref == "#":
+                            pointers = anchors.get("", frozenset({resource_path}))
                             found.update(
                                 pointer
                                 for pointer in pointers
-                                if pointer[: len(resource_path)] == resource_path
+                                if anchor_belongs_to_resource(pointer, canonical_base)
                             )
+                        else:
+                            pointers = _local_schema_pointer(resource_ref, anchors)
+                            if resource_ref == "#" or resource_ref.startswith("#/"):
+                                found.update((*resource_path, *pointer) for pointer in pointers)
+                            else:
+                                found.update(
+                                    pointer
+                                    for pointer in pointers
+                                    if anchor_belongs_to_resource(pointer, canonical_base)
+                                )
                     else:
                         found.update(_local_schema_pointer(ref, anchors, base_uri=scope_uri))
             for key, item in node.items():

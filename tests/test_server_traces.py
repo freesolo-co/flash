@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from collections.abc import AsyncIterator
 from typing import ClassVar
 
@@ -907,15 +908,18 @@ def test_done_gate_bounds_an_unterminated_done_candidate() -> None:
     assert b"".join(forwarded).startswith(b"data: [DONE]")
 
 
-def test_done_gate_bounds_an_unterminated_post_done_suffix() -> None:
+def test_done_gate_releases_an_unterminated_post_done_suffix() -> None:
     gate = trace_sse.SseDoneGate()
+    stream = b"data: [DONE]\n" + b"x" * 500_000
 
-    assert gate.feed(b"data: [DONE]\n") == []
+    relayed = gate.feed(b"data: [DONE]\n")
     for _ in range(5):
-        assert gate.feed(b"x" * 100_000) == []
+        relayed.extend(gate.feed(b"x" * 100_000))
+    relayed.extend(gate.finish())
 
-    assert gate.terminated is True
-    assert gate.done_event == b"data: [DONE]\n"
+    assert b"".join(relayed) == stream
+    assert gate.terminated is False
+    assert gate.done_event is None
     assert gate._buffer == b""
 
 
@@ -1045,6 +1049,22 @@ def test_done_gate_releases_oversized_closed_comment_before_later_data() -> None
     assert accumulator.defect == "stream contained an unparseable data event"
 
 
+def test_done_gate_releases_oversized_partial_comment_before_later_data() -> None:
+    first = b"data: [DONE]\n:" + b"x" * 1_224
+    suffix = b'\ndata: {"choices":[{"index":0,"delta":{"content":"AFTER"}}]}\n\ndata: [DONE]\n\n'
+    stream = first + suffix
+    gate = trace_sse.SseDoneGate()
+
+    relayed = gate.feed(first)
+    relayed.extend(gate.feed(suffix))
+    relayed.extend(gate.finish())
+
+    assert b"".join(relayed) + (gate.done_event or b"") == stream
+    assert b"AFTER" in b"".join(relayed)
+    assert gate.done_event == b"data: [DONE]\n\n"
+    assert gate.terminated is True
+
+
 def test_accumulator_marks_a_multiline_leading_done_event_unparseable() -> None:
     event = b'data: [DONE]\ndata: {"choices":[{"index":0,"delta":{"content":"X"}}]}\n\n'
     accumulator = trace_sse.SseAccumulator()
@@ -1068,14 +1088,17 @@ def test_accumulator_handles_two_done_lines_in_one_event() -> None:
     assert accumulator.defect == "stream contained an unparseable data event"
 
 
-def test_done_gate_bounds_a_newline_free_non_data_suffix() -> None:
+def test_done_gate_releases_a_newline_free_non_data_suffix() -> None:
     gate = trace_sse.SseDoneGate()
+    stream = b"data: [DONE]\n:" + b"k" * 5_000
 
-    assert gate.feed(b"data: [DONE]\n") == []
-    assert gate.feed(b":" + b"k" * 5_000) == []
+    relayed = gate.feed(b"data: [DONE]\n")
+    relayed.extend(gate.feed(b":" + b"k" * 5_000))
+    relayed.extend(gate.finish())
 
-    assert gate.terminated is True
-    assert gate.done_event == b"data: [DONE]\n"
+    assert b"".join(relayed) == stream
+    assert gate.terminated is False
+    assert gate.done_event is None
     assert gate._buffer == b""
 
 
@@ -1409,6 +1432,27 @@ def test_unterminated_sse_line_is_bounded_by_the_accumulation_budget() -> None:
 
     assert accumulator.truncated is True
     assert accumulator._buffer == b""
+
+
+@pytest.mark.wallclock
+def test_sse_accumulator_bytearray_feed_cost_stays_near_linear() -> None:
+    def elapsed(feeds: int) -> float:
+        best = float("inf")
+        for _ in range(3):
+            accumulator = trace_sse.SseAccumulator()
+            started = time.perf_counter()
+            for _ in range(feeds):
+                accumulator.feed(b"x")
+            best = min(best, time.perf_counter() - started)
+        return best
+
+    accumulator = trace_sse.SseAccumulator()
+    assert isinstance(accumulator._buffer, bytearray)
+
+    small = elapsed(40_000)
+    large = elapsed(160_000)
+
+    assert large / 160_000 < (small / 40_000) * 4
 
 
 def test_unterminated_sse_line_scans_each_byte_once(monkeypatch) -> None:
@@ -3727,6 +3771,24 @@ def test_an_empty_schema_under_a_secret_name_survives_redaction(trace_api, monke
     assert stored["tools"][0]["function"]["parameters"]["properties"]["password"] == {}
 
 
+@pytest.mark.parametrize("keyword", ["default", "examples", "example"])
+def test_annotation_only_secret_named_schema_stays_schema_shaped(keyword: str) -> None:
+    literal = ["SECRET"] if keyword == "examples" else "SECRET"
+    schema = {
+        "properties": {
+            "password": {keyword: literal},
+        },
+        "metadata": {"password": {keyword: literal}},
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["properties"]["password"] == {
+        keyword: ["[redacted]"] if keyword == "examples" else "[redacted]"
+    }
+    assert stored["metadata"]["password"] == "[redacted]"
+
+
 def test_secret_named_schema_literals_are_redacted_without_losing_structure(
     trace_api, monkeypatch
 ) -> None:
@@ -4184,6 +4246,22 @@ def test_secret_schema_anchor_ref_literals_are_redacted_transitively(
     assert definitions["Dynamic"]["default"] == "[redacted]"
 
 
+def test_secret_schema_recursive_ref_redacts_recursive_anchor_root() -> None:
+    schema = {
+        "$recursiveAnchor": True,
+        "type": "object",
+        "default": "SECRET-ROOT",
+        "properties": {"password": {"$recursiveRef": "#"}},
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert "$recursiveRef" in trace_redaction._JSON_SCHEMA_STRUCTURAL_KEYWORDS
+    assert "$recursiveAnchor" in trace_redaction._JSON_SCHEMA_STRUCTURAL_KEYWORDS
+    assert stored["default"] == "[redacted]"
+    assert stored["properties"]["password"] == {"$recursiveRef": "#"}
+
+
 def test_secret_schema_dynamic_ref_literals_are_redacted(trace_api, monkeypatch) -> None:
     schema = {
         "type": "object",
@@ -4579,6 +4657,25 @@ def test_embedded_resource_anchor_refs_redact_only_the_selected_resource() -> No
 
     assert definitions["A"]["$defs"]["W"]["default"] == "[redacted]"
     assert definitions["B"]["$defs"]["W"]["default"] == "PUBLIC-IN-B"
+
+
+def test_resource_anchor_does_not_match_anchor_in_embedded_child_resource() -> None:
+    schema = {
+        "$id": "https://example.com/root",
+        "properties": {"password": {"$ref": "#Cred"}},
+        "$defs": {
+            "Child": {
+                "$id": "https://example.com/child",
+                "$defs": {
+                    "C": {"$anchor": "Cred", "default": "CHILD-PUBLIC"},
+                },
+            }
+        },
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["$defs"]["Child"]["$defs"]["C"]["default"] == "CHILD-PUBLIC"
 
 
 def test_document_local_anchor_ref_still_redacts() -> None:
