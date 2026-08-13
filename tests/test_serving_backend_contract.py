@@ -4402,3 +4402,125 @@ def test_a_lock_conflict_while_marking_does_not_fail_the_undeploy(client, monkey
         "the failed mark also skipped the reclaim append, so the download is stranded even though "
         "the two recoveries are independent"
     )
+
+
+def test_a_retry_whose_eviction_fails_keeps_the_claim_marker_alive(client):
+    """`unregister` answering 200 is not proof the claim was released.
+
+    It returns `ok` on paths that deliberately KEEP the claim: a `remove_lora` that failed leaves
+    the LoRA resident, and releasing without a confirmed eviction is the wrong-run's-weights
+    outcome the claim exists to prevent. Clearing `lora_release_pending` on "the rpc returned"
+    therefore destroyed the recovery on exactly the retry it exists for -- the marker vanished
+    while the claim stayed held, and no later undeploy re-dispatched anything.
+    """
+    module = client.app.state.generated_module
+    run_id = "retry-evict-fails"
+    revision = f"{run_id}@final." + "7" * 40
+    int_id = module._lora_int_id(revision)
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "revision", "lifecycle_state": "ready"},
+    }
+    module.adapter_records[module._record_key(run_id)] = {
+        "adapter_id": run_id,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "alias", "alias_of": revision},
+    }
+    module.adapter_records[module._members_key(run_id)] = [run_id, revision]
+    module.adapter_records[module._lora_id_key(int_id)] = revision
+    module.runners.count = 1
+
+    async def _rpc_dies(adapter_id):
+        raise RuntimeError("connection reset mid unregister")
+
+    module.engine_methods["unregister"] = _rpc_dies
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+    record = module.adapter_records[module._record_key(revision)]
+    assert (record.get("metadata") or {}).get("lora_release_pending"), (
+        "precondition: the dead rpc must leave the claim marked for a later retry"
+    )
+
+    # The retry: the RPC completes, but its eviction fails, so the claim is deliberately kept.
+    # This is `unregister`'s real shape for that case -- ok, and the claim still held.
+    async def _rpc_ok_but_eviction_failed(adapter_id):
+        return {"ok": True, "claim_settled": False}
+
+    module.engine_methods["unregister"] = _rpc_ok_but_eviction_failed
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+
+    record = module.adapter_records[module._record_key(revision)]
+    assert (record.get("metadata") or {}).get("lora_release_pending"), (
+        "a retry whose eviction failed cleared the marker anyway, so the claim is still held with "
+        "nothing left that would ever retry it -- a colliding adapter is refused for the life of "
+        "the app"
+    )
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) == revision, (
+        "precondition: the failed eviction must still be holding the claim"
+    )
+
+    # A third undeploy, with a healthy engine, must still find and finish it.
+    dispatched: list[str] = []
+
+    async def _rpc_works(adapter_id):
+        dispatched.append(adapter_id)
+        await module._release_lora_int_id(module._lora_int_id(adapter_id), adapter_id)
+        return {"ok": True, "claim_settled": True}
+
+    module.engine_methods["unregister"] = _rpc_works
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+
+    assert revision in dispatched, (
+        "the third undeploy never re-dispatched the eviction, so the marker had already been lost"
+    )
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) is None, (
+        "the claim is still held after a healthy undeploy finally ran"
+    )
+    record = module.adapter_records[module._record_key(revision)]
+    assert not (record.get("metadata") or {}).get("lora_release_pending"), (
+        "the marker survived a settled claim, so every later delete re-dispatches eviction work "
+        "with nothing left to free"
+    )
+
+
+def test_a_cold_release_of_a_stranded_claim_clears_its_marker(client):
+    """The cold branch releases the claim, so it owes the same clear the warm branch does.
+
+    A `restranded` revision reaches the cold path carrying `lora_release_pending`, and
+    `_release_lora_int_id` there is exactly the recovery the marker was asking for. Leaving it set
+    made every later DELETE re-queue the revision for a reclaim and an eviction with nothing left
+    to free -- the mirror of clearing it when the claim is still held.
+    """
+    module = client.app.state.generated_module
+    run_id = "cold-clears-marker"
+    revision = f"{run_id}@final." + "8" * 40
+    int_id = module._lora_int_id(revision)
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "disabled",
+        "metadata": {
+            "run_id": run_id,
+            "record_type": "revision",
+            "lifecycle_state": "disabled",
+            "lora_release_pending": True,
+        },
+    }
+    module.adapter_records[module._record_key(run_id)] = {
+        "adapter_id": run_id,
+        "status": "disabled",
+        "metadata": {"run_id": run_id, "record_type": "alias", "alias_of": revision},
+    }
+    module.adapter_records[module._members_key(run_id)] = [run_id, revision]
+    module.adapter_records[module._lora_id_key(int_id)] = revision
+    module.runners.count = 0  # cold, so the release branch is the one that runs
+
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) is None, (
+        "the cold branch did not release the stranded claim it was re-dispatched for"
+    )
+    record = module.adapter_records[module._record_key(revision)]
+    assert not (record.get("metadata") or {}).get("lora_release_pending"), (
+        "the cold release left the marker set, so every later delete re-queues this revision for "
+        "an eviction and a reclaim that have nothing left to do"
+    )

@@ -949,7 +949,14 @@ class Engine:
             # and only once the eviction is confirmed.
             current = await adapter_records.get.aio(_record_key(adapter_id))
             if isinstance(current, dict) and current.get("status") != "disabled":
-                return {{"ok": True}}
+                # `claim_settled` because the revision came BACK: the claim is legitimately held by
+                # the new registration, so there is nothing stranded for a later undeploy to
+                # retry. Reporting otherwise would leave a marker on a live revision.
+                return {{"ok": True, "claim_settled": True}}
+            # Whether this call leaves the durable claim in a state nothing has to revisit. False
+            # only when the claim is still held BY THIS REVISION and no eviction confirmed it --
+            # the one case a later undeploy must re-dispatch.
+            claim_settled = True
             if await _owns_lora_int_id(int_id, adapter_id):
                 # Drop it from vLLM too, not just from this dict. The LoRA cache is bounded by
                 # max_loras, so repeated deploy/undeploy cycles would otherwise keep disabled
@@ -980,6 +987,13 @@ class Engine:
                     self._loaded.pop(adapter_id, None)
                     self._int_ids.pop(int_id, None)
                     await _release_lora_int_id(int_id, adapter_id)
+                else:
+                    # The claim is deliberately KEPT here (releasing without a confirmed eviction
+                    # is the wrong-run's-weights outcome), so this call did not settle it. Saying
+                    # so is what lets undeploy tell "the rpc returned" apart from "the claim is
+                    # dealt with" -- clearing the marker on the former destroyed the recovery on
+                    # exactly the retry it exists for.
+                    claim_settled = False
             # Suppressed HERE, not inside the helper: this is the eviction path, whose contract is
             # that it never fails an undeploy. But suppressing is not the same as forgetting -- a
             # failed `rmtree` leaves the download on the volume, and by this point the record is
@@ -992,7 +1006,7 @@ class Engine:
                 # The same marker the cold path uses, so the next undeploy of this run collects it.
                 with contextlib.suppress(Exception):  # marking is itself best effort
                     await _mark_cache_reclaim_pending(adapter_id)
-        return {{"ok": True}}
+        return {{"ok": True, "claim_settled": claim_settled}}
 
     @modal.method()
     async def discard_cache(self, adapter_id: str) -> dict[str, Any]:
@@ -1897,6 +1911,11 @@ def api():
         # of paid GPU time against the 30-minute request timeout, to remove an adapter that is not
         # loaded anywhere. A container that starts later loads from the durable records, which are
         # already `disabled`, so it never brings the adapter back.
+        # Revisions whose stranded claim this call actually settled, cleared AFTER the run lock is
+        # released. `_clear_lora_release_pending` takes that same lock, and `_run_lock` is not
+        # reentrant -- a nested acquire waits on a lease this very call holds and 409s at the
+        # deadline -- so the cold branch records here and clears below.
+        cleared: list[str] = []
         # `restranded` joins the dispatch: those are revisions an EARLIER undeploy disabled but
         # could not finish evicting, so they carry a marker and still hold their claim. They are
         # not in `disabled_revisions` -- that list holds only what THIS pass transitioned -- so
@@ -1905,7 +1924,7 @@ def api():
         if evictable and await _engine_is_warm():
             for revision_id in evictable:
                 try:
-                    await engine.unregister.remote.aio(revision_id)
+                    result = await engine.unregister.remote.aio(revision_id)
                 except Exception:  # gpu eviction is best effort, never fails an undeploy
                     # But best effort is not the same as forgotten. `Engine.unregister` is what
                     # releases the durable claim and reclaims the download, and this revision is
@@ -1942,13 +1961,21 @@ def api():
                     if revision_id not in reclaimable:
                         reclaimable.append(revision_id)
                 else:
-                    # Cleared only on a round trip that actually returned. `unregister` releases
-                    # the claim when it owns it and is a no-op when it does not, so either way
-                    # there is nothing left for a later undeploy to retry -- and leaving the marker
-                    # would make every subsequent DELETE re-dispatch an eviction for a revision
-                    # that is already done with.
-                    with contextlib.suppress(Exception):
-                        await _clear_lora_release_pending(revision_id)
+                    # Cleared on what the call REPORTS, not on the fact that it returned.
+                    # `unregister` answers 200 on paths that deliberately keep the claim -- a
+                    # `remove_lora` that failed leaves the LoRA resident, and releasing without a
+                    # confirmed eviction is the wrong-run's-weights outcome the claim prevents. So
+                    # "the rpc returned" and "the claim is dealt with" are different facts, and
+                    # clearing on the former destroyed the recovery on exactly the retry it exists
+                    # for: the marker vanished while the claim stayed held, and no later undeploy
+                    # re-dispatched anything.
+                    #
+                    # `claim_settled` is the fact itself, computed where the decision is made.
+                    # Absent (an older container mid-rollout) is read as settled, matching the
+                    # previous behavior rather than marking every revision forever.
+                    if not isinstance(result, dict) or result.get("claim_settled", True):
+                        with contextlib.suppress(Exception):
+                            await _clear_lora_release_pending(revision_id)
         else:
             # The COLD counterpart, and it is not optional. `Engine.unregister` is the only
             # successful-undeploy path that releases the durable `loraid:` claim, so skipping it
@@ -2005,6 +2032,17 @@ def api():
                         if isinstance(current, dict) and current.get("status") != "disabled":
                             continue  # revived under this lock's protection; its claim is not ours
                         await _release_lora_int_id(_lora_int_id(revision_id), revision_id)
+                        # CLEARED here too, the mirror of the warm branch. A `restranded` revision
+                        # reaches this path carrying `lora_release_pending`, and the release above
+                        # is exactly the recovery the marker was asking for -- so leaving it set
+                        # made every later DELETE re-queue the revision for a reclaim and an
+                        # eviction with nothing left to free. Inside the suppress and after the
+                        # release, so a failed release keeps the marker and the retry stays alive.
+                        cleared.append(revision_id)
+        # Outside the lock, for the reentrancy reason above.
+        for revision_id in cleared:
+            with contextlib.suppress(Exception):
+                await _clear_lora_release_pending(revision_id)
         # The deferred reclaims, run whether or not anything is warm. Unlike eviction, this has no
         # cheaper time to happen: undeploy is the last event in the run's life, so skipping here
         # leaves the directory on the volume for good. It is also bounded -- one `rmtree` per
