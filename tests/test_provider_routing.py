@@ -918,7 +918,7 @@ def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_clas
     re-select the same unavailable class and burn another full capacity grace on it -- five times,
     at 900s each, for up to 75 minutes of wall clock with every attempt guaranteed to fail for the
     reason the last one did. `no_capacity` is a verdict about the CLASS, not the host, so once the
-    same shape has refused TWICE the market has answered: stop and name the fix.
+    shape the retry would land on has refused TWICE the market has answered: stop and name the fix.
 
     Two, not one: `no_capacity` also covers a transient search flake and an exhausted provider pool,
     and a dry market frees cards, so the second refusal is what separates a blip from a wall (see
@@ -958,7 +958,7 @@ def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_clas
     out = log.getvalue()
     assert "walking past the cheapest class" not in out
     # and the operator is pointed at the two things that actually widen the search.
-    assert "every GPU class this run can use is out of capacity" in out
+    assert "has already refused capacity twice" in out
     assert "drop the gpu.type pin" in out
     assert 'type = ["A100 PCIe", "A100 SXM"]' in out
 
@@ -1013,16 +1013,19 @@ def test_ordered_gpu_pin_walks_to_its_fallback_when_the_first_class_is_dry(orch,
     assert metrics["train_tokens"] == 4096
     # the dry class is not re-asked; the named alternative is where the retry lands.
     assert submitted_gpus == ["A100 PCIe", "A100 SXM"]
-    assert "every GPU class this run can use is out of capacity" not in log.getvalue()
+    assert "has already refused capacity twice" not in log.getvalue()
 
 
-def test_every_named_class_gets_its_own_confirming_retry(orch, monkeypatch):
-    """The two-refusal margin is per CLASS, so no class is written off on a single refusal.
+def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch, monkeypatch):
+    """The stop must fire for a MULTI-class pin, which is the case this feature creates.
 
-    Walking an ordered pin of A then B, the sequence "A refused, B refused, A refused" leaves B
-    asked exactly once. Tracking mere membership ("has this shape ever refused?") would call that
-    exhaustion and end the run on a class that never got its confirming look -- reintroducing, for
-    multi-class pins, exactly the transient-shortage failure the margin exists to prevent."""
+    The trap is that the picker never walks back to a dearer tried class: `_select_candidate`
+    prefers an untried shape once, then falls back to cheapest-per-step, so a dry ordered pin of
+    PCIe ($1.19) and SXM ($1.89) walks PCIe, SXM, PCIe, PCIe, PCIe... Asking "have ALL classes
+    refused twice?" therefore never becomes true -- SXM is stranded at one refusal forever -- and
+    the stop is inert for exactly the pins the ordered list exists to create, leaving the 75-minute
+    loop this PR removes. Asking it of the class the retry WOULD pick is the question that decides
+    the next attempt, and it fires on the third submission here."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -1041,11 +1044,63 @@ def test_every_named_class_gets_its_own_confirming_retry(orch, monkeypatch):
     def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         submitted_gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
-        # three refusals, then capacity returns. the third is PCIe's second, which under
-        # set-membership tracking would have read as "every class has refused" and ended the run.
-        if len(submitted_gpus) <= 3:
-            return PollResult(False, failure="no_capacity", detail="dry")
-        return PollResult(True, metrics={"train_tokens": 4096})
+        return PollResult(False, failure="no_capacity", detail="dry")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(
+        run_id="flash-ordered-pin-stop",
+        type="A100 PCIe",
+        type_fallbacks=("A100 SXM",),
+        max_retries=5,
+    )
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, log)
+
+    # PCIe, SXM, then PCIe again -- and there it stops, because that third submission is PCIe's
+    # second refusal and PCIe is where the retry keeps landing. Not the budget's five: the two
+    # attempts saved are 900s of capacity grace each. Every named class still got a look first,
+    # which is what separates this from writing a run off on one refusal.
+    assert submitted_gpus == ["A100 PCIe", "A100 SXM", "A100 PCIe"]
+    out = log.getvalue()
+    assert "has already refused capacity twice" in out
+    assert "drop the gpu.type pin" in out
+
+
+def test_a_named_alternative_still_gets_its_own_look_after_the_first_class_refuses(
+    orch, monkeypatch
+):
+    """Refusals are a per-shape TALLY, not a set of names, and this is what that buys.
+
+    Track mere membership ("has this shape refused at all?") and the run dies at two submissions:
+    PCIe refuses, SXM refuses, the retry projects back onto PCIe, PCIe is on the list, stop. Both
+    classes would have been written off on a single refusal each -- the momentary-shortage defect,
+    just spread across two classes instead of one. The tally instead requires the class the retry
+    lands on to refuse TWICE, so the run makes a third submission. Here PCIe is dry once and
+    rentable on that second look, which is ordinary market behaviour and must not be fatal."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("runpod", "A100 PCIe", 1.19, 80),
+        Candidate("runpod", "A100 SXM", 1.89, 80),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
+
+    submitted_gpus = []
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        # both classes dry on their first look; PCIe rentable when the retry returns to it.
+        if run_spec.gpu.type == "A100 PCIe" and submitted_gpus.count("A100 PCIe") > 1:
+            return PollResult(True, metrics={"train_tokens": 4096})
+        return PollResult(False, failure="no_capacity", detail="dry")
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     spec = _spec(
@@ -1058,12 +1113,11 @@ def test_every_named_class_gets_its_own_confirming_retry(orch, monkeypatch):
     log = io.StringIO()
     metrics = orch._submit_seed_supervised(spec, spec.seed, log)
 
+    # three submissions, not the two a membership set would have allowed: the run survives one
+    # refusal from each class and rents PCIe on the look the tally kept alive.
     assert metrics["train_tokens"] == 4096
-    # PCIe, SXM, PCIe -- and then a FOURTH attempt, which membership tracking would have refused to
-    # make. Which class the picker returns to is its own cheapest-first business (SXM is dearer, so
-    # it clamps back to PCIe); what this pins down is that the run was still alive to make the call.
-    assert submitted_gpus == ["A100 PCIe", "A100 SXM", "A100 PCIe", "A100 PCIe"]
-    assert "every GPU class this run can use is out of capacity" not in log.getvalue()
+    assert submitted_gpus == ["A100 PCIe", "A100 SXM", "A100 PCIe"]
+    assert "has already refused capacity twice" not in log.getvalue()
 
 
 def test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up(orch, monkeypatch):
@@ -1100,7 +1154,7 @@ def test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up(orch, monkey
 
     assert metrics["train_tokens"] == 4096
     assert submitted_gpus == ["H200", "H200"], "the blip must cost a retry, not the run"
-    assert "every GPU class this run can use is out of capacity" not in log.getvalue()
+    assert "has already refused capacity twice" not in log.getvalue()
 
 
 def test_pinned_gpu_still_retries_a_stall_on_the_same_class(orch, monkeypatch):
@@ -1136,7 +1190,7 @@ def test_pinned_gpu_still_retries_a_stall_on_the_same_class(orch, monkeypatch):
     out = log.getvalue()
     assert "no untried class left; re-selecting H200" in out
     assert "gpu.type is pinned" in out
-    assert "every GPU class this run can use is out of capacity" not in out
+    assert "has already refused capacity twice" not in out
 
 
 def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monkeypatch):

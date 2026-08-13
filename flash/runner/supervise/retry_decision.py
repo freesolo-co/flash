@@ -45,10 +45,21 @@ _REFUSALS_BEFORE_GIVING_UP = 2
 
 # what the log says INSTEAD of naming a retry target, when the run stops on exhausted capacity.
 # it names the things that actually change the outcome, because waiting is not one of them.
+#
+# worded off exactly what the stop establishes, which is narrower than it first looks. NOT "every
+# class refused twice": over an ordered pin the walk is A, B, A, so A has refused twice and B once.
+# and NOT "every fitting class was tried" either -- key 1 of `_select_candidate` sorts on failed
+# provider BEFORE key 2 sorts on untried, so with an untried class stranded on an already-failed
+# provider the picker returns to a tried shape on a healthy one (probed exhaustively: 266 such
+# states over a 2-provider, 3-class candidate set). the one thing true in every case is that the
+# class this retry would land on has already refused twice. say that, and let the remedies cover
+# the rest -- overclaiming here would misdescribe the run in its own failure line, which is the
+# same defect as the docstring this change corrects.
 _EXHAUSTED_CAPACITY_ACTION = (
-    "not retrying: every GPU class this run can use is out of capacity, and each has now refused "
-    "twice, so re-queueing would fail the same way. Widen the search — drop the gpu.type pin, "
-    'name alternatives (type = ["A100 PCIe", "A100 SXM"]), or drop gpu.provider'
+    "not retrying: the GPU class this retry would return to has already refused capacity twice, "
+    "and no better class is left to fail over to, so re-queueing would fail the same way. Widen "
+    'the search -- drop the gpu.type pin, name alternatives (type = ["A100 PCIe", "A100 SXM"]), '
+    "or drop gpu.provider"
 )
 
 
@@ -58,7 +69,7 @@ def _capacity_exhausted(
     *,
     first_cache_drop: bool,
 ) -> bool:
-    """Whether a retry would re-ask a question every fitting shape has ALREADY refused twice.
+    """Whether a retry would re-ask a question the class it lands on has ALREADY refused twice.
 
     A ``no_capacity`` verdict is about the CLASS, not the host: unlike a stall or a preemption, which
     a fresh box can clear, re-submitting to a shape the provider refuses asks the identical question
@@ -71,14 +82,23 @@ def _capacity_exhausted(
     while the same shape refusing twice is the pattern that no amount of re-queueing fixes.
 
     Counted PER SHAPE, which is the whole reason this is a tally and not a set of names. Over an
-    ordered pin of A and B, "A refused, B refused, A refused" puts both shapes on a membership list
-    while B has been asked exactly once -- ending the run on a class that never got its confirming
-    look, which is the transient-shortage failure this margin exists to prevent.
+    ordered pin of A and B, "A refused, B refused" puts both shapes on a membership list after a
+    single refusal each, so the retry projecting back onto A would stop there -- writing off two
+    classes on one refusal apiece, which is the transient-shortage failure the margin prevents.
 
-    Deliberately narrow beyond that. It fires only when every fitting shape is in that state and no
-    cache-less retry is left to change the search: those retries are not repeats, because dropping
-    the shared weight cache lifts the volume's datacenter restriction and reaches hosts the cached
-    attempt could not. Every other infra failure keeps its full retry budget.
+    Asked of the shape the retry WOULD pick, not of every candidate. "Have they all refused twice?"
+    reads like the safer question and is in fact unreachable: ``_select_candidate`` prefers an
+    untried shape once, then falls back to the allocator's cheapest-per-step order, so it clamps
+    onto the cheapest class and never returns to a dearer one it has already tried. Over a dry
+    ordered pin the walk is A, B, A, A, A... -- B is stuck at one refusal forever, the all() never
+    becomes true, and the stop is inert for exactly the multi-class pins this feature exists to
+    create. Reading the projection instead asks the only question that decides the next attempt:
+    is the class we are about to re-submit to one that has already refused twice?
+
+    Deliberately narrow beyond that. It fires only when no cache-less retry is left to change the
+    search: those retries are not repeats, because dropping the shared weight cache lifts the
+    volume's datacenter restriction and reaches hosts the cached attempt could not. Every other
+    infra failure keeps its full retry budget.
     """
     if outcome.result.failure != "no_capacity" or first_cache_drop:
         return False
@@ -89,10 +109,17 @@ def _capacity_exhausted(
     refusals = dict(ctx.capacity_refusals)
     chosen_key = _lifecycle._shape_key(outcome.chosen)
     refusals[chosen_key] = refusals.get(chosen_key, 0) + 1
-    return all(
-        refusals.get(_lifecycle._shape_key(candidate), 0) >= _REFUSALS_BEFORE_GIVING_UP
-        for candidate in outcome.candidates
+    # the same projection the log line reads, so the decision and its explanation cannot disagree.
+    projected = _lifecycle._projected_retry_class(
+        outcome.candidates,
+        ctx.failed_providers,
+        ctx.tried_classes,
+        outcome.chosen,
+        cache_drop=False,
     )
+    if projected is None:
+        return False
+    return refusals.get(_lifecycle._shape_key(projected), 0) >= _REFUSALS_BEFORE_GIVING_UP
 
 
 def _retry_target(
