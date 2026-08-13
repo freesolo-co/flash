@@ -1972,7 +1972,7 @@ def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     assert tail.tail() == ["filler-68", "filler-69", "filler-70"]
 
 
-def test_stall_tail_fields_reports_only_before_the_first_step():
+def test_stall_tail_fields_gates_lines_but_not_silence_after_the_first_step():
     tail = vc.ChildOutputTail()
     tail.record("ray: placement group pending\n")
 
@@ -1980,16 +1980,110 @@ def test_stall_tail_fields_reports_only_before_the_first_step():
     fields = vc.stall_tail_fields(0, tail)
     assert fields == {"child_tail": ["ray: placement group pending"]}
 
-    # once training progresses the step/loss stream is the diagnostic; the tail would be pure
-    # payload bloat on every tick.
-    assert vc.stall_tail_fields(1, tail) == {}
-    assert vc.stall_tail_fields(500, tail) == {}
+    # once training progresses the step/loss stream is the diagnostic, so the retained lines stay
+    # gated. the cheap counter must still be published because mid-training silence is the wedge.
+    assert vc.stall_tail_fields(1, tail, silent_ticks=7) == {"child_tail_silent_ticks": 7}
+    assert vc.stall_tail_fields(500, tail, silent_ticks=8) == {"child_tail_silent_ticks": 8}
 
 
 def test_stall_tail_fields_is_empty_when_the_child_has_said_nothing():
     # an empty key would claim the child spoke and said nothing, which is a different fact from
     # "the child has produced no output at all".
     assert vc.stall_tail_fields(0, vc.ChildOutputTail()) == {}
+
+
+def _bound_silence_watchdog(tail, *, tick_s=30.0, parent_activity=None):
+    watchdog = vc.VerlChildSilenceWatchdog(tail, tick_s=tick_s, parent_activity=parent_activity)
+    torn_down = []
+    watchdog.bind_process(teardown=lambda: torn_down.append(True), is_running=lambda: True)
+    return watchdog, torn_down
+
+
+def test_verl_child_silence_watchdog_tears_down_and_raises_at_the_threshold():
+    tail = vc.ChildOutputTail()
+    tail.record("step: 1\n")
+    watchdog, torn_down = _bound_silence_watchdog(tail)
+
+    assert watchdog.observe(1) == 0
+    for _ in range(120):
+        watchdog.observe(1)
+
+    assert torn_down == [True]
+    with pytest.raises(RuntimeError, match="no output for 3600s while training was running"):
+        watchdog.raise_if_failed()
+
+
+def test_run_verl_training_tears_down_a_silent_child_and_raises_the_named_failure():
+    tail = vc.ChildOutputTail()
+    watchdog = vc.VerlChildSilenceWatchdog(tail, tick_s=3600.0)
+
+    def trip_after_first_output():
+        deadline = time.monotonic() + 5.0
+        while tail.written == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert tail.written > 0
+        assert watchdog.observe(1) == 0
+        assert watchdog.observe(1) == 1
+
+    observer = threading.Thread(target=trip_after_first_output)
+    observer.start()
+    try:
+        with pytest.raises(RuntimeError, match="no output for 3600s while training was running"):
+            vc.run_verl_training(
+                ["bash", "-c", "echo 'step: 1'; sleep 30"],
+                env=dict(os.environ),
+                tail=tail,
+                silence_watchdog=watchdog,
+            )
+    finally:
+        observer.join(timeout=5.0)
+    assert not observer.is_alive()
+
+
+def test_verl_child_silence_watchdog_resets_on_parent_activity_and_probe_failure_counts():
+    tail = vc.ChildOutputTail()
+    tail.record("step: 1\n")
+    activity = [9]
+
+    def parent_activity():
+        value = activity[0]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    watchdog, torn_down = _bound_silence_watchdog(tail, parent_activity=parent_activity)
+    assert watchdog.observe(1) == 0
+    assert watchdog.observe(1) == 1
+    activity[0] = 10
+    assert watchdog.observe(1) == 0
+    activity[0] = RuntimeError("bridge shutting down")
+    assert watchdog.observe(1) == 1
+    assert torn_down == []
+
+
+def test_verl_child_silence_watchdog_resets_when_the_child_keeps_talking():
+    tail = vc.ChildOutputTail()
+    watchdog, torn_down = _bound_silence_watchdog(tail)
+
+    for tick in range(240):
+        tail.record(f"working-{tick}\n")
+        assert watchdog.observe(7) == 0
+
+    watchdog.raise_if_failed()
+    assert torn_down == []
+
+
+def test_verl_child_silence_watchdog_allows_long_silence_below_the_threshold():
+    tail = vc.ChildOutputTail()
+    tail.record("step: 1\n")
+    watchdog, torn_down = _bound_silence_watchdog(tail)
+
+    assert watchdog.observe(1) == 0
+    for expected in range(1, 120):
+        assert watchdog.observe(1) == expected
+
+    watchdog.raise_if_failed()
+    assert torn_down == []
 
 
 def test_stall_tail_fields_reports_how_long_the_child_has_been_silent():
@@ -2000,16 +2094,16 @@ def test_stall_tail_fields_reports_how_long_the_child_has_been_silent():
     staleness = vc.ChildTailStaleness()
     tail.record("Started a local Ray instance\n")
 
-    first = vc.stall_tail_fields(0, tail, staleness=staleness)
+    first = vc.stall_tail_fields(0, tail, silent_ticks=staleness.observe(tail.written))
     assert first["child_tail_silent_ticks"] == 0
 
     # two more ticks with the child saying nothing new: same tail, rising silence.
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 1
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 2
+    assert staleness.observe(tail.written) == 1
+    assert staleness.observe(tail.written) == 2
 
     # the child speaks again, so it is slow rather than stuck and the counter resets.
     tail.record("loading checkpoint shards 1/4\n")
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+    assert staleness.observe(tail.written) == 0
 
 
 def test_child_tail_silence_survives_the_retention_limit():
@@ -2020,10 +2114,10 @@ def test_child_tail_silence_survives_the_retention_limit():
     staleness = vc.ChildTailStaleness()
     for i in range(3):
         tail.record(f"line{i}\n")
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+    assert staleness.observe(tail.written) == 0
     tail.record("line3\n")  # evicts line0; the deque stays length 3
     assert len(tail.tail()) == 3
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+    assert staleness.observe(tail.written) == 0
 
 
 def test_child_tail_silence_is_measured_from_the_childs_first_line():
@@ -2032,9 +2126,10 @@ def test_child_tail_silence_is_measured_from_the_childs_first_line():
     tail = vc.ChildOutputTail()
     staleness = vc.ChildTailStaleness()
     for _ in range(4):
-        assert vc.stall_tail_fields(0, tail, staleness=staleness) == {}
+        silent_ticks = staleness.observe(tail.written)
+        assert vc.stall_tail_fields(0, tail, silent_ticks=silent_ticks) == {}
     tail.record("first words\n")
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+    assert staleness.observe(tail.written) == 0
 
 
 def test_stall_tail_fields_omits_silence_when_no_tracker_is_supplied():

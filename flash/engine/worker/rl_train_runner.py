@@ -17,6 +17,8 @@ from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.result.rollout_samples import sample_completion_text, sanitize_rollout_text
 from flash.engine.worker.backend_common import (
     SHIM_FRAGMENT_FAILED_EXIT_CODE,
+    ChildOutputTail,
+    VerlChildSilenceWatchdog,
     adopt_orphaned_descendants,
     append_step_metrics,
     latest_global_step_dir,
@@ -33,6 +35,7 @@ from flash.engine.worker.backend_common import (
     wrap_shim_fragment,
 )
 from flash.engine.worker.io.heartbeat import (
+    _LIVENESS_TICK_S,
     GRPO_METRIC_HISTORY_LIMIT,
     LATEST_GRPO_METRICS_LAST,
     RewardObservabilityBuffer,
@@ -81,6 +84,13 @@ class _StepMetricState:
     step_line_times: list[float] = field(default_factory=list)
     metrics_last: list[dict] = field(default_factory=list)
     sent_first_metrics: bool = False
+    # the child's output tail and the watchdog reading it are per-run state like everything above,
+    # so they travel with it rather than as two more parameters through the child call.
+    child_tail: ChildOutputTail = field(default_factory=ChildOutputTail)
+    silence_watchdog: VerlChildSilenceWatchdog | None = None
+
+    def __post_init__(self) -> None:
+        self.silence_watchdog = VerlChildSilenceWatchdog(self.child_tail, tick_s=_LIVENESS_TICK_S)
 
 
 @dataclass
@@ -515,7 +525,9 @@ def _execute_rl_child(
         env=env_for_verl,
         start_new_session=True,
     )
-    child_stream = _rl_train()._GrpoSubprocessStream(proc)
+    child_stream = _rl_train()._GrpoSubprocessStream(
+        proc, tail=state.child_tail, silence_watchdog=state.silence_watchdog
+    )
     step_re = re.compile(r"step:\s*(\d+)")
     progress, last_dump_step = state.progress, state.last_dump_step
     shim_markers = (files or {}).get("shim_markers")

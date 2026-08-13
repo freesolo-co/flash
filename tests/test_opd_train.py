@@ -5289,6 +5289,7 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
         child_heartbeat=lambda: None,
         liveness_fields=dict,
         child_tail=None,
+        silence_watchdog=None,
         wandb_link={"wandb_url": None, "wandb_id": None},
     )
     reconciled = []

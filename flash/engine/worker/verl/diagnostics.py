@@ -11,7 +11,12 @@ Split out of `flash.engine.worker.backend_common` to keep that module under the 
 from __future__ import annotations
 
 import collections
+import contextlib
+import math
 import os
+import threading
+from collections.abc import Callable
+from typing import Self
 
 from flash._internal.diagnostics import sanitize_diagnostic
 
@@ -25,10 +30,19 @@ _CHILD_TAIL_LINE_CHARS = 300
 # how many retained lines ride along on a pre-first-step heartbeat. narrower than what is retained:
 # this payload is uploaded every tick, so it stays small enough not to bloat the snapshot.
 STALL_TAIL_LINES = 15
+# one teacher request can spend 105s x 4 attempts + (2 + 4 + 8)s backoff = 434s while
+# the child waits silently, and opd batches those requests serially. parent activity resets opd's
+# counter after each completed interaction; the full hour remains the conservative grpo floor for
+# long rollouts and checkpoint callbacks. ticks are derived from the heartbeat cadence at runtime.
+VERL_CHILD_SILENCE_TIMEOUT_S = 60.0 * 60.0
 _RETRIABLE_VERL_CHILD_SIGNATURES = (
     "cudaErrorDevicesUnavailable",
     "CUDA-capable device(s) is/are busy or unavailable",
 )
+_TEARDOWN_GRACE_S = 10.0
+# grace for a descendant holding stdout open after the trainer exits. observe child exit separately
+# from eof because enginecore can retain the pipe; allow final flushing before group teardown.
+_ORPHANED_PIPE_GRACE_S = 30.0
 
 
 def _backend_common():
@@ -123,6 +137,59 @@ def raise_for_classified_verl_exit(return_code: int, tail: ChildOutputTail) -> N
     )
 
 
+class _ChildExitWatchdog:
+    """tear the group down when the direct child exits but a descendant holds the pipe open."""
+
+    def __init__(self, proc, *, process_group_id: int, grace_s: float) -> None:
+        self._proc = proc
+        self._process_group_id = process_group_id
+        self._grace_s = grace_s
+        self._done = threading.Event()
+        self._thread: threading.Thread | None = None
+        # a child can exit with a full pipe behind it. count both lines read and lines still inside a
+        # callback so a long checkpoint upload is working, not mistaken for an idle inherited pipe.
+        self._lines_read = 0
+        self._lines_in_flight = 0
+        self.tore_down = False
+
+    @contextlib.contextmanager
+    def handling_line(self):
+        """wrap the reader's whole per-line body, including callbacks."""
+        self._lines_read += 1
+        self._lines_in_flight += 1
+        try:
+            yield
+        finally:
+            self._lines_in_flight -= 1
+
+    def __enter__(self) -> Self:
+        self._thread = threading.Thread(
+            target=self._watch, name="verl-child-exit-watchdog", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._done.set()
+        if self._thread is not None:
+            self._thread.join(timeout=_TEARDOWN_GRACE_S)
+
+    def _watch(self) -> None:
+        while not self._done.wait(0.5):
+            if self._proc.poll() is None:
+                continue
+            before = self._lines_read
+            if self._done.wait(self._grace_s):
+                return
+            if self._lines_read != before or self._lines_in_flight:
+                continue
+            self.tore_down = True
+            _backend_common().kill_process_group(
+                self._proc, process_group_id=self._process_group_id
+            )
+            return
+
+
 class ChildTailStaleness:
     """tracks how long a child has been silent, across the ticks that sample its tail.
 
@@ -138,44 +205,127 @@ class ChildTailStaleness:
         self._written = -1
         self._since = 0
 
-    def observe(self, written: int) -> int:
+    def observe(self, written: int, *, active: bool = False) -> int:
         """record this tick's line count; return consecutive ticks with no new output.
 
-        0 means the child spoke since the last observation. n>0 means it has been silent for n
-        ticks, which is the signal that separates a slow start from a wedge.
+        0 means the child spoke or its parent completed work on its behalf since the last observation.
+        n>0 means neither side advanced for n ticks, which separates slow work from a wedge.
         """
-        if written != self._written:
+        if active or written != self._written:
             self._written = written
             self._since = 0
         else:
             self._since += 1
         return self._since
 
+    @property
+    def silent_ticks(self) -> int:
+        """the consecutive silent ticks recorded by the most recent observation."""
+        return self._since
+
+
+class VerlChildSilenceWatchdog:
+    """tear down and classify a verl child that stays silent while a training step is active."""
+
+    def __init__(
+        self,
+        tail: ChildOutputTail,
+        *,
+        tick_s: float,
+        parent_activity: Callable[[], int] | None = None,
+    ) -> None:
+        self._tail = tail
+        self._staleness = ChildTailStaleness()
+        self._parent_activity = parent_activity
+        self._parent_activity_count: int | None = None
+        self._silent_tick_limit = max(1, math.ceil(VERL_CHILD_SILENCE_TIMEOUT_S / tick_s))
+        self._silence_seconds = self._silent_tick_limit * tick_s
+        self._failure: RuntimeError | None = None
+        self._teardown: Callable[[], None] | None = None
+        self._is_running: Callable[[], bool] | None = None
+        self._lock = threading.Lock()
+
+    def bind_process(self, *, teardown: Callable[[], None], is_running: Callable[[], bool]) -> None:
+        """bind the child only after it exists, without holding this lock across teardown."""
+        with self._lock:
+            self._teardown = teardown
+            self._is_running = is_running
+            failed = self._failure is not None
+        if failed:
+            teardown()
+
+    def observe(self, step: int) -> int:
+        """sample child and optional parent progress, tearing down once active-step silence expires."""
+        teardown = None
+        with self._lock:
+            if self._failure is not None:
+                return self._staleness.silent_ticks
+            parent_active = False
+            if self._parent_activity is not None:
+                try:
+                    count = int(self._parent_activity())
+                except Exception:
+                    # losing an optional activity sample must not lose the child-silence sample too:
+                    # repeated probe failures would otherwise disarm the watchdog indefinitely.
+                    pass
+                else:
+                    parent_active = (
+                        self._parent_activity_count is not None
+                        and count != self._parent_activity_count
+                    )
+                    self._parent_activity_count = count
+            silent_ticks = self._staleness.observe(self._tail.written, active=parent_active)
+            # bind_process runs immediately after popen. before that there is no paid child to kill;
+            # afterwards this check keeps normal exit and teardown from being reclassified as silence.
+            running = self._is_running is not None and self._is_running()
+            if step <= 0 or not running or silent_ticks < self._silent_tick_limit:
+                return silent_ticks
+            self._failure = RuntimeError(
+                f"verl child produced no output for {self._silence_seconds:.0f}s while training was "
+                "running; the process group was torn down to release the gpu"
+            )
+            teardown = self._teardown
+        if teardown is not None:
+            teardown()
+        return silent_ticks
+
+    def heartbeat_fields(self, step: int) -> dict[str, object]:
+        """observe this tick and return the field carrying the result.
+
+        callers merge this into a `fields=` payload, so it doubles as the observation seam: a path
+        that publishes the count cannot forget to advance it, and one that never publishes has no
+        watchdog at all.
+        """
+        return {"child_tail_silent_ticks": self.observe(step)}
+
+    def raise_if_failed(self) -> None:
+        """raise the failure latched by the liveness thread on the owning training path."""
+        with self._lock:
+            failure = self._failure
+        if failure is not None:
+            raise failure
+
 
 def stall_tail_fields(
     step: int,
     tail: ChildOutputTail,
     limit: int = STALL_TAIL_LINES,
-    staleness: ChildTailStaleness | None = None,
+    silent_ticks: int | None = None,
 ) -> dict[str, object]:
-    """heartbeat fields carrying the child's last words, but only while it has made no progress.
+    """heartbeat fields carrying silence on every step and child lines only before the first.
 
-    before the first step, the tail is the only collected setup-stall evidence. with ``staleness``,
-    include silent ticks to distinguish a slow start from a wedge. return empty after progress or
-    before any child output.
+    the single tick count is cheap and remains useful during training, but the retained line list is
+    a pre-first-step stall aid: uploading it after progress would bloat every training heartbeat.
+    omit both claims before any child output.
     """
-    if step > 0:
-        return {}
     recent = tail.tail(limit=limit)
     if not recent:
-        # observed even with nothing to report, so a child that starts talking later is measured
-        # from its first line rather than from whenever the payload happened to become non-empty.
-        if staleness is not None:
-            staleness.observe(tail.written)
         return {}
-    fields: dict[str, object] = {"child_tail": recent}
-    if staleness is not None:
-        fields["child_tail_silent_ticks"] = staleness.observe(tail.written)
+    fields: dict[str, object] = {}
+    if step <= 0:
+        fields["child_tail"] = recent
+    if silent_ticks is not None:
+        fields["child_tail_silent_ticks"] = silent_ticks
     return fields
 
 

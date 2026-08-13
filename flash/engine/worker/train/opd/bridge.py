@@ -190,6 +190,11 @@ class _TeacherAlignmentBridge:
         with self._stats_lock:
             return self._teacher_failure
 
+    def teacher_activity_count(self) -> int:
+        """completed teacher interactions, including transient and permanent failures."""
+        with self._stats_lock:
+            return self.teacher_ok + self.teacher_transient + self.teacher_error
+
     def _promote_recovered_teacher_failure(self, failure: tuple[str, str]) -> None:
         with self._stats_lock:
             if self._teacher_failure is None:

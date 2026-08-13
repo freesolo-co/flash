@@ -281,7 +281,12 @@ def test_grpo_classified_exit_drains_group_after_leader_is_reaped(tmp_path, monk
 def test_run_rl_train_reaches_the_executable_grpo_subprocess_stream():
     source = inspect.getsource(rl_train._execute_rl_child)
 
-    assert "child_stream = _rl_train()._GrpoSubprocessStream(proc)" in source
+    # the tail and its watchdog ride on the per-run state, so the stream reads the same objects the
+    # rl_step heartbeat observes rather than constructing a second pair nobody is watching.
+    assert (
+        "_GrpoSubprocessStream( proc, tail=state.child_tail, "
+        "silence_watchdog=state.silence_watchdog )" in " ".join(source.split())
+    )
     assert "for line in child_stream" in source
     assert "return child_stream.wait_and_classify()" in source
 
@@ -6143,8 +6148,12 @@ def test_the_first_sample_bearing_heartbeat_is_forced():
 def test_the_liveness_fields_hook_carries_reward_observability():
     # the rl_step liveness wrap is what publishes between stdout lines. without the fields hook
     # merging it, samples would only ever reach the wire on the one forced first-metrics heartbeat.
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    assert 'fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()}' in src
+    entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    assert '"metrics_last": list(metrics_last), ' in entry
+    assert "**_reward_observability()," in entry
+    # and the watchdog's own field is merged BEFORE the reward diagnostics: those call user reward
+    # code, so a raising observability read must not skip the tick that advances the silence timer.
+    assert entry.index("silence_watchdog.heartbeat_fields(") < entry.index("**_reward_observability(")
 
 
 def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains():
