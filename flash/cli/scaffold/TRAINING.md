@@ -1241,10 +1241,18 @@ break it, and both are ordinary.
 If your `start_episode` **does** seed an assistant message (a worked example, a demonstration
 turn), that message is sitting in `messages` looking exactly like a move, and the loop above
 would apply your own demo to the real state. The cleanest fix is to not seed one: put worked
-examples in the user or system text of the prompt, where no replay loop can mistake them for
-actions. Do not reach for a prompt length instead. Flash may prepend a system message carrying
-the training contract, so `len(self.start_episode(...))` can come out one short of the real
-prefix, and the offset then leaks the demo back in silently.
+examples in the **user** text of the prompt, where no replay loop can mistake them for actions.
+
+Prefer the user turn over a system one. Flash carries the training contract as the system
+prompt, and it yields to yours: `with_system_prompt` returns the list untouched the moment it
+finds a system message that already has content, so a non-empty system turn of your own
+replaces the contract rather than joining it, and the model loses its action and grading
+instructions. If you do want a system turn, `start_episode` is handed the contract text as its
+second argument — put it in yourself.
+
+Do not reach for a prompt length instead. Flash may prepend that system message, so
+`len(self.start_episode(...))` can come out one short of the real prefix, and the offset then
+leaks the demo back in silently.
 
 And once `thinking` is on, a turn arrives as reasoning wrapped around the action rather than
 the action alone, so the text is no longer something `apply` can take as given.
@@ -1317,21 +1325,29 @@ replayed as history on every later call.
 
 `_answer_of` above mirrors how Flash itself splits a turn for grading: the **last** `</think>`
 wins, and text before an unclosed `<think>` is still an answer, so a turn that acted and then
-ran out of budget mid-thought is treated the same way the scorer treats it.
+reopened a thought it never closed is read the same way the scorer reads it.
 
-One case stays genuinely ambiguous, and it is worth knowing rather than papering over. When the
-chat template pre-opens the reasoning block, the model never emits `<think>`, so a turn
-truncated before `</think>` carries no tag at all and reads as a plain answer. Flash resolves
-this with a flag it derives from the rendered template and sets on the adapter; that flag is not
-passed through to your hook, so your environment cannot see it. Do not hardcode a guess either,
-because the same environment needs a different answer under a different model.
+A turn that simply ran out of budget mid-thought never reaches you at all, which is worth
+knowing before you write defenses against it. Both bridges classify a completion that hit
+`max_completion_tokens` as truncated and return **before** `record_model_turn`, so it enters
+neither the transcript nor `step_episode`. Its tokens are masked out of the loss and it takes no
+turn span. The tagless-answer rule above therefore matters for turns the model _finished_ while
+leaving a `<think>` open, not for the ones the cap cut off.
+
+One case does stay genuinely ambiguous. When the chat template pre-opens the reasoning block,
+the model never emits `<think>` itself, so a turn that stopped cleanly inside reasoning carries
+no tag at all and reads as a plain answer. Flash resolves this with a flag it derives from the
+rendered template and sets on the adapter; that flag is not passed through to your hook, so your
+environment cannot see it. Do not hardcode a guess either, because the same environment needs a
+different answer under a different model.
 
 What the parser above does instead is require the action to be the **last** thing in the turn.
-That is why `FINAL_ACTION` is anchored: unfinished reasoning usually runs on past the move it
-was weighing, so `Maybe <move>left</move>, or maybe` fails the anchor and counts as no action.
-The residual case is a turn truncated exactly at a closing tag, which nothing available to an
-environment can tell from a committed answer. Ask for the action last in your prompt, and keep
-`max_completion_tokens` clear of your typical turn length so truncation stays rare.
+That is why `FINAL_ACTION` is anchored: reasoning that was still weighing options usually runs
+on past the move it names, so `Maybe <move>left</move>, or maybe` fails the anchor and counts as
+no action. What survives is a turn that stopped immediately after a closing tag, which nothing
+available to an environment can tell from a committed answer. Ask for the action last in your
+prompt, and keep `max_completion_tokens` clear of your typical turn length so the model is not
+routinely cut off mid-decision.
 
 **Give `apply` one representation.** The replayed turns and `assistant_response` have to arrive
 in the same shape. Passing the unwrapped payload for replayed turns and the raw text for the
