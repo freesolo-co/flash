@@ -199,20 +199,46 @@ def persisted_gpu_head(spec: dict[str, Any] | None) -> str:
     when the truth is on hand, so they read ``remote.allocated_gpu`` first and reach this only in
     the narrow submit-to-handle-persist window before allocation stamps one.
 
-    The ones NAMING AN ENDPOINT -- teardown in ``attach``/``runtime``, the idle reaper -- pass it to
+    The ones NAMING AN ENDPOINT -- teardown in ``attach``/``runtime`` -- pass it to
     ``endpoint_name(canonical_gpu(gpu), _run_suffix(run_id))``, which is a deterministic
-    reconstruction and not a report. They cannot prefer ``allocated_gpu`` in general: the reaper
-    walks stored runs whose remote may hold nothing, and teardown runs after the parse already
-    failed. A wrong guess there names an endpoint that does not exist, and each site is already
-    best-effort about a name resolving to nothing -- the reaper protects an unlisted name, teardown
-    deletes nothing. Strictly better than a raw list, which raises before naming anything at all and
-    so protects and deletes nothing in EVERY case, ordered-pin runs included.
+    reconstruction and not a report. They cannot prefer ``allocated_gpu``: teardown runs after the
+    parse already failed. A wrong guess there names an endpoint that does not exist, and each site
+    is already best-effort about a name resolving to nothing, so it deletes nothing. Strictly better
+    than a raw list, which raises before naming anything at all and so deletes nothing in EVERY
+    case, ordered-pin runs included.
+
+    A guess is only acceptable where a wrong name is inert. Where a MISSING name would hide a paid
+    resource -- the idle reaper, which skips endpoints absent from its index -- use
+    ``persisted_gpu_types`` and name them all.
     """
     gpu = (spec or {}).get("gpu")
     raw = gpu.get("type") if isinstance(gpu, dict) else None
     if isinstance(raw, (list, tuple)):
         raw = raw[0] if raw else None
     return raw if isinstance(raw, str) else ""
+
+
+def persisted_gpu_types(spec: dict[str, Any] | None) -> tuple[str, ...]:
+    """EVERY GPU class a persisted spec finds acceptable, in authored order, without parsing it.
+
+    The set form of ``persisted_gpu_head``, for the caller that must not guess: the idle reaper
+    indexes deterministic endpoint names to decide which endpoints are in ITS scope, and skips any
+    it cannot name. Since allocation may rent any acceptable class, indexing only the head leaves an
+    orphaned fallback endpoint permanently unnameable -- never swept, holding worker quota forever.
+    A guess is fine when a wrong name resolves to nothing; it is not fine when a missing name means
+    a paid resource is invisible.
+
+    Prefer the head where exactly one name is wanted (teardown names one concrete resource). Prefer
+    this wherever a missed name costs more than an extra one, which is both of the reaper's sets:
+    scope gains reach, and protection correctly shields a fallback the run may actually hold.
+    """
+    gpu = (spec or {}).get("gpu")
+    raw = gpu.get("type") if isinstance(gpu, dict) else None
+    if isinstance(raw, str):
+        raw = [raw]
+    elif not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(dict.fromkeys(entry for entry in raw if isinstance(entry, str) and entry))
 
 
 def _opt_int(value: Any) -> int | None:

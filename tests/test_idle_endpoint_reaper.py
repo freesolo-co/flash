@@ -66,8 +66,10 @@ def test_ordered_gpu_pin_is_protected_before_its_handle_is_persisted(monkeypatch
     raw list to `canonical_gpu` raises `AttributeError: 'list' object has no attribute 'strip'`, and
     the call sits under `contextlib.suppress`, so the run silently contributes NO name at all: with
     no `remote.endpoint_name` either, its live endpoint is outside the protected set and reapable
-    while the run is still provisioning. The head is the right class here because the first attempt
-    of an ordered pin rents the author's first preference."""
+    while the run is still provisioning.
+
+    EVERY acceptable class is named, not just the head: the allocator ranks an ordered pin on
+    cost-per-step, so a fallback can be the class actually rented."""
     rows = [{"run_id": "flash-ordered"}]
     statuses = {
         "flash-ordered": RunStatus(
@@ -83,6 +85,33 @@ def test_ordered_gpu_pin_is_protected_before_its_handle_is_persisted(monkeypatch
 
     assert names, "an ordered-pin run contributed no protected name at all"
     assert _derived("A100 PCIe", "flash-ordered") in names
+    assert _derived("A100 SXM", "flash-ordered") in names
+
+
+def test_an_orphaned_fallback_endpoint_stays_in_the_reapers_scope(monkeypatch):
+    """The reaper SKIPS any endpoint absent from its known set, so a missed name is a permanent leak.
+
+    Unlike the protected set, where a missing name costs protection, a missing name here costs
+    reachability: `_sweep_idle_flash_endpoints` does `if known is not None and canon not in known:
+    continue`. An ordered pin whose fallback was rented and orphaned before its handle persisted
+    would never be nameable, and would hold worker quota indefinitely. A terminal run is used
+    because that is when the endpoint is genuinely orphaned rather than merely unprotected."""
+    rows = [{"run_id": "flash-orphan"}]
+    statuses = {
+        "flash-orphan": RunStatus(
+            run_id="flash-orphan",
+            state="failed",
+            spec={"gpu": {"type": ["A100 PCIe", "A100 SXM"]}},
+        )
+    }
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
+    monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
+
+    known = app_mod._known_train_endpoint_names()
+
+    # the fallback is the one the head-only index missed, and the one that leaks.
+    assert _derived("A100 SXM", "flash-orphan") in known
+    assert _derived("A100 PCIe", "flash-orphan") in known
 
 
 def test_reap_once_passes_protected_set_and_grace(monkeypatch):

@@ -18,6 +18,7 @@ from flash.core.spec import (
     TrainSpec,
     load_job_spec_from_env,
     persisted_gpu_head,
+    persisted_gpu_types,
 )
 from flash.schema import (
     TRAIN_KEY_MIN_VERSIONS,
@@ -1328,6 +1329,39 @@ def test_persisted_gpu_head_reads_an_unparseable_spec_without_raising() -> None:
         {"gpu": {"type": 7}},
     ):
         assert persisted_gpu_head(malformed) == ""
+
+
+def test_persisted_gpu_types_names_every_acceptable_class() -> None:
+    """The set form, for the caller where a MISSING name hides a paid resource.
+
+    The idle reaper skips any endpoint it cannot name, so indexing only the head would leave an
+    orphaned fallback endpoint permanently unsweepable. Total over malformed input for the same
+    reason as the head reader: these callers are reached because the record is suspect.
+    """
+    assert persisted_gpu_types({"gpu": {"type": ["A100 PCIe", "A100 SXM"]}}) == (
+        "A100 PCIe",
+        "A100 SXM",
+    )
+    # a scalar pin is the one-entry case, so callers need no separate spelling for it.
+    assert persisted_gpu_types({"gpu": {"type": "H200"}}) == ("H200",)
+    # authored order is preserved and duplicates collapse, so the index cannot double-count.
+    assert persisted_gpu_types({"gpu": {"type": ["H200", "A100 PCIe", "H200"]}}) == (
+        "H200",
+        "A100 PCIe",
+    )
+    # junk entries are dropped rather than raising, and the good ones still survive.
+    assert persisted_gpu_types({"gpu": {"type": ["H200", 7, "", None]}}) == ("H200",)
+    for malformed in (
+        None,
+        {},
+        {"gpu": {}},
+        {"gpu": {"type": ""}},
+        {"gpu": {"type": []}},
+        {"gpu": {"type": None}},
+        {"gpu": "not-a-dict"},
+        {"gpu": {"type": 7}},
+    ):
+        assert persisted_gpu_types(malformed) == ()
 
 
 def test_removed_gpu_pin_key_is_rejected_as_unknown() -> None:
