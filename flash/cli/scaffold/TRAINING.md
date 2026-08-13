@@ -1147,7 +1147,8 @@ import math
 # nothing downstream checks the length and both mismatch directions are bad (see below).
 # count episode.turns, NOT episode.messages: messages starts out holding everything
 # start_episode() returned, so any assistant few-shot demo in the prompt inflates the
-# count. turns starts empty and collects only what the rollout actually generated.
+# count. turns starts empty. it does collect your own env replies alongside the
+# generated turns, so this filter is exact only while those replies are not assistant-role.
 assistant_turns = sum(1 for t in episode.turns if t.role == "assistant")
 assert len(turn_scores) == assistant_turns, (len(turn_scores), assistant_turns)
 assert all(math.isfinite(s) for s in turn_scores)
@@ -1175,7 +1176,9 @@ the final `env_reply`, so the last assistant turn is generated and recorded **wi
 matching `step_episode` call — an environment that appends one reward per `step_episode`
 comes up exactly one short on precisely the episodes that hit the cap. Count the assistant
 entries in `episode.turns`, not the number of steps you took and not the assistant messages
-in `episode.messages` (those include any few-shot demo the prompt carried in).
+in `episode.messages` (those include any few-shot demo the prompt carried in). If your
+`step_episode` returns assistant-role observations, they land in `episode.turns` too, so match
+your actions there the same way you match them on replay rather than counting by role alone.
 
 **Do not verify this by the absence of a warning** — a missing key produces no output at
 all. There are three distinct silent-fallback layers on this path, two of which emit
