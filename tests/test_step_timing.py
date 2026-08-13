@@ -895,3 +895,124 @@ def test_the_child_stream_heartbeat_is_timed_like_the_step_one():
     clock.record(1176.0, 4)
     assert clock.intervals() == [92.0, 92.0]
     assert clock.step_seconds() == 92.0
+
+
+def test_the_wall_warning_never_recommends_an_inert_knob():
+    """`max_examples` does not shorten a `max_steps` run, so advising it buys a doomed relaunch.
+
+    `resolve_update_horizon` returns the configured `max_steps` whenever it is positive and ignores
+    the derived example-based horizon entirely. An operator who follows advice to cut `max_examples`
+    on such a run pays for a relaunch projected to hit the same wall cutoff. The panel cannot tell
+    the two configurations apart -- the heartbeat carries no horizon provenance -- so the guidance
+    has to name the knob that shortens the run under EITHER configuration.
+    """
+    from flash.engine.plan.steps import resolve_update_horizon
+
+    # the premise, asserted rather than assumed: max_steps wins and max_examples is inert.
+    assert resolve_update_horizon(1000, 40) == 40
+    assert resolve_update_horizon(1000, None) == 1000
+
+    for remaining, wall in ((95 * 60, 100 * 60), (300 * 60, 100 * 60)):
+        beat = {
+            "step_duration_s": 92.0,
+            "projected_remaining_s": remaining,
+            "remaining_wall_s": wall,
+            "wall_deadline_at_risk": True,
+            "from_current_attempt": True,
+        }
+        warning = dict(step_timing_pairs(beat, running=True))["wall limit"]
+        assert "max_examples" not in warning, warning
+        assert "step horizon" in warning, warning
+
+
+def test_a_long_upload_keeps_publishing_the_measured_pace():
+    """The upload daemon commits real heartbeats for the whole save, not just one at the end.
+
+    `checkpoint_uploading` is a keepalive liveness wrap, so it publishes every tick while the upload
+    runs -- and an upload REPLACES the published snapshot. Without the timing fields those ticks
+    blank pace, ETA and wall-risk for the entire duration of a save, which on a large model is
+    minutes, and the throttle they arm holds that blank state afterwards.
+    """
+    import ast
+    from pathlib import Path
+
+    import flash
+
+    source = (Path(flash.__file__).parent / "engine" / "worker" / "io" / "hf.py").read_text()
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "liveness_heartbeat"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "checkpoint_uploading"
+    ]
+    assert len(calls) == 1, f"expected one checkpoint_uploading wrap, found {len(calls)}"
+    fields = {kw.arg: kw.value for kw in calls[0].keywords}.get("fields")
+    assert fields is not None, "the upload daemon publishes without step timing"
+    assert isinstance(fields, ast.Name), ast.dump(fields)
+    assert fields.id == "_step_timing_fields_now", fields.id
+
+
+def test_timing_stays_registered_through_the_final_checkpoint_drain():
+    """The last save is published during teardown, after the training block has exited.
+
+    Each trainer drains its uploader/watcher in a `finally` that runs AFTER the step-heartbeat
+    block. That drain uploads the final checkpoint, whose `checkpoint_uploaded` ping is unthrottled
+    and reads the timing registry. If the registration ends with the training block, the run's last
+    save publishes with no pace and arms the 900s throttle behind it -- so the final measurement is
+    blanked on the ping most likely to be the last one anybody reads.
+    """
+    import ast
+    from pathlib import Path
+
+    import flash
+
+    worker = Path(flash.__file__).parent / "engine" / "worker"
+    cases = (
+        ("rl_train.py", "run_rl_train", "publishing_step_timing"),
+        ("sft_train.py", "run_sft_train", "publishing_step_timing"),
+        ("opd_train_runner.py", "_run_child", "publishing_step_timing"),
+    )
+    for filename, funcname, registrar in cases:
+        tree = ast.parse((worker / filename).read_text())
+        fn = next(
+            (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == funcname),
+            None,
+        )
+        assert fn is not None, f"{filename} has no {funcname}"
+        registrations = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and (
+                (isinstance(n.func, ast.Name) and n.func.id == registrar)
+                or (isinstance(n.func, ast.Attribute) and n.func.attr == registrar)
+            )
+        ]
+        assert len(registrations) == 1, f"{funcname}: {len(registrations)} registrations"
+        reg = registrations[0]
+        # every Try whose finally drains a watcher/uploader must be INSIDE the registration's block,
+        # which is true exactly when the registration starts before the Try does.
+        drains = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Try)
+            and n.finalbody
+            and any(
+                isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Attribute)
+                and c.func.attr == "stop"
+                for stmt in n.finalbody
+                for c in ast.walk(stmt)
+            )
+        ]
+        assert drains, f"{funcname}: no draining finally found"
+        for drain in drains:
+            assert reg.lineno < drain.lineno, (
+                f"{funcname}: registration at line {reg.lineno} starts after the drain at "
+                f"{drain.lineno}, so the final checkpoint publishes with no pace"
+            )

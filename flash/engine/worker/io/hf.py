@@ -500,7 +500,15 @@ def upload_resume_checkpoint(
             return True
         heartbeat_context = (
             liveness_heartbeat(
-                "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
+                "checkpoint_uploading",
+                progress=lambda: step,
+                progress_step=True,
+                keepalive=True,
+                # the same reason the final ping below carries them, for longer: this daemon is
+                # keepalive, so it commits a REAL heartbeat every tick for the whole upload. an
+                # upload that outlasts one tick would otherwise replace the snapshot with a pace-less
+                # one and hold it there until the save finishes, on a big model for minutes.
+                fields=_step_timing_fields_now,
             )
             if emit_heartbeat
             else contextlib.nullcontext()

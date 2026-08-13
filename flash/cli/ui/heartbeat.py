@@ -301,21 +301,26 @@ def step_timing_pairs(heartbeat: dict, *, running: bool) -> list[tuple[str, str]
         # which is what eats a thin margin. saying "expected to be cut off" there would assert a
         # cutoff the measurement does not show, and a warning that overstates its case on the runs
         # that go on to finish is how a row gets ignored on the runs that do not.
+        # the advice names the STEP horizon only. `max_steps`, when set, is the authoritative
+        # optimizer-update count and `resolve_update_horizon` ignores the derived one -- so telling
+        # an operator to cut `max_examples` on such a run buys a relaunch that is projected to hit
+        # the same cutoff. the panel cannot tell the two configurations apart (the heartbeat carries
+        # no horizon provenance), so it recommends the knob that shortens the run either way.
         fits = remaining is not None and wall is not None and remaining <= wall
         if fits:
             warning = (
                 f"at this rate the remaining steps only just fit the run's wall limit{against}, "
                 "leaving little room for the final checkpoint upload, which runs after the last "
                 "step and can take minutes on a large model. if the margin matters, relaunch with "
-                "a smaller [train].max_steps or max_examples rather than risking the last save"
+                "a shorter [train] step horizon rather than risking the last save"
             )
         else:
             warning = (
                 f"at this rate the remaining steps do not fit the run's wall limit{against}, so "
                 "training is expected to be cut off before the last step. checkpoints already "
                 "published at your save steps survive, but the steps after the cutoff never run - "
-                "so if you need the full horizon, relaunch with a smaller [train].max_steps or "
-                "max_examples rather than paying out the rest of this one"
+                "so if you need the full horizon, relaunch with a shorter [train] step horizon "
+                "rather than paying out the rest of this one"
             )
         pairs.append(("wall limit", warning))
     return pairs

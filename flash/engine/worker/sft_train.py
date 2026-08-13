@@ -595,24 +595,24 @@ def run_sft_train(spec=None) -> None:
     return_code = 0
     if child.resume_step < model.update_horizon:
         child.watcher.start()
-        # check save completeness only after normal training completion. callback failures occur before
-        # return_code assignment; checking anyway would replace the real zero-grad or lora+ diagnosis
-        # with a missing-save error. opd_train uses the same guard.
+        # check save completeness only after normal training completion. callback failures occur
+        # before return_code assignment; checking anyway would replace the real zero-grad or lora+
+        # diagnosis with a missing-save error. opd_train uses the same guard.
         training_completed = False
-        try:
-            with (
-                publishing_step_timing(callbacks.step_timing_fields),
-                liveness_heartbeat(
+        # spans the watcher drain, not just the child: that drain uploads the final checkpoint and
+        # its unthrottled ping reads this registration, so unregistering first blanks that pace.
+        with publishing_step_timing(callbacks.step_timing_fields):
+            try:
+                with liveness_heartbeat(
                     "sft_step",
                     progress=lambda: int(progress["step"] or 0),
                     fields=callbacks.step_timing_fields,
                     progress_step=True,
-                ),
-            ):
-                return_code = _invoke_sft_child(child, callbacks, on_line)
-                training_completed = return_code == 0
-        finally:
-            child.watcher.stop(require_complete=training_completed)
+                ):
+                    return_code = _invoke_sft_child(child, callbacks, on_line)
+                    training_completed = return_code == 0
+            finally:
+                child.watcher.stop(require_complete=training_completed)
     train_wall, device_peak_gpu_gb = _finish_sft_child(
         gpu_sampler, train_started_at, return_code, child_progress
     )

@@ -3281,7 +3281,12 @@ def test_run_rl_train_wires_the_gradient_check_into_the_publish_path():
     assert "_check_grpo_had_a_gradient(" in verdict_source
     assert "resumed=bool(resume_step)," in verdict_source
     assert "already_complete=bool(resume_step) and resume_step >= expected_steps," in verdict_source
-    assert entry_source.index("_validate_rl_child(") < entry_source.index("_export_final_adapter(")
+    # the export itself moved into `_publish_final_rl_adapter`, so the ordering is asserted against
+    # that call: it is the only path to the export, and the gradient verdict must still precede it.
+    assert "_export_final_adapter(" in inspect.getsource(rl_train._publish_final_rl_adapter)
+    assert entry_source.index("_validate_rl_child(") < entry_source.index(
+        "_publish_final_rl_adapter("
+    )
     assert "export_peft_adapter(" in export_source
     # and that the spread series it passes is actually collected from the child's output.
     assert 'parse_verl_metric(line, "critic/advantages/max")' in metrics_source
@@ -6170,7 +6175,12 @@ def test_the_liveness_fields_hook_carries_reward_observability():
     # checkpoint ping) rather than each closing over the state separately, so both publish one view.
     assert "**_step_timing()" in hook
     assert "_step_timing = _rl_step_timing_publisher(state, expected_steps)" in src
-    assert "publishing_step_timing(_step_timing)" in src
+    # registered through a stand-in rather than directly, because the registration is opened around
+    # the whole try/finally -- the uploader drains in that finally publish the final checkpoint, and
+    # its unthrottled ping reads the registry. `bind` hands the real reader over once the step state
+    # exists, so both publishers still end up on ONE view of the clock.
+    assert "publishing_step_timing(_deferred_timing)" in src
+    assert "_deferred_timing.bind(_step_timing)" in src
 
 
 def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains():

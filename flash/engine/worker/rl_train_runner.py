@@ -446,6 +446,28 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
     return env_for_verl
 
 
+class _DeferredStepTiming:
+    """A step-timing reader that can be registered before the run has one.
+
+    ``publishing_step_timing`` has to be opened around the whole training try/finally, because the
+    uploader drains in that finally publish the final checkpoint and its unthrottled ping reads the
+    registry. But the real reader needs the step state and horizon, which only exist once the child
+    is configured -- well inside the block. This stands in until ``bind`` supplies it.
+
+    Reading empty before then is correct rather than a fallback: no step has been measured yet, so
+    {} is exactly what a ping at that point should carry.
+    """
+
+    def __init__(self) -> None:
+        self._read: Callable[[], dict] | None = None
+
+    def bind(self, read: Callable[[], dict]) -> None:
+        self._read = read
+
+    def __call__(self) -> dict:
+        return self._read() if self._read is not None else {}
+
+
 def _rl_step_timing_publisher(state: _StepMetricState, total_steps: int) -> Callable[[], dict]:
     """A no-argument reader of this run's step timing, for the hooks that publish it.
 

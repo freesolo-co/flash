@@ -715,31 +715,31 @@ def _run_child(
     return_code = 0
     training_completed = runtime.resume_step >= workload.update_horizon
     watcher.start()
-    try:
-        if runtime.resume_step < workload.update_horizon:
-            progress_state.start_training()
-            with (
-                # also read by the checkpoint heartbeat, which is unthrottled and arms the throttle
-                # this stage shares -- see publishing_step_timing.
-                _opd_train.publishing_step_timing(callbacks.step_timing_fields),
-                _opd_train.liveness_heartbeat(
+    # also read by the checkpoint heartbeat, which is unthrottled and arms the throttle this stage
+    # shares -- see publishing_step_timing. opened OUTSIDE the try so it spans the watcher drain in
+    # the finally: that drain uploads the final checkpoint, and unregistering first would publish
+    # the run's last save with no pace and arm the throttle behind it.
+    with _opd_train.publishing_step_timing(callbacks.step_timing_fields):
+        try:
+            if runtime.resume_step < workload.update_horizon:
+                progress_state.start_training()
+                with _opd_train.liveness_heartbeat(
                     "opd_step",
                     progress=lambda: int(callbacks.progress["step"] or 0),
                     progress_step=True,
                     fields=callbacks.liveness_fields,
-                ),
-            ):
-                return_code = _opd_train.run_verl_training(
-                    command,
-                    env=child_env,
-                    on_step=callbacks.on_step,
-                    on_line=callbacks.on_line,
-                    heartbeat=callbacks.child_heartbeat,
-                    tail=callbacks.child_tail,
-                )
-                training_completed = return_code == 0
-    finally:
-        watcher.stop(require_complete=training_completed)
+                ):
+                    return_code = _opd_train.run_verl_training(
+                        command,
+                        env=child_env,
+                        on_step=callbacks.on_step,
+                        on_line=callbacks.on_line,
+                        heartbeat=callbacks.child_heartbeat,
+                        tail=callbacks.child_tail,
+                    )
+                    training_completed = return_code == 0
+        finally:
+            watcher.stop(require_complete=training_completed)
     peak_gpu_gb = gpu_sampler.stop_gb()
     truncation_window = None
     if return_code != 0:

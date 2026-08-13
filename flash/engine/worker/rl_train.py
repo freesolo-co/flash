@@ -336,63 +336,70 @@ def run_rl_train():
     files, reward_runtime = _prepare_rl_runtime(inp, env, tok, prompts)
 
     resume_uploader, gpu_sampler, device_peak_gpu_gb = _initialize_teardown_state()
-    try:
-        # provisioning and the cold verl capability probe can take minutes without step output. keep
-        # liveness running so the stall watchdog does not fail healthy setup (#442). there is no
-        # monotonic progress counter here, only the keepalive.
-        with liveness_heartbeat("rl_configuring"):
-            python_bin = resolve_verl_python(
-                files["workdir"], install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+    # late-bound because the reader needs `state`/`expected_steps` built inside the try, while the
+    # registration must span the finally: BOTH uploader drains (the clean one in _validate_rl_child
+    # and the teardown one below) publish the final checkpoint, whose unthrottled ping reads this
+    # registry, so unregistering first blanks the run's last measured pace. reads {} until the
+    # trainer fills it, which is what every ping before the first measured step should publish.
+    _deferred_timing = _DeferredStepTiming()
+    with publishing_step_timing(_deferred_timing):
+        try:
+            # provisioning and the cold verl probe can take minutes without step output; keep
+            # liveness running so the stall watchdog does not fail healthy setup (#442). no
+            # monotonic progress counter here, only the keepalive.
+            with liveness_heartbeat("rl_configuring"):
+                python_bin = resolve_verl_python(
+                    files["workdir"], install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+                )
+                # gdn boundary resets need fla + causal_conv1d in the child. resolved here
+                # because the answer needs a hub/cache read the child must not repeat.
+                gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
+                gdn_module = (
+                    gdn_probe_module(inp["model_id"], inp["model_revision"]) if gdn_hybrid else ""
+                )
+                # one child answers every independent capability question. each used to cost its own
+                # interpreter, and the torch/verl import -- not the question -- was the price.
+                caps = probe_verl_capabilities(python_bin, gdn_module)
+            configured = _configure_rl_child(
+                inp=inp,
+                files=files,
+                model_path_for_verl=model_path_for_verl,
+                t_start=t_start,
+                python_bin=python_bin,
+                gdn_hybrid=gdn_hybrid,
+                gdn_module=gdn_module,
+                caps=caps,
             )
-            # gdn boundary resets need the child to have fla + causal_conv1d. resolve the model here
-            # because the answer requires a hub/cache read the child must not repeat.
-            gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
-            gdn_module = (
-                gdn_probe_module(inp["model_id"], inp["model_revision"]) if gdn_hybrid else ""
+            expected_steps, loggers = configured["expected_steps"], configured["loggers"]
+            _w.heartbeat("rl_step", step=0, initial=True)
+            state = _StepMetricState()
+            # equal within-group rewards produce zero advantages and gradients. collect per-step
+            # spread; reward mean and pg_loss cannot prove a signal. declared before the uploader,
+            # whose publication gate closes over the histories.
+            adv_spread_history = state.adv_spread_history
+            resume_uploader = _start_resume_uploader(
+                local_dir=files["local_dir"],
+                resume_step=files["resume_step"],
+                inp=inp,
+                workdir=files["workdir"],
+                python_bin=python_bin,
+                preprocessor=preprocessor,
+                adv_spread_history=adv_spread_history,
             )
-            # one child answers every independent capability question. each used to cost its own
-            # interpreter, and the torch/verl import -- not the question -- was the price.
-            caps = probe_verl_capabilities(python_bin, gdn_module)
-        configured = _configure_rl_child(
-            inp=inp,
-            files=files,
-            model_path_for_verl=model_path_for_verl,
-            t_start=t_start,
-            python_bin=python_bin,
-            gdn_hybrid=gdn_hybrid,
-            gdn_module=gdn_module,
-            caps=caps,
-        )
-        expected_steps, loggers = configured["expected_steps"], configured["loggers"]
-        _w.heartbeat("rl_step", step=0, initial=True)
-        state = _StepMetricState()
-        # equal within-group rewards produce zero advantages and gradients. collect per-step spread;
-        # reward mean and pg_loss cannot prove a signal. declare this before the uploader because its
-        # publication gate closes over the histories.
-        adv_spread_history = state.adv_spread_history
-        resume_uploader = _start_resume_uploader(
-            local_dir=files["local_dir"],
-            resume_step=files["resume_step"],
-            inp=inp,
-            workdir=files["workdir"],
-            python_bin=python_bin,
-            preprocessor=preprocessor,
-            adv_spread_history=adv_spread_history,
-        )
-        env_for_verl = _build_rl_child_env(inp, files, loggers, reward_runtime.reward_url)
-        metrics_last = state.metrics_last
+            env_for_verl = _build_rl_child_env(inp, files, loggers, reward_runtime.reward_url)
+            metrics_last = state.metrics_last
 
-        def _progress():
-            return state.progress["step"]
+            def _progress():
+                return state.progress["step"]
 
-        def _reward_observability() -> dict:
-            """return reward metrics and sampled completions for one heartbeat."""
-            return reward_runtime.observability.heartbeat_fields()
+            def _reward_observability() -> dict:
+                """return reward metrics and sampled completions for one heartbeat."""
+                return reward_runtime.observability.heartbeat_fields()
 
-        _step_timing = _rl_step_timing_publisher(state, expected_steps)
-        with (
-            publishing_step_timing(_step_timing),
-            liveness_heartbeat(
+            _step_timing = _rl_step_timing_publisher(state, expected_steps)
+            # fills the stand-in registered above, which outlives this block.
+            _deferred_timing.bind(_step_timing)
+            with liveness_heartbeat(
                 "rl_step",
                 progress=_progress,
                 fields=lambda: {
@@ -401,40 +408,39 @@ def run_rl_train():
                     **_step_timing(),
                 },
                 progress_step=True,
-            ),
-        ):
-            rc = _execute_rl_child(
-                python_bin=python_bin,
-                overrides=configured["overrides"],
-                env_for_verl=env_for_verl,
-                inp=inp,
-                state=state,
-                reward_runtime=reward_runtime,
-                _reward_observability=_reward_observability,
-                files=files,
+            ):
+                rc = _execute_rl_child(
+                    python_bin=python_bin,
+                    overrides=configured["overrides"],
+                    env_for_verl=env_for_verl,
+                    inp=inp,
+                    state=state,
+                    reward_runtime=reward_runtime,
+                    _reward_observability=_reward_observability,
+                    files=files,
+                )
+            _validate_rl_child(
+                rc, state, files["resume_step"], expected_steps, resume_uploader, files=files
             )
-        _validate_rl_child(
-            rc, state, files["resume_step"], expected_steps, resume_uploader, files=files
-        )
-    finally:
-        # drain before the reward server goes down: on a cancel or crash the last completed
-        # checkpoint is exactly the one a retry needs, so it is worth uploading on the way out.
-        if resume_uploader is not None:
+        finally:
+            # drain before the reward server goes down: on a cancel or crash the last completed
+            # checkpoint is exactly the one a retry needs, so it is worth uploading on the way out.
+            if resume_uploader is not None:
+                with contextlib.suppress(Exception):
+                    resume_uploader.stop()
             with contextlib.suppress(Exception):
-                resume_uploader.stop()
-        with contextlib.suppress(Exception):
-            device_peak_gpu_gb = gpu_sampler.stop_gb()
-        # bridge first: the scoring thread is what the server's routes block on, so stopping the
-        # server before it would strand a scoring episode on an event nothing will ever set.
-        if reward_runtime.multi_turn_bridge is not None:
+                device_peak_gpu_gb = gpu_sampler.stop_gb()
+            # bridge first: the scoring thread is what the server's routes block on, so stopping the
+            # server before it would strand a scoring episode on an event nothing will ever set.
+            if reward_runtime.multi_turn_bridge is not None:
+                with contextlib.suppress(Exception):
+                    reward_runtime.multi_turn_bridge.shutdown()
+            reward_runtime.server.shutdown()
+            # every job boundary, not just the failing ones. `kill_process_group` runs on exceptions
+            # alone here, so a straggler an earlier teardown SIGKILLed but could not drain in time would
+            # otherwise be collected only by the next failing job.
             with contextlib.suppress(Exception):
-                reward_runtime.multi_turn_bridge.shutdown()
-        reward_runtime.server.shutdown()
-        # every job boundary, not just the failing ones. `kill_process_group` runs on exceptions
-        # alone here, so a straggler an earlier teardown SIGKILLed but could not drain in time would
-        # otherwise be collected only by the next failing job.
-        with contextlib.suppress(Exception):
-            reap_stragglers()
+                reap_stragglers()
 
     actor_dir, adapter_dir, steps_run, train_wall = _prepare_final_adapter(
         files["local_dir"], configured["t_train"]
@@ -447,13 +453,7 @@ def run_rl_train():
         progress_step=True,
         keepalive=True,
     ):
-        _export_final_adapter(actor_dir, adapter_dir, inp, python_bin)
-        preprocessor.save_pretrained(adapter_dir)
-        _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        # preserve the final checkpoint only when exact save steps are not configured: with
-        # save_at_steps set the customer asked for those steps and nothing else.
-        if final_save_due(steps_run, inp["save_at_steps"]):
-            _w.publish_deployable_checkpoint(adapter_dir, steps_run)
+        _publish_final_rl_adapter(actor_dir, adapter_dir, inp, python_bin, preprocessor, steps_run)
     _write_terminal_metadata(
         inp=inp,
         prompts=prompts,
@@ -474,6 +474,19 @@ def run_rl_train():
     )
 
 
+def _publish_final_rl_adapter(
+    actor_dir, adapter_dir, inp, python_bin, preprocessor, steps_run
+) -> None:
+    """Export the trained adapter, upload it as the run's default, and publish it if due."""
+    _export_final_adapter(actor_dir, adapter_dir, inp, python_bin)
+    preprocessor.save_pretrained(adapter_dir)
+    _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+    # preserve the final checkpoint only when exact save steps are not configured: with
+    # save_at_steps set the customer asked for those steps and nothing else.
+    if final_save_due(steps_run, inp["save_at_steps"]):
+        _w.publish_deployable_checkpoint(adapter_dir, steps_run)
+
+
 # the total startup delay the reward profile hook is allowed to add, covering reference extraction
 # AND timing. both call user code, so one shared ceiling is the only number that means anything to a
 # caller. it stays HERE rather than moving with `_log_reward_profile`: the reward-profile tests
@@ -491,6 +504,7 @@ _PROFILE_BUDGET_S = 30.0
 from flash.engine.worker.rl_train_runner import (  # noqa: E402,F401
     _announce_training,
     _build_rl_child_env,
+    _DeferredStepTiming,
     _execute_rl_child,
     _export_final_adapter,
     _ingest_step_metrics,
