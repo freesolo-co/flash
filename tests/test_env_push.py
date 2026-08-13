@@ -3073,6 +3073,191 @@ def test_a_stray_zip_signature_does_not_refuse_an_oversized_member():
     assert not _has_zip_end_record(b"\x41" * 4096 + b"PK\x05\x06" + b"\x00" * 12)
 
 
+def test_a_refusal_from_the_wrong_format_does_not_end_the_scan(tmp_path):
+    """A handler's limits are applied to bytes that may not be its format at all.
+
+    `_zip_member_count` reads the end-of-central-directory record, so a tar carrying a fake one
+    with the zip64 sentinel and no zip64 record made the ZIP handler refuse for "too many members".
+    `_Unscannable` is deliberately outside `_UNREADABLE_ARCHIVE`, so that refusal escaped before
+    the tar handler ran and the real credential inside was never reported.
+    """
+    import gzip
+    import io
+    import struct
+    import tarfile
+
+    from flash.env_secrets import credential_in_file
+
+    # an end record claiming the zip64 sentinel count, with no zip64 record behind it
+    sentinel = b"PK\x05\x06" + b"\x00" * 6 + struct.pack("<H", 0xFFFF) + b"\x00" * 8
+    sentinel += struct.pack("<H", 0)
+
+    poisoned = tmp_path / "poisoned.tar"
+    with tarfile.open(poisoned, "w") as archive:
+        for member, body in (
+            ("shard.gz", gzip.compress(f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode())),
+            ("pad.bin", sentinel),
+        ):
+            info = tarfile.TarInfo(member)
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(body))
+
+    assert credential_in_file(poisoned) == "a Freesolo API key"
+
+
+def test_a_genuinely_oversized_archive_still_refuses(tmp_path):
+    """Deferring a refusal must not discard it: no handler completing means nothing was verified.
+
+    The deferred refusal is re-raised when every handler failed, so a real archive over the member
+    bound is still fail-closed rather than quietly passing.
+    """
+    import zipfile
+
+    from flash import env_secrets as secrets
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(secrets, "_MAX_ARCHIVE_MEMBERS", 100)
+    try:
+        crowded = tmp_path / "crowded.zip"
+        with zipfile.ZipFile(crowded, "w", zipfile.ZIP_STORED) as archive:
+            for index in range(500):
+                archive.writestr(f"{index}", b"")
+        with pytest.raises(_Unscannable, match="too many members"):
+            credential_in_file(crowded)
+    finally:
+        monkeypatch.undo()
+
+
+def test_an_indented_wrapped_base64_block_is_joined():
+    """A wrapped blob is routinely indented: a YAML block scalar, a value under a `data:` key.
+
+    Requiring the next line to start in column 0 missed 20 of 60 key offsets on a two-space-indented
+    block, at both widths -- and indented is the commonest way a blob is embedded in a config file.
+    """
+    import base64
+    import os
+
+    from flash.env_secrets import _credential_kind
+
+    secret = f"fslo_{_FAKE_KEY_BODY}".encode()
+    for width in (76, 64):
+        for indent in (b"", b"  ", b"    ", b"\t"):
+            for pad in range(60):
+                body = base64.b64encode(b"P" * pad + secret)
+                blob = b"\n".join(
+                    indent + body[index : index + width] for index in range(0, len(body), width)
+                )
+                if b"\n" not in blob:
+                    continue
+                assert _credential_kind(blob) == "a Freesolo API key", (width, indent, pad)
+
+    # the indent must not weld two unrelated indented values into one decodable run
+    unrelated = (
+        base64.b64encode(os.urandom(57)) + b"\n  " + base64.b64encode(os.urandom(57)) + b"\n"
+    )
+    assert _credential_kind(unrelated) is None
+
+
+def test_a_name_holding_a_lone_surrogate_does_not_crash_the_check():
+    """`surrogateescape` is a DECODE-only handler, so encoding a lone surrogate raised.
+
+    Raised out of a security check, that turned the publish route's 400 into an uncaught 500, and
+    crashed the scan of an archive whose member name held one rather than reporting its contents.
+    """
+    from flash.env_secrets import _redacted, credential_in_name
+
+    assert credential_in_name("bad\ud800name") is None
+    # a real credential in a name that ALSO holds a surrogate is still found
+    key = f"fslo_{_FAKE_KEY_BODY}"
+    assert credential_in_name(f"bad\ud800name-{key}") == "a Freesolo API key"
+    # and reporting it does not crash either, since the refusal runs the redactor on that name
+    assert key not in _redacted(f"bad\ud800name-{key}")
+
+
+def test_an_encrypted_pkcs8_key_in_der_is_detected(tmp_path):
+    """`openssl pkcs8 -topk8 -passout` in DER hides the key inside an OCTET STRING.
+
+    None of the plaintext structures appear anywhere in the file, so it published intact -- while
+    the armoured form of the same key was caught by its `BEGIN ENCRYPTED PRIVATE KEY` header, which
+    made DER the way past. A passphrase is not much protection for a key in a public repository.
+    """
+    import subprocess
+
+    from flash.env_secrets import credential_in_file
+
+    plain = tmp_path / "plain.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            str(plain),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    for label, extra in (("pbes2", []), ("pkcs12pbe", ["-v1", "PBE-SHA1-3DES"])):
+        encrypted = tmp_path / f"{label}.der"
+        subprocess.run(
+            [
+                "openssl",
+                "pkcs8",
+                "-topk8",
+                "-in",
+                str(plain),
+                "-outform",
+                "DER",
+                "-out",
+                str(encrypted),
+                "-passout",
+                "pass:hunter2",
+                *extra,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        assert credential_in_file(encrypted) == "a private key", label
+
+    # the public half is not a private key and must still publish
+    public = tmp_path / "pub.der"
+    subprocess.run(
+        ["openssl", "pkey", "-in", str(plain), "-pubout", "-outform", "DER", "-out", str(public)],
+        check=True,
+        capture_output=True,
+    )
+    assert credential_in_file(public) is None
+
+
+def test_a_container_that_cannot_be_expanded_refuses_rather_than_passing(tmp_path):
+    """A `.zst` shard holds its credential nowhere a pattern can see, exactly like a gzip.
+
+    The stdlib has no zstd decompressor, so treating it as final content was a silent bypass.
+    Refusing says what is true -- not verified -- without adding a dependency to inspect a format
+    no environment in the hub currently uses.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("zstd") is None:
+        pytest.skip("zstd is not installed")
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    plain = tmp_path / "data.jsonl"
+    plain.write_text(f'{{"key": "fslo_{_FAKE_KEY_BODY}"}}\n')
+    compressed = tmp_path / "data.jsonl.zst"
+    subprocess.run(
+        ["zstd", "-q", "-f", str(plain), "-o", str(compressed)], check=True, capture_output=True
+    )
+    with pytest.raises(_Unscannable, match="cannot expand"):
+        credential_in_file(compressed)
+
+
 def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
     """`Warning:` is prose; `Proc-Type:` and `DEK-Info:` are RFC 1421 encrypted-key headers.
 
