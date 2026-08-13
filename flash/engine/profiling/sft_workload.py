@@ -262,8 +262,7 @@ class _TokenizedSftRows:
     sampled_texts: list[str]
     multiturn_targets: int
     coerced_singleturn_targets: int
-    authored_reasoning_turns: int
-    rendered_reasoning_spans: int
+    reasoning_by_index: dict[int, tuple[int, int]]
     dropped: int
 
 
@@ -271,6 +270,8 @@ class _TokenizedSftRows:
 class _RetainedSftRows:
     rows: list[dict[str, Any]]
     untruncated_lengths: list[int]
+    authored_reasoning_turns: int
+    rendered_reasoning_spans: int
     dropped: int
 
 
@@ -301,6 +302,30 @@ def _sft_completion_with_provenance(env, example: dict) -> tuple[list[dict], boo
     return env.sft_completion(example), False
 
 
+def _row_reasoning(
+    completion_messages: list[dict],
+    *,
+    full_text: str,
+    prompt_text: str,
+) -> tuple[int, int]:
+    """One row's (authored reasoning turns, reasoning spans that survive into the SUPERVISED span).
+
+    Rendered spans are counted over the full render MINUS the prompt render, not the full text: a
+    literal ``<think>...</think>`` in a system or user message renders a real span that is never
+    supervised, and counting it would offset a target's lost reasoning and suppress the warning.
+
+    The subtraction is on counts rather than a string slice because the prompt render is not always
+    a text prefix of the full render -- for a multi-turn target the generation prompt pre-opens
+    ``<think>`` at a position the full render does not have -- so ``full[len(prompt):]`` is not a
+    safe way to isolate the target.
+    """
+    authored = reasoned_assistant_turns(completion_messages)
+    rendered = count_rendered_reasoning_spans(full_text) - count_rendered_reasoning_spans(
+        prompt_text
+    )
+    return authored, max(0, rendered)
+
+
 def _tokenize_prompt_rows(
     spec,
     prompt_rows: list[tuple[Any, list[dict], list[dict], bool]],
@@ -324,12 +349,11 @@ def _tokenize_prompt_rows(
     sampled_texts: list[str] = []
     multiturn_targets = 0
     coerced_singleturn_targets = 0
-    # counted over the COMPLETION messages and the rendered text of every row, not a sample: this is
-    # the comparison that shows reasoning being dropped at render time, and a sample would let a
-    # cheap row hide an expensive one. only completion turns count, because reasoning in the prompt
-    # history is context the model reads rather than supervision it is trained on.
-    authored_reasoning_turns = 0
-    rendered_reasoning_spans = 0
+    # kept per row rather than summed here, for the same reason as `untruncated_by_index`: rows that
+    # lose their whole completion to the cap are dropped below, and folding their reasoning into a
+    # running total would report loss from rows the run never trains on against a retained-row
+    # denominator. summed after filtering instead.
+    reasoning_by_index: dict[int, tuple[int, int]] = {}
     for row_index, (
         example,
         prompt_messages,
@@ -378,8 +402,16 @@ def _tokenize_prompt_rows(
                 enable_thinking=spec.thinking,
             )
             sampled_texts.append(text)
-            authored_reasoning_turns += reasoned_assistant_turns(completion_messages)
-            rendered_reasoning_spans += count_rendered_reasoning_spans(text)
+            reasoning_by_index[row_index] = _row_reasoning(
+                completion_messages,
+                full_text=text,
+                prompt_text=tokenizer.apply_chat_template(
+                    normalized.messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=spec.thinking,
+                ),
+            )
         else:
             text = tokenizer.apply_chat_template(
                 [*prompt_messages, *completion_messages],
@@ -394,8 +426,11 @@ def _tokenize_prompt_rows(
                 enable_thinking=spec.thinking,
             )
             sampled_texts.append(text)
-            authored_reasoning_turns += reasoned_assistant_turns(completion_messages)
-            rendered_reasoning_spans += count_rendered_reasoning_spans(text)
+            reasoning_by_index[row_index] = _row_reasoning(
+                completion_messages,
+                full_text=text,
+                prompt_text=prompt_text,
+            )
             text_specs.append({"text": text, "prompt_text": prompt_text, "row_index": row_index})
 
     dropped = 0
@@ -421,8 +456,7 @@ def _tokenize_prompt_rows(
         sampled_texts=sampled_texts,
         multiturn_targets=multiturn_targets,
         coerced_singleturn_targets=coerced_singleturn_targets,
-        authored_reasoning_turns=authored_reasoning_turns,
-        rendered_reasoning_spans=rendered_reasoning_spans,
+        reasoning_by_index=reasoning_by_index,
         dropped=dropped,
     )
 
@@ -432,6 +466,8 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
     special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
     rows = []
     retained_untruncated: list[int] = []
+    authored_reasoning = 0
+    rendered_reasoning = 0
     dropped = tokenized.dropped
     for row_index in sorted(tokenized.row_by_index):
         row = tokenized.row_by_index[row_index]
@@ -440,6 +476,12 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
             # appended in lockstep with the row it measures, so the truncation counts below describe
             # the rows that are actually trained on rather than the ones that were dropped.
             retained_untruncated.append(tokenized.untruncated_by_index[row_index])
+            # summed here for the same reason, so the reasoning-loss warning describes the rows the
+            # run trains on. a dropped row contributes neither its authored reasoning nor its
+            # survivors, which would otherwise be reported against a retained-row denominator.
+            row_authored, row_rendered = tokenized.reasoning_by_index.get(row_index, (0, 0))
+            authored_reasoning += row_authored
+            rendered_reasoning += row_rendered
         else:
             dropped += 1
     if not rows:
@@ -450,6 +492,8 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
     return _RetainedSftRows(
         rows=rows,
         untruncated_lengths=retained_untruncated,
+        authored_reasoning_turns=authored_reasoning,
+        rendered_reasoning_spans=rendered_reasoning,
         dropped=dropped,
     )
 
@@ -711,10 +755,11 @@ def prepare_sft_workload(
     # emitted from here rather than the training worker so it reaches the estimate too: by the time
     # the worker logs it the gpu is already allocated, and the whole point is to let the user
     # restructure the dataset before paying for a run that trains on a fraction of its reasoning.
-    # counted over every row, and only over rows the run keeps.
+    # every retained row is counted rather than a sample, so a cheap row cannot hide an expensive
+    # one, and dropped rows are excluded so the figures describe what the run actually trains on.
     reasoning_warning = rendered_reasoning_loss_warning(
-        authored_turns=tokenized.authored_reasoning_turns,
-        rendered_spans=tokenized.rendered_reasoning_spans,
+        authored_turns=retained.authored_reasoning_turns,
+        rendered_spans=retained.rendered_reasoning_spans,
         rows=len(retained.rows),
     )
     if reasoning_warning:
@@ -728,6 +773,6 @@ def prepare_sft_workload(
         sampled_texts=tokenized.sampled_texts,
         multiturn_targets=tokenized.multiturn_targets,
         coerced_singleturn_targets=tokenized.coerced_singleturn_targets,
-        authored_reasoning_turns=tokenized.authored_reasoning_turns,
-        rendered_reasoning_spans=tokenized.rendered_reasoning_spans,
+        authored_reasoning_turns=retained.authored_reasoning_turns,
+        rendered_reasoning_spans=retained.rendered_reasoning_spans,
     )

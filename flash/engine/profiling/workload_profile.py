@@ -57,7 +57,15 @@ def sft_sample_policy(max_examples: object) -> str:
 # non-space character: the thinking template emits `<think>\n\n</think>` on a trailing assistant
 # turn that authored no reasoning, and counting that as surviving reasoning would report 100%
 # survival for a transcript whose reasoning was entirely stripped.
-_NON_EMPTY_THINK = re.compile(r"<think>\s*\S.*?</think>", re.DOTALL)
+#
+# the body may not cross either delimiter. a plain `\s*\S.*?` body lets the required non-space
+# character be the `<` of the closing tag, so two ADJACENT EMPTY blocks -- what consecutive
+# trailing assistant turns render -- merge into one match and count as a survivor. that failure
+# lands exactly on the transcript that lost the most, which is the one this must not miss.
+_NON_EMPTY_THINK = re.compile(
+    r"<think>(?:(?!</think>|<think>).)*?\S(?:(?!</think>|<think>).)*?</think>",
+    re.DOTALL,
+)
 
 
 # why a run resolved to `exact-unpacked`, keyed by the architecture label the packing decision
@@ -124,13 +132,32 @@ def unpacked_batch_warning(
     )
 
 
+def _message_text(content: object) -> str:
+    """The text of a message's ``content`` in either the string or content-block shape."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        )
+    return ""
+
+
 def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:
     """Assistant turns that author reasoning, counted from the SOURCE messages.
 
-    Both shapes the chat template accepts count: a literal ``<think>...</think>`` span inside
-    ``content``, and a separate ``reasoning_content`` field. The template reads the second in
-    preference to the first, so a row that uses it would otherwise look reasoning-free here while
-    rendering reasoning, and the comparison below would under-report the drop.
+    Every shape the chat template accepts counts, because a shape missed here reads as "authored no
+    reasoning" and silences the warning for a row that is losing all of it:
+
+    * a literal ``<think>...</think>`` span in a string ``content``;
+    * the same span inside ``[{"type": "text", "text": ...}]`` content blocks, which
+      ``flash.content.multimodal.text_only_prompt_messages`` flattens for rendering;
+    * a separate ``reasoning_content`` field, which the template reads in preference to an inline
+      span.
     """
     turns = 0
     for message in messages:
@@ -140,8 +167,7 @@ def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:
         if isinstance(reasoning, str) and reasoning.strip():
             turns += 1
             continue
-        content = message.get("content")
-        if isinstance(content, str) and _NON_EMPTY_THINK.search(content):
+        if _NON_EMPTY_THINK.search(_message_text(message.get("content"))):
             turns += 1
     return turns
 

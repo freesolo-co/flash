@@ -98,6 +98,43 @@ def test_the_real_template_keeps_reasoning_authored_in_final_position(tokenizer)
     assert "only" in rendered
 
 
+def test_the_real_template_passes_a_prompt_think_span_through_verbatim(tokenizer) -> None:
+    """Why rendered spans are counted net of the prompt render.
+
+    The template's reasoning split is ASSISTANT-only, so a literal ``<think>...</think>`` written
+    into a system prompt survives into the render while never being supervised. Counting the full
+    render would let that span offset reasoning stripped from the target and silence the warning.
+    """
+    prompt_messages = [
+        {"role": "system", "content": "answer as <think>reasoning</think>answer"},
+        {"role": "user", "content": "board"},
+    ]
+    prompt = _render(tokenizer, prompt_messages, add_generation_prompt=True)
+
+    assert count_rendered_reasoning_spans(prompt) == 1
+    assert "<think>reasoning</think>" in prompt
+
+
+def test_the_real_template_renders_two_empty_blocks_for_two_bare_trailing_turns(tokenizer) -> None:
+    """The input that makes a delimiter-crossing span pattern merge two empty blocks into one.
+
+    Both blocks are empty, so the correct count is zero; a pattern that lets the first closing
+    tag's ``<`` satisfy its non-whitespace requirement reports one survivor instead.
+    """
+    messages = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "<think>first</think>a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "assistant", "content": "a3"},
+    ]
+    rendered = _render(tokenizer, messages)
+
+    assert rendered.count("<think>") == 2
+    assert count_rendered_reasoning_spans(rendered) == 0
+    assert reasoned_assistant_turns(messages) == 1
+
+
 def test_the_real_template_prefers_reasoning_content_over_an_inline_span(tokenizer) -> None:
     """Pins the ``reasoning_content`` branch of ``reasoned_assistant_turns`` to the template."""
     messages = [

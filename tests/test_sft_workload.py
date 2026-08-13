@@ -494,9 +494,20 @@ class ThinkingTokenizer(FakeTokenizer):
         )
         parts = []
         for index, message in enumerate(messages):
-            content = str(message.get("content") or "")
+            raw = message.get("content")
+            if isinstance(raw, list):
+                content = "".join(
+                    block.get("text") or ""
+                    for block in raw
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            else:
+                content = str(raw or "")
             reasoning = ""
-            if "</think>" in content:
+            # the split is ASSISTANT-only in the real template: a literal <think> span in a system
+            # or user message is passed through verbatim, which is what lets prompt text contribute
+            # a rendered span that is never supervised.
+            if message.get("role") == "assistant" and "</think>" in content:
                 reasoning = content.split("</think>")[0].split("<think>")[-1].strip()
                 content = content.split("</think>")[-1].lstrip("\n")
             if message.get("role") == "assistant" and index > last_query:
@@ -629,3 +640,154 @@ def test_reasoning_carried_in_reasoning_content_counts_as_authored(capsys) -> No
 
     assert prepared.authored_reasoning_turns == 2
     assert "dropped" in capsys.readouterr().err
+
+
+def test_adjacent_empty_think_blocks_do_not_merge_into_one_survivor(capsys) -> None:
+    """Two consecutive trailing assistant turns that authored nothing render two EMPTY blocks.
+
+    A span pattern whose body may cross a delimiter lets the required non-space character be the
+    ``<`` of the first closing tag, swallowing both blocks as one match. That reads as a surviving
+    span on a transcript where nothing survived, which suppresses the warning on the worst input.
+    """
+    prepared = _thinking_prepared(
+        [
+            {"role": "assistant", "content": "<think>first</think>a1"},
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "assistant", "content": "a3"},
+        ]
+    )
+
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 0
+    assert "dropped 1 of 1 authored reasoning blocks" in capsys.readouterr().err
+
+
+def test_consecutive_reasoned_turns_are_counted_individually(capsys) -> None:
+    """The paired control for the pattern above: real adjacent spans must still count separately.
+
+    A pattern tightened until it stops merging empty blocks can also stop matching the second of two
+    real ones, which would invent reasoning loss for a transcript that lost none.
+    """
+    prepared = _thinking_prepared(
+        [
+            {"role": "assistant", "content": "<think>first</think>a1"},
+            {"role": "assistant", "content": "<think>second</think>a2"},
+        ]
+    )
+
+    assert prepared.authored_reasoning_turns == 2
+    assert prepared.rendered_reasoning_spans == 2
+    assert "authored reasoning blocks" not in capsys.readouterr().err
+
+
+def test_a_think_span_in_the_prompt_does_not_offset_reasoning_lost_from_the_target(capsys) -> None:
+    """Only the supervised span counts, so prompt text cannot pay for a target's lost reasoning.
+
+    An environment that documents the format by showing a literal ``<think>...</think>`` in its
+    system prompt renders a real span that is never trained on. Counting the full render would let
+    it cancel a dropped target block and silence the warning.
+    """
+
+    class PromptThinkEnvironment(ThinkingEnvironment):
+        def prompt_messages(self, row):
+            return [
+                {"role": "system", "content": "answer as <think>reasoning</think>answer"},
+                {"role": "user", "content": row["prompt"]},
+            ]
+
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        PromptThinkEnvironment(
+            [
+                {"role": "assistant", "content": "<think>first</think>a1"},
+                {"role": "user", "content": "next"},
+                {"role": "assistant", "content": "a2"},
+            ]
+        ),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    assert prepared.authored_reasoning_turns == 1
+    # the prompt's own span is excluded, so the target's loss is still visible
+    assert prepared.rendered_reasoning_spans == 0
+    assert "dropped 1 of 1 authored reasoning blocks" in capsys.readouterr().err
+
+
+def test_reasoning_in_a_dropped_row_is_not_reported_against_the_retained_rows(capsys) -> None:
+    """A row whose completion is truncated away is not trained on, so its reasoning is not lost to
+    the template -- the row is simply gone, and the existing drop warning covers it.
+
+    Counting it here would report a reasoning loss "across N rows" that the retained rows did not
+    incur, and could warn about a run whose every trained row keeps its reasoning.
+    """
+
+    class MixedEnvironment(ThinkingEnvironment):
+        def __init__(self):
+            super().__init__([])
+            self._rows = [{"prompt": "x" * 400, "answer": ""}, {"prompt": "ok", "answer": ""}]
+
+        def sft_completion(self, row):
+            if row["prompt"] == "ok":
+                return [{"role": "assistant", "content": "<think>kept</think>a"}]
+            return [
+                {"role": "assistant", "content": "<think>lost</think>a1"},
+                {"role": "user", "content": "next"},
+                {"role": "assistant", "content": "a2"},
+            ]
+
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=64, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        MixedEnvironment(),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    # the long row lost its whole completion to the cap and was dropped
+    assert prepared.profile.dropped_examples == 1
+    assert prepared.profile.retained_examples == 1
+    # so only the retained row's reasoning is accounted, and it kept all of it
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 1
+    assert "authored reasoning blocks" not in capsys.readouterr().err
+
+
+def test_block_form_assistant_content_counts_as_authored_reasoning(capsys) -> None:
+    """Content blocks are a supported target shape, and a shape missed here silences the warning.
+
+    ``reasoned_assistant_turns`` reading only string ``content`` would score a block-form multi-turn
+    target as authoring nothing, so a row losing all its reasoning would report none.
+    """
+    prepared = _thinking_prepared(
+        [
+            {"role": "assistant", "content": [{"type": "text", "text": "<think>first</think>a1"}]},
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": [{"type": "text", "text": "<think>second</think>a2"}]},
+        ]
+    )
+
+    assert prepared.authored_reasoning_turns == 2
+    assert "dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
