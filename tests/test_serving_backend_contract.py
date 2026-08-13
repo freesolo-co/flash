@@ -4126,3 +4126,171 @@ def test_undeploy_still_reports_success_when_it_converges(client):
         f"runs that did settle"
     )
     assert REVISION in response.json()["disabled_revisions"]
+
+
+def test_a_failed_warm_eviction_rpc_leaves_the_revision_collectable(client):
+    """A warm undeploy whose engine RPC dies must still reclaim the revision's download.
+
+    `Engine.unregister` is the only successful-undeploy path that releases the durable `loraid:`
+    claim and reclaims the disk, and the record is already `disabled` before the RPC is dispatched.
+    A later DELETE walks the members and passes over an already-disabled record unless it carries
+    `cache_reclaim_pending` -- so an RPC that raised used to end the revision's life right there,
+    with a directory on the volume nothing would ever revisit.
+    """
+    module = client.app.state.generated_module
+    run_id = "warm-rpc-death"
+    revision = f"{run_id}@final." + "e" * 40
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "revision", "lifecycle_state": "ready"},
+    }
+    module.adapter_records[module._record_key(run_id)] = {
+        "adapter_id": run_id,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "alias", "alias_of": revision},
+    }
+    module.adapter_records[module._members_key(run_id)] = [run_id, revision]
+    module.runners.count = 1  # warm, so the engine branch is the one taken
+
+    async def _rpc_dies(adapter_id):
+        raise RuntimeError("connection reset mid unregister")
+
+    module.engine_methods["unregister"] = _rpc_dies
+    module.discarded.clear()
+
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+
+    assert revision in module.discarded, (
+        "the engine rpc died and nothing collected the revision's download, so the directory stays "
+        "on the volume: the record is already `disabled` and carries no marker, so every later "
+        "undeploy passes over it for the life of the app"
+    )
+
+
+def test_a_dead_warm_rpc_keeps_its_marker_when_the_reclaim_also_fails(client, monkeypatch):
+    """Both recoveries failing must still leave the revision reachable by the next undeploy.
+
+    The marker is what puts an already-disabled revision back in reach: undeploy's member walk
+    collects a disabled record only when it carries `cache_reclaim_pending`. A successful reclaim
+    clears it (there is nothing left to collect), so the marker only has to survive when the
+    reclaim itself did not.
+    """
+    module = client.app.state.generated_module
+    run_id = "warm-rpc-and-disk-death"
+    revision = f"{run_id}@final." + "d" * 40
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "revision", "lifecycle_state": "ready"},
+    }
+    module.adapter_records[module._record_key(run_id)] = {
+        "adapter_id": run_id,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "alias", "alias_of": revision},
+    }
+    module.adapter_records[module._members_key(run_id)] = [run_id, revision]
+    module.runners.count = 1
+
+    async def _rpc_dies(adapter_id):
+        raise RuntimeError("connection reset mid unregister")
+
+    async def _reclaim_dies(adapter_id):
+        raise OSError("input/output error on the volume")
+
+    module.engine_methods["unregister"] = _rpc_dies
+    # `reclaim_adapter_cache` is a plain `@app.function`, so its body runs for real and calls this.
+    monkeypatch.setattr(module, "_discard_cached_adapter", _reclaim_dies)
+
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+
+    record = module.adapter_records[module._record_key(revision)]
+    assert (record.get("metadata") or {}).get("cache_reclaim_pending"), (
+        "the rpc died and the reclaim died, and nothing left a marker behind -- so the next "
+        "undeploy passes over this disabled record and the directory is orphaned permanently"
+    )
+
+
+def test_a_warm_eviction_that_fails_keeps_the_adapter_findable(client, engine):
+    """`remove_lora` failing must leave both local maps naming the still-resident adapter.
+
+    `_lora_request`'s stale sweep finds a resident adapter holding a re-used int id only through
+    `_int_ids`. Clearing the maps before the eviction is confirmed makes a failed `remove_lora`
+    produce exactly the untracked orphan that sweep exists to catch: the LoRA is still bound to the
+    int id inside vLLM, nothing on this container names it, and a later registration on this
+    replica calls `add_lora` over an id vLLM already has taken.
+    """
+    module = client.app.state.generated_module
+    run_id = "evict-fails"
+    revision = f"{run_id}@final." + "f" * 40
+    int_id = module._lora_int_id(revision)
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "disabled",
+        "metadata": {"run_id": run_id, "record_type": "revision"},
+    }
+    module.adapter_records[module._lora_id_key(int_id)] = revision
+
+    async def _remove_fails(_int_id):
+        raise RuntimeError("vllm refused the eviction")
+
+    resident = object()
+    instance = engine.__new__(engine)
+    instance._locks = {}
+    instance._loaded = {revision: resident}
+    instance._int_ids = {int_id: revision}
+    instance.engine = types.SimpleNamespace(remove_lora=_remove_fails)
+
+    _run_awaitable(engine.unregister(instance, revision))
+
+    assert instance._int_ids.get(int_id) == revision, (
+        "the eviction failed but `_int_ids` was cleared anyway, so the still-resident lora is "
+        "untracked and the stale sweep in `_lora_request` can no longer find it to evict -- the "
+        "next load on this replica calls `add_lora` over an id vllm still has bound"
+    )
+    assert instance._loaded.get(revision) is resident, (
+        "the eviction failed but `_loaded` was cleared anyway, so this replica lost its record of "
+        "an adapter vllm still holds"
+    )
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) == revision, (
+        "the claim was released without a confirmed eviction, so a collider can take the id and "
+        "load while the old weights still occupy it"
+    )
+
+
+def test_undeploy_repairs_a_partial_index_left_by_an_older_version(client):
+    """A run indexed by an older app version must not keep serving after DELETE returns 200.
+
+    Emptiness alone cannot detect the state a version boundary produces. A run whose revisions
+    predate the `members:` key has no index -- and one new registration on it creates a NONEMPTY
+    index naming only the newcomer. Read as "nonempty, therefore complete", the disable loop then
+    covers the newcomer and the alias and leaves every legacy sibling `ready`, resident, and
+    callable by its immutable id, with undeploy reporting success.
+
+    The alias id is what separates the cases: every registration this version handles indexes
+    `run_id` via `_ensure_run_alias`, so an index this version built always names it.
+    """
+    module = client.app.state.generated_module
+    run_id = "legacy-partial"
+    legacy = f"{run_id}@final." + "1" * 40
+    newcomer = f"{run_id}@final." + "2" * 40
+    for revision in (legacy, newcomer):
+        module.adapter_records[module._record_key(revision)] = {
+            "adapter_id": revision,
+            "status": "ready",
+            "metadata": {"run_id": run_id, "record_type": "revision", "lifecycle_state": "ready"},
+        }
+    module.adapter_records[module._record_key(run_id)] = {
+        "adapter_id": run_id,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "alias", "alias_of": newcomer},
+    }
+    # The partial index an older version leaves behind: the newcomer only, no alias id.
+    module.adapter_records[module._members_key(run_id)] = [newcomer]
+
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+
+    assert module.adapter_records[module._record_key(legacy)]["status"] == "disabled", (
+        "undeploy answered 200 while a legacy sibling stayed `ready` -- it is still resident on "
+        "the gpu and directly callable by its immutable id, so the run keeps serving after delete"
+    )

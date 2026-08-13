@@ -242,7 +242,27 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
                 f"read-back returned {response.status_code}: {response.text[:400]}. a non-404 4xx "
                 f"is a hard failure for the client too -- it re-raises any status below 500"
             )
-            record = _record(response.json())
+            # Decoded defensively, because the CLIENT treats both failures as transient. A 200
+            # carrying truncated JSON or a non-object payload makes
+            # `_registered_adapter_response` raise a `ServingError` with NO status code, and
+            # `_wait_revision_ready` re-raises only `status_code < 500` -- so it falls through and
+            # polls again until the deadline. Asserting on the decode here failed the whole run on
+            # one malformed readback and rejected a backend the real deploy drives successfully
+            # once its next read is valid.
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                # Backed off, not spun on. Falling straight to `continue` would skip the sleep at
+                # the tail of the loop and hammer a backend answering malformed 200s as fast as the
+                # network allows for the whole readiness budget. This mirrors the transport-error
+                # branch above: compute from THIS response, sleep, then poll again.
+                delay = _readback_delay(attempt, response.headers.get("Retry-After"))
+                attempt += 1
+                time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+                continue
+            record = _record(payload)
             last = _lifecycle_state(record)
             if last == "failed" or record.get("status") == "disabled":
                 metadata = record.get("metadata") or {}
@@ -490,7 +510,7 @@ def test_readback_echoes_the_identity_the_client_cross_checks(http, deployed):
 
 
 def test_a_constrained_registration_serves_a_constrained_completion(
-    http, adapter_source, run_id, ready_timeout
+    http, adapter_source, run_id, ready_timeout, chat_timeout
 ):
     """`structured_outputs` must survive the round trip byte for byte AND reach generation.
 
@@ -537,6 +557,7 @@ def test_a_constrained_registration_serves_a_constrained_completion(
                 "temperature": 0.0,
                 "chat_template_kwargs": {"enable_thinking": False},
             },
+            timeout=chat_timeout,
         )
         assert response.status_code == 200, (
             f"chat on a constrained revision returned {response.status_code}: {response.text[:400]}"
@@ -835,7 +856,7 @@ def test_concurrent_activations_of_one_alias_leave_exactly_one_winner(
         http.delete(f"/adapters/{run_id}")
 
 
-def test_chat_resolves_the_alias_to_its_immutable_revision(http, deployed):
+def test_chat_resolves_the_alias_to_its_immutable_revision(http, deployed, chat_timeout):
     """Users chat with a run id; the weights must come from the revision it currently targets."""
     run = deployed["metadata"]["run_id"]
     assert _activate(http, deployed["adapter_id"], None).status_code == 200
@@ -848,6 +869,7 @@ def test_chat_resolves_the_alias_to_its_immutable_revision(http, deployed):
             "temperature": 0.0,
             "chat_template_kwargs": {"enable_thinking": False},
         },
+        timeout=chat_timeout,
     )
     assert response.status_code == 200, (
         f"chat returned {response.status_code}: {response.text[:400]}"
@@ -978,7 +1000,7 @@ def test_undeploying_an_unknown_run_is_a_clean_404(http):
     )
 
 
-def test_chat_streams_deltas_the_way_the_cli_asks_for_them(http, deployed):
+def test_chat_streams_deltas_the_way_the_cli_asks_for_them(http, deployed, chat_timeout):
     """`flash models chat` streams; a backend that only serves non-streaming fails the CLI.
 
     `flash/serve/streaming.py` sends `stream: true` and decodes SSE `data:` frames, taking the
@@ -998,7 +1020,7 @@ def test_chat_streams_deltas_the_way_the_cli_asks_for_them(http, deployed):
     }
     deltas: list[str] = []
     saw_done = False
-    with http.stream("POST", "/v1/chat/completions", json=body) as response:
+    with http.stream("POST", "/v1/chat/completions", json=body, timeout=chat_timeout) as response:
         assert response.status_code == 200, f"streaming chat returned {response.status_code}"
         media = response.headers.get("content-type", "")
         assert "text/event-stream" in media, (
@@ -1023,7 +1045,7 @@ def test_chat_streams_deltas_the_way_the_cli_asks_for_them(http, deployed):
     )
 
 
-def test_a_wrong_serving_key_is_rejected(http, serving_url, internal_key):
+def test_a_wrong_serving_key_is_rejected(serving_client_factory, internal_key, adapter_source):
     """A backend that ignores the key passes every other test while being publicly writable.
 
     The rest of the suite only ever sends the CORRECT key, so it cannot tell "checks the key" from
@@ -1044,13 +1066,21 @@ def test_a_wrong_serving_key_is_rejected(http, serving_url, internal_key):
     """
     if not internal_key:
         pytest.skip("no FREESOLO_INTERNAL_KEY configured; the backend is intentionally open")
-    import httpx
 
     revision = "conformance-unauthorized@final." + "0" * 40
     # Bodies are deliberately well-formed: a 422 would prove nothing about authentication, since
     # rejecting a malformed payload does not tell an anonymous caller apart from an authorized one.
+    #
+    # The register probe therefore sends the FULL registration shape, not a bare `adapter_id`. It
+    # used to send only the id while the comment above claimed otherwise: a backend whose schema
+    # validation runs before its auth dependency answers 422 to that, which is neither 401 nor 403,
+    # so the suite reported the registration route as unauthenticated on a backend that rejects
+    # every wrongly-keyed valid request. `_registration` builds the same body `deploy_adapter`
+    # sends; only the run id differs, and nothing is ever created because the key is wrong.
+    unauthorized_body = _registration("conformance-unauthorized", adapter_source)
+    unauthorized_body["adapter_id"] = revision
     probes = (
-        ("register", "POST", "/adapters", {"adapter_id": revision}),
+        ("register", "POST", "/adapters", unauthorized_body),
         ("read back", "GET", f"/adapters/{revision}", None),
         ("activate", "POST", f"/adapters/{revision}/activate", {"expected_adapter_revision": None}),
         (
@@ -1064,14 +1094,17 @@ def test_a_wrong_serving_key_is_rejected(http, serving_url, internal_key):
         ("delete", "DELETE", f"/adapters/{revision}", None),
     )
     unprotected = []
-    with httpx.Client(base_url=serving_url, timeout=30.0) as client:
+    # Built through the shared factory rather than a bare `httpx.Client`, for two reasons the
+    # standalone client got wrong. It did not follow redirects, so a backend that answers a
+    # protected route with Modal's 303 async-result redirect recorded 303 here -- neither 401 nor
+    # 403 -- and a conforming backend was reported as unprotected. And it carried no
+    # `_strip_key_off_origin` hook, so a redirect to another origin would have forwarded the
+    # `internal_key + "-wrong"` header off-origin, from which the real key is trivially recovered.
+    # Overriding just the header on the shipped shape keeps both properties.
+    with serving_client_factory() as client:
+        client.headers["X-Freesolo-Internal-Key"] = internal_key + "-wrong"
         for name, method, path, body in probes:
-            response = client.request(
-                method,
-                path,
-                json=body,
-                headers={"X-Freesolo-Internal-Key": internal_key + "-wrong"},
-            )
+            response = client.request(method, path, json=body)
             if response.status_code not in (401, 403):
                 unprotected.append(f"{name} ({method} {path}) -> {response.status_code}")
 
@@ -1081,3 +1114,54 @@ def test_a_wrong_serving_key_is_rejected(http, serving_url, internal_key):
         f"listed -- read adapter metadata, switch or disable a run's alias, or run generation on "
         f"your GPU -- while the backend still advertises key protection"
     )
+
+
+def test_a_malformed_readback_is_polled_through_rather_than_failed(monkeypatch):
+    """A 200 carrying junk must be treated as transient, exactly as the shipped client treats it.
+
+    `_registered_adapter_response` raises a `ServingError` with NO status code for invalid JSON and
+    for a non-object payload, and `_wait_revision_ready` re-raises only `status_code < 500` -- so
+    both fall through and poll again until the deadline. The suite asserted on the decode instead,
+    so one malformed readback failed the whole conformance run and rejected a backend that
+    `flash models deploy` drives successfully once its next read is valid.
+
+    Takes no live fixtures, so it runs in CI where every `--serving-url` test skips.
+    """
+
+    class _Response:
+        def __init__(self, payload, *, raises=False):
+            self.status_code = 200
+            self.headers: dict[str, str] = {}
+            self.text = "<junk>"
+            self._payload = payload
+            self._raises = raises
+
+        def json(self):
+            if self._raises:
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+            return self._payload
+
+    ready = {
+        "adapter_id": "rev",
+        "status": "ready",
+        "metadata": {"lifecycle_state": "ready"},
+    }
+    # Truncated body, then a non-object body, then the real record. A suite that fails on either of
+    # the first two never sees the third.
+    responses = [
+        _Response(None, raises=True),
+        _Response(["not", "an", "object"]),
+        _Response(ready),
+    ]
+
+    def _get(*args, **kwargs):
+        return responses.pop(0)
+
+    record = _wait_ready(types.SimpleNamespace(get=_get), "rev", timeout=30.0)
+
+    assert record.get("status") == "ready", (
+        "the suite gave up on a malformed read-back instead of polling through it, so a backend "
+        "that answers one truncated 200 mid-deploy fails conformance while the shipped client "
+        "retries and succeeds"
+    )
+    assert not responses, "the loop stopped early and never reached the valid record"

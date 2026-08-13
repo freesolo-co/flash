@@ -163,6 +163,26 @@ def _build_client(serving_url, internal_key):
     )
 
 
+# What the shipped chat clients allow per request. `flash/serve/deploy.py` bounds a non-streaming
+# completion with `30 * 60.0` and the streaming path with the same budget, while every control-plane
+# call goes through `_serving_request`'s hard `min(60.0, ...)` clamp. The suite's session client
+# carries the 60s cap, which is right for register/activate/delete and wrong for generation: a first
+# completion after a scale-to-zero cold start routinely takes minutes, and a 60s bound here failed a
+# backend that `flash models chat` waits out successfully.
+CHAT_REQUEST_TIMEOUT_SECONDS = 30 * 60.0
+
+
+@pytest.fixture(scope="session")
+def chat_timeout():
+    """The per-request timeout every conformance chat call must use.
+
+    Separate from the session client's default on purpose: keeping the 60s cap for control-plane
+    requests is what makes the suite reject a backend the client would abandon, so this widens only
+    the generation calls rather than the client as a whole.
+    """
+    return CHAT_REQUEST_TIMEOUT_SECONDS
+
+
 @pytest.fixture(scope="session")
 def serving_client_factory(serving_url, internal_key):
     """Build a fresh client with the suite's shipped-client shape.

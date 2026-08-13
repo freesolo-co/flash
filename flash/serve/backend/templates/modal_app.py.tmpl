@@ -888,13 +888,12 @@ class Engine:
             # cache and re-downloaded and re-`add_lora`d weights that were already resident. That
             # is a milder version of the very race this guard exists to leave alone, so dropping
             # the cache entry has to be part of the undeploy rather than something that happens on
-            # the way to deciding whether to undeploy at all.
+            # the way to deciding whether to undeploy at all. Both maps now clear together, below,
+            # and only once the eviction is confirmed.
             current = await adapter_records.get.aio(_record_key(adapter_id))
             if isinstance(current, dict) and current.get("status") != "disabled":
                 return {{"ok": True}}
-            self._loaded.pop(adapter_id, None)
             if await _owns_lora_int_id(int_id, adapter_id):
-                self._int_ids.pop(int_id, None)
                 # Drop it from vLLM too, not just from this dict. The LoRA cache is bounded by
                 # max_loras, so repeated deploy/undeploy cycles would otherwise keep disabled
                 # adapters resident until the container restarts and start evicting live ones.
@@ -911,7 +910,18 @@ class Engine:
                     await self.engine.remove_lora(int_id)
                 except Exception:  # best effort, never fails an undeploy
                     evicted = False
+                # The LOCAL maps clear on the same condition as the durable claim, and for the
+                # same reason. They used to be popped before this call: a failed `remove_lora`
+                # then left the LoRA resident under an int id nothing on this container names, so
+                # `_lora_request`'s stale sweep -- which finds a resident stale adapter only
+                # through `_int_ids` -- had nothing to find, and a later re-registration on this
+                # replica called `add_lora` over an id vLLM still has bound. That is the untracked
+                # orphan the sweep's EVICT-FIRST-CLEAR-AFTER ordering exists to prevent, reached
+                # from undeploy instead of from a load. Keeping both entries costs one `max_loras`
+                # slot on a container that is about to recycle and leaves the adapter findable.
                 if evicted:
+                    self._loaded.pop(adapter_id, None)
+                    self._int_ids.pop(int_id, None)
                     await _release_lora_int_id(int_id, adapter_id)
             # Suppressed HERE, not inside the helper: this is the eviction path, whose contract is
             # that it never fails an undeploy. But suppressing is not the same as forgetting -- a
@@ -1645,20 +1655,31 @@ def api():
         # then disable the alias alone and leave every sibling revision `ready`, resident on the
         # GPU, and reactivatable -- undeploy answering 200 for a run that still serves.
         #
-        # Emptiness is the whole trigger, and that is sound only because registration indexes a
-        # revision BEFORE writing its record (see `register_adapter`). A container dying mid
-        # registration can therefore leave an index naming a record that does not exist yet, but
-        # never a record the index does not name -- so a nonempty index is never missing a
-        # revision, and the only index worth repairing is one that is not there at all.
+        # Repaired when the index is missing OR when it does not name the run's own alias id.
         #
-        # It matters that the check is not trying to be cleverer than that. Detecting a NONEMPTY
-        # index that is missing a revision would mean enumerating the run's revisions, which is the
-        # unbounded keyspace scan the lock's non-renewable TTL cannot afford; and the cheap proxy
-        # for it -- "the index does not name the run's own alias id" -- is worthless, because the
-        # alias is indexed before the revision, so it is present in every interrupted state a
-        # revision could be missing from. Fixing the write order is what removes the need to detect
-        # anything here.
-        repaired = await _rebuild_run_members(run_id) if not await _run_members(run_id) else []
+        # Emptiness alone was the trigger, and it is sound only for indexes this app version wrote:
+        # registration indexes a revision BEFORE writing its record (see `register_adapter`), so an
+        # interrupted registration can leave a name without a record but never a record without its
+        # name. Across a version boundary it does not hold. A run whose revisions predate the
+        # `members:` key has no index at all -- and one new registration on that run creates a
+        # nonempty index naming only the newcomer. "Nonempty, therefore complete" then skipped the
+        # scan, and DELETE disabled the newcomer and the alias while every legacy sibling stayed
+        # `ready`, resident, and callable by its immutable id, undeploy reporting success.
+        #
+        # The alias id is the marker that separates the two cases, and it works BECAUSE of the
+        # write order that makes emptiness sound in the first place: `_ensure_run_alias` indexes
+        # `run_id` on every registration this version handles, so an index this version built
+        # always names it, whatever else was interrupted. An index that omits it was necessarily
+        # grown by an older version and is the partial case; an index that has it needs no scan.
+        # That keeps the scan off the ordinary path -- it costs one extra membership read on a
+        # list already fetched, not a keyspace walk per undeploy -- while still catching the
+        # legacy-partial state that emptiness cannot see.
+        #
+        # Still OUTSIDE the run lock either way (see `_rebuild_run_members`): the scan's cost
+        # tracks every adapter ever registered and the lease does not renew, so holding it across
+        # is the one thing that can push a critical section past its own expiry.
+        indexed = await _run_members(run_id)
+        repaired = await _rebuild_run_members(run_id) if run_id not in indexed else []
         # Under the SAME per-run lock `activate` and registration take. Without it, an in-flight
         # activation can write the alias back to `ready` after this loop disabled it, and undeploy
         # returns success while the run stays callable -- the lost update
@@ -1802,8 +1823,26 @@ def api():
         # already `disabled`, so it never brings the adapter back.
         if disabled_revisions and await _engine_is_warm():
             for revision_id in disabled_revisions:
-                with contextlib.suppress(Exception):  # gpu eviction is best effort
+                try:
                     await engine.unregister.remote.aio(revision_id)
+                except Exception:  # gpu eviction is best effort, never fails an undeploy
+                    # But best effort is not the same as forgotten. `Engine.unregister` is what
+                    # releases the durable claim and reclaims the download, and this revision is
+                    # already `disabled` by the time the RPC is dispatched -- so a DELETE that
+                    # answers 200 after the RPC died is the last pass that will ever look at it.
+                    # The next DELETE walks the members and skips every already-disabled record
+                    # unless it carries a marker, so with none set the claim stays held by a
+                    # revision resident nowhere (refusing a future collider on those 31 bits) and
+                    # the directory stays on the volume for good.
+                    #
+                    # Marking is the whole recovery: `_mark_cache_reclaim_pending` re-reads under
+                    # the run lock and marks only a record still `disabled`, and the deferred
+                    # reclaim below plus the next undeploy's `reclaimable` sweep both key off that
+                    # marker. Appending here as well retries the disk in THIS call rather than
+                    # waiting for a DELETE that may never come.
+                    await _mark_cache_reclaim_pending(revision_id)
+                    if revision_id not in reclaimable:
+                        reclaimable.append(revision_id)
         else:
             # The COLD counterpart, and it is not optional. `Engine.unregister` is the only
             # successful-undeploy path that releases the durable `loraid:` claim, so skipping it
@@ -1878,6 +1917,17 @@ def api():
                 # record that anything still needs collecting, so clearing it after a raise turns
                 # a retryable deferral into the permanent leak it was added to prevent; leaving it
                 # lets the next delete try again.
+                #
+                # "Leaving it" only works for a revision that ARRIVED marked. `reclaimable` mixes
+                # two populations: revisions already disabled carrying `cache_reclaim_pending`,
+                # and revisions THIS pass just disabled and appended (the cold-release branch, and
+                # the warm branch when its RPC failed). The second group has no marker, so a raise
+                # here left them exactly as unreachable as not scheduling them at all -- the next
+                # DELETE skips a disabled record with no marker. Marking on the failure path is
+                # what makes the retry real for both groups; it is a no-op for the first, since
+                # `_mark_cache_reclaim_pending` re-reads and the marker is already set.
+                with contextlib.suppress(Exception):
+                    await _mark_cache_reclaim_pending(revision_id)
                 continue
             # Re-taken for the clear. The read-modify-write below raced registration when it ran
             # unlocked: a POST for this revision between the read and the write is reset to
