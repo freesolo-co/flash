@@ -1083,6 +1083,13 @@ turns can run out of context. Watch `truncation_rate`; truncation counts model t
 EOS or a configured stop and is not strictly `finish_reason=length`. OPD runs also report a
 per-step `discarded_rollouts` count alongside that rate.
 
+Neither metric detects the other way `max_context_tokens` shortens an episode. When an environment
+reply would leave no room to generate, both multi-turn loops stop _before_ dispatching the next
+turn. The last model turn ended normally, so nothing is counted as truncated and the episode simply
+ends early. A run can therefore train on systematically shortened trajectories at
+`truncation_rate = 0`. If episodes are ending sooner than the environment's turn limit, suspect the
+context budget rather than the turn cap.
+
 > **On a derived horizon, `prompts_per_step` buys optimizer steps cheaply.** `prompts_per_step`
 > overrides the tuned prompts-per-step. Total generated tokens are
 > `steps x prompts_per_step x group_size x max_completion_tokens`, so when the step count
@@ -1096,8 +1103,11 @@ per-step `discarded_rollouts` count alongside that rate.
 > one; jumping straight to ~80 steps without reading the short run trades one uninformative
 > run for a longer, more expensive one.
 >
-> Two things break the flat-cost approximation, so treat it as a hypothesis to check, not a
-> rule. **`[train] max_steps` overrides the derived horizon**: with it set the step count is
+> Three things break the flat-cost approximation, so treat it as a hypothesis to check, not a
+> rule. **The equation counts one model turn per prompt**: in a multi-turn run every turn gets
+> the full `max_completion_tokens` again, so an episode generates up to that cap times its turn
+> count (bounded by `max_context_tokens`), and the real token bill is a multiple of the estimate.
+> **`[train] max_steps` overrides the derived horizon**: with it set the step count is
 > exactly what you asked for, lowering `prompts_per_step` does not add steps at all, and you
 > simply train on fewer prompts. And per-step cost is not purely token-proportional —
 > GRPO reward waves and OPD teacher calls add latency per step, so multiplying steps can

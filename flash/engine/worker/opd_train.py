@@ -161,8 +161,13 @@ class _OpdProgressState:
             )
             # bound by this step's own sample delta for the same reason the rate clamps to 1.0: an
             # in-flight snapshot can read truncated_rollouts and samples_seen from different steps,
-            # and an unbounded count would report more discards than the step drew and steal the
-            # next step's truncations.
+            # and an unbounded count would report more discards than the step drew.
+            #
+            # the clamp bounds the magnitude; it does NOT establish ownership. these are deltas of
+            # counters the bridge advances asynchronously, so when stdout parsing lags a wave, a
+            # truncation raised by the next step can still be attributed here (and the next step
+            # then reads zero). the same asynchrony has always applied to truncation_rate. read
+            # both as a rolling indicator of truncation pressure, not an exact per-step ledger.
             discarded_rollouts = max(0, min(d_truncated, d_samples_seen))
             # the per-step values are returned for the heartbeat and deliberately kept OUT of the
             # snapshot: this dict is spread verbatim into the persisted opd_state.json resume
