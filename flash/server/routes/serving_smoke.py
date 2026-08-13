@@ -332,8 +332,10 @@ def _run_deployment_smoke(
     train = getattr(spec, "train", None)
     constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
     max_tokens = 256
-    # thinking spends tokens before content, so use the run's own completion budget regardless of
-    # grammar; 256 tokens can truncate the think block and reject a healthy deployment.
+    # thinking spends tokens before content regardless of grammar, so 256 can truncate the think
+    # block and reject a healthy deployment. the resolver widens it to what the run reasons within,
+    # bounded by a smoke-specific ceiling -- this budget is spent from the same wall clock that must
+    # also cold-start the base model and load the adapter, so it cannot track the training context.
     if spec.thinking:
         max_tokens = max(256, resolve_smoke_completion_tokens(spec))
         serving_capacity = serving_completion_token_capacity(

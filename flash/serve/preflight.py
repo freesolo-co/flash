@@ -18,6 +18,17 @@ from flash.engine.plan.vram import opd_completion_len
 
 SERVING_PROMPT_TOKEN_ALLOWANCE = 256
 
+# ceiling on what one deployment smoke may generate, independent of whatever the run trains at.
+# the smoke asks a fixed trivial question under a wall clock that must ALSO cover cold-starting the
+# base model and loading the adapter, so a budget inherited from training spends that deadline on
+# tokens nobody reads: an sft run raised to an 8192 context asked a thinking 27B for 8192 tokens and
+# timed out the deployment. that also coupled the knobs the wrong way, since raising
+# max_context_tokens to avoid training truncation made the run harder to deploy.
+# sized at the largest thinking budget any algorithm resolves to by default, so no
+# default-configured run is smoked at less than it is today, and a generation that still hits this
+# has failed to answer a trivial prompt rather than run out of room.
+SMOKE_COMPLETION_TOKEN_CEILING = 2048
+
 
 class ExternalSchemaReference(ValueError):
     def __init__(self, ref: str) -> None:
@@ -68,21 +79,15 @@ def validate_structured_output_patterns(constraint: dict) -> None:
             raise ValueError(f"{field} is invalid: {exc}") from exc
 
 
-def resolve_smoke_completion_tokens(spec: JobSpec) -> int:
-    """Resolve the deployment smoke's completion budget for one generation.
-
-    This sizes a single smoke request, not the run's training context. sft is the reason the two
-    cannot share a number: an sft run has no completion budget of its own, because the worker trains
-    one packed prompt+completion block bounded by ``max_context_tokens``.
-    """
+def _run_completion_budget(spec: JobSpec) -> int:
+    """The completion budget the run itself trains at, before the smoke's own ceiling applies."""
     explicit = spec.train.max_completion_tokens
     positive_explicit = int(explicit) if explicit is not None and int(explicit) > 0 else None
     if spec.algorithm == "opd":
         return opd_completion_len(positive_explicit, spec.thinking)
     if spec.algorithm == "sft":
-        # SFT ignores max_completion_tokens, so mirror the worker: use explicit max_context_tokens with
-        # the recipe fallback. do not subtract the smoke prompt; slight over-allocation is safe, while
-        # under-allocation can reject a valid checkpoint. serving clamps the final request.
+        # SFT ignores max_completion_tokens, so mirror the worker: use explicit max_context_tokens
+        # with the recipe fallback.
         context = spec.train.max_context_tokens
         if context is not None and int(context) > 0:
             return int(context)
@@ -91,6 +96,20 @@ def resolve_smoke_completion_tokens(spec: JobSpec) -> int:
         return positive_explicit
     recipe = RECIPE.rl
     return int(recipe.max_completion_len_thinking if spec.thinking else recipe.max_completion_len)
+
+
+def resolve_smoke_completion_tokens(spec: JobSpec) -> int:
+    """Resolve the deployment smoke's completion budget for one generation.
+
+    This sizes a single smoke request, not the run's training context, and the two are deliberately
+    decoupled: the smoke's question is fixed and trivial, so what a run trains at says nothing about
+    how many tokens answering it needs. Taking the run's number verbatim let a long training context
+    spend the smoke's whole wall-clock budget generating, which is why the ceiling exists.
+
+    Kept below the run's own budget rather than above it, so the smoke can only ever ask for fewer
+    tokens than the run trained with -- never more than serving is prepared to produce.
+    """
+    return min(_run_completion_budget(spec), SMOKE_COMPLETION_TOKEN_CEILING)
 
 
 def resolve_effective_completion_tokens(spec: JobSpec) -> int | None:

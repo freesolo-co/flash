@@ -674,8 +674,8 @@ def test_run_deployment_smoke_keeps_non_thinking_paths_at_256(monkeypatch, spec)
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [
-        # opd without grammar must still use its explicit completion budget.
-        (_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192), 8192),
+        # opd without grammar must still get a thinking-sized budget, bounded by the smoke ceiling.
+        (_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192), 2048),
         # grpo thinking with no grammar and no explicit budget -> the thinking recipe default.
         (_smoke_spec(algorithm="grpo", thinking=True), 1536),
     ],
@@ -868,24 +868,17 @@ def test_sft_smoke_budget_follows_an_explicit_context_over_the_recipe_default():
     from flash.serve.preflight import resolve_smoke_completion_tokens
 
     # the worker bounds the packed block by max_context_tokens and only falls back to the recipe
-    # when it is unset (flash/engine/worker/entry/sft.py), so the smoke has to resolve the same way.
-    # sizing an 8192-context run at the 2048 recipe default truncated the smoke and rejected a
-    # checkpoint that answered correctly.
-    assert RECIPE.sft.max_seq_len_thinking < 8192
-    spec = _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=8192)
-    assert resolve_smoke_completion_tokens(spec) == 8192
-
-    # a shorter explicit context is honoured too -- the point is that the worker's number wins,
-    # not that the budget only ever grows.
+    # when it is unset (flash/engine/worker/entry/sft.py), so below the ceiling the smoke resolves
+    # the same way: sizing a 512-context run at the 2048 recipe default would over-allocate.
     short = _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=512)
     assert resolve_smoke_completion_tokens(short) == 512
 
     # non-thinking takes the same path.
     assert (
         resolve_smoke_completion_tokens(
-            _smoke_spec(thinking=False, algorithm="sft", max_context_tokens=4096)
+            _smoke_spec(thinking=False, algorithm="sft", max_context_tokens=1024)
         )
-        == 4096
+        == 1024
     )
 
     # a non-positive value is not a budget, so the recipe default still applies.
@@ -895,6 +888,35 @@ def test_sft_smoke_budget_follows_an_explicit_context_over_the_recipe_default():
         )
         == RECIPE.sft.max_seq_len_thinking
     )
+
+
+def test_smoke_budget_is_capped_independently_of_the_training_context():
+    """The smoke asks one fixed trivial question, so the run's training context must not size it.
+
+    Inheriting that number spent the smoke's 600s wall clock -- which also has to cover cold-starting
+    the base model and loading the adapter -- generating tokens nobody reads: a thinking sft run at
+    an 8192 context asked for 8192 tokens and the deployment died on deployment_smoke_timeout. It
+    also coupled the knobs backwards, since raising max_context_tokens to avoid training truncation
+    made the run HARDER to deploy.
+    """
+    from flash.serve.preflight import (
+        SMOKE_COMPLETION_TOKEN_CEILING,
+        resolve_smoke_completion_tokens,
+    )
+
+    assert SMOKE_COMPLETION_TOKEN_CEILING < 8192
+    for spec in (
+        _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=8192),
+        _smoke_spec(thinking=True, algorithm="opd", max_completion_tokens=8192),
+        _smoke_spec(thinking=True, algorithm="grpo", max_completion_tokens=8192),
+    ):
+        assert resolve_smoke_completion_tokens(spec) == SMOKE_COMPLETION_TOKEN_CEILING
+
+    # the ceiling only ever lowers the request: every default-configured run still smokes at exactly
+    # what it does today, so capping cannot truncate a checkpoint that passes now.
+    assert RECIPE.sft.max_seq_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
+    assert RECIPE.rl.max_completion_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
+    assert RECIPE.opd.max_completion_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
 
 
 def test_nonthinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default():
