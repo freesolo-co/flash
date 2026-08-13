@@ -181,20 +181,24 @@ def stall_tail_fields(
     """heartbeat fields carrying the child's last words, but only while it has made no progress.
 
     before the first step, the tail is the only collected setup-stall evidence. with ``staleness``,
-    include silent ticks to distinguish a slow start from a wedge. return empty after progress or
-    before any child output.
+    include silent ticks to distinguish a slow start from a wedge. return empty after progress.
+
+    the silent-tick count is reported even before the child's first line, when there is no tail to
+    carry: a hang during import or ray startup produces no output at all, and that is precisely when
+    the count is the only evidence there is.
     """
     if step > 0:
         return {}
     recent = tail.tail(limit=limit)
-    if not recent:
-        # observed even with nothing to report, so a child that starts talking later is measured
-        # from its first line rather than from whenever the payload happened to become non-empty.
-        if staleness is not None:
-            staleness.observe(tail.written)
-        return {}
-    fields: dict[str, object] = {"child_tail": recent}
+    fields: dict[str, object] = {}
+    if recent:
+        fields["child_tail"] = recent
     if staleness is not None:
+        # published even when there is no tail to annotate. a child that hangs BEFORE its first
+        # line -- an import, a ray startup, a mount -- is the case with the least evidence and the
+        # most need for this number, and withholding it here would leave the one consumer that can
+        # end such a run unable to see it. the log renderer drops the annotation when there are no
+        # lines to attach it to, so this costs one integer on the payload and changes no output.
         fields["child_tail_silent_ticks"] = staleness.observe(tail.written)
     return fields
 

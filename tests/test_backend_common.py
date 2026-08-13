@@ -2032,7 +2032,8 @@ def test_child_tail_silence_is_measured_from_the_childs_first_line():
     tail = vc.ChildOutputTail()
     staleness = vc.ChildTailStaleness()
     for _ in range(4):
-        assert vc.stall_tail_fields(0, tail, staleness=staleness) == {}
+        # the pre-output ticks carry the count but no tail, since there is nothing yet to show.
+        assert "child_tail" not in vc.stall_tail_fields(0, tail, staleness=staleness)
     tail.record("first words\n")
     assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
 
@@ -2080,6 +2081,38 @@ def test_new_content_still_clears_the_silence_counter():
 
     tail.record("loading checkpoint shards 2/4\n")
     assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+
+
+def test_a_child_that_hangs_before_its_first_line_still_publishes_silent_ticks():
+    """The case with no evidence at all is the one that most needs the counter.
+
+    A child that wedges during import, ray startup or a mount never writes a line, so there is no
+    tail to annotate -- and the only consumer that can end such a run reads the count off the
+    heartbeat payload. Withholding it while still advancing the tracker left the abort event unset
+    forever, which is the same indefinite billing this change exists to stop.
+    """
+    tail = vc.ChildOutputTail()
+    staleness = vc.ChildTailStaleness()
+
+    fields = vc.stall_tail_fields(0, tail, staleness=staleness)
+    assert fields.get("child_tail_silent_ticks") == 0, (
+        "a child that has said nothing publishes no silent-tick count, so nothing can ever "
+        "condemn a hang that happens before the first line"
+    )
+    # no tail to report yet: the count travels on its own rather than dragging an empty list along.
+    assert "child_tail" not in fields
+
+    for expected in (1, 2, 3):
+        assert (
+            vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"]
+            == expected
+        )
+
+    # and the count keeps its meaning once output finally arrives.
+    tail.record("ray: started\n")
+    later = vc.stall_tail_fields(0, tail, staleness=staleness)
+    assert later["child_tail_silent_ticks"] == 0
+    assert later["child_tail"] == ["ray: started"]
 
 
 def test_stall_tail_fields_omits_silence_when_no_tracker_is_supplied():
