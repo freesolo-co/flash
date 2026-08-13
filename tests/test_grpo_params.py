@@ -724,3 +724,141 @@ def test_grpo_prompt_budget_guard_matches_the_worker_resolver() -> None:
     # both enforcement sites must read the shared helper, not re-derive the recipe inline.
     assert "grpo_completion_len" in inspect.getsource(inputs._resolve_sequence_lengths)
     assert "grpo_completion_len" in inspect.getsource(schema._validate_on_policy_prompt_budget)
+
+
+def _budget_spec(algorithm, train_extra, thinking=False):
+    return spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": algorithm,
+            "thinking": thinking,
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+            "train": {"epochs": 1, "max_examples": 5, **train_extra},
+        },
+        run_id=f"{algorithm}-budget-report",
+    )
+
+
+def test_prompt_budget_report_equals_what_the_worker_derives() -> None:
+    """The reported budget must be the worker's own number, or it is worse than no report.
+
+    `_resolve_sequence_lengths` derives `vllm_max_len - max_completion` and then DROPS every prompt
+    over it. If this report drifted from that arithmetic, a user would size their prompts against a
+    budget the run does not use and lose rows anyway.
+
+    The worker additionally clamps the context to the model architecture, which needs an hf config
+    probe unavailable on the control plane. Clamping only ever SHRINKS the length, so the reported
+    budget is an upper bound: it can never claim more room than the worker allows.
+    """
+    from flash.engine.plan.recipe import RECIPE
+    from flash.engine.plan.vram import (
+        grpo_completion_len,
+        opd_completion_len,
+        rl_prompt_budget,
+    )
+
+    def worker_budget(algorithm, ctx, completion, thinking):
+        # mirrors train/rl/inputs.py:_resolve_sequence_lengths and opd_train_runner._prepare_prompts
+        if algorithm == "opd":
+            resolved = opd_completion_len(completion, thinking)
+            prompt_len = RECIPE.opd.max_prompt_len
+        else:
+            resolved = grpo_completion_len(completion, thinking)
+            prompt_len = RECIPE.rl.max_prompt_len
+        return int(ctx or max(1024, prompt_len + resolved)) - resolved
+
+    checked = 0
+    for algorithm in ("grpo", "opd"):
+        for ctx in (0, 2048, 8192, 32768):
+            for completion in (None, 320, 512, 4096):
+                for thinking in (False, True):
+                    train = {"max_completion_tokens": completion} if completion else {}
+                    if ctx:
+                        train["max_context_tokens"] = ctx
+                    try:
+                        spec = _budget_spec(algorithm, train, thinking)
+                    except ConfigError:
+                        # an authored context below the completion budget is already rejected at
+                        # parse (#1065). there is no run to report a budget for.
+                        continue
+                    checked += 1
+                    reported = rl_prompt_budget(spec)
+                    assert reported["prompt_budget"] == worker_budget(
+                        algorithm, ctx, completion, thinking
+                    ), (algorithm, ctx, completion, thinking)
+                    assert (
+                        reported["engine_len"] - reported["max_completion"]
+                        == reported["prompt_budget"]
+                    )
+    # the ConfigError skip above must not be able to empty the matrix and pass vacuously.
+    assert checked >= 40, checked
+
+
+def test_unset_context_reports_the_recipe_default_budget_and_warns() -> None:
+    """The defaulted budget is the case the #1065 submit guard cannot see: it returns early when
+    max_context_tokens is unset, so a run continuing an 8192-token sft silently trains at 2048
+    (grpo) or 1024 (opd). Reporting it is the whole point of the field."""
+    from flash.engine.plan.recipe import RECIPE
+    from flash.engine.plan.vram import rl_prompt_budget, rl_prompt_budget_warning
+
+    grpo = rl_prompt_budget(_budget_spec("grpo", {"max_completion_tokens": 4096}))
+    assert grpo["context_source"] == "recipe_default"
+    assert grpo["prompt_budget"] == RECIPE.rl.max_prompt_len == 2048
+
+    opd = rl_prompt_budget(_budget_spec("opd", {"max_completion_tokens": 4096}))
+    assert opd["context_source"] == "recipe_default"
+    assert opd["prompt_budget"] == RECIPE.opd.max_prompt_len == 1024
+
+    # the warning has to carry the DROP semantics, not just the number: a budget alone reads as a
+    # capacity note, and the danger is specifically that over-budget rows are deleted, not shortened.
+    message = rl_prompt_budget_warning(grpo)
+    assert "2048-token prompt budget" in message
+    assert "DROPPED, not truncated" in message
+
+    # an authored context is the user's own choice -> nothing surprising to report.
+    authored = rl_prompt_budget(
+        _budget_spec("grpo", {"max_context_tokens": 8192, "max_completion_tokens": 4096})
+    )
+    assert authored["context_source"] == "authored"
+    assert authored["prompt_budget"] == 8192 - 4096
+    assert rl_prompt_budget_warning(authored) is None
+
+
+def test_prompt_budget_names_the_warm_start_context_it_does_not_inherit() -> None:
+    """The finding's exact scenario: sft trains at 8192, the rl child leaves max_context_tokens
+    unset and silently retrains at 2048, with nothing connecting the two numbers. The child does NOT
+    inherit the source context (that would move sizing, allocation and cost), so the warning names
+    it instead."""
+    from flash.engine.plan.vram import rl_prompt_budget, rl_prompt_budget_warning
+
+    spec = _budget_spec("grpo", {"max_completion_tokens": 4096})
+    budget = rl_prompt_budget(spec, warm_start_context=8192)
+    assert budget["warm_start_context"] == 8192
+    assert budget["prompt_budget"] == 2048  # unchanged: reporting is not inheriting
+
+    message = rl_prompt_budget_warning(budget)
+    assert "8192" in message
+    assert "NOT" in message
+    assert "inherited" in message
+
+    # no warm start -> the key is absent rather than a misleading zero.
+    assert "warm_start_context" not in rl_prompt_budget(spec)
+
+
+def test_sft_has_no_prompt_budget_because_it_truncates_instead_of_dropping() -> None:
+    """sft shortens an over-long row and reports truncated_examples/untruncated_max_length through
+    its workload profile. Emitting a drop-semantics budget for it would describe behaviour it does
+    not have."""
+    from flash.engine.plan.vram import rl_prompt_budget, rl_prompt_budget_warning
+
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "sft",
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+            "train": {"epochs": 1, "max_context_tokens": 8192},
+        },
+        run_id="sft-budget-report",
+    )
+    assert rl_prompt_budget(spec) is None
+    assert rl_prompt_budget_warning(None) is None

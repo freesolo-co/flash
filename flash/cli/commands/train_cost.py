@@ -87,6 +87,13 @@ def _cmd_train_cost_offline(spec) -> int:
         print(render.cost_panel(estimate))
     else:
         print(estimate.breakdown())
+    # derived locally: --cost never reaches the server, so there is no response to read the budget
+    # off. the derivation is pure spec arithmetic, so it agrees with the server's. the warm-start
+    # source context is deliberately NOT passed -- this path cannot read the source run, and naming
+    # a context it did not verify would be a claim rather than a measurement.
+    from flash.engine.plan.vram import rl_prompt_budget
+
+    _print_rl_prompt_budget_warning({"prompt_budget": rl_prompt_budget(spec)})
     return 0
 
 
@@ -185,6 +192,22 @@ def _print_unpacked_batch_warning(status: object, spec) -> None:
         examples_per_update=examples_per_update,
         configured_batch_size=getattr(spec.train, "batch_size", None),
     )
+    if not message:
+        return
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+
+
+def _print_rl_prompt_budget_warning(status: object) -> None:
+    """Warn when a grpo/opd run's prompt budget defaulted off the recipe instead of being chosen.
+
+    The server derives the budget at submit and carries it on the response, so the number is known
+    before a training gpu is allocated. The worker's own `dropped N prompts` line lands in the
+    worker log only after allocation, which is too late to change the config for free.
+    """
+    from flash.engine.plan.vram import rl_prompt_budget_warning
+
+    budget = status.get("prompt_budget") if isinstance(status, dict) else None
+    message = rl_prompt_budget_warning(budget)
     if not message:
         return
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)

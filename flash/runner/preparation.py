@@ -137,6 +137,46 @@ def _inherit_warmstart_revision(
     return _runner()._adopted_warmstart_revision(spec, src_spec)
 
 
+def _warmstart_source_context(
+    spec: JobSpec,
+    *,
+    owner_org_id: str = "",
+    owner_key_id: int | None = None,
+) -> int | None:
+    """The warm-start source's authored ``max_context_tokens``, for reporting only.
+
+    An rl run does NOT inherit its source's context: an omitted ``max_context_tokens`` falls back to
+    the recipe default, so a child of an 8192-token sft trains at 2048 with nothing naming the gap.
+    This reads the source's number purely so the prompt-budget warning can name it. It changes no
+    spec and no sizing -- reporting it is deliberately not the same as adopting it, which would move
+    engine length, vram sizing, allocation and cost for runs that train fine today.
+
+    Best-effort for the same reason as ``_inherit_warmstart_revision``: every way a source can be
+    unusable is diagnosed there or by ``_prepare_init_from_adapter`` with its own message, and a
+    diagnostic must never be the thing that fails a submission. Authorization is still checked
+    before the read, so an unauthorized run's context never reaches the submitter.
+    """
+    ref = spec.train.init_from_adapter
+    if not ref or not samples_on_policy(spec.algorithm):
+        return None
+    from flash.schema import parse_checkpoint_ref
+
+    parsed = parse_checkpoint_ref(ref)
+    if parsed is None:
+        return None
+    try:
+        src_status = _runner().get_status(parsed[0])
+        if not _runner()._warmstart_source_is_authorized(
+            src_status, parsed[0], owner_org_id=owner_org_id, owner_key_id=owner_key_id
+        ):
+            return None
+        src_spec = _runner().effective_spec_from_status(src_status)
+    except Exception:
+        return None
+    context = int(getattr(src_spec.train, "max_context_tokens", 0) or 0)
+    return context or None
+
+
 def _prepare_init_from_adapter(
     spec: JobSpec,
     *,
