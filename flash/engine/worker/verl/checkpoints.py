@@ -9,6 +9,7 @@ Split out of `flash.engine.worker.backend_common` to keep that module under the 
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
@@ -42,6 +43,10 @@ class MergerOutputLayoutError(RuntimeError):
 # written merge tree is still on the disk when this is sampled, so anything proportional to the
 # expected output would read a normal 90%-complete failure as exhaustion.
 _MERGE_DISK_EXHAUSTED_FREE_BYTES = 64 * 1024 * 1024
+
+# how long to wait for a killed merger to be reaped. SIGKILL is not refusable, so this is only ever
+# the kernel finishing the teardown; it exists so a cancel can never block indefinitely here.
+_MERGER_KILL_REAP_SECONDS = 10
 
 # ENOSPC as it reaches this process in text form. the merger is a subprocess, so its safetensors
 # and torch errors arrive as printed output rather than as exceptions -- but a failure raised in
@@ -152,16 +157,36 @@ def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
     forwarded as they arrive, and the ENOSPC evidence is recognized IN FLIGHT instead of from a tail
     buffer -- in the run this comes from, the message was several hundred lines above the final
     error, further back than any bounded tail worth holding.
+
+    Kills the child on ANY BaseException, which is what ``subprocess.run`` did before this streamed:
+    its bare ``except`` calls ``process.kill()``. ``Popen.__exit__`` does not -- it special-cases
+    ``KeyboardInterrupt`` (assuming the SIGINT already reached the child) and otherwise calls an
+    unbounded ``wait()``. Worker cancellation arrives as ``SystemExit``, so relying on the context
+    manager would block the unwind on a merge that still has minutes of full-model write left, keep
+    the caller's ``finally`` from deleting the merge tree, and let a doomed child go on consuming the
+    exact disk this module exists to protect.
     """
     process = subprocess.Popen(
         cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
     enospc_line = ""
-    with process:
+    # deliberately NOT `with process:` -- its __exit__ runs before any handler here and calls an
+    # unbounded wait(), so the kill below would not be reached until the child exited on its own.
+    try:
         for line in process.stdout or ():
             print(line, end="", flush=True)
             if not enospc_line and any(m in line.lower() for m in _ENOSPC_MARKERS):
                 enospc_line = line.strip()
+    except BaseException:
+        process.kill()
+        raise
+    finally:
+        # reap so a killed child cannot outlive this call as a zombie still holding its output fds,
+        # but bounded: a cancel path must not be able to hang on an unkillable child.
+        if process.stdout:
+            process.stdout.close()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=_MERGER_KILL_REAP_SECONDS)
     if process.returncode:
         raise subprocess.CalledProcessError(process.returncode, cmd, output=enospc_line or None)
 

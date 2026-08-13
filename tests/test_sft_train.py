@@ -3624,6 +3624,61 @@ def test_the_merger_streams_its_output_instead_of_buffering_it(tmp_path):
     )
 
 
+def test_a_cancel_while_streaming_kills_the_merger(tmp_path):
+    """cancelling the export must not leave the merger writing.
+
+    `subprocess.run` killed the child on any BaseException (its bare `except` calls
+    `process.kill()`). `Popen.__exit__` does not: it special-cases `KeyboardInterrupt`, assuming the
+    SIGINT already reached the child, and otherwise calls an unbounded `wait()`. Worker cancellation
+    arrives as `SystemExit`, so leaning on the context manager would block the unwind on a merge with
+    minutes of full-model write still to go, hold up the caller's `finally` that deletes the merge
+    tree, and let a doomed child keep consuming the disk this module exists to protect.
+
+    Driven with a real child rather than a fake: what is being asserted is process lifetime, which a
+    stubbed Popen cannot demonstrate. `SystemExit` specifically -- `KeyboardInterrupt` is the one
+    case `Popen.__exit__` already handles, so testing only that would pass against the bug.
+    """
+    import subprocess as subprocess_module
+    import sys
+    import time
+
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    # prints one line, then stays alive far longer than this test: a merge in mid-write.
+    child = "import sys,time; print('merging shard 1'); sys.stdout.flush(); time.sleep(120)"
+
+    holder: dict[str, subprocess_module.Popen] = {}
+    real_popen = verl_checkpoints.subprocess.Popen
+
+    def tracking_popen(*args, **kwargs):
+        holder["p"] = real_popen(*args, **kwargs)
+        return holder["p"]
+
+    def cancelling_print(line, **kwargs):
+        # the cancel lands while the loop is reading the child's output, which is the window the
+        # finding is about.
+        raise SystemExit(1)
+
+    verl_checkpoints.subprocess.Popen = tracking_popen
+    verl_checkpoints.print = cancelling_print
+    started = time.monotonic()
+    try:
+        with pytest.raises(SystemExit):
+            verl_checkpoints._run_merger([sys.executable, "-c", child], dict(os.environ))
+    finally:
+        verl_checkpoints.subprocess.Popen = real_popen
+        del verl_checkpoints.print
+
+    elapsed = time.monotonic() - started
+    process = holder["p"]
+    assert process.poll() is not None, "the merger survived the cancel and is still writing"
+    assert elapsed < 30, (
+        f"the cancel waited {elapsed:.1f}s on the child instead of killing it (the child sleeps 120s)"
+    )
+    if process.stdout and not process.stdout.closed:
+        process.stdout.close()
+
+
 def test_the_adapter_is_moved_out_of_the_merge_tree_not_copied(monkeypatch, tmp_path):
     """the export must never hold two copies of the adapter at once.
 
