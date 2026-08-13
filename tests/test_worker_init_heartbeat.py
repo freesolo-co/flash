@@ -290,14 +290,16 @@ def test_liveness_heartbeat_rechecks_done_after_diagnostics():
     assert "done.is_set()" in between, "must re-check done.is_set() between diagnostics and emit"
 
 
-def test_heartbeat_marks_progress_only_for_real_heartbeats(monkeypatch):
-    """heartbeat() bumps _HB_LAST_PROGRESS_TS for a real heartbeat but NOT a liveness ping, and stamps
-    liveness=True on the liveness payload so the provider can skip it."""
+def test_heartbeat_publishes_progress_age_that_grows_without_progress(monkeypatch):
+    """real heartbeats report the prior progress interval; liveness pings keep aging that interval."""
     import json
 
     import flash.engine.worker as ne
 
-    seen: list = []
+    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
+    now = {"t": 1000.0}
+    seen: list[dict] = []
+    monkeypatch.setattr(hbmod.time, "time", lambda: now["t"])
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
 
     def _capture(local, *a, **k):
@@ -305,16 +307,50 @@ def test_heartbeat_marks_progress_only_for_real_heartbeats(monkeypatch):
             seen.append(json.load(f))
 
     monkeypatch.setattr(ne, "hf_upload_file", _capture)
+    monkeypatch.setattr(ne, "_HB_LAST_PROGRESS_TS", 900.0)
 
-    ne._HB_LAST_PROGRESS_TS = 0.0
-    ne.heartbeat("rl_step", step=1)  # real progress
-    after_real = ne._HB_LAST_PROGRESS_TS
-    assert after_real > 0, "a real heartbeat must mark progress"
-    assert seen[-1].get("liveness") is None, "a real heartbeat carries no liveness flag"
+    ne.heartbeat("rl_step", step=1)
+    assert seen[-1]["progress_age_s"] == 100.0
+    assert seen[-1].get("liveness") is None
+    assert ne._HB_LAST_PROGRESS_TS == 1000.0
 
-    ne.heartbeat("rl_step", liveness=True, step=1)  # liveness ping
-    assert after_real == ne._HB_LAST_PROGRESS_TS, "a liveness ping must NOT advance progress"
-    assert seen[-1].get("liveness") is True, "a liveness ping is stamped liveness=True"
+    now["t"] = 1012.3
+    ne.heartbeat("rl_step", liveness=True, step=1)
+    assert seen[-1]["progress_age_s"] == 12.3
+    assert seen[-1].get("liveness") is True
+    assert ne._HB_LAST_PROGRESS_TS == 1000.0
+
+    now["t"] = 1045.6
+    ne.heartbeat("rl_step", liveness=True, step=1)
+    assert seen[-1]["progress_age_s"] == 45.6
+    assert seen[-1].get("liveness") is True
+    assert ne._HB_LAST_PROGRESS_TS == 1000.0
+
+
+def test_heartbeat_omits_progress_age_before_first_progress(monkeypatch):
+    import json
+
+    import flash.engine.worker as ne
+
+    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
+    seen: list[dict] = []
+    monkeypatch.setattr(hbmod.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ne, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(ne, "_HB_LAST_PROGRESS_TS", 0.0)
+    monkeypatch.setattr(ne, "_HB_PROGRESS_SEQ", 0)
+    monkeypatch.setattr(ne, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+
+    def _capture(local, *a, **k):
+        with open(local) as f:
+            seen.append(json.load(f))
+
+    monkeypatch.setattr(ne, "hf_upload_file", _capture)
+
+    ne.heartbeat("rl_step", liveness=True, step=0)
+
+    assert "progress_age_s" not in seen[-1]
+    assert ne._HB_LAST_PROGRESS_TS == 0.0
 
 
 def test_heartbeat_console_summarizes_metric_backlog():
@@ -828,6 +864,9 @@ def test_progress_carry_upgrades_ping_after_throttled_real_heartbeat(monkeypatch
     assert uploads, "the ping must commit once the slot opens"
     assert uploads[-1].get("liveness") is None, (
         "the ping must be upgraded to a real heartbeat: it carries progress HF never saw"
+    )
+    assert uploads[-1]["progress_age_s"] == 901.0, (
+        "carried progress keeps the age of the original real heartbeat; the upgrade is not new progress"
     )
 
     uploads.clear()

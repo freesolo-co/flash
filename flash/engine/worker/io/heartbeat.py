@@ -142,21 +142,25 @@ def heartbeat(
     stage: str, *, liveness: bool = False, force: bool = False, initial: bool = False, **kw
 ):
     global _HB_CLAIM_SEQ
-    ts = time.time()
-    # liveness pings don't count as progress; provider stall detection skips them.
-    if not liveness:
-        _w._HB_LAST_PROGRESS_TS = ts
     with _HB_LOCK:
+        ts = time.time()
+        previous_progress_ts = float(_w._HB_LAST_PROGRESS_TS or 0.0)
+        # measure from the previous real heartbeat before advancing the reference. a real heartbeat
+        # then reports the completed progress interval instead of 0, while a liveness ping reports
+        # how long that same interval has remained open.
         if not liveness:
+            _w._HB_LAST_PROGRESS_TS = ts
             _w._HB_PROGRESS_SEQ += 1
         elif _w._HB_PROGRESS_SEQ > _w._HB_PROGRESS_UPLOADED_SEQ:
             # progress-carry: a real heartbeat since the last committed snapshot never reached HF
             # (throttled away or its upload failed). upgrade this ping to a real heartbeat so the
             # control plane's stall clock sees that progress instead of killing a healthy run.
-            # deliberately after the _HB_LAST_PROGRESS_TS bump above: carried progress is not NEW
-            # progress, so the worker's own stall-dump timer keeps its original reference point.
+            # carried progress is not new progress, so do not advance _HB_LAST_PROGRESS_TS: the
+            # worker's own stall-dump timer and the published age keep the original reference point.
             liveness = False
         my_progress_seq = _w._HB_PROGRESS_SEQ
+    # progress-carry may clear the liveness flag, but it only republishes progress already recorded at
+    # previous_progress_ts. keep the age anchored there so carried progress does not look newly made.
     payload = {
         "stage": stage,
         "ts": ts,
@@ -167,6 +171,11 @@ def heartbeat(
         **({"liveness": True} if liveness else {}),
         **kw,
     }
+    if previous_progress_ts:
+        payload["progress_age_s"] = round(ts - previous_progress_ts, 1)
+    else:
+        # cold start is unknown, never zero: zero would falsely claim progress at emit time.
+        payload.pop("progress_age_s", None)
     _dc = os.environ.get("RUNPOD_DC_ID") or ""
     if _dc:
         payload.setdefault("dc", _dc)

@@ -29,6 +29,19 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- A training run's heartbeat age could not be told apart from a stall. Mid-training heartbeat
+  commits are held up to 15 minutes to stay under the artifact repo's commit cap, so `ts` is the
+  time the last _committed_ payload was built, not the last time the worker did anything. A run
+  polled between two optimizer steps therefore showed a growing age beside an unchanged step
+  counter whether it was healthy or wedged, and the same reading was misread in both directions.
+  Heartbeats now carry `progress_age_s`, the worker's own measurement of how long it had been
+  since its last real progress when the payload was built. Because the trainers run verl in a
+  child process and sample progress from that child's output, this measures the child advancing
+  rather than the supervisor's timer still firing. `flash runs status` uses it to bound how old
+  the last progress can be, and past the 15-minute hold says plainly that throttling no longer
+  explains the gap without claiming either health or a stall. Heartbeats from a worker that
+  predates the field, and runs quiet for less than the hold, read exactly as before.
+
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always
   `flash`. On a host where `runpod-flash` owns the `flash` script, the printed

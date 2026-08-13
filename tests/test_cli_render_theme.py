@@ -664,6 +664,102 @@ def test_heartbeat_is_current_attempt_rejects_malformed_identities() -> None:
     assert is_current({"remote": {"attempt": 2}}, {"attempt": 1}) is False
 
 
+def test_progress_age_distinguishes_real_heartbeat_from_liveness_bound(monkeypatch):
+    from flash.cli.ui import heartbeat as heartbeat_ui
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 5000.0)
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+    }
+    heartbeat = {
+        "stage": "rl_step",
+        "step": 14,
+        "ts": 1990.0,
+        "progress_age_s": 20.0,
+    }
+
+    real_out = render.run_status(dict(base, last_heartbeat=heartbeat))
+    long_period_out = render.run_status(
+        dict(base, last_heartbeat={**heartbeat, "progress_age_s": 1200.0})
+    )
+    liveness_out = render.run_status(dict(base, last_heartbeat={**heartbeat, "liveness": True}))
+
+    assert real_out != long_period_out
+    assert "prior progress interval of 1200.0s" in long_period_out
+    assert real_out != liveness_out
+    assert "the upload is 3010.0s old" in real_out
+    assert "prior progress interval of 20.0s" in real_out
+    assert "last known progress can be as old as 3030.0s" not in real_out
+
+    assert "last known progress can be as old as 3030.0s" in liveness_out
+    assert "prior progress interval of 20.0s" not in liveness_out
+
+    for out in (real_out, liveness_out):
+        assert "upload throttling no longer explains the gap" in out
+        assert "this signal does not show recent progress" in out
+        assert "proves recent worker-side progress" not in out
+        assert "advances normally" not in out
+
+
+def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
+    from flash.cli.ui import heartbeat
+
+    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    base = {
+        "state": "running",
+        "remote": {"attempt": 2},
+    }
+    old_worker = {
+        "stage": "rl_step",
+        "step": 14,
+        "attempt": 2,
+        "ts": 1400.0,
+    }
+
+    def progress(hb: dict) -> str:
+        return dict(heartbeat._heartbeat_pairs(dict(base, last_heartbeat=hb)))["progress"]
+
+    old_hint = progress(old_worker)
+    assert progress({**old_worker, "progress_age_s": 220.0}) == old_hint
+    assert progress({**old_worker, "progress_age_s": 20.0, "liveness": True}) == old_hint
+
+
+def test_missing_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
+    from flash.cli.ui import heartbeat
+
+    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    obj = {
+        "state": "running",
+        "remote": {"attempt": 2},
+        "last_heartbeat": {
+            "stage": "rl_step",
+            "step": 14,
+            "attempt": 2,
+            "ts": 800.0,
+        },
+    }
+
+    assert heartbeat._heartbeat_pairs(obj) == [
+        ("worker", "rl_step · step 14"),
+        ("heartbeat", "20m ago"),
+        (
+            "progress",
+            (
+                "the step above is the last one UPLOADED, not necessarily the one training is on; "
+                "a throttled worker can hold it for many minutes while the trainer advances "
+                "normally. uploads are held up to 15 min, so compare the age above against that "
+                "(and your [wandb] run, if configured) before treating this as a stall"
+            ),
+        ),
+    ]
+
+
 def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     """A frozen step on a throttled worker must not read as a stalled trainer (AS-018/AS-019).
 

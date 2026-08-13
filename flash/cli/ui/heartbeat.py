@@ -114,6 +114,10 @@ _QUIET_HEARTBEAT_HINT = (
 # than on 900s -- the incident that motivated this reported 559s and 687s, squarely inside that
 # window, where a 900s gate would stay silent and leave only the dead-end quiet hint.
 _STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
+# progress_age_s is frozen at payload build time, so it is not a present-tense liveness reading by
+# itself. once the upload is older than the throttle, compare it with the worker-side reading without
+# claiming either health or a stall: newer progress may be uncommitted, or the worker may be silent.
+_UPLOAD_THROTTLE_S = 900.0
 # only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
 # post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older
 # than 900s means a long step, failed uploads, or a real stall -- not reporting lag.
@@ -266,9 +270,39 @@ def _stale_step_hint(
 
     if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
         return None
-    # do not suggest `runs log -f`: it shows control-plane logs, and worker output arrives only after
-    # termination (flash/cli/commands/__init__.py cmd_log) on a 3600s upload interval. use heartbeat age against
-    # the 900s throttle, with w&b as the optional live signal.
+    progress_age_s = heartbeat.get("progress_age_s")
+    if (
+        isinstance(progress_age_s, (int, float))
+        and not isinstance(progress_age_s, bool)
+        and progress_age_s >= 0
+    ):
+        # a liveness ping records no progress at ts, so its last known progress predates the payload by
+        # progress_age_s. a real heartbeat records progress at ts; there progress_age_s is the prior
+        # progress interval, useful as a step-period yardstick rather than as current silence. the
+        # caller already proved the upload is older than the quiet threshold, so this bound is too;
+        # no recent-progress reading is reachable here. past 900s use the conservative comparison;
+        # below it retain the existing throttle-lag reading.
+        progress_age_bound_s = heartbeat_age_seconds
+        if heartbeat.get("liveness"):
+            progress_age_bound_s += float(progress_age_s)
+        if progress_age_bound_s >= _UPLOAD_THROTTLE_S:
+            if heartbeat.get("liveness"):
+                comparison = f"the last known progress can be as old as {progress_age_bound_s:.1f}s"
+            else:
+                comparison = (
+                    f"the upload is {heartbeat_age_seconds:.1f}s old versus the worker's prior "
+                    f"progress interval of {float(progress_age_s):.1f}s"
+                )
+            return (
+                "the step above is the last one UPLOADED; "
+                f"{comparison}. upload throttling no longer explains the gap, but newer progress "
+                "may be uncommitted and a long step may still be running; this signal does not show "
+                "recent progress"
+            )
+        # below the 900s hold, throttling still explains the visible lag. fall through to the exact
+        # pre-existing reading so new workers never lose guidance in the incident's 300-900s band.
+    # old workers do not publish progress_age_s. keep their existing throttle-only reading exactly so
+    # content-addressed in-flight runs do not change interpretation when the CLI upgrades.
     return (
         "the step above is the last one UPLOADED, not necessarily the one training is on; "
         "a throttled worker can hold it for many minutes while the trainer advances normally. "
