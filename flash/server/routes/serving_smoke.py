@@ -23,7 +23,7 @@ from referencing.exceptions import Unresolvable
 from flash.adapters.lora_rank import serving_completion_token_capacity
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.core.spec import JobSpec
-from flash.serve.deploy import RetryableServingUnavailable, ServingError
+from flash.serve.deploy import AliasThinkingSilent, RetryableServingUnavailable, ServingError
 from flash.serve.preflight import (
     SERVING_PROMPT_TOKEN_ALLOWANCE,
     ExternalSchemaReference,
@@ -400,4 +400,74 @@ def _run_deployment_smoke(
         "verify_finish_reason": finish,
         "thinking_tag": "<think>" in content or "</think>" in content,
         "verify_sample": answer[:160],
+    }
+
+
+_ALIAS_THINKING_BUDGET_SECONDS = 120.0
+
+
+def _reasoning_is_silent(result: object) -> bool:
+    """Whether a served response came back with no reasoning channel at all.
+
+    Serving splits reasoning onto `reasoning_content` and `flash.serve.thinking` folds it back into
+    a balanced `<think>...</think>`. That fold is what makes the distinction here decidable: a model
+    that merely thought briefly still arrives with a pair (an empty `reasoning_content` folds to
+    `<think></think>`), so an absent pair means the field itself never arrived and the reasoning
+    parser was not applied -- not that this particular generation had little to say.
+    """
+    choice = (result.get("choices") or [{}])[0] if isinstance(result, dict) else {}
+    content = str((choice.get("message") or {}).get("content") or "")
+    return "<think>" not in content and "</think>" not in content
+
+
+def _verify_alias_thinking(
+    run_id: str,
+    spec: JobSpec,
+    adapter_revision: str,
+    *,
+    budget_s: float = _ALIAS_THINKING_BUDGET_SECONDS,
+) -> dict:
+    """Confirm the freshly activated alias still serves the reasoning channel.
+
+    The deployment smoke pins the immutable revision and runs BEFORE the alias flip, so nothing in
+    the pipeline ever asks the mutable alias -- which is what a bare `model: <run-id>` request
+    actually resolves to. A redeploy that reconciles the alias without re-applying the reasoning
+    parser therefore commits `ready` while every real request comes back with its reasoning silent.
+    This is the one request that closes that gap, so it deliberately targets `run_id`.
+    """
+    started = time.monotonic()
+    deadline = started + budget_s
+
+    def _alias_call(timeout_s: float = budget_s):
+        return _app.serve_chat(
+            run_id=run_id,
+            messages=[{"role": "user", "content": _SMOKE_PROMPT}],
+            temperature=0.0,
+            max_tokens=resolve_smoke_completion_tokens(spec),
+            thinking=True,
+            timeout_s=timeout_s,
+        )
+
+    try:
+        result = _bounded_call(_alias_call, deadline=deadline, budget_s=budget_s)
+    except ServingError:
+        raise
+    except Exception as exc:
+        # an alias that cannot answer at all is a different failure from one that answers without
+        # reasoning, and the smoke already proved the revision generates. report it as itself.
+        raise ServingError(f"alias thinking verification could not reach {run_id}: {exc}") from exc
+    if _reasoning_is_silent(result):
+        raise AliasThinkingSilent(
+            run_id,
+            adapter_revision,
+            detail=(
+                "the alias returns no reasoning while the immutable revision smoked with a "
+                "thinking block, so alias reconciliation did not re-apply the reasoning "
+                "configuration"
+            ),
+        )
+    return {
+        "alias_thinking_tag": True,
+        "alias_thinking_verified_at": time.time(),
+        "alias_thinking_latency_s": time.monotonic() - started,
     }

@@ -5399,6 +5399,103 @@ def test_deploy_recovers_ambiguous_ready_persistence_after_activation(api, monke
     assert runner.read_verified_adapter_revisions(run_id) == frozenset({revision})
 
 
+def test_deploy_fails_when_the_activated_alias_serves_no_reasoning(api, monkeypatch):
+    """A thinking run whose alias loses its reasoning channel must not commit ready.
+
+    The reported regression: the immutable revision smokes with a thinking block, the alias flip
+    succeeds, and every subsequent request against the alias comes back with reasoning silent. The
+    alias is live and answering, so the deployment is degraded rather than broken -- but the record
+    has to say so, because `ready` on a thinking run asserts that it thinks.
+    """
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs",
+        json={"spec": {**SPEC, "thinking": True}, "dry_run": True},
+        headers=_bearer(key),
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, run_id)
+        return Deployment(
+            run_id=run_id,
+            model=SPEC["model"],
+            adapter_hf_prefix=f"{kwargs['adapter_prefix']}/adapter",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            openai_base_url="https://serve.example/v1",
+            adapter_revision=revision,
+        )
+
+    # the revision thinks, the alias does not: the exact before/after that previously went
+    # unnoticed because nothing ever asked the alias.
+    def by_target(**kwargs):
+        if kwargs["run_id"] == revision:
+            return _smoke_chat_result(revision, run_id, "<think>2+2 is 4</think>4")
+        return _smoke_chat_result(revision, run_id, "4")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(app_mod, "serve_chat", by_target)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "failed"
+    assert "alias_thinking_silent" in resp.json()["error"]
+    assert resp.json()["alias_thinking_tag"] is False
+
+
+def test_deploy_records_alias_thinking_on_a_healthy_thinking_deployment(api, monkeypatch):
+    """The healthy path still commits ready and exposes the resolved state on the record."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs",
+        json={"spec": {**SPEC, "thinking": True}, "dry_run": True},
+        headers=_bearer(key),
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, run_id)
+        return Deployment(
+            run_id=run_id,
+            model=SPEC["model"],
+            adapter_hf_prefix=f"{kwargs['adapter_prefix']}/adapter",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            openai_base_url="https://serve.example/v1",
+            adapter_revision=revision,
+        )
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: _smoke_chat_result(revision, run_id, "<think>2+2 is 4</think>4"),
+    )
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "ready"
+    assert resp.json()["alias_thinking_tag"] is True
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset({revision})
+
+
 def test_commit_miss_with_same_attempt_retries_and_persists_ready(api, monkeypatch):
     # the run state moves under the cas guard (e.g. done -> deployed by a sibling write) while
     # this attempt still owns the deployment record: the ready commit must be retried against the

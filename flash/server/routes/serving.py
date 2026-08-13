@@ -863,4 +863,5 @@ from flash.server.routes.serving_smoke import (  # noqa: E402,F401
     _thinking_tag_is_guaranteed,
     _validate_json_schema,
     _validate_structured_smoke,
+    _verify_alias_thinking,
 )

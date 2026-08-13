@@ -26,8 +26,9 @@ pytest.importorskip("fastapi")
 from fastapi import HTTPException
 
 import flash.server.routes.serving as serving
+import flash.server.routes.serving_completion as serving_completion
 from flash.engine.plan.recipe import RECIPE
-from flash.serve.deploy import ServingError
+from flash.serve.deploy import AliasThinkingSilent, ServingError
 
 
 def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
@@ -1449,3 +1450,119 @@ def test_nonthinking_structured_smoke_validates_whole_stripped_content(monkeypat
         ),
     )
     assert out["verify_sample"] == "<think>literal</think>4"
+
+
+def test_alias_thinking_verification_targets_the_mutable_alias(monkeypatch):
+    """The check must ask the alias, because that is what a bare `model: <run-id>` resolves to.
+
+    The deployment smoke pins the immutable revision, so asking the revision a second time would
+    re-prove what already passed and still never touch the surface the regression appeared on.
+    """
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("<think>2+2 is 4</think>The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    out = serving._verify_alias_thinking("run-1", _smoke_spec(thinking=True), _SMOKE_REVISION)
+
+    assert calls[0]["run_id"] == "run-1"
+    assert calls[0]["run_id"] != _SMOKE_REVISION
+    assert calls[0]["thinking"] is True
+    assert 0 < calls[0]["timeout_s"] <= 120.0
+    assert out["alias_thinking_tag"] is True
+    assert out["alias_thinking_latency_s"] >= 0.0
+
+
+def test_alias_thinking_verification_rejects_a_silent_reasoning_channel(monkeypatch):
+    """The reproduced shape: healthy generation, `finish_reason: stop`, and no reasoning at all."""
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("The answer is 4"),
+    )
+    with pytest.raises(AliasThinkingSilent, match="alias_thinking_silent"):
+        serving._verify_alias_thinking("run-1", _smoke_spec(thinking=True), _SMOKE_REVISION)
+
+
+def test_alias_thinking_verification_accepts_an_empty_reasoning_block(monkeypatch):
+    """A model that thought briefly still proves the parser ran, so it must not be failed.
+
+    `flash.serve.thinking` folds an empty `reasoning_content` to `<think></think>`, which is what
+    separates "thought little" from "the reasoning field never arrived".
+    """
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think></think>The answer is 4"),
+    )
+    out = serving._verify_alias_thinking("run-1", _smoke_spec(thinking=True), _SMOKE_REVISION)
+    assert out["alias_thinking_tag"] is True
+
+
+def test_pinned_revision_smoke_alone_would_not_catch_a_silent_alias(monkeypatch):
+    """Pin the gap itself: revision healthy, alias silent -- exactly the reported before/after.
+
+    The smoke passes against the immutable revision and reports `thinking_tag: True`, so a
+    pipeline that verified only the revision commits `ready` while every real request against the
+    alias comes back with its reasoning channel silent.
+    """
+    spec = _smoke_spec(thinking=True)
+
+    def by_target(**kwargs):
+        if kwargs["run_id"] == _SMOKE_REVISION:
+            return _smoke_response("<think>2+2 is 4</think>The answer is 4")
+        return _smoke_response("The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", by_target)
+
+    assert _run_smoke(spec)["thinking_tag"] is True
+    with pytest.raises(AliasThinkingSilent):
+        serving._verify_alias_thinking("run-1", spec, _SMOKE_REVISION)
+
+
+def _fake_deployment():
+    """A deployment stub WITHOUT `adapter_revision`, matching the fakes the deploy tests use.
+
+    Deliberately bare: the skip path must not read anything off the deployment, so requiring the
+    attribute here would break every existing test whose fake predates this check.
+    """
+    return types.SimpleNamespace()
+
+
+def test_alias_thinking_verification_is_skipped_for_a_nonthinking_run(monkeypatch):
+    """A run with no reasoning channel must not pay for the check or gain a new failure mode."""
+    calls = []
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **kwargs: calls.append(kwargs) or _smoke_response("The answer is 4"),
+    )
+    smoke_result = {"thinking_tag": False}
+    serving_completion._verify_activated_alias_thinking(
+        "run-1", _smoke_spec(thinking=False), _fake_deployment(), smoke_result
+    )
+
+    assert calls == []
+    assert "alias_thinking_tag" not in smoke_result
+
+
+def test_alias_thinking_verification_is_skipped_when_the_revision_never_thought(monkeypatch):
+    """Only a difference between revision and alias is the regression this check exists for.
+
+    An uncataloged model whose template omits the tag reaches here with `thinking_tag` false and
+    has already been judged by the smoke, so asking the alias could only fail it a second time for
+    a condition that is not alias reconciliation.
+    """
+    calls = []
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **kwargs: calls.append(kwargs) or _smoke_response("The answer is 4"),
+    )
+    serving_completion._verify_activated_alias_thinking(
+        "run-1", _smoke_spec(thinking=True), _fake_deployment(), {"thinking_tag": False}
+    )
+
+    assert calls == []

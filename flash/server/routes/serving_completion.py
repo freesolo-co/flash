@@ -18,7 +18,12 @@ from flash.runner import (
     mark_checkpoint_deployed,
     verified_adapter_revision_generation,
 )
-from flash.serve.deploy import ActivationOutcomeUnknown, AdapterConfigMissing, ServingError
+from flash.serve.deploy import (
+    ActivationOutcomeUnknown,
+    AdapterConfigMissing,
+    AliasThinkingSilent,
+    ServingError,
+)
 from flash.server import app as _app
 from flash.server.platform import db
 
@@ -293,6 +298,7 @@ def _finish_deployment_unlocked(
     try:
         dep = _app.deploy_adapter(**deploy_kwargs, before_activate=_before_activate)
         activated = True
+        _verify_activated_alias_thinking(run_id, spec, dep, smoke_result)
         current = {**current, **dep.to_dict()}
         current.pop("activation_outcome_unknown", None)
         current["verify"] = True
@@ -333,6 +339,12 @@ def _finish_deployment_unlocked(
                 previous, marked, persisted=marked.deployment == reconciling
             )
             return
+        if isinstance(exc, AliasThinkingSilent):
+            # the alias is live and answering, so this is a degraded deployment rather than a failed
+            # one -- but a thinking run whose alias returns no reasoning is exactly the regression
+            # that previously committed `ready` unnoticed, so the record must not say ready.
+            _record_alias_thinking_failure(run_id, exc, current, deployment)
+            return
         if activated:
             try:
                 latest = _app.get_status(run_id)
@@ -353,6 +365,52 @@ def _finish_deployment_unlocked(
                 print(f"deploy[{run_id}]: {divergence}", flush=True)
             return
         _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
+
+
+def _record_alias_thinking_failure(
+    run_id: str, exc: AliasThinkingSilent, current: dict, deployment: dict
+) -> None:
+    """Persist a `failed` record for an alias that activated without its reasoning channel.
+
+    `alias_thinking_tag` is recorded false rather than omitted: the field is what a client reads to
+    verify the resolved state, and absent would be indistinguishable from a deployment predating
+    the check.
+    """
+    failed = _deployment_state(
+        current,
+        "failed",
+        error=str(exc),
+        detail=(
+            "alias activated but serves no reasoning; redeploy to re-apply the reasoning "
+            "configuration"
+        ),
+        alias_thinking_tag=False,
+    )
+    previous = _app.get_status(run_id)
+    marked = _serving.mark_deployment_failed(run_id, failed)
+    _serving._report_persisted_transition(
+        previous, marked, persisted=_deployment_failure_persisted(marked, failed)
+    )
+
+
+def _verify_activated_alias_thinking(run_id: str, spec: JobSpec, dep, smoke_result: dict) -> None:
+    """Prove the freshly activated alias kept the reasoning channel the revision smoked with.
+
+    Raises `ServingError` when it did not, which reaches the caller's failure path with the alias
+    already live. That is the correct direction: the alias serves a real adapter and answers
+    normally, so tearing it down would replace a degraded deployment with none, but committing
+    `ready` would state that a thinking deployment thinks when it demonstrably does not.
+
+    Gated on the smoke's own `thinking_tag` so this only ever fires on a genuine regression: if the
+    pinned revision produced no reasoning either, the smoke has already judged that (it raises for a
+    catalog model), and the difference this check exists to catch is not present.
+    """
+    if not spec.thinking or not smoke_result.get("thinking_tag"):
+        return
+    # read off the deployment only once the gate above has passed: a non-thinking run must reach
+    # none of this, so the attribute is never required of a deployment that will not be checked.
+    revision = str(getattr(dep, "adapter_revision", "") or "")
+    smoke_result.update(_serving._verify_alias_thinking(run_id, spec, revision))
 
 
 def _record_deployment_failure(

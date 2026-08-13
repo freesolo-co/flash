@@ -23,6 +23,7 @@ from flash.serve.errors import (  # noqa: F401 -- re-exported: callers import th
     ActivationOutcomeUnknown,
     AdapterConfigMissing,
     AdapterTensorMissing,
+    AliasThinkingSilent,
     RetryableServingUnavailable,
     ServingError,
 )
