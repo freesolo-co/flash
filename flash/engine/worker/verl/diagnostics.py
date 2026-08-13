@@ -56,6 +56,7 @@ class ChildOutputTail:
         self._written = 0
         self._retriable_infra_signature: str | None = None
         self._cuda_oom_evidence: str | None = None
+        self._host_ram_kill_evidence: str | None = None
 
     def record(self, line: str) -> None:
         if self._retriable_infra_signature is None:
@@ -67,6 +68,10 @@ class ChildOutputTail:
             from flash.engine.worker.perf.lifecycle import cuda_oom_message_evidence
 
             self._cuda_oom_evidence = cuda_oom_message_evidence(line)
+        if self._host_ram_kill_evidence is None:
+            from flash.engine.worker.perf.lifecycle import host_ram_kill_evidence
+
+            self._host_ram_kill_evidence = host_ram_kill_evidence(line)
         text = line.rstrip("\n")
         if text:
             # sanitize before the per-line cap, not after: truncating first could split a credential
@@ -85,6 +90,11 @@ class ChildOutputTail:
     def cuda_oom_evidence(self) -> str | None:
         """the first authoritative cuda oom message evidence observed in child output."""
         return self._cuda_oom_evidence
+
+    @property
+    def host_ram_kill_evidence(self) -> str | None:
+        """the first authoritative ray host-RAM kill evidence observed in child output."""
+        return self._host_ram_kill_evidence
 
     @property
     def written(self) -> int:
@@ -108,6 +118,20 @@ def raise_for_classified_verl_exit(return_code: int, tail: ChildOutputTail) -> N
     """raise a classified failure when a nonzero verl child reported authoritative evidence."""
     if return_code == 0:
         return
+    # host RAM is checked FIRST. a node that runs out of system memory kills the workers holding the
+    # gpu, and the resulting cascade (thread-pool failures, bridge HTTP errors) prints AFTER the kill
+    # line -- so whichever evidence is raised becomes the run's reported cause, and the ray kill is
+    # the one that explains the rest. it is also permanent in the way a cuda oom is not: a
+    # larger-VRAM class whose nodes ship the same system ram fails identically.
+    host_ram_evidence = tail.host_ram_kill_evidence
+    if host_ram_evidence is not None:
+        raise RuntimeError(
+            f"verl subprocess exited with status {return_code} after ray killed its workers: "
+            f"{host_ram_evidence}. this is HOST RAM (system memory) exhaustion, not a gpu OOM -- "
+            "gpu memory was not the scarce resource, so retrying on a larger-VRAM class of the same "
+            "node shape fails identically. select a gpu class whose nodes carry more system RAM; "
+            "the worker-process floor is set by process COUNT, which prompts_per_step does not change."
+        )
     oom_evidence = tail.cuda_oom_evidence
     if oom_evidence is not None:
         raise RuntimeError(
