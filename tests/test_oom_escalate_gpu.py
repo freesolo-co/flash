@@ -149,6 +149,30 @@ def test_cuda_oom_still_wins_when_no_host_ram_kill_is_present(monkeypatch):
     assert lc.is_cuda_oom(raised.value) is True
 
 
+@pytest.mark.parametrize("ray_first", [True, False])
+def test_host_ram_wins_when_both_signals_are_present(monkeypatch, ray_first):
+    """When BOTH signals appear, the host-RAM kill is the cause and must win either print order.
+
+    A node dying of system memory kills the workers holding the GPU, so a torch OOM can be printed
+    by a worker on its way down -- BEFORE or AFTER ray's kill line, depending on which process
+    flushed first. Escalating VRAM on that torch line buys a bigger card for a node whose RAM is
+    what ran out, so the verdict must not depend on interleaving.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+    from flash.engine.worker.verl.diagnostics import ChildOutputTail, raise_for_classified_verl_exit
+
+    monkeypatch.setattr(lc, "cuda_oom_count", lambda: 0)
+    torch_line = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
+    lines = [RAY_HOST_RAM_KILL + "\n", torch_line]
+    tail = ChildOutputTail()
+    for line in lines if ray_first else reversed(lines):
+        tail.record(line)
+
+    with pytest.raises(RuntimeError, match="HOST RAM") as raised:
+        raise_for_classified_verl_exit(1, tail)
+    assert lc.is_cuda_oom(raised.value) is False
+
+
 def test_is_cuda_oom_typed_torch_error():
     torch = pytest.importorskip("torch")  # skipped on the torch-less offline CI image
     from flash.engine.worker.perf.lifecycle import is_cuda_oom
