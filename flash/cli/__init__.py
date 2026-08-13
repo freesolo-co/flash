@@ -61,6 +61,10 @@ from flash.cli.ui import render
 from flash.client.config import shadowed_login_warning
 from flash.core.catalog import ALGORITHMS
 
+# argv flags whose VALUE is a credential, so it must never be echoed back to the user. both the
+# freesolo key (`flash login`) and the HuggingFace token (`flash models export`) use this name.
+_CREDENTIAL_FLAGS = frozenset({"--api-key"})
+
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
 # every subparser's own `help=` / `<cmd> --help`). test_cli_help.py asserts these rows stay in
@@ -849,6 +853,32 @@ def _warn_if_login_shadowed(args) -> None:
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
+def _redacted_args(raw_args: list[str]) -> list[str]:
+    """`raw_args` with any credential value replaced, for echoing a command back to the user.
+
+    The unexpected-error handler suggests re-running the exact command with --debug, which would
+    otherwise reproduce a `--api-key <key>` the user typed -- printing the key into a terminal, a
+    CI log or a pasted bug report. That is the same exposure `--api-key` already carries in process
+    listings, and the fix costs nothing: the value is never what makes the traceback useful.
+    """
+    redacted: list[str] = []
+    drop_value = False
+    for arg in raw_args:
+        if drop_value:
+            redacted.append("<redacted>")
+            drop_value = False
+            continue
+        if arg in _CREDENTIAL_FLAGS:
+            redacted.append(arg)
+            drop_value = True
+            continue
+        flag, sep, _ = arg.partition("=")
+        # `--api-key=secret` is one argv entry, so the split form has to be handled separately or
+        # the value rides along inside it.
+        redacted.append(f"{flag}=<redacted>" if sep and flag in _CREDENTIAL_FLAGS else arg)
+    return redacted
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     parser = _build_parser()
@@ -882,7 +912,7 @@ def main(argv: list[str] | None = None) -> int:
         # point at the exact command to re-run, copy-pasteable. --debug is a root-level flag, so it
         # must come BEFORE the subcommand (argparse rejects `flash runs --debug`); place it right
         # after the program name. raw_args never contains --debug here — that path re-raises above.
-        cmd = " ".join([CLI_NAME, "--debug", *(shlex.quote(a) for a in raw_args)])
+        cmd = " ".join([CLI_NAME, "--debug", *(shlex.quote(a) for a in _redacted_args(raw_args))])
         print(render.error(str(exc) or exc.__class__.__name__), file=sys.stderr)
         print(render.arrow(f"run `{cmd}` for the full traceback"), file=sys.stderr)
         return 1

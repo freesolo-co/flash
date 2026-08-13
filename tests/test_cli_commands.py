@@ -2741,6 +2741,60 @@ def test_export_still_applies_creation_rules_on_an_old_hub_when_the_repo_is_abse
     assert "hf_secret" not in err
 
 
+def test_export_keeps_the_creation_rules_when_existence_is_inconclusive(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """An unanswered existence lookup must not buy a bypass of the namespace rules.
+
+    The old-hub branch skips the creation rules on the grounds that an EXISTING repo is not being
+    created. Extending that to a lookup that merely failed would let any transient Hub error carry
+    an export into a namespace nothing verified -- the wrong-namespace export this preflight exists
+    to stop. Being denied a bypass costs a `contributor` one retry; granting it wrongly is silent.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "contributor"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        # the pre-1.5 signature: no `write` parameter, so there is no exact write probe.
+        def auth_check(self, repo_id, *, repo_type=None, token=None):
+            return
+
+        def repo_exists(self, repo_id, *, repo_type=None, token=None):
+            raise OSError("hub unreachable")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.4.0"),
+    )
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 1
+    )
+    assert not any(call[0] == "export" for call in fake_client.calls)
+    err = capsys.readouterr().err
+    assert "cannot create" in err
+    assert "hf_secret" not in err
+
+
 def test_export_refuses_a_gated_destination_instead_of_treating_it_as_creatable(
     fake_client, monkeypatch, capsys
 ) -> None:

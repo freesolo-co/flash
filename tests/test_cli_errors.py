@@ -94,6 +94,35 @@ def test_debug_flag_shows_traceback():
     assert "Traceback (most recent call last)" in proc.stderr
 
 
+def test_unexpected_error_suggestion_does_not_replay_a_credential():
+    """The `run ... --debug` suggestion echoes argv, so it must not echo the key inside it.
+
+    Both argv spellings matter: argparse accepts `--api-key secret` as two entries and
+    `--api-key=secret` as one, and only the first is caught by looking at the following element.
+    """
+    from flash.cli import _redacted_args
+
+    separate = _redacted_args(
+        ["models", "export", "--repository", "alice/model", "--api-key", "hf_SUPERSECRET"]
+    )
+    assert "hf_SUPERSECRET" not in separate
+    assert separate == [
+        "models",
+        "export",
+        "--repository",
+        "alice/model",
+        "--api-key",
+        "<redacted>",
+    ]
+
+    joined = _redacted_args(["login", "--api-key=fs_SUPERSECRET"])
+    assert "fs_SUPERSECRET" not in joined
+    assert joined == ["login", "--api-key=<redacted>"]
+
+    # a non-credential flag keeps its value: the suggestion is only useful if it stays runnable.
+    assert _redacted_args(["runs", "status", "--json"]) == ["runs", "status", "--json"]
+
+
 def test_train_without_login_fails_fast():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = os.path.join(tmp, "run.toml")

@@ -346,12 +346,13 @@ def _hub_repo_gated_errors() -> tuple[type[BaseException], ...]:
     return ()
 
 
-def _hf_repo_exists(api: object, repository: str, token: str) -> bool:
-    """Whether the destination is already there, for hubs with no exact write probe.
+def _hf_repo_confirmed_to_exist(api: object, repository: str, token: str) -> bool:
+    """Whether the Hub affirmatively said the destination is already there.
 
-    Only ever used to decide that the CREATION rules do not apply. An error is reported as "does not
-    exist" so an unreachable or unreadable Hub keeps the stricter creation path rather than silently
-    waving the export through.
+    True only on an affirmative answer. A missing `repo_exists`, an error, or any other non-answer
+    is False, meaning "not confirmed", which leaves the creation rules in charge. That asymmetry is
+    deliberate: bypassing those rules is what lets an export reach a namespace nobody verified, so
+    it must be earned by a real answer rather than granted by the absence of one.
     """
     repo_exists = getattr(api, "repo_exists", None)
     if not callable(repo_exists):
@@ -363,13 +364,17 @@ def _hf_repo_exists(api: object, repository: str, token: str) -> bool:
 
 
 def _hf_hub_version() -> str:
-    """The installed hub version for messages, without importing the package at module scope."""
+    """The installed hub version for messages, without importing the package at module scope.
+
+    Falls back to a phrase, not a version-shaped string: this is only reached when the version could
+    not be read, and printing something that looks like a number would name a version nobody has.
+    """
     try:
         from huggingface_hub import __version__
 
         return str(__version__)
     except Exception:
-        return "<1.5"
+        return "(unknown version)"
 
 
 def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
@@ -416,12 +421,14 @@ def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
     # very repo, because a role is a coarser fact than the permission being checked.
     auth_check = getattr(api, "auth_check", None)
     exact_probe = callable(auth_check) and "write" in inspect.signature(auth_check).parameters
-    if not exact_probe and _hf_repo_exists(api, repository, token):
+    if not exact_probe and _hf_repo_confirmed_to_exist(api, repository, token):
         # `auth_check(..., write=True)` only exists from huggingface-hub 1.5, and this package still
         # supports >=1.2, so on 1.2-1.4 there is no exact write probe. the rules below are CREATION
         # rules and a destination that already exists is not being created, so applying them here
         # would reject the org `contributor` this ordering was fixed to admit. degrade to a warning,
         # exactly as this function already does when the Hub is unreachable or the package is absent.
+        # only a CONFIRMED existing repo takes this path. an unanswered lookup keeps the creation
+        # rules, which is what stops an unverified export into someone else's namespace.
         print(
             f"warning: huggingface-hub {_hf_hub_version()} cannot check write access to an "
             f"existing repo; proceeding without verifying {repository}",
