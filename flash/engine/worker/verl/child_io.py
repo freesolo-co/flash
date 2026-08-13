@@ -263,11 +263,17 @@ _LORA_ROLLOUT_TARGET = "verl.workers.rollout.vllm_rollout.vllm_async_server"
 # reads as a failed experiment rather than a broken run, and no loss curve can distinguish the two.
 #
 # the shim supplies the else-branch verl omits: with lora_as_adapter set, an absent adapter is a
-# hard error. that is safe on flash's paths because every flash rollout is a lora rollout
-# (train.lora_rank has a minimum of 1) and generation only ever runs after a weight sync has added
-# the adapter -- both opd and grpo set trainer.val_before_train=false, so there is no pre-sync
-# validation pass that would legitimately generate from the base model. `lora_as_adapter` is false
-# for a merged-lora rollout, so this never fires on a path where base-model generation is intended.
+# hard error. every flash rollout is a lora rollout (train.lora_rank parses with minimum=1), and
+# there is no legitimate window where the adapter is missing:
+#   - ray_trainer.fit loads the checkpoint and calls update_weights BEFORE any generation,
+#     including the optional pre-train validation pass, so the first rollout is already post-sync.
+#   - the adapter is re-added on every step's weight sync (utils.py _update_weights -> add_lora),
+#     and the one remove_lora is inside that same awaited sync, with no generation scheduled in it.
+#   - lora rollouts sleep at level 1 rather than 2 specifically to keep the adapter across steps.
+#   - vllm is configured max_loras=1 against a single fixed id, so nothing evicts it under pressure.
+# `lora_as_adapter` is false for a merged-lora rollout, which serves the adapter through the base
+# weights and legitimately carries no LoRARequest, so mirroring that flag keeps the guard off the
+# one path where generating without a LoRARequest is correct.
 def render_lora_rollout_guard_shim() -> str:
     """child-side sitecustomize fragment that fails a rollout whose lora never reached the engine.
 

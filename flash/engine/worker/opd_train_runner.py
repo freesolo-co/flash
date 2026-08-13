@@ -598,6 +598,7 @@ def _build_child_callbacks(
     progress_state: Any,
     bridge: Any,
     resume_step: int,
+    shim_markers: str,
 ) -> _ChildCallbacks:
     progress = {
         "step": resume_step,
@@ -606,8 +607,10 @@ def _build_child_callbacks(
         "truncation_step": None,
     }
     wandb_link: dict[str, str | None] = {}
+    shims_verified = False
 
     def on_line(line: str) -> None:
+        nonlocal shims_verified
         watcher.raise_if_failed()
         link = _opd_train.parse_wandb_link(line)
         if link is not None:
@@ -615,6 +618,15 @@ def _build_child_callbacks(
         step_number = _opd_train.verl_step_number(line)
         if step_number is None:
             return
+        # the first step line is the training-start boundary: sitecustomize import is long finished
+        # by then, so a marker still missing means this child never ran ours and every rollout it
+        # has already served could have come from the base model. raising here kills the child
+        # (run_verl_training tears the process group down on a callback failure), which costs one
+        # step instead of the whole gpu and teacher budget. not on the first output line: fragments
+        # print while later ones are still applying.
+        if not shims_verified:
+            _opd_train.verify_applied_shim_markers(shim_markers, (_LORA_ROLLOUT_GUARD_SHIM,))
+            shims_verified = True
         # use parse_verl_metric because numpy 2 pprint emits np.float64(...); float() would drop
         # every step and leave a trained run with an empty loss curve.
         loss = _opd_train.parse_verl_metric(line, "actor/distillation/loss")
@@ -673,7 +685,10 @@ def _run_child(
     overrides = _opd_train.build_opd_overrides(config)
     progress_state = _opd_train._OpdProgressState(runtime.resume_state)
     watcher = _build_checkpoint_watcher(request, workload, runtime, progress_state)
-    callbacks = _build_child_callbacks(watcher, progress_state, runtime.bridge, runtime.resume_step)
+    shim_markers = _opd_train.shim_marker_file(workload.shim_dir)
+    callbacks = _build_child_callbacks(
+        watcher, progress_state, runtime.bridge, runtime.resume_step, shim_markers
+    )
     child_env = _build_child_env(request, prompt_state, workload, runtime, eos_token_ids)
     command = [runtime.python_bin, runtime.entry_path, *overrides]
     gpu_sampler = _opd_train._NvidiaSmiPeakSampler().start()
@@ -700,12 +715,10 @@ def _run_child(
                 )
                 training_completed = return_code == 0
                 if training_completed:
-                    # a child that trained to completion must have proved the rollout guard applied.
-                    # a missing marker means its sitecustomize never ran, so every rollout in this
-                    # run could have come from the base model with nothing in the logs to show it.
+                    # belt and braces behind the first-step check in _build_child_callbacks: a run
+                    # that exits 0 without ever printing a step line still may not pass unverified.
                     _opd_train.verify_applied_shim_markers(
-                        _opd_train.shim_marker_file(workload.shim_dir),
-                        (_LORA_ROLLOUT_GUARD_SHIM,),
+                        shim_markers, (_LORA_ROLLOUT_GUARD_SHIM,)
                     )
     finally:
         watcher.stop(require_complete=training_completed)

@@ -2794,6 +2794,17 @@ def _progress_bridge_snapshot(*, samples_seen: int, truncated_rollouts: int):
     )
 
 
+def _applied_shim_markers(tmp_path) -> str:
+    """a marker file recording the guard as applied, as a child with a working shim leaves it.
+
+    the callbacks verify it on the first step line, so tests that drive steps need the real
+    thing rather than a stub: a bare path would fail them for the reason the check exists.
+    """
+    marker = tmp_path / "applied_shims.txt"
+    marker.write_text("lora-rollout-guard\n", encoding="utf-8")
+    return str(marker)
+
+
 def test_opd_progress_truncation_rate_is_per_step_not_cumulative():
     progress = _OpdProgressState()
 
@@ -6555,7 +6566,7 @@ def test_on_line_parses_the_numpy2_distillation_loss_the_image_actually_prints()
     )
 
 
-def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
+def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch, tmp_path):
     import flash.engine.worker.opd_train_runner as opd_runner
 
     emitted = []
@@ -6569,6 +6580,7 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
         _OpdProgressState(),
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
+        _applied_shim_markers(tmp_path),
     )
 
     callbacks.on_line("step:1 - actor/distillation/loss:0.5")
@@ -6582,7 +6594,7 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
     ]
 
 
-def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
+def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch, tmp_path):
     import flash.engine.worker.opd_train_runner as opd_runner
 
     emitted = []
@@ -6596,6 +6608,7 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
         _OpdProgressState(),
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
+        _applied_shim_markers(tmp_path),
     )
 
     callbacks.on_line("step:1 - actor/distillation/loss:0.5")
@@ -6608,7 +6621,7 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
     assert "truncation_rate" not in emitted[1][1]
 
 
-def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch):
+def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch, tmp_path):
     """the step-match guard must not silently disable the rate in production.
 
     on_line gates on verl_step_number, on_step on backend_common's own step_pattern. the two
@@ -6632,6 +6645,7 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
         _OpdProgressState(),
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
+        _applied_shim_markers(tmp_path),
     )
 
     # the step number reaching on_step is the one backend_common parses, not a hand-picked int.
@@ -7134,3 +7148,27 @@ def test_opd_fails_a_completed_run_whose_rollout_guard_never_applied(tmp_path):
         opd_train.verify_applied_shim_markers(
             opd_train.shim_marker_file(str(tmp_path)), ("lora-rollout-guard",)
         )
+
+
+def test_opd_stops_an_unguarded_child_at_its_first_step_not_after_the_whole_run(tmp_path):
+    """the check must land on the first step line, not only after the child exits.
+
+    a child whose sitecustomize was skipped serves every rollout from the base model. verifying
+    post-exit still fails the run, but only once the entire gpu and teacher budget is spent, so
+    the marker is checked at the first step boundary and the raise tears the child down there.
+    """
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    callbacks = opd_runner._build_child_callbacks(
+        SimpleNamespace(raise_if_failed=lambda: None),
+        _OpdProgressState(),
+        _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
+        0,
+        opd_train.shim_marker_file(str(tmp_path)),  # no marker: the shim never applied
+    )
+
+    # output before the first step is not a verdict: fragments still print while later ones apply.
+    callbacks.on_line("(TaskRunner pid=3125) loading checkpoint\n")
+
+    with pytest.raises(RuntimeError, match=r"never proved.*lora-rollout-guard"):
+        callbacks.on_line("step:1 - actor/distillation/loss:0.5")
