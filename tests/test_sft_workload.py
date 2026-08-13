@@ -1093,6 +1093,23 @@ def test_reasoning_sampled_without_an_opening_tag_still_counts_as_authored(capsy
     assert "the chat template dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
 
 
+def test_the_templates_own_empty_think_block_is_not_counted_as_authored(capsys) -> None:
+    """A turn carrying only ``<think>\\n\\n</think>`` authored nothing, so nothing can be lost.
+
+    The template stamps that empty block onto qualifying trailing assistant turns, so it comes back
+    in any transcript captured from a previous render. Counting it as authored marks a block the
+    real render does not have; the span counts then disagree and the row is reported as having lost
+    ALL of its reasoning -- a total-loss warning for a dataset that lost none.
+    """
+    completion = [{"role": "assistant", "content": "<think>\n\n</think>just an answer"}]
+    prepared = _thinking_prepared(completion)
+
+    assert prepared.authored_reasoning_turns == 0
+    assert prepared.rendered_reasoning_spans == 0
+    assert prepared.truncated_reasoning_spans == 0
+    assert "reasoning" not in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("label", "content"),
     [

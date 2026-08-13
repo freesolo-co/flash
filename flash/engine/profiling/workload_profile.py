@@ -196,12 +196,19 @@ def _reasoning_body_offset(text: str) -> int | None:
     so a sampled completion carries only the close, and ``flash.serve.thinking`` recognises the same
     shape. Requiring a balanced pair would score such a turn as authoring nothing, leaving it out of
     the denominator and understating -- or entirely suppressing -- the warning.
+
+    Emptiness is judged on the BODY, after the opener is located, never on the text preceding the
+    close. The template stamps an empty ``<think>\\n\\n</think>`` onto qualifying trailing assistant
+    turns, so that leading text is present on a turn that authored nothing; treating it as authored
+    marks a block the real render does not have, and the resulting span-count mismatch reports the
+    whole row as template-dropped -- a total loss warning for a dataset that lost nothing.
     """
     close = text.find(_THINK_CLOSE)
-    if close < 0 or not text[:close].strip():
+    if close < 0:
         return None
     open_at = text.rfind(_THINK_OPEN, 0, close)
-    return 0 if open_at < 0 else open_at + len(_THINK_OPEN)
+    body = 0 if open_at < 0 else open_at + len(_THINK_OPEN)
+    return body if text[body:close].strip() else None
 
 
 def _marked_inline_reasoning(content: object, marker: str) -> object:
