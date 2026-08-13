@@ -549,7 +549,7 @@ def _check_env_push_credentials(pkg: Path, *, entrypoint: Path) -> None:
     `--name`, so a key passed there was published verbatim -- and left a window in which any local
     process rewriting a source file put unscanned bytes into the archive.
     """
-    from flash.cli.commands.env.secrets import reject_credential_bearing_package
+    from flash.env_secrets import reject_credential_bearing_package
 
     # the entrypoint is staged as environment.py, so name it in the author's terms: telling them
     # to fix `environment.py` when their file is `custom_env.py` points at a file they don't have.

@@ -30,6 +30,7 @@ import re
 import time
 import zipfile
 import zlib
+from collections.abc import Iterator
 from pathlib import Path
 from typing import IO
 
@@ -85,6 +86,27 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     ("a Slack token", re.compile(rb"(?:xox[baprs]|xapp)-([A-Za-z0-9-]{10,%d})" % _MAX_BODY)),
 )
 
+# Credentials with no issuer prefix, anchored on the ASSIGNMENT that names them instead. A W&B key
+# is 40 undifferentiated hex characters, and `WANDB_API_KEY` is this repository's default runtime
+# secret (`flash/client/runtime_secrets.py`), so a training environment is exactly where one sits
+# beside the config. Matching bare 40-hex would refuse every dataset carrying a git sha; the
+# variable name is what makes these bytes a credential rather than a hash.
+#
+# These skip `_is_high_entropy`, which exists to spare hand-written placeholders in a body that is
+# otherwise unmistakably a key. Here the variable name already carries that meaning, and a hex body
+# can legitimately be all-letters (`abcdef...`), which the placeholder heuristic would reject. A
+# literal `${WANDB_API_KEY}` reference is not matched, since it is not 40 hex characters.
+#
+# The NAME matches case-insensitively: the same key sits in an env file as `WANDB_API_KEY` and in a
+# yaml or python config as `wandb_api_key`, and it is equally live in both. The 40-hex body is what
+# bounds the false positives, not the casing of the name.
+_ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
+    (
+        "a Weights & Biases API key",
+        re.compile(rb"(?i:wandb_api_key)[\"']?\s*[:=]\s*[\"']?([0-9a-fA-F]{40})"),
+    ),
+)
+
 # A PEM header only means a key is present when the BODY follows it. The header alone is something
 # documentation says -- "if you see -----BEGIN RSA PRIVATE KEY----- in a log, redact it" -- and
 # refusing on it blocks a legitimate publish over prose about credentials. Requiring a base64 line
@@ -119,18 +141,30 @@ _SCAN_OVERLAP_BYTES = 1024
 # choice and a renamed archive is still an archive.
 _COMPRESSED_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00")
 
-# A base64 run long enough to hold the shortest credential a pattern admits. Bounded at both ends
-# so the scan walks past ordinary prose rather than decoding every word it meets.
-_BASE64_RUN = re.compile(rb"[A-Za-z0-9+/]{24,%d}={0,2}" % (_MAX_BODY * 2))
+# A base64 run long enough to hold the shortest credential a pattern admits. The lower bound makes
+# the scan walk past ordinary prose rather than decoding every word it meets. There is deliberately
+# no upper bound: capping the run split a long encoded file into adjacent pieces, and a credential
+# straddling the cut decoded into neither half -- so base64 of a whole `env.sh` published clean.
+# Length is instead bounded by `_decode_windows` below, which slides a window over the run.
+_BASE64_RUN = re.compile(rb"[A-Za-z0-9+/]{24,}={0,2}")
+
+# How much of one base64 run to decode at a time, and how far the windows overlap. The overlap
+# exceeds the encoded length of the longest possible match (4/3 of `_MAX_BODY` plus its prefix), so
+# a credential anywhere in a run of any length lands whole inside some window.
+_BASE64_WINDOW = 8192
+_BASE64_WINDOW_OVERLAP = 1024
 
 # How many container layers deep to expand. A zip holding a gzipped shard is an ordinary way to
 # ship a dataset, and stopping at one level meant the inner member's bytes were treated as final
 # content -- so a key one layer further in published untouched. The limit still exists because
 # each layer multiplies the work a hostile archive can demand.
 _MAX_CONTAINER_DEPTH = 4
-# A nested container is buffered in memory to be re-opened, so its size is capped. Beyond this the
-# member keeps the streaming scan of its literal bytes: spilling arbitrary expansions to disk
-# during a publish is a worse trade than leaving one very large nested archive unexpanded.
+# A nested container is buffered in memory to be reopened, so its size is capped.
+#
+# BOTH limits refuse rather than pass when they bite. Returning "nothing found" made the cheapest
+# bypass of the entire check "make it expensive": pad an archive past the buffer cap, or bury the
+# key one layer past the depth cap, and the scan reported clean. No real environment here comes
+# close to either bound, so a refusal means something genuinely unusual is being published.
 _MAX_NESTED_BUFFER_BYTES = 64 << 20
 # Wall-clock budget for expanding one file's archives. Expansion is unbounded in principle, so it
 # needs a stop -- but a stop on BYTES is the wrong one: it discards the tail of the stream, and a
@@ -194,7 +228,7 @@ def _is_high_entropy(body: bytes) -> bool:
 
 def _match(data: bytes) -> str | None:
     """The kind of credential the literal bytes `data` contain, or None."""
-    for kind, pattern in _LITERAL_PATTERNS:
+    for kind, pattern in _LITERAL_PATTERNS + _ASSIGNED_PATTERNS:
         if pattern.search(data):
             return kind
     for kind, pattern in _TOKEN_PATTERNS:
@@ -218,24 +252,41 @@ def _match_base64(data: bytes) -> str | None:
     `_credential_kind`, which keeps the recursion one level deep: base64 of base64 is not a
     convention worth chasing, and unbounded re-decoding is a denial-of-service surface.
 
+    A run is decoded in overlapping windows rather than whole, so memory stays bounded on a large
+    encoded blob while a credential anywhere in it still lands whole inside some window. Slicing a
+    long run into ADJACENT pieces was a bypass: a key straddling the cut decoded into neither half,
+    so base64 of an ordinary config file published clean.
+
     Measured against the false-positive risk before adopting it: 630,011 base64-shaped runs across
     8,769 real hub files decode to zero credential matches, so this costs no legitimate publish.
     """
     for run in _BASE64_RUN.finditer(data):
         candidate = run.group(0)
-        # base64 encodes 3 bytes per 4 characters; ignore what cannot reach the shortest prefix
-        for start in range(min(len(candidate), 4)):
-            chunk = candidate[start:]
-            chunk = chunk[: len(chunk) - len(chunk) % 4]
-            if len(chunk) < 24:
-                continue
-            try:
-                decoded = base64.b64decode(chunk, validate=True)
-            except (ValueError, binascii.Error):
-                continue
-            if kind := _match(decoded):
-                return kind
+        for window in _decode_windows(candidate):
+            # base64 packs 3 bytes per 4 characters, so a run rarely starts on a boundary; all four
+            # alignments are tried, each trimmed to a whole number of quartets.
+            for start in range(min(len(window), 4)):
+                chunk = window[start:]
+                chunk = chunk[: len(chunk) - len(chunk) % 4]
+                if len(chunk) < 24:
+                    continue
+                try:
+                    decoded = base64.b64decode(chunk, validate=True)
+                except (ValueError, binascii.Error):
+                    continue
+                if kind := _match(decoded):
+                    return kind
     return None
+
+
+def _decode_windows(run: bytes) -> Iterator[bytes]:
+    """Overlapping slices of a base64 run, each small enough to decode eagerly."""
+    if len(run) <= _BASE64_WINDOW:
+        yield run
+        return
+    step = _BASE64_WINDOW - _BASE64_WINDOW_OVERLAP
+    for start in range(0, len(run), step):
+        yield run[start : start + _BASE64_WINDOW]
 
 
 def _credential_kind(data: bytes) -> str | None:
@@ -246,10 +297,12 @@ def _credential_kind(data: bytes) -> str | None:
     decode every member (most are not text at all), strip the NUL padding of each wide form and
     re-test: that is exact for the ASCII-range characters every one of these credentials is built
     from, and costs nothing on the ordinary UTF-8 file, which has no NULs to strip.
+
+    Narrowed text goes through the SAME checks as literal text, base64 included. Running only the
+    plain patterns over it left the two supported encodings composable: a UTF-16 config file holding
+    a base64 credential passed both gates individually and published.
     """
-    if kind := _match(data):
-        return kind
-    if kind := _match_base64(data):
+    if kind := _decoded_kind(data):
         return kind
     if b"\x00" not in data:
         return None
@@ -257,14 +310,25 @@ def _credential_kind(data: bytes) -> str | None:
         for offset in keep:
             # take every `width`-th byte: for UTF-16 that is the ASCII half of each code unit, in
             # whichever of the two byte orders the file used.
-            narrowed = data[offset::width]
-            if kind := _match(narrowed):
+            if kind := _decoded_kind(data[offset::width]):
                 return kind
     return None
 
 
-class _ExpansionBudgetExceeded(Exception):
-    """An archive took longer to expand than `_MAX_DECOMPRESS_SECONDS` allows."""
+def _decoded_kind(data: bytes) -> str | None:
+    """The kind of credential in `data` literally, or inside a base64 run within it."""
+    return _match(data) or _match_base64(data)
+
+
+class _Unscannable(Exception):
+    """A member could not be scanned to the end, so the publish cannot be vouched for.
+
+    Every limit this module imposes -- time, nesting depth, buffer size -- raises this rather than
+    returning None. A limit that returns "no credential found" is indistinguishable from a clean
+    scan, so the cheapest way past the whole check is to make it expensive: bury the key deeper
+    than the depth cap, or behind a member too large to buffer. Refusing keeps the limits honest
+    about what they mean, which is "not verified", not "verified clean".
+    """
 
 
 def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int = 0) -> str | None:
@@ -276,29 +340,30 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     protection.
 
     `deadline` bounds expansion time when the bytes come from an archive. Exceeding it raises
-    rather than returning None, so the caller can refuse the publish: a stream too expensive to
-    finish is one this scan cannot vouch for, and silently calling it clean is how the cap leaked.
+    `_Unscannable` rather than returning None, so the caller refuses the publish.
 
-    A stream that is ITSELF a container is expanded in turn, up to `_MAX_CONTAINER_DEPTH`. Nested
-    containers are only buffered when they are small enough to hold in memory; a larger one keeps
-    the streaming scan of its literal bytes, since the alternative is spilling arbitrary expansions
-    to disk during a publish.
+    A stream that is ITSELF a container is expanded in turn. Nested containers are buffered to be
+    reopened, so one too large to hold in memory also raises: leaving it to the scan of its literal
+    bytes looked like a reasonable trade, but a deflated member's bytes hold the credential nowhere
+    a pattern can see, so it was a silent bypass reachable by padding an archive past the cap.
     """
     carry = b""
     buffered = bytearray()
     nested = False
     while chunk := handle.read(_SCAN_CHUNK_BYTES):
         if deadline is not None and time.monotonic() > deadline:
-            raise _ExpansionBudgetExceeded
+            raise _Unscannable("takes too long to decompress")
         if not carry and depth:
             nested = _looks_compressed(chunk[:6])
-        if nested and len(buffered) <= _MAX_NESTED_BUFFER_BYTES:
+        if nested:
+            if len(buffered) > _MAX_NESTED_BUFFER_BYTES:
+                raise _Unscannable("contains a compressed member too large to inspect")
             buffered.extend(chunk)
         window = carry + chunk
         if kind := _credential_kind(window):
             return kind
         carry = window[-_SCAN_OVERLAP_BYTES:]
-    if nested and 0 < len(buffered) <= _MAX_NESTED_BUFFER_BYTES:
+    if nested and buffered:
         return _credential_in_container(bytes(buffered), deadline=deadline or 0.0, depth=depth + 1)
     return None
 
@@ -330,7 +395,7 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
     budget refuses, arriving through error handling instead.
     """
     if depth > _MAX_CONTAINER_DEPTH:
-        return None
+        raise _Unscannable("nests compressed containers too deeply to inspect")
     opened: IO[bytes] | None = None
     try:
         # `is_zipfile` scans for the end-of-central-directory record, so it recognises a zip with a
@@ -372,7 +437,7 @@ def credential_in_file(path: Path) -> str | None:
     saving: a credential sitting in a sqlite state file or a pickle is as published as one in a
     shell script, and the prefixes above cannot realistically collide with random bytes.
 
-    Raises `_ExpansionBudgetExceeded` if an archive is too expensive to finish expanding, which the
+    Raises `_Unscannable` if an archive is too expensive to finish expanding, which the
     caller turns into a refusal: unverifiable is not the same as clean.
     """
     with path.open("rb") as handle:
@@ -440,11 +505,11 @@ def reject_credential_bearing_package(package_root: Path, *, display: dict[str, 
                 kind = credential_in_name(relative) or (
                     credential_in_file(member) if member.is_file() else None
                 )
-            except _ExpansionBudgetExceeded:
+            except _Unscannable as exc:
                 raise ValueError(
-                    f"{shown} takes too long to decompress to be scanned for credentials. "
-                    "Publishing it would commit unscanned content to a shared environment "
-                    "repository. Remove or unpack the archive before publishing."
+                    f"{shown} {exc}, so it cannot be checked for credentials. Publishing it would "
+                    "commit unscanned content to a shared environment repository. Unpack the "
+                    "archive before publishing."
                 ) from None
             if not kind:
                 continue

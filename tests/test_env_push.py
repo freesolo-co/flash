@@ -1662,7 +1662,7 @@ def test_push_allows_ordinary_environments_and_datasets(monkeypatch, tmp_path):
 def test_credential_scan_reads_across_chunk_boundaries_and_into_binaries(tmp_path):
     import sqlite3
 
-    from flash.cli.commands.env.secrets import (
+    from flash.env_secrets import (
         _MAX_BODY,
         _SCAN_CHUNK_BYTES,
         _SCAN_OVERLAP_BYTES,
@@ -1734,7 +1734,7 @@ def test_push_scans_generated_members_and_resists_post_scan_mutation(monkeypatch
 
 
 def test_push_refuses_every_issued_openai_key_family(tmp_path):
-    from flash.cli.commands.env.secrets import _credential_kind
+    from flash.env_secrets import _credential_kind
 
     # sk-svcacct- and sk-admin- carry project- and org-wide authority. Neither is reachable
     # through the bare `sk-` branch: the subtype's own hyphen ends its alphanumeric run early.
@@ -1792,7 +1792,7 @@ def test_credential_scan_survives_a_container_it_cannot_open(tmp_path):
     A truncated or unsupported container is ordinary in a dataset directory, and refusing to
     publish one -- or crashing on it -- would be a worse bug than the hole being closed.
     """
-    from flash.cli.commands.env.secrets import credential_in_file
+    from flash.env_secrets import credential_in_file
 
     truncated = tmp_path / "broken.zip"
     truncated.write_bytes(b"PK\x03\x04" + b"\x00" * 8)
@@ -1810,7 +1810,7 @@ def test_credential_scan_reads_wide_encodings(tmp_path):
     A PowerShell `env.ps1` is UTF-16 by default on Windows, which is exactly the sourceable secrets
     file this whole check exists for -- in the one encoding that walked straight past it.
     """
-    from flash.cli.commands.env.secrets import credential_in_file
+    from flash.env_secrets import credential_in_file
 
     for encoding in ("utf-16", "utf-16-be", "utf-32", "utf-32-be"):
         wide = tmp_path / f"env-{encoding}.ps1"
@@ -1846,7 +1846,7 @@ def test_push_refuses_a_credential_used_as_a_filename(monkeypatch, tmp_path, cap
 
 
 def test_push_refuses_a_credential_used_as_a_directory_name(monkeypatch, tmp_path):
-    from flash.cli.commands.env.secrets import credential_in_name
+    from flash.env_secrets import credential_in_name
 
     env_dir = tmp_path / "env"
     env_dir.mkdir()
@@ -1867,7 +1867,7 @@ def test_a_pem_header_without_a_key_body_is_prose_not_a_credential(tmp_path):
     Refusing on the header alone blocked a legitimate publish over writing about credentials, which
     is the kind of false refusal that gets a check disabled.
     """
-    from flash.cli.commands.env.secrets import _credential_kind
+    from flash.env_secrets import _credential_kind
 
     prose = b"If you see -----BEGIN RSA PRIVATE KEY----- in a log, redact it before sharing."
     assert _credential_kind(prose) is None
@@ -1881,7 +1881,7 @@ def test_a_pem_header_without_a_key_body_is_prose_not_a_credential(tmp_path):
 
 def test_slack_app_level_tokens_are_matched(tmp_path):
     """`xapp-` is a separate prefix, not another letter in the `xox?` set."""
-    from flash.cli.commands.env.secrets import _credential_kind
+    from flash.env_secrets import _credential_kind
 
     for prefix in ("xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "xapp-"):
         token = f"{prefix}1-A012BC3DEF-1234567890123-abcdefABCDEF0123456789"
@@ -1915,7 +1915,7 @@ def test_credential_scan_survives_archives_the_stdlib_refuses_to_read(tmp_path):
     import struct
     import zipfile
 
-    from flash.cli.commands.env.secrets import credential_in_file
+    from flash.env_secrets import credential_in_file
 
     plain = tmp_path / "plain.zip"
     with zipfile.ZipFile(plain, "w") as archive:
@@ -1950,7 +1950,7 @@ def test_a_credential_cannot_hide_behind_a_wall_of_padding(tmp_path):
     """
     import gzip
 
-    from flash.cli.commands.env.secrets import credential_in_file
+    from flash.env_secrets import credential_in_file
 
     padded = tmp_path / "shard.jsonl.gz"
     with gzip.open(padded, "wb", compresslevel=9) as handle:
@@ -1972,8 +1972,8 @@ def test_push_refuses_an_archive_too_expensive_to_scan(monkeypatch, tmp_path, ca
     """
     import gzip
 
-    from flash.cli.commands.env import secrets
-    from flash.cli.commands.env.secrets import _ExpansionBudgetExceeded, credential_in_file
+    from flash import env_secrets as secrets
+    from flash.env_secrets import _Unscannable, credential_in_file
 
     env_dir = tmp_path / "env"
     env_dir.mkdir()
@@ -1983,7 +1983,7 @@ def test_push_refuses_an_archive_too_expensive_to_scan(monkeypatch, tmp_path, ca
 
     # a budget already spent: the first chunk of expansion is over the deadline
     monkeypatch.setattr(secrets, "_MAX_DECOMPRESS_SECONDS", -1.0)
-    with pytest.raises(_ExpansionBudgetExceeded):
+    with pytest.raises(_Unscannable):
         credential_in_file(slow)
 
     cap: dict = {}
@@ -2002,7 +2002,7 @@ def test_an_unreadable_zip_member_does_not_hide_the_members_behind_it(tmp_path):
     """
     import zipfile
 
-    from flash.cli.commands.env.secrets import credential_in_file
+    from flash.env_secrets import credential_in_file
 
     def _build(name: str, *, encrypt_first: bool):
         path = tmp_path / name
@@ -2027,7 +2027,7 @@ def test_an_unreadable_zip_member_does_not_hide_the_members_behind_it(tmp_path):
 def test_every_member_unreadable_is_not_an_error(tmp_path):
     import zipfile
 
-    from flash.cli.commands.env.secrets import credential_in_file
+    from flash.env_secrets import credential_in_file
 
     path = tmp_path / "opaque.zip"
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -2052,7 +2052,7 @@ def test_a_corrupt_xz_does_not_crash_the_publish(tmp_path):
     """
     import lzma
 
-    from flash.cli.commands.env.secrets import _UNREADABLE_ARCHIVE, credential_in_file
+    from flash.env_secrets import _UNREADABLE_ARCHIVE, credential_in_file
 
     assert issubclass(lzma.LZMAError, _UNREADABLE_ARCHIVE)
 
@@ -2074,21 +2074,21 @@ def test_the_expansion_budget_is_not_swallowed_by_the_per_member_handler(monkeyp
     """A timeout must still refuse, not be mistaken for an unreadable member and skipped."""
     import zipfile
 
-    from flash.cli.commands.env import secrets
-    from flash.cli.commands.env.secrets import (
+    from flash import env_secrets as secrets
+    from flash.env_secrets import (
         _UNREADABLE_ARCHIVE,
-        _ExpansionBudgetExceeded,
+        _Unscannable,
         credential_in_file,
     )
 
-    assert not issubclass(_ExpansionBudgetExceeded, _UNREADABLE_ARCHIVE)
+    assert not issubclass(_Unscannable, _UNREADABLE_ARCHIVE)
 
     path = tmp_path / "slow.zip"
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("big.txt", "\0" * (4 << 20))
 
     monkeypatch.setattr(secrets, "_MAX_DECOMPRESS_SECONDS", -1.0)
-    with pytest.raises(_ExpansionBudgetExceeded):
+    with pytest.raises(_Unscannable):
         credential_in_file(path)
 
 
@@ -2103,7 +2103,7 @@ def test_a_credential_nested_two_containers_deep_is_still_found(tmp_path):
     import io
     import zipfile
 
-    from flash.cli.commands.env.secrets import credential_in_file
+    from flash.env_secrets import credential_in_file
 
     secret = f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode()
 
@@ -2130,7 +2130,7 @@ def test_a_zip_behind_an_executable_stub_is_still_expanded(tmp_path):
     import io
     import zipfile
 
-    from flash.cli.commands.env.secrets import credential_in_file
+    from flash.env_secrets import credential_in_file
 
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -2153,7 +2153,7 @@ def test_a_base64_encoded_credential_is_decoded_and_found(tmp_path):
     """
     import base64
 
-    from flash.cli.commands.env.secrets import _credential_kind, credential_in_file
+    from flash.env_secrets import _credential_kind, credential_in_file
 
     encoded = base64.b64encode(f"fslo_{_FAKE_KEY_BODY}".encode()).decode()
     manifest = tmp_path / "secret.yaml"
@@ -2186,7 +2186,7 @@ def test_scaffolding_placeholders_do_not_refuse_the_publish(placeholder):
     repeated-character ones, so a scaffolded environment could not be published at all. That is the
     failure mode that gets a check switched off.
     """
-    from flash.cli.commands.env.secrets import _credential_kind
+    from flash.env_secrets import _credential_kind
 
     assert _credential_kind(placeholder.encode()) is None
 
@@ -2202,9 +2202,114 @@ def test_scaffolding_placeholders_do_not_refuse_the_publish(placeholder):
 )
 def test_issued_keys_are_still_caught_after_narrowing_the_entropy_test(credential, kind):
     """The placeholder allowance must not open a hole: issued bodies are mixed-case with digits."""
-    from flash.cli.commands.env.secrets import _credential_kind
+    from flash.env_secrets import _credential_kind
 
     assert _credential_kind(credential.encode()) == kind
+
+
+def test_a_scan_limit_refuses_rather_than_reporting_clean(tmp_path, monkeypatch):
+    """Every bound raises, so "expensive to scan" can never be spent as "no credential found".
+
+    Both caps returned None when they bit, which is the verdict a clean file gets. That made the
+    cheapest bypass of the whole check "make it expensive": pad a nested container past the buffer
+    cap, or bury the key one layer past the depth cap, and the publish went through with exit 0.
+    """
+    import gzip
+    import io
+
+    from flash import env_secrets as secrets
+    from flash.env_secrets import _MAX_CONTAINER_DEPTH, _Unscannable, credential_in_file
+
+    def _gz(payload: bytes) -> bytes:
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6) as handle:
+            handle.write(payload)
+        return buf.getvalue()
+
+    # Past the buffer cap, which is lowered so the fixture stays small. The padding is random so it
+    # does not compress below the cap, and the credential is followed by compressible bytes so
+    # deflate does not emit it as a STORED block -- were it stored, the key would survive literally
+    # in the outer file and be found without expanding anything, which tests nothing.
+    monkeypatch.setattr(secrets, "_MAX_NESTED_BUFFER_BYTES", 1 << 20)
+    padded = os.urandom(4 << 20) + f"fslo_{_FAKE_KEY_BODY}".encode() + b"\n" + b"x" * (1 << 20)
+    oversized = _gz(padded)
+    assert f"fslo_{_FAKE_KEY_BODY}".encode() not in oversized, "the key survived literally"
+    too_big = tmp_path / "padded.gz"
+    too_big.write_bytes(_gz(oversized))
+    with pytest.raises(_Unscannable, match="too large to inspect"):
+        credential_in_file(too_big)
+
+    # Past the depth cap.
+    buried = f"fslo_{_FAKE_KEY_BODY}".encode()
+    for _ in range(_MAX_CONTAINER_DEPTH + 2):
+        buried = _gz(buried)
+    too_deep = tmp_path / "buried.gz"
+    too_deep.write_bytes(buried)
+    with pytest.raises(_Unscannable, match="too deeply to inspect"):
+        credential_in_file(too_deep)
+
+    # the control: the same nesting inside the cap still resolves to a found credential, so the
+    # refusals above come from the bounds and not from expansion being broken outright.
+    shallow = f"fslo_{_FAKE_KEY_BODY}".encode()
+    for _ in range(_MAX_CONTAINER_DEPTH - 1):
+        shallow = _gz(shallow)
+    within = tmp_path / "shallow.gz"
+    within.write_bytes(shallow)
+    assert credential_in_file(within) == "a Freesolo API key"
+
+
+def test_a_credential_straddling_a_base64_window_is_still_decoded(tmp_path):
+    """A long base64 run is decoded in OVERLAPPING windows, so no cut can hide a key.
+
+    Bounding the run itself was worse than bounding nothing: a base64 blob longer than the bound
+    was skipped entirely, so encoding a big config file was enough to publish the key inside it.
+    Slicing into adjacent windows instead moved the hole rather than closing it -- a credential
+    across the cut decodes into neither piece.
+    """
+    import base64
+
+    from flash.env_secrets import _BASE64_WINDOW, _credential_kind, credential_in_file
+
+    secret = f"fslo_{_FAKE_KEY_BODY}".encode()
+
+    # a run far past any single window, with the key deliberately placed on the seam
+    prefix_bytes = (_BASE64_WINDOW // 4) * 3
+    blob = base64.b64encode(b"A" * prefix_bytes + secret + b"B" * prefix_bytes)
+    assert len(blob) > _BASE64_WINDOW, "the run must exceed one window to test the overlap"
+    manifest = tmp_path / "secret.yaml"
+    manifest.write_bytes(b"data:\n  bundle: " + blob + b"\n")
+    assert credential_in_file(manifest) == "a Freesolo API key"
+
+    # base64 inside a wide encoding: the two supported forms must compose, not merely pass alone
+    wide = base64.b64encode(secret).decode().encode("utf-16-le")
+    assert _credential_kind(wide) == "a Freesolo API key"
+
+
+def test_an_assigned_key_with_no_prefix_is_caught_by_its_variable_name(tmp_path):
+    """A W&B key is 40 hex characters and carries no prefix, so only the assignment identifies it.
+
+    Every other pattern here keys off an issued prefix. This one cannot, which is why it is matched
+    through the variable it is assigned to rather than by shape -- 40 hex characters on their own
+    are just as likely to be a commit sha, and refusing those would block ordinary publishes.
+    """
+    from flash.env_secrets import _credential_kind, credential_in_file
+
+    key = b"3f" * 20
+    script = tmp_path / "run.sh"
+    script.write_bytes(b"#!/bin/sh\nexport WANDB_API_KEY=" + key + b"\n")
+    assert credential_in_file(script) == "a Weights & Biases API key"
+
+    for form in (b'WANDB_API_KEY: "' + key + b'"', b"wandb_api_key = '" + key + b"'"):
+        assert _credential_kind(form) == "a Weights & Biases API key", form
+
+    # the near misses that must stay publishable
+    for benign in (
+        b"commit: " + key,
+        b"WANDB_API_KEY=${WANDB_API_KEY}\n",
+        b"WANDB_API_KEY=$(pass show wandb)\n",
+        b"sha256: " + key + b"\n",
+    ):
+        assert _credential_kind(benign) is None, benign
 
 
 def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
@@ -2213,7 +2318,7 @@ def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
     Admitting any capitalized word plus a colon reopened the prose false positive that requiring a
     body was meant to close.
     """
-    from flash.cli.commands.env.secrets import _credential_kind
+    from flash.env_secrets import _credential_kind
 
     for prose in (
         b"See -----BEGIN RSA PRIVATE KEY-----\nWarning: never commit keys to the repo",

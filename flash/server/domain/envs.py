@@ -15,6 +15,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from flash.env_secrets import reject_credential_bearing_package
 from flash.envs.loader import _github_token
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
@@ -480,7 +481,24 @@ def publish_package(
     with tempfile.TemporaryDirectory(prefix="flash-env-publish-") as tmp:
         dest = Path(tmp)
         _safe_extract(tar_bytes, dest)
+        _reject_credentials(dest)
         return _github_publish(dest, name=name, key=key, project_slug=project_slug)
+
+
+def _reject_credentials(package_root: Path) -> None:
+    """Refuse a package carrying a credential, before anything is committed to the hub.
+
+    The CLI runs this same check before uploading, but the CLI is not the trust boundary: an older
+    client, a direct `Client.publish_env`, or a raw `POST /v1/envs` arrives here having skipped it
+    entirely. The server is what writes to the shared hub, whose history is permanent, so the check
+    has to hold here too.
+
+    Runs on the safely extracted tree, so what is scanned is exactly what would be committed.
+    """
+    try:
+        reject_credential_bearing_package(package_root, display={})
+    except ValueError as exc:
+        raise EnvPublishError(str(exc)) from None
 
 
 _SLUG_SEGMENT_RE = re.compile(r"^[a-z0-9._-]+$")

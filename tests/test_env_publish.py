@@ -1209,6 +1209,48 @@ def test_copy_package_to_checkout_rejects_escape(tmp_path):
         envs._copy_package_to_checkout(source=source, checkout=checkout, publish_root="../escape")
 
 
+def test_publish_refuses_a_package_carrying_a_credential(monkeypatch):
+    """The CLI check is not the trust boundary; the server writes to the hub, so it checks too.
+
+    `flash env push` scans before uploading, but an older client, a direct `Client.publish_env` or
+    a raw `POST /v1/envs` arrives here having skipped it entirely. The hub's history is permanent,
+    so a credential that reaches `_github_publish` is already unrecoverable.
+    """
+    reached = False
+
+    def _fail(*args, **kwargs):
+        nonlocal reached
+        reached = True
+        raise AssertionError("a credential-bearing package reached the hub")
+
+    monkeypatch.setattr(envs, "_github_publish", _fail)
+    key = "fslo_" + "a1B2c3D4" * 6
+    package = _pkg_b64({**_MINIMAL, "env.sh": f"export FREESOLO_API_KEY={key}\n"})
+
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs.publish_package(
+            package_b64=package, name="demo", key={"org_slug": "acme"}, project_slug="p"
+        )
+
+    assert not reached
+    assert excinfo.value.status == 400
+    assert "Freesolo API key" in str(excinfo.value)
+    assert key not in str(excinfo.value), "the refusal must not echo the credential"
+
+    # the control: the same package without the key publishes, so the gate is not refusing
+    # everything that passes through it.
+    monkeypatch.setattr(envs, "_github_publish", lambda *a, **k: "acme/p/demo")
+    assert (
+        envs.publish_package(
+            package_b64=_pkg_b64(_MINIMAL),
+            name="demo",
+            key={"org_slug": "acme"},
+            project_slug="p",
+        )
+        == "acme/p/demo"
+    )
+
+
 def test_safe_extract_rejects_traversal(tmp_path):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
