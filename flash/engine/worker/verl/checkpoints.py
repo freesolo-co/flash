@@ -428,11 +428,16 @@ def export_peft_adapter(
         # still-undeleted merge tree, a peak this function's own headroom check does not budget for.
         for name in os.listdir(lora_dir):
             os.replace(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
-    except BaseException as error:
+    except Exception as error:
         # classified before the `finally` below deletes the merge tree: that cleanup frees tens of
         # gb, so once it has run the disk has room again and the evidence for "this died of a full
         # disk" is gone. re-raises as MergeDiskExhaustedError only when the filesystem agrees, so a
         # merge that failed for any other reason keeps its own error.
+        #
+        # Exception, not BaseException: a cancel arriving mid-export (KeyboardInterrupt/SystemExit)
+        # on a disk that happens to be tight is still a cancel, and relabelling it as a full disk
+        # would both misreport it and strip the semantics every cancel path depends on. the
+        # `finally` below still frees the merge tree for those.
         raise_for_merge_disk_exhaustion(error, ckpt_actor_dir, merge_out)
         raise
     finally:

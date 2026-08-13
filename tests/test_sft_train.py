@@ -3327,6 +3327,31 @@ def test_enospc_is_recognized_even_when_the_disk_reads_free(monkeypatch, tmp_pat
         )
 
 
+def test_a_cancel_during_the_merge_is_not_relabelled_as_a_full_disk(monkeypatch, tmp_path):
+    """a cancel stays a cancel, even on a disk that happens to be full.
+
+    `KeyboardInterrupt` and `SystemExit` derive from BaseException, not Exception, and the whole
+    cancel path depends on that: they are how a user stop unwinds the worker. Catching them here to
+    ask about the disk would report a deliberate stop as a storage failure and strip the semantics
+    every handler above relies on -- and a tight disk at the moment of a cancel is coincidence, not
+    cause. The merge tree must still be freed on the way out.
+    """
+    verl_checkpoints, actor_dir = _enospc_merge_setup(
+        monkeypatch, tmp_path, free_bytes=0, error=KeyboardInterrupt()
+    )
+    merge_out = tmp_path / "adapter_merge"
+
+    with pytest.raises(KeyboardInterrupt):
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+
+    assert not merge_out.exists(), "a cancelled export stranded the full-model merge tree on disk"
+
+
 def test_the_disk_is_sampled_before_the_merge_tree_is_freed(monkeypatch, tmp_path):
     """the classification must happen while the evidence still exists.
 
