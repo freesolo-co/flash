@@ -213,6 +213,41 @@ def _print_rl_prompt_budget_warning(status: object) -> None:
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
+def warmstart_source_context(client, spec) -> int | None:
+    """The warm-start source's authored ``max_context_tokens``, read before the run is submitted.
+
+    The server resolves this too (``runner.preparation._warmstart_source_context``) and puts it on
+    the response, but the response arrives after the run is already provisioning, so a warning that
+    waits for it names a context the user can no longer act on. Pre-submit the reference is still in
+    its public ``<run_id>[/step-N]`` form, so the cli can resolve it over its own authenticated
+    client and warn while the config is still free to change.
+
+    Best-effort for the same reason as the server's copy: a diagnostic must never be the thing that
+    fails a submission, and every way a source can be genuinely unusable is diagnosed with its own
+    message on the submit path. A source we cannot read simply goes unnamed.
+    """
+    from flash.core.catalog import samples_on_policy
+
+    ref = getattr(spec.train, "init_from_adapter", "")
+    if not ref or not samples_on_policy(spec.algorithm):
+        return None
+    from flash.schema import parse_checkpoint_ref
+
+    parsed = parse_checkpoint_ref(ref)
+    if parsed is None:
+        return None
+    try:
+        src = client.get_run(parsed[0])
+    # broad by intent: reporting only, and no diagnostic may be the thing that fails a submit
+    except Exception:
+        return None
+    train = (src or {}).get("spec", {}).get("train", {}) if isinstance(src, dict) else {}
+    context = train.get("max_context_tokens") if isinstance(train, dict) else None
+    if isinstance(context, bool) or not isinstance(context, int) or context <= 0:
+        return None
+    return context
+
+
 def _print_sft_cost(status: dict, spec) -> None:
     total = status.get("estimated_cost_usd") if isinstance(status, dict) else None
     if not isinstance(total, (int, float)) or isinstance(total, bool):

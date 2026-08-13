@@ -934,8 +934,54 @@ def test_real_submit_warns_before_create_run_while_the_config_is_still_free() ->
     from flash.cli import commands as commands_mod
 
     body = getsource(commands_mod.cmd_train)
-    warned = body.index('_print_rl_prompt_budget_warning({"prompt_budget": rl_prompt_budget(spec)')
     # the REAL submit, not the dry-run call earlier in the same function: that one is nested in a
     # try block, so its indentation is what tells the two apart.
     submitted = body.index("\n    status = client.create_run(")
+    # anchor on the locally-derived call, which is the one that has to precede the submit. matching
+    # the whole argument text instead would make this fail on a reformat rather than on the bug.
+    warned = body.index("\n    _print_rl_prompt_budget_warning(")
     assert warned < submitted
+
+
+def test_real_submit_names_the_warm_start_context_not_just_the_bare_budget() -> None:
+    """Moving the warning before create_run must not cost the sentence that makes it useful.
+
+    The local spec cannot contain the SOURCE run's context, so a warning derived from the spec alone
+    says "budget defaulted" without ever saying which context is being ignored -- and the 8192-sft
+    child retraining at 2048 is the finding's headline scenario. Resolving it pre-submit through the
+    cli's own client keeps both the timing and the content. Asserting only that a warning is printed
+    would pass on the stripped version, so this asserts the source number is IN the message."""
+    from flash.cli.commands.train_cost import warmstart_source_context
+    from flash.engine.plan.prompt_budget import rl_prompt_budget, rl_prompt_budget_warning
+
+    class _Client:
+        def get_run(self, run_id):
+            assert run_id == "run-abc123"  # the PUBLIC id, not an internal storage locator
+            return {"spec": {"train": {"max_context_tokens": 8192}}}
+
+    spec = _budget_spec("grpo", {"init_from_adapter": "run-abc123"})
+    context = warmstart_source_context(_Client(), spec)
+    assert context == 8192
+
+    message = rl_prompt_budget_warning(rl_prompt_budget(spec, warm_start_context=context))
+    assert message
+    assert "8192" in message
+    assert "NOT" in message
+
+    # an unreadable source must go unnamed, never fail the submit: a diagnostic that raises is worse
+    # than one that stays quiet.
+    class _Broken:
+        def get_run(self, run_id):
+            raise RuntimeError("no such run")
+
+    assert warmstart_source_context(_Broken(), spec) is None
+
+    # and the submit path must actually WIRE it in. testing the helper alone passes even when the
+    # call site drops the kwarg, which is exactly how this regressed once already: the timing fix
+    # moved the warning earlier and silently left the source context behind.
+    from inspect import getsource
+
+    from flash.cli import commands as commands_mod
+
+    body = getsource(commands_mod.cmd_train)
+    assert "warm_start_context=warmstart_source_context(client, spec)" in body

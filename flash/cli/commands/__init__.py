@@ -439,7 +439,17 @@ def cmd_train(args) -> int:
     # warning printed on the response arrives once the run is already provisioning and can no longer
     # be reconfigured. the budget is derived from the local spec, so nothing forces us to wait for
     # the server to tell us a number we can compute here for free.
-    _print_rl_prompt_budget_warning({"prompt_budget": rl_prompt_budget(spec)})
+    #
+    # the warm-start context is resolved here too rather than read off the response: it is the part
+    # that names WHICH context is being ignored, and moving the warning earlier without it would
+    # trade the finding's headline scenario for the timing fix instead of getting both.
+    _print_rl_prompt_budget_warning(
+        {
+            "prompt_budget": rl_prompt_budget(
+                spec, warm_start_context=warmstart_source_context(client, spec)
+            )
+        }
+    )
     status = client.create_run(
         payload,
         runtime_secrets=runtime_secrets,
@@ -968,4 +978,5 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _print_unpacked_batch_warning,
     _sft_cost_rows,
     _warn_if_wandb_requested_without_key,
+    warmstart_source_context,
 )
