@@ -541,82 +541,96 @@ def cmd_serve_status(args) -> int:
     # directions: probing an genuinely open backend costs one 404 read of a made-up id, which is
     # the pass answer anyway. Skipping wrongly costs a failed deploy.
     if payload.get("requires_key") is not False:
-        import urllib.error
+        return _verify_serving_key(base, shown)
+    print(f"\nready. deploy a run with: {CLI_NAME} models deploy <run-id>")
+    return 0
 
-        probe = f"flash-serve-status-probe-{uuid.uuid4().hex}"
-        try:
-            _status_request(base, internal_key_header(), f"/adapters/{probe}")
-        except urllib.error.HTTPError as exc:
-            # BOTH rejection codes. The generated app answers 401, but the contract is written for
-            # any backend, and the conformance suite accepts 401 or 403 as a valid rejection -- so
-            # recognizing only 401 here reports `ready` against a backend the suite would pass and
-            # the very next deploy would fail on.
-            if exc.code in (401, 403):
-                print(
-                    f"\nthe backend at {shown} rejected the serving key ({exc.code}). set "
-                    f"FREESOLO_INTERNAL_KEY to the value of the app's FLASH_SERVING_KEY secret; "
-                    f"deploys will fail until it matches.",
-                    file=sys.stderr,
-                )
-                return 1
-            # 5xx is the backend failing, not the key being wrong. Either way the operator cannot
-            # deploy, and `ready` would be a false green -- so report it rather than swallow it.
-            if exc.code >= 500:
-                print(
-                    f"\nthe backend at {shown} returned {exc.code} when the serving key was "
-                    f"checked, so the key could not be verified. check the app's logs before "
-                    f"deploying.",
-                    file=sys.stderr,
-                )
-                return 1
-            # 404 for this made-up id is the expected answer and the ONLY one that proves the read
-            # -back route works: the key got past authentication and the route resolved the id to
-            # "no such record".
-            #
-            # Any other 4xx is not a pass. A 400/405/422 says the backend did not answer this route
-            # the way the contract requires -- a missing route, a rejected path shape, a handler
-            # that wants query parameters -- and `models deploy` polls this exact route, where
-            # `_registered_adapter_response` treats a non-404 4xx as fatal. Falling through to
-            # `ready` here means the operator is told the backend is good and then loses the deploy
-            # to the same status, after registration has already started.
-            if exc.code != 404:
-                print(
-                    f"\nthe backend at {shown} answered {exc.code} for a read-back of an unknown "
-                    f"adapter id, where the contract requires 404. `{CLI_NAME} models deploy` polls "
-                    f"this route and fails on any non-404 4xx, so deploys will not work against "
-                    f"this backend.",
-                    file=sys.stderr,
-                )
-                return 1
-        except Exception as exc:
-            # The backend answered /healthz a moment ago, so a transport failure here is a real
-            # inconsistency worth surfacing rather than swallowing. Reported without claiming to
-            # know which side is at fault.
+
+def _verify_serving_key(base: str, shown: str) -> int:
+    """Exercise the configured key against a route that authenticates, and report the outcome.
+
+    Returns the command's exit code: 0 only when the probe answered 404, which is the one response
+    that proves both that the key got past authentication and that the read-back route resolves an
+    unknown id the way the contract requires.
+    """
+    import urllib.error
+
+    from flash.serve.urls import internal_key_header
+
+    probe = f"flash-serve-status-probe-{uuid.uuid4().hex}"
+    try:
+        _status_request(base, internal_key_header(), f"/adapters/{probe}")
+    except urllib.error.HTTPError as exc:
+        # BOTH rejection codes. The generated app answers 401, but the contract is written for
+        # any backend, and the conformance suite accepts 401 or 403 as a valid rejection -- so
+        # recognizing only 401 here reports `ready` against a backend the suite would pass and
+        # the very next deploy would fail on.
+        if exc.code in (401, 403):
             print(
-                f"\ncould not verify the serving key against {shown}: {_redacted(exc, base)}",
+                f"\nthe backend at {shown} rejected the serving key ({exc.code}). set "
+                f"FREESOLO_INTERNAL_KEY to the value of the app's FLASH_SERVING_KEY secret; "
+                f"deploys will fail until it matches.",
                 file=sys.stderr,
             )
             return 1
-        else:
-            # Reached only when the read-back RETURNED, which for a `uuid4` id that was never
-            # registered means the backend answered 200 with a record it made up. Every branch
-            # above handles a raising response, and without this one a 200 fell past all of them
-            # to `ready` -- so the one outcome that proves the backend does NOT implement
-            # unknown-record semantics was the outcome reported as success.
-            #
-            # It is not a harmless quirk to tolerate. `models deploy` polls this exact route and
-            # compares the record it gets back against the identity it registered; a backend that
-            # fabricates records answers that poll with a mismatch, which the client reads as an
-            # immutability violation and refuses. Telling the operator `ready` here means the
-            # failure surfaces mid-deploy instead of during the command written to diagnose it.
+        # 5xx is the backend failing, not the key being wrong. Either way the operator cannot
+        # deploy, and `ready` would be a false green -- so report it rather than swallow it.
+        if exc.code >= 500:
             print(
-                f"\nthe backend at {shown} answered 200 with a record for an adapter id that was "
-                f"never registered, where the contract requires 404. `{CLI_NAME} models deploy` "
-                f"cross-checks the record it reads back, so a backend that fabricates records "
-                f"fails every deploy.",
+                f"\nthe backend at {shown} returned {exc.code} when the serving key was "
+                f"checked, so the key could not be verified. check the app's logs before "
+                f"deploying.",
                 file=sys.stderr,
             )
             return 1
+        # 404 for this made-up id is the expected answer and the ONLY one that proves the read
+        # -back route works: the key got past authentication and the route resolved the id to
+        # "no such record".
+        #
+        # Any other 4xx is not a pass. A 400/405/422 says the backend did not answer this route
+        # the way the contract requires -- a missing route, a rejected path shape, a handler
+        # that wants query parameters -- and `models deploy` polls this exact route, where
+        # `_registered_adapter_response` treats a non-404 4xx as fatal. Falling through to
+        # `ready` here means the operator is told the backend is good and then loses the deploy
+        # to the same status, after registration has already started.
+        if exc.code != 404:
+            print(
+                f"\nthe backend at {shown} answered {exc.code} for a read-back of an unknown "
+                f"adapter id, where the contract requires 404. `{CLI_NAME} models deploy` polls "
+                f"this route and fails on any non-404 4xx, so deploys will not work against "
+                f"this backend.",
+                file=sys.stderr,
+            )
+            return 1
+    except Exception as exc:
+        # The backend answered /healthz a moment ago, so a transport failure here is a real
+        # inconsistency worth surfacing rather than swallowing. Reported without claiming to
+        # know which side is at fault.
+        print(
+            f"\ncould not verify the serving key against {shown}: {_redacted(exc, base)}",
+            file=sys.stderr,
+        )
+        return 1
+    else:
+        # Reached only when the read-back RETURNED, which for a `uuid4` id that was never
+        # registered means the backend answered 200 with a record it made up. Every branch
+        # above handles a raising response, and without this one a 200 fell past all of them
+        # to `ready` -- so the one outcome that proves the backend does NOT implement
+        # unknown-record semantics was the outcome reported as success.
+        #
+        # It is not a harmless quirk to tolerate. `models deploy` polls this exact route and
+        # compares the record it gets back against the identity it registered; a backend that
+        # fabricates records answers that poll with a mismatch, which the client reads as an
+        # immutability violation and refuses. Telling the operator `ready` here means the
+        # failure surfaces mid-deploy instead of during the command written to diagnose it.
+        print(
+            f"\nthe backend at {shown} answered 200 with a record for an adapter id that was "
+            f"never registered, where the contract requires 404. `{CLI_NAME} models deploy` "
+            f"cross-checks the record it reads back, so a backend that fabricates records "
+            f"fails every deploy.",
+            file=sys.stderr,
+        )
+        return 1
     print(f"\nready. deploy a run with: {CLI_NAME} models deploy <run-id>")
     return 0
 
