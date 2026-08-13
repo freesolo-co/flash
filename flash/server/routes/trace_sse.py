@@ -631,6 +631,9 @@ class SseAccumulator:
                 continue
             else:
                 index = raw_index
+            tool_call_entry_bytes = max(64, self._value_size(index) + 12)
+            if index not in accumulated_calls and not self._reserve(b"x" * tool_call_entry_bytes):
+                return
             fragment = {key: value for key, value in tool_call.items() if key != "index"}
             target = accumulated_calls.setdefault(index, {})
             if not self._reserve_tool_call_fragment(target, fragment):

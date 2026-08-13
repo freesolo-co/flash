@@ -832,6 +832,24 @@ def test_tool_call_fragments_charge_only_retained_output_bytes() -> None:
     assert accumulator._accumulated_bytes < 31_000
 
 
+def test_tool_call_slots_count_toward_the_stream_budget() -> None:
+    budget = 5_000
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=budget)
+
+    for index in range(2_000):
+        event = json.dumps(
+            {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": index}]}}]}
+        ).encode()
+        accumulator.feed(b"data: " + event + b"\n\n")
+        if accumulator.truncated:
+            break
+
+    assert accumulator.truncated is True
+    assert accumulator.defect is None
+    assert len(accumulator._choices[0]["tool_calls"]) < 2_000
+    assert accumulator._accumulated_bytes <= budget
+
+
 def test_materialization_depth_limit_records_a_defect_without_truncating() -> None:
     accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=100_000)
     nested: object = "leaf"
