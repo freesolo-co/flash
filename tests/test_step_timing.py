@@ -1072,6 +1072,43 @@ def test_a_long_upload_keeps_publishing_the_measured_pace():
     assert fields.id == "_step_timing_fields_now", fields.id
 
 
+def test_every_checkpoint_heartbeat_carries_the_measured_pace():
+    """Asserted over ALL of them rather than by naming stages, because the gap was a SIBLING site.
+
+    `checkpoint_uploading` was fixed while `checkpoint_deployable` -- emitted from the same file, on
+    every required intermediate save -- was left publishing without timing. Each of these stages is
+    unthrottled but ARMS the throttle the step stages share, so one that omits the fields blanks the
+    measured pace and then blocks the pings that would restore it.
+
+    A test naming today's stages would have passed while that gap was live. This one fails for any
+    checkpoint heartbeat added later that repeats the omission.
+    """
+    import ast
+    from pathlib import Path
+
+    import flash
+
+    source = (Path(flash.__file__).parent / "engine" / "worker" / "io" / "hf.py").read_text()
+    checkpoint_pings = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and (getattr(node.func, "attr", None) or getattr(node.func, "id", None)) == "heartbeat"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and str(node.args[0].value).startswith("checkpoint_")
+    ]
+    assert checkpoint_pings, "no checkpoint heartbeats found -- the walk stopped matching"
+
+    untimed = [
+        node.args[0].value
+        for node in checkpoint_pings
+        # the fields arrive expanded (**step_timing_fields_now()), so the marker is a **kwargs entry.
+        if not any(kw.arg is None for kw in node.keywords)
+    ]
+    assert not untimed, f"checkpoint heartbeats publishing without step timing: {untimed}"
+
+
 def test_timing_stays_registered_through_the_final_checkpoint_drain():
     """The last save is published during teardown, after the training block has exited.
 

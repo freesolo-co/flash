@@ -388,7 +388,19 @@ def publish_deployable_checkpoint(
                 ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
             )
             if _emit_heartbeat:
-                _w.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
+                # carries the pace for the same reason the upload pings do: this stage is
+                # unthrottled but ARMS the throttle the step stages share, so publishing a snapshot
+                # without timing blanks the measured pace and then blocks every ping that could
+                # restore it. an intermediate save is followed immediately by the resume upload, so
+                # the gap is the length of that save -- minutes on a large model.
+                from flash.engine.worker.io.heartbeat import step_timing_fields_now
+
+                _w.heartbeat(
+                    "checkpoint_deployable",
+                    step=step,
+                    subfolder=subfolder,
+                    **step_timing_fields_now(),
+                )
             return subfolder
         except Exception as e:
             last_error = e
