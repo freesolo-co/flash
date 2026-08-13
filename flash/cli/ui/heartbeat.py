@@ -295,13 +295,28 @@ def step_timing_pairs(heartbeat: dict, *, running: bool) -> list[tuple[str, str]
         # the wall is named only when the worker sent it, so the warning never cites a number the
         # panel cannot show. without it the warning still stands on the projection alone.
         against = f" against {_humanize_duration(wall)} of wall time left" if wall else ""
-        warning = (
-            f"at this rate the remaining steps do not fit the run's wall limit{against}, so "
-            "training is expected to be cut off before the last step. checkpoints already "
-            "published at your save steps survive, but the steps after the cutoff never run - "
-            "so if you need the full horizon, relaunch with a smaller [train].max_steps or "
-            "max_examples rather than paying out the rest of this one"
-        )
+        # the worker warns from 90% of the allowance, so the flag covers two different situations
+        # and they deserve different words. a projection that still FITS is a headroom warning: the
+        # final checkpoint upload runs after the last step and can take minutes on a large model,
+        # which is what eats a thin margin. saying "expected to be cut off" there would assert a
+        # cutoff the measurement does not show, and a warning that overstates its case on the runs
+        # that go on to finish is how a row gets ignored on the runs that do not.
+        fits = remaining is not None and wall is not None and remaining <= wall
+        if fits:
+            warning = (
+                f"at this rate the remaining steps only just fit the run's wall limit{against}, "
+                "leaving little room for the final checkpoint upload, which runs after the last "
+                "step and can take minutes on a large model. if the margin matters, relaunch with "
+                "a smaller [train].max_steps or max_examples rather than risking the last save"
+            )
+        else:
+            warning = (
+                f"at this rate the remaining steps do not fit the run's wall limit{against}, so "
+                "training is expected to be cut off before the last step. checkpoints already "
+                "published at your save steps survive, but the steps after the cutoff never run - "
+                "so if you need the full horizon, relaunch with a smaller [train].max_steps or "
+                "max_examples rather than paying out the rest of this one"
+            )
         pairs.append(("wall limit", warning))
     return pairs
 

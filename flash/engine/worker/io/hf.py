@@ -558,7 +558,16 @@ def upload_resume_checkpoint(
                         )
                         if emit_heartbeat:
                             with contextlib.suppress(Exception):
-                                _w.heartbeat("checkpoint_upload_failed", step=step)
+                                # same reason as the success ping above: this stage is unthrottled
+                                # too, so it also arms the throttle the step stages share. an
+                                # optional checkpoint that failed does not stop the run, and
+                                # publishing without the timing would blank the pace of a run that
+                                # is still training.
+                                _w.heartbeat(
+                                    "checkpoint_upload_failed",
+                                    step=step,
+                                    **_step_timing_fields_now(),
+                                )
                         if failure_stage in {"before", "after"}:
                             raise
     return False

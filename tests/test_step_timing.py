@@ -572,6 +572,41 @@ def test_every_step_timestamp_comes_from_a_clock_that_cannot_jump():
     assert checked == 5, checked
 
 
+def test_a_failed_optional_checkpoint_does_not_blank_the_pace_either(monkeypatch, tmp_path):
+    """The failure ping is unthrottled too, so it arms the same throttle the success ping does.
+
+    An optional checkpoint that exhausts its retries does not stop the run: training continues, and
+    a payload without the timing would blank the pace of a run that is still going -- then block
+    every step ping that could restore it for up to the throttle interval.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker.io import heartbeat as worker_heartbeat
+    from flash.engine.worker.io import hf as worker_hf
+
+    sent: list[tuple[str, dict]] = []
+
+    class Api:
+        def upload_folder(self, **_kwargs):
+            raise ConnectionError("hf unavailable")
+
+        def list_repo_files(self, **_kwargs):
+            return []
+
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker, "heartbeat", lambda stage, **kw: sent.append((stage, kw)))
+    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
+
+    measured = {"step_duration_s": 92.0, "projected_remaining_s": 17204.0}
+    with worker_heartbeat.publishing_step_timing(lambda: measured):
+        assert not worker_hf.upload_resume_checkpoint(4, str(tmp_path))
+
+    failed = [kw for stage, kw in sent if stage == "checkpoint_upload_failed"]
+    assert failed, [stage for stage, _ in sent]
+    assert failed[0]["step_duration_s"] == 92.0
+    assert failed[0]["projected_remaining_s"] == 17204.0
+
+
 def test_a_checkpoint_path_is_not_timed_as_a_step(tmp_path):
     """SFT and OPD used to scan stdout with a looser pattern than the gate their siblings use.
 
@@ -600,3 +635,163 @@ def test_a_checkpoint_path_is_not_timed_as_a_step(tmp_path):
     )
     assert code == 0
     assert seen == [1, 2], seen
+
+
+def _replay(clock, timeline):
+    """Drive the clock the way a trainer's on_step does: record, heartbeat, then note the duration."""
+    for arrival, step, heartbeat_s in timeline:
+        clock.record(arrival, step)
+        clock.note_if_blocked(heartbeat_s)
+
+
+def test_the_backlog_a_block_leaves_behind_is_not_timed_as_fast_steps():
+    """Breaking the one blocked span is not enough -- the burst behind it is the bigger error.
+
+    The child keeps training while the reader is blocked, so the steps it completes meanwhile queue
+    in the pipe and are then read back-to-back at pipe speed. Those arrivals measure the drain, not
+    the steps. Left in, they do not merely add noise: once the burst outnumbers the real lines it
+    takes the median, and the published pace collapsed to 0.10s against a true 92s -- a 920x
+    under-report that makes the ETA and the wall warning useless in the direction that matters.
+    """
+    clock = step_timing.StepClock()
+    _replay(
+        clock,
+        [
+            (0.0, 1, 0.001),
+            (92.0, 2, 0.001),
+            (184.0, 3, 900.0),  # a 900s block; the child completes steps 4-12 meanwhile
+            *[(1084.0 + i * 0.1, 4 + i, 0.001) for i in range(9)],  # the drain, at pipe speed
+            (1176.9, 13, 0.001),  # the first line the reader actually waited for
+            (1268.9, 14, 0.001),
+        ],
+    )
+
+    assert clock.step_seconds() == 92.0
+    assert not [gap for gap in clock.intervals() if gap < 1.0], clock.intervals()
+
+
+def test_the_head_of_the_burst_cannot_end_the_drain_by_its_own_gap():
+    """The first line after a block spans the block itself, so its gap proves nothing.
+
+    Reading it as "the reader waited, so there is no backlog" ends the drain before it starts and
+    admits the entire burst -- which is exactly how the first attempt at this fix failed.
+    """
+    clock = step_timing.StepClock()
+    _replay(
+        clock,
+        [
+            (0.0, 1, 0.001),
+            (92.0, 2, 900.0),
+            (992.0, 3, 0.001),  # head of the burst: a 900s gap, but a backlog follows it
+            (992.1, 4, 0.001),
+            (992.2, 5, 0.001),
+            (1084.2, 6, 0.001),
+            (1176.2, 7, 0.001),
+        ],
+    )
+
+    assert clock.step_seconds() == 92.0
+    assert not [gap for gap in clock.intervals() if gap < 1.0], clock.intervals()
+
+
+def test_a_block_that_buffered_nothing_costs_one_interval_not_a_quota():
+    """The drain ends on evidence, not a fixed count, so a quiet block is cheap.
+
+    Discarding a fixed number of lines after every block would throw away real steps on the common
+    case where the block was short enough to buffer nothing.
+    """
+    clock = step_timing.StepClock()
+    _replay(
+        clock,
+        [
+            (0.0, 1, 0.001),
+            (92.0, 2, 5.0),  # blocked 5s: far too short to buffer a 92s step
+            (184.0, 3, 0.001),
+            (276.0, 4, 0.001),
+            (368.0, 5, 0.001),
+        ],
+    )
+
+    # the blocked span itself is dropped; every step after it is measured normally.
+    assert clock.intervals() == [92.0, 92.0, 92.0]
+    assert clock.step_seconds() == 92.0
+
+
+def test_the_drain_always_ends_so_a_fast_run_is_never_silenced():
+    """A run whose real steps are faster than the block threshold must still publish a pace.
+
+    Without the bound such a run looks like one unending burst and reports nothing at all for the
+    rest of its life, which is worse than a slightly skewed median.
+    """
+    clock = step_timing.StepClock()
+    fast = [(0.0, 1, 0.001), (0.2, 2, 900.0)]
+    # every subsequent line arrives faster than the blocking threshold, so nothing ever looks
+    # like a line the reader waited for.
+    fast += [(0.4 + i * 0.2, 3 + i, 0.001) for i in range(400)]
+    _replay(clock, fast)
+
+    measured = clock.step_seconds()
+    assert measured is not None, "the bound must let a fast run resume publishing"
+    assert measured == pytest.approx(0.2, abs=0.01), measured
+    # asserted on the drain itself, not only on the published number: without the bound the clock
+    # stays in the drain forever and keeps discarding lines, and a run long enough to leave two
+    # stragglers outside it would still answer 0.2 while measuring almost nothing.
+    assert not clock._draining_backlog, "the drain must end rather than run for the whole run"
+    assert clock._drained <= step_timing.StepClock._MAX_DRAINED_LINES
+    # the retained window is what bounds this, not the drain: 256 timestamps bound 255 spans.
+    assert len(clock.intervals()) == 255, len(clock.intervals())
+
+
+def test_a_thin_margin_is_not_reported_as_a_certain_cutoff():
+    """The 90% trigger covers two situations, and only one of them is a cutoff.
+
+    At 95 minutes projected against 100 remaining the warning fires, but the measured horizon still
+    fits -- what the margin threatens is the final checkpoint upload, which runs after the last step.
+    Telling that operator training "is expected to be cut off" asserts something the measurement does
+    not show, and a row that overstates its case on runs that go on to finish is how it gets ignored
+    on the runs that do not.
+    """
+    thin = {
+        "step_duration_s": 92.0,
+        "projected_remaining_s": 95 * 60,
+        "remaining_wall_s": 100 * 60,
+        "wall_deadline_at_risk": True,
+        "from_current_attempt": True,
+    }
+    warning = dict(step_timing_pairs(thin, running=True))["wall limit"]
+    assert "only just fit" in warning
+    assert "expected to be cut off" not in warning
+    assert "final checkpoint upload" in warning
+
+
+def test_a_projection_that_really_overruns_still_says_so():
+    """The original wording has to survive for the case it was written for: 31h against a 24h wall."""
+    over = {
+        "step_duration_s": 600.0,
+        "projected_remaining_s": 31 * 3600,
+        "remaining_wall_s": 24 * 3600,
+        "wall_deadline_at_risk": True,
+        "from_current_attempt": True,
+    }
+    warning = dict(step_timing_pairs(over, running=True))["wall limit"]
+    assert "do not fit" in warning
+    assert "expected to be cut off" in warning
+    assert "only just fit" not in warning
+
+
+def test_an_unnamed_wall_falls_back_to_the_stronger_warning():
+    """Without both numbers the panel cannot prove the projection fits, so it must not claim it does.
+
+    The worker sends ``remaining_wall_s`` only alongside the flag, but a payload can lose it (an
+    older worker, a junk value rejected by _finite_positive). Softening the warning on missing
+    evidence would be the wrong default: the flag itself still means the run is at risk.
+    """
+    no_wall = {
+        "step_duration_s": 92.0,
+        "projected_remaining_s": 95 * 60,
+        "wall_deadline_at_risk": True,
+        "from_current_attempt": True,
+    }
+    warning = dict(step_timing_pairs(no_wall, running=True))["wall limit"]
+    assert "do not fit" in warning
+    assert "only just fit" not in warning

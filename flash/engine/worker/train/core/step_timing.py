@@ -79,6 +79,11 @@ class StepClock:
     # this is ~2x the window a projection actually needs.
     _RETAINED_STEP_LINES = 256
 
+    # how many post-block lines may be discarded as buffered before the clock starts measuring
+    # again regardless. a bound rather than a rule: it guarantees the drain always ends, so a run
+    # whose real steps are faster than the drain floor cannot be silenced for the rest of its life.
+    _MAX_DRAINED_LINES = 64
+
     def __init__(self) -> None:
         self._times: list[float] = []
         # closed runs of consecutive step lines, split where blocking work made a span unmeasurable.
@@ -87,6 +92,11 @@ class StepClock:
         self._break_after_last = False
         # a reprint's own arrival, held as the start of the next segment (see record).
         self._pending_baseline: float | None = None
+        # set by a block and cleared by the first line the reader genuinely waited for; while set,
+        # back-to-back arrivals are discarded as pipe backlog (see _draining).
+        self._draining_backlog = False
+        self._drained = 0
+        self._last_arrival: float | None = None
 
     def note_blocking_work(self) -> None:
         """Declare that the caller is about to block, so the span in progress is not a step.
@@ -101,8 +111,17 @@ class StepClock:
         block: the step was still running while we blocked, so what we could subtract is not what
         the step cost. Same principle as the warmup exclusion -- a span that includes work no step
         pays is not a step -- and it costs one interval on a run that has many.
+
+        Breaking the ONE span is not enough. The child keeps training while the reader is blocked,
+        so every step it completes meanwhile queues in the pipe and is then read back-to-back at
+        pipe speed. Those arrivals are the reader catching up, not steps costing microseconds, and
+        left in they drag the median toward zero -- with the drain outnumbering the real lines the
+        published pace collapsed to 0.10s against a true 92s. So the clock also enters a drain (see
+        ``_draining``) and discards the burst.
         """
         self._break_after_last = True
+        self._draining_backlog = True
+        self._drained = 0
 
     def note_if_blocked(self, elapsed_s: float) -> None:
         """Break the span when a call took long enough to have blocked the reader.
@@ -117,7 +136,7 @@ class StepClock:
         never splits a segment; anything above it is long enough to distort an interval either way.
         """
         if elapsed_s >= _BLOCKING_CALL_THRESHOLD_S:
-            self._break_after_last = True
+            self.note_blocking_work()
 
     def record(self, now: float, step: int | None = None) -> None:
         """Note that a step line for ``step`` arrived at ``now``.
@@ -140,16 +159,16 @@ class StepClock:
         still swallow the whole replay: a resume printing step 5 at t=0 and again at t=50, then step
         6 at t=142, must measure 92s for step 6 and not 142s.
 
-        Only an IMMEDIATE repeat is skipped, not every non-advancing number. The step patterns these
-        callers scan with differ -- SFT and OPD use ``run_verl_training``'s looser ``step:\\s*(\\d+)``,
-        which also matches ``global_step:9`` inside a checkpoint path, where RL's gate requires a
-        word boundary. A monotonic rule would let one such spurious high number suppress every real
-        step after it and freeze the published pace at whatever it last measured, which is worse
-        than the repeat it set out to exclude: a wrong number that never corrects itself.
+        Only an IMMEDIATE repeat is skipped, not every non-advancing number. A monotonic rule would
+        let one out-of-order or spurious number suppress every real step after it and freeze the
+        published pace at whatever it last measured, which is worse than the repeat it set out to
+        exclude: a wrong number that never corrects itself.
 
         ``step`` is optional because a caller that cannot identify the step is better off timing
         every line than timing none; only a caller that KNOWS a number repeated can skip it.
         """
+        if self._draining(now):
+            return
         if step is not None:
             if self._last_step is not None and int(step) == self._last_step:
                 # the span up to here is not a step, but this timestamp is where the next one starts.
@@ -168,8 +187,46 @@ class StepClock:
             self._times = [self._pending_baseline] if self._pending_baseline is not None else []
         self._break_after_last = False
         self._pending_baseline = None
+        self._last_arrival = float(now)
         self._times.append(float(now))
         self._trim()
+
+    def _draining(self, now: float) -> bool:
+        """True while this line is one the reader is catching up on rather than one it waited for.
+
+        A blocked reader leaves the child's step lines queued in the pipe, and they then arrive
+        back-to-back at pipe speed. Timing those measures the drain, not the steps: with the burst
+        outnumbering the real lines the published pace collapsed to 0.10s against a true 92s.
+
+        A burst is identified by its arrival gap, not by counting lines: the whole point is that the
+        reader was not waiting, so an inter-arrival below the same threshold that declared the block
+        is a line that was already sitting in the pipe. The first line whose gap exceeds it is one
+        the reader genuinely waited for, which ends the drain -- so a block that buffered nothing
+        costs a single line rather than a fixed quota.
+
+        ``_MAX_DRAINED_LINES`` bounds it so the drain always ends. Without it a run whose real steps
+        are faster than the threshold would look like an unending burst and publish nothing at all
+        for the rest of its life, which is a worse failure than a slightly skewed median.
+        """
+        if not self._draining_backlog:
+            return False
+        previous = self._last_arrival
+        self._last_arrival = float(now)
+        if previous is None or self._drained == 0:
+            # the FIRST line after the block is the head of the burst, and its own gap spans the
+            # block itself, so that gap says nothing about whether a backlog follows. it is kept
+            # (it opens the new segment) and the question is deferred to the line after it.
+            self._drained = 1
+            return False
+        if float(now) - previous >= _BLOCKING_CALL_THRESHOLD_S:
+            # the reader waited for this one, so the backlog is gone and normal timing resumes.
+            self._draining_backlog = False
+            return False
+        if self._drained >= self._MAX_DRAINED_LINES:
+            self._draining_backlog = False
+            return False
+        self._drained += 1
+        return True
 
     def _trim(self) -> None:
         """Keep the newest ``_RETAINED_STEP_LINES`` timestamps across all segments."""
