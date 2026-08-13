@@ -1251,6 +1251,25 @@ def test_publish_refuses_a_package_carrying_a_credential(monkeypatch):
     )
 
 
+def test_publish_refuses_a_credential_supplied_as_the_env_name():
+    """The name becomes the hub path and the commit message, so it leaks just as permanently.
+
+    Only the extracted package was scanned, and the name never reaches that check -- so a key
+    passed as the environment name was published intact even though the same bytes in a file
+    would have been refused.
+    """
+    key = "fslo_" + "a1B2c3D4" * 6
+
+    for name in (key, f"my-env-{key}"):
+        with pytest.raises(envs.EnvPublishError) as excinfo:
+            envs.validate_publish_inputs(package_b64=_pkg_b64(_MINIMAL), name=name)
+        assert "Freesolo API key" in str(excinfo.value)
+        assert key not in str(excinfo.value), "the refusal must not echo the credential"
+
+    # an ordinary name is unaffected
+    assert envs.validate_publish_inputs(package_b64=_pkg_b64(_MINIMAL), name="demo")
+
+
 def test_safe_extract_rejects_traversal(tmp_path):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:

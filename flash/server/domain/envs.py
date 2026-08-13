@@ -15,7 +15,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from flash.env_secrets import reject_credential_bearing_package
+from flash.env_secrets import credential_in_name, reject_credential_bearing_package
 from flash.envs.loader import _github_token
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
@@ -449,6 +449,11 @@ def validate_publish_inputs(*, package_b64: object, name: object) -> bytes:
         raise EnvPublishError("env package must be a base64 string")
     if not name:
         raise EnvPublishError("missing env name")
+    # The NAME is scanned as well as the package. It becomes the hub path and the commit message,
+    # so a credential passed as the environment name is published just as permanently as one in a
+    # file -- and it never reaches `_reject_credentials`, which only ever sees the extracted tree.
+    if kind := credential_in_name(name):
+        raise EnvPublishError(f"env name contains {kind}; rotate it and use a different name")
     max_encoded = ((_MAX_UPLOAD_BYTES + 2) // 3) * 4 + 3
     if len(package_b64) > max_encoded:
         raise EnvPublishError(

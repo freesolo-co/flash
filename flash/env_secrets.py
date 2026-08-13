@@ -139,10 +139,20 @@ _LITERAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     # `(?: BLOCK)?` because OpenPGP armours as `-----BEGIN PGP PRIVATE KEY BLOCK-----`. Without it
     # the trailing word made the header unmatchable and a `gpg --export-secret-keys --armor` file
     # published intact -- `[A-Z ]*` reaches `PGP PRIVATE KEY`, but nothing followed ` BLOCK`.
+    #
+    # `_ARMOR_HEADERS` skips the RFC 4880 armor headers that sit between the BEGIN line and the
+    # body. Requiring base64 IMMEDIATELY after the header caught only the headerless export: an
+    # armour carrying `Version:` or `Comment:` -- what most implementations emit, and what a
+    # hand-annotated backup carries -- went undetected again.
+    #
+    # Those five keys are named exactly, for the same reason `Proc-Type:`/`DEK-Info:` are below. A
+    # general `[A-Za-z-]+:` would also skip `Warning:` and `Note:`, which is prose about a key
+    # rather than a key, and reopens the false positive the base64 requirement exists to close.
     (
         "a private key block",
         re.compile(
             rb"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\r\n\s]*"
+            rb"(?:(?:Version|Comment|MessageID|Hash|Charset):[^\r\n]*[\r\n\s]*)*"
             rb"(?:[A-Za-z0-9+/=]{32,}|Proc-Type:|DEK-Info:)"
         ),
     ),
@@ -504,7 +514,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     while chunk := handle.read(_SCAN_CHUNK_BYTES):
         if deadline is not None and time.monotonic() > deadline:
             raise _Unscannable("takes too long to decompress")
-        if not carry and _is_openpgp_secret_key(chunk[:16]):
+        if not carry and _is_openpgp_secret_key(chunk[:24]):
             # only ever at offset 0, and `carry` is empty only on the first chunk. Every file and
             # every archive member reaches this, so the binary export is covered wherever it sits.
             return "a private key"
@@ -530,7 +540,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         if kind := _credential_kind(window):
             return kind
         carry = window[-_SCAN_OVERLAP_BYTES:]
-    if overflowed and _ZIP_END_RECORD in tail:
+    if overflowed and _has_zip_end_record(tail):
         raise _Unscannable("contains an archive too large to inspect")
     if buffered and _looks_like_container(bytes(buffered)):
         return _credential_in_container(bytes(buffered), deadline=deadline or 0.0, depth=depth + 1)
@@ -573,10 +583,18 @@ def _is_openpgp_secret_key(head: bytes) -> bool:
     tag_old, tag_new = head[0] & 0xFC, head[0]
     if tag_old not in (0x94, 0x9C) and tag_new not in (0xC5, 0xC7):
         return False
-    # old format carries the length in 1, 2 or 4 bytes as selected by the low two bits; new format
-    # always in the byte after the tag. The version byte follows, and only 4 and 6 are issued.
+    # Old format carries the length in 1, 2 or 4 bytes as selected by the low two bits.
+    #
+    # New format is NOT always one byte: RFC 4880 encodes it in one octet below 192, two up to
+    # 8383, and five above that. Assuming one put the version byte at the wrong offset for any
+    # packet of 192 bytes or more -- which is every RSA secret key, and anything Sequoia, RNP or
+    # `--use-new-packet-format` writes -- so those returned false and published intact.
     lengths = {0x00: 2, 0x01: 3, 0x02: 5}
-    offset = 2 if tag_new in (0xC5, 0xC7) else lengths.get(head[0] & 0x03, 0)
+    if tag_new in (0xC5, 0xC7):
+        first = head[1] if len(head) > 1 else 0
+        offset = 2 if first < 192 else (3 if first < 224 else (6 if first == 0xFF else 0))
+    else:
+        offset = lengths.get(head[0] & 0x03, 0)
     if offset == 0 or len(head) <= offset or head[offset] not in (4, 6):
         return False
     # then a four-byte creation timestamp, then the algorithm
@@ -600,7 +618,43 @@ def _looks_like_tar(source: Path | bytes) -> bool:
             magic = source[257:265]
     except OSError:
         return False
-    return magic.startswith((b"ustar\x0000", b"ustar  \x00", b"ustar\x00"))
+    if magic.startswith((b"ustar\x0000", b"ustar  \x00", b"ustar\x00")):
+        return True
+    # V7 -- the original pre-POSIX format, still written by `tar --format=v7` -- has NO magic at
+    # all: offset 257 is zero padding. Testing the magic alone left it unrecognised, so a v7 tar
+    # holding a gzipped credential was never enumerated and published intact. Its header is
+    # verifiable anyway: the checksum at offset 148 covers the first 512 bytes with that field
+    # read as spaces, which is a structural property no ordinary file satisfies by chance.
+    return _has_tar_checksum(source)
+
+
+def _has_tar_checksum(source: Path | bytes) -> bool:
+    """Whether `source` begins a tar header whose stored checksum verifies.
+
+    The check is what makes magic-less V7 detection safe: an arbitrary binary would have to carry
+    a valid octal checksum of its own first 512 bytes at exactly offset 148 to be mistaken for one.
+    """
+    try:
+        if isinstance(source, Path):
+            with source.open("rb") as handle:
+                block = handle.read(512)
+        else:
+            block = source[:512]
+    except OSError:
+        return False
+    if len(block) < 512:
+        return False
+    field = block[148:156]
+    try:
+        stored = int(field.split(b"\x00")[0].split()[0] or b"-1", 8)
+    except (ValueError, IndexError):
+        return False
+    # the checksum is computed with its own field taken as eight spaces
+    blanked = block[:148] + b" " * 8 + block[156:]
+    return stored in (
+        sum(blanked),
+        sum(bytes(byte - 256 if byte > 127 else byte for byte in blanked)),
+    )
 
 
 def _looks_like_container(data: bytes) -> bool:
@@ -648,29 +702,101 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
     """
     if depth > _MAX_CONTAINER_DEPTH:
         raise _Unscannable("nests compressed containers too deeply to inspect")
-    opened: IO[bytes] | None = None
-    try:
-        # `is_zipfile` scans for the end-of-central-directory record, so it recognises a zip with a
-        # preamble -- a self-extracting archive carries an executable stub, and its LEADING bytes
-        # are `MZ`, not `PK`. Testing the magic alone left that whole class unexpanded.
-        if zipfile.is_zipfile(source if isinstance(source, Path) else io.BytesIO(source)):
-            return _credential_in_zip(source, deadline=deadline, depth=depth)
-        if _looks_like_tar(source):
-            return _credential_in_tar(source, deadline=deadline, depth=depth)
-        head = source[:6] if isinstance(source, bytes) else source.open("rb").read(6)
-        opener = {b"BZh": bz2.open, b"\xfd7zXZ\x00": lzma.open}.get(
-            next((magic for magic in (b"BZh", b"\xfd7zXZ\x00") if head.startswith(magic)), b""),
-            gzip.open,
-        )
-        opened = opener(source if isinstance(source, Path) else io.BytesIO(source), "rb")
-        with opened as stream:
-            return _scan_stream(stream, deadline=deadline, depth=depth)
-    except _UNREADABLE_ARCHIVE:
-        return None
+    # EVERY applicable format is tried, not just the first one that claims a match. The detectors
+    # are heuristics over untrusted bytes and one of them was decisive: `is_zipfile` searches the
+    # last 64 KiB for the end-of-central-directory record, so four bytes of `PK\x05\x06` ANYWHERE
+    # in a tar made it claim the file. The tar was then opened as a zip, failed, and the failure
+    # was read as "nothing here" -- so adding four stray bytes to any member of a tar took a
+    # gzipped credential inside it from refused to published. Falling through instead means a
+    # wrong guess costs an open attempt rather than the whole scan.
+    for handler in (_credential_in_zip, _credential_in_tar, _credential_in_compressed):
+        try:
+            if kind := handler(source, deadline=deadline, depth=depth):
+                return kind
+        except _UNREADABLE_ARCHIVE:
+            continue  # not this format, or corrupt in it; the remaining formats still get a turn
+    return None
+
+
+def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
+    """The kind of credential inside a gzip, bzip2 or xz stream, or None."""
+    head = source[:6] if isinstance(source, bytes) else source.open("rb").read(6)
+    opener = {b"BZh": bz2.open, b"\xfd7zXZ\x00": lzma.open}.get(
+        next((magic for magic in (b"BZh", b"\xfd7zXZ\x00") if head.startswith(magic)), b""),
+        gzip.open,
+    )
+    with opener(source if isinstance(source, Path) else io.BytesIO(source), "rb") as stream:
+        return _scan_stream(stream, deadline=deadline, depth=depth)
+
+
+def _has_zip_end_record(tail: bytes) -> bool:
+    """Whether `tail` ends with a STRUCTURALLY valid zip end-of-central-directory record.
+
+    The bare four-byte signature is not enough to refuse a publish on. Those bytes occur by chance
+    about once per 4 GB of arbitrary data, and this test runs over the last 64 KiB of every member
+    too large to buffer -- so a model shard that happened to contain them was refused as an
+    unverifiable archive, with a message about an archive that was never there.
+
+    A real record is self-describing: the 2-byte comment length at offset 20 states exactly how
+    many bytes follow it. Requiring that to agree with what is actually there costs nothing on a
+    genuine zip and drops essentially every chance hit, since random bytes would have to encode
+    their own remaining length correctly.
+    """
+    offset = tail.rfind(_ZIP_END_RECORD)
+    while offset >= 0:
+        if len(tail) >= offset + 22:
+            comment = int.from_bytes(tail[offset + 20 : offset + 22], "little")
+            if len(tail) - (offset + 22) == comment:
+                return True
+        offset = tail.rfind(_ZIP_END_RECORD, 0, offset)
+    return False
+
+
+def _zip_member_count(source: Path | bytes) -> int:
+    """The member count a zip's end-of-central-directory record claims, or 0 if unreadable.
+
+    Read from the record rather than from a parsed archive so an absurd count can be refused
+    before `ZipFile` materializes that many `ZipInfo` objects.
+
+    A count of `0xffff` is the zip64 sentinel: the true count lives in the zip64 record, which is
+    read instead. Treating the sentinel as a literal 65,535 would wave through the archives that
+    carry more members than a 16-bit field can express, which are the ones this limit is for --
+    but reporting it as over the bound would refuse an ordinary 70,000-member archive, which is
+    under the bound and perfectly legitimate. Only the real count settles it.
+
+    Reporting 0 for an unreadable record is not a bypass: the constructor below then rejects the
+    archive, and the per-member loop still enforces the same bound.
+    """
+    tail = source[-_ZIP_TAIL_BYTES:] if isinstance(source, bytes) else b""
+    if isinstance(source, Path):
+        try:
+            with source.open("rb") as handle:
+                handle.seek(max(0, source.stat().st_size - _ZIP_TAIL_BYTES))
+                tail = handle.read()
+        except OSError:
+            return 0
+    offset = tail.rfind(_ZIP_END_RECORD)
+    if offset < 0 or len(tail) < offset + 12:
+        return 0
+    total = int.from_bytes(tail[offset + 10 : offset + 12], "little")
+    if total != 0xFFFF:
+        return total
+    # zip64 end-of-central-directory: the 8-byte total sits 32 bytes into its own record
+    zip64 = tail.rfind(b"PK\x06\x06")
+    if zip64 < 0 or len(tail) < zip64 + 40:
+        return _MAX_ARCHIVE_MEMBERS + 1  # claims zip64 but has no record: not verifiable, refuse
+    return int.from_bytes(tail[zip64 + 32 : zip64 + 40], "little")
 
 
 def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
     """The kind of credential in any readable member of a zip, or None."""
+    # The member count is read from the end-of-central-directory record BEFORE `ZipFile` is
+    # constructed. `ZipFile.__init__` parses the whole central directory and materializes every
+    # `ZipInfo`, so a bound checked after it is charged the cost it exists to avoid -- measured at
+    # 1.8 seconds and 239 MB of resident memory for 400,000 empty entries in a 35 MB file, all of
+    # it spent before the per-member loop below ran once.
+    if _zip_member_count(source) > _MAX_ARCHIVE_MEMBERS:
+        raise _Unscannable("contains an archive with too many members to inspect")
     with zipfile.ZipFile(source if isinstance(source, Path) else io.BytesIO(source)) as archive:
         for count, info in enumerate(archive.infolist(), 1):
             if count > _MAX_ARCHIVE_MEMBERS:

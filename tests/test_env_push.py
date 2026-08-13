@@ -2575,6 +2575,12 @@ def test_an_oversized_tar_refuses_rather_than_passing(tmp_path, monkeypatch):
 
     A tar past the cap is exactly as unverifiable as a gzip past it -- its members can be
     compressed, and those hold the credential nowhere the literal scan can see.
+
+    What must never happen is a silent None. Refusing was the original fix; DETECTING is strictly
+    better and is what happens now that the container dispatch tries every applicable format
+    instead of committing to the first one that claims the bytes -- the tar is enumerated, the
+    gzipped member expanded, and the key found rather than merely suspected. Both outcomes are
+    accepted here because both are safe; a None is the bug.
     """
     import gzip
     import io
@@ -2597,8 +2603,12 @@ def test_an_oversized_tar_refuses_rather_than_passing(tmp_path, monkeypatch):
 
     oversized = tmp_path / "big.tar.gz"
     oversized.write_bytes(gzip.compress(buf.getvalue()))
-    with pytest.raises(_Unscannable, match="too large to inspect"):
-        credential_in_file(oversized)
+    outcome: str | None
+    try:
+        outcome = credential_in_file(oversized)
+    except _Unscannable as refusal:
+        outcome = str(refusal)
+    assert outcome in ("a Freesolo API key", "contains an archive too large to inspect")
 
 
 def test_a_credential_in_line_wrapped_base64_is_decoded(tmp_path):
@@ -2877,6 +2887,190 @@ def test_a_hex_body_under_an_issuer_prefix_is_a_placeholder_not_a_key():
     real = b"WANDB_API_KEY=d5c7bfe532fe1fe056b940909986e48aee4f5112"
     assert _credential_kind(real) == "a Weights & Biases API key"
     assert _credential_kind(b"WANDB_API_KEY=your_wandb_api_key_here_replace_before_push") is None
+
+
+def test_an_armoured_key_is_detected_through_its_armor_headers():
+    """RFC 4880 armor puts `Version:`/`Comment:` between the BEGIN line and the body.
+
+    Requiring base64 immediately after the header caught only a headerless export, so the form most
+    implementations actually emit -- and any hand-annotated backup -- went undetected.
+
+    The header keys are named exactly rather than accepting `[A-Za-z-]+:`, because a general rule
+    would also skip `Warning:` and `Note:`, which is prose about a key rather than a key.
+    """
+    from flash.env_secrets import _credential_kind
+
+    body = "A" * 64
+    for headers in (
+        b"",
+        b"Version: GnuPG v2.4.4\n",
+        b"Comment: exported for backup\n",
+        b"Version: GnuPG v2.4.4\nComment: exported for backup\n",
+    ):
+        armoured = b"-----BEGIN PGP PRIVATE KEY BLOCK-----\n" + headers + b"\n" + body.encode()
+        assert _credential_kind(armoured) == "a private key block", headers
+
+    # prose about a key is still not a key, which is what naming the headers exactly preserves
+    prose = b"-----BEGIN RSA PRIVATE KEY-----\nWarning: never commit one of these\n"
+    assert _credential_kind(prose) is None
+
+
+def test_every_openpgp_packet_length_encoding_is_parsed():
+    """New-format packets encode the length in one, two or five octets, not always one.
+
+    Assuming one put the version byte at the wrong offset for any packet of 192 bytes or more --
+    every RSA secret key, and anything Sequoia, RNP or `--use-new-packet-format` writes -- so those
+    returned false and published intact.
+    """
+    from flash.env_secrets import _is_openpgp_secret_key
+
+    def _packet(tag: int, body_length: int) -> bytes:
+        if body_length < 192:
+            length = bytes([body_length])
+        elif body_length < 8384:
+            offset = body_length - 192
+            length = bytes([(offset >> 8) + 192, offset & 0xFF])
+        else:
+            length = b"\xff" + body_length.to_bytes(4, "big")
+        # version 4, a four-byte creation time, then algorithm 1 (RSA)
+        return bytes([tag]) + length + b"\x04" + b"\x6a\x7e\x24\x0a" + b"\x01" + b"\x00" * 16
+
+    for body_length in (10, 191, 192, 500, 8383, 8384, 20_000, 100_000):
+        for tag in (0xC5, 0xC7):  # secret key and secret subkey, new format
+            assert _is_openpgp_secret_key(_packet(tag, body_length)), (tag, body_length)
+
+    # old format: the low two bits select a 1, 2 or 4 byte length, for both secret tags
+    lengths = {0: b"\x64", 1: b"\x01\xf4", 2: b"\x00\x01\x00\x00"}
+    tail = b"\x04\x6a\x7e\x24\x0a\x01" + b"\x00" * 16
+    for tag in (5, 7):
+        for length_type, length in lengths.items():
+            first = 0x80 | (tag << 2) | length_type
+            assert _is_openpgp_secret_key(bytes([first]) + length + tail), (tag, length_type)
+
+    # the PUBLIC halves, tags 6 and 14, must still publish
+    for tag in (6, 14):
+        for length_type, length in lengths.items():
+            first = 0x80 | (tag << 2) | length_type
+            assert not _is_openpgp_secret_key(bytes([first]) + length + tail), (tag, length_type)
+
+
+def test_a_v7_tar_is_enumerated_despite_having_no_magic(tmp_path):
+    """V7 is the original pre-POSIX tar, still written by `tar --format=v7`, and has NO magic.
+
+    Offset 257 is zero padding, so testing the magic alone left it unrecognised: a v7 tar holding a
+    gzipped credential was never enumerated and published intact. The header checksum identifies it
+    instead, which is a structural property an ordinary file does not satisfy by chance.
+    """
+    import gzip
+    import subprocess
+
+    from flash.env_secrets import credential_in_file
+
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "shard.gz").write_bytes(
+        gzip.compress(f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode())
+    )
+    archive = tmp_path / "v7.tar"
+    subprocess.run(
+        ["tar", "--format=v7", "-cf", str(archive), "-C", str(source), "shard.gz"],
+        check=True,
+        capture_output=True,
+    )
+    assert archive.read_bytes()[257:265] == b"\x00" * 8, "the fixture must have no ustar magic"
+    assert credential_in_file(archive) == "a Freesolo API key"
+
+    # an ordinary binary must not be mistaken for a magic-less tar
+    plain = tmp_path / "weights.bin"
+    plain.write_bytes(b"\x41" * 4096)
+    assert credential_in_file(plain) is None
+
+
+def test_stray_zip_bytes_in_a_tar_do_not_abandon_the_scan(tmp_path):
+    """`is_zipfile` searches the last 64 KiB for `PK\\x05\\x06`, so four stray bytes claimed a tar.
+
+    The tar was then opened as a zip, failed, and the failure was read as "nothing here" -- so
+    adding four bytes to any member took a gzipped credential inside it from refused to published.
+    Every applicable format is now tried rather than only the first one that claims the bytes.
+    """
+    import gzip
+    import io
+    import tarfile
+    import zipfile
+
+    from flash.env_secrets import credential_in_file
+
+    def _tar(name: str, filler: bytes):
+        path = tmp_path / name
+        with tarfile.open(path, "w") as archive:
+            for member, body in (
+                ("shard.gz", gzip.compress(f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode())),
+                ("readme.txt", filler),
+            ):
+                info = tarfile.TarInfo(member)
+                info.size = len(body)
+                archive.addfile(info, io.BytesIO(body))
+        return path
+
+    poisoned = _tar("poisoned.tar", b"PK\x05\x06 filler")
+    assert zipfile.is_zipfile(poisoned), "the fixture must actually fool is_zipfile"
+    assert credential_in_file(poisoned) == "a Freesolo API key"
+
+    control = _tar("control.tar", b"harmless filler")
+    assert not zipfile.is_zipfile(control)
+    assert credential_in_file(control) == "a Freesolo API key"
+
+
+def test_an_absurd_member_count_is_refused_before_the_directory_is_parsed(tmp_path):
+    """`ZipFile.__init__` materializes every `ZipInfo`, so a bound checked after it pays the cost.
+
+    Measured at 1.8 seconds and 239 MB of resident memory for 400,000 empty entries in a 35 MB
+    file, all of it spent before the per-member loop ran once. The count is read from the
+    end-of-central-directory record first, which brought the same archive to 4 MB.
+    """
+    import zipfile
+
+    from flash import env_secrets as secrets
+    from flash.env_secrets import _Unscannable, _zip_member_count, credential_in_file
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(secrets, "_MAX_ARCHIVE_MEMBERS", 100)
+    try:
+        crowded = tmp_path / "crowded.zip"
+        with zipfile.ZipFile(crowded, "w", zipfile.ZIP_STORED) as archive:
+            for index in range(500):
+                archive.writestr(f"{index}", b"")
+        assert _zip_member_count(crowded) == 500
+        with pytest.raises(_Unscannable, match="too many members"):
+            credential_in_file(crowded)
+    finally:
+        monkeypatch.undo()
+
+    # an ordinary archive is unaffected, and its credential is still found
+    modest = tmp_path / "modest.zip"
+    with zipfile.ZipFile(modest, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("env.sh", f'export KEY="fslo_{_FAKE_KEY_BODY}"\n')
+    assert credential_in_file(modest) == "a Freesolo API key"
+
+
+def test_a_stray_zip_signature_does_not_refuse_an_oversized_member():
+    """The bare four-byte signature occurs by chance about once per 4 GB of arbitrary data.
+
+    Tested over the last 64 KiB of every member too large to buffer, that refused a model shard as
+    an unverifiable archive with a message about an archive that was never there. A real record
+    states its own comment length at offset 20, and requiring that to agree drops the chance hits.
+    """
+    import struct
+
+    from flash.env_secrets import _has_zip_end_record
+
+    genuine = b"PK\x05\x06" + b"\x00" * 16 + struct.pack("<H", 5) + b"hello"
+    assert _has_zip_end_record(genuine)
+    # a truthful record with no comment at all is the common case
+    assert _has_zip_end_record(b"PK\x05\x06" + b"\x00" * 16 + struct.pack("<H", 0))
+    # the signature alone, with a length that does not describe what follows, is chance
+    assert not _has_zip_end_record(b"PK\x05\x06" + b"\x00" * 16 + struct.pack("<H", 99) + b"hi")
+    assert not _has_zip_end_record(b"\x41" * 4096 + b"PK\x05\x06" + b"\x00" * 12)
 
 
 def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
