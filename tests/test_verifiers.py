@@ -1982,6 +1982,38 @@ def test_step_episode_receives_the_raw_turn_not_the_scored_one(monkeypatch):
     )
 
 
+def test_an_image_bearing_env_reply_reaches_the_scorer_as_blocks_not_as_a_repr(monkeypatch):
+    """EnvironmentTurn.content is ChatContent, so a block list is a shape the scorer can read.
+
+    The adapter used to build every environment turn with ``content=str(...)``, which turned an
+    image reply into the python repr of its block list -- ``"[{'type': 'image_url', ...}]"`` -- for
+    anything grading the episode's turns. That is lossy at a boundary that natively supports blocks,
+    and it is silent: the scorer still sees a plausible-looking string.
+    """
+    blocks = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
+
+    class _ImageReplyEnv(_SteppingMultiTurnEnv):
+        def step_episode(self, example, messages, assistant_response):
+            return _EnvironmentStepResult(
+                done=False,
+                messages=({"role": "user", "content": blocks},),
+                final_response_text=None,
+            )
+
+    sdk_env = _ImageReplyEnv()
+    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+
+    state = env.new_rollout_state({"id": "a", "input": "2+2?", "output": "4"})
+    env.record_model_turn(state, _THINK_COMPLETION)
+    env.env_reply(state["messages"], state)
+
+    contents = [turn.content for turn in state["turns"]]
+    assert blocks in contents, f"the image blocks did not survive to the scorer: {contents!r}"
+    assert not any(isinstance(c, str) and c.startswith("[{") for c in contents), (
+        f"an env turn was stringified into a repr: {contents!r}"
+    )
+
+
 def test_stepping_the_env_leaves_the_scored_text_stripped(monkeypatch):
     """Fixing step_episode must not un-fix grading: the scorer still sees answer-only text."""
     sdk_env = _SteppingMultiTurnEnv()

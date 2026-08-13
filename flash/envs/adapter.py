@@ -638,10 +638,14 @@ class FreesoloEnvironment(BaseEnvironment):
         replies = [dict(message) for message in step.messages]
         state.setdefault("messages", []).extend(replies)
         for message in replies:
+            content = message.get("content", "")
             state.setdefault("turns", []).append(
                 self._EnvironmentTurn(
                     role=str(message.get("role", "")),
-                    content=str(message.get("content", "")),
+                    # not str(): EnvironmentTurn.content is ChatContent, so a block list is a shape
+                    # the scorer can already read. coercing it here would hand score_episodes the
+                    # python repr of the blocks instead of the blocks themselves.
+                    content=content if isinstance(content, (list, tuple)) else str(content),
                 )
             )
         return replies

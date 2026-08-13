@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler
 
 from flash.engine.worker.backend_common import BoundedThreadingHTTPServer
 from flash.engine.worker.score_batcher import ScoreBatcher
+from flash.engine.worker.train.core.child.glue import validate_transcript_messages
 from flash.engine.worker.train.rl.scoring import RolloutScoreRequest, score_rollouts
 
 # how many concurrently-finished episodes the multi-turn bridge scores in ONE env call. a whole
@@ -197,12 +198,16 @@ class MultiTurnBridge:
                 return {"terminal": True, "messages": []}
             replies = self._env.env_reply(list(state.get("messages") or ()), state)
             terminal = bool(self._env.rollout_done(state, self._max_turns))
+        # NOT str(content): an env returning image blocks hands back a list of content blocks, and
+        # coercing it would put the python repr of that list into the transcript as text -- the
+        # model would read "[{'type': 'image_url', ...}]" while no pixels were ever added, because
+        # the media on every generate call is fixed from the initial prompt. the shared validator
+        # is the same contract the opd bridge applies to its own env replies, and it rejects
+        # non-text content loudly instead. rendering a mid-episode image is genuinely unsupported
+        # here; being unsupported is survivable, being silent is not.
         return {
             "terminal": terminal,
-            "messages": [
-                {"role": str(message.get("role", "")), "content": str(message.get("content", ""))}
-                for message in replies
-            ],
+            "messages": validate_transcript_messages(list(replies), source="environment reply"),
         }
 
     def _score_batch(self, requests: list) -> list:

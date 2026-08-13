@@ -4638,6 +4638,56 @@ def test_bridge_step_stops_before_asking_a_finished_env_for_a_reply():
     }
 
 
+@pytest.mark.parametrize("block_type", ["image", "image_url", "input_image"])
+def test_bridge_step_rejects_an_env_reply_image_instead_of_stringifying_it(block_type):
+    # the silent-drop shape this guards: the bridge used to coerce every reply's content with
+    # str(), so an env showing the model a NEW image each turn (a browser screenshot, a rendered
+    # board) trained on the python repr of the block list -- the model literally read
+    # "[{'type': 'image_url', ...}]" as text. no image was ever decoded, because the media on every
+    # generate call is fixed from the initial prompt. nothing warned, nothing errored, and the
+    # rollouts looked healthy. the rejection is loud precisely because the defect was silent.
+    env = _BridgeEnv(
+        done_after=2,
+        replies=[
+            {
+                "role": "user",
+                "content": [{"type": block_type, "image_url": {"url": "data:image/png;base64,AA"}}],
+            }
+        ],
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="image content blocks") as caught:
+        bridge.step({"session_id": "a", "completion_text": "first"})
+    # the message must name the cause, not just the shape: an env author reading it needs to know
+    # the image was never decoded, not merely that a list was unwelcome.
+    assert "fixed from the initial prompt" in str(caught.value)
+
+
+def test_bridge_step_still_passes_a_text_reply_through_unchanged():
+    # the rejection above must not cost the supported path: a text env reply is the common case and
+    # has to survive the validator byte-for-byte.
+    env = _BridgeEnv(done_after=2, replies=[{"role": "user", "content": "again"}])
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    assert bridge.step({"session_id": "a", "completion_text": "first"}) == {
+        "terminal": False,
+        "messages": [{"role": "user", "content": "again"}],
+    }
+
+
+def test_child_glue_image_block_types_match_the_flash_definition():
+    # flash/engine/worker/train/core/child/glue.py is stdlib-only so the parent can copy it into the
+    # verl child's workdir, where `flash` is not importable -- so it re-declares the image block
+    # vocabulary instead of importing it. pin the two equal: a spelling added to the real definition
+    # but not the copy would silently fall back to the generic "must be text" message, losing the
+    # named diagnosis for exactly the case this defect was about.
+    from flash.content.multimodal import _IMAGE_BLOCK_TYPES as canonical
+    from flash.engine.worker.train.core.child.glue import _IMAGE_BLOCK_TYPES as copied
+
+    assert copied == canonical
+
+
 def test_bridge_step_on_an_unknown_session_raises_rather_than_scoring_a_blank_episode():
     with pytest.raises(KeyError, match="unknown multi-turn session"):
         _bridge(_BridgeEnv()).step({"session_id": "ghost", "completion_text": "x"})

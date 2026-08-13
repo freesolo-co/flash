@@ -20,6 +20,17 @@ from uuid import uuid4
 
 _ALLOWED_MESSAGE_KEYS = frozenset({"role", "content"})
 _PROBE_PREFIX = "flash-env-glue-probe"
+# duplicated from flash.content.multimodal._IMAGE_BLOCK_TYPES rather than imported: this module is
+# stdlib-only so the parent can copy it into the verl child's workdir, where flash is not
+# importable. tests/test_rl_train.py pins the two sets equal so they cannot drift.
+_IMAGE_BLOCK_TYPES = frozenset({"image", "image_url", "input_image"})
+
+
+def _has_image_block(content) -> bool:
+    """whether non-text content is an image block list, so the rejection can say so by name."""
+    return isinstance(content, (list, tuple)) and any(
+        isinstance(block, dict) and block.get("type") in _IMAGE_BLOCK_TYPES for block in content
+    )
 
 
 def normalize_token_ids(value) -> list[int]:
@@ -63,6 +74,16 @@ def validate_transcript_messages(messages: list[dict], *, source: str) -> list[d
         if not isinstance(role, str) or not role.strip():
             raise ValueError(f"{source} message {position} has an invalid role")
         if not isinstance(content, str):
+            if _has_image_block(content):
+                # the specific failure worth naming: an env showing the model a NEW image each turn
+                # (a browser screenshot, a rendered board). the media on every generate call is
+                # fixed from the initial prompt, so there is nowhere to put a mid-episode image.
+                raise ValueError(
+                    f"{source} message {position} returns image content blocks, which a multi-turn "
+                    "rollout cannot show the model: the media conditioning every turn is fixed from "
+                    "the initial prompt, so an image returned mid-episode would never be decoded. "
+                    "return text describing the observation, or put the image in the initial prompt"
+                )
             raise ValueError(f"{source} message {position} content must be text for multi-turn")
         normalized.append({"role": role, "content": content})
     return normalized
