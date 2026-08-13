@@ -348,6 +348,12 @@ commit the backend downloads and the suffix of the immutable revision id, so a b
 placeholder would pass the id grammar and then fail minutes later, on the GPU, as an unresolvable
 revision rather than as the missing argument it is.
 
+`--conformance-ready-timeout` defaults to 300 seconds because that is the budget `flash models
+deploy` itself enforces (`REVISION_READY_BUDGET_SECONDS`). A backend that only reaches `ready` after
+longer than this is one the shipped client cannot drive, so the suite would otherwise pass a target
+that fails in real use. Raise it deliberately if a first cold start has to pull weights over a slow
+link, but know that a pass above 300s no longer means "works with flash unchanged".
+
 It writes: registering, activating, and deleting adapters are all real state changes on the target.
 Run it against a backend you own.
 

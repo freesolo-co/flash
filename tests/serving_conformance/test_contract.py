@@ -411,12 +411,17 @@ def test_concurrent_activations_of_one_alias_leave_exactly_one_winner(
         )
 
         # The winner is what the alias actually points at -- a backend could return one 200 and one
-        # 409 while landing the loser's write.
+        # 409 while landing the loser's write. Accepting EITHER revision here would pass exactly
+        # that backend, so the expected target is derived from which activation got the 200:
+        # `pool.map` yields results in input order, so `codes[i]` belongs to `revisions[i]`.
+        revisions = (first["adapter_id"], second["adapter_id"])
+        expected = revisions[codes.index(200)]
         alias = _record(http.get(f"/adapters/{run_id}").json())
         metadata = alias.get("metadata") if isinstance(alias.get("metadata"), dict) else {}
-        assert metadata.get("alias_of") in (first["adapter_id"], second["adapter_id"]), (
-            f"after the race the alias points at {metadata.get('alias_of')!r}, which is neither "
-            f"revision that was activated"
+        assert metadata.get("alias_of") == expected, (
+            f"the activation of {expected} returned 200, but after the race the alias points at "
+            f"{metadata.get('alias_of')!r}. the backend told one caller it won and then committed "
+            f"the other write, so a deploy reports success while a different revision serves"
         )
     finally:
         http.delete(f"/adapters/{run_id}")

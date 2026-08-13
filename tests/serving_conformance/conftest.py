@@ -113,7 +113,34 @@ def http(serving_url, internal_key):
             f"{exc}. install it with `pip install httpx`, or drop --serving-url to skip the suite."
         )
     headers = {"X-Freesolo-Internal-Key": internal_key} if internal_key else {}
-    with httpx.Client(base_url=serving_url, headers=headers, timeout=120.0) as client:
+
+    def _origin(url) -> tuple[str, str, int | None]:
+        return (url.scheme.lower(), (url.host or "").rstrip(".").lower(), url.port)
+
+    target = _origin(httpx.URL(serving_url))
+
+    def _strip_key_off_origin(request) -> None:
+        # The same hook the shipped client installs, for the same reason: httpx strips only
+        # `Authorization` and `Cookie` across an origin change, so the plane credential rides a
+        # custom header straight to whatever host a redirect names. Following redirects without
+        # this would make the suite leak the key that a real deploy would not.
+        if "X-Freesolo-Internal-Key" not in request.headers:
+            return
+        if _origin(request.url) != target:
+            del request.headers["X-Freesolo-Internal-Key"]
+
+    # follow_redirects mirrors `_new_serving_client`. Modal answers a slow registration, chat, or
+    # delete with a 303 to a same-origin async-result poll url, and the shipped client follows it;
+    # a suite that does not would see the bare 303 and fail a backend that `flash models deploy`
+    # drives successfully -- the suite rejecting behavior the client handles.
+    with httpx.Client(
+        base_url=serving_url,
+        headers=headers,
+        timeout=120.0,
+        follow_redirects=True,
+        max_redirects=100,
+        event_hooks={"request": [_strip_key_off_origin]},
+    ) as client:
         yield client
 
 

@@ -320,15 +320,23 @@ async def _discard_cached_adapter(adapter_id: str) -> None:
     whose weights are gone, which fails at the next cold start rather than here. Re-registration is
     an explicit request that downloads the revision again, so a record that is no longer disabled
     is exactly the signal to leave the directory alone; the next undeploy collects it.
+
+    RAISES when the delete fails, and that is the point: the caller decides what a failure means.
+    Undeploy's deferred path keeps its `cache_reclaim_pending` marker so a later DELETE retries,
+    which only works if the failure reaches it. Swallowing here (the old `suppress` plus
+    `ignore_errors`) made every filesystem error -- a transient volume i/o fault, a permission
+    problem -- look like a completed reclaim, so the marker was cleared for a directory that is
+    still on disk and nothing would ever collect it. Callers that genuinely do not care still wrap
+    the call; the difference is that they now choose to.
     """
     current = await adapter_records.get.aio(_record_key(adapter_id))
     if isinstance(current, dict) and current.get("status") == "disabled":
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(
-                shutil.rmtree,
-                f"{{ADAPTER_DIR}}/{{_adapter_digest(adapter_id)}}",
-                ignore_errors=True,
-            )
+        # `ignore_errors` stays FALSE so a failed unlink surfaces. `missing_ok` behavior is kept by
+        # tolerating an already-absent directory: a reclaim that ran before is a success, not an
+        # error, and re-running one is exactly what a retried undeploy does.
+        directory = f"{{ADAPTER_DIR}}/{{_adapter_digest(adapter_id)}}"
+        if os.path.exists(directory):
+            await asyncio.to_thread(shutil.rmtree, directory)
 
 
 async def _rebuild_run_members(run_id: str) -> list[str]:
@@ -757,7 +765,12 @@ class Engine:
                     evicted = False
                 if evicted:
                     await _release_lora_int_id(int_id, adapter_id)
-            await _discard_cached_adapter(adapter_id)
+            # Suppressed HERE, not inside the helper: this is the eviction path, whose contract is
+            # that it never fails an undeploy. The record is already `disabled` and off the GPU, so
+            # a directory left behind is a storage cost, not a correctness problem -- and the run's
+            # own DELETE pass is what carries a retry marker, not this call.
+            with contextlib.suppress(Exception):
+                await _discard_cached_adapter(adapter_id)
         return {{"ok": True}}
 
     @modal.method()
@@ -888,6 +901,28 @@ class Engine:
 # container goes away mid-load the task goes with it, no error is raised anywhere, and the record
 # stays `registered` until the client gives up -- with the GPU idle and healthy the whole time.
 # ---------------------------------------------------------------------------------------------
+@app.function(
+    image=image,
+    secrets=secrets,
+    volumes={{CACHE_MOUNT: cache_volume}},
+    timeout=TIMEOUT_SECONDS,
+)
+async def reclaim_adapter_cache(adapter_id: str) -> dict[str, Any]:
+    """Delete one revision's download from the volume, on a container with NO gpu.
+
+    `Engine.discard_cache` does the same work, but `Engine` is declared `gpu=GPU` and its
+    `@modal.enter` loads the base model into vLLM -- so calling it with everything scaled to zero
+    boots a GPU container, waits out a multi-minute model load, and bills all of it, purely to run
+    `rmtree`. That is self-defeating for the DEFERRED reclaim in particular, which exists precisely
+    because the engine was cold and the fix was to avoid paying for a GPU start.
+
+    Same volume, same durable re-check, no accelerator. `Engine.discard_cache` stays for the warm
+    caller in `unregister`, where a container is already running and the round trip is free.
+    """
+    await _discard_cached_adapter(adapter_id)
+    return {{"ok": True}}
+
+
 @app.function(image=image, secrets=secrets, timeout=TIMEOUT_SECONDS)
 async def settle_adapter(record: dict[str, Any]) -> None:
     """Load one adapter onto the engine, then write the lifecycle state the client waits on."""
@@ -993,8 +1028,27 @@ async def settle_adapter(record: dict[str, Any]) -> None:
     # every cold failed load would leak its download onto the volume permanently. The flag is what
     # undeploy looks for.
     if discard_cache and engine_warm:
-        with contextlib.suppress(Exception):
+        try:
             await Engine().discard_cache.remote.aio(adapter_id)
+        except Exception:
+            # Falls back to the SAME deferral the cold path uses. Previously suppressed outright,
+            # which was the one case with no retry anywhere: the cold path at least leaves a marker,
+            # while a warm reclaim that failed -- a volume i/o fault, the container recycling
+            # mid-call -- was simply forgotten, and undeploy skips the record because this settle
+            # already made it `disabled`. Marking it means the run's DELETE collects it later.
+            #
+            # Written with the record re-read under the run lock, because the settle that owned this
+            # record has already committed and released it; blindly re-putting the copy in hand
+            # would undo whatever landed since.
+            with contextlib.suppress(Exception):  # marking is itself best effort
+                async with _run_lock(run_id):
+                    pending = await adapter_records.get.aio(_record_key(adapter_id))
+                    if isinstance(pending, dict) and pending.get("status") == "disabled":
+                        pending["metadata"] = {{
+                            **(pending.get("metadata") or {{}}),
+                            "cache_reclaim_pending": True,
+                        }}
+                        await adapter_records.put.aio(_record_key(adapter_id), pending)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1008,7 +1062,7 @@ def api():
     web = FastAPI(title=f"flash serving: {{BASE_MODEL}}")
     engine = Engine()
 
-    async def _spawn_settle(record: dict[str, Any]) -> None:
+    async def _spawn_settle(record: dict[str, Any], holds_lock: bool = False) -> None:
         """Hand the load to a worker, marking the record `failed` if the handoff itself fails.
 
         A raise here would otherwise return 500 over a durable record still reading `registered` --
@@ -1028,27 +1082,41 @@ def api():
         and be unable to commit its result at all. The run whose load actually succeeds would sit
         at `failed` permanently.
 
-        The token is re-read WITHOUT taking the run lock: one caller already holds it (the
-        identical-registration path), so acquiring it here would deadlock against itself. A plain
-        read is the right amount of care anyway -- the failure this guards is a newer attempt
-        already durably recorded, which a read sees, and losing a race to an attempt stamped in the
-        same instant costs a spurious `failed` that re-registering clears.
+        The check and the write are ONE critical section, taken under the run lock unless the caller
+        already holds it (`holds_lock`, which the identical-registration path passes -- acquiring it
+        again there would deadlock against itself). Read and write as separate awaits, an identical
+        registration landing between them stamps a new `settle_attempt` and queues its own settle,
+        and this stale `failed` record then lands on top: the newer POST has already returned
+        success, but the settle it spawned finds its token gone and can never commit `ready`. So an
+        accepted registration sits at `failed` forever, which is exactly the outcome the token check
+        was written to prevent -- it just could not see a writer that arrived after its read.
         """
         try:
             settle_adapter.spawn(record)
         except Exception as exc:
-            attempt = (record.get("metadata") or {{}}).get("settle_attempt")
-            current = await _read(record["adapter_id"])
-            if attempt is not None and isinstance(current, dict):
-                if (current.get("metadata") or {{}}).get("settle_attempt") != attempt:
-                    raise
-            record["status"] = "failed"
-            record["metadata"] = {{
-                **(record.get("metadata") or {{}}),
-                "lifecycle_state": "failed",
-                "failure": f"could not enqueue the adapter load: {{exc}}",
-            }}
-            await _write(record)
+
+            async def _commit_failure() -> None:
+                attempt = (record.get("metadata") or {{}}).get("settle_attempt")
+                current = await _read(record["adapter_id"])
+                if attempt is not None and isinstance(current, dict):
+                    if (current.get("metadata") or {{}}).get("settle_attempt") != attempt:
+                        raise
+                record["status"] = "failed"
+                record["metadata"] = {{
+                    **(record.get("metadata") or {{}}),
+                    "lifecycle_state": "failed",
+                    "failure": f"could not enqueue the adapter load: {{exc}}",
+                }}
+                await _write(record)
+
+            if holds_lock:
+                await _commit_failure()
+            else:
+                # From the record, not a closure: this helper is called for revisions and for the
+                # alias, and `metadata.run_id` is the same value the registration path locked on.
+                settle_run = (record.get("metadata") or {{}}).get("run_id") or record["adapter_id"]
+                async with _run_lock(settle_run):
+                    await _commit_failure()
             raise
 
     def _require_key(request: Request) -> None:
@@ -1270,7 +1338,8 @@ def api():
                 # only by a new artifact.
                 await _ensure_run_alias(run_id, adapter_id)
                 if state != "ready":
-                    await _spawn_settle(existing)
+                    # Already inside `_run_lock(run_id)`, so the failure commit must not retake it.
+                    await _spawn_settle(existing, holds_lock=True)
                 return {{"ok": True, "adapter": existing}}
             record["metadata"]["settle_attempt"] = uuid.uuid4().hex
             await _write(record)
@@ -1358,14 +1427,27 @@ def api():
         # client this undeploy disabled something it did not.
         reclaimable: list[str] = []
         # Repair BEFORE the lock, because the scan is unbounded and the lease is not renewable.
-        # Only when the index is empty, so the ordinary path stays one indexed read.
         #
         # Unioning `adapter_id` into the members below is not enough on its own: flash's client
         # always deletes by RUN id (`undeploy_adapter` builds the url from run_id), so on the real
         # path `adapter_id == run_id` and the union adds nothing. With no index, the loop would
         # then disable the alias alone and leave every sibling revision `ready`, resident on the
         # GPU, and reactivatable -- undeploy answering 200 for a run that still serves.
-        repaired = [] if await _run_members(run_id) else await _rebuild_run_members(run_id)
+        #
+        # Repaired when the index is empty OR demonstrably incomplete, not on emptiness alone.
+        # Registration writes the revision record and then indexes it as two operations, so a
+        # container that dies between them leaves a NONEMPTY index missing exactly that revision --
+        # an emptiness check sees a populated index, skips the repair, and the orphan stays `ready`,
+        # resident, and directly callable after DELETE answered 200. Index existence is not index
+        # completeness.
+        #
+        # Incompleteness is detected without a keyspace scan: `_ensure_run_alias` indexes the alias
+        # and the revision together on every registration, so an index that does not contain the
+        # run's own alias id is one that was interrupted. That is a single indexed read, which keeps
+        # hold time independent of how many adapters the app has ever seen -- the invariant the
+        # lock's non-renewable TTL depends on. The scan runs only in the case that is already broken.
+        indexed = await _run_members(run_id)
+        repaired = [] if run_id in indexed else await _rebuild_run_members(run_id)
         # Under the SAME per-run lock `activate` and registration take. Without it, an in-flight
         # activation can write the alias back to `ready` after this loop disabled it, and undeploy
         # returns success while the run stays callable -- the lost update
@@ -1515,37 +1597,47 @@ def api():
         # The deferred reclaims, run whether or not anything is warm. Unlike eviction, this has no
         # cheaper time to happen: undeploy is the last event in the run's life, so skipping here
         # leaves the directory on the volume for good. It is also bounded -- one `rmtree` per
-        # revision whose load failed while scaled to zero -- and `discard_cache` deliberately does
-        # not touch the GPU, so this cannot evict an id a colliding adapter has since taken.
+        # revision whose load failed while scaled to zero.
+        #
+        # Dispatched to `reclaim_adapter_cache`, NOT `Engine.discard_cache`: `Engine` carries
+        # `gpu=GPU` and loads the base model on enter, so routing this through it would boot and
+        # bill a GPU container to run `rmtree` -- exactly the cold-start cost the deferral was
+        # introduced to avoid, paid at undeploy instead of at settle.
         for revision_id in reclaimable:
             try:
-                await Engine().discard_cache.remote.aio(revision_id)
+                await reclaim_adapter_cache.remote.aio(revision_id)
             except Exception:  # reclaiming disk is best effort, but the marker is not
                 # Left marked on purpose. Best effort means a failed reclaim must not fail the
-                # undeploy -- it does NOT mean forgetting the directory. This call boots a
-                # container to reach the volume, so a timeout is the likely failure here, and the
-                # marker is the only record that anything still needs collecting. Clearing it
-                # after a raise turns a retryable deferral into the permanent leak it was added
-                # to prevent; leaving it lets the next delete try again.
+                # undeploy -- it does NOT mean forgetting the directory. The marker is the only
+                # record that anything still needs collecting, so clearing it after a raise turns
+                # a retryable deferral into the permanent leak it was added to prevent; leaving it
+                # lets the next delete try again.
                 continue
-            reclaimed = await _read(revision_id)
-            if isinstance(reclaimed, dict):
+            # Re-taken for the clear. The read-modify-write below raced registration when it ran
+            # unlocked: a POST for this revision between the read and the write is reset to
+            # `registered` with a fresh `settle_attempt`, and writing the whole stale record back
+            # restored `disabled` AND dropped the token, so the settle that POST spawned could
+            # never commit -- an accepted registration that can never reach ready.
+            async with _run_lock(run_id):
+                reclaimed = await _read(revision_id)
+                if not isinstance(reclaimed, dict):
+                    continue
                 metadata = reclaimed.get("metadata") or {{}}
                 # Cleared only when the record is STILL disabled, matching the same condition
                 # `_discard_cached_adapter` re-checks before deleting. A revision re-registered
                 # while this ran keeps its files on purpose -- clearing the marker then would drop
                 # the deferral for a directory nothing had collected, which is the leak again.
-                if (
+                if not (
                     metadata.get("cache_reclaim_pending")
                     and reclaimed.get("status") == "disabled"
                 ):
-                    # Cleared so a repeated undeploy does not re-run the reclaim on every call.
-                    reclaimed["metadata"] = {{
-                        key: value
-                        for key, value in metadata.items()
-                        if key != "cache_reclaim_pending"
-                    }}
-                    await adapter_records.put.aio(_record_key(revision_id), reclaimed)
+                    continue
+                # Cleared so a repeated undeploy does not re-run the reclaim on every call. Only
+                # the metadata key changes, on the record just read under this lock.
+                reclaimed["metadata"] = {{
+                    key: value for key, value in metadata.items() if key != "cache_reclaim_pending"
+                }}
+                await adapter_records.put.aio(_record_key(revision_id), reclaimed)
         # Reported only now, after everything this call did disable has been evicted. 409 says the
         # run is in flux and the retry is theirs to make; what this pass disabled stays disabled
         # and is off the GPU, so a retry converges on the remainder.

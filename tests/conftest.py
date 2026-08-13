@@ -58,8 +58,17 @@ def pytest_addoption(parser):
     group.addoption(
         "--conformance-ready-timeout",
         type=float,
-        default=600.0,
-        help="seconds to wait for a revision to reach ready (default: 600, covers a cold start)",
+        # The CLIENT's budget, not a generous one. `deploy_adapter` gives up at
+        # REVISION_READY_BUDGET_SECONDS (300s) and fails the deploy, so a suite that waits longer
+        # certifies a backend `flash models deploy` cannot actually drive: conformance green would
+        # mean "works with the shipped client unchanged" while the shipped client times out.
+        # Raising this is a deliberate act (a first cold start pulling weights can exceed it), which
+        # is what the flag is for -- but the DEFAULT has to be the contract the client enforces.
+        default=300.0,
+        help=(
+            "seconds to wait for a revision to reach ready "
+            "(default: 300, matching flash's own deploy budget)"
+        ),
     )
 
 

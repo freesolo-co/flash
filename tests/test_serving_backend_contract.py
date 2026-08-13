@@ -217,6 +217,16 @@ def _stub_modal(monkeypatch, engine_methods, spawned=None, engine_classes=None, 
         def __call__(self, *args, **kwargs):
             return self._fn(*args, **kwargs)
 
+        @property
+        def remote(self):
+            """`.remote.aio(...)`, the awaited call the app uses when it needs the RESULT.
+
+            Distinct from `spawn`, which is fire-and-forget. Undeploy awaits the cache reclaim on a
+            plain (cpu-only) function this way, so a stub without it would AttributeError on every
+            undeploy that has a deferred reclaim to collect.
+            """
+            return types.SimpleNamespace(aio=self._fn)
+
         def spawn(self, *args, **kwargs):
             spawned.append((self._fn.__name__, args, kwargs))
             return self.local(*args, **kwargs)
@@ -276,6 +286,9 @@ def client(monkeypatch, tmp_path):
         return {"ok": True}
 
     async def discard_cache(adapter_id):
+        # The WARM path: `Engine.discard_cache` on a container that is already up. This stub stands
+        # in for the whole remote method, so the real `_discard_cached_adapter` never runs here and
+        # this is the only place the call is observable.
         discarded.append(adapter_id)
         return {"ok": True}
 
@@ -321,6 +334,18 @@ def client(monkeypatch, tmp_path):
     # The stub handle resolves each engine method through this dict per call, so a test can swap
     # one out to model what a concurrent caller does in the middle of a remote round trip.
     module.engine_methods = engine_methods
+
+    # The COLD path: undeploy's deferred reclaim runs on the cpu-only `reclaim_adapter_cache`,
+    # which is a plain `@app.function` and so is NOT replaced by the engine stub -- its body runs
+    # for real and calls `_discard_cached_adapter` here. Recorded into the same list as the warm
+    # path so a test can simply ask "was this revision reclaimed", whichever route it took.
+    _real_discard = module._discard_cached_adapter
+
+    async def _recording_discard(adapter_id):
+        discarded.append(adapter_id)
+        return await _real_discard(adapter_id)
+
+    module._discard_cached_adapter = _recording_discard
     test_client = TestClient(module.api())
     # Reach the generated module from a test: its Dict and its functions ARE the durable state,
     # so lifecycle races have to be driven through them rather than simulated alongside.
@@ -1240,6 +1265,44 @@ def test_undeploy_works_when_the_member_index_is_missing(client):
         "still serving"
     )
     assert response.json()["disabled_revisions"] == [REVISION]
+
+
+def test_undeploy_repairs_a_partial_member_index(client):
+    """Index EXISTENCE is not index completeness, and only completeness makes undeploy correct.
+
+    Registration writes the revision record and indexes it as two operations, so a container that
+    dies between them leaves a `members:` key that exists and is nonempty while missing exactly the
+    revision that was mid-registration. A repair gated on emptiness sees a populated index, skips
+    the scan, and the orphaned revision survives undeploy as `ready` -- resident on the GPU and
+    directly callable by its immutable id after DELETE answered 200.
+
+    The alias id is the completeness signal: `_ensure_run_alias` indexes the alias and the revision
+    together, so an index without the alias is one that was interrupted. That keeps the check a
+    single indexed read rather than the keyspace scan the lock's TTL cannot afford.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    orphan = "run-abc@step-30." + "e" * 40
+    module.adapter_records[module._record_key(orphan)] = {
+        "adapter_id": orphan,
+        "status": "ready",
+        "base_model": BASE_MODEL,
+        "metadata": {
+            "record_type": "revision",
+            "run_id": RUN_ID,
+            "lifecycle_state": "ready",
+        },
+    }
+    # The interrupted state: the record exists, the index does not name it, and the index is not
+    # empty -- it still lists the revision whose registration completed.
+    module.adapter_records[module._members_key(RUN_ID)] = [REVISION]
+
+    response = client.delete(f"/adapters/{REVISION}")
+    assert response.status_code == 200, f"undeploy returned {response.status_code}"
+    assert module.adapter_records[module._record_key(orphan)]["status"] == "disabled", (
+        "a revision missing from a NONEMPTY member index survived undeploy as `ready`, so it stays "
+        "resident and callable by its immutable id after undeploy reported the run was taken down"
+    )
 
 
 def test_a_registration_landing_during_the_disable_pass_is_still_undeployed(client):
@@ -2425,6 +2488,56 @@ def test_undeploy_deletes_the_downloaded_adapter(client, monkeypatch, tmp_path):
     )
 
 
+def test_a_failed_rmtree_is_reported_rather_than_swallowed(client, monkeypatch, tmp_path):
+    """A filesystem failure has to escape the helper, or every caller believes a lie.
+
+    `ignore_errors=True` plus an outer suppress meant a transient volume i/o fault or a permission
+    problem produced the same result as a completed delete: no raise, no signal. That defeats the
+    marker machinery one layer up -- undeploy clears `cache_reclaim_pending` on a successful-looking
+    reclaim, so the directory stays on the volume with nothing left that would retry it. The helper
+    does not decide whether a failure matters; the caller does, and it cannot decide what it cannot
+    see.
+    """
+    module = client.app.state.generated_module
+    revision = "run-rmfail@final." + "3" * 40
+    downloaded = tmp_path / module._adapter_digest(revision)
+    downloaded.mkdir()
+    (downloaded / "adapter_model.safetensors").write_bytes(b"weights")
+    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "disabled",
+    }
+
+    def _rmtree_fails(path, *args, **kwargs):
+        raise OSError(5, "input/output error")
+
+    monkeypatch.setattr(module.shutil, "rmtree", _rmtree_fails)
+
+    with pytest.raises(OSError, match="input/output error"):
+        _run_awaitable_result(module._discard_cached_adapter(revision))
+
+    assert downloaded.exists(), "the directory should still be there; the delete failed"
+
+
+def test_a_reclaim_of_an_already_gone_directory_is_a_success(client, monkeypatch, tmp_path):
+    """Propagating real errors must not turn an idempotent retry into a failure.
+
+    A retried undeploy reclaims a revision whose directory a previous pass already removed. That is
+    the reclaim having succeeded, not an error -- raising there would keep the marker set forever
+    and make every subsequent delete retry a delete that can never report success.
+    """
+    module = client.app.state.generated_module
+    revision = "run-gone@final." + "4" * 40
+    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "disabled",
+    }
+    # No directory is created: this is the second pass over an already-collected revision.
+    _run_awaitable_result(module._discard_cached_adapter(revision))
+
+
 def test_a_redeployed_revision_keeps_its_downloaded_adapter(client, monkeypatch, tmp_path):
     """Cleanup must not delete weights a concurrent redeploy has already brought back.
 
@@ -2747,6 +2860,63 @@ def test_metadata_cannot_turn_a_revision_into_an_alias(client):
     )
 
 
+def test_a_warm_reclaim_that_fails_still_leaves_a_marker(client):
+    """The one reclaim path that used to have no retry anywhere.
+
+    A warm settle deletes the download inline and, before this, suppressed any failure outright.
+    The cold path at least records `cache_reclaim_pending`; the warm path recorded nothing, and
+    undeploy passes over records that are already `disabled` -- which this settle just made it. So a
+    volume i/o fault, or the container recycling mid-call, silently orphaned the directory with
+    nothing anywhere that would ever collect it.
+    """
+    module = client.app.state.generated_module
+    module.runners.count = 1  # warm: the reclaim runs inline rather than deferring
+    revision = "run-warmfail@final." + "2" * 40
+    key = module._record_key(revision)
+    original = module.engine_methods["discard_cache"]
+
+    async def _reclaim_fails(adapter_id):
+        if adapter_id == revision:
+            raise OSError("input/output error on the volume")
+        return await original(adapter_id)
+
+    module.engine_methods["discard_cache"] = _reclaim_fails
+    try:
+        client.post(
+            "/adapters",
+            json={
+                **REGISTRATION,
+                "adapter_id": revision,
+                "repo_id": BAD_REPO,
+                "checkpoint": "run-warmfail",
+                "metadata": {
+                    "record_type": "revision",
+                    "run_id": "run-warmfail",
+                    "checkpoint_step": None,
+                    "hf_revision": "2" * 40,
+                },
+            },
+        )
+        assert _lifecycle(client, revision) == "failed"
+    finally:
+        module.engine_methods["discard_cache"] = original
+
+    assert (module.adapter_records[key].get("metadata") or {}).get(
+        "cache_reclaim_pending"
+    ) is True, (
+        "a warm reclaim that failed left no marker, so the download is orphaned: undeploy skips the "
+        "record because this settle already disabled it, and nothing else collects the directory"
+    )
+
+    # And the marker is what makes the later undeploy actually collect it.
+    module.discarded.clear()
+    response = client.delete("/adapters/run-warmfail")
+    assert response.status_code == 200, f"undeploy returned {response.status_code}"
+    assert revision in module.discarded, (
+        "undeploy did not retry the reclaim the warm path deferred after its failure"
+    )
+
+
 def test_a_failed_load_reclaims_its_downloaded_weights(client):
     """A terminally failed revision must not keep its download forever.
 
@@ -2909,6 +3079,60 @@ def test_a_cold_failed_load_is_reclaimed_by_the_next_undeploy(client):
     )
 
 
+def test_the_deferred_reclaim_does_not_boot_the_gpu_class(client):
+    """The whole point of deferring was NOT paying for a GPU start; undeploy must not pay it either.
+
+    `Engine` is declared `gpu=GPU` and loads the base model in `@modal.enter`, so dispatching the
+    reclaim through it starts an accelerator container and waits out a multi-minute model load to
+    run one `rmtree`. Deferring the reclaim at settle time and then routing it through the GPU class
+    at undeploy just moves that cost, it does not avoid it -- and the deferral exists precisely
+    because nothing was warm.
+
+    Asserted on the ENGINE handle rather than the outcome: both routes delete the same directory, so
+    only "which function was called" distinguishes them.
+    """
+    module = client.app.state.generated_module
+    module.runners.count = 0
+    revision = "run-nogpu@final." + "f" * 40
+    client.post(
+        "/adapters",
+        json={
+            **REGISTRATION,
+            "adapter_id": revision,
+            "repo_id": BAD_REPO,
+            "checkpoint": "run-nogpu",
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "run-nogpu",
+                "checkpoint_step": None,
+                "hf_revision": "f" * 40,
+            },
+        },
+    )
+    assert _lifecycle(client, revision) == "failed"
+
+    engine_calls: list[str] = []
+    original = module.engine_methods["discard_cache"]
+
+    async def _record_engine_route(adapter_id):
+        engine_calls.append(adapter_id)
+        return await original(adapter_id)
+
+    module.engine_methods["discard_cache"] = _record_engine_route
+    try:
+        response = client.delete("/adapters/run-nogpu")
+    finally:
+        module.engine_methods["discard_cache"] = original
+
+    assert response.status_code == 200, f"undeploy returned {response.status_code}"
+    assert revision in module.discarded, "the deferred reclaim never ran at all"
+    assert engine_calls == [], (
+        f"the deferred reclaim went through Engine.discard_cache for {engine_calls}, which is the "
+        f"gpu-backed class. with everything scaled to zero that boots an accelerator container and "
+        f"loads the base model to run an rmtree -- the cold-start cost the deferral existed to avoid"
+    )
+
+
 def test_a_revision_revived_during_its_reclaim_keeps_the_pending_marker(client):
     """Clearing the marker must follow the same condition the delete itself is gated on.
 
@@ -2942,10 +3166,10 @@ def test_a_revision_revived_during_its_reclaim_keeps_the_pending_marker(client):
     )
     assert _lifecycle(client, revision) == "failed"
 
-    # The engine stub stands in for the Modal method, so the revive is injected there. The real
-    # `_discard_cached_adapter` re-checks the record and would skip the delete for exactly this
-    # state; what is under test is whether the CALLER still clears the marker afterwards.
-    original = module.engine_methods["discard_cache"]
+    # Injected at `_discard_cached_adapter`, which is what undeploy's cpu-only reclaim function
+    # calls. The real one re-checks the record and would skip the delete for exactly this state;
+    # what is under test is whether the CALLER still clears the marker afterwards.
+    original = module._discard_cached_adapter
 
     async def _revive_mid_reclaim(adapter_id):
         record = module.adapter_records.get(key)
@@ -2954,11 +3178,11 @@ def test_a_revision_revived_during_its_reclaim_keeps_the_pending_marker(client):
             module.adapter_records[key] = record
         return await original(adapter_id)
 
-    module.engine_methods["discard_cache"] = _revive_mid_reclaim
+    module._discard_cached_adapter = _revive_mid_reclaim
     try:
         client.delete("/adapters/run-revived")
     finally:
-        module.engine_methods["discard_cache"] = original
+        module._discard_cached_adapter = original
 
     settled = module.adapter_records[key]
     assert (settled.get("metadata") or {}).get("cache_reclaim_pending") is True, (
@@ -2996,18 +3220,19 @@ def test_a_reclaim_that_raises_keeps_its_pending_marker(client):
     )
     assert _lifecycle(client, revision) == "failed"
 
-    original = module.engine_methods["discard_cache"]
+    # Raised from inside the cpu-only reclaim function's body, which is the call undeploy awaits.
+    original = module._discard_cached_adapter
 
     async def _reclaim_times_out(adapter_id):
         if adapter_id == revision:
             raise TimeoutError("the container never started")
         return await original(adapter_id)
 
-    module.engine_methods["discard_cache"] = _reclaim_times_out
+    module._discard_cached_adapter = _reclaim_times_out
     try:
         response = client.delete("/adapters/run-reclaimfail")
     finally:
-        module.engine_methods["discard_cache"] = original
+        module._discard_cached_adapter = original
 
     # The undeploy still succeeds: a directory left on the volume is not a reason to tell the
     # operator their run is still serving.
