@@ -24,7 +24,9 @@ import gzip
 import lzma
 import os
 import re
+import time
 import zipfile
+import zlib
 from pathlib import Path
 from typing import IO
 
@@ -84,11 +86,17 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
 # documentation says -- "if you see -----BEGIN RSA PRIVATE KEY----- in a log, redact it" -- and
 # refusing on it blocks a legitimate publish over prose about credentials. Requiring a base64 line
 # after the header keeps every real key (they all carry one) and drops the mention of one.
+#
+# The second alternative is the encrypted form, whose body is preceded by RFC 1421 headers instead
+# of starting with base64. It names those two headers exactly: a general `[A-Za-z-]+:` also accepts
+# `Warning:` or `Note:`, which is prose about a key rather than a key, and reopens the very false
+# positive the base64 requirement exists to close.
 _LITERAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     (
         "a private key block",
         re.compile(
-            rb"-----BEGIN [A-Z ]*PRIVATE KEY-----[\r\n\s]*(?:[A-Za-z0-9+/=]{32,}|[A-Za-z-]+:)"
+            rb"-----BEGIN [A-Z ]*PRIVATE KEY-----[\r\n\s]*"
+            rb"(?:[A-Za-z0-9+/=]{32,}|Proc-Type:|DEK-Info:)"
         ),
     ),
 )
@@ -107,11 +115,16 @@ _SCAN_OVERLAP_BYTES = 1024
 # in the file. Detected by magic rather than by extension, since the extension is the publisher's
 # choice and a renamed archive is still an archive.
 _COMPRESSED_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00")
-# Decompressed bytes scanned per file. Expansion is unbounded in principle, so it needs a stop. The
-# cap is the publish's own package size limit: no legitimate member of a 256 MB package expands to
-# more than the entire package, so nothing real is truncated, while a pathological archive cannot
-# expand without end.
-_MAX_DECOMPRESSED_BYTES = 256 << 20
+# Wall-clock budget for expanding one file's archives. Expansion is unbounded in principle, so it
+# needs a stop -- but a stop on BYTES is the wrong one: it discards the tail of the stream, and a
+# credential placed after the cutoff then publishes. That is not hypothetical, since the package
+# limit bounds *compressed* size: gzip does about 1000:1 on padding, so a 294 KB member expands
+# past any byte cap you would plausibly set while staying far under the 256 MB package limit.
+#
+# So the whole stream is scanned, chunk by chunk with bounded memory, and the budget bounds TIME.
+# A pathological archive costs a bounded wait rather than an unbounded one, while every real member
+# -- the largest here expands in about 3 seconds -- finishes long inside it.
+_MAX_DECOMPRESS_SECONDS = 60.0
 
 
 def _is_high_entropy(body: bytes) -> bool:
@@ -163,15 +176,26 @@ def _credential_kind(data: bytes) -> str | None:
     return None
 
 
-def _scan_stream(handle: IO[bytes], *, limit: int) -> str | None:
-    """The kind of credential in the first `limit` bytes of `handle`, or None.
+class _ExpansionBudgetExceeded(Exception):
+    """An archive took longer to expand than `_MAX_DECOMPRESS_SECONDS` allows."""
 
-    Read in chunks with an overlap so a credential straddling a chunk boundary is still matched.
+
+def _scan_stream(handle: IO[bytes], *, deadline: float | None = None) -> str | None:
+    """The kind of credential anywhere in `handle`, or None.
+
+    The WHOLE stream is read -- memory is bounded by the chunk size, not the total -- with an
+    overlap so a credential straddling a chunk boundary is still matched. Stopping early on a byte
+    count would mean a key placed after the cutoff publishes, which is the bug rather than the
+    protection.
+
+    `deadline` bounds expansion time when the bytes come from an archive. Exceeding it raises
+    rather than returning None, so the caller can refuse the publish: a stream too expensive to
+    finish is one this scan cannot vouch for, and silently calling it clean is how the cap leaked.
     """
     carry = b""
-    read = 0
-    while read < limit and (chunk := handle.read(min(_SCAN_CHUNK_BYTES, limit - read))):
-        read += len(chunk)
+    while chunk := handle.read(_SCAN_CHUNK_BYTES):
+        if deadline is not None and time.monotonic() > deadline:
+            raise _ExpansionBudgetExceeded
         window = carry + chunk
         if kind := _credential_kind(window):
             return kind
@@ -191,7 +215,12 @@ def _credential_in_compressed(path: Path) -> str | None:
     reading. An unsupported, truncated or corrupt archive falls back to the literal scan of its own
     bytes, which is the coverage it had before. Refusing to publish it, or crashing on it, would be
     a worse bug than the hole being closed: a half-written shard in a dataset directory is ordinary.
+    The caught set is deliberately wide, because the standard library reports these through no
+    single base class: an encrypted member raises RuntimeError, a member compressed with a method
+    zipfile does not implement raises NotImplementedError, and a corrupt deflate stream raises
+    zlib.error -- none of which is an OSError, so each one aborted the publish with a traceback.
     """
+    deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
     try:
         if zipfile.is_zipfile(path):
             with zipfile.ZipFile(path) as archive:
@@ -199,7 +228,7 @@ def _credential_in_compressed(path: Path) -> str | None:
                     if info.is_dir():
                         continue
                     with archive.open(info) as member:
-                        if kind := _scan_stream(member, limit=_MAX_DECOMPRESSED_BYTES):
+                        if kind := _scan_stream(member, deadline=deadline):
                             return kind
             return None
         with path.open("rb") as raw:
@@ -209,8 +238,16 @@ def _credential_in_compressed(path: Path) -> str | None:
             gzip.open,
         )
         with opener(path, "rb") as stream:
-            return _scan_stream(stream, limit=_MAX_DECOMPRESSED_BYTES)
-    except (OSError, EOFError, ValueError, zipfile.BadZipFile):
+            return _scan_stream(stream, deadline=deadline)
+    except (
+        OSError,
+        EOFError,
+        ValueError,
+        RuntimeError,
+        NotImplementedError,
+        zipfile.BadZipFile,
+        zlib.error,
+    ):
         return None
 
 
@@ -220,11 +257,15 @@ def credential_in_file(path: Path) -> str | None:
     Scanned as raw bytes, binary members included. Skipping binaries would be a hole rather than a
     saving: a credential sitting in a sqlite state file or a pickle is as published as one in a
     shell script, and the prefixes above cannot realistically collide with random bytes.
+
+    Raises `_ExpansionBudgetExceeded` if an archive is too expensive to finish expanding, which the
+    caller turns into a refusal: unverifiable is not the same as clean.
     """
     with path.open("rb") as handle:
         compressed = handle.read(6).startswith(_COMPRESSED_MAGIC)
         handle.seek(0)
-        if kind := _scan_stream(handle, limit=_MAX_DECOMPRESSED_BYTES):
+        # no deadline on the file's own bytes: that read is bounded by the package size limit
+        if kind := _scan_stream(handle):
             return kind
     return _credential_in_compressed(path) if compressed else None
 
@@ -278,15 +319,23 @@ def reject_credential_bearing_package(package_root: Path, *, display: dict[str, 
         for name in sorted(dirs) + sorted(files):
             member = Path(root) / name
             relative = member.relative_to(package_root).as_posix()
-            # the NAME is checked too, directories included: a file called `fslo_<key>.json`
-            # publishes the key in the repository's file tree whatever its contents are.
-            kind = credential_in_name(relative) or (
-                credential_in_file(member) if member.is_file() else None
-            )
+            shown = _redacted(display.get(relative, relative))
+            try:
+                # the NAME is checked too, directories included: a file called `fslo_<key>.json`
+                # publishes the key in the repository's file tree whatever its contents are.
+                kind = credential_in_name(relative) or (
+                    credential_in_file(member) if member.is_file() else None
+                )
+            except _ExpansionBudgetExceeded:
+                raise ValueError(
+                    f"{shown} takes too long to decompress to be scanned for credentials. "
+                    "Publishing it would commit unscanned content to a shared environment "
+                    "repository. Remove or unpack the archive before publishing."
+                ) from None
             if not kind:
                 continue
             raise ValueError(
-                f"{_redacted(display.get(relative, relative))} contains what looks like {kind}. "
+                f"{shown} contains what looks like {kind}. "
                 "Publishing would commit it to a shared environment repository, permanently in "
                 "git history. Remove the credential from the environment directory and rotate it "
                 "before publishing."

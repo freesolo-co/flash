@@ -1886,3 +1886,129 @@ def test_slack_app_level_tokens_are_matched(tmp_path):
     for prefix in ("xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "xapp-"):
         token = f"{prefix}1-A012BC3DEF-1234567890123-abcdefABCDEF0123456789"
         assert _credential_kind(token.encode()) == "a Slack token", prefix
+
+
+def _flip_zip_flags(
+    source: bytes, *, offset_local: int, offset_central: int, value: bytes
+) -> bytes:
+    """`source` with a field overwritten in both the local and central directory headers."""
+    raw = bytearray(source)
+    for index in range(len(raw) - 4):
+        if raw[index : index + 4] == b"PK\x03\x04":
+            start = index + offset_local
+            raw[start : start + len(value)] = value
+        elif raw[index : index + 4] == b"PK\x01\x02":
+            start = index + offset_central
+            raw[start : start + len(value)] = value
+    return bytes(raw)
+
+
+def test_credential_scan_survives_archives_the_stdlib_refuses_to_read(tmp_path):
+    """A container that cannot be expanded must fall back, not abort the publish.
+
+    The standard library reports these through no common base class: an encrypted member raises
+    RuntimeError, an unimplemented compression method raises NotImplementedError, and a corrupt
+    deflate stream raises zlib.error. None is an OSError, so each one crashed `flash env push` with
+    a traceback on an ordinary corrupt dataset shard.
+    """
+    import gzip
+    import struct
+    import zipfile
+
+    from flash.cli.commands.env.secrets import credential_in_file
+
+    plain = tmp_path / "plain.zip"
+    with zipfile.ZipFile(plain, "w") as archive:
+        archive.writestr("member.txt", "ordinary content " * 20)
+    source = plain.read_bytes()
+
+    # bit 0 of the general-purpose flag marks a member encrypted -> RuntimeError
+    encrypted = tmp_path / "encrypted.zip"
+    encrypted.write_bytes(_flip_zip_flags(source, offset_local=6, offset_central=8, value=b"\x01"))
+    assert credential_in_file(encrypted) is None
+
+    # method 99 is AES, which zipfile does not implement -> NotImplementedError
+    unsupported = tmp_path / "unsupported.zip"
+    unsupported.write_bytes(
+        _flip_zip_flags(source, offset_local=8, offset_central=10, value=struct.pack("<H", 99))
+    )
+    assert credential_in_file(unsupported) is None
+
+    # a corrupt deflate stream under a valid gzip header -> zlib.error
+    corrupt = tmp_path / "corrupt.gz"
+    good = gzip.compress(b"x" * 5000)
+    corrupt.write_bytes(good[:12] + bytes(b ^ 0xFF for b in good[12:60]) + good[60:])
+    assert credential_in_file(corrupt) is None
+
+
+def test_a_credential_cannot_hide_behind_a_wall_of_padding(tmp_path):
+    """The whole expanded stream is scanned, so a key placed late is still found.
+
+    Capping the scan at a byte count looked safe because the package limit is 256 MB -- but that
+    limit bounds COMPRESSED size. Padding compresses about 1000:1, so a file well under the limit
+    expands past any such cap, and a key after the cutoff published with exit 0.
+    """
+    import gzip
+
+    from flash.cli.commands.env.secrets import credential_in_file
+
+    padded = tmp_path / "shard.jsonl.gz"
+    with gzip.open(padded, "wb", compresslevel=9) as handle:
+        block = b"\0" * (1 << 20)
+        for _ in range(300):
+            handle.write(block)
+        handle.write(f"fslo_{_FAKE_KEY_BODY}".encode())
+
+    # the published artifact is small; only its expansion is large
+    assert padded.stat().st_size < 8 << 20
+    assert credential_in_file(padded) == "a Freesolo API key"
+
+
+def test_push_refuses_an_archive_too_expensive_to_scan(monkeypatch, tmp_path, capsys):
+    """An archive that cannot be finished is refused, not waved through.
+
+    Unverifiable is not the same as clean: returning None on a timeout would hand the publisher the
+    exact bypass the budget exists to prevent.
+    """
+    import gzip
+
+    from flash.cli.commands.env import secrets
+    from flash.cli.commands.env.secrets import _ExpansionBudgetExceeded, credential_in_file
+
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    slow = env_dir / "slow.gz"
+    slow.write_bytes(gzip.compress(b"\0" * (4 << 20)))
+
+    # a budget already spent: the first chunk of expansion is over the deadline
+    monkeypatch.setattr(secrets, "_MAX_DECOMPRESS_SECONDS", -1.0)
+    with pytest.raises(_ExpansionBudgetExceeded):
+        credential_in_file(slow)
+
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+    assert not cap, "an unscannable archive reached the upload"
+    assert "too long to decompress" in capsys.readouterr().err
+
+
+def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
+    """`Warning:` is prose; `Proc-Type:` and `DEK-Info:` are RFC 1421 encrypted-key headers.
+
+    Admitting any capitalized word plus a colon reopened the prose false positive that requiring a
+    body was meant to close.
+    """
+    from flash.cli.commands.env.secrets import _credential_kind
+
+    for prose in (
+        b"See -----BEGIN RSA PRIVATE KEY-----\nWarning: never commit keys to the repo",
+        b"-----BEGIN RSA PRIVATE KEY-----\nNote: redact this before sharing a log",
+    ):
+        assert _credential_kind(prose) is None, prose
+
+    for real in (
+        b"-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC\n",
+        b"-----BEGIN RSA PRIVATE KEY-----\nDEK-Info: AES-128-CBC\n",
+    ):
+        assert _credential_kind(real) == "a private key block", real
