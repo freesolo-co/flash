@@ -1571,7 +1571,13 @@ def test_push_refuses_shell_env_file_holding_a_live_api_key(monkeypatch, tmp_pat
         ("notes.md", "my key is sk-ant-{body} do not share", "Anthropic"),
         # a .pem is already dropped by NAME, so the uncovered case is a private key pasted into a
         # file whose name says nothing -- which is how a deploy key reaches a bootstrap script.
-        ("bootstrap.py", '# -----BEGIN RSA PRIVATE KEY-----\nKEY = "MIIEow=="\n', "private key"),
+        # the body line is full width: openssl wraps at 64 characters, and requiring a body is what
+        # keeps documentation that merely mentions the header publishable.
+        (
+            "bootstrap.py",
+            'KEY = """-----BEGIN RSA PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSi"""\n',
+            "private key",
+        ),
     ],
 )
 def test_push_refuses_any_published_file_carrying_a_credential(
@@ -1743,3 +1749,140 @@ def test_push_refuses_every_issued_openai_key_family(tmp_path):
 
     # ...while a lowercase-hex body of the same length stays an ordinary content hash.
     assert _credential_kind(b"https://cdn.example/a/sk-0123456789abcdef0123456789abcdef.js") is None
+
+
+def test_push_refuses_a_credential_packed_inside_an_archive(monkeypatch, tmp_path, capsys):
+    """A compressed member does not contain its credential literally, so it must be expanded.
+
+    Scanning the container's own bytes cannot see a deflated `env.sh` -- the key is not in the file
+    in any form a regex can match. Archives are ordinary in an environment (a bundled dataset
+    shard), and `flash env push` publishes them, so the packed key shipped with exit 0.
+    """
+    import bz2
+    import gzip
+    import lzma
+    import zipfile
+
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    secret = f'export FREESOLO_API_KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode()
+
+    # detected by MAGIC, not extension: a `.bin` is expanded and a mislabelled `.gz` is not missed
+    with zipfile.ZipFile(env_dir / "bundle.bin", "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("nested/env.sh", secret)
+    for name, packed in (
+        ("shard.jsonl.gz", gzip.compress(secret)),
+        ("shard.jsonl.bz2", bz2.compress(secret)),
+        ("shard.jsonl.xz", lzma.compress(secret)),
+    ):
+        (env_dir / name).write_bytes(packed)
+        assert secret not in (env_dir / name).read_bytes(), name
+
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+    assert not cap, "a packed credential reached the upload"
+    assert "bundle.bin" in capsys.readouterr().err
+
+
+def test_credential_scan_survives_a_container_it_cannot_open(tmp_path):
+    """An archive that will not open falls back to its literal bytes rather than erroring.
+
+    A truncated or unsupported container is ordinary in a dataset directory, and refusing to
+    publish one -- or crashing on it -- would be a worse bug than the hole being closed.
+    """
+    from flash.cli.commands.env.secrets import credential_in_file
+
+    truncated = tmp_path / "broken.zip"
+    truncated.write_bytes(b"PK\x03\x04" + b"\x00" * 8)
+    assert credential_in_file(truncated) is None
+
+    # the literal scan of the container's own bytes still applies when expansion yields nothing
+    stored = tmp_path / "stored.gz"
+    stored.write_bytes(b"\x1f\x8b garbage " + f"fslo_{_FAKE_KEY_BODY}".encode())
+    assert credential_in_file(stored) == "a Freesolo API key"
+
+
+def test_credential_scan_reads_wide_encodings(tmp_path):
+    """UTF-16/32 text interleaves NULs, so a key in it matches none of the byte patterns.
+
+    A PowerShell `env.ps1` is UTF-16 by default on Windows, which is exactly the sourceable secrets
+    file this whole check exists for -- in the one encoding that walked straight past it.
+    """
+    from flash.cli.commands.env.secrets import credential_in_file
+
+    for encoding in ("utf-16", "utf-16-be", "utf-32", "utf-32-be"):
+        wide = tmp_path / f"env-{encoding}.ps1"
+        wide.write_bytes(f'$env:FREESOLO_API_KEY = "fslo_{_FAKE_KEY_BODY}"\n'.encode(encoding))
+        assert credential_in_file(wide) == "a Freesolo API key", encoding
+
+    # narrowing must not invent a credential out of unrelated NUL-padded bytes
+    padded = tmp_path / "padded.bin"
+    padded.write_bytes(b"\x00".join(b"ordinary binary content" for _ in range(50)))
+    assert credential_in_file(padded) is None
+
+
+def test_push_refuses_a_credential_used_as_a_filename(monkeypatch, tmp_path, capsys):
+    """A file NAMED after a key publishes it in the repository's file tree, contents irrelevant.
+
+    Scanning only contents let an empty `fslo_<key>.json` through with exit 0, and the published
+    tree then shows that name forever. The refusal masks the body so the message cannot re-leak the
+    key it is refusing.
+    """
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / f"cache-fslo_{_FAKE_KEY_BODY}.json").write_text("{}\n")
+
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+    assert not cap, "a credential-named file reached the upload"
+
+    err = capsys.readouterr().err
+    assert "cache-fslo_***.json" in err
+    assert _FAKE_KEY_BODY not in err, "the refusal echoed the credential it was refusing"
+
+
+def test_push_refuses_a_credential_used_as_a_directory_name(monkeypatch, tmp_path):
+    from flash.cli.commands.env.secrets import credential_in_name
+
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    keyed = env_dir / f"runs-fslo_{_FAKE_KEY_BODY}"
+    keyed.mkdir()
+    (keyed / "notes.md").write_text("nothing secret here\n")
+
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+    assert credential_in_name("a/b/hf_AbCdEf0123456789012345/c.txt") == "a Hugging Face token"
+    assert credential_in_name("src/hf_hub_download_helper.py") is None
+
+
+def test_a_pem_header_without_a_key_body_is_prose_not_a_credential(tmp_path):
+    """Documentation that mentions a PEM header must still publish.
+
+    Refusing on the header alone blocked a legitimate publish over writing about credentials, which
+    is the kind of false refusal that gets a check disabled.
+    """
+    from flash.cli.commands.env.secrets import _credential_kind
+
+    prose = b"If you see -----BEGIN RSA PRIVATE KEY----- in a log, redact it before sharing."
+    assert _credential_kind(prose) is None
+
+    # a real block always carries its body, in either the bare or the encrypted-header form
+    body = b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAvR0Y2fJ8kLmNpQrStUvWxYz0123456789ab\n"
+    assert _credential_kind(body) == "a private key block"
+    encrypted = b"-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC\n"
+    assert _credential_kind(encrypted) == "a private key block"
+
+
+def test_slack_app_level_tokens_are_matched(tmp_path):
+    """`xapp-` is a separate prefix, not another letter in the `xox?` set."""
+    from flash.cli.commands.env.secrets import _credential_kind
+
+    for prefix in ("xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "xapp-"):
+        token = f"{prefix}1-A012BC3DEF-1234567890123-abcdefABCDEF0123456789"
+        assert _credential_kind(token.encode()) == "a Slack token", prefix
