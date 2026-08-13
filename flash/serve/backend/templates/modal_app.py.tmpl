@@ -273,10 +273,28 @@ async def _release_lora_int_id(int_id: int, adapter_id: str) -> bool:
     taken before the download and released only by its owner, so a resident adapter always has one.
     Answering False there would skip the eviction for every adapter loaded before this app carried
     claims at all, leaving them resident against `max_loras` until the container restarts.
+
+    A claim held by SOMEBODY ELSE returns without touching the key at all, and that early exit is
+    load-bearing rather than an optimization. `pop` genuinely vacates the key before the restore
+    puts it back, so on the non-owner path there is a window in which the id is unowned: a third
+    colliding adapter can claim it there, the `skip_if_exists=True` restore then silently does
+    nothing, and the resident owner has permanently lost its claim to an adapter that is not
+    resident -- while still being resident itself. That is the wrong-run's-weights state the whole
+    mechanism exists to prevent, and it was reachable from the ordinary undeploy of a REFUSED
+    collider, which is the one caller guaranteed to hit the non-owner path.
+
+    Reading first removes it: the only caller that vacated a peer's claim now never calls `pop`.
+    The read is not a lock and does not pretend to be one -- an owner's own concurrent release can
+    still change the answer -- but that case is one adapter releasing itself twice, which is
+    idempotent, not two adapters trading a live claim.
     """
-    removed = await adapter_records.pop.aio(_lora_id_key(int_id), None)
+    key = _lora_id_key(int_id)
+    owner = await adapter_records.get.aio(key)
+    if owner is not None and owner != adapter_id:
+        return False
+    removed = await adapter_records.pop.aio(key, None)
     if removed is not None and removed != adapter_id:
-        await adapter_records.put.aio(_lora_id_key(int_id), removed, skip_if_exists=True)
+        await adapter_records.put.aio(key, removed, skip_if_exists=True)
         return False
     return True
 
@@ -615,6 +633,9 @@ class Engine:
         # across somebody else's multi-minute download is what stalls live traffic.
         cached = self._loaded.get(adapter_id)
         if cached is not None:
+            # Returned WITHOUT consulting the shared claim, which is correct for the traffic that
+            # takes this branch and not correct for settle. See `_reclaim_lora_int_id`, which
+            # `register` calls to close the difference.
             return cached
         # One lock PER adapter, so a cold load serializes only its own duplicate loads. asyncio has
         # no await between the get and the set below, so this is not racy on a single event loop.
@@ -745,9 +766,56 @@ class Engine:
             self._int_ids[int_id] = adapter_id
             return request
 
+    async def _reclaim_lora_int_id(self, adapter_id: str) -> None:
+        """Re-establish the durable claim for an adapter this container already has resident.
+
+        `_lora_request`'s cache hit is what makes this necessary, and the hit is not a bug: a
+        generate against a resident adapter must not pay a Dict round trip. But a REGISTRATION that
+        hits the cache is a different question, because `Engine` scales horizontally and undeploy's
+        `unregister` is ONE remote call that Modal routes to ONE replica. So:
+
+          - replicas A and B both have the revision resident,
+          - undeploy lands on A, which evicts and releases the claim,
+          - the run is redeployed and settle lands on B, which returns its cached entry.
+
+        B never calls `_claim_lora_int_id`, so the record goes `ready` holding no claim -- and the
+        claim is precisely what refuses a colliding revision. The next revision that hashes to the
+        same 31 bits then takes the free id and loads, and two adapters that both read `ready`
+        contend for one vLLM slot, which is the wrong-run's-weights outcome the claim exists to
+        prevent.
+
+        Re-claiming under the adapter's own lock, so this cannot race that adapter's own load. A
+        LOST claim is fatal to the cached entry rather than to the caller's deploy alone: the id
+        belongs to somebody else now, this container's resident copy is the intruder under it, and
+        leaving it in `_loaded` would let the next generate answer from it. So the entry is dropped
+        and the id evicted before raising, which puts this container back in the state a cold one
+        would have been in -- the next settle re-downloads and re-contests honestly.
+        """
+        async with self._locks.setdefault(adapter_id, asyncio.Lock()):
+            if self._loaded.get(adapter_id) is None:
+                return  # evicted while we waited; the caller's load will claim normally
+            int_id = _lora_int_id(adapter_id)
+            owner = await _claim_lora_int_id(int_id, adapter_id)
+            if owner == adapter_id:
+                self._int_ids[int_id] = adapter_id
+                return
+            self._loaded.pop(adapter_id, None)
+            with contextlib.suppress(Exception):  # best effort: the raise below is the real report
+                await self.engine.remove_lora(int_id)
+            self._int_ids.pop(int_id, None)
+            raise RuntimeError(
+                f"lora id {{int_id}} is held by {{owner}}, so this container's cached copy of "
+                f"{{adapter_id}} cannot be re-established. redeploy under a different run id."
+            )
+
     @modal.method()
     async def register(self, record: dict[str, Any]) -> dict[str, Any]:
         try:
+            # A registration that finds the adapter already resident must still hold the claim,
+            # which the cache hit inside `_lora_request` skips. Ordered BEFORE the load so a
+            # genuine miss claims exactly once, in the one place that downloads.
+            if self._loaded.get(record["adapter_id"]) is not None:
+                await self._reclaim_lora_int_id(record["adapter_id"])
             await self._lora_request(record)
         except Exception as exc:  # a real load failure, reported as such
             return {{"ok": False, "failure": f"{{type(exc).__name__}}: {{exc}}"}}
@@ -1225,7 +1293,20 @@ def api():
     async def register_adapter(payload: dict[str, Any], request: Request) -> dict[str, Any]:
         _require_key(request)
         adapter_id = str(payload.get("adapter_id") or "").strip()
-        metadata = payload.get("metadata") or {{}}
+        # Type-checked, not just defaulted. `or {{}}` substitutes only the FALSY cases, so a truthy
+        # non-object -- a bare string, a nonempty list -- came through intact and the `.get` below
+        # raised AttributeError, answering 500 for a malformed body this endpoint already knows how
+        # to reject. That distinction is not cosmetic to the caller: the client treats 5xx as an
+        # ambiguous failure and retries after re-reading the record, while a 422 tells it the
+        # payload is wrong and to stop.
+        metadata = payload.get("metadata")
+        if metadata is None:
+            metadata = {{}}
+        if not isinstance(metadata, dict):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"metadata must be an object, got {{type(metadata).__name__}}",
+            )
         run_id = str(metadata.get("run_id") or "").strip()
         if not adapter_id or not run_id:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "adapter_id and run_id are required")
@@ -1631,6 +1712,21 @@ def api():
             for revision_id in disabled_revisions:
                 with contextlib.suppress(Exception):  # gpu eviction is best effort
                     await engine.unregister.remote.aio(revision_id)
+        else:
+            # The COLD counterpart, and it is not optional. `Engine.unregister` is the only
+            # successful-undeploy path that releases the durable `loraid:` claim, so skipping it
+            # when nothing is warm left the claim naming a revision that is `disabled` and resident
+            # nowhere -- forever. The id is a hash of the adapter id, so a later revision that
+            # collides on those 31 bits is then refused by a ghost, and repeated cold undeploys
+            # accumulate claims no engine will ever release.
+            #
+            # Done HERE rather than through a remote call because it is pure Dict work: releasing a
+            # claim touches no GPU, and routing it through `Engine` would boot the container the
+            # warm check just established is not running. `_release_lora_int_id` is already
+            # ownership-checked, so releasing a claim another adapter has since taken is a no-op.
+            for revision_id in disabled_revisions:
+                with contextlib.suppress(Exception):  # releasing is best effort, like eviction
+                    await _release_lora_int_id(_lora_int_id(revision_id), revision_id)
         # The deferred reclaims, run whether or not anything is warm. Unlike eviction, this has no
         # cheaper time to happen: undeploy is the last event in the run's life, so skipping here
         # leaves the directory on the volume for good. It is also bounded -- one `rmtree` per

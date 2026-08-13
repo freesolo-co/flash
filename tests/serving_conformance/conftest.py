@@ -98,20 +98,35 @@ def ready_timeout(request) -> float:
     return float(request.config.getoption("--conformance-ready-timeout"))
 
 
-@pytest.fixture(scope="session")
-def http(serving_url, internal_key):
-    """A client bound to the target, carrying the internal key exactly as flash sends it."""
-    # FAILS rather than skips. Reaching this fixture means the suite was explicitly enabled with
-    # --serving-url, and a skip there is a false green: pytest exits 0 having checked not one
-    # endpoint, which reads as "the backend conforms". The whole point of this suite is that its
-    # green means something.
+def _require_httpx() -> None:
+    """FAILS rather than skips.
+
+    Reaching a client fixture means the suite was explicitly enabled with --serving-url, and a skip
+    there is a false green: pytest exits 0 having checked not one endpoint, which reads as "the
+    backend conforms". The whole point of this suite is that its green means something.
+    """
     try:
-        import httpx
+        import httpx  # noqa: F401
     except ImportError as exc:
         pytest.fail(
             "the conformance suite needs httpx to talk to the backend, and it is not installed: "
             f"{exc}. install it with `pip install httpx`, or drop --serving-url to skip the suite."
         )
+
+
+def _build_client(serving_url, internal_key):
+    """One client shape for the whole suite, so no caller can drift from the shipped one.
+
+    Factored out rather than inlined in the `http` fixture because the concurrency test cannot use
+    that fixture: it is session-scoped and shared, and driving one client from two threads would
+    test httpx's connection pool as much as the backend's locking. Building its own was correct;
+    building a DIFFERENT one was not -- a bare client has neither `follow_redirects` nor the
+    key-stripping hook, so it failed a Modal backend on the 303 the real client follows, and would
+    have carried the plane credential across an off-origin redirect the fixture is careful to
+    strip.
+    """
+    import httpx
+
     headers = {"X-Freesolo-Internal-Key": internal_key} if internal_key else {}
 
     def _origin(url) -> tuple[str, str, int | None]:
@@ -133,14 +148,35 @@ def http(serving_url, internal_key):
     # delete with a 303 to a same-origin async-result poll url, and the shipped client follows it;
     # a suite that does not would see the bare 303 and fail a backend that `flash models deploy`
     # drives successfully -- the suite rejecting behavior the client handles.
-    with httpx.Client(
+    return httpx.Client(
         base_url=serving_url,
         headers=headers,
         timeout=120.0,
         follow_redirects=True,
         max_redirects=100,
         event_hooks={"request": [_strip_key_off_origin]},
-    ) as client:
+    )
+
+
+@pytest.fixture(scope="session")
+def serving_client_factory(serving_url, internal_key):
+    """Build a fresh client with the suite's shipped-client shape.
+
+    For the concurrency test, which needs one client per thread rather than the shared session one.
+    """
+    _require_httpx()
+
+    def _factory():
+        return _build_client(serving_url, internal_key)
+
+    return _factory
+
+
+@pytest.fixture(scope="session")
+def http(serving_url, internal_key):
+    """A client bound to the target, carrying the internal key exactly as flash sends it."""
+    _require_httpx()
+    with _build_client(serving_url, internal_key) as client:
         yield client
 
 

@@ -1416,6 +1416,11 @@ def test_undeploying_an_idle_run_does_not_cold_start_the_gpu(client):
     _register_and_ready(client)
     module = client.app.state.generated_module
     module.runners.count = 0
+    # Planted, because the fixture stubs `Engine.register` and the real claim is taken deep inside
+    # `Engine._lora_request` on the GPU side, which never runs here. Every adapter that has ever
+    # loaded holds one, so this is the ordinary state a cold undeploy meets -- and without it the
+    # assertion below would be checking for the absence of a key nothing ever wrote.
+    module.adapter_records[module._lora_id_key(module._lora_int_id(REVISION))] = REVISION
 
     response = client.delete(f"/adapters/{RUN_ID}")
     assert response.status_code == 200
@@ -1425,6 +1430,15 @@ def test_undeploying_an_idle_run_does_not_cold_start_the_gpu(client):
     assert module.unregistered == [], (
         "an idle deployment reached the engine to evict an adapter, so undeploy cold-started a "
         "GPU and paid for a weight load to remove something that was not resident"
+    )
+    # Skipping the GPU must not skip the CLAIM. `Engine.unregister` is the only successful-undeploy
+    # path that releases the durable `loraid:` entry, so a cold undeploy that only skipped eviction
+    # left the claim naming a revision that is disabled and resident nowhere -- permanently, since
+    # nothing else releases it. The id is a hash of the adapter id, so a later revision colliding on
+    # those 31 bits is then refused by a ghost.
+    assert module._lora_id_key(module._lora_int_id(REVISION)) not in module.adapter_records, (
+        "a cold undeploy left the lora int-id claim behind, so the id stays reserved by a disabled "
+        "revision no engine holds and a future colliding revision is refused by a ghost"
     )
 
 
@@ -1804,6 +1818,66 @@ def test_a_failed_load_does_not_release_a_claim_another_container_is_using(clien
     assert dict.get(module.adapter_records, key) == retried["adapter_id"], (
         "a failed load released the shared lora id claim while another container still had the "
         "adapter resident under it, leaving the id free for a colliding adapter to take"
+    )
+
+
+def test_releasing_a_peers_claim_never_vacates_the_key(client):
+    """A non-owner's release must not briefly empty the key a third adapter can claim.
+
+    `pop`-then-restore genuinely REMOVES the entry before putting it back, so the non-owner path
+    had a window in which the id was unowned. A third colliding adapter claiming inside it wins
+    with `skip_if_exists=True`, the restore then silently does nothing, and the resident owner has
+    permanently lost its claim -- while still being resident under that int. vLLM addresses a LoRA
+    only by the int, so the newcomer loading over it is the wrong-run's-weights outcome.
+
+    Reachable from the ORDINARY undeploy of a refused collider, which is the one caller guaranteed
+    to take the non-owner path. Simulated by claiming from inside `pop`, which is exactly where a
+    concurrent container's claim would land.
+    """
+    module = client.app.state.generated_module
+    resident = "run-resident@final." + "c" * 40
+    refused = "run-refused@final." + "d" * 40
+    newcomer = "run-newcomer@final." + "f" * 40
+    int_id = module._lora_int_id(resident)
+    key = module._lora_id_key(int_id)
+
+    records = module.adapter_records
+    dict.__setitem__(records, key, resident)
+
+    class _RacingDict(type(records)):
+        """Claims the id from another container the moment the key is vacated."""
+
+        @property
+        def pop(self):
+            outer = self
+
+            def _pop(popped_key, default=None):
+                value = dict.pop(outer, popped_key, default)
+                if popped_key == key and popped_key not in outer:
+                    # The window: a third adapter's atomic insert-if-absent, which SUCCEEDS only
+                    # because the key is momentarily absent.
+                    dict.__setitem__(outer, popped_key, newcomer)
+                return value
+
+            return _Aio(_pop)
+
+    racing = _RacingDict()
+    racing.update(records)
+    module.adapter_records = racing
+    try:
+        # `refused` collided with `resident` and never loaded, so undeploying it must not disturb
+        # the claim at all.
+        released = _run_awaitable_result(module._release_lora_int_id(int_id, refused))
+    finally:
+        restored = dict(racing)
+        records.clear()
+        records.update(restored)
+        module.adapter_records = records
+
+    assert released is False, "releasing a claim owned by a peer must report False"
+    assert dict.get(module.adapter_records, key) == resident, (
+        "a non-owner's release vacated the claim long enough for a third adapter to take it, so "
+        "the resident owner lost its id permanently while still holding the lora under that int"
     )
 
 
@@ -2813,6 +2887,17 @@ def test_provenance_must_agree_with_the_revision_id(client):
         client.post("/adapters", json={**REGISTRATION, "adapter_id": "not-a-revision"}).status_code
         == 422
     )
+    # `metadata` that is not an object is a client error too, not a crash. `payload.get(...) or {}`
+    # replaces only the FALSY cases, so a truthy non-object survived and the very next `.get` raised
+    # AttributeError -- a 500 for a request this endpoint has already decided how to reject. The
+    # difference matters to the client: it retries a 5xx as an ambiguous failure and re-reads the
+    # record, where a 422 tells it the payload is wrong and to stop.
+    for bad_metadata in ("run-abc", ["run-abc"], 7, True):
+        response = client.post("/adapters", json={**REGISTRATION, "metadata": bad_metadata})
+        assert response.status_code == 422, (
+            f"registration answered {response.status_code} for metadata={bad_metadata!r}; a "
+            "malformed body must be a client error, not an unhandled crash the client retries"
+        )
     # And the matching payload still registers.
     assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
 
@@ -2992,6 +3077,92 @@ def test_a_failed_reclaim_during_eviction_still_leaves_a_marker(client, engine, 
         "eviction swallowed a failed reclaim without marking it, so the download is orphaned: the "
         "record is already `disabled`, every later undeploy passes over it, and nothing collects "
         "the directory for the life of the app"
+    )
+
+
+def test_registering_an_already_resident_adapter_reestablishes_its_claim(
+    client, engine, monkeypatch
+):
+    """A cache hit during SETTLE must not report ready while holding no claim.
+
+    `Engine` scales horizontally and undeploy's eviction is ONE remote call, which Modal routes to
+    ONE replica. So two replicas can both hold a revision resident, undeploy lands on A and
+    releases the durable claim, and a redeploy whose settle lands on B returns B's cached entry
+    without ever calling `_claim_lora_int_id`. The record goes `ready` with the int id unclaimed --
+    and the claim is exactly what refuses a colliding revision, so the next id-collider loads and
+    two `ready` adapters contend for one vLLM slot.
+
+    Driven against the real `Engine.register` because the fixture stubs that whole method, which is
+    where the reclaim lives.
+    """
+    module = client.app.state.generated_module
+    int_id = module._lora_int_id(REVISION)
+    # `_lora_request` imports LoRARequest at its top, before the cache hit returns, so the import
+    # has to resolve even on the branch that never constructs one.
+    vllm_lora = types.ModuleType("vllm.lora.request")
+    vllm_lora.LoRARequest = lambda *a, **k: types.SimpleNamespace(args=a)
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", vllm_lora)
+    instance = engine.__new__(engine)
+    instance._locks = {}
+    # Replica B's state: resident from an earlier deploy, with the claim already released by the
+    # undeploy that landed on replica A.
+    instance._loaded = {REVISION: object()}
+    instance._int_ids = {int_id: REVISION}
+    assert module._lora_id_key(int_id) not in module.adapter_records
+
+    result = _run_awaitable_result(
+        engine.register(instance, {**REGISTRATION, "adapter_id": REVISION})
+    )
+
+    assert result == {"ok": True}, f"a resident adapter failed to re-register: {result}"
+    assert module.adapter_records.get(module._lora_id_key(int_id)) == REVISION, (
+        "settle hit this replica's warm cache and answered ok without re-claiming the lora int "
+        "id, so the record reads `ready` while the id is unowned and a colliding revision can "
+        "take it and load alongside"
+    )
+
+
+def test_a_resident_adapter_whose_id_was_taken_refuses_and_evicts_itself(client, engine):
+    """The reclaim must lose loudly, and must not leave the intruder resident.
+
+    If a colliding adapter took the id while this replica was idle, this container's cached copy is
+    the one sitting under somebody else's claim. Answering ok would route generates to it; keeping
+    it in `_loaded` while refusing would leave the next generate doing the same. So the cache entry
+    is dropped and the id evicted, which returns this replica to what a cold one would have been.
+    """
+    module = client.app.state.generated_module
+    int_id = module._lora_int_id(REVISION)
+    collider = "run-other@final." + "b" * 40
+    module.adapter_records[module._lora_id_key(int_id)] = collider
+
+    removed: list[int] = []
+
+    async def _remove_lora(value):
+        removed.append(value)
+
+    instance = engine.__new__(engine)
+    instance._locks = {}
+    instance._loaded = {REVISION: object()}
+    instance._int_ids = {int_id: REVISION}
+    instance.engine = types.SimpleNamespace(remove_lora=_remove_lora)
+
+    result = _run_awaitable_result(
+        engine.register(instance, {**REGISTRATION, "adapter_id": REVISION})
+    )
+
+    assert result["ok"] is False, "a cached adapter whose id another run now owns reported ready"
+    assert collider in result["failure"], (
+        f"the failure must name the holder so the operator can redeploy: {result['failure']}"
+    )
+    assert REVISION not in instance._loaded, (
+        "the refused adapter stayed in `_loaded`, so the next generate still answers from a copy "
+        "sitting under another run's claim"
+    )
+    assert removed == [int_id], f"the intruding lora was not evicted from vllm: {removed}"
+    assert module.adapter_records[module._lora_id_key(int_id)] == collider, (
+        "re-claiming clobbered the rightful holder's claim"
     )
 
 

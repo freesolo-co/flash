@@ -15,11 +15,12 @@ one implementation of it.
 
 from __future__ import annotations
 
-import contextlib
 import inspect
 import json
 import re
 import time
+import types
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +34,16 @@ REQUIRED_CAPABILITIES = {"immutable_adapter_revisions", "alias_compare_and_swap"
 # and asserted against the real value in `test_the_per_request_cap_still_matches_the_client`, so
 # the copy cannot drift into passing backends the client would time out on.
 _CLIENT_REQUEST_TIMEOUT_CAP = 60.0
+
+# The readiness backoff the client actually uses: `_readback_delay` starts at
+# READBACK_DELAY_SECONDS and doubles, but caps EVERY delay -- including one taken from a
+# `Retry-After` header -- at READBACK_MAX_DELAY_SECONDS. Mirrored here for the same reason as the
+# timeout cap, and guarded the same way by `test_the_readiness_backoff_still_matches_the_client`:
+# a suite that sleeps longer than the client polls fewer times inside one budget, so a revision the
+# client would have seen go ready near the end of its window is missed here and a conforming
+# backend fails.
+_CLIENT_READBACK_BASE_DELAY = 0.5
+_CLIENT_READBACK_MAX_DELAY = 2.0
 
 # Echoed back verbatim on read-back; the client compares each one to decide whether a revision id
 # still names the artifact it registered.
@@ -126,6 +137,25 @@ def _register(http, body: dict):
     return response
 
 
+def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
+    """`flash/serve/deploy.py:_readback_delay`, mirrored.
+
+    Same two rules as the original: a usable `Retry-After` wins over the backoff, and BOTH are
+    clamped to the same ceiling. The clamp on the header is the part that is easy to drop and the
+    part that matters -- a backend answering `Retry-After: 30` would otherwise get 30s of silence
+    here and 2s from the client.
+    """
+    if retry_after is not None:
+        try:
+            delay = float(retry_after)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if delay > 0 and delay == delay and delay != float("inf"):
+                return min(delay, _CLIENT_READBACK_MAX_DELAY)
+    return min(_CLIENT_READBACK_BASE_DELAY * (2**attempt), _CLIENT_READBACK_MAX_DELAY)
+
+
 def _wait_ready(http, revision: str, timeout: float) -> dict:
     """Poll to a settled state, honoring Retry-After exactly as the client does.
 
@@ -140,17 +170,51 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
     the budget alone is not what the client allows: `_serving_request` clamps whatever it is handed
     to 60s. Passing the full remaining budget here would accept a backend whose read-back takes 90s
     -- inside the suite's overall budget, but past what every real poll permits.
+
+    A request that times out is RETRIED, not raised, which is the other half of matching the
+    client: `_wait_revision_ready` re-raises only a `status_code < 500`, and a transport timeout
+    carries no status at all, so it falls through to the retry. Letting httpx's exception escape
+    here would fail conformance for a backend `flash models deploy` handles -- and on a
+    scale-to-zero app the first read-back is exactly where a cold start makes one poll exceed 60s
+    and the next answer immediately. The overall deadline is what ends the wait, not any single
+    slow read.
+
+    The BACKOFF mirrors `_readback_delay` rather than inventing its own, and the ceiling is the
+    part that matters. The client caps every readiness delay at 2s -- including one it took from a
+    `Retry-After` header, which it clamps rather than obeys. Sleeping the header's value here (up
+    to 30s, growing to 15s on the fallback) makes this suite poll far fewer times inside the same
+    budget, so a revision that goes ready near the end of the window is seen by a real deploy and
+    missed here: conformance fails a backend that works. Honoring `Retry-After` at all is still
+    right, since it is what the client reads; honoring it UNCAPPED is what was wrong.
     """
+    # Imported here, not at module scope, matching the rest of the suite: httpx is only needed on
+    # the paths that talk to a backend, and a hard import would break collection wherever the
+    # `--serving-url` tests are skipped anyway.
+    import httpx
+
     deadline = time.monotonic() + timeout
-    delay = 1.0
+    attempt = 0
+    delay = _CLIENT_READBACK_BASE_DELAY
+    # Reset every pass rather than carried: a 404 read-back sets no header, and the client likewise
+    # re-reads it from the response it just got instead of reusing a previous poll's value.
+    retry_after: str | None = None
     last = "registered"
     while True:
+        retry_after = None
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        response = http.get(
-            f"/adapters/{revision}", timeout=min(_CLIENT_REQUEST_TIMEOUT_CAP, remaining)
-        )
+        try:
+            response = http.get(
+                f"/adapters/{revision}", timeout=min(_CLIENT_REQUEST_TIMEOUT_CAP, remaining)
+            )
+        except httpx.TimeoutException:
+            # Transient by the client's own rules. Backing off rather than hammering a backend that
+            # is plainly still warming up.
+            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            attempt += 1
+            delay = _readback_delay(attempt)
+            continue
         if deadline - time.monotonic() <= 0:
             # Completed, but not in time. Not honored, for the same reason the client does not.
             break
@@ -166,11 +230,9 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
             if last == "ready":
                 return record
             retry_after = response.headers.get("Retry-After")
-            if retry_after:
-                with contextlib.suppress(ValueError):
-                    delay = max(0.5, min(float(retry_after), 30.0))
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
-        delay = min(delay * 2, 15.0)
+        attempt += 1
+        delay = _readback_delay(attempt, retry_after)
     pytest.fail(
         f"revision {revision} never reached ready within {timeout}s (last state {last!r}). "
         "a read-back that only completes after the budget is spent does not count: the client "
@@ -223,6 +285,61 @@ def test_the_per_request_cap_still_matches_the_client():
         f"by {_CLIENT_REQUEST_TIMEOUT_CAP}s. a suite that allows longer than the client passes "
         f"backends whose read-backs time out on every real deploy"
     )
+
+
+def test_the_readiness_backoff_still_matches_the_client():
+    """The mirrored polling delays must not drift either, and the CEILING is what matters.
+
+    Same reasoning as the per-request cap, and the same failure shape in reverse: a suite that
+    sleeps LONGER than the client polls fewer times inside one budget, so a revision the client
+    would have caught going ready near the end of its window is missed here and a working backend
+    fails conformance. The `Retry-After` clamp is the specific value worth pinning -- the client
+    treats that header as an upper hint it may shorten, not as an instruction, and a suite that
+    obeys it verbatim hands a slow backend the power to make itself untestable.
+
+    Takes no fixtures, for the same reason as the cap guard: it must run in CI, where no
+    `--serving-url` is set and every live test skips.
+    """
+    from flash.serve import deploy
+
+    # Read out of the SOURCE, not off the module. `tests/conftest.py` installs an autouse fixture
+    # that zeroes these very constants so the offline suite does not sleep, so a runtime attribute
+    # read here would compare against 0.0 and assert on the test harness rather than on what flash
+    # ships. The cap guard reads source for the same reason -- there the clamp is a literal.
+    source = Path(deploy.__file__).read_text()
+    shipped = {}
+    for name in ("READBACK_DELAY_SECONDS", "READBACK_MAX_DELAY_SECONDS"):
+        found = re.search(rf"^{name} = ([0-9.]+)$", source, re.MULTILINE)
+        assert found, (
+            f"could not find `{name}` in flash/serve/deploy.py; this suite's mirrored readiness "
+            f"backoff can no longer be checked against the client and may be silently wrong"
+        )
+        shipped[name] = float(found.group(1))
+
+    assert shipped["READBACK_MAX_DELAY_SECONDS"] == _CLIENT_READBACK_MAX_DELAY, (
+        f"the client now caps readiness delays at {shipped['READBACK_MAX_DELAY_SECONDS']}s but "
+        f"this suite still uses {_CLIENT_READBACK_MAX_DELAY}s. a suite that waits longer than the "
+        f"client polls fewer times in the same budget and fails backends the client accepts"
+    )
+    assert shipped["READBACK_DELAY_SECONDS"] == _CLIENT_READBACK_BASE_DELAY, (
+        f"the client's readiness backoff now starts at {shipped['READBACK_DELAY_SECONDS']}s but "
+        f"this suite still starts at {_CLIENT_READBACK_BASE_DELAY}s"
+    )
+    # The mirrored helper must also AGREE with the real one, not merely share its constants: the
+    # clamp on `Retry-After` lives in the code, not in a constant, and dropping it would leave both
+    # assertions above passing. Compared against a copy of `_readback_delay` rebound to the SHIPPED
+    # constants, since the live one is running under the zeroing fixture too.
+    client_delay = types.FunctionType(
+        deploy._readback_delay.__code__,
+        {**deploy._readback_delay.__globals__, **shipped},
+        deploy._readback_delay.__name__,
+        deploy._readback_delay.__defaults__,
+    )
+    for attempt, retry_after in ((0, None), (3, None), (9, None), (0, "30"), (0, "0.5"), (1, "x")):
+        assert _readback_delay(attempt, retry_after) == client_delay(attempt, retry_after), (
+            f"the mirrored readiness backoff disagrees with the client for "
+            f"attempt={attempt} retry_after={retry_after!r}"
+        )
 
 
 def test_healthz_advertises_the_required_capabilities(http):
@@ -421,8 +538,64 @@ def test_a_stale_compare_and_swap_is_rejected(http, deployed):
     )
 
 
+def test_a_non_null_expectation_replaces_the_live_revision(
+    http, adapter_source, run_id, ready_timeout
+):
+    """The upgrade path: activating step-20 while naming step-10 as the expectation.
+
+    Every activation test above passes `expected_adapter_revision: None`, which is only what the
+    FIRST deploy of a run sends. On every subsequent deploy the managed plane computes the alias's
+    live revision (`flash/server/routes/serving.py:_activation_predecessor`) and sends THAT, and
+    the client then verifies the response echoes it back as `previous_adapter_revision`. So a
+    backend that implements only the null expectation -- treating any non-null value as a mismatch,
+    or ignoring it and answering `null` -- passed this entire suite and then failed every
+    checkpoint upgrade its users attempted. That is precisely the class of gap conformance exists
+    to close, and no null-expectation test can reach it.
+
+    Asserts the two things the client genuinely acts on: the 200 with the correct
+    `previous_adapter_revision` (mismatched, it raises `mismatched previous alias revision`), and
+    the alias record actually moving, since a backend could echo the right provenance while
+    leaving the alias where it was.
+    """
+    first = _registration(run_id, adapter_source, step=10)
+    second = _registration(run_id, adapter_source, step=20)
+    for body in (first, second):
+        _register(http, body)
+        _wait_ready(http, body["adapter_id"], ready_timeout)
+
+    assert _activate(http, first["adapter_id"], None).status_code == 200, (
+        "the initial null-expectation activation must succeed before the upgrade can be tested"
+    )
+
+    response = _activate(http, second["adapter_id"], first["adapter_id"])
+    assert response.status_code == 200, (
+        f"activating {second['adapter_id']} with {first['adapter_id']} as the expectation returned "
+        f"{response.status_code}: {response.text[:400]}. this is the ordinary upgrade path -- "
+        f"every deploy after a run's first one names the live revision as its expectation, so a "
+        f"backend that rejects it cannot serve a second checkpoint"
+    )
+    payload = response.json()
+    assert payload.get("previous_adapter_revision") == first["adapter_id"], (
+        f"activation echoed previous_adapter_revision="
+        f"{payload.get('previous_adapter_revision')!r}, expected {first['adapter_id']!r}; the "
+        f"client fails the deploy on exactly this comparison"
+    )
+    assert payload.get("target_adapter_revision") == second["adapter_id"], (
+        f"activation echoed target_adapter_revision={payload.get('target_adapter_revision')!r}, "
+        f"expected {second['adapter_id']!r}"
+    )
+
+    alias = _record(http.get(f"/adapters/{run_id}").json())
+    metadata = alias.get("metadata") if isinstance(alias.get("metadata"), dict) else {}
+    assert metadata.get("alias_of") == second["adapter_id"], (
+        f"the activation reported success but the alias still names "
+        f"{metadata.get('alias_of')!r}; a backend that returns the right provenance without "
+        f"moving the alias serves the OLD checkpoint to every request after an upgrade"
+    )
+
+
 def test_concurrent_activations_of_one_alias_leave_exactly_one_winner(
-    http, serving_url, internal_key, adapter_source, run_id, ready_timeout
+    http, serving_client_factory, adapter_source, run_id, ready_timeout
 ):
     """`alias_compare_and_swap` is an ATOMICITY claim, and only concurrency can test it.
 
@@ -438,8 +611,6 @@ def test_concurrent_activations_of_one_alias_leave_exactly_one_winner(
     """
     import concurrent.futures
 
-    import httpx
-
     first = _registration(run_id, adapter_source, step=10)
     second = _registration(run_id, adapter_source, step=20)
     try:
@@ -447,10 +618,13 @@ def test_concurrent_activations_of_one_alias_leave_exactly_one_winner(
             _register(http, body)
             _wait_ready(http, body["adapter_id"], ready_timeout)
 
-        headers = {"X-Freesolo-Internal-Key": internal_key} if internal_key else {}
-
         def activate(revision: str) -> int:
-            with httpx.Client(base_url=serving_url, timeout=60.0, headers=headers) as client:
+            # One client PER THREAD, but built by the same factory the `http` fixture uses. A
+            # thread needs its own so the test measures the backend's locking rather than httpx's
+            # connection pool; it needs the factory's shape so a Modal 303 is followed and the
+            # internal key is stripped across an off-origin redirect, exactly as a real deploy
+            # does.
+            with serving_client_factory() as client:
                 response = client.post(
                     f"/adapters/{revision}/activate",
                     json={"expected_adapter_revision": None},
