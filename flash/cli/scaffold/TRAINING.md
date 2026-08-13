@@ -1240,8 +1240,13 @@ for message in messages[:-1]:
         state = self.apply(state, m.group(1))
 ```
 
-A demo written in prose does not match, and a real action always does. That property holds no
-matter what Flash puts in front of your prompt.
+A demo written in prose does not match, and a real action does, whatever Flash puts in front of
+your prompt. That is the property a count cannot give you. Two limits to be honest about: a
+demo written in your _own_ action syntax is indistinguishable from a move, so write demos in
+prose or a visibly different form; and an anchored pattern like the one above will not match an
+action buried in surrounding reasoning, which drops that turn silently. If your models emit
+reasoning around their actions, search rather than anchor, and prefer failing loudly on an
+assistant turn that parses to nothing over skipping it.
 
 Either shape rebuilds state from the actions alone, which is right when your observations are a
 deterministic function of them. If an observation carries information the actions do not (a
@@ -1270,9 +1275,10 @@ trajectories ran the full turn cap and scored 0.60-0.65 instead of 1.0.
 The usual checks do not catch this. `flash env test` does not require a gold trajectory to
 terminate or to score well; it checks that your hooks run to completion and returns finite
 rewards. Its blocking reward gate is narrow by design: it fires only for GRPO, and only when
-**every** replayed gold episode scores exactly zero, no per-turn signal separates them, and a
-deliberately wrong answer scores at least as well. A gold episode collecting partial credit
-never reaches that comparison, so `overall: PASS` is expected here rather than surprising.
+**every** replayed gold episode scores exactly zero, and then, probing the first of those
+episodes, no per-turn signal separates it and a deliberately wrong answer scores at least as
+well. A single gold episode collecting partial credit stops the gate before it ever reaches
+that comparison, so `overall: PASS` is expected here rather than surprising.
 Your own tests can miss it from the other side: one that calls `step_episode` directly with
 `messages[:-1]` is exercising a call shape the trainer never produces.
 
