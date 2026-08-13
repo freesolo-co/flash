@@ -1211,34 +1211,44 @@ list. The two arguments describe one action, not two.
 So a replaying environment must stop before the final message, and take the newest action
 from `assistant_response`:
 
+The simplest environment to get right is one whose opening prompt contains no assistant
+message at all. Then every assistant message in the transcript is a real action, and the only
+bound you need is the newest turn:
+
 ```python
 def step_episode(self, example, messages, assistant_response):
     state = self.initial_state(example)
-    # skip the opening prompt: only turns AFTER it are actions the model took.
-    # `start_episode` messages are seeded into the transcript before the first turn,
-    # so an assistant-role few-shot demo in there is NOT an action -- replaying it
-    # would apply a worked example to the real state.
-    seeded = len(self.start_episode(example, ""))
     # every assistant turn EXCEPT the newest: messages[-1] is assistant_response
-    for message in messages[seeded:-1]:
+    for message in messages[:-1]:
         if message["role"] == "assistant":
             state = self.apply(state, message["content"])
     state = self.apply(state, assistant_response)  # the newest action, exactly once
     ...
 ```
 
-Both bounds matter, for different reasons. The `[:-1]` keeps you from applying the newest
-action twice. The `seeded` offset keeps you from applying your own prompt as if the model had
-played it: `messages` begins as a copy of what `start_episode` returned, so anything
-assistant-role in your opening prompt (a worked example, a demonstration turn) is sitting in
-the transcript looking exactly like a move. If your `start_episode` never emits an assistant
-message, the offset is a no-op and you can drop it; write it down anyway, because adding one
-demo later would otherwise silently corrupt every episode.
+If your `start_episode` **does** seed an assistant message (a worked example, a demonstration
+turn), that message is sitting in `messages` looking exactly like a move, and the loop above
+would apply your own demo to the real state. Do not try to fix this by recomputing the prompt
+length: Flash may prepend a system message carrying the training contract, so
+`len(self.start_episode(...))` can be one short of the real prefix, and the offset silently
+leaks the demo back in. Mark your own actions instead, so the boundary is carried by the data
+rather than by a count that has to stay in sync:
 
-That shape rebuilds state from the actions alone, which is right when your observations are a
+```python
+ACTION = re.compile(r"^<move>(.*)</move>$", re.DOTALL)  # your own action syntax
+
+for message in messages[:-1]:
+    if message["role"] == "assistant" and (m := ACTION.match(message["content"].strip())):
+        state = self.apply(state, m.group(1))
+```
+
+A demo written in prose does not match, and a real action always does. That property holds no
+matter what Flash puts in front of your prompt.
+
+Either shape rebuilds state from the actions alone, which is right when your observations are a
 deterministic function of them. If an observation carries information the actions do not (a
 sampled outcome, a tool result, anything external), replay it too: iterate the same
-`messages[seeded:-1]` and branch on `message["role"]` so both the actions and the state-bearing
+`messages[:-1]` and branch on `message["role"]` so both the actions and the state-bearing
 observations are folded back in.
 
 Replaying all of `messages` and then applying `assistant_response` again applies the **newest**
