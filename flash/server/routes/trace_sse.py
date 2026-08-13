@@ -99,15 +99,12 @@ class SseDoneGate:
                 self._line_start = 0
                 self._scan_start = 0
             elif not _is_data_field(content) and len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
-                if self._line_start < len(self._buffer):
-                    forwarded.extend(self._buffer[: self._line_start])
-                    del self._buffer[: self._line_start]
-                    self._line_start = 0
-                    self._scan_start = 0
-                    self._holding_done_candidate = False
-                    continue
-                self._settle_bounded_done()
-                return [bytes(forwarded)] if forwarded else []
+                forwarded.extend(self._buffer[: self._line_start])
+                del self._buffer[: self._line_start]
+                self._line_start = 0
+                self._scan_start = 0
+                self._holding_done_candidate = False
+                continue
 
         if self._holding_done_candidate:
             partial_line = bytes(self._buffer[self._line_start :])
@@ -184,15 +181,6 @@ class SseDoneGate:
         self._partial_line_in_progress = False
         self._holding_done_candidate = False
         return [forwarded] if forwarded else []
-
-    def _settle_bounded_done(self) -> None:
-        self.done_event = bytes(self._buffer[: min(self._line_start, _POST_DONE_SUFFIX_LIMIT)])
-        self._buffer.clear()
-        self._line_start = 0
-        self._scan_start = 0
-        self._event_in_progress = False
-        self._partial_line_in_progress = False
-        self._holding_done_candidate = False
 
 
 def _is_data_field(line: bytes) -> bool:

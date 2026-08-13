@@ -104,6 +104,31 @@ _JSON_SCHEMA_KEYWORDS = _JSON_SCHEMA_STRUCTURAL_KEYWORDS | _JSON_SCHEMA_ANNOTATI
 _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS = frozenset(
     {"default", "const", "enum", "examples", "example"}
 )
+_JSON_SCHEMA_PROPERTY_MAP_KEYWORDS = frozenset({"properties", "$defs", "definitions"})
+_JSON_SCHEMA_VALUE_KEYWORDS = frozenset(
+    {
+        "items",
+        "additionalItems",
+        "contains",
+        "not",
+        "additionalProperties",
+        "propertyNames",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "if",
+        "then",
+        "else",
+        "contentSchema",
+        "prefixItems",
+        "anyOf",
+        "allOf",
+        "oneOf",
+    }
+)
+_JSON_SCHEMA_WRAPPER_KEYS = frozenset({"schema", "parameters", "input_schema", "output_schema"})
+_JSON_SCHEMA_TYPES = frozenset(
+    {"null", "boolean", "object", "array", "number", "string", "integer"}
+)
 
 
 @dataclass
@@ -133,6 +158,59 @@ def _is_schema_definition(value: Any) -> bool:
     if any(key in _JSON_SCHEMA_STRUCTURAL_KEYWORDS for key in keys):
         return True
     return bool(keys) and all(key in _JSON_SCHEMA_KEYWORDS for key in keys)
+
+
+def _has_schema_context(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if isinstance(value.get("$schema"), str) or isinstance(value.get("$id"), str):
+        return True
+    property_maps = [
+        value[keyword]
+        for keyword in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS
+        if isinstance(value.get(keyword), dict)
+    ]
+    property_maps_are_schemas = all(
+        all(_is_unambiguous_schema_definition(item) for item in property_map.values())
+        for property_map in property_maps
+    )
+    schema_type = value.get("type")
+    if (
+        isinstance(schema_type, str)
+        and schema_type in _JSON_SCHEMA_TYPES
+        and property_maps_are_schemas
+    ):
+        return True
+    if (
+        isinstance(schema_type, list)
+        and schema_type
+        and all(isinstance(item, str) and item in _JSON_SCHEMA_TYPES for item in schema_type)
+        and property_maps_are_schemas
+    ):
+        return True
+    return bool(property_maps) and property_maps_are_schemas
+
+
+def _is_unambiguous_schema_definition(value: Any) -> bool:
+    if isinstance(value, bool):
+        return True
+    if not isinstance(value, dict):
+        return False
+    keys = [key for key in value if not (isinstance(key, str) and key.startswith("x-"))]
+    if not keys:
+        return True
+    if any(key not in _JSON_SCHEMA_KEYWORDS for key in keys):
+        return False
+    schema_type = value.get("type")
+    if schema_type is None:
+        return True
+    if isinstance(schema_type, str):
+        return schema_type in _JSON_SCHEMA_TYPES
+    return (
+        isinstance(schema_type, list)
+        and bool(schema_type)
+        and all(isinstance(item, str) and item in _JSON_SCHEMA_TYPES for item in schema_type)
+    )
 
 
 def _redact_schema_literal(value: Any, *, depth: int, flag: _SanitizationFlag | None = None) -> Any:
@@ -290,12 +368,12 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
                     if resource_path is not None:
                         resource_ref = f"#{fragment}"
                         if keyword == "$recursiveRef" and resource_ref == "#":
-                            pointers = anchors.get("", frozenset({resource_path}))
-                            found.update(
+                            pointers = frozenset(
                                 pointer
-                                for pointer in pointers
+                                for pointer in anchors.get("", frozenset())
                                 if anchor_belongs_to_resource(pointer, canonical_base)
                             )
+                            found.update(pointers or {resource_path})
                         else:
                             pointers = _local_schema_pointer(resource_ref, anchors)
                             if resource_ref == "#" or resource_ref.startswith("#/"):
@@ -370,6 +448,7 @@ def _redact_secret_fields(
     *,
     depth: int = 0,
     schema_property_map: bool = False,
+    schema_context: bool = False,
     secret_schema_definition: bool = False,
     response_root: bool = False,
     choice_list: bool = False,
@@ -385,14 +464,17 @@ def _redact_secret_fields(
             flag.hit = True
         return "[redacted]"
     if isinstance(value, dict):
+        schema_context = schema_context or _has_schema_context(value)
         local_secret_schema_refs = {
             (*schema_definition_path, *pointer)
             for pointer in _secret_schema_definition_refs(value, depth=depth)
         }
         active_secret_schema_refs = (secret_schema_refs or set()) | local_secret_schema_refs
-        secret_schema_definition = secret_schema_definition or (
-            schema_definition_path in active_secret_schema_refs
-        )
+        referenced_schema_definition = schema_definition_path in active_secret_schema_refs
+        if schema_definition_path and isinstance(value.get("$id"), str):
+            secret_schema_definition = referenced_schema_definition
+        else:
+            secret_schema_definition = secret_schema_definition or referenced_schema_definition
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
             schema_definition = schema_property_map and _is_schema_definition(item)
@@ -403,12 +485,23 @@ def _redact_secret_fields(
             elif _is_secret_key(key, allow_token=logprob_entries) and not schema_definition:
                 redacted[key] = "[redacted]"
             else:
+                child_schema_context = schema_context and (
+                    key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS
+                    or key in _JSON_SCHEMA_VALUE_KEYWORDS
+                    or schema_property_map
+                    or key in _JSON_SCHEMA_KEYWORDS
+                )
+                if key in _JSON_SCHEMA_WRAPPER_KEYS and _has_schema_context(item):
+                    child_schema_context = True
                 redacted[key] = _redact_secret_fields(
                     item,
                     depth=depth + 1,
                     schema_property_map=(
-                        key in {"properties", "$defs", "definitions"} and isinstance(item, dict)
+                        schema_context
+                        and key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS
+                        and isinstance(item, dict)
                     ),
+                    schema_context=child_schema_context,
                     secret_schema_definition=secret_schema_definition
                     or (schema_definition and _is_secret_key(key))
                     or referenced_secret_definition,
@@ -429,6 +522,7 @@ def _redact_secret_fields(
                 item,
                 depth=depth + 1,
                 schema_property_map=schema_property_map,
+                schema_context=schema_context,
                 secret_schema_definition=(
                     secret_schema_definition
                     or (*schema_definition_path, str(index)) in (secret_schema_refs or set())

@@ -971,21 +971,21 @@ def test_done_gate_relays_a_multiline_done_event_whole(chunks: list[bytes]) -> N
     assert gate._buffer == b""
 
 
-def test_done_gate_bounds_an_undelimited_multiline_post_done_suffix() -> None:
-    """The suffix bound counts the retained terminator too. A genuine terminator event can carry
-    endless non-data continuation lines without a blank delimiter, so the whole held event must stay
-    bounded rather than counting only the unparsed tail."""
+def test_done_gate_releases_an_undelimited_multiline_post_done_suffix() -> None:
+    """The suffix bound counts the retained terminator too. Once an undelimited event exceeds it,
+    the candidate must be released rather than settled because a later data line can still change it."""
 
     gate = trace_sse.SseDoneGate()
 
     assert gate.feed(b"data: [DONE]\n") == []
+    forwarded = []
     for _ in range(5_000):
-        assert gate.feed(b": keepalive\n") == []
+        forwarded.extend(gate.feed(b": keepalive\n"))
 
-    assert gate.terminated is True
+    assert gate.terminated is False
     assert gate._buffer == b""
-    assert gate.done_event is not None
-    assert len(gate.done_event) <= trace_sse._POST_DONE_SUFFIX_LIMIT
+    assert gate.done_event is None
+    assert b"".join(forwarded).startswith(b"data: [DONE]\n")
 
 
 def test_done_gate_releases_a_large_second_data_line_and_later_events() -> None:
@@ -1047,6 +1047,25 @@ def test_done_gate_releases_oversized_closed_comment_before_later_data() -> None
     assert accumulator.received is False
     assert accumulator.output()["choices"] == []
     assert accumulator.defect == "stream contained an unparseable data event"
+
+
+def test_done_gate_releases_oversized_closed_comment_across_chunks() -> None:
+    chunk1 = b"data: [DONE]\n:" + b"x" * 1_200 + b"\n"
+    chunk2 = b'data: {"choices":[{"index":0,"delta":{"content":"AFTER"}}]}\n\ndata: [DONE]\n\n'
+    gate = trace_sse.SseDoneGate()
+    accumulator = trace_sse.SseAccumulator()
+
+    relayed = gate.feed(chunk1)
+    assert gate.terminated is False
+    relayed.extend(gate.feed(chunk2))
+    relayed.extend(gate.finish())
+    accumulator.feed(chunk1)
+    accumulator.feed(chunk2)
+    accumulator.finish()
+
+    assert b"".join(relayed) + (gate.done_event or b"") == chunk1 + chunk2
+    assert b"AFTER" in b"".join(relayed)
+    assert gate.terminated is accumulator._done
 
 
 def test_done_gate_releases_oversized_partial_comment_before_later_data() -> None:
@@ -3771,6 +3790,33 @@ def test_an_empty_schema_under_a_secret_name_survives_redaction(trace_api, monke
     assert stored["tools"][0]["function"]["parameters"]["properties"]["password"] == {}
 
 
+@pytest.mark.parametrize("container", ["properties", "$defs", "definitions"])
+def test_schema_container_names_do_not_exempt_instance_secrets(container: str) -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "password": {"type": "string", "default": "SECRET"},
+        },
+    }
+    instance = {container: {"password": {"type": "text", "value": "SECRET"}}}
+    nested_instance = {"metadata": instance}
+    typed_extension = {"type": "object", **instance}
+    direct = {"password": {"type": "text", "value": "SECRET"}}
+
+    stored_schema = traces._redact_secret_fields(schema)
+
+    assert stored_schema["properties"]["password"] == {
+        "type": "string",
+        "default": "[redacted]",
+    }
+    assert traces._redact_secret_fields(instance)[container]["password"] == "[redacted]"
+    assert traces._redact_secret_fields(nested_instance)["metadata"][container]["password"] == (
+        "[redacted]"
+    )
+    assert traces._redact_secret_fields(typed_extension)[container]["password"] == "[redacted]"
+    assert traces._redact_secret_fields(direct)["password"] == "[redacted]"
+
+
 @pytest.mark.parametrize("keyword", ["default", "examples", "example"])
 def test_annotation_only_secret_named_schema_stays_schema_shaped(keyword: str) -> None:
     literal = ["SECRET"] if keyword == "examples" else "SECRET"
@@ -4260,6 +4306,26 @@ def test_secret_schema_recursive_ref_redacts_recursive_anchor_root() -> None:
     assert "$recursiveAnchor" in trace_redaction._JSON_SCHEMA_STRUCTURAL_KEYWORDS
     assert stored["default"] == "[redacted]"
     assert stored["properties"]["password"] == {"$recursiveRef": "#"}
+
+
+def test_recursive_ref_without_local_anchor_falls_back_to_resource_root() -> None:
+    schema = {
+        "type": "object",
+        "default": "ROOT-SECRET",
+        "properties": {"password": {"$recursiveRef": "#"}},
+        "$defs": {
+            "Sibling": {
+                "$id": "https://example.com/sibling",
+                "$recursiveAnchor": True,
+                "default": "SIBLING-PUBLIC",
+            }
+        },
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["default"] == "[redacted]"
+    assert stored["$defs"]["Sibling"]["default"] == "SIBLING-PUBLIC"
 
 
 def test_secret_schema_dynamic_ref_literals_are_redacted(trace_api, monkeypatch) -> None:
