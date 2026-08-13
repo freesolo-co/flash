@@ -1237,11 +1237,16 @@ Parse the transcript instead, and parse it the same way on both paths:
 ```python
 ACTION = re.compile(r"<move>(.*?)</move>", re.DOTALL)  # your own action syntax
 
+# True if your prompt pre-opens the reasoning block, so the model never emits <think>
+PROMPT_OPENS_THINKING = False
+
 
 def answer_of(content: str) -> str:
     """The committed answer: everything after reasoning, or "" if reasoning never closed."""
     if "</think>" in content:
         return content.rsplit("</think>", 1)[1]
+    if PROMPT_OPENS_THINKING:  # tagless: the whole turn is unfinished reasoning
+        return ""
     return "" if "<think>" in content else content
 
 
@@ -1268,9 +1273,14 @@ replayed as history on every later call.
 
 `answer_of` above mirrors how Flash itself splits a turn for grading: the **last** `</think>`
 wins, and a turn truncated before its closing tag yields no answer at all, so unfinished
-reasoning raises here rather than being mined for an action the model never committed to. If
-your prompt pre-opens the reasoning block, the turn arrives with a closing tag and no opener,
-which this handles as written.
+reasoning raises here rather than being mined for an action the model never committed to.
+
+The tagless case is the one that needs your input. A turn cut off mid-reasoning has no
+`</think>`, and whether it also has an opening `<think>` depends on who wrote it: a model that
+opens its own block leaves the tag in the text, while a prompt that pre-opens the block does
+not, so the truncated turn carries no tag at all and is indistinguishable from a plain answer
+by inspection. Set `PROMPT_OPENS_THINKING` to match your prompt. Flash resolves the same
+ambiguity with the same flag rather than by guessing, which is why the parser needs telling.
 
 **Give `apply` one representation.** The replayed turns and `assistant_response` have to arrive
 in the same shape. Passing the unwrapped payload for replayed turns and the raw text for the
@@ -1313,10 +1323,18 @@ trajectories ran the full turn cap and scored 0.60-0.65 instead of 1.0.
 The usual checks do not catch this. `flash env test` does not require a gold trajectory to
 terminate or to score well; it checks that your hooks run to completion and returns finite
 rewards. Its blocking reward gate is narrow by design: it fires only for GRPO, and only when
-**every** replayed gold episode scores exactly zero, and then, probing the first of those
-episodes, no per-turn signal separates it and a deliberately wrong answer scores at least as
-well. A single gold episode collecting partial credit stops the gate before it ever reaches
-that comparison, so `overall: PASS` is expected here rather than surprising.
+every **eligible** replayed gold episode scores exactly zero, and then, probing the first of
+those episodes, no per-turn signal separates it and a deliberately wrong answer scores at least
+as well. A single eligible gold episode collecting partial credit stops the gate before it ever
+reaches that comparison, so `overall: PASS` is expected here rather than surprising.
+
+Eligible is narrower than it sounds, and it cuts both ways. Two kinds of episode are left out
+of the gate's totals: a gold answer written in `<think>` markup, which this command replays
+verbatim and cannot grade the way a thinking run would, and a multi-turn replay whose reference
+turns run out before the rollout does, which is then part reference and part junk. Their rewards
+are still printed and still warned about. So an excluded episode scoring well does not save you
+from the gate, and if every zero-scoring reference happens to be excluded the gate has nothing
+left to judge and does not fire at all.
 Your own tests can miss it from the other side: one that calls `step_episode` directly with
 `messages[:-1]` is exercising a call shape the trainer never produces.
 
