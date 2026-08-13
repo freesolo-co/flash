@@ -791,3 +791,51 @@ def test_block_form_assistant_content_counts_as_authored_reasoning(capsys) -> No
 
     assert prepared.authored_reasoning_turns == 2
     assert "dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
+
+
+def test_a_reasoned_assistant_turn_in_the_prompt_does_not_cancel_a_surviving_target_block(
+    capsys,
+) -> None:
+    """A prompt span the FULL render strips must not be subtracted from the full render's count.
+
+    A prompt ending in a reasoned assistant turn is trailing while the prompt is rendered alone, so
+    that render keeps its reasoning -- but the completion adds a later user turn, which moves the
+    template's boundary past it and strips it from the full render. Subtracting the prompt render's
+    count would remove a span the full render never had, cancelling the target's own surviving block
+    and warning about a row that lost nothing.
+    """
+
+    class PriorTurnEnvironment(ThinkingEnvironment):
+        def prompt_messages(self, row):
+            return [
+                {"role": "user", "content": row["prompt"]},
+                {"role": "assistant", "content": "<think>promptreason</think>a1"},
+            ]
+
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        PriorTurnEnvironment(
+            [
+                {"role": "user", "content": "next"},
+                {"role": "assistant", "content": "<think>targetreason</think>a2"},
+            ]
+        ),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    # the one authored target turn is in final position, so the template keeps it: nothing is lost
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 1
+    assert "authored reasoning blocks" not in capsys.readouterr().err

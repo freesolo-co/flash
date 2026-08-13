@@ -15,6 +15,7 @@ import pytest
 from flash.engine.profiling.workload_profile import (
     count_rendered_reasoning_spans,
     reasoned_assistant_turns,
+    without_authored_reasoning,
 )
 
 pytestmark = pytest.mark.live
@@ -115,6 +116,35 @@ def test_the_real_template_passes_a_prompt_think_span_through_verbatim(tokenizer
     assert "<think>reasoning</think>" in prompt
 
 
+def test_the_real_template_strips_a_prompt_turn_that_the_prompt_only_render_keeps(
+    tokenizer,
+) -> None:
+    """Why the baseline is a re-render of the whole row, not the prompt render.
+
+    The same assistant turn is trailing in the prompt-only render and interior in the full render,
+    so its span exists in one and not the other. Subtracting the prompt's count would remove a span
+    the full render never had, cancelling a target block that did survive.
+    """
+    prompt_messages = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "<think>promptreason</think>a1"},
+    ]
+    completion_messages = [
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "<think>targetreason</think>a2"},
+    ]
+    prompt = _render(tokenizer, prompt_messages, add_generation_prompt=True)
+    full = _render(tokenizer, [*prompt_messages, *completion_messages])
+
+    # the prompt render keeps the prior turn's reasoning; the full render strips it
+    assert "promptreason" in prompt
+    assert count_rendered_reasoning_spans(prompt) == 1
+    assert "promptreason" not in full
+    # only the target's own reasoning survives, and prompt-count subtraction would erase it
+    assert count_rendered_reasoning_spans(full) == 1
+    assert "targetreason" in full
+
+
 def test_the_real_template_renders_two_empty_blocks_for_two_bare_trailing_turns(tokenizer) -> None:
     """The input that makes a delimiter-crossing span pattern merge two empty blocks into one.
 
@@ -133,6 +163,26 @@ def test_the_real_template_renders_two_empty_blocks_for_two_bare_trailing_turns(
     assert rendered.count("<think>") == 2
     assert count_rendered_reasoning_spans(rendered) == 0
     assert reasoned_assistant_turns(messages) == 1
+
+
+def test_the_baseline_render_differs_from_the_full_render_only_by_authored_reasoning(
+    tokenizer,
+) -> None:
+    """The property the survivor count rests on, checked against the shipped template.
+
+    ``without_authored_reasoning`` must remove exactly the assistant reasoning and change nothing
+    else, so both renders apply the same boundary rule to the same positions and their span counts
+    differ only by the blocks that survived.
+    """
+    baseline = _render(tokenizer, without_authored_reasoning(MULTITURN))
+    full = _render(tokenizer, MULTITURN)
+
+    assert count_rendered_reasoning_spans(baseline) == 0
+    assert count_rendered_reasoning_spans(full) - count_rendered_reasoning_spans(baseline) == 1
+    # the answers and turn structure are untouched: only the reasoning is gone
+    for answer in ("a1", "a2", "a3"):
+        assert answer in baseline
+    assert baseline.count("<|im_start|>") == full.count("<|im_start|>")
 
 
 def test_the_real_template_prefers_reasoning_content_over_an_inline_span(tokenizer) -> None:

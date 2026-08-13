@@ -20,6 +20,7 @@ from flash.engine.profiling.workload_profile import (
     rendered_reasoning_loss_warning,
     sft_sample_policy,
     unpacked_batch_warning,
+    without_authored_reasoning,
 )
 from flash.engine.worker.entry.sft import (
     _pretokenize_completion_only,
@@ -303,26 +304,35 @@ def _sft_completion_with_provenance(env, example: dict) -> tuple[list[dict], boo
 
 
 def _row_reasoning(
+    prompt_messages: list[dict],
     completion_messages: list[dict],
     *,
     full_text: str,
-    prompt_text: str,
+    render: Callable[[list[dict]], str],
 ) -> tuple[int, int]:
     """One row's (authored reasoning turns, reasoning spans that survive into the SUPERVISED span).
 
-    Rendered spans are counted over the full render MINUS the prompt render, not the full text: a
-    literal ``<think>...</think>`` in a system or user message renders a real span that is never
-    supervised, and counting it would offset a target's lost reasoning and suppress the warning.
+    Survivors are the full render's spans minus those of a BASELINE render of the same row with the
+    completion's reasoning stripped. The whole render cannot be counted directly: the template's
+    reasoning split is assistant-only, so a literal ``<think>...</think>`` written into a system or
+    user message renders a real span that is never supervised, and counting it would offset a
+    target's lost reasoning and silence the warning.
 
-    The subtraction is on counts rather than a string slice because the prompt render is not always
-    a text prefix of the full render -- for a multi-turn target the generation prompt pre-opens
-    ``<think>`` at a position the full render does not have -- so ``full[len(prompt):]`` is not a
-    safe way to isolate the target.
+    The baseline is a re-render rather than the prompt render because the two must apply the
+    template's ``last_query_index`` boundary to the same positions. A reasoned assistant turn at the
+    end of the prompt is trailing in a prompt-only render and keeps its span, but the completion's
+    later user turn moves the boundary past it and the full render strips it -- subtracting the
+    prompt render would then remove a span the full render never had, cancelling a completion span
+    that did reach the loss and firing a false warning. Same messages, same positions, one
+    difference.
     """
     authored = reasoned_assistant_turns(completion_messages)
-    rendered = count_rendered_reasoning_spans(full_text) - count_rendered_reasoning_spans(
-        prompt_text
-    )
+    if authored == 0:
+        # nothing authored means nothing to lose, and the baseline would equal the full render.
+        # skipped rather than rendered so a dataset with no reasoning pays nothing for this check.
+        return 0, 0
+    baseline = render([*prompt_messages, *without_authored_reasoning(completion_messages)])
+    rendered = count_rendered_reasoning_spans(full_text) - count_rendered_reasoning_spans(baseline)
     return authored, max(0, rendered)
 
 
@@ -354,6 +364,15 @@ def _tokenize_prompt_rows(
     # running total would report loss from rows the run never trains on against a retained-row
     # denominator. summed after filtering instead.
     reasoning_by_index: dict[int, tuple[int, int]] = {}
+
+    def render_transcript(messages: list[dict]) -> str:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=spec.thinking,
+        )
+
     for row_index, (
         example,
         prompt_messages,
@@ -395,30 +414,16 @@ def _tokenize_prompt_rows(
                 ),
                 "multimodal_inputs": multimodal_inputs,
             }
-            text = tokenizer.apply_chat_template(
-                [*normalized.messages, *completion_messages],
-                tokenize=False,
-                add_generation_prompt=False,
-                enable_thinking=spec.thinking,
-            )
+            text = render_transcript([*normalized.messages, *completion_messages])
             sampled_texts.append(text)
             reasoning_by_index[row_index] = _row_reasoning(
+                normalized.messages,
                 completion_messages,
                 full_text=text,
-                prompt_text=tokenizer.apply_chat_template(
-                    normalized.messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=spec.thinking,
-                ),
+                render=render_transcript,
             )
         else:
-            text = tokenizer.apply_chat_template(
-                [*prompt_messages, *completion_messages],
-                tokenize=False,
-                add_generation_prompt=False,
-                enable_thinking=spec.thinking,
-            )
+            text = render_transcript([*prompt_messages, *completion_messages])
             prompt_text = tokenizer.apply_chat_template(
                 prompt_messages,
                 tokenize=False,
@@ -427,9 +432,10 @@ def _tokenize_prompt_rows(
             )
             sampled_texts.append(text)
             reasoning_by_index[row_index] = _row_reasoning(
+                prompt_messages,
                 completion_messages,
                 full_text=text,
-                prompt_text=prompt_text,
+                render=render_transcript,
             )
             text_specs.append({"text": text, "prompt_text": prompt_text, "row_index": row_index})
 

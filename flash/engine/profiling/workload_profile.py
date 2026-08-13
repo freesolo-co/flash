@@ -147,6 +147,40 @@ def _message_text(content: object) -> str:
     return ""
 
 
+def without_authored_reasoning(messages: list[dict]) -> list[dict]:
+    """The same messages with assistant reasoning removed, structure and positions untouched.
+
+    Rendering this alongside the real messages isolates the reasoning the completion contributes:
+    both renders run the template's ``last_query_index`` rule over identical roles in identical
+    positions, so the two differ only by the spans the assistant turns authored.
+
+    Subtracting a PROMPT-ONLY render cannot do this. A reasoned assistant turn at the end of the
+    prompt is final in the prompt-only render and keeps its span, but the completion's later user
+    turn moves the boundary past it and the full render strips it -- so the subtraction removes a
+    span the full render no longer has, and erases a surviving completion span with it.
+    """
+    stripped: list[dict] = []
+    for message in messages:
+        copied = dict(message)
+        if copied.get("role") == "assistant":
+            copied.pop("reasoning_content", None)
+            text = copied.get("content")
+            if isinstance(text, str) and "</think>" in text:
+                copied["content"] = text.split("</think>")[-1].lstrip("\n")
+            elif isinstance(text, list):
+                copied["content"] = [
+                    {**block, "text": block["text"].split("</think>")[-1].lstrip("\n")}
+                    if isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                    and "</think>" in block["text"]
+                    else block
+                    for block in text
+                ]
+        stripped.append(copied)
+    return stripped
+
+
 def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:
     """Assistant turns that author reasoning, counted from the SOURCE messages.
 
