@@ -1235,11 +1235,14 @@ prefix, and the offset then leaks the demo back in silently.
 Parse the transcript instead, and parse it the same way on both paths:
 
 ```python
+from flash.content.thinking import strip_think
+
 ACTION = re.compile(r"<move>(.*?)</move>", re.DOTALL)  # your own action syntax
 
 
 def action_of(content: str) -> str:
-    found = ACTION.search(content)
+    # strip_think drops the reasoning span, so an action named inside <think> cannot win
+    found = ACTION.search(strip_think(content) or "")
     if found is None:  # a generated turn carrying no action is a bug worth seeing
         raise ValueError(f"no action in assistant turn: {content[:120]!r}")
     return found.group(1)
@@ -1251,10 +1254,15 @@ for message in messages[:-1]:
 state = self.apply(state, action_of(assistant_response))  # the newest action, exactly once
 ```
 
-**Search, do not anchor.** With `thinking = true` the transcript keeps the raw turn, so a prior
-action reaches you as `<think>...</think><move>...</move>`. A start-anchored pattern matches
-none of those, and the loop then rebuilds nothing but the newest move while looking like it
-replayed the whole episode.
+**Parse the answer, not the raw turn.** With `thinking = true` the transcript keeps the turn
+exactly as the model emitted it, so a prior action reaches you as
+`<think>...</think><move>...</move>`. A start-anchored pattern matches none of those and the
+loop silently rebuilds nothing but the newest move. Searching the raw text is not the fix
+either: a model that weighs `<move>left</move>` in its reasoning before committing to
+`<move>right</move>` hands the first match to a plain search, and the wrong action is then
+replayed as history on every later call. `strip_think` removes the reasoning span first, and it
+also returns `""` for a turn truncated before `</think>`, so unfinished reasoning raises here
+rather than being mined for an action the model never committed to.
 
 **Give `apply` one representation.** The replayed turns and `assistant_response` have to arrive
 in the same shape. Passing the unwrapped payload for replayed turns and the raw text for the
@@ -1278,9 +1286,12 @@ action twice on every call. Earlier actions still appear once; it is the turn yo
 that gets duplicated. What that does to your state depends on the transition:
 
 - **Self-inverse** (a toggle, a parity or XOR update): the two applications cancel, so the
-  state you step and score is one action behind the transcript. The action does land on the
-  next call, where it is no longer the newest, so the episode advances but always trails by
-  one, and a terminal condition checked at the moment it should first hold is missed.
+  state `step_episode` works from is one action behind the transcript. The action does land on
+  the next call, where it is no longer the newest, so the episode advances but always trails by
+  one, and a terminal condition checked at the moment it should first hold is missed. A
+  `score_episode` that replays the finished transcript applies each action once and is not
+  itself off by one; what reaches the reward is the damage `step_episode` already did, an
+  episode that ran past the turn it should have ended on.
 - **Idempotent** (a set insert, an overwrite-with-the-same-value): the duplicate is absorbed
   and the state is correct. This one is genuinely harmless.
 - **Anything else** (a counter, an append, a charge, a move that composes): the newest action
