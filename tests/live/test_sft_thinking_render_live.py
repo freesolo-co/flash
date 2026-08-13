@@ -290,15 +290,71 @@ def test_a_reasoning_span_stops_at_its_own_turn_not_a_later_tool_message(tokeniz
     assert TURN_END not in body
 
 
-def test_a_verbatim_turn_boundary_inside_reasoning_is_the_documented_ambiguity(tokenizer) -> None:
-    """Pins the ONE shape the rendered text genuinely cannot resolve, so it stays known.
+def test_the_fake_renders_a_tool_role_message_the_way_the_template_does(tokenizer) -> None:
+    """The offline fake must agree with the template on the tool shape, not just on span counts.
 
-    A quoted header alone is content, and a quoted ``<|im_end|>`` alone is content -- both are
-    handled. Written out TOGETHER they are byte-identical to a real turn boundary, which is what a
-    turn boundary is, so no rule reading the render alone can tell them apart and the turn reports
-    no span. This asserts the current behavior rather than endorsing it: the marker pairing in
-    ``_row_reasoning`` is what stops such a row being miscounted as a survivor, and a change here
-    should be a deliberate one.
+    A ``role="tool"`` message does not render as a ``tool`` header: the template wraps it in a USER
+    turn carrying ``<tool_response>``. That is precisely why a tool turn does not reset
+    ``last_query_index`` and the assistant before it keeps its reasoning. A fake emitting a header
+    the template never produces can agree on counts by luck while disagreeing on the layout the
+    span rules actually read, and the offline suite validates the warning against that fake.
+    """
+    from tests.test_sft_workload import ThinkingTokenizer
+
+    messages = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1", "reasoning_content": "R1"},
+        {"role": "tool", "content": "TOOLOUT"},
+        {"role": "assistant", "content": "a2", "reasoning_content": "R2"},
+    ]
+    real = _render(tokenizer, messages)
+    fake = ThinkingTokenizer().apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False, enable_thinking=True
+    )
+
+    # byte-identical, not merely span-equivalent
+    assert fake == real
+    # and the shape is the wrapped user turn, with no tool header anywhere
+    assert "<|im_start|>user\n<tool_response>" in real
+    assert "<|im_start|>tool" not in real
+
+
+def test_a_quoted_terminator_does_not_lose_the_block_when_a_turn_follows(tokenizer) -> None:
+    """A quoted ``<|im_end|>`` must not end the scan when a REAL turn follows.
+
+    The horizon match consumes this turn's terminator, so its start IS that terminator. Searching
+    for a terminator strictly below the horizon therefore cannot see the real one and finds only
+    the quoted one, which sits in front of the block's closer -- so the block is dropped entirely
+    and an intact survivor reports as lost. The turn that follows is what makes this reachable: with
+    nothing after it, the backwards search from the end finds the real terminator anyway.
+    """
+    messages = [
+        {"role": "user", "content": "u1"},
+        # quotes the terminator, and is NOT the last turn
+        {"role": "assistant", "content": "a1", "reasoning_content": "mentions <|im_end|> inline"},
+        {"role": "assistant", "content": "a2", "reasoning_content": "SECOND"},
+    ]
+    full = _render(tokenizer, messages)
+    spans = reasoning_span_texts(full)
+
+    # both turns follow the last user message, so the template keeps both blocks
+    assert len(spans) == 2
+    assert "mentions <|im_end|> inline" in spans[0]
+    assert "SECOND" in spans[1]
+
+
+def test_reasoning_the_scan_cannot_resolve_is_not_reported_as_a_template_drop(tokenizer) -> None:
+    """Reasoning the template KEPT must never be reported as reasoning the template dropped.
+
+    Reasoning containing a verbatim ``<|im_end|>`` newline plus a header is byte-identical to a real
+    turn boundary, so no rule reading the render alone can resolve the block. That is a limit of the
+    scan, not a loss: the template kept the reasoning. The distinction matters outwardly, because
+    the drop warning tells the user to split their transcript into single-turn rows -- advice that
+    is simply wrong for a row whose reasoning survived, and that no rerun would talk them out of.
+
+    So the contract asserted here is the outward one: the row goes unreported rather than reported
+    wrongly. A future scan that resolves this shape should make the assertion below stronger, not
+    fail it.
     """
     messages = [
         {"role": "user", "content": "u1"},
@@ -311,10 +367,11 @@ def test_a_verbatim_turn_boundary_inside_reasoning_is_the_documented_ambiguity(t
     ]
     full = _render(tokenizer, messages)
 
-    # the reasoning IS in the render, and the template did keep it
+    # the template kept the reasoning verbatim: this row lost nothing
     assert "see <|im_end|>" in full
-    # but its bytes are a turn boundary, so the block is not resolvable from the text
-    assert reasoning_spans(full) == []
+    # so whatever the scan resolves, it must not claim the block was dropped
+    spans = reasoning_span_texts(full)
+    assert spans == [] or any("then more" in span for span in spans)
 
 
 def test_the_real_template_prefers_reasoning_content_over_an_inline_span(tokenizer) -> None:

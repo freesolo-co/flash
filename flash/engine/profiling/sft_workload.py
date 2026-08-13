@@ -379,9 +379,16 @@ def _row_reasoning(
         return _RowReasoning(0, 0, 0)
     ends = reasoning_span_end_offsets(full_text)
     prefix = reasoning_marker_prefix(full_text)
-    marked_spans = reasoning_span_texts(
-        render([*prompt_messages, *with_marked_reasoning(completion_messages, prefix)])
-    )
+    marked_render = render([*prompt_messages, *with_marked_reasoning(completion_messages, prefix)])
+    marked_spans = reasoning_span_texts(marked_render)
+    if prefix in marked_render and not any(prefix in span for span in marked_spans):
+        # the template KEPT reasoning the span scan could not locate: a marker rides only inside
+        # text the template chose to keep, so a marker in the render with no marked span means the
+        # scan failed to bound a block that survived -- not that the template dropped it. reporting
+        # a drop here would tell the user to split a transcript that lost nothing, so the row is
+        # left unreported. reachable when reasoning quotes a turn boundary verbatim (see
+        # ``reasoning_spans``); a row the template really stripped keeps no marker at all.
+        return _RowReasoning(0, 0, 0)
     if len(marked_spans) != len(ends):
         # marking changed the span sequence, so the two renders no longer address the same spans.
         # unreachable by construction; treated as "cannot tell" rather than guessed at, because a

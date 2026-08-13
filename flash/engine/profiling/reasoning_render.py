@@ -80,9 +80,16 @@ def reasoning_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for match in _TEMPLATE_REASONING_START.finditer(text):
         next_turn = _TEMPLATE_TURN_START.search(text, match.end())
-        horizon = len(text) if next_turn is None else next_turn.start()
-        turn_end = text.rfind(_TURN_END, match.end(), horizon)
-        limit = horizon if turn_end < 0 else turn_end
+        if next_turn is not None:
+            # the horizon match CONSUMES this turn's terminator, so its start IS that terminator --
+            # searching for one below the horizon would find only a terminator the reasoning quotes,
+            # and end the scan in front of the real closer.
+            limit = next_turn.start()
+        else:
+            # nothing follows, so the turn's own terminator is the last one in the render. reasoning
+            # that quotes the token sits before it, which is why this looks backwards from the end.
+            turn_end = text.rfind(_TURN_END, match.end())
+            limit = len(text) if turn_end < 0 else turn_end
         close = text.rfind(_TEMPLATE_REASONING_END, match.end(), limit)
         if close < 0 or not text[match.end() : close].strip():
             continue

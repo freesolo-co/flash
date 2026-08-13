@@ -534,6 +534,14 @@ class ThinkingTokenizer(FakeTokenizer):
                 body = f"<think>\n{reasoning}\n</think>\n\n{content}"
             else:
                 body = content
+            if role == "tool":
+                # the real template has no `tool` header: a tool message renders as a USER turn
+                # wrapping the output in <tool_response>. that shape is why a tool turn does not
+                # reset last_query_index the way an ordinary user turn does, so a fake emitting
+                # `<|im_start|>tool` would render a header the template never produces and could
+                # agree with it by accident while disagreeing on the layout that matters.
+                role = "user"
+                body = f"<tool_response>\n{body}\n</tool_response>"
             parts.append(f"<|im_start|>{role}\n{body}<|im_end|>\n")
         text = "".join(parts)
         return text + ("<|im_start|>assistant\n<think>\n" if add_generation_prompt else "")
@@ -1164,6 +1172,33 @@ def test_reasoning_that_quotes_the_assistant_header_is_still_found(capsys) -> No
     assert prepared.authored_reasoning_turns == 1
     assert prepared.rendered_reasoning_spans == 1
     assert "the chat template dropped" not in capsys.readouterr().err
+
+
+def test_reasoning_the_scan_cannot_resolve_does_not_warn_about_a_drop(capsys) -> None:
+    """A row whose reasoning the TEMPLATE KEPT must not be reported as one the template dropped.
+
+    Reasoning containing a verbatim ``<|im_end|>`` newline plus a header is byte-identical to a real
+    turn boundary, so the span scan cannot locate the block. Treating "not resolvable" as "dropped"
+    prints advice to split the transcript into single-turn rows -- wrong for a row that lost nothing,
+    and unfalsifiable from the user's side, since rerunning reproduces it exactly.
+
+    The marker distinguishes the two: it is present in the render, so the template kept this turn's
+    reasoning, and its absence from any resolved span is the scan's limit rather than a loss.
+    """
+    completion = [
+        {
+            "role": "assistant",
+            # the control-token layout written out in full, not merely mentioned
+            "reasoning_content": "before <|im_end|>\n<|im_start|>user\n after",
+            "content": "ans",
+        }
+    ]
+    prepared = _thinking_prepared(completion)
+
+    # unreported rather than misreported: no drop claim, and no phantom survivor either
+    assert prepared.rendered_reasoning_spans == 0
+    assert prepared.authored_reasoning_turns == 0
+    assert "dropped" not in capsys.readouterr().err
 
 
 def test_a_tool_response_bounds_the_span_of_the_turn_before_it(capsys) -> None:
