@@ -293,6 +293,39 @@ def _normalize_percent_encoding(value: str) -> str:
     return "".join(normalized)
 
 
+def _remove_dot_segments(path: str) -> str:
+    input_buffer = path
+    output: list[str] = []
+    while input_buffer:
+        if input_buffer.startswith("../"):
+            input_buffer = input_buffer[3:]
+        elif input_buffer.startswith("./"):
+            input_buffer = input_buffer[2:]
+        elif input_buffer.startswith("/./"):
+            input_buffer = f"/{input_buffer[3:]}"
+        elif input_buffer == "/.":
+            input_buffer = "/"
+        elif input_buffer.startswith("/../"):
+            input_buffer = f"/{input_buffer[4:]}"
+            if output:
+                output.pop()
+        elif input_buffer == "/..":
+            input_buffer = "/"
+            if output:
+                output.pop()
+        elif input_buffer in {".", ".."}:
+            input_buffer = ""
+        else:
+            segment_end = input_buffer.find("/", 1 if input_buffer.startswith("/") else 0)
+            if segment_end < 0:
+                output.append(input_buffer)
+                input_buffer = ""
+            else:
+                output.append(input_buffer[:segment_end])
+                input_buffer = input_buffer[segment_end:]
+    return "".join(output)
+
+
 def _canonical_resource_uri(uri: str) -> str:
     scheme, netloc, path, query, fragment = urlsplit(uri)
     normalized_scheme = scheme.casefold()
@@ -314,7 +347,7 @@ def _canonical_resource_uri(uri: str) -> str:
         (
             normalized_scheme,
             normalized_netloc,
-            _normalize_percent_encoding(path),
+            _remove_dot_segments(_normalize_percent_encoding(path)),
             _normalize_percent_encoding(query),
             _normalize_percent_encoding(fragment),
         )

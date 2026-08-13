@@ -386,6 +386,12 @@ class SseAccumulator:
             self.truncated = True
 
     def finish(self) -> None:
+        if self._buffer.endswith(b"\r"):
+            fragment = bytes(self._buffer[:-1])
+            self._buffer.clear()
+            self._consume_line(fragment)
+        elif _is_data_field(bytes(self._buffer)):
+            self._note_defect("stream ended with an unterminated data event")
         self._buffer.clear()
         self._scan_start = 0
         if self._event_data:

@@ -659,6 +659,36 @@ def test_sse_accumulator_discards_unterminated_data_event_at_eof() -> None:
     assert accumulator.defect == "stream ended with an unterminated data event"
 
 
+def test_sse_accumulator_discards_unterminated_data_line_at_eof() -> None:
+    event = b'data: {"choices":[{"index":0,"delta":{"content":"GHOST"}}]}'
+    accumulator = trace_sse.SseAccumulator()
+
+    accumulator.feed(event)
+    accumulator.finish()
+
+    assert accumulator.received is False
+    assert accumulator.output()["choices"] == []
+    assert accumulator.defect == "stream ended with an unterminated data event"
+
+
+def test_sse_accumulator_dispatches_terminal_cr_event_delimiter() -> None:
+    payload = b'data: {"choices":[{"index":0,"delta":{"content":"OK"}}]}'
+    for delimiter in (b"\r\r", b"\r\r\n", b"\n\n"):
+        accumulator = trace_sse.SseAccumulator()
+        accumulator.feed(payload + delimiter)
+        accumulator.finish()
+
+        assert accumulator.output()["choices"][0]["message"]["content"] == "OK"
+        assert accumulator.received is True
+        assert accumulator.defect is None
+
+    gate = trace_sse.SseDoneGate()
+    assert gate.feed(b"data: [DONE]\r\r") == []
+    assert gate.finish() == []
+    assert gate.terminated is True
+    assert gate.done_event == b"data: [DONE]\r\r"
+
+
 def test_sse_accumulator_dispatches_blank_line_terminated_control() -> None:
     event = (
         b'data: {"choices":[{"index":0,"delta":{"content":"GHOST"},"finish_reason":"stop"}]}\n\n'
@@ -4271,6 +4301,59 @@ def test_percent_encoded_reserved_schema_resource_uri_stays_distinct() -> None:
     assert trace_redaction._canonical_resource_uri("https://example.com/a%2fb") == (
         "https://example.com/a%2Fb"
     )
+
+
+@pytest.mark.parametrize(
+    ("ref", "redacted"),
+    [
+        ("https://example.com/a/./schema#/$defs/Cred", True),
+        ("https://example.com/a/b/../schema#/$defs/Cred", True),
+        ("https://example.com/%61/schema#/$defs/Cred", True),
+        ("https://example.com/b/schema#/$defs/Cred", False),
+        ("https://example.com/a%2Fschema#/$defs/Cred", False),
+    ],
+    ids=["dot", "parent", "unreserved", "distinct-path", "reserved-slash"],
+)
+def test_dot_segment_schema_resource_refs_match_only_the_same_resource(
+    ref: str, redacted: bool
+) -> None:
+    schema = {
+        "$id": "https://example.com/a/schema",
+        "type": "object",
+        "properties": {"api_key": {"$ref": ref}},
+        "$defs": {
+            "Cred": {
+                "default": "SECRET",
+                "const": "SECRET-C",
+                "enum": ["SECRET-E"],
+            }
+        },
+    }
+
+    stored = traces._redact_secret_fields(schema)["$defs"]["Cred"]
+
+    expected = (
+        {"default": "[redacted]", "const": "[redacted]", "enum": ["[redacted]"]}
+        if redacted
+        else {"default": "SECRET", "const": "SECRET-C", "enum": ["SECRET-E"]}
+    )
+    assert stored == expected
+
+
+@pytest.mark.parametrize(
+    ("uri", "canonical"),
+    [
+        ("https://example.com/a/./schema", "https://example.com/a/schema"),
+        ("https://example.com/a/b/../schema", "https://example.com/a/schema"),
+        ("https://example.com/../../a/schema", "https://example.com/a/schema"),
+        ("https://example.com/a/.", "https://example.com/a/"),
+        ("https://example.com/a/b/..", "https://example.com/a/"),
+        ("https://example.com/a/", "https://example.com/a/"),
+    ],
+    ids=["dot", "parent", "leading-parent", "trailing-dot", "trailing-parent", "trailing-slash"],
+)
+def test_canonical_resource_uri_removes_dot_segments(uri: str, canonical: str) -> None:
+    assert trace_redaction._canonical_resource_uri(uri) == canonical
 
 
 def test_secret_schema_ref_with_extension_keyword_redacts_neutral_target() -> None:
