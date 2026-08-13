@@ -303,6 +303,7 @@ class _PollContext:
     current_attempt: int
     launch_ts: float
     next_gpu_note: str
+    on_last_gpu: bool
     poll_errors: PollErrorTracker
 
 
@@ -493,7 +494,23 @@ def _classify_queue_state(
         # capacity timer forever, so it expires after WORKER_COMING_UP_TTL_S.
         state.worker_coming_up_at = now if (usable or recovering) else None
         if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
-            context.say(f"queued; workers: {workers}")
+            # name the budget this wait is spending. the queue timer only arms while the job is
+            # actually starved, so an armed timer is the only case with a countdown to report: a
+            # worker that is coming up is governed by the much larger setup grace instead, and
+            # printing a capacity countdown there would tell the operator to expect the wrong
+            # deadline. before it arms there is nothing to count, so say only what is queued.
+            # `usable or recovering` is the same evidence that clears the timer two lines above.
+            # read it here rather than the timer's own `since`, which is still armed from the
+            # classify pass that ran BEFORE this health read: on the first queued poll of a normal
+            # cold start that would print a capacity deadline which evaporates one poll later.
+            budget = ""
+            if state.queued_timer.since is not None and not (usable or recovering):
+                budget = "; " + _jobs.queue_wait_note(
+                    now - state.queued_timer.since,
+                    context.queue_grace_s,
+                    context.on_last_gpu,
+                )
+            context.say(f"queued; workers: {workers}{budget}")
         if state.unhealthy_timer.expired(
             workers.get("unhealthy") and not usable and not recovering,
             now,
@@ -622,6 +639,7 @@ def poll_job(
         current_attempt=attempt_id,
         launch_ts=launch_ts,
         next_gpu_note=_jobs.capacity_escalation_note(on_last_gpu),
+        on_last_gpu=on_last_gpu,
         poll_errors=PollErrorTracker(say, interval_s),
     )
     state = _PollState(

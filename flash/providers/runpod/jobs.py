@@ -71,6 +71,7 @@ __all__ = [
     "make_hf_failure_detail_reader",
     "make_hf_heartbeat_reader",
     "poll_job",
+    "queue_wait_note",
     "submit_run",
     "weight_cache_datacenters",
     "weight_cache_endpoint_kwargs",
@@ -307,6 +308,23 @@ def capacity_escalation_note(on_last_gpu: bool) -> str:
         if on_last_gpu
         else "GPU-class escalation may follow"
     )
+
+
+def queue_wait_note(waited_s: float, queue_grace_s: float, on_last_gpu: bool) -> str:
+    """The budget clause on a "still queued" line: how long we have waited of how long we will.
+
+    Without it the queued line repeats unchanged every 90s and nothing separates a wait still
+    within budget from a wedged one, so the operator's natural reaction is to cancel and relaunch,
+    throwing away queue position. `on_last_gpu` explains why the budget is the larger one and is
+    worded as the escalation fact ONLY: it is also true when the infra retry budget is exhausted
+    with classes still untried, so it must never be reported as "this GPU class is pinned".
+    """
+    because = (
+        " (no further GPU-class escalation follows, so capacity is given longer)"
+        if on_last_gpu
+        else ""
+    )
+    return f"waited {int(waited_s)}s of {int(queue_grace_s)}s capacity grace{because}"
 
 
 def submit_run(

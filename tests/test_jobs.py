@@ -686,6 +686,85 @@ def test_capacity_timer_rearms_when_worker_health_stops_being_readable(monkeypat
     assert jobs.WORKER_COMING_UP_TTL_S == 300.0
 
 
+def _queued_forever_log(monkeypatch, health, *, queue_grace_s=900.0, on_last_gpu=True):
+    """`_queued_forever` with the operator log captured, returning (result, printed lines)."""
+    import io
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=20.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    log = io.StringIO()
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        log=log,
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=3000.0,
+        queue_grace_s=queue_grace_s,
+        on_last_gpu=on_last_gpu,
+    )
+    return res, log.getvalue().splitlines()
+
+
+def test_queued_line_names_the_budget_the_wait_is_spending(monkeypatch):
+    # The queued line repeated unchanged every 90s, so nothing on screen separated a wait still
+    # inside its budget from a wedged one. The operator's only recourse was reading stall_kwargs in
+    # the source, and the natural reaction -- cancel and relaunch -- throws away queue position.
+    # Both numbers are already in scope at the call site, so print them.
+    res, lines = _queued_forever_log(monkeypatch, lambda eid, _fp, **_kw: {"workers": {}})
+    assert res.failure == "no_capacity"
+    queued = [ln for ln in lines if "queued; workers:" in ln]
+    assert queued, f"no queued line was printed at all: {lines}"
+    assert all("capacity grace" in ln for ln in queued), queued
+    # the elapsed figure must actually advance -- a constant would be no more informative than the
+    # bare line this replaces.
+    waited = [int(ln.split("waited ")[1].split("s of")[0]) for ln in queued]
+    assert waited == sorted(waited), waited
+    assert waited[-1] > waited[0], waited
+    assert all(f"of {int(900.0)}s capacity grace" in ln for ln in queued), queued
+
+
+def test_queued_line_explains_the_larger_budget_without_claiming_a_pin(monkeypatch):
+    # on_last_gpu triples the grace, which is the surprising part worth explaining. But it is NOT a
+    # synonym for "the class is pinned": lifecycle.py sets it whenever the infra retry budget is
+    # exhausted, with classes still untried. Printing "pinned" would state something false on that
+    # path, so the clause must state the escalation fact only, matching capacity_escalation_note.
+    _, last = _queued_forever_log(monkeypatch, lambda eid, _fp, **_kw: {"workers": {}})
+    on_last = [ln for ln in last if "queued; workers:" in ln]
+    assert on_last, last
+    assert all("no further GPU-class escalation follows" in ln for ln in on_last), on_last
+    assert not any("pinned" in ln for ln in on_last), on_last
+
+    _, other = _queued_forever_log(
+        monkeypatch, lambda eid, _fp, **_kw: {"workers": {}}, queue_grace_s=300.0, on_last_gpu=False
+    )
+    not_last = [ln for ln in other if "queued; workers:" in ln]
+    # a class with somewhere left to walk carries the smaller budget and no explanation clause.
+    assert not_last, other
+    assert all("of 300s capacity grace" in ln for ln in not_last), not_last
+    assert not any("escalation" in ln for ln in not_last), not_last
+
+
+def test_queued_line_omits_a_capacity_countdown_while_a_worker_is_coming_up(monkeypatch):
+    # A worker that is initializing is governed by the much larger setup grace, not the capacity
+    # timer -- which is why the timer is not armed here. Printing a capacity countdown anyway would
+    # advertise a deadline that will not fire and invite exactly the needless cancel this change
+    # exists to prevent.
+    res, lines = _queued_forever_log(
+        monkeypatch, lambda eid, _fp, **_kw: {"workers": {"initializing": 1}}
+    )
+    assert res.failure == "stalled"  # setup grace governed, as it should
+    queued = [ln for ln in lines if "queued; workers:" in ln]
+    assert queued, lines
+    assert not any("capacity grace" in ln for ln in queued), queued
+
+
 def test_no_worker_at_all_is_still_reported_as_missing_capacity(monkeypatch):
     # Non-regression for the case the backstop actually exists for: health is readable and reports
     # NO worker in any state. Nothing is coming up, so nothing suppresses the timer and the run
