@@ -8,6 +8,7 @@ serving regression instead of the deploy that caused it.
 
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import time
@@ -188,6 +189,39 @@ def test_an_unreadable_plane_produces_no_warning_instead_of_an_error(failure) ->
     assert _alias_move_warning(_Client(raises=failure), "flash-1", 50) is None
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        # the client translates urllib's HTTPError and URLError and documents that anything else
+        # propagates, so a connection dropped mid-read arrives as the bare OSError urllib raised.
+        ConnectionResetError("connection reset by peer"),
+        http.client.IncompleteRead(b"{"),
+        # a plane answering a shape no version of this client models still must not break deploy.
+        TypeError("unexpected payload"),
+    ],
+)
+def test_an_untranslated_transport_failure_is_contained_not_printed(failure, monkeypatch) -> None:
+    """The advisory read runs on a worker thread, where an escaping exception is not just silent.
+
+    `ApiError`/`ClientError` do not cover every way a read fails: an untranslated one reaches the
+    thread hook and prints a traceback to stderr across a deploy that is otherwise proceeding
+    normally, so the warning nobody asked for becomes noise on a command that worked.
+
+    Asserted at the thread hook rather than on captured stderr: the hook is what would print, and
+    pytest installs its own, so a stderr assertion passes whether or not the exception escaped.
+    """
+    escaped = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: escaped.append(args.exc_type))
+
+    assert _alias_move_warning(_Client(raises=failure), "flash-1", 50) is None
+
+    # the worker is a daemon thread, so wait for it before judging whether anything escaped.
+    for thread in threading.enumerate():
+        if thread is not threading.current_thread():
+            thread.join(5.0)
+    assert escaped == []
+
+
 def test_the_advisory_read_is_bounded_well_under_the_client_default() -> None:
     """An advisory line must not hold a real deploy for the client's full 60s default.
 
@@ -240,6 +274,10 @@ def test_a_read_that_overruns_its_budget_is_abandoned_rather_than_waited_out() -
     start = time.monotonic()
     warning = _alias_move_warning(_Stalling(), "flash-1", 50)
     elapsed = time.monotonic() - start
+    # snapshot BEFORE releasing the worker. releasing first lets it wake and append between the
+    # release and the read, so the abandonment assertion below could fail on a correct
+    # implementation -- the list only means "still in flight" while the worker is still blocked.
+    still_in_flight = list(returned_late)
     released.set()
 
     # no warning is the documented outcome for a plane that cannot answer in time.
@@ -247,7 +285,7 @@ def test_a_read_that_overruns_its_budget_is_abandoned_rather_than_waited_out() -
     # generous against CI scheduling noise, and still far below the 30s the read would take.
     assert elapsed < deploy_module._ALIAS_WARNING_READ_SECONDS + 5.0, f"waited {elapsed:.2f}s"
     # the read had NOT finished when the caller gave up: it was abandoned, not merely slow.
-    assert returned_late == []
+    assert still_in_flight == []
 
 
 def test_a_read_that_answers_in_time_still_warns() -> None:

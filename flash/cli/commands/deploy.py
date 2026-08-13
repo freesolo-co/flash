@@ -230,12 +230,23 @@ def _read_within(budget: float, read):
 
 
 def _read_or_none(read):
-    """The advisory read's failure contract: a plane that cannot answer produces no warning."""
+    """The advisory read's failure contract: a plane that cannot answer produces no warning.
+
+    Deliberately broader than `ApiError`/`ClientError`. The client translates urllib's HTTPError
+    and URLError, and documents that anything else propagates -- so a connection reset or a
+    truncated body mid-read surfaces as the bare `ConnectionResetError` / `IncompleteRead` that
+    urllib raised. Those are exactly the "plane cannot answer" case this exists to absorb, and on
+    the worker thread an escaping one reaches the thread hook and prints a traceback across a
+    deploy that is otherwise proceeding normally: a warning nobody asked for turning into noise
+    on a command that worked.
+    """
     try:
         return read()
-    except (ApiError, ClientError):
-        # the deploy itself is the authority on whether it can proceed. failing it here would turn
-        # a warning nobody asked for into an outage of the command it decorates.
+    except Exception:
+        # the deploy itself is the authority on whether it can proceed. failing it here -- or
+        # printing a traceback beside it -- would turn a warning nobody asked for into a fault in
+        # the command it decorates. BaseException still propagates, so KeyboardInterrupt is
+        # unaffected.
         return None
 
 
