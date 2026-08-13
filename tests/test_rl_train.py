@@ -316,6 +316,299 @@ def _image_placeholder_count(row) -> int:
     return sum(str(m["content"]).count("<image>") for m in row["prompt"])
 
 
+def _exec_shim_fragment(source, namespace=None):
+    """exec a rendered fragment the way the child does, and run the patch it defers.
+
+    Every fragment now registers its body with the deferral registry instead of patching at import
+    (see ``shims.render_deferred_patch_runtime``), because touching verl at sitecustomize time
+    initializes cuda against every gpu and collapses the rank->device map. A test that exec'd the
+    fragment alone would therefore assert on a patch that never ran.
+
+    Draining the registry here rather than importing the target keeps these tests independent of
+    whether a stub module is already in ``sys.modules``: the registry applies immediately for an
+    imported target and waits for the rest, and this runs whatever is still pending either way.
+    """
+    namespace = {} if namespace is None else namespace
+    # the registry is cached on `sys` so one sitecustomize can hold many fragments, which also means
+    # it OUTLIVES a test. drop any existing one first and uninstall ours after, or a later test
+    # inherits this one's pending callbacks and its finder stays on meta_path for the whole session.
+    previous = getattr(sys, "_flash_defer_registry", None)
+    if previous is not None:
+        previous.uninstall()
+        del sys._flash_defer_registry
+    try:
+        exec(
+            compile(verl_shims.render_deferred_patch_runtime(), "sitecustomize.py", "exec"),
+            namespace,
+        )
+        exec(compile(source, "sitecustomize.py", "exec"), namespace)
+        registry = sys._flash_defer_registry
+        for target in list(registry._pending):
+            registry._run(target)
+        registry.uninstall()
+    finally:
+        del sys._flash_defer_registry
+        if previous is not None:
+            sys._flash_defer_registry = previous
+    return namespace
+
+
+def _module_scope_imports(source: str) -> set[str]:
+    """top-level packages imported at MODULE scope by ``source`` (nested defs excluded)."""
+    names = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            names.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Try):
+            # the unwrapped tf32 fragment is a bare try/except at module scope; look inside it.
+            for inner in node.body:
+                if isinstance(inner, ast.Import):
+                    names.update(alias.name.split(".")[0] for alias in inner.names)
+                elif isinstance(inner, ast.ImportFrom) and inner.module and inner.level == 0:
+                    names.add(inner.module.split(".")[0])
+    return names
+
+
+def test_no_rl_fragment_imports_verl_or_vllm_at_module_scope():
+    """the regression barrier for the multi-gpu rank->device collapse.
+
+    sitecustomize runs at interpreter startup, BEFORE ray narrows an actor's CUDA_VISIBLE_DEVICES to
+    its own card. importing verl there reaches `verl/utils/device.py`, whose module scope calls
+    `torch.cuda.is_available()` -- which runs cuInit and freezes the cuda device map against every
+    visible gpu. The later narrowing cannot rebuild it, so every rank keeps device 0 and nccl aborts
+    with "Duplicate GPU detected". That killed 7/7 multi-gpu runs on hardware that was entirely idle.
+
+    Every fragment must therefore defer through `_deferred_patch`. This asserts the property that
+    matters -- no module-scope verl/vllm import -- rather than the mechanism, so a future fragment
+    that finds another way to defer still passes and an eager one still fails.
+
+    torch itself is allowed: the tf32 fragment imports it and only sets matmul flags. It is
+    `torch.cuda`, not the import, that runs cuInit.
+    """
+    rendered = {
+        # the two unwrapped fragments count too: they are composed into the same sitecustomize, so
+        # an eager verl import in either collapses the map just as thoroughly.
+        "tf32": backend_common.render_tf32_shim(),
+        "tilelang-cudart": backend_common.render_tilelang_cudart_shim(),
+        "kl-ref-adapter": verl_shims.render_kl_ref_adapter_shim(True),
+        "structured-outputs": verl_shims.render_structured_outputs_shim({"type": "json_object"}),
+        "exact-save-steps": verl_shims.render_exact_save_steps_shim((3,), 10),
+        "stop-sequences": verl_shims.render_stop_sequences_shim(("</answer>",)),
+        "image-pad-ban": verl_shims.render_image_pad_ban_shim(151655),
+        "per-turn-credit": verl_shims.render_per_turn_credit_shim(True),
+        "reentrant-checkpointing": verl_shims.render_reentrant_checkpointing_shim(True),
+        "entropy-quantile": verl_shims.render_entropy_quantile_shim(0.2),
+        "rank-device-assert": verl_shims.render_rank_device_assert_shim(2),
+    }
+    # each renderer was called with its feature ON, so an empty one would silently exempt itself.
+    assert all(rendered.values()), sorted(name for name, src in rendered.items() if not src)
+    offenders = {
+        name: sorted(_module_scope_imports(src) & {"verl", "vllm"})
+        for name, src in rendered.items()
+    }
+    assert {name: bad for name, bad in offenders.items() if bad} == {}
+
+
+@contextlib.contextmanager
+def _defer_registry(tmp_path=None):
+    """install a fresh deferral registry, and take it back off meta_path afterwards.
+
+    The registry is cached on ``sys`` so one sitecustomize can hold every fragment, which also means
+    it outlives a test. Without this, a later test inherits the pending callbacks and the finder
+    stays on ``meta_path`` for the rest of the session.
+    """
+    previous = getattr(sys, "_flash_defer_registry", None)
+    if previous is not None:
+        previous.uninstall()
+        del sys._flash_defer_registry
+    try:
+        exec(compile(verl_shims.render_deferred_patch_runtime(), "sitecustomize.py", "exec"), {})
+        yield sys._flash_defer_registry
+    finally:
+        current = getattr(sys, "_flash_defer_registry", None)
+        if current is not None:
+            current.uninstall()
+            del sys._flash_defer_registry
+        if previous is not None:
+            sys._flash_defer_registry = previous
+
+
+def test_the_deferred_registry_runs_patches_at_the_targets_real_import(tmp_path, monkeypatch):
+    """the property the whole fix rests on, exercised through an actual import statement.
+
+    Two callbacks share one target on purpose: that is the case the per-fragment finder design
+    could not survive (siblings either recursed forever or the first match silently dropped the
+    other's patch), and it is not hypothetical -- stop-sequences and image-pad-ban both hook
+    `verl.experimental.agent_loop`.
+    """
+    (tmp_path / "flash_defer_probe.py").write_text("VALUE = 'imported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("flash_defer_probe", None)
+    fired: list[str] = []
+    with _defer_registry() as registry:
+        try:
+            registry.register("flash_defer_probe", lambda: fired.append("first"))
+            registry.register("flash_defer_probe", lambda: fired.append("second"))
+            # registering is not applying: nothing has imported the target, so nothing may have run.
+            # this is the whole point -- at sitecustomize time, touching verl is what breaks ranks.
+            assert fired == []
+
+            import flash_defer_probe
+
+            # both bodies ran, in registration order, and the module they patched is fully executed
+            # by the time they see it.
+            assert fired == ["first", "second"]
+            assert flash_defer_probe.VALUE == "imported"
+            # the registry drains and takes itself back off meta_path once nothing is pending.
+            assert not any(f is registry for f in sys.meta_path)
+        finally:
+            sys.modules.pop("flash_defer_probe", None)
+
+
+def test_a_deferred_patch_registered_after_its_target_is_imported_applies_immediately(monkeypatch):
+    # ordering must not decide whether a patch happens. a target already in sys.modules has nothing
+    # left to intercept, so the body runs now rather than waiting for an import that will not come.
+    fired: list[str] = []
+    with _defer_registry() as registry:
+        monkeypatch.setitem(sys.modules, "flash_defer_present", types.ModuleType("x"))
+        registry.register("flash_defer_present", lambda: fired.append("now"))
+        assert fired == ["now"]
+
+
+def test_a_deferred_body_that_raises_still_fails_closed_through_the_import(tmp_path, monkeypatch):
+    """a fragment that cannot apply must kill the child, not let it train unpatched.
+
+    Deferral changes WHEN a body runs; it must not change what happens when one fails. The
+    exception has to come out of the child's own import of the target, which is how the run dies
+    instead of training with a silently missing patch.
+    """
+    (tmp_path / "flash_defer_boom.py").write_text("VALUE = 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("flash_defer_boom", None)
+
+    def _explode():
+        raise RuntimeError("fragment could not apply")
+
+    with _defer_registry() as registry:
+        try:
+            registry.register("flash_defer_boom", _explode)
+            with pytest.raises(RuntimeError, match="fragment could not apply"):
+                import flash_defer_boom  # noqa: F401
+        finally:
+            sys.modules.pop("flash_defer_boom", None)
+
+
+def test_the_rank_device_assert_is_inert_on_a_single_card_run():
+    # one rank cannot collide with itself and the collective path never runs, so the fragment must
+    # not render at all -- an assertion that can only ever pass is noise in every single-card log.
+    assert verl_shims.render_rank_device_assert_shim(1) == ""
+    assert verl_shims.render_rank_device_assert_shim(0) == ""
+    multi = verl_shims.render_rank_device_assert_shim(2)
+    assert multi
+    compile(multi, "sitecustomize.py", "exec")
+
+
+def test_the_rank_device_assert_compares_uuids_after_verls_own_init():
+    """the two properties that decide whether this check works at all.
+
+    It must read the binding AFTER verl's `Worker.__init__` (that is what applies ray's narrowing
+    and calls set_device -- checking before it measures the unpinned state and always passes), and
+    it must compare gpu UUIDs, not ordinals: with per-actor CUDA_VISIBLE_DEVICES every rank reports
+    ordinal 0 whether the mapping is correct or collapsed, so ordinals cannot tell the two apart.
+    """
+    source = verl_shims.render_rank_device_assert_shim(2)
+    wrapper = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "_flash_rank_init"
+    )
+
+    def _statement_calling(name: str) -> int:
+        for index, node in enumerate(wrapper.body):
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and getattr(inner.func, "id", "") == name:
+                    return index
+        raise AssertionError(f"{name} is not called in _flash_rank_init")
+
+    # structural ordering, not a comment: the original init has already returned by the statement
+    # that runs the check, so the binding being measured is the one ray actually applied.
+    assert _statement_calling("_flash_rank_original_init") < _statement_calling("_flash_rank_check")
+    assert "get_device_properties" in source
+    assert "uuid" in source
+    # a collision must raise rather than print: a warning in a log nobody reads is what the current
+    # failure already is.
+    assert "raise RuntimeError(" in source
+
+
+def _run_rank_device_check(tmp_path, monkeypatch, bindings):
+    """run the rendered check once per (rank, ordinal, uuid), against a fake torch and verl.
+
+    Returns the error each rank raised, or None. Ranks share one claims file exactly as they do on
+    the worker, which is what lets a rank see a device another rank already took.
+    """
+    claims = tmp_path / "rank_device_claims.txt"
+    monkeypatch.setenv("FLASH_RANK_DEVICE_CLAIMS", str(claims))
+    source = verl_shims.render_rank_device_assert_shim(len(bindings))
+    results = []
+    for rank, ordinal, uuid in bindings:
+        torch_stub = types.ModuleType("torch")
+        torch_stub.cuda = SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda ordinal=ordinal: ordinal,
+            get_device_properties=lambda _o, uuid=uuid: SimpleNamespace(uuid=uuid),
+        )
+
+        class _Worker:
+            def __init__(self):
+                pass
+
+        worker_module = types.ModuleType("verl.single_controller.base.worker")
+        worker_module.Worker = _Worker
+        base = types.ModuleType("verl.single_controller.base")
+        base.worker = worker_module
+        for name, module in {
+            "torch": torch_stub,
+            "verl": types.ModuleType("verl"),
+            "verl.single_controller": types.ModuleType("verl.single_controller"),
+            "verl.single_controller.base": base,
+            "verl.single_controller.base.worker": worker_module,
+        }.items():
+            monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setenv("RANK", str(rank))
+        monkeypatch.setenv("LOCAL_RANK", str(rank))
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(ordinal))
+        with _defer_registry():
+            _exec_shim_fragment(source)
+        try:
+            _Worker()
+            results.append(None)
+        except RuntimeError as exc:
+            results.append(str(exc))
+    return results
+
+
+def test_the_rank_device_assert_passes_when_every_rank_opened_its_own_card(tmp_path, monkeypatch):
+    # the healthy multi-card shape: distinct uuids, so nothing is refused. both ranks report
+    # ordinal 0 because ray gave each actor its own CUDA_VISIBLE_DEVICES -- which is exactly why
+    # ordinals cannot be the thing compared.
+    errors = _run_rank_device_check(tmp_path, monkeypatch, [(0, 0, "GPU-aaaa"), (1, 0, "GPU-bbbb")])
+    assert errors == [None, None]
+
+
+def test_the_rank_device_assert_refuses_when_two_ranks_land_on_one_card(tmp_path, monkeypatch):
+    # the failure that killed 7/7 multi-gpu runs. the second rank finds rank 0's uuid already
+    # claimed and refuses, minutes before nccl would abort with a pci id and no rank mapping.
+    errors = _run_rank_device_check(tmp_path, monkeypatch, [(0, 0, "GPU-same"), (1, 0, "GPU-same")])
+    assert errors[0] is None
+    assert errors[1] is not None
+    # the message has to carry the mapping: naming the colliding ranks is the entire diagnostic
+    # value over the nccl abort it front-runs.
+    assert "GPU-same" in errors[1]
+    assert "[0, 1]" in errors[1]
+
+
 def test_multimodal_rows_match_verl_placeholder_assertion():
     rows = rl_train.build_verl_dataset_rows(
         [
@@ -2313,7 +2606,25 @@ def test_the_reentrant_shim_installs_vision_input_grads_only_for_multimodal_runs
     assert "visual.patch_embed" in multimodal
     # the call has to land INSIDE the checkpointing branch: dedented one level it would run for
     # every module verl builds, including engines whose checkpointing verl deliberately left off.
-    assert "\n        _flash_install_vision_input_grads(module)\n" in multimodal
+    # asserted over the PARSED tree rather than a fixed indent, because the whole fragment is
+    # indented into a deferred body (see shims._deferred_patch) and a literal-column check would
+    # then fail for a reason that has nothing to do with where the call sits.
+    import ast as _ast
+
+    guards = [
+        node
+        for node in _ast.walk(_ast.parse(multimodal))
+        if isinstance(node, _ast.If) and "enable_gradient_checkpointing" in _ast.dump(node.test)
+    ]
+    assert len(guards) == 1, "expected exactly one gradient-checkpointing guard"
+    nested = [
+        node
+        for node in _ast.walk(guards[0])
+        if isinstance(node, _ast.Call)
+        and isinstance(node.func, _ast.Name)
+        and node.func.id == "_flash_install_vision_input_grads"
+    ]
+    assert nested, "the vision hook must be called inside the checkpointing branch"
     # the flag is independent of the shim: a multimodal run on a model that does not need reentrant
     # checkpointing gets no shim at all, and therefore no hook.
     assert rl_train.render_reentrant_checkpointing_shim(False, multimodal=True) == ""
@@ -2522,7 +2833,7 @@ def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alon
         for name in parents:
             sys.modules.setdefault(name, types.ModuleType(name))
         sys.modules[module_stub.__name__] = module_stub
-        exec(rl_train.render_reentrant_checkpointing_shim(True), {})
+        _exec_shim_fragment(rl_train.render_reentrant_checkpointing_shim(True))
         # checkpointing on -> the flag is put back to reentrant, and the lora-frozen embeddings
         # get input grads so the checkpointed segment actually produces a backward (GRAD-001)
         engine = _Engine(True)
@@ -2669,7 +2980,7 @@ def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(source, "sitecustomize.py", "exec"), {})
+        _exec_shim_fragment(source)
         asyncio.run(_AgentLoopWorker()._run_agent_loop({"temperature": 1.0}))
     finally:
         for name in stubs:
@@ -2736,7 +3047,7 @@ def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(source, "sitecustomize.py", "exec"), {})
+        _exec_shim_fragment(source)
         # called exactly as verl calls it (agent_loop.py:583): two positionals plus keywords.
         asyncio.run(
             _AgentLoopWorker()._run_agent_loop(
@@ -2889,7 +3200,7 @@ def _load_kl_ref_engine():
         sys.modules[name] = module
     try:
         source = rl_train.render_kl_ref_adapter_shim(True)
-        exec(compile(source, "sitecustomize.py", "exec"), {})
+        _exec_shim_fragment(source)
     finally:
         for name in stubs:
             sys.modules.pop(name, None)
@@ -6287,7 +6598,7 @@ def _run_per_turn_shim(rows, uids, episode_advantages, response_mask=None):
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(rl_train.render_per_turn_credit_shim(True), "sitecustomize.py", "exec"), {})
+        _exec_shim_fragment(rl_train.render_per_turn_credit_shim(True))
         # call the module global by name, exactly as ray_trainer.fit does at its call site.
         out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
     finally:
@@ -6461,7 +6772,7 @@ def test_per_turn_credit_shim_passes_through_a_batch_without_per_turn_metadata()
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(rl_train.render_per_turn_credit_shim(True), "sitecustomize.py", "exec"), {})
+        _exec_shim_fragment(rl_train.render_per_turn_credit_shim(True))
         out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
     finally:
         for name in stubs:
@@ -6877,6 +7188,9 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
     files = _shim_files(tmp_path)
     inp = {
+        # one card: the rank/device assertion renders empty, so it owes no marker here. the
+        # multi-card case is pinned by the test below.
+        "dp_cards": 1,
         "reentrant_checkpointing": True,
         "multimodal": False,
         "entropy_quantile": 0.2,
@@ -6910,6 +7224,38 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
     # that raised must not be able to cost the run its tensor-core throughput.
     assert source.index("tf32") < source.index("_FLASH_SHIM_MARKER_FILE")
     assert f"_flash_shim_os._exit({backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE})" in source
+
+
+def test_write_rl_shim_puts_the_rank_device_assert_first_when_the_run_spans_cards(
+    tmp_path, monkeypatch
+):
+    # the whole point of the assertion is to report a collapsed rank->device map before the model
+    # load that currently buries it, so it owes a marker and it owes the first position. a run that
+    # reaches nccl before this fragment applies has already lost the diagnostic.
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    files = _shim_files(tmp_path)
+    inp = {
+        "dp_cards": 2,
+        "reentrant_checkpointing": True,
+        "multimodal": False,
+        "entropy_quantile": None,
+        "per_turn_credit": False,
+        "stop_sequences": (),
+        "image_pad_token_id": None,
+        "structured_outputs": None,
+        "save_at_steps": (),
+        "steps": 20,
+        "warmstart_adapter": None,
+        "kl_coef": 0.0,
+        "multi_turn": False,
+    }
+    expected = rl_train._write_rl_shim(inp, files)
+    assert expected == ["rank-device-assert", "reentrant-checkpointing"]
+    source = Path(files["shim_py"]).read_text()
+    compile(source, "sitecustomize.py", "exec")
+    assert source.index("_flash_record_applied_shim('rank-device-assert')") < source.index(
+        "_flash_record_applied_shim('reentrant-checkpointing')"
+    )
 
 
 def test_the_gdn_varlen_append_is_wrapped_and_extends_the_expected_marker_set():
