@@ -64,6 +64,10 @@ from flash.core.catalog import ALGORITHMS
 # argv flags whose VALUE is a credential, so it must never be echoed back to the user. both the
 # freesolo key (`flash login`) and the HuggingFace token (`flash models export`) use this name.
 _CREDENTIAL_FLAGS = frozenset({"--api-key"})
+# long options that share a prefix with a credential flag and would make an abbreviation ambiguous.
+# argparse refuses an ambiguous abbreviation, so it never binds a value and cannot leak one; this
+# only exists so the redaction agrees with the parser about which spellings are real.
+_CREDENTIAL_PREFIX_RIVALS = frozenset({"--api-url"})
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
@@ -853,6 +857,26 @@ def _warn_if_login_shadowed(args) -> None:
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
+def _is_credential_flag(arg: str) -> bool:
+    """Whether `arg` is a credential flag, including the abbreviations argparse accepts.
+
+    argparse allows any unambiguous prefix of a long option, so `--api-k` and `--api-ke` both reach
+    `api_key`. Matching the full spelling exactly would leave those spellings unredacted and print
+    the key -- the redaction would look correct while missing every abbreviated invocation.
+
+    A bare prefix is deliberately NOT enough: `--api` is ambiguous between `--api-key` and
+    `--api-url`, so argparse rejects it and no value is ever bound. Redacting it anyway would be
+    harmless here, but requiring a unique match keeps this in step with what the parser accepts.
+    """
+    if not arg.startswith("--") or len(arg) <= 2:
+        return False
+    if not any(flag.startswith(arg) for flag in _CREDENTIAL_FLAGS):
+        return False
+    # ambiguity is judged against the rival options too: `--api` matches `--api-key` here, but
+    # argparse still refuses it because `--api-url` also starts that way.
+    return not any(rival.startswith(arg) for rival in _CREDENTIAL_PREFIX_RIVALS)
+
+
 def _redacted_args(raw_args: list[str]) -> list[str]:
     """`raw_args` with any credential value replaced, for echoing a command back to the user.
 
@@ -868,14 +892,14 @@ def _redacted_args(raw_args: list[str]) -> list[str]:
             redacted.append("<redacted>")
             drop_value = False
             continue
-        if arg in _CREDENTIAL_FLAGS:
+        if _is_credential_flag(arg):
             redacted.append(arg)
             drop_value = True
             continue
         flag, sep, _ = arg.partition("=")
         # `--api-key=secret` is one argv entry, so the split form has to be handled separately or
         # the value rides along inside it.
-        redacted.append(f"{flag}=<redacted>" if sep and flag in _CREDENTIAL_FLAGS else arg)
+        redacted.append(f"{flag}=<redacted>" if sep and _is_credential_flag(flag) else arg)
     return redacted
 
 

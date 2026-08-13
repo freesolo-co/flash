@@ -121,6 +121,39 @@ def test_unexpected_error_suggestion_does_not_replay_a_credential():
 
     # a non-credential flag keeps its value: the suggestion is only useful if it stays runnable.
     assert _redacted_args(["runs", "status", "--json"]) == ["runs", "status", "--json"]
+    assert _redacted_args(["login", "--api-url", "https://x"]) == [
+        "login",
+        "--api-url",
+        "https://x",
+    ]
+
+
+def test_unexpected_error_suggestion_redacts_abbreviated_credential_flags():
+    """argparse accepts any unambiguous prefix of a long option, and those bind the value too.
+
+    `flash login --api-k SECRET` and `--api-ke=SECRET` both populate `api_key`, so matching only the
+    full `--api-key` spelling leaves every abbreviated invocation printing the credential. The
+    parser is asserted here alongside the redaction: the point is that these spellings are real,
+    not hypothetical.
+    """
+    from flash.cli import _build_parser, _redacted_args
+
+    parser = _build_parser()
+    for argv in (["login", "--api-k", "fs_SUPERSECRET"], ["login", "--api-ke=fs_SUPERSECRET"]):
+        assert parser.parse_args(argv).api_key == "fs_SUPERSECRET", "abbreviation must be real"
+        assert not any("fs_SUPERSECRET" in part for part in _redacted_args(argv))
+
+    # the HF token on `models export` uses the same flag name and needs the same coverage.
+    export = _redacted_args(["models", "export", "--api-k", "hf_SUPERSECRET"])
+    assert not any("hf_SUPERSECRET" in part for part in export)
+
+    # `--api` is ambiguous (--api-key vs --api-url), so argparse binds nothing and there is no
+    # value to leak. redaction agrees with the parser rather than inventing a match.
+    ambiguous_accepted = False
+    with contextlib.suppress(SystemExit):
+        parser.parse_args(["login", "--api", "fs_SUPERSECRET"])
+        ambiguous_accepted = True
+    assert not ambiguous_accepted, "an ambiguous abbreviation must not bind a credential"
 
 
 def test_train_without_login_fails_fast():
