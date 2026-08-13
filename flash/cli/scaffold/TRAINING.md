@@ -1222,26 +1222,46 @@ def step_episode(self, example, messages, assistant_response):
     ...
 ```
 
-Replaying all of `messages` and then applying `assistant_response` again double-applies every
-action. How loudly that fails depends entirely on the action: if applying an action twice is
-not the same as applying it once, you tend to notice quickly. If it **is** the same, you do
-not notice at all. Any toggle, any parity or XOR update, any set insert, any idempotent write
-absorbs the duplicate silently, and the episode simply never advances: the terminal condition
-is never reached, `done` never fires, and every rollout burns the full turn cap.
+That shape rebuilds state from the actions alone, which is right when your observations are a
+deterministic function of them. If an observation carries information the actions do not (a
+sampled outcome, a tool result, anything external), replay it too: iterate the same
+`messages[:-1]` and branch on `message["role"]` so both the actions and the state-bearing
+observations are folded back in. The `[:-1]` is the part that matters; what you do with each
+role is your environment's business.
 
-That failure is invisible to the usual checks. `flash env test` can report `overall: PASS`
-with every contract check green, because it does not require a gold trajectory to terminate,
-only to outscore a junk answer, and a partially-credited stuck episode clears that bar. Your
-own unit tests can miss it too, in the opposite direction: a test that calls `step_episode`
-directly with `messages[:-1]` is exercising a call shape the trainer never produces, so it
-passes on an environment training cannot solve.
+Replaying all of `messages` and then applying `assistant_response` again applies the **newest**
+action twice on every call. Earlier actions still appear once; it is the turn you were handed
+that gets duplicated. What that does to your state depends on the transition:
 
-The reliable signal is the turn count, not the verdict. Check that a gold trajectory both
-terminates and takes the number of turns it should: an episode that always runs to the cap on
-a task with a short known solution is the symptom, and a `PASS` beside it does not make it
-less wrong. Drive that check through the real rollout path (`flash env test`, or the loader
-plus the adapter hooks) rather than by calling `step_episode` yourself, so the convention
-under test is the one training uses.
+- **Self-inverse** (a toggle, a parity or XOR update): the two applications cancel, so the
+  state you step and score is one action behind the transcript. The action does land on the
+  next call, where it is no longer the newest, so the episode advances but always trails by
+  one, and a terminal condition checked at the moment it should first hold is missed.
+- **Idempotent** (a set insert, an overwrite-with-the-same-value): the duplicate is absorbed
+  and the state is correct. This one is genuinely harmless.
+- **Anything else** (a counter, an append, a charge, a move that composes): the newest action
+  is over-applied, and the state runs ahead of the transcript.
+
+None of these raise. The self-inverse case is the one that bites hardest, because "off by one
+action, forever" reads as a model that never solves the task rather than as a broken
+environment: on a Lights Out board, where each press is its own inverse over GF(2), gold
+trajectories ran the full turn cap and scored 0.60-0.65 instead of 1.0.
+
+The usual checks do not catch this. `flash env test` does not require a gold trajectory to
+terminate or to score well; it checks that your hooks run to completion and returns finite
+rewards. Its blocking reward gate is narrow by design: it fires only for GRPO, and only when
+**every** replayed gold episode scores exactly zero, no per-turn signal separates them, and a
+deliberately wrong answer scores at least as well. A gold episode collecting partial credit
+never reaches that comparison, so `overall: PASS` is expected here rather than surprising.
+Your own tests can miss it from the other side: one that calls `step_episode` directly with
+`messages[:-1]` is exercising a call shape the trainer never produces.
+
+So check the turn count, not just the verdict. A gold trajectory should terminate in about the
+number of turns the task needs, and one that always runs to the cap on a task with a short
+known solution is the symptom worth chasing; a `PASS` beside it does not make it less wrong.
+Drive that check through the real rollout path (`flash env test`, or the loader plus the
+adapter hooks) rather than by calling `step_episode` yourself, so the convention under test is
+the one training uses.
 
 **Measure efficiency against each example's own optimum, not the turn budget.** A reward
 like `1 - turns_taken / max_turns` makes perfect play unreachable: an example whose best
