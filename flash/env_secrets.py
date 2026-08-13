@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import IO
 
 from flash.env_formats import (
+    _MAX_ARCHIVE_MEMBERS,
     _UNEXPANDABLE_MAGIC,
     _ZIP_TAIL_BYTES,
     _has_zip_end_record,
@@ -184,8 +185,13 @@ _LITERAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
             # Ed448 or X448 key publish intact; the four are one contiguous range.
             rb"\x02\x01\x00\x30.\x06(?:\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
             rb"|\x03\x2b\x65[\x6e-\x71]|\x07\x2a\x86\x48\xce\x3d\x02\x01)"
-            # PKCS#1 RSAPrivateKey: version 0 then a long-form modulus INTEGER
-            rb"|\x30\x82..\x02\x01\x00\x02\x82"
+            # PKCS#1 RSAPrivateKey: version 0 then the modulus INTEGER, whose length may be stated
+            # in any of DER's three forms. Requiring `\x02\x82` recognised only 2048-bit and larger
+            # keys: `openssl rsa -outform DER -traditional` writes `02 81 81` for a 1024-bit key
+            # and a short-form `02 41` for a 512-bit one, so both published intact. `0x81` and
+            # `0x82` introduce a 1- and 2-byte length; a short form below 0x80 IS the length, and
+            # is bounded from 0x40 up so an ordinary `02 01 00 02 xx` byte sequence does not match.
+            rb"|\x30\x82..\x02\x01\x00\x02(?:\x82..|\x81.|[\x40-\x7f])\x00"
             # SEC1 ECPrivateKey: version 1, a curve-sized scalar, then the [0] curve parameters
             rb"|\x02\x01\x01\x04(?:\x20.{32}|\x30.{48}|\x42.{66})\xa0"
             # EncryptedPrivateKeyInfo: `openssl pkcs8 -topk8 -passout` in DER. The plaintext key is
@@ -217,7 +223,17 @@ _SCAN_OVERLAP_BYTES = 1024
 # no upper bound: capping the run split a long encoded file into adjacent pieces, and a credential
 # straddling the cut decoded into neither half -- so base64 of a whole `env.sh` published clean.
 # Length is instead bounded by `_decode_windows` below, which slides a window over the run.
-_BASE64_RUN = re.compile(rb"[A-Za-z0-9+/]{24,}={0,2}")
+#
+# The URL-safe alphabet (`-` and `_` for `+` and `/`, RFC 4648 section 5) is admitted too. It is
+# what `base64.urlsafe_b64encode`, a JWT, and most token-in-a-URL configs emit, and accepting only
+# `+/` split such a value at its first `-` so the fragments decoded to neither the whole token nor
+# anything matching. The two alphabets are disjoint apart from the shared 62 characters, so one
+# pattern covers both and the decode below translates whichever pair is present.
+_BASE64_RUN = re.compile(rb"[A-Za-z0-9+/\-_]{24,}={0,2}")
+
+# Maps the URL-safe alphabet onto the standard one so a single decoder handles both. A run mixing
+# the two is not valid base64 either way, and translating it simply fails to decode as before.
+_URL_SAFE_ALPHABET = bytes.maketrans(b"-_", b"+/")
 
 # A fixed-width wrapped base64 block: one or more full-width lines, then a final line of any
 # length. The widths are the two conventions in use -- 76 for MIME (`base64.encodebytes`, mail,
@@ -282,12 +298,14 @@ _MAX_NESTED_BUFFER_BYTES = 64 << 20
 # 5,000 x 60s of expansion from an authenticated `POST /v1/envs` while every individual file stayed
 # inside the apparent one-minute limit.
 _MAX_DECOMPRESS_SECONDS = 60.0
-# How many members of ONE archive to enumerate. `ZipFile` reads the entire central directory up
-# front, so a nested archive of millions of empty entries materialises millions of `ZipInfo`
-# objects before any per-member budget is consulted -- and empty members never enter the read loop
-# that checks the deadline, so neither bound could stop it. The package extractor counts such an
-# archive as a single ordinary file, so this is the only place the inner count is bounded.
-_MAX_ARCHIVE_MEMBERS = 100_000
+# How many members of ONE archive to enumerate, imported above. `ZipFile` reads the entire central
+# directory up front, so a nested archive of millions of empty entries materialises millions of
+# `ZipInfo` objects before any per-member budget is consulted -- and empty members never enter the
+# read loop that checks the deadline, so neither bound could stop it. The package extractor counts
+# such an archive as a single ordinary file, so this is the only place the inner count is bounded.
+#
+# Every read of it is in THIS module, and the directory walk takes it as an argument rather than
+# reading it from its own, so rebinding it here still governs the whole check.
 
 # An all-hex body of key length. Recognised so `_is_high_entropy` admits a legacy 40-hex W&B key,
 # whose lowercase letters would otherwise read as the hand-written-placeholder convention.
@@ -413,7 +431,7 @@ def _match_base64(data: bytes) -> str | None:
                 if len(chunk) < 24:
                     continue
                 try:
-                    decoded = base64.b64decode(chunk, validate=True)
+                    decoded = base64.b64decode(chunk.translate(_URL_SAFE_ALPHABET), validate=True)
                 except (ValueError, binascii.Error):
                     continue
                 if kind := _match(decoded):
@@ -652,8 +670,9 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
     # `ZipInfo`, so a bound checked after it is charged the cost it exists to avoid -- measured at
     # 1.8 seconds and 239 MB of resident memory for 400,000 empty entries in a 35 MB file, all of
     # it spent before the per-member loop below ran once.
-    if _zip_member_count(source) > _MAX_ARCHIVE_MEMBERS:
+    if _zip_member_count(source, _MAX_ARCHIVE_MEMBERS) > _MAX_ARCHIVE_MEMBERS:
         raise _Unscannable("contains an archive with too many members to inspect")
+    encrypted = False
     with zipfile.ZipFile(source if isinstance(source, Path) else io.BytesIO(source)) as archive:
         for count, info in enumerate(archive.infolist(), 1):
             if count > _MAX_ARCHIVE_MEMBERS:
@@ -662,12 +681,25 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
                 raise _Unscannable("takes too long to decompress")
             if info.is_dir():
                 continue
+            # Bit 0 of the general-purpose flags marks an encrypted member. Its bytes cannot be
+            # read without the password, so treating it as clean approved a package whose only copy
+            # of a credential was inside -- `zip -P` around a key file published intact.
+            #
+            # Noted and raised AFTER the loop rather than here, because the members behind it must
+            # still be scanned: refusing on sight would abandon the rest of the archive, and a
+            # credential further down would go unreported in favour of a weaker message about an
+            # unreadable member. A found credential is the more specific answer, so it wins.
+            if info.flag_bits & 0x01:
+                encrypted = True
+                continue
             try:
                 with archive.open(info) as member:
                     if kind := _scan_stream(member, deadline=deadline, depth=depth):
                         return kind
             except _UNREADABLE_ARCHIVE:
                 continue  # this member is opaque; the rest of the archive still gets scanned
+    if encrypted:
+        raise _Unscannable("contains an encrypted archive member this check cannot read")
     return None
 
 

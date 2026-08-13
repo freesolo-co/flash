@@ -1915,17 +1915,20 @@ def test_credential_scan_survives_archives_the_stdlib_refuses_to_read(tmp_path):
     import struct
     import zipfile
 
-    from flash.env_secrets import credential_in_file
+    from flash.env_secrets import _Unscannable, credential_in_file
 
     plain = tmp_path / "plain.zip"
     with zipfile.ZipFile(plain, "w") as archive:
         archive.writestr("member.txt", "ordinary content " * 20)
     source = plain.read_bytes()
 
-    # bit 0 of the general-purpose flag marks a member encrypted -> RuntimeError
+    # bit 0 of the general-purpose flag marks a member encrypted -> RuntimeError.
+    # Refused rather than approved: its bytes cannot be read, and unreadable is not clean. What
+    # this test pins is that the stdlib exception does not escape as a traceback.
     encrypted = tmp_path / "encrypted.zip"
     encrypted.write_bytes(_flip_zip_flags(source, offset_local=6, offset_central=8, value=b"\x01"))
-    assert credential_in_file(encrypted) is None
+    with pytest.raises(_Unscannable, match="encrypted archive member"):
+        credential_in_file(encrypted)
 
     # method 99 is AES, which zipfile does not implement -> NotImplementedError
     unsupported = tmp_path / "unsupported.zip"
@@ -2025,9 +2028,15 @@ def test_an_unreadable_zip_member_does_not_hide_the_members_behind_it(tmp_path):
 
 
 def test_every_member_unreadable_is_not_an_error(tmp_path):
+    """An archive nothing can be read from is refused, not approved.
+
+    An encrypted member is guarded so it cannot mask the members behind it, but when NO member
+    could be read the archive has been inspected in name only. Returning None there approved a
+    package whose only copy of a credential sat inside it.
+    """
     import zipfile
 
-    from flash.env_secrets import credential_in_file
+    from flash.env_secrets import _Unscannable, credential_in_file
 
     path = tmp_path / "opaque.zip"
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -2040,7 +2049,8 @@ def test_every_member_unreadable_is_not_an_error(tmp_path):
             raw[index + 8] |= 0x01
     path.write_bytes(bytes(raw))
 
-    assert credential_in_file(path) is None
+    with pytest.raises(_Unscannable, match="encrypted archive member"):
+        credential_in_file(path)
 
 
 def test_a_corrupt_xz_does_not_crash_the_publish(tmp_path):
@@ -3277,3 +3287,179 @@ def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
         b"-----BEGIN RSA PRIVATE KEY-----\nDEK-Info: AES-128-CBC\n",
     ):
         assert _credential_kind(real) == "a private key block", real
+
+
+def test_an_encrypted_zip_member_is_refused_rather_than_skipped(tmp_path):
+    """A password-encrypted member's bytes cannot be read, and unreadable is not clean.
+
+    `archive.open()` raises `RuntimeError` for one, which `_UNREADABLE_ARCHIVE` caught as an
+    opaque member and skipped -- so a package whose only copy of a credential sat inside an
+    encrypted member was approved.
+    """
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    readable = tmp_path / "readable.zip"
+    with zipfile.ZipFile(readable, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("key", f'export KEY="fslo_{_FAKE_KEY_BODY}"\n' * 20)
+    # deflated, so the credential is not sitting in the raw bytes for the outer scan to find
+    assert f"fslo_{_FAKE_KEY_BODY}".encode() not in readable.read_bytes()
+    assert credential_in_file(readable) == "a Freesolo API key"
+
+    # the same archive with bit 0 of the general-purpose flags set on the member
+    raw = bytearray(readable.read_bytes())
+    raw[raw.find(b"PK\x03\x04") + 6] |= 0x01
+    raw[raw.find(b"PK\x01\x02") + 8] |= 0x01
+    encrypted = tmp_path / "encrypted.zip"
+    encrypted.write_bytes(bytes(raw))
+    with pytest.raises(_Unscannable, match="encrypted archive member"):
+        credential_in_file(encrypted)
+
+
+def test_a_patched_member_count_cannot_shrink_a_real_central_directory(tmp_path):
+    """`ZipFile` walks the central directory by SIZE, not by the end record's count field.
+
+    Patching both count fields of a real 500-entry archive down to 1 left every entry materialized
+    while the bound saw a single member, restoring the memory and CPU exposure the bound exists to
+    prevent. The directory is walked instead, which reads the same bytes without allocating a
+    `ZipInfo` per entry.
+    """
+    import zipfile
+
+    from flash import env_secrets as secrets
+    from flash.env_secrets import _Unscannable, _zip_member_count, credential_in_file
+
+    crowded = tmp_path / "crowded.zip"
+    with zipfile.ZipFile(crowded, "w", zipfile.ZIP_STORED) as archive:
+        for index in range(500):
+            archive.writestr(f"{index}", b"")
+    raw = bytearray(crowded.read_bytes())
+    end = raw.rfind(b"PK\x05\x06")
+    raw[end + 8 : end + 10] = (1).to_bytes(2, "little")
+    raw[end + 10 : end + 12] = (1).to_bytes(2, "little")
+    patched = tmp_path / "patched.zip"
+    patched.write_bytes(bytes(raw))
+
+    # the archive really does still hold all 500, whatever its end record claims
+    with zipfile.ZipFile(patched) as archive:
+        assert len(archive.infolist()) == 500
+    assert _zip_member_count(patched) == 500
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(secrets, "_MAX_ARCHIVE_MEMBERS", 100)
+    try:
+        with pytest.raises(_Unscannable, match="too many members"):
+            credential_in_file(patched)
+    finally:
+        monkeypatch.undo()
+
+
+def test_a_v7_tar_with_a_non_ascii_name_is_still_expanded(tmp_path):
+    """The signed-checksum branch built a `bytes` from values that go negative above 127.
+
+    Any V7 header holding a non-ASCII byte -- a UTF-8 filename is enough -- raised `ValueError`
+    there. Inside a zip that surfaced as an unreadable member and was skipped, so a credential
+    compressed within the tar was approved.
+    """
+    import gzip
+    import subprocess
+    import zipfile
+
+    from flash.env_secrets import credential_in_file
+
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "é.gz").write_bytes(gzip.compress(f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode()))
+    archive = tmp_path / "v7.tar"
+    subprocess.run(
+        ["tar", "--format=v7", "-cf", str(archive), "-C", str(source), "é.gz"],
+        check=True,
+        capture_output=True,
+    )
+    assert archive.read_bytes()[257:265] == b"\x00" * 8, "the fixture must have no ustar magic"
+    assert any(byte > 127 for byte in archive.read_bytes()[:512]), "header must be non-ASCII"
+    assert credential_in_file(archive) == "a Freesolo API key"
+
+    # and nested inside a zip, where the exception was swallowed as an unreadable member
+    nested = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested, "w", zipfile.ZIP_DEFLATED) as outer:
+        outer.write(archive, "inner.tar")
+    assert credential_in_file(nested) == "a Freesolo API key"
+
+
+def test_a_url_safe_base64_credential_is_decoded():
+    """RFC 4648 section 5 swaps `+/` for `-_`, which is what a JWT or a token-in-a-URL uses.
+
+    Accepting only the standard alphabet split such a value at its first `-`, and the surviving
+    fragments decoded to neither the whole token nor anything matching.
+    """
+    import base64
+
+    from flash.env_secrets import _credential_kind
+
+    # a leading 0xf8 byte is what forces the differing character into the encoding
+    raw = b"\xf8fslo_" + _FAKE_KEY_BODY.encode()
+    standard = base64.b64encode(raw)
+    url_safe = base64.urlsafe_b64encode(raw)
+    assert standard != url_safe, "the fixture must actually differ between the two alphabets"
+
+    assert _credential_kind(standard) == "a Freesolo API key"
+    assert _credential_kind(url_safe) == "a Freesolo API key"
+
+
+def test_every_pkcs1_modulus_length_form_is_recognised(tmp_path):
+    """DER states a length in three forms, and only the 2-byte one was matched.
+
+    `openssl rsa -outform DER -traditional` writes `02 82` for 2048-bit and larger keys, `02 81 81`
+    for a 1024-bit key and a short-form `02 41` for a 512-bit one, so every key below 2048 bits
+    published intact despite being a private key.
+    """
+    import subprocess
+
+    from flash.env_secrets import credential_in_file
+
+    for bits in (512, 1024, 2048, 4096):
+        pem, der = tmp_path / f"{bits}.pem", tmp_path / f"{bits}.der"
+        subprocess.run(
+            ["openssl", "genrsa", "-out", str(pem), str(bits)], check=True, capture_output=True
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "rsa",
+                "-in",
+                str(pem),
+                "-outform",
+                "DER",
+                "-traditional",
+                "-out",
+                str(der),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        assert credential_in_file(der) == "a private key", bits
+
+    # an ordinary binary that happens to carry the version prefix is not a key
+    plain = tmp_path / "weights.bin"
+    plain.write_bytes(b"\x30\x82\x00\x10\x02\x01\x00\x02\x00" + b"\x41" * 4096)
+    assert credential_in_file(plain) is None
+
+
+def test_an_openpgp_packet_shorter_than_its_fields_is_not_a_key(tmp_path):
+    """The declared body length must reach the version, timestamp and algorithm actually read.
+
+    Ignoring it read those fields from BEYOND the packet, so `c5 01 04 00 00 00 00 01` -- an
+    ordinary binary declaring a one-byte body -- was refused as a private key.
+    """
+    from flash.env_secrets import _is_openpgp_secret_key, credential_in_file
+
+    assert not _is_openpgp_secret_key(bytes.fromhex("c501040000000001"))
+    short = tmp_path / "short.bin"
+    short.write_bytes(bytes.fromhex("c501040000000001") + b"\x00" * 200)
+    assert credential_in_file(short) is None
+
+    # a packet whose declared length DOES cover its fields is still a key
+    real = bytes([0xC5, 20]) + b"\x04" + b"\x6a\x7e\x24\x0a" + b"\x01" + b"\x00" * 16
+    assert _is_openpgp_secret_key(real)

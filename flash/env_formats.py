@@ -19,6 +19,15 @@ from pathlib import Path
 _ZIP_END_RECORD = b"PK\x05\x06"
 _ZIP_TAIL_BYTES = (64 << 10) + 64
 
+# A central-directory record's fixed part, before its variable-length name, extra field and
+# comment. Used to step from one record to the next while counting them.
+_ZIP_CENTRAL_HEADER_BYTES = 46
+
+# How many members of one archive are inspected before it is refused as unscannable. Defined here
+# because the directory walk below needs a bound of its own, and re-exported through
+# `flash.env_secrets`, which is where the policy is applied and where tests rebind it.
+_MAX_ARCHIVE_MEMBERS = 100_000
+
 # Leading bytes of the compressed containers worth expanding. Detected by magic rather than by
 # extension, since the extension is the publisher's choice and a renamed archive is still an
 # archive.
@@ -94,8 +103,28 @@ def _is_openpgp_secret_key(head: bytes) -> bool:
         offset = lengths.get(head[0] & 0x03, 0)
     if offset == 0 or len(head) <= offset or head[offset] not in (4, 6):
         return False
+    # The declared body length must actually reach the fields read below. A packet claiming a
+    # one-byte body cannot hold a version, a four-byte timestamp and an algorithm, so reading them
+    # takes bytes from BEYOND the packet -- `c5 01 04 00 00 00 00 01` is an ordinary binary that
+    # was refused as a private key. Old-format length type 3 is indeterminate, which declares no
+    # length at all, and is already excluded by the table above.
+    body = _openpgp_body_length(head, offset)
+    if body is not None and body < 6:
+        return False
     # then a four-byte creation timestamp, then the algorithm
     return len(head) > offset + 5 and head[offset + 5] in algorithms
+
+
+def _openpgp_body_length(head: bytes, offset: int) -> int | None:
+    """The body length an OpenPGP packet header declares, or None if it is not stated."""
+    if head[0] in (0xC5, 0xC7):
+        first = head[1]
+        if first < 192:
+            return first
+        if first < 224:
+            return ((first - 192) << 8) + head[2] + 192 if len(head) > 2 else None
+        return int.from_bytes(head[2:6], "big") if len(head) > 5 else None
+    return int.from_bytes(head[1:offset], "big")
 
 
 def _looks_like_tar(source: Path | bytes) -> bool:
@@ -148,10 +177,13 @@ def _has_tar_checksum(source: Path | bytes) -> bool:
         return False
     # the checksum is computed with its own field taken as eight spaces
     blanked = block[:148] + b" " * 8 + block[156:]
-    return stored in (
-        sum(blanked),
-        sum(bytes(byte - 256 if byte > 127 else byte for byte in blanked)),
-    )
+    # Historic tars signed the header bytes, so both sums are accepted. The signed one is summed
+    # as integers rather than rebuilt through `bytes()`: a negative value is not a byte, so any
+    # header holding a byte above 127 -- a UTF-8 filename is enough -- raised `ValueError` here.
+    # That propagated out of `_looks_like_tar`, where the zip handler caught it as an unreadable
+    # member and skipped it, so a v7 tar with a non-ASCII name inside a zip published intact.
+    signed = sum(byte - 256 if byte > 127 else byte for byte in blanked)
+    return stored in (sum(blanked), signed)
 
 
 def _has_zip_end_record(tail: bytes) -> bool:
@@ -177,11 +209,51 @@ def _has_zip_end_record(tail: bytes) -> bool:
     return False
 
 
-def _zip_member_count(source: Path | bytes) -> int:
-    """The member count a zip's end-of-central-directory record claims, or 0 if unreadable.
+def _zip_directory_entries(
+    source: Path | bytes, tail: bytes, offset: int, limit: int
+) -> int | None:
+    """How many central-directory records a zip really holds, or None if it cannot be walked.
 
-    Read from the record rather than from a parsed archive so an absurd count can be refused
-    before `ZipFile` materializes that many `ZipInfo` objects.
+    Counted by stepping over the records rather than by trusting the end record's count field,
+    which is attacker-controlled and does not govern what `ZipFile` actually parses.
+
+    Stops one past `limit`: the caller only needs to know the bound is exceeded, and walking an
+    unbounded directory would make this counter the very cost it exists to prevent.
+    """
+    size = int.from_bytes(tail[offset + 12 : offset + 16], "little")
+    start = int.from_bytes(tail[offset + 16 : offset + 20], "little")
+    if size == 0 or size == 0xFFFFFFFF or start == 0xFFFFFFFF:
+        return None
+    try:
+        if isinstance(source, Path):
+            with source.open("rb") as handle:
+                handle.seek(start)
+                directory = handle.read(size)
+        else:
+            directory = source[start : start + size]
+    except OSError:
+        return None
+    count, cursor = 0, 0
+    while cursor + _ZIP_CENTRAL_HEADER_BYTES <= len(directory):
+        if directory[cursor : cursor + 4] != b"PK\x01\x02":
+            return None  # not a directory record, so this walk proves nothing
+        name, extra, comment = (
+            int.from_bytes(directory[cursor + at : cursor + at + 2], "little")
+            for at in (28, 30, 32)
+        )
+        cursor += _ZIP_CENTRAL_HEADER_BYTES + name + extra + comment
+        count += 1
+        if count > limit:
+            break
+    return count
+
+
+def _zip_member_count(source: Path | bytes, limit: int = _MAX_ARCHIVE_MEMBERS) -> int:
+    """How many members a zip holds, or 0 if that cannot be read.
+
+    Read without parsing the archive so an absurd count can be refused before `ZipFile`
+    materializes that many `ZipInfo` objects. `limit` is passed in rather than read from the module
+    so the caller's bound -- which tests rebind -- governs how far the directory walk goes.
 
     A count of `0xffff` is the zip64 sentinel: the true count lives in the zip64 record, which is
     read instead. Treating the sentinel as a literal 65,535 would wave through the archives that
@@ -204,6 +276,14 @@ def _zip_member_count(source: Path | bytes) -> int:
     if offset < 0 or len(tail) < offset + 12:
         return 0
     total = int.from_bytes(tail[offset + 10 : offset + 12], "little")
+    # The claimed count is not trusted on its own. `ZipFile` walks the central directory by its
+    # SIZE (`while total < size_cd`), not by this count, so patching both count fields of a real
+    # 500-entry archive down to 1 left all 500 entries materialized while this bound saw one
+    # member. The directory itself is walked instead, which is the same bytes the constructor
+    # reads but without allocating a `ZipInfo` per entry -- the cost this bound exists to avoid.
+    walked = _zip_directory_entries(source, tail, offset, limit)
+    if walked is not None:
+        total = max(total, walked)
     if total != 0xFFFF:
         return total
     # zip64 end-of-central-directory: the 8-byte total sits 32 bytes into its own record
