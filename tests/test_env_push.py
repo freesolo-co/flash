@@ -1836,27 +1836,28 @@ def test_narrowing_does_not_invent_a_credential_out_of_machine_code(tmp_path):
     Guarded by the wide encodings above, which must keep working; a gate that fixed this by simply
     not narrowing would pass this test and lose the `env.ps1` case the narrowing exists for.
     """
-    from pathlib import Path
-
     from flash.env_secrets import _decoded_kind, credential_in_file
 
-    binaries = [
-        candidate
-        for candidate in sorted(Path("/usr/bin").iterdir())
-        if candidate.is_file() and not candidate.is_symlink()
-    ][:200]
-    # only binaries with nothing in their literal bytes: the rest may hold a real embedded key
-    # (`dockerd` ships one), and refusing those is correct rather than a false positive.
-    clean = [
-        binary
-        for binary in binaries
-        if binary.stat().st_size > 1 << 16 and not _decoded_kind(binary.read_bytes())
-    ]
-    if not clean:
-        pytest.skip("no suitable binary on this machine")
+    # Lifted verbatim from `/usr/bin/bash`, where this was first seen: three symbol names and their
+    # NUL terminators. Taking every second byte spells `fslo_eietossvdrdrcsP3`, which matches the
+    # Freesolo pattern and passes the entropy test. Pinned as bytes rather than read from the
+    # machine's own `/usr/bin`, which differs between here and CI and would make the test prove
+    # something different in each place -- or nothing, if the binaries it happened to pick were
+    # clean.
+    symbols = b"fos\x00loop_redirections\x00saved-redirects\x00PS3\x00"
+    assert _decoded_kind(symbols[0::2]) == "a Freesolo API key", "fixture no longer narrows"
 
-    flagged = [binary.name for binary in clean if credential_in_file(binary)]
-    assert not flagged, f"narrowing invented a credential in {flagged}"
+    # padded to an even offset so the fixture keeps the parity that narrows
+    binary = tmp_path / "libexample.so"
+    binary.write_bytes(b"\x7fELF\x02\x01\x01\x00" + symbols * 4)
+    assert credential_in_file(binary) is None
+
+    # The NULs here are string terminators, scattered through a symbol table rather than the
+    # regular padding column of wide text -- which is exactly what separates this from the
+    # `env.ps1` case above and what the gate keys on.
+    wide = tmp_path / "env.ps1"
+    wide.write_bytes(f'$env:FREESOLO_API_KEY = "fslo_{_FAKE_KEY_BODY}"\n'.encode("utf-16"))
+    assert credential_in_file(wide) == "a Freesolo API key"
 
 
 def test_push_refuses_a_credential_used_as_a_filename(monkeypatch, tmp_path, capsys):
