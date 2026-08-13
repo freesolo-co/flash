@@ -1442,6 +1442,79 @@ def test_undeploying_an_idle_run_does_not_cold_start_the_gpu(client):
     )
 
 
+def test_a_cold_undeploys_release_holds_the_run_lock(client):
+    """The status read and the release must not straddle a re-registration.
+
+    Both calls are `modal.Dict` operations, atomic individually and unsynchronized together. So a
+    bare re-read narrows the window without closing it: a POST can land between the read that saw
+    `disabled` and the `pop` that acts on it, take a fresh claim, and have this stale undeploy drop
+    it -- after which the settle commits `ready` holding no claim, which is the exact state this
+    release exists to prevent, reintroduced from the other side.
+
+    Registration takes the run lock for its own read-modify-write, so taking it here is what makes
+    the pair atomic against it. Driven by observing the lock key while the release runs, since the
+    interleaving itself is not reachable from a single-threaded test.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    module.runners.count = 0  # cold, so the release branch is the one that runs
+    module.adapter_records[module._lora_id_key(module._lora_int_id(REVISION))] = REVISION
+
+    lock_key = module._lock_key(RUN_ID)
+    held: list[bool] = []
+    real_pop = module._release_lora_int_id
+
+    async def _watching_release(int_id, adapter_id):
+        held.append(lock_key in module.adapter_records)
+        return await real_pop(int_id, adapter_id)
+
+    module._release_lora_int_id = _watching_release
+    try:
+        assert client.delete(f"/adapters/{RUN_ID}").status_code == 200
+    finally:
+        module._release_lora_int_id = real_pop
+
+    assert held == [True], (
+        "the cold release ran outside the run lock, so a registration can land between its status "
+        "read and its pop and lose the fresh claim it just took"
+    )
+    assert lock_key not in module.adapter_records, "the release left the run lock held"
+
+
+def test_a_cold_release_leaves_a_revived_revisions_claim_alone(client):
+    """The status re-read is still load-bearing, now under the lock rather than instead of it.
+
+    `disabled_revisions` is captured earlier in the pass, and `_engine_is_warm` takes an engine
+    round trip after it -- ample room for a re-registration to be accepted and re-claim the id. The
+    lock stops that landing INSIDE the read-and-release pair; it does not rewind one that landed
+    before the lock was taken. So the release stays scoped by the record's own status.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    module.runners.count = 0
+    key = module._lora_id_key(module._lora_int_id(REVISION))
+    module.adapter_records[key] = REVISION
+
+    real_warm = module._engine_is_warm
+
+    async def _revive_while_checking_warmth():
+        result = await real_warm()
+        # Revived after the disabled list was captured, before the release loop reads the record.
+        module.adapter_records[module._record_key(REVISION)]["status"] = "ready"
+        return result
+
+    module._engine_is_warm = _revive_while_checking_warmth
+    try:
+        assert client.delete(f"/adapters/{RUN_ID}").status_code == 200
+    finally:
+        module._engine_is_warm = real_warm
+
+    assert dict.get(module.adapter_records, key) == REVISION, (
+        "a stale undeploy released the claim of a revision that had been re-registered, so its "
+        "settle reports `ready` while holding no claim and a colliding revision can take the id"
+    )
+
+
 def test_undeploy_still_evicts_from_a_warm_engine(client):
     """The skip above must not become "never evict".
 
@@ -2959,6 +3032,42 @@ def test_registration_requires_a_pinned_commit_sha(client):
     assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202)
 
 
+def test_a_padded_sha_is_stored_normalized_not_as_the_caller_sent_it(client):
+    """What the agreement check tolerates, the record must not preserve.
+
+    The id-vs-metadata comparison strips before comparing, so `" abc... "` is accepted as naming
+    the same commit the id does. Storing the caller's raw string then breaks two things the strip
+    was meant to make safe: `_adapter_path` hands it to `snapshot_download(revision=...)`, which
+    cannot resolve a padded sha and fails a registration that validated cleanly; and the readback
+    the client uses to recover from a 5xx compares its canonical sha against a record that says
+    something else, so an accepted registration reads as an immutability violation.
+
+    Normalizing rather than rejecting keeps exactly the tolerance the comparison already grants.
+    """
+    padded = "  " + "a" * 40 + "\n"
+    response = client.post(
+        "/adapters",
+        json={**REGISTRATION, "metadata": {**REGISTRATION["metadata"], "hf_revision": padded}},
+    )
+    assert response.status_code in (200, 202), (
+        f"a padded sha the agreement check accepts was rejected downstream: {response.text}"
+    )
+
+    module = client.app.state.generated_module
+    stored = module.adapter_records[module._record_key(REVISION)]["metadata"]["hf_revision"]
+    assert stored == "a" * 40, (
+        f"the record stored the caller's raw {stored!r}; snapshot_download cannot resolve it and "
+        f"the client's readback sees a sha that disagrees with the id it registered"
+    )
+
+    # And the normalized form is what identity is computed on, so the same revision re-registered
+    # with the canonical spelling is the no-op immutability promises rather than a 409.
+    assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202), (
+        "re-registering the same revision with the canonical sha conflicted with the padded one, "
+        "so a retry that spells the commit differently cannot converge"
+    )
+
+
 def test_metadata_cannot_turn_a_revision_into_an_alias(client):
     """`record_type` is this endpoint's to state, not the caller's to supply.
 
@@ -3124,13 +3233,20 @@ def test_registering_an_already_resident_adapter_reestablishes_its_claim(
     )
 
 
-def test_a_resident_adapter_whose_id_was_taken_refuses_and_evicts_itself(client, engine):
-    """The reclaim must lose loudly, and must not leave the intruder resident.
+def test_a_resident_adapter_whose_id_was_taken_refuses_without_evicting(client, engine):
+    """The reclaim must lose loudly, and must NOT evict an id it no longer owns.
 
     If a colliding adapter took the id while this replica was idle, this container's cached copy is
-    the one sitting under somebody else's claim. Answering ok would route generates to it; keeping
-    it in `_loaded` while refusing would leave the next generate doing the same. So the cache entry
-    is dropped and the id evicted, which returns this replica to what a cold one would have been.
+    the one sitting under somebody else's claim. Answering ok would route generates to it, so the
+    registration fails and `_loaded` is dropped.
+
+    But it must not call `remove_lora`. Ownership can only be sampled BEFORE that await, so the
+    winner can finish its own sweep and `add_lora` while the removal is in flight -- and the
+    removal then lands on the WINNER, whose record still reads `ready` while nothing is resident.
+    Evicting a resource this container no longer owns is not this path's job: the winner's own
+    stale sweep in `_lora_request` evicts leftovers under a contended id, it holds the claim while
+    doing so, and it refuses to load over an eviction it could not confirm. `_int_ids` is left in
+    place precisely so that sweep can find this adapter.
     """
     module = client.app.state.generated_module
     int_id = module._lora_int_id(REVISION)
@@ -3160,56 +3276,29 @@ def test_a_resident_adapter_whose_id_was_taken_refuses_and_evicts_itself(client,
         "the refused adapter stayed in `_loaded`, so the next generate still answers from a copy "
         "sitting under another run's claim"
     )
-    assert removed == [int_id], f"the intruding lora was not evicted from vllm: {removed}"
+    assert removed == [], (
+        f"the reclaim evicted lora id {removed} it no longer owns; the winner can load into that "
+        f"id while this removal is in flight, so the eviction lands on the winner and leaves its "
+        f"record `ready` with nothing resident"
+    )
+    assert instance._int_ids.get(int_id) == REVISION, (
+        "the index entry was dropped, so the winner's own sweep cannot find this still-resident "
+        "adapter to evict before it loads over the id"
+    )
     assert module.adapter_records[module._lora_id_key(int_id)] == collider, (
         "re-claiming clobbered the rightful holder's claim"
     )
 
 
-def test_a_failed_reclaim_eviction_keeps_the_resident_adapter_findable(client, engine):
-    """A reclaim that cannot evict must leave the orphan in `_int_ids`.
-
-    Same invariant `_lora_request`'s stale sweep already holds, and the reclaim path contradicted
-    it. If `remove_lora` fails, this adapter is STILL resident under the int id; clearing the index
-    anyway makes it unfindable, and the winner's later load on this replica consults exactly that
-    index, sees nothing to evict, and calls `add_lora` over an id vLLM still has bound -- which
-    fails, or answers from the old weights under the new revision.
-    """
-    module = client.app.state.generated_module
-    int_id = module._lora_int_id(REVISION)
-    collider = "run-other@final." + "b" * 40
-    module.adapter_records[module._lora_id_key(int_id)] = collider
-
-    async def _remove_lora(value):
-        raise RuntimeError("vllm refused to unload")
-
-    instance = engine.__new__(engine)
-    instance._locks = {}
-    instance._loaded = {REVISION: object()}
-    instance._int_ids = {int_id: REVISION}
-    instance.engine = types.SimpleNamespace(remove_lora=_remove_lora)
-
-    result = _run_awaitable_result(
-        engine.register(instance, {**REGISTRATION, "adapter_id": REVISION})
-    )
-
-    assert result["ok"] is False, "a cached adapter whose id another run owns reported ready"
-    assert instance._int_ids.get(int_id) == REVISION, (
-        "a failed eviction cleared the int-id index while the adapter was still resident, so the "
-        "orphan is invisible to the sweep that would evict it before reusing the id"
-    )
-    assert REVISION not in instance._loaded, (
-        "the refused adapter stayed serveable from `_loaded` despite holding no claim"
-    )
-
-
 def test_a_reclaim_does_not_evict_a_lora_the_winner_already_loaded(client, engine):
-    """Eviction must be ownership-scoped, not issued blind after the claim was lost.
+    """The other reachable state, and the one an ownership guard could not have saved.
 
-    `owner` is read before an await, so the winner can complete its own sweep and `add_lora` in the
-    gap. Evicting on that stale read kicks the rightful holder off the GPU while its record still
-    reads `ready` -- an adapter that silently stops answering, which is worse than the state this
-    path exists to clean up. `_int_ids` naming somebody else is exactly that signal.
+    `owner` can only be sampled BEFORE the await, so the winner is free to complete its own sweep
+    and `add_lora` in the gap -- which is why the reclaim evicts nothing at all rather than
+    evicting conditionally. Here the winner has already landed on this same container, so
+    `_int_ids` names it: a removal issued on the stale read would kick the rightful holder off the
+    GPU while its record still reads `ready`, an adapter that silently stops answering. Losing the
+    claim and losing the right to touch the id are the same event.
     """
     module = client.app.state.generated_module
     int_id = module._lora_int_id(REVISION)

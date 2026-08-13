@@ -811,22 +811,27 @@ class Engine:
             # to recycle, and leaves the orphan discoverable by the sweep that knows how to evict
             # it.
             #
-            # And the eviction is guarded by ownership rather than issued blind. `owner` was read
-            # before this await, so B can finish its own sweep and `add_lora` in the gap; evicting
-            # then kicks the rightful holder off the GPU while its record still reads `ready`.
-            # `_int_ids` naming somebody else is exactly that signal, so this only removes a LoRA
-            # this container still believes is its own.
-            stale = self._int_ids.get(int_id)
-            evicted = True
-            if stale is None or stale == adapter_id:
-                try:
-                    await self.engine.remove_lora(int_id)
-                except Exception:  # best effort: the raise below is the real report
-                    evicted = False
-                if evicted and self._int_ids.get(int_id) == adapter_id:
-                    self._int_ids.pop(int_id, None)
-            # Dropped from `_loaded` regardless: this container may not serve an adapter it does
-            # not hold the claim for, and `_int_ids` is what keeps a failed eviction findable.
+            # NOT evicted here at all, and that is the fix rather than an omission. Guarding the
+            # eviction by ownership was still wrong, because ownership can only be sampled BEFORE
+            # the await: the winner B can finish its own sweep and `add_lora` while this
+            # `remove_lora` is in flight, so the removal lands on B and a post-await recheck can
+            # only decline to also delete B's index entry -- B is already off the GPU with its
+            # record reading `ready`.
+            #
+            # Losing the claim means this id belongs to B, and evicting a resource this container
+            # no longer owns is not this path's job. B's own stale sweep in `_lora_request` is what
+            # evicts a leftover resident under a contended id, it is ownership-correct by
+            # construction (it runs before B's load, holding the claim), and it RAISES rather than
+            # loading over an eviction it could not confirm. Both reachable states are already
+            # covered by it:
+            #   - B has not swept yet: `_int_ids` still names this adapter, so B's sweep finds it
+            #     and evicts before loading.
+            #   - B has already swept: it evicted this adapter then, so there is nothing resident
+            #     for this path to remove.
+            #
+            # So `_int_ids` is deliberately LEFT in place -- it is the breadcrumb B's sweep reads --
+            # while `_loaded` is dropped, because this container must not serve an adapter whose
+            # claim it has lost.
             self._loaded.pop(adapter_id, None)
             raise RuntimeError(
                 f"lora id {{int_id}} is held by {{owner}}, so this container's cached copy of "
@@ -1411,6 +1416,14 @@ def api():
             # does not cover `record_type`.
             "metadata": {{
                 **metadata,
+                # The NORMALIZED sha, not the caller's original. The agreement check above strips
+                # before comparing, so `" abc... "` is accepted as matching the id -- but storing
+                # the raw value then hands that padded string to `snapshot_download(revision=...)`,
+                # which fails to resolve an otherwise valid commit, and an ambiguous-registration
+                # readback disagrees with the client's canonical sha. Stripping here rather than
+                # rejecting keeps the tolerance the comparison already grants, and makes the stored
+                # record say the same thing the id does.
+                "hf_revision": str(metadata.get("hf_revision") or "").strip() or None,
                 "record_type": "revision",
                 "lifecycle_state": "registered",
             }},
@@ -1750,20 +1763,25 @@ def api():
             # warm check just established is not running. `_release_lora_int_id` is already
             # ownership-checked, so releasing a claim another adapter has since taken is a no-op.
             #
-            # The record is RE-READ first, and the list alone is not enough to justify the release.
-            # `disabled_revisions` was captured under the lock, but `_engine_is_warm` runs after it
-            # and takes an engine round trip -- ample room for a re-registration of the same
-            # revision to be accepted, re-claim the id, and start settling. Releasing on the stale
-            # list then pops the LIVE claim out from under that settle, which reports `ready`
-            # holding nothing: precisely the unclaimed-ready state this release was added to
-            # prevent, reintroduced from the other direction. The check is ownership-scoped by the
-            # record's own status, so only a revision that is still disabled has its claim dropped.
-            for revision_id in disabled_revisions:
-                with contextlib.suppress(Exception):  # releasing is best effort, like eviction
-                    current = await adapter_records.get.aio(_record_key(revision_id))
-                    if isinstance(current, dict) and current.get("status") != "disabled":
-                        continue  # revived while we checked warmth; its new claim is not ours
-                    await _release_lora_int_id(_lora_int_id(revision_id), revision_id)
+            # RE-TAKEN under the run lock, which registration also holds, so the status read and
+            # the release cannot straddle a re-registration. A bare re-read was not enough: it
+            # narrowed the window but left the read and the `pop` as two unsynchronized calls, so
+            # a POST landing between them still had its fresh claim dropped by this stale
+            # undeploy -- and that settle then commits `ready` holding nothing, which is the state
+            # this release exists to prevent, reintroduced from the other side.
+            #
+            # Affordable to hold because it is a small fixed number of Dict calls per disabled
+            # revision and nothing slow runs inside it: the engine round trip (`_engine_is_warm`)
+            # already happened above, deliberately outside the lock, and the GPU eviction branch
+            # stays outside it. That keeps the "no unbounded work under a non-renewable lease"
+            # invariant intact.
+            async with _run_lock(run_id):
+                for revision_id in disabled_revisions:
+                    with contextlib.suppress(Exception):  # releasing is best effort, like eviction
+                        current = await adapter_records.get.aio(_record_key(revision_id))
+                        if isinstance(current, dict) and current.get("status") != "disabled":
+                            continue  # revived under this lock's protection; its claim is not ours
+                        await _release_lora_int_id(_lora_int_id(revision_id), revision_id)
         # The deferred reclaims, run whether or not anything is warm. Unlike eviction, this has no
         # cheaper time to happen: undeploy is the last event in the run's life, so skipping here
         # leaves the directory on the volume for good. It is also bounded -- one `rmtree` per

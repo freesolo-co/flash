@@ -148,10 +148,15 @@ def _build_client(serving_url, internal_key):
     # delete with a 303 to a same-origin async-result poll url, and the shipped client follows it;
     # a suite that does not would see the bare 303 and fail a backend that `flash models deploy`
     # drives successfully -- the suite rejecting behavior the client handles.
+    # 60s, matching `_serving_request`'s hard `min(60.0, ...)` clamp rather than exceeding it.
+    # Registration, activation and deletion all go through that clamp in the shipped client, so a
+    # 120s default here accepts a backend that handles `POST /adapters` synchronously for 90s --
+    # which a real deploy abandons at 60s, and whose recovery read then sees 404. Readiness polling
+    # passes its own explicit per-request timeout, so this default does not bound that.
     return httpx.Client(
         base_url=serving_url,
         headers=headers,
-        timeout=120.0,
+        timeout=60.0,
         follow_redirects=True,
         max_redirects=100,
         event_hooks={"request": [_strip_key_off_origin]},

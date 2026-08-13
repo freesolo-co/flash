@@ -210,10 +210,11 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
             )
         except httpx.TimeoutException:
             # Transient by the client's own rules. Backing off rather than hammering a backend that
-            # is plainly still warming up.
-            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            # is plainly still warming up. Same compute-then-sleep order as the tail of the loop; a
+            # timed-out request carries no response and so no `Retry-After`.
             attempt += 1
             delay = _readback_delay(attempt)
+            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             continue
         if deadline - time.monotonic() <= 0:
             # Completed, but not in time. Not honored, for the same reason the client does not.
@@ -238,9 +239,14 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
             if last == "ready":
                 return record
             retry_after = response.headers.get("Retry-After")
-        time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+        # Computed from THIS response, then slept -- not slept-then-computed. The client derives
+        # each delay from the response it just received before its next poll, so computing after
+        # the sleep applied the PREVIOUS response's delay: a first `Retry-After: 2` was answered
+        # with a 0.5s sleep here and a 2s one there. Near the deadline that lets the suite make a
+        # poll the real client never would and certify a backend the client cannot drive.
         attempt += 1
         delay = _readback_delay(attempt, retry_after)
+        time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
     pytest.fail(
         f"revision {revision} never reached ready within {timeout}s (last state {last!r}). "
         "a read-back that only completes after the budget is spent does not count: the client "
@@ -473,6 +479,31 @@ def test_a_constrained_registration_serves_a_constrained_completion(
 def test_reregistering_identical_content_is_idempotent(http, deployed):
     """The client retries registration after an ambiguous 5xx; a retry must not fail."""
     _register(http, deployed)
+
+
+def test_reregistering_while_the_first_load_is_pending_is_idempotent(
+    http, adapter_source, run_id, ready_timeout
+):
+    """Idempotence is required in the PENDING state, which is where the retry actually happens.
+
+    Asserting it only after `ready` tests the easy half. The case that matters is the recovery
+    path: a cold load exceeds the client's five-minute readiness budget, the operator reruns
+    `models deploy`, and the identical registration arrives while the first load is still
+    `registered`. A backend that accepts duplicates only once loading has finished answers 409
+    there and strands exactly the retry the client is built to make.
+
+    So the second POST goes in immediately after the first is accepted, with no wait between them.
+    """
+    body = _registration(run_id, adapter_source)
+    try:
+        _register(http, body)
+        # No `_wait_ready` in between -- the pending window IS the state under test.
+        _register(http, body)
+        # And the run must still converge afterwards: accepting the duplicate is not enough if it
+        # wedged the first load or left two settles fighting over one record.
+        _wait_ready(http, body["adapter_id"], ready_timeout)
+    finally:
+        http.delete(f"/adapters/{run_id}")
 
 
 @pytest.mark.parametrize("field", sorted(_MUTATIONS))
