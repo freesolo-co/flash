@@ -4676,6 +4676,19 @@ def test_bridge_step_still_passes_a_text_reply_through_unchanged():
     }
 
 
+def test_bridge_step_rejects_a_null_env_reply_rather_than_showing_the_model_the_word_none():
+    # the same silent-corruption class as the image case, found while fixing it: the old
+    # str(message.get("content", "")) turned an explicit content=None into the literal string
+    # "None", so the model read the WORD "None" as its observation and trained on it. the opd
+    # bridge already rejects this through the same validator, so this is the grpo path catching up
+    # rather than new strictness.
+    env = _BridgeEnv(done_after=2, replies=[{"role": "user", "content": None}])
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="content must be text"):
+        bridge.step({"session_id": "a", "completion_text": "first"})
+
+
 def test_child_glue_image_block_types_match_the_flash_definition():
     # flash/engine/worker/train/core/child/glue.py is stdlib-only so the parent can copy it into the
     # verl child's workdir, where `flash` is not importable -- so it re-declares the image block
