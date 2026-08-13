@@ -695,6 +695,63 @@ def test_the_head_of_the_burst_cannot_end_the_drain_by_its_own_gap():
     assert not [gap for gap in clock.intervals() if gap < 1.0], clock.intervals()
 
 
+def test_a_confirmed_backlog_discards_the_head_it_deferred_judgement_on():
+    """The burst head bounds no step either, once a back-to-back line proves it was buffered.
+
+    Its own gap spans the block, so the drain cannot judge it on arrival and keeps it. But when the
+    next line arrives back-to-back, that is the confirmation the head was read at drain speed rather
+    than waited for. Left in place it starts a PARTIAL interval, closed by the first line the reader
+    genuinely waits for: 26s against a true 92s.
+
+    The median absorbs that from the third interval on, so this only bites a run that blocks in its
+    first steps -- which has nothing to absorb it with, and is exactly when an operator is deciding
+    whether to let hours of GPU time run. It understates the pace, so the wall warning under-fires.
+    """
+    clock = step_timing.StepClock()
+    _replay(
+        clock,
+        [
+            (0.0, 1, 0.001),
+            (92.0, 2, 0.001),
+            (184.0, 3, 60.0),  # blocked; the child completes step 4 meanwhile
+            (250.0, 4, 0.001),  # head of the burst: kept, pending confirmation
+            (250.1, 5, 0.001),  # back-to-back -- confirms the head was buffered too
+            (276.0, 6, 0.001),  # the first line genuinely waited for: opens the new segment
+            (368.0, 7, 0.001),
+        ],
+    )
+
+    # 276.0 -> 368.0 only. the 26s partial (250.1 -> 276.0) must not be in here.
+    assert clock.intervals() == [92.0, 92.0, 92.0]
+    assert clock.step_seconds() == 92.0
+
+
+def test_an_early_block_cannot_understate_the_pace_with_nothing_to_average_it_out():
+    """The same defect where it actually hurts: too few intervals for the median to hide it.
+
+    With one clean interval on either side the bad sample is a third of the sample set, and the
+    median lands halfway between wrong and right rather than on either.
+    """
+    clock = step_timing.StepClock()
+    _replay(
+        clock,
+        [
+            (0.0, 1, 0.001),
+            (92.0, 2, 60.0),
+            (158.0, 3, 0.001),  # burst head
+            (158.1, 4, 0.001),  # confirms the backlog
+            (184.0, 5, 0.001),  # partial span, 25.9s, if the head survives
+            (276.0, 6, 0.001),
+        ],
+    )
+
+    # the median is asserted at TWO intervals on purpose. with three it lands on 92.0 even when the
+    # partial is present, so a median-only assertion here passes against the bug it is meant to
+    # catch; the interval set is what actually distinguishes the two.
+    assert clock.intervals() == [92.0, 92.0]
+    assert clock.step_seconds() == 92.0
+
+
 def test_a_block_that_buffered_nothing_costs_one_interval_not_a_quota():
     """The drain ends on evidence, not a fixed count, so a quiet block is cheap.
 

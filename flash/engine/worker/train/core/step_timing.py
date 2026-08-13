@@ -229,6 +229,15 @@ class StepClock:
         if self._drained >= self._MAX_DRAINED_LINES:
             self._draining_backlog = False
             return False
+        if self._drained == 1:
+            # this line arrived back-to-back, which is the confirmation the deferred head was
+            # buffered too: it was read at drain speed rather than waited for, so it bounds no step.
+            # left in place it becomes the start of a PARTIAL interval, closed by the first line the
+            # reader genuinely waits for -- 26s against a true 92s. the median absorbs that from the
+            # third interval on, but a block in a run's first steps has nothing to absorb it with.
+            # dropping it lets that first waited-for line open the segment instead, which is what the
+            # reprint path already does with its own baseline.
+            self._times.clear()
         self._drained += 1
         return True
 
