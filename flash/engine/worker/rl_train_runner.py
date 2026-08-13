@@ -519,10 +519,15 @@ def _ingest_step_metrics(
         # heartbeat.py force_first_samples and retry until committed. later emissions remain
         # throttled to protect the hf commit cap.
         if not sent_first_metrics:
-            # this upload is synchronous and retries until it commits, so it stalls the stdout
-            # consumer that timestamps the NEXT step line. tell the clock not to time that span
-            # rather than publish an upload retry as the cost of a step.
-            state.step_clock.note_blocking_work()
+            # this upload is synchronous and retries until it commits, so it CAN stall the stdout
+            # consumer that timestamps the NEXT step line -- but it does not always: with no
+            # HF_REPO, or on a fast commit, it returns in microseconds. so it is MEASURED and the
+            # span is broken only when it really blocked, the same way the SFT and OPD callbacks
+            # do it. declaring the block unconditionally also entered the drain, which on a run
+            # whose steps are shorter than the drain threshold reads every following line as
+            # backlog: at 0.4s/step a spurious block suppressed 37 of 37 lines and left the pace
+            # published from one stale interval.
+            started = time.monotonic()
             sent_first_metrics = _w.heartbeat(
                 "rl_step",
                 force=True,
@@ -531,6 +536,7 @@ def _ingest_step_metrics(
                 **_reward_observability(),
                 gpu=gpu_diagnostics(include_torch=False),
             )
+            state.step_clock.note_if_blocked(time.monotonic() - started)
             state.sent_first_metrics = sent_first_metrics
         # per-step series for train_meta observability parity. these live on the same
         # line as everything else: verl's only console metric sink is LocalLogger,

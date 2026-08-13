@@ -625,10 +625,10 @@ def test_every_step_timestamp_comes_from_a_clock_that_cannot_jump():
                 f"{name}:{node.lineno} times a step off a clock that can jump: {timestamp}"
             )
             checked += 1
-    # every trainer records, and SFT and OPD each time TWO uploads: the one on the step line and the
-    # one the child stream fires from a non-step line. a passing assertion loop that visited nothing
-    # would be the failure this guards against.
-    assert checked == 7, checked
+    # every trainer records, SFT and OPD each time TWO uploads (the one on the step line and the one
+    # the child stream fires from a non-step line), and RL times its forced first-metrics ping. a
+    # passing assertion loop that visited nothing would be the failure this guards against.
+    assert checked == 8, checked
 
 
 def test_a_failed_optional_checkpoint_does_not_blank_the_pace_either(monkeypatch, tmp_path):
@@ -1010,6 +1010,76 @@ def test_the_child_stream_heartbeat_is_timed_like_the_step_one():
     clock.record(1176.0, 4)
     assert clock.intervals() == [92.0, 92.0]
     assert clock.step_seconds() == 92.0
+
+
+def test_no_synchronous_upload_declares_a_block_it_never_measured():
+    """Every in-loop upload MEASURES before breaking the span; none asserts a block up front.
+
+    RL's forced first-metrics ping called ``note_blocking_work()`` unconditionally, before the
+    upload it was describing. That upload does not always block: with no ``HF_REPO``, or on a fast
+    commit, it returns in microseconds -- and the unconditional call then discarded a real interval
+    AND entered the drain.
+
+    The drain is what makes it more than one lost sample. On a run whose steps are shorter than the
+    blocking threshold, every following line looks like backlog: at 0.4s/step a spurious block
+    suppressed 37 of 37 lines and left the pace published from a single stale interval.
+    """
+    import ast
+    from pathlib import Path
+
+    import flash
+
+    # read off disk, not through inspect: importing these runners raises on a circular import.
+    worker_dir = Path(flash.__file__).parent / "engine" / "worker"
+    unconditional: list[str] = []
+    for name in ("rl_train_runner.py", "sft_train_runner.py", "opd_train_runner.py"):
+        source = (worker_dir / name).read_text()
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            if (getattr(node.func, "attr", None)) == "note_blocking_work":
+                unconditional.append(f"{name}:{node.lineno}")
+
+    assert not unconditional, f"blocks declared without measuring the call: {unconditional}"
+
+    # and the RL site specifically now measures around its forced ping, as SFT and OPD do.
+    rl = " ".join(ast.unparse(ast.parse((worker_dir / "rl_train_runner.py").read_text())).split())
+    assert "started = time.monotonic()" in rl
+    assert "note_if_blocked(time.monotonic() - started)" in rl
+
+
+def test_a_fast_first_heartbeat_does_not_silence_a_fast_run():
+    """The measured behaviour the structural test above protects, on both step scales."""
+    quick = step_timing.StepClock()
+    quick.record(0.0, 1)
+    quick.record(92.0, 2)
+    quick.note_if_blocked(0.001)  # the ping returned instantly -- nothing blocked
+    quick.record(184.0, 3)
+    quick.record(276.0, 4)
+    # the interval across the ping is real and must survive.
+    assert quick.intervals() == [92.0, 92.0, 92.0]
+
+    # sub-second steps: the drain must not swallow the run.
+    fast = step_timing.StepClock()
+    moment = 0.0
+    fast.record(moment, 1)
+    moment += 0.4
+    fast.record(moment, 2)
+    fast.note_if_blocked(0.001)
+    for step in range(3, 40):
+        moment += 0.4
+        fast.record(moment, step)
+    assert len(fast.intervals()) == 38, fast.intervals()
+    assert round(fast.step_seconds(), 4) == 0.4
+
+    # a REAL stall on the same call is still excluded -- the guard keeps working.
+    stalled = step_timing.StepClock()
+    stalled.record(0.0, 1)
+    stalled.record(92.0, 2)
+    stalled.note_if_blocked(900.0)
+    stalled.record(992.0, 3)
+    stalled.record(1084.0, 4)
+    assert stalled.intervals() == [92.0, 92.0]
 
 
 def test_the_wall_warning_never_recommends_an_inert_knob():
