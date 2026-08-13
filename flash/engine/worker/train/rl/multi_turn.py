@@ -268,9 +268,13 @@ class MultiTurnBridge:
                 warn = not self._warned_missing_turn_rewards
                 self._warned_missing_turn_rewards = True
             if warn:
+                # scoped to the group, not the run: the shim skips only the groups that contain an
+                # episode without a usable vector, so other groups keep per-turn credit. saying
+                # "this run" would misreport which credit assignment actually trained the model.
                 print(
-                    "[rl-verl] per-turn credit was requested, but the environment returned no "
-                    "usable per_turn_rewards metadata; this run falls back to episode-level credit",
+                    "[rl-verl] per-turn credit was requested, but an episode returned no usable "
+                    "per_turn_rewards metadata; every rollout group containing such an episode "
+                    "falls back to episode-level credit (warned once per run)",
                     flush=True,
                 )
         turns = None if reward.turns is None else [float(value) for value in reward.turns]

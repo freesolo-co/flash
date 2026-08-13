@@ -4686,8 +4686,14 @@ def test_per_turn_credit_without_turn_rewards_warns_once_and_keeps_fallback(caps
             "turns": None,
         }
 
+    out = capsys.readouterr().out
     warning = "per-turn credit was requested"
-    assert capsys.readouterr().out.count(warning) == 1
+    assert out.count(warning) == 1
+    # the fallback the shim actually applies is per group, not per run
+    # (test_per_turn_credit_shim_leaves_other_groups_on_episode_credit), so a warning claiming the
+    # run switched schemes would misreport which credit assignment trained the model.
+    assert "rollout group" in out
+    assert "this run falls back" not in out
 
 
 def test_bridge_hands_each_scored_episode_to_the_sample_recorder():
