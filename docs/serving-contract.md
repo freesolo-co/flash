@@ -91,11 +91,13 @@ Must answer before the model is loaded. The client calls it during deploy prefli
 container that blocks health on a multi-minute weight load reads as an unreachable backend.
 
 `requires_key` is optional and reports whether the backend authenticates writes at all - not
-whether the caller's own key is correct. `flash serve status` reads it to decide whether to verify
-the key: when it is `true`, status follows up with an authenticated `GET /adapters/{unknown-id}`
-and treats `401` or `403` as a misconfigured key. Health itself may stay unauthenticated (the
-generated app leaves it open so a cold backend is still diagnosable), which is exactly why status
-cannot conclude anything about the key from this endpoint alone.
+whether the caller's own key is correct. `flash serve status` follows up with an authenticated
+`GET /adapters/{unknown-id}` and treats `401` or `403` as a misconfigured key. It skips that probe
+only on an explicit `false`: because the field is optional, omitting it means "no claim", and
+treating a missing field as "open" would report `ready` against a protected backend whose next
+deploy 401s. Health itself may stay unauthenticated (the generated app leaves it open so a cold
+backend is still diagnosable), which is exactly why status cannot conclude anything about the key
+from this endpoint alone.
 
 Either rejection code is accepted, so a backend that answers `403` on a bad key is diagnosed
 correctly rather than reported as ready. `404` for the unknown id is the expected answer from an
@@ -125,6 +127,26 @@ Registers a revision. The client sends:
 
 `org_id` and `structured_outputs` appear when set. Accept `200` or `202`; anything else is treated
 as a failure.
+
+`structured_outputs` is the run's declared output grammar, and it is **the record's, not the
+request's**: it is decided at registration, stored, and applied to every completion. A chat request
+must never be able to loosen or replace it.
+
+Its value is a JSON object of vLLM `StructuredOutputsParams` kwargs. Flash sends exactly four
+constraint forms (`flash/content/structured_outputs.py:CONSTRAINT_KEYS`), one per registration:
+
+| key           | value                                | meaning                                      |
+| ------------- | ------------------------------------ | -------------------------------------------- |
+| `json`        | a JSON Schema object (or its string) | output must validate against the schema      |
+| `regex`       | a regex string                       | output must match the pattern                |
+| `choice`      | a list of strings                    | output must be exactly one of them           |
+| `json_object` | `true`                               | output must be some syntactically valid JSON |
+
+Other `StructuredOutputsParams` kwargs (such as `whitespace_pattern`) may accompany the constraint
+key. A backend that recognizes only one form silently serves unconstrained text for the other three:
+the conformance suite exercises `regex`, so passing conformance does **not** prove the other forms
+work. Implement all four, or reject a registration carrying a form you do not support at
+registration time rather than at first chat.
 
 Five rules:
 
@@ -184,9 +206,11 @@ record and compares `adapter_id`, `repo_id`, `repo_type`, `subfolder`, `base_mod
 looks like a _different_ artifact under the same revision id, which the client reports as an
 immutability violation and refuses to deploy.
 
-While a record is still loading, set `Retry-After` on the response. The client honors it instead of
-falling back to exponential backoff, which is the difference between a poll every 2 seconds and a
-poll every 30.
+While a record is still loading, set `Retry-After` on the response. The client prefers it over its
+own exponential backoff, but **clamps it to 2 seconds** (`READBACK_MAX_DELAY_SECONDS`), and clamps
+its own backoff to the same ceiling. So `Retry-After: 30` buys you a poll every 2 seconds, not every
+30: the header can only ever slow the client down to that ceiling, never past it. Size your
+readiness path for a 2-second poll for the whole load, and do not rely on the header to shed load.
 
 ### Lifecycle
 
@@ -330,6 +354,39 @@ Standalone use of `flash models chat` does not check any of this, so a backend t
 answers chat. It is deployment through a managed plane that requires it.
 
 An unknown or not-yet-activated model is `404` or `503`.
+
+#### Streaming
+
+`flash models chat` and `flash env eval` both send `"stream": true` on every request, so a backend
+that implements only the one-shot JSON above satisfies the deployment smoke and still produces no
+usable CLI chat. Streaming is required for those two commands, not optional.
+
+The client branches on **response `Content-Type`**, which is what makes a partial implementation
+safe to grow into: answer `application/json` and it reads the whole body and takes the one-shot
+`choices[0].message.content` path above, ignoring `stream` entirely. Answer anything else and it
+decodes the body as server-sent events.
+
+The SSE shape it decodes, line by line:
+
+```
+data: {"choices": [{"delta": {"content": "Hel"}}]}
+
+data: {"choices": [{"delta": {"content": "lo"}}]}
+
+data: [DONE]
+```
+
+- Only lines beginning with `data:` are read; anything else (including SSE `event:` and comment
+  lines) is skipped, so blank-line framing and keep-alives are fine.
+- Each payload is a JSON object whose `choices[]` carry `delta`. Text comes from `delta.content`.
+- `data: [DONE]` ends the stream. Without it the client stops at end-of-body, so the sentinel is
+  what distinguishes a finished answer from a truncated one.
+- A thinking model may put its reasoning on `delta.reasoning_content` instead; the client re-wraps
+  that into a `<think>` block so the streamed text matches the one-shot string. A backend that
+  streams reasoning inline inside `content` also works.
+
+Provenance headers are sent on the streaming response exactly as on the one-shot one - they are
+headers, so they arrive before the first chunk either way.
 
 #### The cold-start envelope
 
