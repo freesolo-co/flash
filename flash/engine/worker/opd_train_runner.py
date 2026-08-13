@@ -631,7 +631,7 @@ def _build_child_callbacks(
 
     def on_step(step: int) -> None:
         progress["step"] = step
-        step_clock.record(time.time())
+        step_clock.record(time.time(), step)
         payload = {"step": step}
         if progress["loss"] is not None:
             payload["loss"] = progress["loss"]
@@ -640,7 +640,14 @@ def _build_child_callbacks(
         _opd_train._w.heartbeat("opd_step", **payload, **step_timing_fields())
 
     def child_heartbeat() -> None:
-        _opd_train._w.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
+        # see liveness_fields below: an upload replaces the published snapshot, so every ping that
+        # can win the shared step slot has to carry the timing or a measured pace disappears.
+        _opd_train._w.heartbeat(
+            "opd_step",
+            liveness=True,
+            step=int(progress["step"] or 0),
+            **step_timing_fields(),
+        )
 
     child_tail = _opd_train.ChildOutputTail()
     # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside

@@ -247,7 +247,12 @@ def _humanize_step_cost(seconds: float) -> str:
     This number's whole use is comparison -- against another run, another config, or the horizon
     being multiplied by it -- and the minute rounding a span can afford would print 92s and 149s
     identically as "2m", hiding a 60% difference in what the run costs.
+
+    A sub-second pace keeps a decimal for the same reason: whole-second rounding would print a
+    measured step as "0s/step", which reads as no measurement at all beside a nonzero projection.
     """
+    if seconds < 10:
+        return f"{seconds:.1f}s"
     if seconds < 600:
         return f"{seconds:.0f}s"
     return f"{seconds / 60:.1f}m"

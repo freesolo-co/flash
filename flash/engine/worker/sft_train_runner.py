@@ -749,7 +749,7 @@ class _SftProgressCallbacks:
 
     def on_step(self, step: int) -> None:
         self.progress.values["step"] = step
-        self.progress.step_clock.record(time.time())
+        self.progress.step_clock.record(time.time(), step)
         payload = {
             "step": step,
             "loss": self.progress.values["loss"],
@@ -772,7 +772,16 @@ class _SftProgressCallbacks:
         )
 
     def child_heartbeat(self) -> None:
-        _w.heartbeat("sft_step", liveness=True, step=int(self.progress.values["step"] or 0))
+        # carries the timing for the same reason the liveness daemon does: an upload REPLACES the
+        # published snapshot, and this ping shares the step heartbeat's throttled slot. one that won
+        # it without these fields would blank a measured pace off live status, which reads as the
+        # measurement having been lost rather than simply not re-sent.
+        _w.heartbeat(
+            "sft_step",
+            liveness=True,
+            step=int(self.progress.values["step"] or 0),
+            **self.step_timing_fields(),
+        )
 
 
 def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_line) -> int:

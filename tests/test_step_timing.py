@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from flash.cli.ui.heartbeat import _heartbeat_pairs, step_timing_pairs
 from flash.engine.worker.train.core import step_timing
 
@@ -142,6 +144,66 @@ def test_the_rate_resists_a_single_expensive_step():
     assert clock.step_seconds() == 92.0
 
 
+def test_a_replayed_step_number_is_not_timed_as_a_step():
+    """verl reprints a step on a validation pass, and a resumed run replays its resume step.
+
+    ``append_step_metrics`` dedupes exactly these repeats for the metrics backlog. No optimizer
+    update happened between the two lines, so timing them would publish the validation pass as the
+    cost of a step -- the same class of error as counting warmup.
+    """
+    clock = step_timing.StepClock()
+    clock.record(0.0, 0)
+    clock.record(92.0, 1)
+    clock.record(140.0, 1)  # the reprint: 48s that no step paid for
+    assert clock.intervals() == [92.0]
+    assert clock.step_seconds() == 92.0
+
+    # a caller that cannot identify the step still times every line: timing all is better than none.
+    unnumbered = step_timing.StepClock()
+    unnumbered.record(0.0)
+    unnumbered.record(92.0)
+    assert unnumbered.intervals() == [92.0]
+
+
+def test_a_span_containing_blocking_work_is_not_timed():
+    """The stdout consumer timestamps a step line when it READS it.
+
+    RL's first metric line is followed by a forced heartbeat that retries until it commits, which
+    can hold that loop for minutes. The span is dropped rather than published, and the steps around
+    it still measure -- one lost interval on a run that has many.
+    """
+    clock = step_timing.StepClock()
+    clock.record(0.0, 0)
+    clock.note_blocking_work()
+    clock.record(300.0, 1)  # 92s of step plus a slow upload retry
+    clock.record(392.0, 2)
+    assert clock.intervals() == [92.0]
+    assert clock.step_seconds() == 92.0
+
+
+def test_the_projection_amortizes_saves_that_the_pace_excludes():
+    """The two numbers answer different questions and need different estimators.
+
+    ``step_duration_s`` is what a step costs, so it stays median and ignores the save. The
+    projection is a SUM of future steps, and saves are real recurring work on the save schedule --
+    under-counting them is worst for the wall warning, whose whole job is spotting a run that will
+    not fit.
+    """
+    intervals = [92.0] * 9 + [400.0]  # one save every ten steps
+    assert step_timing.steady_state_step_seconds(intervals) == 92.0
+
+    projected = step_timing.projected_remaining_seconds(intervals, current_step=0, total_steps=100)
+    assert projected is not None
+    # the median alone would claim 9200s and never charge for the nine remaining saves.
+    assert projected > 92.0 * 100
+    assert projected == pytest.approx(12280.0)
+
+    # but one pathological span cannot double the projection the way raw warmup once did.
+    stalled = [92.0] * 9 + [9000.0]
+    capped = step_timing.projected_remaining_seconds(stalled, current_step=0, total_steps=100)
+    assert capped == pytest.approx(92.0 * 2 * 100)
+
+
 def test_the_retained_window_is_bounded_and_keeps_the_recent_steps():
     """A long run must not grow this without bound, and must track its CURRENT rate.
 
@@ -158,6 +220,32 @@ def test_the_retained_window_is_bounded_and_keeps_the_recent_steps():
     for offset in range(1, clock._RETAINED_STEP_LINES + 1):
         clock.record(50000.0 + offset * 200.0)
     assert clock.step_seconds() == 200.0
+
+
+def test_the_window_stays_bounded_when_blocking_work_splits_it():
+    """Splitting on blocking work must not become a way to retain unbounded state.
+
+    A long run can block many times, and each split leaves a closed segment behind. The cap covers
+    every segment together rather than each one, so the total is what a bounded window promises.
+    """
+    clock = step_timing.StepClock()
+    for index in range(20000):
+        if index % 7 == 0:
+            clock.note_blocking_work()
+        clock.record(float(index) * 10.0, index)
+
+    retained = sum(len(segment) for segment in clock._segments) + len(clock._times)
+    assert retained <= clock._RETAINED_STEP_LINES
+    assert clock.step_seconds() == 10.0
+
+    # and the degenerate case -- blocking before EVERY line, so no segment ever bounds a step --
+    # publishes nothing rather than a wrong number, and still keeps nothing around.
+    always_blocked = step_timing.StepClock()
+    for index in range(500):
+        always_blocked.note_blocking_work()
+        always_blocked.record(float(index) * 10.0, index)
+    assert always_blocked.intervals() == []
+    assert always_blocked.step_seconds() is None
 
 
 def test_the_panel_shows_nothing_until_a_step_is_measured():
@@ -190,6 +278,11 @@ def test_a_per_step_cost_keeps_the_precision_a_comparison_needs():
     assert pace(92.0) != pace(149.0)
     assert "92s" in pace(92.0)
     assert "149s" in pace(149.0)
+
+    # a sub-second pace keeps a decimal for the same reason: rounding a measured step to "0s/step"
+    # reads as no measurement at all, beside a projection that is plainly nonzero.
+    assert "0.4s" in pace(0.4)
+    assert not pace(0.4).startswith("0s")
 
 
 def test_the_panel_warns_when_the_rate_will_not_fit_the_wall():

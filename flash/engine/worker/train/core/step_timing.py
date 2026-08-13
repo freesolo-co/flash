@@ -22,6 +22,16 @@ the second at 19:54:13. Timing between consecutive lines therefore measures 92s 
 515s, because the warmup falls before the first line rather than between two of them. A rule that
 instead dropped "the first interval" would be both wrong and lossy: it would discard a real steady-
 state step while still admitting warmup on any path whose first line arrives earlier.
+
+Two other spans between step lines are not steps either, for the same reason. A step number that
+verl REPRINTS -- on a validation pass, or replaying a resume step -- had no optimizer update between
+the two lines. And a span in which this process BLOCKED, waiting on a synchronous heartbeat upload
+that retries until it commits, contains work no step pays for. Both are excluded at ``StepClock``,
+so every trainer gets the same answer.
+
+The pace and the projection then part ways deliberately: ``step_duration_s`` is the median, what a
+step costs, while a projection of the next N steps is a sum and takes an amortized rate that charges
+for the checkpoint saves the median suppresses.
 """
 
 from __future__ import annotations
@@ -65,14 +75,73 @@ class StepClock:
 
     def __init__(self) -> None:
         self._times: list[float] = []
+        # closed runs of consecutive step lines, split where blocking work made a span unmeasurable.
+        self._segments: list[list[float]] = []
+        self._last_step: int | None = None
+        self._break_after_last = False
 
-    def record(self, now: float) -> None:
-        """Note that a step line arrived at ``now``."""
+    def note_blocking_work(self) -> None:
+        """Declare that the caller is about to block, so the span in progress is not a step.
+
+        The stdout consumer timestamps a step line when it READS it, so anything that blocks that
+        loop defers the next timestamp and lands in the next interval. RL's first metric line is
+        followed by a forced heartbeat that retries until the upload commits, which on a flaky HF
+        can hold the loop for a long time -- and the resulting interval would be published as what a
+        step costs.
+
+        Dropping that one span is the honest answer rather than subtracting an estimate of the
+        block: the step was still running while we blocked, so what we could subtract is not what
+        the step cost. Same principle as the warmup exclusion -- a span that includes work no step
+        pays is not a step -- and it costs one interval on a run that has many.
+        """
+        self._break_after_last = True
+
+    def record(self, now: float, step: int | None = None) -> None:
+        """Note that a step line for ``step`` arrived at ``now``.
+
+        A repeated step number is ignored rather than timed. verl reprints a step on a validation
+        pass and a resumed run replays its resume step -- ``append_step_metrics`` dedupes exactly
+        these repeats for the metrics backlog -- and no optimizer update happened between the two
+        lines. Timing them would measure the validation pass or the resume init and publish it as
+        the cost of a step, which is the same class of error as counting warmup.
+
+        ``step`` is optional because a caller that cannot identify the step is better off timing
+        every line than timing none; only a caller that KNOWS a number repeated can skip it.
+        """
+        if step is not None:
+            if self._last_step is not None and int(step) <= self._last_step:
+                return
+            self._last_step = int(step)
+        if self._break_after_last and self._times:
+            # this line closes a span that contained blocking work, so it opens a new segment
+            # instead of extending the current one -- the span itself is never an interval.
+            self._segments.append(self._times)
+            self._times = []
+        self._break_after_last = False
         self._times.append(float(now))
+        self._trim()
+
+    def _trim(self) -> None:
+        """Keep the newest ``_RETAINED_STEP_LINES`` timestamps across all segments."""
         del self._times[: -self._RETAINED_STEP_LINES]
+        budget = self._RETAINED_STEP_LINES - len(self._times)
+        kept: list[list[float]] = []
+        for segment in reversed(self._segments):
+            if budget <= 1:
+                break
+            # a segment shorter than two lines bounds no step, so it is dropped rather than kept.
+            trimmed = segment[-budget:]
+            if len(trimmed) >= 2:
+                kept.append(trimmed)
+                budget -= len(trimmed)
+        self._segments = list(reversed(kept))
 
     def intervals(self) -> list[float]:
-        return step_intervals(self._times)
+        """Every measured step span, across segments split by blocking work."""
+        spans: list[float] = []
+        for segment in (*self._segments, self._times):
+            spans.extend(step_intervals(segment))
+        return spans
 
     def step_seconds(self) -> float | None:
         """Steady-state seconds per step, or None before one whole step has been measured."""
@@ -84,7 +153,11 @@ def steady_state_step_seconds(step_intervals_s: list[float]) -> float | None:
 
     Takes the MEDIAN, matching ``_measured_idle_fraction``'s reading of the same intervals: a step
     that happens to publish a checkpoint, or one that pays a lazy recompilation, is a real outlier
-    that a mean would smear across the projection.
+    that a mean would smear across every step the operator is trying to reason about.
+
+    This is what a step COSTS, and it is what ``step_duration_s`` publishes. Projecting a sum of
+    future steps is a different question with a different estimator -- see
+    ``_amortized_step_seconds``, which charges for the saves this deliberately ignores.
 
     The caller supplies intervals from ``step_intervals``, which bounds n steps with n+1 step lines
     and therefore already excludes the warmup span before the first one. Nothing here can recover
@@ -111,13 +184,39 @@ def projected_remaining_seconds(
     Counts only steps not yet run. Steps already completed are spent whether or not they were slow,
     so folding them back in would re-charge the run for its own warmup.
     """
-    per_step = steady_state_step_seconds(step_intervals_s)
+    per_step = _amortized_step_seconds(step_intervals_s)
     if per_step is None:
         return None
     if total_steps <= 0:
         return None
     remaining_steps = max(0, int(total_steps) - max(0, int(current_step)))
     return per_step * remaining_steps
+
+
+def _amortized_step_seconds(step_intervals_s: list[float]) -> float | None:
+    """Seconds per step for projecting a SUM of future steps, or None if nothing is measured.
+
+    The median answers "what does a step cost"; this answers "what will the next N cost", and those
+    want different estimators. Checkpoint saves are real recurring work -- they land between step
+    lines on the save schedule -- but the median deliberately suppresses them as outliers. Projecting
+    with it therefore under-counts every future save, which matters most for the wall warning, whose
+    entire job is to notice a run that will not fit.
+
+    The mean is the correct estimator for a sum: an occasional expensive step is amortized across
+    the horizon at the rate it actually occurs, with no save schedule to thread through or keep in
+    sync. It is capped at twice the median so a single pathological span -- a long upload retry, a
+    stall -- cannot inflate the projection the way raw warmup once did.
+    """
+    finite = [float(gap) for gap in step_intervals_s if gap > 0]
+    if not finite:
+        return None
+    typical = statistics.median(finite)
+    return min(statistics.fmean(finite), typical * _PROJECTION_OUTLIER_CAP)
+
+
+# how far above the typical step the amortized rate may sit. saves and recompiles should raise a
+# projection; one stalled span should not double it.
+_PROJECTION_OUTLIER_CAP = 2.0
 
 
 # fraction of the remaining wall allowance a projection may consume before the run is called at

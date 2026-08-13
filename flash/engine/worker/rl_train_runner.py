@@ -473,7 +473,7 @@ def _ingest_step_metrics(
     if step_metrics is not None:
         now = time.time()
         state.step_line_times.append(now)
-        state.step_clock.record(now)
+        state.step_clock.record(now, step_metrics.get("step"))
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]
@@ -485,6 +485,10 @@ def _ingest_step_metrics(
         # heartbeat.py force_first_samples and retry until committed. later emissions remain
         # throttled to protect the hf commit cap.
         if not sent_first_metrics:
+            # this upload is synchronous and retries until it commits, so it stalls the stdout
+            # consumer that timestamps the NEXT step line. tell the clock not to time that span
+            # rather than publish an upload retry as the cost of a step.
+            state.step_clock.note_blocking_work()
             sent_first_metrics = _w.heartbeat(
                 "rl_step",
                 force=True,
