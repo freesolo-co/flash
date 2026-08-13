@@ -1250,26 +1250,35 @@ def answer_of(content: str) -> str:
     return "" if "<think>" in content else content
 
 
-def action_of(content: str) -> str | None:
-    """The action in a turn, or None if it carries none. A model is free to emit junk."""
+def action_of(content: str) -> Move | None:
+    """The action in a turn, or None if it carries none the environment can use.
+
+    A tag match is not a valid move: `<move>bad</move>` matches too. Parse and validate
+    here so `apply` only ever sees actions it can perform.
+    """
     found = ACTION.search(answer_of(content))
-    return found.group(1) if found else None
+    return self.parse_move(found.group(1)) if found else None
 
 
 for message in messages[:-1]:
     if message["role"] == "assistant":
         action = action_of(message["content"])
-        if action is not None:  # unparsable turns changed nothing then; keep it that way
+        if action is not None:  # unusable turns changed nothing then; keep it that way
             state = self.apply(state, action)
 newest = action_of(assistant_response)
 if newest is None:
-    # no action to apply. reply with the error and let the reward do the teaching
+    # nothing to apply. reply with the error and let the reward do the teaching
     return EnvironmentStepResult(
         done=False,
         messages=[{"role": "user", "content": "Reply with a single <move>(r,c)</move>."}],
     )
 state = self.apply(state, newest)  # the newest action, exactly once
 ```
+
+`parse_move` is yours: it returns the move when the payload names a legal one and `None`
+otherwise, out-of-range coordinates included. Keeping validation there rather than inside
+`apply` is what makes both call sites safe at once, since a replayed turn gets the same verdict
+it got when it was live.
 
 **Parse the answer, not the raw turn.** With `thinking = true` the transcript keeps the turn
 exactly as the model emitted it, so a prior action reaches you as
@@ -1295,12 +1304,14 @@ in the same shape. Passing the unwrapped payload for replayed turns and the raw 
 newest one gives a single action two meanings, so the transition it produces depends on which
 call is looking at it.
 
-**Do not raise on a turn that parses to nothing.** A model emitting junk is ordinary, especially
-early in GRPO exploration, and it is the reward's job to teach otherwise. Nothing between your
-hook and the trainer catches the exception: `env_reply` calls `step_episode` without a guard, so
-a `ValueError` from your parser leaves the multi-turn bridge and can take the run down over one
-malformed sample. Return an error observation, or end the episode with a low score, but let the
-episode reach the reward.
+**Do not raise on a turn you cannot use.** A model emitting junk is ordinary, especially early
+in GRPO exploration, and it is the reward's job to teach otherwise. Nothing between your hook
+and the trainer catches the exception: `env_reply` calls `step_episode` without a guard, so a
+`ValueError` from your parser, your validator, or your transition leaves the multi-turn bridge
+and can take the run down over one malformed sample. Return an error observation, or end the
+episode with a low score, but let the episode reach the reward. That covers more than a missing
+tag: an action that parses but names something illegal has to land in the same branch, which is
+why validation belongs before `apply` rather than inside it.
 
 The same shape covers a seeded assistant demo: an unparsable turn is skipped on replay, which is
 exactly right, because a demo written in prose changed nothing when it was "played" either. That
