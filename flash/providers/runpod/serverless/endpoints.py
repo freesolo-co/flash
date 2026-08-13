@@ -31,6 +31,10 @@ _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
 # hourly cadence -- this costs one extra commit per run, not per hour, so the shared-artifact-repo
 # rate budget the interval exists to protect is unchanged.
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
+# how often the uploader LOOKS at the console, not how often it commits: a stat() costs nothing
+# against the shared artifact repo's commit budget, and it is what lets a wedge be noticed two
+# polls after output stops rather than at the next hourly boundary.
+_CONSOLE_UPLOAD_POLL_S = 120.0
 
 _ENDPOINT_CACHE: dict[str, Any] = {}
 
@@ -524,12 +528,24 @@ def _train_body(input_data: dict) -> dict:
             timeout, so a slow snapshot can still be running when the final one begins. Both write
             the same ``.tail`` file and commit to the same repo path, and if the older call landed
             last it would replace the terminal console with bytes captured BEFORE the failure --
-            destroying the record. The lock makes the last caller the last writer."""
+            destroying the record. The lock makes the last caller the last writer.
+
+            The wait is BOUNDED. An unbounded acquire would hand a wedged network request the power
+            to block ``run_mode`` until the deadline timer hard-exits the process -- so a hung
+            periodic upload would cost the terminal snapshot entirely, the opposite of the point.
+            On timeout the upload is skipped rather than run concurrently: overlapping is what
+            could overwrite newer bytes with older ones, and the in-flight snapshot is still
+            uploading a superset of what this call would have sent."""
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
                 return
-            with console_upload_lock:
+            if not console_upload_lock.acquire(timeout=120.0):
+                print(f"console upload skipped for {mode}; a snapshot is still in flight")
+                return
+            try:
                 _upload_console_locked(mode, console)
+            finally:
+                console_upload_lock.release()
 
         def _upload_console_locked(mode: str, console: str) -> None:
             try:
@@ -586,16 +602,27 @@ def _train_body(input_data: dict) -> dict:
             def _upload_loop() -> None:
                 # literals, not the module-level upload constants: only this function's SOURCE
                 # ships to the worker, so referencing one by name is a NameError before training.
-                # test_first_console_snapshot_precedes_the_stall_teardown pins these two numbers to
+                # test_first_console_snapshot_precedes_the_stall_teardown pins these numbers to
                 # those constants so the shipped uploader cannot drift.
                 #
-                # first snapshot early so a run torn down inside the stall window still has one,
-                # then the steady hourly cadence.
-                if stop_upload.wait(600.0):
-                    return
-                _upload_console(mode)  # best-effort; swallows its own errors
-                while not stop_upload.wait(3600.0):
-                    _upload_console(mode)
+                # polls every 120s but commits rarely: an upload happens only when the console has
+                # bytes not yet uploaded AND either the hourly interval elapsed or output just went
+                # quiet. quiet is the wedge signature, and a wedged run is torn down long before the
+                # next hourly boundary -- so without it the artifact predates the hang. the commit
+                # rate against the shared repo is unchanged for a healthy run.
+                due_s, since, uploaded_size, previous_size = 600.0, 0.0, -1, -1
+                while not stop_upload.wait(120.0):
+                    since += 120.0
+                    try:
+                        size = os.path.getsize(console)
+                    except OSError:
+                        size = -1
+                    went_quiet = size == previous_size
+                    previous_size = size
+                    if size == uploaded_size or not (since >= due_s or went_quiet):
+                        continue
+                    _upload_console(mode)  # best-effort; swallows its own errors
+                    uploaded_size, since, due_s = size, 0.0, 3600.0
 
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()

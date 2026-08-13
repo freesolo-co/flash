@@ -30,9 +30,14 @@ import urllib.request
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
 _FAILURE_FALLBACK_MAX_CHARS = 8192
+# the key and the value may each be quoted: a credential that reaches a diagnostic inside a json or
+# dict repr -- `{"access_token": "..."}` -- puts a closing quote between the name and the separator,
+# which an unquoted-only pattern cannot cross, so the value printed verbatim. a runtime-minted
+# credential is in no environment variable, so the value pass cannot catch it either and this shape
+# rule is the only thing standing between it and an artifact the user can fetch.
 _SECRET_DETAIL = re.compile(
     r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
-    r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)"
+    r"(['\"]?\s*[:=]\s*)(?:bearer\s+)?(['\"]?)([^\s,;'\"}]+)"
 )
 # component lines of a multiline credential shorter than this are punctuation such as ``}``, not
 # secrets; redacting them would erase innocent text. Matches `bootstrap_secrets._MIN_SECRET_COMPONENT`.
@@ -286,8 +291,8 @@ def _safe_child_failure_detail(error: Exception) -> str:
     return _SECRET_DETAIL.sub(
         lambda match: (
             match.group(0)
-            if match.group(3).isdigit()
-            else f"{match.group(1)}{match.group(2)}<redacted>"
+            if match.group(4).isdigit()
+            else f"{match.group(1)}{match.group(2)}{match.group(3)}<redacted>"
         ),
         message,
     )

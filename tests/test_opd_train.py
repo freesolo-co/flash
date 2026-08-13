@@ -4656,6 +4656,27 @@ def test_child_failure_sanitizer_keeps_token_ids_and_redacts_encoded_and_multili
         assert "defghijkl" not in _safe_child_failure_detail(ValueError(f"url ?auth={encoded}"))
 
 
+def test_child_failure_sanitizer_redacts_a_runtime_credential_quoted_in_json_or_a_dict():
+    """A credential minted at runtime is in NO environment variable, so shape is the only net.
+
+    It reaches a diagnostic inside a json body or a dict repr, where the closing quote after the key
+    sits between the name and the `:` separator. An unquoted-only pattern cannot cross that, so the
+    value was persisted verbatim into the fallback record and then into the uploaded failure
+    artifact -- which the user can fetch with `flash runs log`.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, secret in (
+        ('auth failed: {"access_token":"runtime-secret-abc123"}', "runtime-secret-abc123"),
+        ("auth failed: {'api_key': 'runtime-secret-xyz'}", "runtime-secret-xyz"),
+        ('{"password": "runtime-pw-4471"}', "runtime-pw-4471"),
+        ('headers={"Authorization":"Bearer runtime-tok-999"}', "runtime-tok-999"),
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert secret not in redacted, redacted
+        assert "<redacted>" in redacted
+
+
 def test_explicit_multiturn_score_rejection_bypasses_delivery_handler():
     from flash.engine.worker.train.opd.child.multiturn import _post_multiturn_score
 
@@ -5677,6 +5698,42 @@ def test_specific_failure_wins_over_generic_child_failure():
         )
 
     assert str(error.value) == "permanent optimizer marker failure: marker rejected"
+
+
+def test_recorded_child_failure_beats_the_completion_cap_heuristic():
+    """Direct evidence must outrank an inference drawn from an earlier batch.
+
+    The truncation window says "rollouts were truncated, so max_completion_tokens is probably too
+    small" -- a guess about a PRIOR no-signal batch. A recorded child failure says exactly why the
+    child died. When a child records a TRANSIENT failure and then exits with a generic status, the
+    heuristic used to win: the user was told to raise their completion cap, and a retriable failure
+    became fatal, burning the run instead of retrying it.
+    """
+    from flash.engine.worker.perf import RetriableInfraError
+
+    class _Window:
+        indicates_completion_cap = True
+        truncated_rollouts = 7
+        samples_seen = 8
+        max_completion = 512
+
+    with pytest.raises(RetriableInfraError) as error:
+        _raise_verl_failure(
+            1,  # generic status, NOT 86/87 -- so only the ordering decides
+            None,
+            child_failure=("transient", "[stage=generate] ValueError: bridge died"),
+            truncation_window=_Window(),
+        )
+
+    assert "bridge died" in str(error.value)
+    assert "max_completion_tokens" not in str(error.value)
+    # the retry a transient classification earns must survive.
+    assert isinstance(error.value, RetriableInfraError)
+
+    # with no recorded child failure the heuristic is still the best available explanation.
+    with pytest.raises(RuntimeError, match="completion cap is likely too small") as fallback:
+        _raise_verl_failure(1, None, truncation_window=_Window())
+    assert not isinstance(fallback.value, RetriableInfraError)
 
 
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():

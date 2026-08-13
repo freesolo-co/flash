@@ -1078,42 +1078,107 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
         # the defect this guards: the steady interval alone outlives both deadlines.
         assert setup_grace_s < endpoints._CONSOLE_UPLOAD_INTERVAL_S
 
-    # _train_body ships as SOURCE to the worker, so it inlines these two numbers rather than
+    # the poll is what actually beats the deadline: it is how soon after output stops the uploader
+    # can notice and commit. two polls is the worst case.
+    for poll_s in (
+        endpoints._CONSOLE_UPLOAD_POLL_S,
+        _instance_bootstrap._CONSOLE_UPLOAD_POLL_S,
+    ):
+        assert 2 * poll_s < training_stall_s
+
+    # _train_body ships as SOURCE to the worker, so it inlines these numbers rather than
     # referencing the constants (test_train_body_imports_every_name_it_uses enforces that). pin the
     # literals here so the shipped uploader cannot drift away from the deadlines above.
     body = inspect.getsource(endpoints._train_body)
-    assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S})" in body
-    assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_INTERVAL_S})" in body
+    assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_POLL_S})" in body
+    assert (
+        f"due_s, since, uploaded_size, previous_size = {endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S}"
+        in body
+    )
+    assert f"due_s = size, 0.0, {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
 
 
-def test_instance_console_upload_loop_snapshots_before_the_first_full_interval(monkeypatch):
-    """Drive the real instance loop: the FIRST wait must be short, later waits the steady interval.
-
-    The constants alone do not prove this. Reverting the loop to `while not stop.wait(interval_s)`
-    leaves every constant untouched and every other test green, while the instance path silently
-    goes back to waiting a full hour before its first snapshot -- past both stall deadlines.
-    """
+def _drive_instance_upload_loop(monkeypatch, sizes: list[int], cycles: int) -> tuple[list, list]:
+    """Run the real instance loop over a scripted console-size series. Returns (waits, uploads)."""
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
 
     waits: list[float] = []
-    uploads: list[str] = []
+    uploads: list[int] = []
+    clock = {"i": 0}
 
     class _Stop:
         def wait(self, seconds: float) -> bool:
             waits.append(seconds)
-            return len(waits) > 3  # let three cycles run, then stop the loop
+            return len(waits) > cycles
 
+    def _size(_console: str) -> int:
+        index = min(clock["i"], len(sizes) - 1)
+        clock["i"] += 1
+        return sizes[index]
+
+    monkeypatch.setattr(_instance_bootstrap, "_console_size", _size)
     monkeypatch.setattr(
         _instance_bootstrap,
         "_upload_console_snapshot",
-        lambda _payload, _console, mode: uploads.append(mode),
+        lambda _payload, _console, _mode: uploads.append(clock["i"]),
     )
     _instance_bootstrap._console_upload_loop({}, "/tmp/console.txt", "train", 3600.0, _Stop())
+    return waits, uploads
 
-    assert waits[0] == _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    assert waits[0] < 3600.0
-    assert waits[1:] == [3600.0, 3600.0, 3600.0]
-    assert uploads == ["train", "train", "train"]
+
+def test_instance_console_upload_loop_polls_faster_than_it_commits(monkeypatch):
+    """A healthy, growing run polls often but still commits only on the hourly boundary.
+
+    The poll cadence must not become the COMMIT cadence: the shared artifact repo budgets 5
+    commits/hour and the heartbeat already spends 4 (see
+    test_live_console_uploads_are_throttled_for_shared_artifact_repos).
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    interval_s = _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
+    # run long enough to pass the first commit AND the following hourly one.
+    cycles = int((first_s + interval_s) / poll_s) + 1
+    # console keeps growing every poll: never quiet, so only the elapsed-interval rule can fire.
+    growing = [1000 * (n + 1) for n in range(cycles + 2)]
+    waits, uploads = _drive_instance_upload_loop(monkeypatch, growing, cycles=cycles)
+
+    assert waits[0] == poll_s
+    assert set(waits) == {poll_s}
+    # exactly two commits: the first snapshot and one hourly -- NOT one per poll.
+    assert len(uploads) == 2
+    assert uploads[0] * poll_s == first_s
+    assert (uploads[1] - uploads[0]) * poll_s == interval_s
+
+
+def test_instance_console_upload_loop_commits_when_a_wedged_run_goes_quiet(monkeypatch):
+    """The wedge case: output stops, and the snapshot must land before the stall teardown.
+
+    A run that hangs at 700s is torn down around 1900s while the next hourly snapshot would not be
+    due until 4200s, so an interval-only loop uploads a console that PREDATES the hang -- losing
+    the last lines, which are the whole diagnostic. Going quiet is what triggers the commit.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    # the run must wedge AFTER its first snapshot -- the case the interval rule cannot cover on its
+    # own. a series that wedges BEFORE the first commit proves nothing: the elapsed-interval rule
+    # fires there anyway, so the test would still pass with the quiet trigger deleted.
+    grow_polls = int(first_s / poll_s) + 1
+    cycles = grow_polls + 6
+    wedged = [1000 * (n + 1) for n in range(grow_polls)] + [1000 * grow_polls] * 8
+    _waits, uploads = _drive_instance_upload_loop(monkeypatch, wedged, cycles=cycles)
+
+    # two commits: the first snapshot, then one more once output stopped.
+    assert len(uploads) == 2, "a run that wedges after its first snapshot must commit again"
+    quiet_upload_s = uploads[1] * poll_s
+    # strictly inside the 1200s training stall deadline, and far short of the hourly interval.
+    assert quiet_upload_s < 1200.0
+    assert quiet_upload_s < _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
+    # and it must not keep re-uploading identical bytes once the run is silent.
+    assert uploads[1] < cycles
 
 
 def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots():

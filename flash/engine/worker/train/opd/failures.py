@@ -204,6 +204,16 @@ def _raise_verl_failure(
     if return_code == _PERMANENT_TEACHER_EXIT:
         detail = f": {child_failure[1]}" if child_failure is not None else ""
         raise RuntimeError(f"permanent teacher bridge failure{detail}")
+    # ahead of the truncation heuristic: the record is direct evidence of why the child died,
+    # while `indicates_completion_cap` is an inference drawn from an EARLIER no-signal batch. a
+    # child that recorded a transient bridge failure and then exited with a generic status would
+    # otherwise be reported as a fatal completion-cap error -- telling the user to raise
+    # max_completion_tokens, and losing the retry a transient classification is what earns.
+    if child_failure is not None:
+        classification, message = child_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(f"transient teacher bridge failure: {message}")
+        raise RuntimeError(f"permanent teacher bridge failure: {message}")
     if truncation_window is not None and truncation_window.indicates_completion_cap:
         raise RuntimeError(
             f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "
@@ -212,11 +222,6 @@ def _raise_verl_failure(
             f"truncated at the configured max_completion_tokens={int(truncation_window.max_completion)}, "
             "so the completion cap is likely too small"
         )
-    if child_failure is not None:
-        classification, message = child_failure
-        if classification == "transient":
-            raise _w.RetriableInfraError(f"transient teacher bridge failure: {message}")
-        raise RuntimeError(f"permanent teacher bridge failure: {message}")
     raise RuntimeError(f"verl OPD subprocess exited with status {return_code}")
 
 

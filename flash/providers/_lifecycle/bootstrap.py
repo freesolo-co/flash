@@ -40,6 +40,7 @@ PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
+_CONSOLE_UPLOAD_POLL_S = 120.0
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
@@ -265,31 +266,49 @@ def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str 
     hf_upload(payload, tail_path, f"console_{mode}.txt")
 
 
-def _console_upload_loop(
-    payload: dict,
-    console: str,
-    mode: str,
-    interval_s: float,
-    stop_upload,
-) -> None:
-    """Snapshot the console periodically until ``stop_upload`` is set.
+def _console_size(console: str) -> int:
+    """Current console size, or -1 if it cannot be read (never yet created, or removed)."""
+    try:
+        return os.path.getsize(console)
+    except OSError:
+        return -1
 
-    The first wait is _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S rather than a full interval: the steady
-    cadence is hourly, but the stall classifier tears a wedged run down at 1200s (training) or
-    3000s (setup grace), so a loop that waited a whole interval first could never upload the
-    console of a run that HUNG -- the one run whose console is the only evidence of why. Only the
-    first wait shortens, so the steady rate against the shared artifact repo is unchanged.
+
+def _console_upload_loop(
+    payload: dict, console: str, mode: str, interval_s: float, stop_upload
+) -> None:
+    """Snapshot the console until ``stop_upload`` is set, polling cheaply for a wedge.
+
+    _CONSOLE_UPLOAD_POLL_S is how often the uploader LOOKS, not how often it commits: a stat() costs
+    nothing against the shared artifact repo's commit budget.
+
+    The stall classifier tears a wedged run down at 1200s (training) or 3000s (setup grace), so an
+    hourly loop uploads a console PREDATING the hang -- and the last lines before output stopped are
+    the whole diagnostic. Shortening the interval is not available: the heartbeat already spends 4
+    of the 5 commits/hour this shared artifact repo is budgeted (see
+    test_live_console_uploads_are_throttled_for_shared_artifact_repos).
+
+    So it polls often and commits rarely: only when the console holds un-uploaded bytes AND either
+    the interval elapsed or output just WENT QUIET, quiet being the wedge signature. A healthy run
+    still commits hourly; a wedged one commits once more when it falls silent, then never again
+    because later polls find nothing new.
     """
-    wait_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
-    while not stop_upload.wait(wait_s):
-        wait_s = interval_s
+    poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
+    due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
+    sent = prev = -1
+    since = 0.0
+    while not stop_upload.wait(poll_s):
+        since += poll_s
+        size = _console_size(console)
+        quiet = size == prev
+        prev = size
+        if size == sent or not (since >= due_s or quiet):
+            continue
         try:
             _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
-            print(
-                f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
-                flush=True,
-            )
+            print(f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}")
+        sent, since, due_s = size, 0.0, interval_s
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
@@ -652,22 +671,24 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         pump_secrets = _payload_secrets(payload)
 
         def pump():
+            """Tee the child's output to this process's stdout and the console file.
+
+            This process's stdout is the instance's container log, which the control plane pulls as
+            the failure detail (vast holds the box after a non-zero exit precisely so it can). Only
+            this process knows the run's secret VALUES, so each echoed child line is sanitized here
+            at the source -- the control-plane sanitizer downstream cannot value-redact a runtime
+            secret whose name it never sees. Mirrors the runpod serverless handler. The console FILE
+            keeps the raw line; its upload path sanitizes the tail.
+
+            The bound keeps the END of an oversized line: the root cause sits at the end of a native
+            stack or json blob, and the control plane's failure detail reads the provider's instance
+            log rather than the uploaded console, so a prefix cut here loses it everywhere.
+            """
             try:
                 for line in proc.stdout:
                     with pump_write_lock:
                         if not pump_writes_enabled:
                             return
-                        # this process's stdout is the instance's container log, which the control
-                        # plane pulls as the failure detail (vast holds the box after a non-zero
-                        # exit precisely so it can). only this process knows the run's secret
-                        # VALUES, so each echoed child line is sanitized here at the source -- the
-                        # control-plane sanitizer downstream cannot value-redact a runtime secret
-                        # whose name it never sees. mirrors the runpod serverless handler. the
-                        # console FILE keeps the raw line; its upload path sanitizes the tail.
-                        # the bound keeps the END of an oversized line: the root cause sits at the
-                        # end of a native stack or json blob, and the control plane's failure
-                        # detail reads the provider's instance log rather than the uploaded
-                        # console, so a prefix cut here loses it everywhere.
                         print(
                             _safe_detail(line, 100_000, secrets=pump_secrets, keep="end"),
                             end="",
