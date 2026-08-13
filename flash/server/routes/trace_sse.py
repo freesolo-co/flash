@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
+
+from flash.server.platform import traces as platform_traces
 
 _POST_DONE_SUFFIX_LIMIT = 1024
 _UTF8_BOM = b"\xef\xbb\xbf"
@@ -30,7 +33,8 @@ class SseDoneGate:
         self._buffer = bytearray()
         self._line_start = 0
         self._scan_start = 0
-        self._event_data: list[bytes] = []
+        self._event_in_progress = False
+        self._partial_line_in_progress = False
         self._holding_done_candidate = False
         self.done_event: bytes | None = None
 
@@ -47,11 +51,18 @@ class SseDoneGate:
         while (line_end := _line_end(self._buffer, self._scan_start)) is not None:
             line, next_cursor = line_end
             content = bytes(self._buffer[self._line_start : line])
+            continuing_partial_line = self._partial_line_in_progress
+            self._partial_line_in_progress = False
             self._line_start = next_cursor
             self._scan_start = next_cursor
+            if continuing_partial_line:
+                forwarded.extend(self._buffer[:next_cursor])
+                del self._buffer[:next_cursor]
+                self._line_start = 0
+                self._scan_start = 0
+                continue
             if not content:
-                event_data = b"\n".join(self._event_data)
-                if self._holding_done_candidate and event_data == b"[DONE]":
+                if self._holding_done_candidate:
                     self.done_event = bytes(self._buffer[:next_cursor])
                     self._buffer.clear()
                     self._line_start = 0
@@ -61,18 +72,17 @@ class SseDoneGate:
                 del self._buffer[:next_cursor]
                 self._line_start = 0
                 self._scan_start = 0
-                self._event_data.clear()
-                self._holding_done_candidate = False
+                self._event_in_progress = False
                 continue
             if content.startswith(b"data:"):
                 data = content[len(b"data:") :].strip()
-                if not self._event_data and data == b"[DONE]":
+                if not self._event_in_progress and data == b"[DONE]":
                     self._holding_done_candidate = True
                 elif self._holding_done_candidate:
                     # sse joins multiple data lines with a newline, so a second one proves that the
                     # combined event is not the single `[DONE]` terminator the gate is looking for.
                     self._holding_done_candidate = False
-                self._event_data.append(data)
+                self._event_in_progress = True
             if not self._holding_done_candidate:
                 forwarded.extend(self._buffer[:next_cursor])
                 del self._buffer[:next_cursor]
@@ -91,6 +101,7 @@ class SseDoneGate:
                 self._buffer.clear()
                 self._line_start = 0
                 self._scan_start = 0
+                self._partial_line_in_progress = True
             elif len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
                 self._settle_bounded_done()
             else:
@@ -98,7 +109,7 @@ class SseDoneGate:
             return [bytes(forwarded)] if forwarded else []
 
         trailing = bytes(self._buffer)
-        if not self._event_data and _could_be_done_line(trailing):
+        if not self._event_in_progress and _could_be_done_line(trailing):
             if len(trailing) > _POST_DONE_SUFFIX_LIMIT:
                 retained = trailing[-_POST_DONE_SUFFIX_LIMIT:]
                 forwarded.extend(trailing[: -len(retained)])
@@ -128,7 +139,8 @@ class SseDoneGate:
         self._buffer.clear()
         self._line_start = 0
         self._scan_start = 0
-        self._event_data.clear()
+        self._event_in_progress = False
+        self._partial_line_in_progress = False
         self._holding_done_candidate = False
         return [forwarded] if forwarded else []
 
@@ -137,7 +149,8 @@ class SseDoneGate:
         self._buffer.clear()
         self._line_start = 0
         self._scan_start = 0
-        self._event_data.clear()
+        self._event_in_progress = False
+        self._partial_line_in_progress = False
         self._holding_done_candidate = False
 
 
@@ -174,18 +187,31 @@ def _utf8_safe_text(value: str) -> str:
     return value
 
 
-def _materialize_fragments(value: Any) -> Any:
+def _materialize_fragments(
+    value: Any,
+    *,
+    depth: int = 0,
+    note_defect: Callable[[str], None] | None = None,
+) -> Any:
+    if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
+        if note_defect is not None:
+            note_defect("stream output exceeded the maximum nesting depth")
+        return "[redacted]"
     if isinstance(value, _StringFragments):
         value = value.text()
     if isinstance(value, str):
         return _utf8_safe_text(value)
     if isinstance(value, dict):
         return {
-            _utf8_safe_text(key) if isinstance(key, str) else key: _materialize_fragments(item)
+            _utf8_safe_text(key) if isinstance(key, str) else key: _materialize_fragments(
+                item, depth=depth + 1, note_defect=note_defect
+            )
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_materialize_fragments(item) for item in value]
+        return [
+            _materialize_fragments(item, depth=depth + 1, note_defect=note_defect) for item in value
+        ]
     return value
 
 
@@ -326,7 +352,7 @@ class SseAccumulator:
             return len(serialized.encode("utf-8"))
         except UnicodeEncodeError:
             self._note_defect("stream contained text that is not valid utf-8")
-            safe_value = _materialize_fragments(value)
+            safe_value = _materialize_fragments(value, note_defect=self._note_defect)
             safe_serialized = (
                 safe_value
                 if isinstance(safe_value, str)
@@ -373,6 +399,26 @@ class SseAccumulator:
         sizes[key] = value_size
         return True
 
+    def _tool_call_fragment_size(self, target: dict[str, Any], fragment: dict[str, Any]) -> int:
+        size = 0
+        for key, value in fragment.items():
+            current = target.get(key)
+            if isinstance(value, dict) and isinstance(current, dict):
+                size += self._tool_call_fragment_size(current, value)
+                continue
+            if isinstance(value, str):
+                current_text = current.text() if isinstance(current, _StringFragments) else current
+                if current_text == value and key in {"id", "type"}:
+                    continue
+            size += self._value_size(value)
+            if key not in target:
+                size += self._value_size(key) + 4
+        return size
+
+    def _reserve_tool_call_fragment(self, target: dict[str, Any], fragment: dict[str, Any]) -> bool:
+        retained_size = self._tool_call_fragment_size(target, fragment)
+        return self._reserve(b"x" * retained_size)
+
     @property
     def has_error(self) -> bool:
         return "error" in self._envelope
@@ -399,11 +445,12 @@ class SseAccumulator:
         choices: list[dict[str, Any]] = []
         for index in sorted(self._choices):
             state = self._choices[index]
-            message = _materialize_fragments(state["message"])
+            message = _materialize_fragments(state["message"], note_defect=self._note_defect)
             tool_calls = state["tool_calls"]
             if tool_calls:
                 message["tool_calls"] = [
-                    _materialize_fragments(tool_calls[i]) for i in sorted(tool_calls)
+                    _materialize_fragments(tool_calls[i], note_defect=self._note_defect)
+                    for i in sorted(tool_calls)
                 ]
             choice = {
                 **state["extensions"],
@@ -412,9 +459,14 @@ class SseAccumulator:
                 "finish_reason": state["finish_reason"],
             }
             if state["logprobs"]:
-                choice["logprobs"] = _materialize_fragments(state["logprobs"])
+                choice["logprobs"] = _materialize_fragments(
+                    state["logprobs"], note_defect=self._note_defect
+                )
             choices.append(choice)
-        return _materialize_fragments({**self._envelope, "choices": choices, "usage": self.usage})
+        return _materialize_fragments(
+            {**self._envelope, "choices": choices, "usage": self.usage},
+            note_defect=self._note_defect,
+        )
 
     def _choice_state(self, index: int) -> dict[str, Any]:
         return self._choices.setdefault(
@@ -564,8 +616,6 @@ class SseAccumulator:
             if tool_calls is not None:
                 self._note_defect("stream tool_calls was not a list")
             return
-        if not self._reserve(tool_calls):
-            return
         accumulated_calls: dict[int, dict[str, Any]] = state["tool_calls"]
         for position, tool_call in enumerate(tool_calls):
             if not isinstance(tool_call, dict):
@@ -581,8 +631,8 @@ class SseAccumulator:
                 continue
             else:
                 index = raw_index
+            fragment = {key: value for key, value in tool_call.items() if key != "index"}
             target = accumulated_calls.setdefault(index, {})
-            _merge_fragment_dict(
-                target,
-                {key: value for key, value in tool_call.items() if key != "index"},
-            )
+            if not self._reserve_tool_call_fragment(target, fragment):
+                return
+            _merge_fragment_dict(target, fragment)

@@ -249,7 +249,7 @@ def _schema_anchor_pointers(value: Any, *, depth: int = 0) -> dict[str, frozense
         if isinstance(node, dict):
             for keyword in keywords:
                 anchor = node.get(keyword)
-                if isinstance(anchor, str) and path:
+                if isinstance(anchor, str):
                     anchors.setdefault(anchor, set()).add(path)
             for key, item in node.items():
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
@@ -352,6 +352,9 @@ def _redact_secret_fields(
             for pointer in _secret_schema_definition_refs(value, depth=depth)
         }
         active_secret_schema_refs = (secret_schema_refs or set()) | local_secret_schema_refs
+        secret_schema_definition = secret_schema_definition or (
+            schema_definition_path in active_secret_schema_refs
+        )
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
             schema_definition = schema_property_map and _is_schema_definition(item)

@@ -753,6 +753,30 @@ def test_done_gate_bounds_a_newline_free_non_data_suffix() -> None:
     assert gate._buffer == b""
 
 
+def test_done_gate_partial_second_data_line_keeps_event_nonterminal() -> None:
+    chunks = [b"data: [DONE]\n", b"data: a", b"\n", b"data: [DONE]\n", b"\n"]
+    gate = trace_sse.SseDoneGate()
+
+    forwarded = [part for chunk in chunks for part in gate.feed(chunk)]
+    forwarded.extend(gate.finish())
+
+    assert b"".join(forwarded) == b"".join(chunks)
+    assert gate.terminated is False
+    assert gate.done_event is None
+
+
+def test_done_gate_drops_forwarded_data_from_terminator_state() -> None:
+    gate = trace_sse.SseDoneGate()
+
+    gate.feed(b"data: x\n")
+    for _ in range(20_000):
+        gate.feed(b"data: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\n")
+
+    assert not hasattr(gate, "_event_data")
+    assert gate._event_in_progress is True
+    assert gate.terminated is False
+
+
 def test_empty_string_deltas_do_not_accumulate_fragment_entries() -> None:
     accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=256)
     empty_event = b'data: {"choices":[{"index":0,"delta":{"content":""}}]}\n\n'
@@ -786,6 +810,52 @@ def test_repeated_sse_envelope_fields_do_not_consume_the_stream_budget() -> None
 
     assert accumulator.truncated is False
     assert accumulator.output()["choices"][0]["message"]["content"] == fragment * 512
+
+
+def test_tool_call_fragments_charge_only_retained_output_bytes() -> None:
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=100_000)
+    event = (
+        b'data: {"choices":[{"index":0,"delta":{"tool_calls":'
+        b'[{"index":0,"function":{"arguments":"x"}}]}}]}\n\n'
+    )
+
+    for _ in range(30_000):
+        accumulator.feed(event)
+    accumulator.feed(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n')
+
+    output = accumulator.output()
+    assert accumulator.truncated is False
+    assert output["choices"][0]["finish_reason"] == "tool_calls"
+    assert output["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == (
+        "x" * 30_000
+    )
+    assert accumulator._accumulated_bytes < 31_000
+
+
+def test_materialization_depth_limit_records_a_defect_without_truncating() -> None:
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=100_000)
+    nested: object = "leaf"
+    for _ in range(2_000):
+        nested = {"x": nested}
+    accumulator._choices[0] = {
+        "message": nested,
+        "tool_calls": {},
+        "logprobs": {},
+        "extensions": {},
+        "finish_reason": "stop",
+    }
+
+    output = accumulator.output()
+
+    assert accumulator.defect == "stream output exceeded the maximum nesting depth"
+    assert accumulator.truncated is False
+    cursor = output["choices"][0]["message"]
+    traversed = 0
+    while isinstance(cursor, dict):
+        cursor = cursor["x"]
+        traversed += 1
+    assert traversed <= platform_traces._MAX_PAYLOAD_DEPTH
+    assert cursor == "[redacted]"
 
 
 def test_distinct_sse_delta_field_names_count_toward_the_stream_budget() -> None:
@@ -3198,6 +3268,22 @@ def test_percent_decoding_precedes_schema_pointer_unescaping() -> None:
     assert traces._local_schema_pointer("#/a~1b", anchors) == frozenset({("a/b",)})
     assert traces._local_schema_pointer("#/x/%zz", anchors) == frozenset({("x", "%zz")})
     assert traces._local_schema_pointer("http://e/x#Alpha", anchors) == frozenset()
+
+
+def test_root_schema_anchor_ref_redacts_only_through_the_ref_edge() -> None:
+    literal = "ROOT-ANCHOR-LITERAL"
+    target = {"$anchor": "Alpha", "default": literal}
+    linked = {
+        **target,
+        "properties": {"password": {"$ref": "#Alpha"}},
+    }
+    control = {
+        **target,
+        "properties": {"label": {"type": "string"}},
+    }
+
+    assert traces._redact_secret_fields(linked)["default"] == "[redacted]"
+    assert traces._redact_secret_fields(control)["default"] == literal
 
 
 @pytest.mark.parametrize("nesting", [0, 9], ids=["shallow", "deep"])
