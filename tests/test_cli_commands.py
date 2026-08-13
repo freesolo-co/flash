@@ -1524,6 +1524,7 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
         "frac_reward_zero_std": 0.25,
         "mean_completion_tokens": 48.5,
         "truncation_rate": 0.125,
+        "discarded_rollouts": 1,
         "max_completion_tokens": 256,
     }
     metric_two = {
@@ -1536,6 +1537,7 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
         "frac_reward_zero_std": 0.0,
         "mean_completion_tokens": 51.0,
         "truncation_rate": 0.25,
+        "discarded_rollouts": 2,
         "max_completion_tokens": 256,
     }
 
@@ -1583,11 +1585,11 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
     assert metric_lines == [
         (
             "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
-            "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 max_comp_tokens=256"
+            "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 discarded=1 max_comp_tokens=256"
         ),
         (
             "step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 frac_zero_std=0 "
-            "comp_len=51 trunc=0.25 max_comp_tokens=256"
+            "comp_len=51 trunc=0.25 discarded=2 max_comp_tokens=256"
         ),
     ]
 

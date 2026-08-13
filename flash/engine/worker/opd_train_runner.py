@@ -590,6 +590,7 @@ def _build_child_callbacks(
         "step": resume_step,
         "loss": None,
         "truncation_rate": None,
+        "discarded_rollouts": None,
         "truncation_step": None,
     }
     wandb_link: dict[str, str | None] = {}
@@ -613,7 +614,10 @@ def _build_child_callbacks(
             # when NO step ever produced a distillation loss.
             return
         progress["loss"] = loss
-        progress["truncation_rate"] = progress_state.record_step(step_number, loss, bridge)
+        (
+            progress["truncation_rate"],
+            progress["discarded_rollouts"],
+        ) = progress_state.record_step(step_number, loss, bridge)
         progress["truncation_step"] = step_number
 
     def on_step(step: int) -> None:
@@ -623,6 +627,7 @@ def _build_child_callbacks(
             payload["loss"] = progress["loss"]
         if progress["truncation_step"] == step and progress["truncation_rate"] is not None:
             payload["truncation_rate"] = progress["truncation_rate"]
+            payload["discarded_rollouts"] = progress["discarded_rollouts"]
         _opd_train._w.heartbeat("opd_step", **payload)
 
     def child_heartbeat() -> None:
