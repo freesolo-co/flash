@@ -640,9 +640,12 @@ def _build_child_callbacks(
     tail_staleness = _opd_train.ChildTailStaleness()
 
     def liveness_fields() -> dict[str, object]:
-        return _opd_train.stall_tail_fields(
-            int(progress["step"] or 0), child_tail, staleness=tail_staleness
-        )
+        # steps THIS child has taken, not the absolute step it resumed at. `stall_tail_fields`
+        # stops reporting once its step argument is above zero, so passing the resumed step would
+        # silence the stall signal from the first tick of every resumed attempt -- exactly the
+        # attempts most likely to wedge, since a resume re-runs the whole import and ray startup.
+        steps_this_child = max(0, int(progress["step"] or 0) - resume_step)
+        return _opd_train.stall_tail_fields(steps_this_child, child_tail, staleness=tail_staleness)
 
     return _ChildCallbacks(
         on_line,

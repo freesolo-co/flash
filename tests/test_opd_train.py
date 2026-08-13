@@ -6779,6 +6779,34 @@ def test_opd_stall_abort_reason_states_only_what_was_observed():
     )
 
 
+def test_a_resumed_child_still_reports_silence_before_its_own_first_step():
+    """A resume starts `progress["step"]` at the resumed step, which would silence the detector.
+
+    `stall_tail_fields` reports nothing once its step argument is above zero, so feeding it the
+    ABSOLUTE step would switch the stall signal off from the very first tick of every resumed
+    attempt. Those are the attempts most exposed to this failure, not least: a resume re-runs the
+    whole import and ray startup, which is where the wedge happens.
+    """
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    watcher = SimpleNamespace(raise_if_failed=lambda: None)
+    progress_state = SimpleNamespace(record_step=lambda *_args: None)
+    callbacks = opd_runner._build_child_callbacks(watcher, progress_state, object(), 120)
+
+    callbacks.child_tail.record("ray: waiting for placement group\n")
+    fields = callbacks.liveness_fields()
+    assert "child_tail_silent_ticks" in fields, (
+        "a child resumed at step 120 publishes no silence counter, so a wedge during its startup "
+        "can never be condemned and bills until the provider timeout"
+    )
+    assert fields["child_tail_silent_ticks"] == 0
+    assert callbacks.liveness_fields()["child_tail_silent_ticks"] == 1
+
+    # once THIS child takes a step past the resume point, progress is real and reporting stops.
+    callbacks.on_step(121)
+    assert callbacks.liveness_fields() == {}
+
+
 def test_transfer_queue_init_passes_the_config_through_and_returns():
     seen = []
     _init_transfer_queue(lambda conf: seen.append(conf), {"backend": "SimpleStorage"}, timeout_s=30)
