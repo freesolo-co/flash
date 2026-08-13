@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 
 from flash.cli.ui import render
@@ -60,9 +61,10 @@ _PERMANENT_POLL_STATUSES = frozenset({401, 403})
 # the pre-deploy alias read is advisory, so it must not spend the client's default 60s budget
 # deciding whether to print a warning: a stalled read would delay every real deploy behind a
 # line nobody asked for. short enough to stay unnoticed, long enough for a healthy plane.
-# it is spent as BOTH bounds: as a socket timeout it only bounds each individual read, so a
-# proxy trickling bytes just inside it holds the deploy open indefinitely -- exactly the delay
-# this exists to prevent. as a wall-clock body deadline too, it bounds the whole read.
+# it is spent three ways, because the client's own bounds are per-phase: as a socket timeout it
+# bounds one socket operation, and as a body deadline it bounds the body but is only consulted
+# once headers are parsed. a peer trickling headers just inside the socket timeout escapes both.
+# `_read_within` bounds the total in wall-clock time, which is the one that actually holds.
 _ALIAS_WARNING_READ_SECONDS = 5.0
 
 
@@ -201,6 +203,42 @@ def _served_step_label(step: int | None) -> str:
     return "final" if step is None else f"step-{step}"
 
 
+def _read_within(budget: float, read):
+    """Run an advisory read, giving up on it entirely once ``budget`` seconds have passed.
+
+    The client's two bounds are both per-phase, not total: `timeout` restarts on every socket
+    operation and the body deadline is only checked once `urlopen` has finished parsing headers.
+    A peer that trickles the status line or headers just inside the socket timeout therefore
+    stalls for timeout x however many pauses it takes -- 12s against a 2s budget, measured -- and
+    the whole point of the bound is that the deploy the user actually asked for is waiting behind
+    it. Only wall-clock time outside the call bounds every phase at once.
+
+    A daemon thread rather than a cancellation: a blocked socket read cannot be interrupted from
+    outside, so the read is abandoned rather than stopped. That is sound only because this result
+    is discardable -- no warning is the documented outcome for a plane that cannot answer, so an
+    overrunning read degrades to silence. Daemon, so a stuck thread cannot keep the interpreter
+    alive after the deploy finishes.
+    """
+    result: list = []
+    worker = threading.Thread(
+        target=lambda: result.append(_read_or_none(read)),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(budget)
+    return result[0] if result else None
+
+
+def _read_or_none(read):
+    """The advisory read's failure contract: a plane that cannot answer produces no warning."""
+    try:
+        return read()
+    except (ApiError, ClientError):
+        # the deploy itself is the authority on whether it can proceed. failing it here would turn
+        # a warning nobody asked for into an outage of the command it decorates.
+        return None
+
+
 def _alias_move_warning(client, base_run_id: str, requested_step: int | None) -> str | None:
     """Warn when deploying moves the shared `<run_id>` alias off a different checkpoint.
 
@@ -214,18 +252,16 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
     stop the deploy. Returns None when nothing is being displaced -- no deployment, the same
     checkpoint again, or an unreadable current record.
     """
-    try:
+    current = _read_within(
+        _ALIAS_WARNING_READ_SECONDS,
         # not `deployment_for`: its step filter hides exactly the record this asks about, a
         # DIFFERENT checkpoint holding the alias.
-        current = client.deployed_checkpoint(
+        lambda: client.deployed_checkpoint(
             base_run_id,
             timeout=_ALIAS_WARNING_READ_SECONDS,
             body_deadline=_ALIAS_WARNING_READ_SECONDS,
-        )
-    except (ApiError, ClientError):
-        # the deploy itself is the authority on whether it can proceed. failing it here would turn
-        # a warning nobody asked for into an outage of the command it decorates.
-        return None
+        ),
+    )
     if current is None:
         return None
     # a `reconciling` record whose activation outcome was never recorded may ALREADY hold the

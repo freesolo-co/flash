@@ -36,10 +36,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   operation on the first, and read as a serving regression rather than the deploy that caused
   it. The warning names both checkpoints and points at `flash models chat <run-id>/step-N`,
   which addresses a checkpoint directly and does not depend on where the id points. It is
-  advisory: the deploy still proceeds, the pre-deploy read is bounded in wall-clock time well
-  under the client's default timeout so a slow plane cannot hold a deploy behind it, and a
-  control plane that cannot answer (or answers with a checkpoint step this client cannot read)
-  does not fail the command. A deployment whose activation outcome was never settled still warns, but without
+  advisory: the deploy still proceeds, the pre-deploy read is abandoned outright once it exceeds
+  a few seconds so no shape of slow plane can hold a deploy behind it, and a control plane that
+  cannot answer (or answers with a checkpoint step this client cannot read) does not fail the
+  command. A deployment whose activation outcome was never settled still warns, but without
   naming a checkpoint: that record's step describes the incoming attempt rather than what the id
   currently serves, and the authoritative target is server-side only, so the warning says the
   live checkpoint cannot be determined and points at `flash models deployments`.

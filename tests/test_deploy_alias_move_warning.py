@@ -9,6 +9,8 @@ serving regression instead of the deploy that caused it.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -212,6 +214,45 @@ def test_the_advisory_read_is_bounded_in_wall_clock_not_just_per_socket_read() -
     _alias_move_warning(client, "flash-1", 50)
 
     assert client.read_deadlines == [deploy_module._ALIAS_WARNING_READ_SECONDS]
+
+
+@pytest.mark.wallclock
+def test_a_read_that_overruns_its_budget_is_abandoned_rather_than_waited_out() -> None:
+    """Neither client bound covers every phase, so the caller has to bound the total itself.
+
+    `timeout` restarts on each socket operation and the body deadline is only consulted once
+    `urlopen` has parsed the headers, so a peer trickling the status line or headers just inside
+    the socket timeout stalls for timeout x however many pauses it takes -- measured at 12s
+    against a 2s budget. The deploy the user actually asked for is waiting behind this, so an
+    overrunning advisory read has to be given up on, not waited out.
+    """
+
+    released = threading.Event()
+    returned_late = []
+
+    class _Stalling:
+        def deployed_checkpoint(self, run_id, timeout=None, *, body_deadline=None):
+            # stands in for a peer trickling headers: nothing to read, and no bound the client
+            # applies covers it. released at the end so the thread cannot outlive the test.
+            returned_late.append(released.wait(30))
+            return _ready(100)
+
+    start = time.monotonic()
+    warning = _alias_move_warning(_Stalling(), "flash-1", 50)
+    elapsed = time.monotonic() - start
+    released.set()
+
+    # no warning is the documented outcome for a plane that cannot answer in time.
+    assert warning is None
+    # generous against CI scheduling noise, and still far below the 30s the read would take.
+    assert elapsed < deploy_module._ALIAS_WARNING_READ_SECONDS + 5.0, f"waited {elapsed:.2f}s"
+    # the read had NOT finished when the caller gave up: it was abandoned, not merely slow.
+    assert returned_late == []
+
+
+def test_a_read_that_answers_in_time_still_warns() -> None:
+    """Bounding the read must not cost the warning on a plane that answers normally."""
+    assert "step-100" in (_alias_move_warning(_Client(_ready(100)), "flash-1", 50) or "")
 
 
 @pytest.mark.parametrize(
