@@ -37,9 +37,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   - **Every episode scored 0.0.** The existing blocking gate is GRPO-only and abstains for a
     reasoning-markup reference, a replay that ran out mid-episode, and a junk probe that raised, so
     an all-zero run routinely printed `PASS` and nothing else. A constant reward is never a
-    measurement, and for GRPO it is actively silent: rewards are mean-centred within each group, so
-    a constant reward is a zero advantage and a zero gradient - training completes, the loss curve
-    looks unremarkable, W&B looks healthy, and the adapter comes out identical to its warm start.
+    measurement, and for GRPO it carries the risk of being actively silent: rewards are mean-centred
+    within each group, so if sampled rollouts score alike the advantage and gradient are zero -
+    training completes, the loss curve looks unremarkable, W&B looks healthy, and the adapter comes
+    out identical to its warm start. That is stated as a risk rather than a prediction: this command
+    scores at most three offline gold replays, never a group of policy samples, so it cannot know
+    what a real rollout group would pay.
     The end-of-run advantage-spread guard catches that only after the GPUs are paid for. An
     all-`echo` run is reported differently and more weakly, because zero is the _correct_ score for
     the deliberate junk echo replays - what is wrong there is that no _replayable_ gold answer was
@@ -60,7 +63,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     final state says nothing about the reference either way. That keeps both halves honest - a
     five-move solution against a twelve-turn cap on an unsolvable board (the field case, since real
     datasets carry minimal solutions) is still reported, while a short gold answer on a working
-    environment is not blamed for the padding that followed it.
+    environment is not blamed for the padding that followed it. The ceiling compared against is the
+    _effective_ one: a row setting `max_episode_turns` below the dataset-wide `max_turns` is stopped
+    by its own budget, which `rollout_done` gives precedence, so measuring exhaustion against
+    `max_turns` alone silenced this warning for exactly the rows whose budget is tightest.
   - **A gold completion whose rendered role sequence collapses.** SFT does not replay a completion
     turn by turn; it renders one training string from `prompt_messages + sft_completion`, and
     nothing validated that concatenation. On a single-turn environment a gold answer returned as

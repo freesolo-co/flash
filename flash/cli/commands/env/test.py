@@ -9,6 +9,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from flash.cli.commands.env.episode import _effective_turn_cap
 from flash.cli.commands.env.push import _err, _resolve_local_env_entrypoint
 from flash.cli.commands.env.test_evaluations import _check_evaluation_suites
 from flash.cli.commands.env.test_warnings import (
@@ -259,11 +260,18 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     record["thinking_markup"] = _carries_thinking_markup(reference_turns)
     # mirror the worker turn loop (flash/engine/worker/train/rl/child/multiturn.py): drive one model
     # turn, then stop at the hard turn ceiling, on the env's own done signal, or when the
-    # env yields no reply. the hard cap is fixed at what the trainer passes (env.max_turns)
-    # and the turn counter rises every turn until it reaches the cap, so a cooperatively-
-    # stepping env terminates here exactly as it would in training; no separate
+    # env yields no reply. the turn counter rises every turn until it reaches the cap, so a
+    # cooperatively-stepping env terminates here exactly as it would in training; no separate
     # non-termination guard is needed.
-    hard_cap = int(env.max_turns)
+    #
+    # the ceiling is the EFFECTIVE one, not `env.max_turns`: a row that sets `max_episode_turns`
+    # below the dataset-wide cap is stopped by its own budget, and `rollout_done` gives that budget
+    # precedence (flash/envs/adapter.py). comparing the turn count against `env.max_turns` alone
+    # left `stopped_at_ceiling` False for exactly those episodes, so a dead environment held under a
+    # short per-example cap reached `overall: PASS` with no warning -- the silent pass this check
+    # exists to catch. shared with `flash env eval`, which derives the same limit for the same
+    # reason, so the two commands cannot drift.
+    hard_cap = _effective_turn_cap(env, state)
     turns = 0
     # mirrors the worker's own flag: True while the newest turn has not been through env_reply.
     env_step_pending = False

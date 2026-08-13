@@ -277,10 +277,15 @@ def _warn_on_uniformly_zero_rewards(
             "(`sft_completion`, or the row's `output`) and re-run"
         )
     else:
+        # phrased as a RISK, not a prediction. this command scored at most three offline gold
+        # replays, never a group of policy samples, so it cannot know what a real rollout group
+        # would pay. saying the adapter is guaranteed to come out unchanged would overstate the
+        # evidence, and an operator who trains anyway and sees a normal-looking run learns to
+        # distrust the warning.
         detail = (
-            "every rollout would then carry the same reward, which GRPO centres to a zero "
-            "advantage and a zero gradient: the run would complete, report an unremarkable loss "
-            "curve, and produce an adapter identical to its warm start"
+            "if sampled rollouts score alike, GRPO centres the group to a zero advantage and a "
+            "zero gradient: the run completes, reports an unremarkable loss curve, and produces "
+            "an adapter identical to its warm start"
             if algorithm == _REWARD_DRIVEN_ALGORITHM
             else "a reward that is constant across every row measures nothing about the environment"
         )

@@ -2449,6 +2449,69 @@ def test_env_test_stays_quiet_for_a_healthy_env_under_real_rollout_done_semantic
     assert "never finished" not in captured.err
 
 
+class _PerExampleCapDeadEnv(_MultiTurnEnv):
+    """A dead environment whose PER-EXAMPLE budget is well below the dataset-wide cap.
+
+    `rollout_done` gives `state["max_episode_turns"]` precedence over `env.max_turns`
+    (flash/envs/adapter.py), so this episode is stopped by its own budget at turn 3 while the
+    dataset-wide ceiling is 12. Deriving the ceiling from `env.max_turns` alone left the exhaustion
+    flag False for exactly these episodes, so a board no move can solve reached `overall: PASS`
+    with nothing said -- the silent pass this warning exists to catch.
+    """
+
+    max_turns = 12
+    rollout_done = FreesoloEnvironment.rollout_done
+
+    def dataset(self):
+        return [
+            {
+                "input": "solve the board",
+                "output": [{"role": "assistant", "content": f"move {n}"} for n in range(1, 3)],
+            }
+        ]
+
+    def new_rollout_state(self, example):
+        prompt = [{"role": "user", "content": example["input"]}]
+        return {
+            "prompt": prompt,
+            "messages": list(prompt),
+            "done": False,
+            "turn": 0,
+            "max_episode_turns": 3,
+        }
+
+    def env_reply(self, messages, state):
+        # never declares the episode done: no sequence of moves satisfies the win condition.
+        state["turn"] += 1
+        reply = {"role": "user", "content": "keep going"}
+        messages.append(reply)
+        return [reply]
+
+    def reward(self, completion, example, state=None):
+        self.scored_state = state
+        return 0.62
+
+
+def test_env_test_warns_when_a_per_example_cap_stops_an_unfinished_replay(
+    monkeypatch, tmp_path, capsys
+):
+    """The exhaustion verdict must use the EFFECTIVE ceiling, not the dataset-wide one.
+
+    A row may set `max_episode_turns` below `env.max_turns`, and the adapter gives that budget
+    precedence. Comparing the turn count against `env.max_turns` alone silenced the warning for
+    every such episode, which is the one shape where the budget is tightest and a non-terminating
+    reference is most likely to go unnoticed.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _PerExampleCapDeadEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=replay turns=3" in captured.out
+    assert "replay gold answer never finished: it used all 3 turn(s)" in captured.err
+
+
 def test_env_test_warns_when_the_completion_repeats_the_prompts_last_user_turn(
     monkeypatch, tmp_path, capsys
 ):
