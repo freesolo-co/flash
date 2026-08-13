@@ -68,18 +68,30 @@ class SseDoneGate:
                 data = content[len(b"data:") :].strip()
                 if not self._event_data and data == b"[DONE]":
                     self._holding_done_candidate = True
+                elif self._holding_done_candidate:
+                    # sse joins multiple data lines with a newline, so a second one proves that the
+                    # combined event is not the single `[DONE]` terminator the gate is looking for.
+                    self._holding_done_candidate = False
                 self._event_data.append(data)
             if not self._holding_done_candidate:
                 forwarded.extend(self._buffer[:next_cursor])
                 del self._buffer[:next_cursor]
                 self._line_start = 0
                 self._scan_start = 0
-            elif len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
+            elif not content.startswith(b"data:") and len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
                 self._settle_bounded_done()
                 return [bytes(forwarded)] if forwarded else []
 
         if self._holding_done_candidate:
-            if len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
+            partial_line = bytes(self._buffer[self._line_start :])
+            if partial_line.startswith(b"data:"):
+                # a second data line changes the combined event even before its newline arrives.
+                self._holding_done_candidate = False
+                forwarded.extend(self._buffer)
+                self._buffer.clear()
+                self._line_start = 0
+                self._scan_start = 0
+            elif len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
                 self._settle_bounded_done()
             else:
                 self._scan_start = _resume_scan_at(self._buffer)
@@ -106,7 +118,13 @@ class SseDoneGate:
         return [bytes(forwarded)] if forwarded else []
 
     def finish(self) -> list[bytes]:
-        forwarded = bytes(self._buffer)
+        if self.done_event is not None:
+            return []
+        forwarded = b""
+        if self._holding_done_candidate:
+            self.done_event = bytes(self._buffer)
+        else:
+            forwarded = bytes(self._buffer)
         self._buffer.clear()
         self._line_start = 0
         self._scan_start = 0
@@ -148,11 +166,24 @@ class _StringFragments:
         return "".join(self.parts)
 
 
+def _utf8_safe_text(value: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return value.encode("utf-16", errors="surrogatepass").decode("utf-16", errors="replace")
+    return value
+
+
 def _materialize_fragments(value: Any) -> Any:
     if isinstance(value, _StringFragments):
-        return value.text()
+        value = value.text()
+    if isinstance(value, str):
+        return _utf8_safe_text(value)
     if isinstance(value, dict):
-        return {key: _materialize_fragments(item) for key, item in value.items()}
+        return {
+            _utf8_safe_text(key) if isinstance(key, str) else key: _materialize_fragments(item)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [_materialize_fragments(item) for item in value]
     return value
@@ -288,19 +319,27 @@ class SseAccumulator:
             self.defect = reason
 
     def _value_size(self, value: Any) -> int:
-        if isinstance(value, str):
-            return len(value.encode("utf-8"))
         if isinstance(value, bytes):
             return len(value)
-        # measuring fragments instead of serializing the whole accumulated envelope keeps each
-        # chunk constant-time. json overhead only makes this an approximate storage budget, so
-        # the explicit truncation marker remains the authoritative export signal.
-        return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+        serialized = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        try:
+            return len(serialized.encode("utf-8"))
+        except UnicodeEncodeError:
+            self._note_defect("stream contained text that is not valid utf-8")
+            safe_value = _materialize_fragments(value)
+            safe_serialized = (
+                safe_value
+                if isinstance(safe_value, str)
+                else json.dumps(safe_value, ensure_ascii=False)
+            )
+            return len(safe_serialized.encode("utf-8"))
 
     def _reserve(self, value: Any, *, retained_key: str | None = None) -> bool:
-        if self.truncated or self._max_accumulated_bytes is None:
-            return not self.truncated
+        if self.truncated:
+            return False
         size = self._value_size(value)
+        if self._max_accumulated_bytes is None:
+            return True
         if retained_key is not None:
             size += self._value_size(retained_key) + 4
         if size > self._max_accumulated_bytes - self._accumulated_bytes:
@@ -317,10 +356,12 @@ class SseAccumulator:
         return self._reserve_overwriting_in(sizes, key, value)
 
     def _reserve_overwriting_in(self, sizes: dict[str, int], key: str, value: Any) -> bool:
-        if self.truncated or self._max_accumulated_bytes is None:
-            return not self.truncated
-        previous_size = sizes.get(key, 0)
+        if self.truncated:
+            return False
         value_size = self._value_size(value)
+        if self._max_accumulated_bytes is None:
+            return True
+        previous_size = sizes.get(key, 0)
         size = value_size
         if key not in sizes:
             size += self._value_size(key) + 4
@@ -373,7 +414,7 @@ class SseAccumulator:
             if state["logprobs"]:
                 choice["logprobs"] = _materialize_fragments(state["logprobs"])
             choices.append(choice)
-        return {**self._envelope, "choices": choices, "usage": self.usage}
+        return _materialize_fragments({**self._envelope, "choices": choices, "usage": self.usage})
 
     def _choice_state(self, index: int) -> dict[str, Any]:
         return self._choices.setdefault(

@@ -645,6 +645,16 @@ def test_done_gate_bounds_an_unterminated_post_done_suffix() -> None:
     assert gate._buffer == b""
 
 
+def test_done_gate_parks_an_eof_terminated_done_candidate() -> None:
+    gate = trace_sse.SseDoneGate()
+
+    assert gate.feed(b"data: [DONE]\n") == []
+    assert gate.finish() == []
+
+    assert gate.done_event == b"data: [DONE]\n"
+    assert gate.terminated is True
+
+
 def test_done_gate_discards_bytes_after_the_terminator() -> None:
     gate = trace_sse.SseDoneGate()
     chunk = b'data: [DONE]\n\ndata: {"late":1}\n\n'
@@ -684,20 +694,63 @@ def test_done_gate_relays_a_multiline_done_event_whole(chunks: list[bytes]) -> N
 
 
 def test_done_gate_bounds_an_undelimited_multiline_post_done_suffix() -> None:
-    """The suffix bound counts the retained terminator too. Counting only the unparsed tail let a
-    provider that streams endless `data:` lines without a blank delimiter grow the held event
-    without limit -- the same unbounded growth, one indirection away."""
+    """The suffix bound counts the retained terminator too. A genuine terminator event can carry
+    endless non-data continuation lines without a blank delimiter, so the whole held event must stay
+    bounded rather than counting only the unparsed tail."""
 
     gate = trace_sse.SseDoneGate()
 
     assert gate.feed(b"data: [DONE]\n") == []
     for _ in range(5_000):
-        assert gate.feed(b"data: junk\n") == []
+        assert gate.feed(b": keepalive\n") == []
 
     assert gate.terminated is True
     assert gate._buffer == b""
     assert gate.done_event is not None
     assert len(gate.done_event) <= trace_sse._POST_DONE_SUFFIX_LIMIT
+
+
+def test_done_gate_releases_a_large_second_data_line_and_later_events() -> None:
+    """A second data line changes the SSE event's combined payload, so it was never a terminator.
+    The genuine-terminator suffix bound must not truncate that legal event or anything after it."""
+
+    first = b"data: [DONE]\ndata: " + b"x" * 2_000 + b"\n"
+    completion = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+    suffix = b"\n" + completion + b":\n\n"
+    assert len(first + suffix) == 2_072
+    gate = trace_sse.SseDoneGate()
+
+    forwarded = gate.feed(first)
+    assert b"".join(forwarded) == first
+    forwarded.extend(gate.feed(suffix))
+    forwarded.extend(gate.finish())
+
+    assert b"".join(forwarded) == first + suffix
+    assert gate.terminated is False
+    assert gate.done_event is None
+
+
+def test_done_gate_releases_a_large_partial_second_data_line() -> None:
+    gate = trace_sse.SseDoneGate()
+    partial = b"data: " + b"y" * 2_000
+
+    assert len(partial) == 2_006
+    assert gate.feed(b"data: [DONE]\n") == []
+    assert b"".join(gate.feed(partial)) == b"data: [DONE]\n" + partial
+    assert gate.terminated is False
+    assert gate.done_event is None
+    assert gate._buffer == b""
+
+
+def test_done_gate_bounds_a_newline_free_non_data_suffix() -> None:
+    gate = trace_sse.SseDoneGate()
+
+    assert gate.feed(b"data: [DONE]\n") == []
+    assert gate.feed(b":" + b"k" * 5_000) == []
+
+    assert gate.terminated is True
+    assert gate.done_event == b"data: [DONE]\n"
+    assert gate._buffer == b""
 
 
 def test_empty_string_deltas_do_not_accumulate_fragment_entries() -> None:
@@ -1227,6 +1280,74 @@ async def test_streaming_upstream_error_records_raw_json(tmp_path, monkeypatch) 
     span = exported["records"][0]["spans"][0]
     assert span["error"] == "upstream returned status 429"
     assert span["output_payload"] == {"error": {"message": "rate limited"}}
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("/v1/retry", "https://api.openai.com/v1/retry"),
+        ("https://provider.example/retry", "https://provider.example/retry"),
+    ],
+    ids=["relative", "absolute"],
+)
+def test_provider_redirect_locations_resolve_against_the_upstream_url(
+    location: str, expected: str
+) -> None:
+    headers = traces._safe_provider_response_headers(
+        {"Location": location},
+        status_code=302,
+        upstream_url="https://api.openai.com/v1/chat/completions",
+    )
+
+    assert headers == {"Location": expected}
+    assert (
+        traces._safe_provider_response_headers(
+            {"Location": location},
+            status_code=200,
+            upstream_url="https://api.openai.com/v1/chat/completions",
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streamed"])
+def test_relative_provider_redirects_target_the_upstream_origin(
+    trace_api, monkeypatch, stream: bool
+) -> None:
+    redirect_body = b"retry upstream"
+    if stream:
+
+        class _RelativeRedirectClient(_StreamingAsyncClient):
+            body = _StreamingBody([redirect_body])
+
+            async def send(self, request, *, stream) -> httpx.Response:
+                assert stream is True
+                return httpx.Response(
+                    302,
+                    headers={"content-type": "text/plain", "location": "/v1/retry"},
+                    stream=type(self).body,
+                    request=request,
+                )
+
+        monkeypatch.setattr(traces.httpx, "AsyncClient", _RelativeRedirectClient)
+    else:
+        _StaticAsyncClient.response = httpx.Response(
+            302,
+            content=redirect_body,
+            headers={"content-type": "text/plain", "location": "/v1/retry"},
+        )
+        monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions",
+        headers=_HEADERS,
+        json={**_REQUEST, "stream": stream},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://api.openai.com/v1/retry"
+    assert response.content == redirect_body
 
 
 def test_a_redirect_is_recorded_but_not_exported_as_a_training_target(
@@ -3041,6 +3162,44 @@ def test_secret_named_schema_ref_literals_are_redacted(trace_api, monkeypatch) -
     }
 
 
+@pytest.mark.parametrize(
+    "ref",
+    ["#/$defs/Alpha", "#/%24defs/Alpha", "#Alpha", "#Alph%61"],
+    ids=["pointer", "encoded-pointer", "anchor", "encoded-anchor"],
+)
+def test_percent_encoded_secret_schema_refs_are_redacted(trace_api, monkeypatch, ref: str) -> None:
+    schema = {
+        "type": "object",
+        "properties": {"api_key": {"$ref": ref}},
+        "$defs": {
+            "Alpha": {
+                "$anchor": "Alpha",
+                "default": "LEAKED-DEFAULT",
+                "const": "LEAKED-CONST",
+                "enum": ["LEAKED-ENUM"],
+            }
+        },
+    }
+
+    stored = _recorded_response_schema(trace_api, monkeypatch, schema)
+
+    assert stored["$defs"]["Alpha"]["default"] == "[redacted]"
+    assert stored["$defs"]["Alpha"]["const"] == "[redacted]"
+    assert stored["$defs"]["Alpha"]["enum"] == ["[redacted]"]
+
+
+def test_percent_decoding_precedes_schema_pointer_unescaping() -> None:
+    anchors: dict[str, frozenset[tuple[str, ...]]] = {}
+
+    assert traces._local_schema_pointer("#/%24defs/Alpha", anchors) == frozenset(
+        {("$defs", "Alpha")}
+    )
+    assert traces._local_schema_pointer("#/a%2Fb", anchors) == frozenset({("a", "b")})
+    assert traces._local_schema_pointer("#/a~1b", anchors) == frozenset({("a/b",)})
+    assert traces._local_schema_pointer("#/x/%zz", anchors) == frozenset({("x", "%zz")})
+    assert traces._local_schema_pointer("http://e/x#Alpha", anchors) == frozenset()
+
+
 @pytest.mark.parametrize("nesting", [0, 9], ids=["shallow", "deep"])
 def test_secret_schema_anchor_ref_literals_are_redacted_transitively(
     trace_api, monkeypatch, nesting: int
@@ -4487,6 +4646,65 @@ def test_stream_content_list_is_preserved() -> None:
 
     assert accumulator.defect is None
     assert accumulator.output()["choices"][0]["message"]["content"] == content
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"marker": "\ud800", "choices": []},
+        {"choices": [{"index": 0, "delta": {}, "marker": "\ud800"}]},
+        {"choices": [{"index": 0, "delta": {"content": "\ud800"}}]},
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\ud800"}}]},
+                }
+            ]
+        },
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "\ud800"}]},
+    ],
+    ids=["envelope", "choice-extension", "content", "tool-call", "finish-reason"],
+)
+def test_surrogates_mark_recording_defective_without_truncating(payload: dict) -> None:
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=10_000)
+    event = json.dumps(payload, ensure_ascii=True).encode()
+
+    accumulator.feed(b"data: " + event + b"\n\n")
+
+    assert accumulator.defect == "stream contained text that is not valid utf-8"
+    assert accumulator.truncated is False
+    assert "\ud800" not in repr(accumulator.output())
+
+
+def test_ordinary_content_with_a_production_budget_is_not_defective() -> None:
+    accumulator = trace_sse.SseAccumulator(
+        max_accumulated_bytes=platform_traces.MAX_PAYLOAD_TOTAL_BYTES
+    )
+
+    accumulator.feed(b'data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n')
+
+    assert accumulator.defect is None
+    assert accumulator.truncated is False
+
+
+def test_a_surrogate_in_a_stream_does_not_interrupt_the_relay(trace_api, monkeypatch) -> None:
+    event = b'data: {"choices":[{"index":0,"delta":{"content":"\\ud800"}}]}\n\n'
+    terminator = b"data: [DONE]\n\n"
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody([event, terminator])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    assert response.content == event + terminator
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["error"] == "stream contained text that is not valid utf-8"
+    assert span["attributes"] is None
 
 
 def test_a_non_object_delta_marks_the_stream_errored(trace_api, monkeypatch) -> None:

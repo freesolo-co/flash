@@ -9,6 +9,7 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any
+from urllib.parse import unquote, urljoin
 
 import anyio
 import httpx
@@ -225,6 +226,9 @@ def _redact_schema_literal(value: Any, *, depth: int) -> Any:
 def _local_schema_pointer(
     ref: str, anchors: Mapping[str, frozenset[tuple[str, ...]]]
 ) -> frozenset[tuple[str, ...]]:
+    if not ref.startswith("#"):
+        return frozenset()
+    ref = unquote(ref)
     if ref.startswith("#/"):
         segments = tuple(
             segment.replace("~1", "/").replace("~0", "~") for segment in ref[2:].split("/")
@@ -430,7 +434,7 @@ def _sanitize_for_trace(value: Any, secrets: tuple[str, ...], *, response: bool 
 
 
 def _safe_provider_response_headers(
-    headers: Mapping[str, str], *, status_code: int
+    headers: Mapping[str, str], *, status_code: int, upstream_url: str
 ) -> dict[str, str]:
     safe: dict[str, str] = {}
     for name, value in headers.items():
@@ -440,7 +444,7 @@ def _safe_provider_response_headers(
             or normalized.startswith(_SAFE_PROVIDER_RESPONSE_HEADER_PREFIXES)
             or (300 <= status_code < 400 and normalized == "location")
         ):
-            safe[name] = value
+            safe[name] = urljoin(upstream_url, value) if normalized == "location" else value
     return safe
 
 
@@ -720,7 +724,7 @@ async def _non_streaming_response(
         return await _upstream_failure_response(context)
 
     response_headers = _safe_provider_response_headers(
-        upstream_headers, status_code=upstream_status
+        upstream_headers, status_code=upstream_status, upstream_url=context.url
     )
     if response_too_large:
         await _record_trace(context, output_payload=None, error=_UPSTREAM_TOO_LARGE_ERROR)
@@ -923,7 +927,9 @@ async def chat_completions(
             await client.aclose()
             raise
         response_headers = _safe_provider_response_headers(
-            upstream_response.headers, status_code=upstream_response.status_code
+            upstream_response.headers,
+            status_code=upstream_response.status_code,
+            upstream_url=context.url,
         )
         response_headers.update({"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
         media_type: str | None = "text/event-stream"
