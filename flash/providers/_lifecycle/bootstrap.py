@@ -39,9 +39,6 @@ else:
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-# see endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S: the hourly cadence outlives the stall limits that
-# tear a wedged run down (1200s training, 3000s setup), so the first snapshot is taken early and the
-# hourly rate is left alone.
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
@@ -275,7 +272,17 @@ def _console_upload_loop(
     interval_s: float,
     stop_upload,
 ) -> None:
-    def _snapshot() -> None:
+    """Snapshot the console periodically until ``stop_upload`` is set.
+
+    The first wait is _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S rather than a full interval: the steady
+    cadence is hourly, but the stall classifier tears a wedged run down at 1200s (training) or
+    3000s (setup grace), so a loop that waited a whole interval first could never upload the
+    console of a run that HUNG -- the one run whose console is the only evidence of why. Only the
+    first wait shortens, so the steady rate against the shared artifact repo is unchanged.
+    """
+    wait_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
+    while not stop_upload.wait(wait_s):
+        wait_s = interval_s
         try:
             _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
@@ -283,14 +290,6 @@ def _console_upload_loop(
                 f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
                 flush=True,
             )
-
-    # first snapshot early so a run torn down inside the stall window still has one, then the
-    # steady cadence.
-    if stop_upload.wait(min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)):
-        return
-    _snapshot()
-    while not stop_upload.wait(interval_s):
-        _snapshot()
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
