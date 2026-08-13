@@ -210,10 +210,19 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
             response = http.get(
                 f"/adapters/{revision}", timeout=min(_CLIENT_REQUEST_TIMEOUT_CAP, remaining)
             )
-        except httpx.TimeoutException:
+        except httpx.RequestError:
             # Transient by the client's own rules. Backing off rather than hammering a backend that
             # is plainly still warming up. Same compute-then-sleep order as the tail of the loop; a
-            # timed-out request carries no response and so no `Retry-After`.
+            # failed request carries no response and so no `Retry-After`.
+            #
+            # The FULL transport-error class, not just timeouts. `_serving_request` converts every
+            # `httpx.RequestError` into a `ServingError` carrying no status code, and
+            # `_wait_revision_ready` re-raises only `status_code < 500`, so the client retries all
+            # of them until its deadline. Catching timeouts alone let a connection reset or a
+            # dropped keep-alive -- the ordinary shape of a scale-to-zero backend bringing a
+            # container up -- fail conformance on the first occurrence, rejecting a backend every
+            # real deploy tolerates. `TimeoutException` is a subclass of `RequestError`, so this
+            # strictly widens what was already handled; the deadline still bounds the wait.
             delay = _readback_delay(attempt)
             attempt += 1
             time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
@@ -570,6 +579,56 @@ def test_reregistering_while_the_first_load_is_pending_is_idempotent(
         # And the run must still converge afterwards: accepting the duplicate is not enough if it
         # wedged the first load or left two settles fighting over one record.
         _wait_ready(http, body["adapter_id"], ready_timeout)
+    finally:
+        http.delete(f"/adapters/{run_id}")
+
+
+def test_a_final_revision_registers_and_reaches_ready(http, adapter_source, run_id, ready_timeout):
+    """The ordinary finished-run shape, which every other test here skips.
+
+    `deploy_adapter` emits `<run>@final.<sha>` with `checkpoint_step: null` whenever no checkpoint
+    step is selected, which is what a completed run deploys as -- yet every registration in this
+    suite passes an integer step, so a backend that parses only `@step-N` passes conformance and
+    then fails every normal deploy. The null step is the specific part worth exercising: a backend
+    that coerces it, or that requires the field to be an int, rejects the id its own grammar
+    accepts.
+    """
+    body = _registration(run_id, adapter_source, step=None)
+    assert body["adapter_id"].endswith(f"@final.{adapter_source['hf_revision']}"), (
+        "the helper stopped producing the final-revision shape, so this test no longer covers it"
+    )
+    try:
+        _register(http, body)
+        record = _wait_ready(http, body["adapter_id"], ready_timeout)
+        assert (record.get("metadata") or {}).get("checkpoint_step") is None, (
+            "a final revision came back with a checkpoint step; the client compares provenance "
+            "exactly on its recovery readback and would call this a different immutable identity"
+        )
+    finally:
+        http.delete(f"/adapters/{run_id}")
+
+
+def test_a_thinking_adapter_registers_and_reaches_ready(
+    http, adapter_source, run_id, ready_timeout
+):
+    """`thinking: true` must be storable, not merely rejectable.
+
+    Every successful registration in this suite hardcodes `thinking: false`, and the immutability
+    matrix only proves that flipping it CONFLICTS. A backend that stores the field unconditionally
+    as false satisfies both: the identity readback matches, and the mutation still conflicts. The
+    control plane sends `thinking: true` for runs trained in thinking mode, where that backend
+    either fails the client's identity check or renders prompts in the wrong mode -- a silent
+    quality failure rather than an error.
+    """
+    body = {**_registration(run_id, adapter_source), "thinking": True}
+    try:
+        _register(http, body)
+        record = _wait_ready(http, body["adapter_id"], ready_timeout)
+        assert record.get("thinking") is True, (
+            f"a thinking adapter read back as {record.get('thinking')!r}; the client compares this "
+            f"field exactly, so the deploy fails, and a backend that ignores it renders prompts in "
+            f"the wrong mode"
+        )
     finally:
         http.delete(f"/adapters/{run_id}")
 
@@ -971,6 +1030,15 @@ def test_a_wrong_serving_key_is_rejected(http, serving_url, internal_key):
     "ignores the header". This sends a deliberately wrong one at a mutating endpoint: registration
     is what an unauthenticated caller would abuse to load arbitrary adapters onto the GPU.
 
+    EVERY protected route, not registration alone. Authentication is per-endpoint, so a backend
+    that guards its writes and leaves the rest open passes a registration-only probe while exposing
+    adapter metadata, letting an anonymous caller switch or disable a run's alias, and serving
+    public GPU-backed generation. Each of those is reachable independently, so each is asked
+    directly rather than inferred from a global policy the backend never actually has.
+
+    A 404 counts as unauthenticated exposure here, not as a pass: it means the handler ran and
+    reported on a resource before any key was checked.
+
     Skipped when no key is configured, because a backend with no key set is legitimately open (a
     laptop, a private network) and the contract does not require one.
     """
@@ -978,13 +1046,38 @@ def test_a_wrong_serving_key_is_rejected(http, serving_url, internal_key):
         pytest.skip("no FREESOLO_INTERNAL_KEY configured; the backend is intentionally open")
     import httpx
 
+    revision = "conformance-unauthorized@final." + "0" * 40
+    # Bodies are deliberately well-formed: a 422 would prove nothing about authentication, since
+    # rejecting a malformed payload does not tell an anonymous caller apart from an authorized one.
+    probes = (
+        ("register", "POST", "/adapters", {"adapter_id": revision}),
+        ("read back", "GET", f"/adapters/{revision}", None),
+        ("activate", "POST", f"/adapters/{revision}/activate", {"expected_adapter_revision": None}),
+        (
+            "chat",
+            "POST",
+            "/v1/chat/completions",
+            {"model": revision, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+        ),
+        # Deletion last: an authenticated backend refuses it, and an unauthenticated one has
+        # already failed this test before it could delete anything real.
+        ("delete", "DELETE", f"/adapters/{revision}", None),
+    )
+    unprotected = []
     with httpx.Client(base_url=serving_url, timeout=30.0) as client:
-        response = client.post(
-            "/adapters",
-            json={"adapter_id": "conformance-unauthorized@final." + "0" * 40},
-            headers={"X-Freesolo-Internal-Key": internal_key + "-wrong"},
-        )
-    assert response.status_code in (401, 403), (
-        f"registration with a WRONG serving key returned {response.status_code}; the backend does "
-        f"not check the key, so registration, activation, chat, and deletion are publicly callable"
+        for name, method, path, body in probes:
+            response = client.request(
+                method,
+                path,
+                json=body,
+                headers={"X-Freesolo-Internal-Key": internal_key + "-wrong"},
+            )
+            if response.status_code not in (401, 403):
+                unprotected.append(f"{name} ({method} {path}) -> {response.status_code}")
+
+    assert not unprotected, (
+        f"these routes answered a WRONG serving key without rejecting it: {'; '.join(unprotected)}. "
+        f"each one is independently reachable, so an anonymous caller can use exactly the ones "
+        f"listed -- read adapter metadata, switch or disable a run's alias, or run generation on "
+        f"your GPU -- while the backend still advertises key protection"
     )

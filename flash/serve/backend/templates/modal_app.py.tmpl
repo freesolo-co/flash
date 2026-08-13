@@ -871,6 +871,20 @@ class Engine:
             # in which the newcomer claims the id and loads -- and this `remove_lora(int_id)` then
             # evicts the NEWCOMER, whose record still says `ready` while nothing is resident.
             # Holding the claim across the eviction closes that window entirely.
+            #
+            # And gated on the DURABLE record still being disabled, re-read here rather than
+            # inherited from the caller's snapshot -- the same guard, and for the same reason, as
+            # `_discard_cached_adapter` below. `disabled_revisions` is captured under the run lock
+            # and this RPC is dispatched after that lock is released, so a re-registration of this
+            # exact revision can be accepted, load, and verify its fresh claim in between. Evicting
+            # on the stale snapshot then removes a LoRA the new settle has already loaded and
+            # releases the claim it verified, after which that settle commits `ready` from its own
+            # successful engine response while nothing is resident and the id is free for a
+            # collider. Re-registration is an explicit request to serve this revision again, so a
+            # record that is no longer disabled is exactly the signal to leave the GPU alone.
+            current = await adapter_records.get.aio(_record_key(adapter_id))
+            if isinstance(current, dict) and current.get("status") != "disabled":
+                return {{"ok": True}}
             if await _owns_lora_int_id(int_id, adapter_id):
                 self._int_ids.pop(int_id, None)
                 # Drop it from vLLM too, not just from this dict. The LoRA cache is bounded by
@@ -1416,13 +1430,27 @@ def api():
             # does not cover `record_type`.
             "metadata": {{
                 **metadata,
-                # The NORMALIZED sha, not the caller's original. The agreement check above strips
-                # before comparing, so `" abc... "` is accepted as matching the id -- but storing
-                # the raw value then hands that padded string to `snapshot_download(revision=...)`,
-                # which fails to resolve an otherwise valid commit, and an ambiguous-registration
-                # readback disagrees with the client's canonical sha. Stripping here rather than
-                # rejecting keeps the tolerance the comparison already grants, and makes the stored
-                # record say the same thing the id does.
+                # EVERY provenance field in its NORMALIZED form, not the caller's original. The
+                # agreement check above strips and coerces before comparing, so `"  abc  "` and
+                # `"10"` are both accepted as matching the id -- and storing the raw value then
+                # breaks the very thing the tolerance was granted for. Each field breaks
+                # differently, which is why all three are rewritten rather than only the sha:
+                #
+                #   - `hf_revision` goes to `snapshot_download(revision=...)`, which cannot
+                #     resolve a padded sha, so a registration that validated cleanly fails on the
+                #     GPU minutes later.
+                #   - `run_id` is what `_run_members` and the alias are keyed on. Stored padded,
+                #     the record joins a run whose alias name has spaces in it, so `/activate`
+                #     answers "run alias is missing" forever and the revision can never serve.
+                #   - `checkpoint_step` is echoed as provenance the client cross-checks on its 5xx
+                #     recovery readback, and `_fingerprint` reads it directly -- so `"10"` stored
+                #     as a string makes the canonical retry a 409 against a fingerprint that
+                #     differs only in type.
+                #
+                # Normalizing rather than rejecting keeps exactly the tolerance the comparison
+                # already grants, and makes the stored record say the same thing the id does.
+                "run_id": run_id,
+                "checkpoint_step": None if expected_step is None else int(expected_step),
                 "hf_revision": str(metadata.get("hf_revision") or "").strip() or None,
                 "record_type": "revision",
                 "lifecycle_state": "registered",
@@ -1782,6 +1810,21 @@ def api():
                         if isinstance(current, dict) and current.get("status") != "disabled":
                             continue  # revived under this lock's protection; its claim is not ours
                         await _release_lora_int_id(_lora_int_id(revision_id), revision_id)
+                        # And the DOWNLOAD, not only the claim. The warm branch reclaims the disk
+                        # as part of `Engine.unregister`; skipping the engine skipped that too, so
+                        # a cold undeploy of a healthy run left its directory on the volume with
+                        # nothing that would ever revisit it. `reclaimable` is populated only from
+                        # revisions that were ALREADY disabled carrying a marker, and a revision
+                        # this pass disables is neither, so no later DELETE collects it either --
+                        # successful cold undeploys grew paid storage without bound.
+                        #
+                        # Appended rather than deleted inline for the reason the deferred path
+                        # exists: `rmtree` is filesystem work, this loop holds the run lock, and
+                        # the lock's lease does not renew. The dispatch below already runs whether
+                        # or not anything is warm, is outside the lock, and re-checks the record
+                        # before deleting, so joining that list is the whole fix.
+                        if revision_id not in reclaimable:
+                            reclaimable.append(revision_id)
         # The deferred reclaims, run whether or not anything is warm. Unlike eviction, this has no
         # cheaper time to happen: undeploy is the last event in the run's life, so skipping here
         # leaves the directory on the volume for good. It is also bounded -- one `rmtree` per

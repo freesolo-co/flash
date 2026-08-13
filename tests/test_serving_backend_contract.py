@@ -1074,9 +1074,16 @@ def test_a_disabled_revision_is_dropped_from_the_engine(client):
     The engine's LoRA cache is bounded by max_loras, so adapters left resident across repeated
     deploy/undeploy cycles eventually evict live ones or fail new loads until the container
     restarts.
+
+    Driven against a DISABLED record, which is the only state the real caller dispatches from:
+    DELETE writes every member `disabled` under the run lock and only then makes this RPC. Calling
+    it on a `ready` record models a revision that has been re-registered since the snapshot was
+    taken, where standing down is the required behavior rather than a missed eviction -- that case
+    has its own test.
     """
     _register_and_ready(client)
     module = client.app.state.generated_module
+    module.adapter_records[module._record_key(REVISION)]["status"] = "disabled"
     engine_class = module.engine_classes[0]
     removed: list[int] = []
 
@@ -1515,6 +1522,33 @@ def test_a_cold_release_leaves_a_revived_revisions_claim_alone(client):
     )
 
 
+def test_a_cold_undeploy_reclaims_the_download_it_disabled(client):
+    """Skipping the GPU must not skip the DISK, any more than it skipped the claim.
+
+    The warm branch reclaims the download as part of `Engine.unregister`, so declining to call the
+    engine silently dropped that half too. Nothing else collects it: `reclaimable` is populated
+    only from revisions that were ALREADY disabled and carrying a marker, and a revision this pass
+    disables is neither, so every later DELETE skips it as well. A successful cold undeploy of a
+    healthy run therefore grew paid storage permanently, which is the ordinary case rather than an
+    edge one -- scale-to-zero is the default.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    module.runners.count = 0
+    module.discarded.clear()
+
+    assert client.delete(f"/adapters/{RUN_ID}").status_code == 200
+
+    assert REVISION in module.discarded, (
+        "a cold undeploy left the downloaded adapter on the volume, and no later pass revisits a "
+        "revision it disabled itself, so the directory is paid for until the app is torn down"
+    )
+    assert module.unregistered == [], (
+        "reclaiming the disk cold-started a GPU container, which is the cost the cold branch "
+        "exists to avoid"
+    )
+
+
 def test_undeploy_still_evicts_from_a_warm_engine(client):
     """The skip above must not become "never evict".
 
@@ -1529,6 +1563,51 @@ def test_undeploy_still_evicts_from_a_warm_engine(client):
     assert client.delete(f"/adapters/{RUN_ID}").status_code == 200
     assert REVISION in module.unregistered, (
         "a warm engine was left holding the disabled adapter, so its max_loras slot never frees"
+    )
+
+
+def test_a_warm_eviction_stands_down_for_a_revision_that_was_re_registered(client, engine):
+    """The eviction RPC is dispatched from a snapshot, so it must re-check before touching the GPU.
+
+    `disabled_revisions` is captured under the run lock, and this call is made after that lock is
+    released. A `models deploy` landing in the gap re-registers the same revision, loads it, and
+    verifies its fresh claim -- and the stale eviction then removes the LoRA that settle just
+    loaded and releases the claim it verified. The settle commits `ready` from its own successful
+    engine response, so the record reads healthy while nothing is resident and the int id is free
+    for a collider to take.
+
+    Same guard `_discard_cached_adapter` already applies to the disk, applied to the GPU.
+    """
+    module = client.app.state.generated_module
+    int_id = module._lora_int_id(REVISION)
+    module.adapter_records[module._lora_id_key(int_id)] = REVISION
+    # Re-registered: the record is `ready` again by the time this stale RPC executes.
+    module.adapter_records[module._record_key(REVISION)] = {
+        "adapter_id": REVISION,
+        "status": "ready",
+        "metadata": {"lifecycle_state": "ready", "run_id": RUN_ID},
+    }
+
+    removed: list[int] = []
+
+    async def _remove_lora(value):
+        removed.append(value)
+
+    instance = engine.__new__(engine)
+    instance._locks = {}
+    instance._loaded = {REVISION: object()}
+    instance._int_ids = {int_id: REVISION}
+    instance.engine = types.SimpleNamespace(remove_lora=_remove_lora)
+
+    _run_awaitable_result(engine.unregister(instance, REVISION))
+
+    assert removed == [], (
+        "a stale undeploy evicted a revision that had been re-registered and loaded, so its settle "
+        "reports `ready` while nothing is resident on the gpu"
+    )
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) == REVISION, (
+        "the stale undeploy released the claim the new settle had already verified, so a colliding "
+        "revision can take the int id while this one still reads `ready`"
     )
 
 
@@ -3066,6 +3145,58 @@ def test_a_padded_sha_is_stored_normalized_not_as_the_caller_sent_it(client):
         "re-registering the same revision with the canonical sha conflicted with the padded one, "
         "so a retry that spells the commit differently cannot converge"
     )
+
+
+def test_padded_provenance_is_stored_canonically_not_as_sent(client):
+    """Every field the agreement check normalizes must be STORED normalized, not just compared.
+
+    The check strips `run_id` and coerces `checkpoint_step` before comparing them to the id, so a
+    padded run and a string step are both accepted -- and storing the raw values then breaks the
+    exact things that tolerance was granted for. Each one fails differently, which is why this
+    asserts all three rather than the sha alone:
+
+      - `run_id` keys the alias and the membership index, so a padded copy files the record under
+        a run whose alias name has spaces in it and `/activate` answers "run alias is missing"
+        forever.
+      - `checkpoint_step` is read directly by `_fingerprint`, so `"10"` stored as a string makes
+        the canonical retry a 409 against a fingerprint differing only in type.
+      - `hf_revision` goes to `snapshot_download`, which cannot resolve a padded sha.
+    """
+    padded = {
+        **REGISTRATION,
+        "metadata": {
+            **REGISTRATION["metadata"],
+            "run_id": f"  {RUN_ID}  ",
+            "checkpoint_step": "10",
+            "hf_revision": "  " + REGISTRATION["metadata"]["hf_revision"] + "\n",
+        },
+    }
+    assert client.post("/adapters", json=padded).status_code in (200, 202)
+
+    module = client.app.state.generated_module
+    metadata = module.adapter_records[module._record_key(REVISION)]["metadata"]
+    assert metadata["run_id"] == RUN_ID, (
+        f"the record stored the padded run id {metadata['run_id']!r}, so its alias is keyed on a "
+        f"name with whitespace and activation can never find it"
+    )
+    assert metadata["checkpoint_step"] == 10, (
+        f"the record stored {metadata['checkpoint_step']!r} rather than the parsed int, so an "
+        f"identical retry sent canonically conflicts on a fingerprint that differs only in type"
+    )
+    assert metadata["hf_revision"] == REGISTRATION["metadata"]["hf_revision"]
+
+    # The two failures that follow from storing the raw values, asserted as behavior rather than
+    # inferred from the record: the canonical retry must be the no-op immutability promises, and
+    # the run must actually be activatable.
+    assert client.post("/adapters", json=REGISTRATION).status_code in (200, 202), (
+        "the canonical retry conflicted with the padded registration"
+    )
+    assert (
+        client.post(
+            f"/adapters/{REVISION}/activate", json={"expected_adapter_revision": None}
+        ).status_code
+        == 200
+    ), "the run alias was written under the padded name, so the revision can never be activated"
 
 
 def test_metadata_cannot_turn_a_revision_into_an_alias(client):
