@@ -753,6 +753,94 @@ def test_capacity_grace_scales_with_gpu_walk_position():
     assert sig.parameters["setup_grace_s"].default >= 1800.0
 
 
+def test_capacity_grace_scales_with_the_card_count():
+    # Multi-card shapes are scarcer than single cards, so a grace sized for 1x expires on a 4x wait
+    # that was merely slow rather than starved -- and expiring it does not find capacity faster:
+    # the supervisor tears the endpoint down and re-requests the SAME class, paying a fresh cold
+    # start to rejoin the queue it just left. Observed as 3-5 attempts and ~55 min of queueing per
+    # arm before a single optimizer step, worst on the multi-GPU arms.
+    from flash.providers.runpod import jobs
+
+    single = jobs.stall_kwargs(on_last_gpu=True, gpu_count=1)
+    assert single["queue_grace_s"] == 900.0
+
+    for count in (2, 4):
+        scaled = jobs.stall_kwargs(on_last_gpu=True, gpu_count=count)
+        assert scaled["queue_grace_s"] == 900.0 * count, count
+        assert scaled["throttled_grace_s"] == 900.0 * count, count
+        # only the capacity backstops move: a placed worker's cold start is governed by the setup
+        # grace, which has nothing to do with how scarce the shape was to obtain.
+        assert scaled["setup_grace_s"] == single["setup_grace_s"], count
+        assert scaled["stall_after_s"] == single["stall_after_s"], count
+
+    # the smaller mid-walk budget scales too -- scarcity is a property of the shape, not of where
+    # the walk has reached.
+    assert jobs.stall_kwargs(gpu_count=4)["queue_grace_s"] == 300.0 * 4
+
+    # bounded, so a hypothetical very wide shape cannot wait without limit. The run's absolute wall
+    # deadline is checked every poll iteration regardless, so the cap is a second bound, not the only one.
+    assert jobs.stall_kwargs(on_last_gpu=True, gpu_count=8)["queue_grace_s"] == (
+        900.0 * jobs.CAPACITY_GRACE_PER_GPU_CAP
+    )
+
+
+def test_single_card_capacity_grace_is_unchanged_by_the_scaling():
+    # The whole change must be invisible to 1x runs, which are the overwhelming majority: an
+    # absent, unusable, or explicitly-single count all multiply by exactly 1. A default that
+    # silently scaled would lengthen every single-card run's failover.
+    from flash.providers.runpod import jobs
+
+    baseline = jobs.stall_kwargs(on_last_gpu=True)
+    assert baseline["queue_grace_s"] == 900.0
+    for count in (1, 0, -3, None, True):
+        # bool is not a card count: `True` would otherwise multiply by 1 by accident of int
+        # subclassing rather than by rejection.
+        assert jobs.stall_kwargs(on_last_gpu=True, gpu_count=count) == baseline, count
+
+
+def test_reattach_poll_reproduces_the_multi_card_capacity_grace(monkeypatch):
+    # A run adopted after a control-plane restart must wait on the same budget its submission used.
+    # The count is read from the persisted EFFECTIVE worker spec (which submission stamped with the
+    # count allocation resolved), not from the handle: _build_attach_context pops
+    # `allocated_gpu_count` off the remote before the handle ever reaches the provider, so sourcing
+    # it there would silently read 1 and halve a 2x run's grace on every recovery.
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import PROVIDER
+    from flash.providers.runpod import jobs as jobs
+
+    captured: dict = {}
+
+    def fake_poll_job(handle, **kw):
+        captured.update(kw)
+        return jobs.PollResult(True, metrics={})
+
+    monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
+
+    spec = JobSpec(
+        run_id="reattach-multi",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="grpo",
+        train=TrainSpec(epochs=1, max_examples=1, hf_repo=""),
+        gpu=GpuSpec(type="B200", count=2),
+    )
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "ep",
+            "endpoint_name": "n",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "j",
+            "started_ts": 1.0,
+            "on_last_gpu": True,
+            "attempt": 1,
+        }
+    )
+    PROVIDER.poll(handle, spec, spec.seed)
+    assert captured["queue_grace_s"] == 1800.0
+    assert captured["throttled_grace_s"] == 1800.0
+
+
 def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.base import JobHandle
@@ -834,6 +922,46 @@ def test_submit_run_payload_carries_code_prefix(monkeypatch):
     ).ok
     assert submitted["endpoint_id"] == "ep"
     assert submitted["payload"]["code_prefix"] == pinned_prefix
+
+
+def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkeypatch):
+    # The submitting process must apply the scaled budget too, not just a recovering one -- this is
+    # the path that burned the queue time in the first place. The count is read off the effective
+    # spec this attempt is launching, which allocation may have resolved to FEWER cards than the
+    # run's ceiling named, so the wait matches what was actually rented.
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        jobs, "deploy_train_endpoint", lambda *a, **k: ("ep", "endpoint-name", _RUNPOD_FINGERPRINT)
+    )
+    monkeypatch.setattr(jobs, "build_function_input", lambda payload: payload)
+    monkeypatch.setattr(runpod_api, "submit_job", lambda *_a, **_kw: "job-1")
+    monkeypatch.setattr(
+        jobs,
+        "poll_job",
+        lambda *a, **kw: captured.update(kw) or jobs.PollResult(True, metrics={}),
+    )
+
+    def _submit(count):
+        captured.clear()
+        spec = JobSpec(
+            run_id="scaled-grace",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(epochs=1, hf_repo="org/repo"),
+            gpu=GpuSpec(type="H200", count=count),
+        )
+        assert jobs.submit_run(
+            spec, seed=spec.seed, on_last_gpu=True, deadline_at=10_000_000_000.0
+        ).ok
+        return captured["queue_grace_s"]
+
+    assert _submit(4) == 3600.0
+    # and a single-card run on the identical path is untouched.
+    assert _submit(1) == 900.0
 
 
 def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deletion(monkeypatch):
