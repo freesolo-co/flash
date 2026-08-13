@@ -11,6 +11,7 @@ from flash.engine.profiling.workload_profile import (
     sft_profile_input_digest,
     unpacked_batch_warning,
 )
+from flash.engine.worker.entry.sft import select_sft_examples
 
 
 class FakeTokenizer:
@@ -268,6 +269,16 @@ def _rebuild_digest(spec: JobSpec) -> JobSpec:
 
 def _spec_with_max_steps(max_steps: int) -> JobSpec:
     return _rebuild_digest(replace(_spec(), train=replace(_spec().train, max_steps=max_steps)))
+
+
+def _training_order(count: int) -> list[str]:
+    """The prompts in the order the TRAINER consumes them, from its own selection function.
+
+    The rows are shuffled under the job seed, so file order is not training order. A test that
+    assumed the latter would assert against a sequence no run ever sees.
+    """
+    rows = [{"prompt": f"board{index}", "answer": "ignored"} for index in range(count)]
+    return [row["prompt"] for row in select_sft_examples(rows, 0, _spec().seed)]
 
 
 def _uneven_spec(max_steps: int | None = None) -> JobSpec:
@@ -1315,6 +1326,70 @@ def test_a_span_bounded_at_a_quoted_closer_is_not_scored_as_fully_retained(capsy
     assert prepared.rendered_reasoning_spans == 0
     assert prepared.truncated_reasoning_spans == 0
     assert prepared.authored_reasoning_turns == 0
+
+
+def test_reasoning_loss_is_measured_over_the_rows_the_horizon_reaches(capsys) -> None:
+    """``max_steps`` can stop a run before it loads every row, and only loaded rows can lose.
+
+    The counts describe the retained dataset, but the optimizer consumes rows in the retained order
+    and stops at ``authoritative_steps * examples_per_update``. Reasoning that sits only in rows
+    past that point never reaches training, so warning about it names a remedy for a loss the run
+    cannot suffer. Authoritative TOKEN accounting is already bounded this way; this is the same
+    bound applied to the same rows.
+
+    The rows here are ordered by the seeded shuffle the trainer itself uses, so the prefix the
+    horizon reaches is the prefix the optimizer really trains on -- picking the rows by file order
+    instead would assert against a sequence no run ever sees.
+    """
+    consumed = set(_training_order(4)[:2])
+
+    class TailLossEnvironment(ThinkingEnvironment):
+        def __init__(self) -> None:
+            super().__init__([], prompt="board")
+            self._rows = [{"prompt": f"board{index}", "answer": "ignored"} for index in range(4)]
+
+        def sft_completion(self, row):
+            if row["prompt"] in consumed:
+                return [{"role": "assistant", "content": "plain answer"}]
+            # never reached at max_steps=1: the template strips the first turn's reasoning
+            return [
+                {"role": "assistant", "content": "<think>lost</think>a1"},
+                {"role": "user", "content": "next"},
+                {"role": "assistant", "content": "<think>kept</think>a2"},
+            ]
+
+    def prepared(max_steps: int):
+        base = _spec()
+        spec = _rebuild_digest(
+            replace(
+                base,
+                thinking=True,
+                train=replace(
+                    base.train, max_context_tokens=512, max_examples=0, max_steps=max_steps
+                ),
+            )
+        )
+        return prepare_sft_workload(
+            spec,
+            TailLossEnvironment(),
+            tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+            producer_version="1.2.3",
+            packing_support=lambda _model, _revision: ("pure-attention", True),
+        )
+
+    # the control: an unbounded run does reach the lossy rows, so the warning is owed
+    unbounded = prepared(0)
+    assert unbounded.profile.authoritative_steps == 4
+    assert "the chat template dropped" in capsys.readouterr().err
+
+    # one update consumes only the plain prefix, so there is no loss to report
+    bounded = prepared(1)
+    assert bounded.profile.authoritative_steps == 1
+    assert bounded.profile.examples_per_update == 2
+    # the retained dataset is unchanged; only the WARNING is bounded to the horizon
+    assert len(bounded.rows) == 4
+    assert bounded.authored_reasoning_turns == unbounded.authored_reasoning_turns
+    assert "the chat template dropped" not in capsys.readouterr().err
 
 
 def test_a_known_loss_is_still_reported_beside_an_unjudgeable_survivor(capsys) -> None:

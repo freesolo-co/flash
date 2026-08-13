@@ -279,6 +279,10 @@ class _RetainedSftRows:
     rendered_reasoning_spans: int
     truncated_reasoning_spans: int
     dropped: int
+    # kept PER ROW, in the retained order, so the warning can be bounded to the rows the optimizer
+    # actually consumes. the totals above describe the whole retained dataset, which is what the
+    # profile records; a run stopped early by max_steps trains on a PREFIX of these rows.
+    row_reasoning: list[_RowReasoning]
 
 
 @dataclass(frozen=True)
@@ -578,6 +582,7 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
     authored_reasoning = 0
     rendered_reasoning = 0
     truncated_reasoning = 0
+    per_row: list[_RowReasoning] = []
     dropped = tokenized.dropped
     for row_index in sorted(tokenized.row_by_index):
         row = tokenized.row_by_index[row_index]
@@ -594,6 +599,9 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
                 authored_reasoning += row_reasoning.authored_turns
                 rendered_reasoning += row_reasoning.rendered_spans
                 truncated_reasoning += row_reasoning.truncated_spans
+            # appended for EVERY retained row, including one that authored nothing, so this list
+            # stays index-aligned with ``rows``. a prefix of it is then the same prefix of rows.
+            per_row.append(row_reasoning if row_reasoning is not None else _RowReasoning(0, 0, 0))
         else:
             dropped += 1
     if not rows:
@@ -608,6 +616,7 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
         rendered_reasoning_spans=rendered_reasoning,
         truncated_reasoning_spans=truncated_reasoning,
         dropped=dropped,
+        row_reasoning=per_row,
     )
 
 
@@ -742,6 +751,35 @@ def _build_sft_profile(
     )
 
 
+def _horizon_row_count(rows: list, profile: SftWorkloadProfile) -> int:
+    """How many of ``rows`` the resolved update horizon reaches, in retained order.
+
+    Mirrors ``_authoritative_token_total``: updates consume ``examples_per_update`` rows each, in
+    the retained order, wrapping at the end of an epoch. A horizon at or past one full pass reaches
+    every row, so the answer saturates at ``len(rows)`` rather than reporting a row twice.
+    """
+    per_update = max(int(profile.examples_per_update), 1)
+    reached = int(profile.authoritative_steps) * per_update
+    return min(len(rows), max(reached, 0))
+
+
+def _horizon_row_reasoning(
+    per_row: list[_RowReasoning], profile: SftWorkloadProfile
+) -> _RowReasoning:
+    """The reasoning totals over just the rows the optimizer consumes.
+
+    ``per_row`` is index-aligned with the retained rows, so the horizon's row count is also its
+    prefix length. An empty prefix -- a horizon of zero updates -- totals zero and stays silent,
+    which is correct: a run that performs no update cannot lose reasoning to one.
+    """
+    consumed = per_row[: _horizon_row_count(per_row, profile)]
+    return _RowReasoning(
+        sum(row.authored_turns for row in consumed),
+        sum(row.rendered_spans for row in consumed),
+        sum(row.truncated_spans for row in consumed),
+    )
+
+
 def _print_workload_warnings(
     profile: SftWorkloadProfile,
     retained: _RetainedSftRows,
@@ -766,13 +804,20 @@ def _print_workload_warnings(
     )
     if warning:
         print(f"warning: [train] {warning}", file=sys.stderr)
-    # every retained row is counted rather than sampled, so a cheap row cannot hide an expensive
-    # one, and dropped rows are excluded so the figures describe what the run actually trains on.
+    # every row the optimizer reaches is counted rather than sampled, so a cheap row cannot hide an
+    # expensive one, and dropped rows are excluded so the figures describe what the run trains on.
+    #
+    # bounded to the horizon rather than the whole retained dataset, the way authoritative token
+    # accounting already is: `max_steps` can stop a run before it traverses every row, and the rows
+    # past that point are never trained on. counting them either invents a loss the run cannot
+    # suffer -- a warning naming a remedy for reasoning that never reaches the optimizer -- or
+    # dilutes a real one behind rows that never load.
+    consumed = _horizon_row_reasoning(retained.row_reasoning, profile)
     reasoning_warning = rendered_reasoning_loss_warning(
-        authored_turns=retained.authored_reasoning_turns,
-        rendered_spans=retained.rendered_reasoning_spans,
-        truncated_spans=retained.truncated_reasoning_spans,
-        rows=len(retained.rows),
+        authored_turns=consumed.authored_turns,
+        rendered_spans=consumed.rendered_spans,
+        truncated_spans=consumed.truncated_spans,
+        rows=_horizon_row_count(retained.rows, profile),
     )
     if reasoning_warning:
         print(f"warning: [train] {reasoning_warning}", file=sys.stderr)
