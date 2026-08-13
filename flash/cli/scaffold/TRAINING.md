@@ -1214,20 +1214,32 @@ from `assistant_response`:
 ```python
 def step_episode(self, example, messages, assistant_response):
     state = self.initial_state(example)
+    # skip the opening prompt: only turns AFTER it are actions the model took.
+    # `start_episode` messages are seeded into the transcript before the first turn,
+    # so an assistant-role few-shot demo in there is NOT an action -- replaying it
+    # would apply a worked example to the real state.
+    seeded = len(self.start_episode(example, ""))
     # every assistant turn EXCEPT the newest: messages[-1] is assistant_response
-    for message in messages[:-1]:
+    for message in messages[seeded:-1]:
         if message["role"] == "assistant":
             state = self.apply(state, message["content"])
     state = self.apply(state, assistant_response)  # the newest action, exactly once
     ...
 ```
 
+Both bounds matter, for different reasons. The `[:-1]` keeps you from applying the newest
+action twice. The `seeded` offset keeps you from applying your own prompt as if the model had
+played it: `messages` begins as a copy of what `start_episode` returned, so anything
+assistant-role in your opening prompt (a worked example, a demonstration turn) is sitting in
+the transcript looking exactly like a move. If your `start_episode` never emits an assistant
+message, the offset is a no-op and you can drop it; write it down anyway, because adding one
+demo later would otherwise silently corrupt every episode.
+
 That shape rebuilds state from the actions alone, which is right when your observations are a
 deterministic function of them. If an observation carries information the actions do not (a
 sampled outcome, a tool result, anything external), replay it too: iterate the same
-`messages[:-1]` and branch on `message["role"]` so both the actions and the state-bearing
-observations are folded back in. The `[:-1]` is the part that matters; what you do with each
-role is your environment's business.
+`messages[seeded:-1]` and branch on `message["role"]` so both the actions and the state-bearing
+observations are folded back in.
 
 Replaying all of `messages` and then applying `assistant_response` again applies the **newest**
 action twice on every call. Earlier actions still appear once; it is the turn you were handed
