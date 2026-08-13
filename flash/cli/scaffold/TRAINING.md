@@ -1210,8 +1210,10 @@ list. The two arguments describe one action, not two.
 
 So a replaying environment must stop before the final message, and take the newest action
 from `assistant_response`. The simplest case is an environment whose opening prompt contains
-no assistant message at all: every assistant message in the transcript is then a real action,
-and the newest turn is the only bound you need.
+no assistant message and whose own replies never use the assistant role: every assistant
+message in the transcript is then a real action, and the newest turn is the only bound you
+need. Both halves matter, because Flash appends your `step_episode` replies to the same
+transcript, so an assistant-role observation comes back to you looking like a move.
 
 ```python
 def step_episode(self, example, messages, assistant_response):
@@ -1235,50 +1237,55 @@ prefix, and the offset then leaks the demo back in silently.
 Parse the transcript instead, and parse it the same way on both paths:
 
 ```python
+import re
+
 ACTION = re.compile(r"<move>(.*?)</move>", re.DOTALL)  # your own action syntax
 
-# True if your prompt pre-opens the reasoning block, so the model never emits <think>
-PROMPT_OPENS_THINKING = False
 
+class MyEnv(EnvironmentMultiTurn):
+    def _answer_of(self, content: str) -> str:
+        """The committed answer, with any reasoning span removed.
 
-def answer_of(content: str) -> str:
-    """The committed answer: everything after reasoning, or "" if reasoning never closed."""
-    if "</think>" in content:
-        return content.rsplit("</think>", 1)[1]
-    if PROMPT_OPENS_THINKING:  # tagless: the whole turn is unfinished reasoning
-        return ""
-    return "" if "<think>" in content else content
+        Mirrors how Flash splits a turn for grading: the LAST </think> wins, and text
+        before an unclosed <think> is still an answer.
+        """
+        if "</think>" in content:
+            return content.rsplit("</think>", 1)[1]
+        return content.split("<think>", 1)[0] if "<think>" in content else content
 
+    def _action_of(self, content: str, state) -> Move | None:
+        """The action in a turn, or None if it carries none this state can use.
 
-def action_of(content: str) -> Move | None:
-    """The action in a turn, or None if it carries none the environment can use.
+        A tag match is not a valid move: `<move>bad</move>` matches too, and a legal
+        square may already be occupied. Validate here so `apply` only ever sees actions
+        it can perform.
+        """
+        found = ACTION.search(self._answer_of(content))
+        return self.parse_move(found.group(1), state) if found else None
 
-    A tag match is not a valid move: `<move>bad</move>` matches too. Parse and validate
-    here so `apply` only ever sees actions it can perform.
-    """
-    found = ACTION.search(answer_of(content))
-    return self.parse_move(found.group(1)) if found else None
-
-
-for message in messages[:-1]:
-    if message["role"] == "assistant":
-        action = action_of(message["content"])
-        if action is not None:  # unusable turns changed nothing then; keep it that way
-            state = self.apply(state, action)
-newest = action_of(assistant_response)
-if newest is None:
-    # nothing to apply. reply with the error and let the reward do the teaching
-    return EnvironmentStepResult(
-        done=False,
-        messages=[{"role": "user", "content": "Reply with a single <move>(r,c)</move>."}],
-    )
-state = self.apply(state, newest)  # the newest action, exactly once
+    def step_episode(self, example, messages, assistant_response):
+        state = self.initial_state(example)
+        for message in messages[:-1]:
+            if message["role"] == "assistant":
+                action = self._action_of(message["content"], state)
+                if action is not None:  # unusable turns changed nothing then; keep it so
+                    state = self.apply(state, action)
+        newest = self._action_of(assistant_response, state)
+        if newest is None:
+            # nothing to apply. reply with the error and let the reward do the teaching
+            return EnvironmentStepResult(
+                done=False,
+                messages=[{"role": "user", "content": "Reply with one <move>(r,c)</move>."}],
+            )
+        state = self.apply(state, newest)  # the newest action, exactly once
+        ...
 ```
 
-`parse_move` is yours: it returns the move when the payload names a legal one and `None`
-otherwise, out-of-range coordinates included. Keeping validation there rather than inside
-`apply` is what makes both call sites safe at once, since a replayed turn gets the same verdict
-it got when it was live.
+`parse_move` is yours: it returns the move when the payload names one this state can accept and
+`None` otherwise. That covers malformed payloads, out-of-range coordinates, and moves that are
+well-formed but illegal right now, which is why it takes the reconstructed `state` rather than
+the payload alone. Keeping validation there rather than inside `apply` is what makes both call
+sites safe at once, since a replayed turn gets the same verdict it got when it was live.
 
 **Parse the answer, not the raw turn.** With `thinking = true` the transcript keeps the turn
 exactly as the model emitted it, so a prior action reaches you as
@@ -1288,16 +1295,18 @@ either: a model that weighs `<move>left</move>` in its reasoning before committi
 `<move>right</move>` hands the first match to a plain search, and the wrong action is then
 replayed as history on every later call.
 
-`answer_of` above mirrors how Flash itself splits a turn for grading: the **last** `</think>`
-wins, and a turn truncated before its closing tag yields no answer at all, so unfinished
-reasoning raises here rather than being mined for an action the model never committed to.
+`_answer_of` above mirrors how Flash itself splits a turn for grading: the **last** `</think>`
+wins, and text before an unclosed `<think>` is still an answer, so a turn that acted and then
+ran out of budget mid-thought is treated the same way the scorer treats it.
 
-The tagless case is the one that needs your input. A turn cut off mid-reasoning has no
-`</think>`, and whether it also has an opening `<think>` depends on who wrote it: a model that
-opens its own block leaves the tag in the text, while a prompt that pre-opens the block does
-not, so the truncated turn carries no tag at all and is indistinguishable from a plain answer
-by inspection. Set `PROMPT_OPENS_THINKING` to match your prompt. Flash resolves the same
-ambiguity with the same flag rather than by guessing, which is why the parser needs telling.
+One case stays genuinely ambiguous. When the chat template pre-opens the reasoning block, the
+model never emits `<think>`, so a turn truncated before `</think>` carries no tag at all and
+reads as a plain answer. Flash resolves this with a flag it derives from the rendered template
+and sets on the adapter, which is not passed through to your hook, so your environment cannot
+see it. Do not hardcode a guess: the same environment needs a different answer under a different
+model. Rely instead on the action itself being present and valid, which is what
+`_action_of` already checks, and on your prompt asking for the action last so an action that
+appears at all is one the model committed to.
 
 **Give `apply` one representation.** The replayed turns and `assistant_response` have to arrive
 in the same shape. Passing the unwrapped payload for replayed turns and the raw text for the
