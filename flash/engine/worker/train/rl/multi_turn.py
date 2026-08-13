@@ -205,8 +205,16 @@ class MultiTurnBridge:
         # is the same contract the opd bridge applies to its own env replies, and it rejects
         # non-text content loudly instead. rendering a mid-episode image is genuinely unsupported
         # here; being unsupported is survivable, being silent is not.
+        #
+        # only when the reply will actually be rendered: the child breaks on terminal BEFORE it
+        # validates (rl/child/multiturn.py:398), so a terminal reply is discarded unread and never
+        # reaches the model. an env that ends the episode in its last observation ("solved it, here
+        # is the final board") corrupts nothing, so raising there would kill a paid run over bytes
+        # nobody trains on.
+        if terminal:
+            return {"terminal": True, "messages": []}
         return {
-            "terminal": terminal,
+            "terminal": False,
             "messages": validate_transcript_messages(list(replies), source="environment reply"),
         }
 

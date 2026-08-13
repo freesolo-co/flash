@@ -24,6 +24,10 @@ _PROBE_PREFIX = "flash-env-glue-probe"
 # stdlib-only so the parent can copy it into the verl child's workdir, where flash is not
 # importable. tests/test_rl_train.py pins the two sets equal so they cannot drift.
 _IMAGE_BLOCK_TYPES = frozenset({"image", "image_url", "input_image"})
+# the sources that describe a reply arriving DURING an episode. the mid-episode image diagnosis is
+# only true for these: every other source is an initial prompt, where images are supported and
+# "put the image in the initial prompt" would be circular advice.
+_MID_EPISODE_SOURCES = frozenset({"environment reply"})
 
 
 def _has_image_block(content) -> bool:
@@ -74,10 +78,13 @@ def validate_transcript_messages(messages: list[dict], *, source: str) -> list[d
         if not isinstance(role, str) or not role.strip():
             raise ValueError(f"{source} message {position} has an invalid role")
         if not isinstance(content, str):
-            if _has_image_block(content):
+            if _has_image_block(content) and source in _MID_EPISODE_SOURCES:
                 # the specific failure worth naming: an env showing the model a NEW image each turn
                 # (a browser screenshot, a rendered board). the media on every generate call is
                 # fixed from the initial prompt, so there is nowhere to put a mid-episode image.
+                # only for a mid-episode reply: on an INITIAL prompt "put the image in the initial
+                # prompt" is advice to do what the author already did, so those sources keep the
+                # neutral message below.
                 raise ValueError(
                     f"{source} message {position} returns image content blocks, which a multi-turn "
                     "rollout cannot show the model: the media conditioning every turn is fixed from "

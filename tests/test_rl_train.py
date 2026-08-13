@@ -4689,6 +4689,51 @@ def test_bridge_step_rejects_a_null_env_reply_rather_than_showing_the_model_the_
         bridge.step({"session_id": "a", "completion_text": "first"})
 
 
+def test_bridge_step_does_not_reject_a_terminal_env_reply_the_child_never_reads():
+    # the child breaks on step["terminal"] BEFORE it validates (rl/child/multiturn.py:398), so a
+    # terminal reply is discarded unread. an env that ends the episode in its last observation
+    # ("solved it, here is the final board") corrupts nothing, so validating it would kill a paid
+    # run over bytes nobody trains on. the env still records the turn into state["messages"]
+    # itself, so the scorer's transcript keeps it either way.
+    image = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
+
+    class _EndsInsideReply(_BridgeEnv):
+        # done ONLY once env_reply has run, so the bridge takes the env_reply path (done_after=1
+        # would return terminal at the earlier rollout_done check and never call env_reply at all).
+        def __init__(self):
+            super().__init__(done_after=99, replies=[{"role": "user", "content": image}])
+            self.replied = False
+
+        def env_reply(self, messages, state):
+            self.replied = True
+            return super().env_reply(messages, state)
+
+        def rollout_done(self, state, max_turns):
+            return self.replied
+
+    env = _EndsInsideReply()
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    step = bridge.step({"session_id": "a", "completion_text": "first"})
+    assert env.replied, "the env_reply path must actually run or this proves nothing"
+    assert step["terminal"] is True
+
+
+@pytest.mark.parametrize(
+    "source", ["initial prompt", "child initial prompt", "environment initial prompt"]
+)
+def test_initial_prompt_image_keeps_the_neutral_message(source):
+    # the mid-episode wording ends in "put the image in the initial prompt". on an INITIAL prompt
+    # that is advice to do what the author already did, and images ARE supported there, so only a
+    # mid-episode reply gets the specific diagnosis.
+    from flash.engine.worker.train.core.child.glue import validate_transcript_messages
+
+    image = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
+    with pytest.raises(ValueError, match="content must be text for multi-turn") as excinfo:
+        validate_transcript_messages([{"role": "user", "content": image}], source=source)
+    assert "put the image in the initial prompt" not in str(excinfo.value)
+
+
 def test_child_glue_image_block_types_match_the_flash_definition():
     # flash/engine/worker/train/core/child/glue.py is stdlib-only so the parent can copy it into the
     # verl child's workdir, where `flash` is not importable -- so it re-declares the image block
