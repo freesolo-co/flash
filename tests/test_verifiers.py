@@ -151,6 +151,147 @@ class _BudgetMultiTurnEnv(_EnvironmentMultiTurn):
         return [_RewardResult(score=0.0, success=False, metrics=()) for _ in episodes]
 
 
+class _PerEpisodeImageEnv(_EnvironmentSingleTurn):
+    """Single-turn env that CHOOSES its image inside start_episode.
+
+    The record names a pool, not one image, so nothing in the raw row identifies what the model
+    was shown. The env records its pick on the task it was handed and grades against that pick --
+    the documented way an env carries per-episode state, and the only one the SDK offers, since
+    score_responses(example, texts) takes no prompt.
+    """
+
+    def __init__(self, picks):
+        self._picks = list(picks)
+        self.graded_against = []
+
+    def start_episode(self, example, prompt_text):
+        chosen = self._picks.pop(0)
+        example.metadata["chosen_image"] = chosen
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what color?"},
+                    {"type": "image", "image": chosen},
+                ],
+            }
+        ]
+
+    def score_responses(self, example, response_texts):
+        chosen = example.metadata.get("chosen_image")
+        self.graded_against.append(chosen)
+        out = []
+        for response in response_texts:
+            # the grader can only be right if it is told which image was actually rendered.
+            score = 1.0 if chosen and chosen.split("/")[-1].split(".")[0] in response else 0.0
+            out.append(
+                _RewardResult(
+                    score=score, success=score == 1.0, metrics=(_RewardMetric("match", score),)
+                )
+            )
+        return out
+
+
+def test_start_episode_image_choice_reaches_single_turn_scoring(monkeypatch):
+    """An image the env chose INSIDE start_episode must reach single-turn scoring.
+
+    Single-turn scoring used to rebuild the TaskExample from the raw dataset record, so a
+    per-episode choice the env made while building the prompt never reached the grader: the model
+    was shown one image and graded against a record that does not identify it. The reward was
+    silently wrong, and GRPO optimizes exactly that number.
+
+    A top-level record image was never the broken case (it is part of the record and survives a
+    rebuild); an env that RANDOMIZES or GENERATES per episode is.
+    """
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    sdk_env = _PerEpisodeImageEnv(picks=["pool/red.png", "pool/blue.png"])
+    # no "metadata" key on the record: task_example_from_record substitutes a FRESH {} for such a
+    # row, so this is the shape whose per-episode state a rebuild silently dropped.
+    env = FreesoloEnvironment(
+        sdk_env,
+        "owner/env",
+        source=[{"input": "what color?", "image_pool": ["red", "blue"]}],
+        contract_text="",
+    )
+    # the row object GRPO generates from and grades on is the one dataset() built.
+    (row,) = env.dataset()
+
+    prompt = env.prompt_messages(row)
+    rendered = [
+        block["image"]
+        for message in prompt
+        for block in (message["content"] if isinstance(message["content"], list) else [])
+        if block.get("type") == "image"
+    ]
+    assert rendered == ["pool/red.png"]
+
+    # the model answered with what it was actually shown, so a grader that sees the same episode
+    # must score 1.0. scoring 0.0 here means it graded a DIFFERENT episode.
+    assert env.reward("it is red", row) == 1.0
+    assert sdk_env.graded_against == ["pool/red.png"]
+    # and the choice must not be re-rolled by the scoring call: a second start_episode would both
+    # consume the next pick and grade against an episode that was never generated.
+    assert sdk_env._picks == ["pool/blue.png"]
+
+
+def test_per_episode_state_survives_every_single_turn_scoring_entry_point(monkeypatch):
+    """reward, grade, scores_breakdown, reward_with_error and the BATCHED paths all grade the
+    episode that was generated -- one rebuilt task on any of them is a silently wrong reward."""
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    sdk_env = _PerEpisodeImageEnv(picks=["pool/red.png"])
+    env = FreesoloEnvironment(
+        sdk_env, "owner/env", source=[{"input": "what color?"}], contract_text=""
+    )
+    (row,) = env.dataset()
+    env.prompt_messages(row)
+
+    assert env.reward("it is red", row) == 1.0
+    assert env.grade("it is red", row) is True
+    assert env.scores_breakdown("it is red", row) == {"match": 1.0, "total": 1.0}
+    assert env.reward_with_error("it is red", row)[0] == 1.0
+    # batched entry points: GRPO scores a whole group through these.
+    assert env.reward_many([(row, {"response_text": "it is red"})]) == [1.0]
+    assert env.scores_breakdown_many([(row, {"response_text": "it is red"})]) == [
+        {"match": 1.0, "total": 1.0}
+    ]
+    # every one of them graded the generated episode, and none re-ran start_episode.
+    assert set(sdk_env.graded_against) == {"pool/red.png"}
+    assert sdk_env._picks == []
+
+
+def test_a_rebuilt_dataset_reusing_a_positional_id_is_not_graded_through_a_stale_task(monkeypatch):
+    """Ids are POSITIONAL (example_000000 ...), so a rebuilt dataset reuses them for different
+    rows. Keying the per-row task on the id alone would grade the new row through the old row's
+    task -- the retained episode of a row that is no longer in the dataset."""
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    sdk_env = _PerEpisodeImageEnv(picks=["pool/red.png", "pool/blue.png"])
+    env = FreesoloEnvironment(
+        sdk_env, "owner/env", source=[{"input": "what color?"}], contract_text=""
+    )
+    (first,) = env.dataset()
+    env.prompt_messages(first)
+
+    # a fresh dataset generation: same positional id, different row.
+    env._dataset_cache = None
+    env._source = [{"input": "what color now?"}]
+    (second,) = env.dataset()
+    env.prompt_messages(second)
+
+    assert env.reward("it is blue", second) == 1.0
+    assert sdk_env.graded_against[-1] == "pool/blue.png"
+    # the superseded row's task is not retained: the dataset it belonged to is gone.
+    assert len(env._row_tasks) == 1
+
+
 def test_single_turn_reward_many_batches_by_example_value_identical(monkeypatch):
     """Single-turn reward_many groups same-example rollouts into ONE score_responses() call
     (env-concurrent, the win for judge/network rewards) while staying byte-identical and in input
