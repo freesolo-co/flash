@@ -900,6 +900,45 @@ def test_a_worker_that_stays_placed_does_not_renew_its_setup_budget_forever(monk
     )
 
 
+def test_an_unhealthy_worker_counts_as_a_grant(monkeypatch):
+    # An `unhealthy` worker is an ALLOCATED box whose image failed to start, so it proves the grant
+    # exactly as a healthy one does -- `preload_runpod._has_worker` counts it for the same reason.
+    # The latch checked only `usable or recovering`, so health flickering between `{"unhealthy": 1}`
+    # and empty never recorded it: each empty snapshot reset the unhealthy timer, the job stayed
+    # exempt as never-granted, and the broken box was finally misreported as `no_capacity` (which
+    # can trip the weight-cache drop on a run whose capacity was fine all along).
+    #
+    # Pristine `dev` reports `stalled` here, so this is a regression to avoid, not a change.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    flip = {"n": 0}
+
+    def health(_eid, _fp, **_kw):
+        flip["n"] += 1
+        return {"workers": {"unhealthy": 1} if flip["n"] % 2 == 0 else {}}
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        deadline_at=500_000.0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", (
+        f"a flickering unhealthy worker reported {res.failure!r}; an allocated-but-broken box is "
+        f"not absent capacity ({res.detail})"
+    )
+
+
 def test_one_flaky_job_status_does_not_prove_a_worker_grant(monkeypatch):
     # The grant latch must be an allowlist of statuses that PROVE the job left the queue, never
     # `!= "IN_QUEUE"` -- that shape also matches None and any unrecognized string, so a single flaky

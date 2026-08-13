@@ -504,7 +504,13 @@ def _classify_queue_state(
         # flag: a probe that starts failing must not leave a stale true suppressing the
         # capacity timer forever, so it expires after WORKER_COMING_UP_TTL_S.
         state.worker_coming_up_at = now if (usable or recovering) else None
-        if usable or recovering:
+        if usable or recovering or workers.get("unhealthy"):
+            # an unhealthy worker is an ALLOCATED box whose image failed to start, so it proves the
+            # grant just as much as a healthy one -- `preload_runpod._has_worker` counts it for the
+            # same reason. it deliberately does not feed `worker_coming_up_at` above: that
+            # suppresses the capacity timer for a worker that is coming up, which an unhealthy one
+            # is not. this only records that capacity was never the problem, so health flickering
+            # between unhealthy and empty cannot make a broken box look like starvation.
             state.ever_saw_worker = True
         if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
             context.say(f"queued; workers: {workers}")
