@@ -4877,3 +4877,84 @@ def test_a_registration_that_cannot_index_its_alias_exposes_no_record(client, mo
         "finds a matching identity, concludes the post landed, and polls a record no settle will "
         "ever advance -- instead of retrying the idempotent post that would repair it"
     )
+
+
+def test_a_load_undone_by_a_mid_flight_undeploy_hands_back_the_claim(client, engine, monkeypatch):
+    """The lifecycle is re-checked AFTER the load, not only before it.
+
+    The pre-load check and `_claim_lora_int_id` are separate Dict operations under a process-local
+    lock, so an undeploy on another replica can disable the revision, evict it, and release its
+    claim in the gap -- and this path then re-claims and loads, leaving a residency under a
+    `disabled` record carrying no marker, which is the leak the pre-load check exists to close,
+    reached one await later. Checking the claim alone does not cover it: an undeploy that ran
+    entirely inside that window releases the claim, and this load re-takes it, so `_still_holds`
+    answers True while the record says the revision is gone.
+    """
+    lora = types.ModuleType("vllm.lora.request")
+    lora.LoRARequest = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora)
+
+    module = client.app.state.generated_module
+    revision = "undeploy-during-load@final." + "c" * 40
+    int_id = module._lora_int_id(revision)
+    live = {
+        "adapter_id": revision,
+        "repo_id": "acme/artifacts",
+        "repo_type": "dataset",
+        "subfolder": "sft/run-abc/adapter",
+        "base_model": BASE_MODEL,
+        "status": "ready",
+        "metadata": {
+            "run_id": "undeploy-during-load",
+            "record_type": "revision",
+            "lifecycle_state": "ready",
+            "hf_revision": "a" * 40,
+        },
+    }
+    module.adapter_records[module._record_key(revision)] = dict(live)
+
+    async def _adapter_path(_self, _record):
+        return "/vol/flash-serving/adapters/deadbeef"
+
+    monkeypatch.setattr(engine, "_adapter_path", _adapter_path)
+
+    removed: list[int] = []
+
+    async def _remove_lora(target):
+        removed.append(target)
+
+    async def _add_lora(_request):
+        # The race: the undeploy completes while this load is in flight. It disables the record and
+        # releases the claim; this load has already taken the claim again.
+        module.adapter_records[module._record_key(revision)] = {
+            "adapter_id": revision,
+            "status": "disabled",
+            "metadata": {
+                "run_id": "undeploy-during-load",
+                "record_type": "revision",
+                "lifecycle_state": "disabled",
+            },
+        }
+
+    instance = engine.__new__(engine)
+    instance._locks = {}
+    instance._loaded = {}
+    instance._int_ids = {}
+    instance.engine = types.SimpleNamespace(add_lora=_add_lora, remove_lora=_remove_lora)
+
+    with pytest.raises(RuntimeError, match="changed hands while"):
+        _run_awaitable(engine._lora_request(instance, live))
+
+    assert int_id in removed, (
+        "the load stayed resident after the undeploy that superseded it, so a disabled revision "
+        "keeps a max_loras slot and can still answer generations"
+    )
+    assert revision not in instance._loaded, (
+        "the superseded load is still cached on this replica and would serve the next generate"
+    )
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) is None, (
+        "the load kept the claim it re-took, so the int id is reserved by a revision that is "
+        "disabled and resident nowhere -- refusing every future collider on those 31 bits"
+    )

@@ -831,7 +831,31 @@ class Engine:
             # there -- and this `add_lora` would land on top of it, two adapters under one vLLM
             # int. Losing the claim means this load must not stay resident, so it undoes itself
             # and reports the failure rather than leaving the engine in that state.
-            if not await _still_holds_lora_int_id(int_id, adapter_id):
+            # BOTH facts are re-checked, not just the claim. The pre-load lifecycle read above and
+            # `_claim_lora_int_id` are separate Dict operations under a process-local lock, so an
+            # undeploy on another replica can disable the revision, evict it, and release its claim
+            # in the gap between them -- and this path then re-claims and loads, leaving a residency
+            # under a `disabled` record that carries no marker, which is precisely the leak the
+            # pre-load check was added to close, reached one await later.
+            #
+            # Checking the claim alone does not cover it: an undeploy that ran entirely inside that
+            # window releases the claim, and this load then re-takes it, so `_still_holds` answers
+            # True while the record says the revision is gone. The lifecycle is the fact that
+            # settles it, and re-reading it AFTER the load is what makes the window closed rather
+            # than merely narrow.
+            #
+            # `_read`-shaped tolerance, deliberately: only an explicit terminal state undoes the
+            # load. A Dict hiccup answering None must not tear down a healthy adapter.
+            superseded = not await _still_holds_lora_int_id(int_id, adapter_id)
+            if not superseded:
+                latest = await adapter_records.get.aio(_record_key(adapter_id))
+                if isinstance(latest, dict):
+                    latest_state = (latest.get("metadata") or {{}}).get("lifecycle_state")
+                    superseded = latest.get("status") == "disabled" or latest_state in (
+                        "disabled",
+                        "failed",
+                    )
+            if superseded:
                 # Recorded in `_int_ids` BEFORE the undo, and the undo is unconditional.
                 #
                 # Two earlier shapes were both wrong, in opposite directions, and the pair is why
@@ -868,6 +892,21 @@ class Engine:
                 if evicted:
                     self._int_ids.pop(int_id, None)
                 self._loaded.pop(adapter_id, None)
+                # The claim this load re-took is handed back, but ONLY when a confirmed eviction
+                # says nothing is resident under the id. The undeploy that superseded this load
+                # already released the claim, so re-claiming it here would otherwise leave the id
+                # reserved by a revision that is disabled and resident nowhere -- the exact ghost
+                # `lora_release_pending` exists to clear. Holding it on a FAILED eviction is the
+                # right way round, for the reason the rest of this file keeps repeating: the LoRA
+                # is still bound inside vLLM, and freeing the id there lets a collider load over
+                # weights that are still present.
+                #
+                # `_release_lora_int_id` is ownership-checked and suppressed: a claim another
+                # adapter has since taken is left alone, and a Dict failure here must not replace
+                # the real error below with a transient one.
+                if evicted:
+                    with contextlib.suppress(Exception):
+                        await _release_lora_int_id(int_id, adapter_id)
                 raise RuntimeError(
                     f"lora id {{int_id}} changed hands while {{adapter_id}} was loading, so this "
                     f"load was superseded. redeploy to retry."
