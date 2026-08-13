@@ -555,6 +555,20 @@ def _update_heartbeat(context: _PollContext, state: _PollState) -> None:
 def _classify_stall(context: _PollContext, state: _PollState, status: Any) -> PollResult | None:
     in_setup = context.heartbeat_reader is not None and not state.seen_training_hb
     stall_limit = context.setup_grace_s if in_setup else context.stall_after_s
+    # a job still IN_QUEUE with no worker granted is not stalled: nothing is running that could
+    # make progress, and _classify_queue_state above already owns this wait on the capacity grace
+    # (returning `no_capacity`, the failure the supervisor routes on). The two limits are
+    # independent, so a capacity grace scaled past the stall limit -- a 4-card shape waits 3600s
+    # against a 3000s setup grace -- would otherwise be cut short HERE by a timer measuring the
+    # absence of a worker that was never granted, mislabelled "stalled", and re-requesting the same
+    # class exactly as before. Defer to the capacity timer for this state instead of racing it.
+    #
+    # Only for the no-worker case: once health shows one coming up, the queue timer is suppressed
+    # and the setup grace legitimately governs the cold start, unscaled, as it always did.
+    if status == "IN_QUEUE" and not _worker_is_coming_up(
+        state.worker_coming_up_at, _jobs.time.time()
+    ):
+        return None
     if _jobs.time.time() - state.last_progress <= stall_limit:
         return None
     phase = "setup (pre-training)" if in_setup else "training"

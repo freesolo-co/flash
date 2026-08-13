@@ -784,6 +784,93 @@ def test_capacity_grace_scales_with_the_card_count():
     )
 
 
+def _queued_forever_scaled(monkeypatch, *, gpu_count, heartbeat_reader, workers=None):
+    """Drive the REAL poll loop against a job that never leaves IN_QUEUE, on a scaled grace."""
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fp, **_kw: {"workers": workers or {}},
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=20.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    return jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=heartbeat_reader,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=gpu_count),
+    )
+
+
+@pytest.mark.parametrize("heartbeat_reader", [lambda: None, None])
+def test_the_scaled_capacity_grace_is_actually_reached_not_preempted_by_the_stall_timer(
+    monkeypatch, heartbeat_reader
+):
+    # The scaled grace is only real if the poll loop actually waits it out. `_classify_stall` runs
+    # on the SAME iteration as the capacity check with its own independent limits (setup_grace_s
+    # 3000, stall_after_s 1500), so a 4-card grace of 3600s was cut short at ~3000s -- and, worse,
+    # reported as "stalled" rather than "no_capacity".
+    #
+    # The label is not cosmetic. The supervisor's weight-cache fallback fires only on
+    # `no_capacity`/`poll_error`, so a mislabelled capacity failure ALSO stops a cached run from
+    # dropping its datacenter-restricting volume and retrying on the unrestricted all-DC pool. It
+    # is the whole failure the scaling exists to avoid, with the wait merely renamed.
+    #
+    # Parametrized over both heartbeat-reader states because they select different stall limits
+    # (3000 vs 1500) and both preempted 3600s.
+    res = _queued_forever_scaled(monkeypatch, gpu_count=4, heartbeat_reader=heartbeat_reader)
+    assert res.failure == "no_capacity", res.detail
+    waited = int(res.detail.split("IN_QUEUE for ")[1].split("s ")[0])
+    assert waited > 3600, f"gave up at {waited}s, before the 3600s the 4-card shape was granted"
+
+
+def test_a_worker_that_is_coming_up_still_gets_the_unscaled_setup_grace(monkeypatch):
+    # The capacity timer is suppressed once RunPod grants a worker, so from there the wait is a
+    # cold start, not starvation -- and a cold start's budget has nothing to do with how scarce the
+    # shape was to obtain. Deferring the stall timer for a PLACED worker would let a wide shape sit
+    # through a wedged image pull for the full scaled grace instead of the setup grace.
+    res = _queued_forever_scaled(
+        monkeypatch,
+        gpu_count=4,
+        heartbeat_reader=lambda: None,
+        workers={"initializing": 1},
+    )
+    assert res.failure == "stalled"
+    assert "limit 3000s" in res.detail, res.detail
+
+
+def test_a_job_outside_the_queue_still_stalls_on_its_own_limit(monkeypatch):
+    # The queue deferral must be scoped to IN_QUEUE-with-no-worker. A running job that stops making
+    # progress is genuinely stalled and must still be caught on the unscaled limit; disabling the
+    # stall timer generally would let a wedged trainer burn the whole run deadline.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(
+        runpod_api, "endpoint_health_for_fingerprint", lambda eid, _fp, **_kw: {"workers": {}}
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=20.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled"
+    assert "limit 3000s" in res.detail, res.detail
+
+
 def test_single_card_capacity_grace_is_unchanged_by_the_scaling():
     # The whole change must be invisible to 1x runs, which are the overwhelming majority: an
     # absent, unusable, or explicitly-single count all multiply by exactly 1. A default that
