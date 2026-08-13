@@ -633,6 +633,7 @@ def _build_child_callbacks(
     silence_watchdog = _opd_train.VerlChildSilenceWatchdog(
         child_tail,
         tick_s=_opd_train._heartbeat._LIVENESS_TICK_S,
+        baseline_step=resume_step,
         parent_activity=getattr(bridge, "teacher_activity_count", None),
     )
 

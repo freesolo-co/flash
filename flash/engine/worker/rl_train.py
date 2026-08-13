@@ -128,7 +128,6 @@ class _GrpoSubprocessStream:
                 with watchdog.handling_line():
                     self._tail.record(line)
                     yield line
-        self.silence_watchdog.raise_if_failed()
         if watchdog.tore_down:
             self._orphaned_pipe = True
             # the group is already gone, so teardown must not be attempted a second time.
@@ -161,6 +160,10 @@ class _GrpoSubprocessStream:
         except BaseException:
             self.terminate()
             raise
+        # AFTER the classifier, never before: teardown makes the exit nonzero, and a child that
+        # printed `cudaErrorDevicesUnavailable` before wedging still deserves the RetriableInfraError
+        # its own evidence earns rather than the generic silence failure.
+        self.silence_watchdog.raise_if_failed()
         if return_code != 0:
             # an unclassified nonzero exit RETURNS from the classifier rather than raising, so this
             # is the failing path that reached no teardown. the direct child is gone but its group

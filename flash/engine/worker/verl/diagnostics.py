@@ -241,6 +241,7 @@ class VerlChildSilenceWatchdog:
         tail: ChildOutputTail,
         *,
         tick_s: float,
+        baseline_step: int = 0,
         parent_activity: Callable[[], int] | None = None,
     ) -> None:
         self._tail = tail
@@ -252,11 +253,12 @@ class VerlChildSilenceWatchdog:
         self._failure: RuntimeError | None = None
         self._teardown: Callable[[], None] | None = None
         self._is_running: Callable[[], bool] | None = None
-        # the step THIS process started from, latched on the first observation. a resumed opd run
-        # seeds its progress dict with resume_step, so a bare `step > 0` reads as "training is
-        # active" while ray and the model are still loading and no child line has arrived yet --
-        # arming the kill path during a setup phase that a fresh run is exempt from.
-        self._baseline_step: int | None = None
+        # the step this child STARTS from, supplied by the caller before launch rather than sampled.
+        # it cannot be latched from the first observation: the liveness thread samples one tick in,
+        # so a child that reports step 1 and then wedges would make 1 its own baseline and never
+        # count as training again. a resumed run passes its resume_step, which is what keeps ray and
+        # model loading exempt without giving a wedged child the same free pass.
+        self._baseline_step = int(baseline_step)
         self._lock = threading.Lock()
 
     def bind_process(self, *, teardown: Callable[[], None], is_running: Callable[[], bool]) -> None:
@@ -289,10 +291,8 @@ class VerlChildSilenceWatchdog:
                     )
                     self._parent_activity_count = count
             silent_ticks = self._staleness.observe(self._tail.written, active=parent_active)
-            if self._baseline_step is None:
-                self._baseline_step = step
-            # "this process has completed a step", not "step is positive": measured against the
-            # baseline so a resume gets the same setup exemption a fresh run gets.
+            # "this child has completed a step", not "step is positive": measured against the
+            # baseline it started from, so a resume gets the same setup exemption a fresh run gets.
             training = step > self._baseline_step
             # bind_process runs immediately after popen. before that there is no paid child to kill;
             # afterwards this check keeps normal exit and teardown from being reclassified as silence.

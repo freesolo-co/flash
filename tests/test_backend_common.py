@@ -1992,8 +1992,10 @@ def test_stall_tail_fields_is_empty_when_the_child_has_said_nothing():
     assert vc.stall_tail_fields(0, vc.ChildOutputTail()) == {}
 
 
-def _bound_silence_watchdog(tail, *, tick_s=30.0, parent_activity=None):
-    watchdog = vc.VerlChildSilenceWatchdog(tail, tick_s=tick_s, parent_activity=parent_activity)
+def _bound_silence_watchdog(tail, *, tick_s=30.0, baseline_step=0, parent_activity=None):
+    watchdog = vc.VerlChildSilenceWatchdog(
+        tail, tick_s=tick_s, baseline_step=baseline_step, parent_activity=parent_activity
+    )
     torn_down = []
     watchdog.bind_process(teardown=lambda: torn_down.append(True), is_running=lambda: True)
     return watchdog, torn_down
@@ -2021,6 +2023,25 @@ def test_verl_child_silence_timeout_stays_under_the_provider_stall_deadline():
     assert vc.VERL_CHILD_SILENCE_TIMEOUT_S > 105.0 * 4 + 14.0
 
 
+def test_verl_child_silence_watchdog_kills_a_child_that_wedges_on_its_very_first_step():
+    """The baseline is the step the child STARTED from, not the first one sampled.
+
+    The liveness thread samples one tick after launch, so a child that prints `step: 1` inside that
+    first window and then wedges would make 1 its own baseline. `step > baseline` would be false
+    forever and the wedge -- the exact case this watchdog exists for -- would bill the gpu
+    untouched. Supplying the pre-launch step closes that.
+    """
+    tail = vc.ChildOutputTail()
+    tail.record("step: 1\n")
+    watchdog, torn_down = _bound_silence_watchdog(tail, baseline_step=0)
+
+    # every observation reports step 1: the child advanced once, then went silent for good.
+    for _ in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0) + 1):
+        watchdog.observe(1)
+
+    assert torn_down == [True]
+
+
 def test_verl_child_silence_watchdog_gives_a_resumed_run_the_same_setup_exemption():
     """A resumed opd run seeds `progress["step"]` from resume_step (opd_train_runner.py), so a
     bare `step > 0` test reads as "training is running" while ray and the model are still loading
@@ -2029,7 +2050,7 @@ def test_verl_child_silence_watchdog_gives_a_resumed_run_the_same_setup_exemptio
     """
     resumed = vc.ChildOutputTail()
     resumed.record("ray: loading model\n")
-    resumed_watchdog, resumed_torn_down = _bound_silence_watchdog(resumed)
+    resumed_watchdog, resumed_torn_down = _bound_silence_watchdog(resumed, baseline_step=40)
 
     fresh = vc.ChildOutputTail()
     fresh.record("ray: loading model\n")
@@ -2095,6 +2116,48 @@ def test_run_verl_training_tears_down_a_silent_child_and_raises_the_named_failur
     assert not observer.is_alive()
 
 
+def test_a_silenced_child_that_reported_infra_trouble_still_raises_the_retriable_failure():
+    """Teardown makes the exit nonzero, so the tail's own classification must be read FIRST.
+
+    A child that printed `cudaErrorDevicesUnavailable` and then wedged has already earned a
+    RetriableInfraError, which is what moves the run to a healthy worker. Raising the generic
+    silence failure ahead of the classifier downgrades that to a terminal error and the run loses
+    the retry its evidence justified.
+    """
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    tail = vc.ChildOutputTail()
+    watchdog = vc.VerlChildSilenceWatchdog(tail, tick_s=vc.VERL_CHILD_SILENCE_TIMEOUT_S)
+
+    def trip_after_first_output():
+        deadline = time.monotonic() + 5.0
+        while tail.written == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert tail.written > 0
+        watchdog.observe(1)
+        watchdog.observe(2)
+
+    observer = threading.Thread(target=trip_after_first_output)
+    observer.start()
+    try:
+        # the signature is authoritative evidence the gpu was unavailable, so it must win over the
+        # silence message even though the silence watchdog is what actually stopped the child.
+        with pytest.raises(RetriableInfraError):
+            vc.run_verl_training(
+                [
+                    "bash",
+                    "-c",
+                    "echo 'step: 1'; echo 'cudaErrorDevicesUnavailable'; sleep 30",
+                ],
+                env=dict(os.environ),
+                tail=tail,
+                silence_watchdog=watchdog,
+            )
+    finally:
+        observer.join(timeout=5.0)
+    assert not observer.is_alive()
+
+
 def test_verl_child_silence_watchdog_resets_on_parent_activity_and_probe_failure_counts():
     tail = vc.ChildOutputTail()
     tail.record("step: 1\n")
@@ -2133,8 +2196,11 @@ def test_verl_child_silence_watchdog_allows_long_silence_below_the_threshold():
     tail.record("step: 1\n")
     watchdog, torn_down = _bound_silence_watchdog(tail)
 
+    # one tick short of the limit: the count keeps climbing and nothing is torn down. derived from
+    # the timeout so a change to it retunes this rather than silently making the test vacuous.
+    limit = int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0)
     assert watchdog.observe(1) == 0
-    for expected in range(1, 120):
+    for expected in range(1, limit):
         assert watchdog.observe(1) == expected
 
     watchdog.raise_if_failed()

@@ -550,8 +550,6 @@ def run_verl_training(
         # other caller of this -- runs on exceptions alone: a worker whose later jobs all succeed
         # would hold that zombie for its whole life, as pid 1 with nothing else to reap it.
         reap_stragglers()
-    if silence_watchdog is not None:
-        silence_watchdog.raise_if_failed()
     collected = proc.returncode
     if collected is None:
         # the bounded wait above can end with nothing collected, which the unbounded one it replaced
@@ -577,6 +575,12 @@ def run_verl_training(
     except BaseException:
         kill_process_group(proc, process_group_id=process_group_id)
         raise
+    # AFTER the classifier, never before: teardown makes the exit nonzero, and a child that printed
+    # `cudaErrorDevicesUnavailable` before wedging still deserves the RetriableInfraError its own
+    # evidence earns. raising the generic silence failure first would downgrade that to a terminal
+    # error and cost the run the retry the tail already justified.
+    if silence_watchdog is not None:
+        silence_watchdog.raise_if_failed()
     if return_code != 0:
         # a nonzero exit that carried no recognized signature RETURNS from the classifier rather
         # than raising, so this is the one failing path that reached neither teardown above. the
