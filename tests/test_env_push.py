@@ -1641,6 +1641,11 @@ def test_push_allows_ordinary_environments_and_datasets(monkeypatch, tmp_path):
     )
     # a hand-written placeholder is snake_case English, carrying neither digit nor capital
     (env_dir / "conftest_helper.py").write_text('STUB = "fslo_retry_after_close"\n')
+    # a lowercase-hex body is a content hash, not a key: this is an ordinary CDN asset URL, and
+    # the bare `sk-` alternation matched it until it was narrowed to mixed-case bodies.
+    (env_dir / "README.md").write_text(
+        "assets live at https://cdn.example.com/a/sk-0123456789abcdef0123456789abcdef.js\n"
+    )
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 

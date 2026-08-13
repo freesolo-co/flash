@@ -36,7 +36,13 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("a Prime Intellect key", re.compile(r"pit_([A-Za-z0-9]{16,})")),
     ("an Anthropic API key", re.compile(r"sk-ant-([A-Za-z0-9_-]{20,})")),
     ("an OpenRouter API key", re.compile(r"sk-or-v1-([A-Za-z0-9]{20,})")),
-    ("an OpenAI API key", re.compile(r"sk-proj-([A-Za-z0-9_-]{20,})|sk-([A-Za-z0-9]{32,})")),
+    # the bare `sk-` form requires a MIXED-CASE body. A lowercase-hex body of the same length is
+    # a content hash, not a key -- `.../assets/sk-<32 hex>.js` is an ordinary CDN asset URL, and
+    # matching it refused a publish carrying no credential at all.
+    (
+        "an OpenAI API key",
+        re.compile(r"sk-proj-([A-Za-z0-9_-]{20,})|sk-([a-z0-9]*[A-Z][A-Za-z0-9]{31,})"),
+    ),
     ("a Slack token", re.compile(r"xox[baprs]-([A-Za-z0-9-]{10,})")),
 )
 
