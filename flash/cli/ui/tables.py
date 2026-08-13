@@ -70,8 +70,20 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
 
 
 def gpu_label(spec: dict, remote: dict) -> str:
-    """Human-facing GPU label. Provider metadata stays internal."""
-    return remote.get("allocated_gpu") or (spec.get("gpu") or {}).get("type", "")
+    """Human-facing GPU label. Provider metadata stays internal.
+
+    Reads the RAW persisted spec, not a parsed `JobSpec`, so it has to render `gpu.type` in both
+    spellings: an ordered pin persists as a list, and until allocation records `allocated_gpu` that
+    list is the only label there is. Returning it unchanged put a list in a `{:<}` alignment slot
+    and raised `TypeError: unsupported format string passed to list.__format__`, which takes down
+    the whole `flash runs list` table -- every OTHER run included -- rather than the one cell.
+    Joined rather than truncated to the head: the run is genuinely allowed on any of them, and the
+    column is the only place that is visible while a run is still provisioning.
+    """
+    gpu_type = (spec.get("gpu") or {}).get("type", "")
+    if isinstance(gpu_type, (list, tuple)):
+        gpu_type = " | ".join(str(entry) for entry in gpu_type)
+    return remote.get("allocated_gpu") or gpu_type
 
 
 def runs_table(runs: list[dict]) -> str:

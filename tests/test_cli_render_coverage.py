@@ -578,3 +578,61 @@ def test_runs_table_marks_live_rows_with_a_tilde(styled_plain) -> None:
     assert "~$2.5000" in out  # live: the quote, flagged
     assert "$1.2500" in out  # settled: the real charge
     assert "~$1.2500" not in out
+
+
+def test_runs_table_renders_an_ordered_gpu_pin_that_has_not_allocated_yet(styled_plain) -> None:
+    """`gpu_label` reads the RAW persisted spec, where an ordered pin is a LIST.
+
+    `to_dict()` folds an ordered pin back into `gpu.type = [...]`, and until allocation records
+    `remote.allocated_gpu` that list is the only label available. Returned unchanged it lands in an
+    alignment slot as `{:<}` and raises `TypeError: unsupported format string passed to
+    list.__format__` -- which takes down the ENTIRE `flash runs list` table, every unrelated run
+    included, not just the offending cell. So the failure mode is a user who cannot see any of
+    their runs because one of them is provisioning on an ordered pin."""
+    out = render.runs_table(
+        [
+            {
+                "run_id": "flash-ordered",
+                "state": "provisioning",
+                "updated_at": 2,
+                "spec": {
+                    "model": "m",
+                    "algorithm": "sft",
+                    "gpu": {"type": ["A100 PCIe", "A100 SXM"]},
+                },
+                "remote": {},
+            },
+            {
+                "run_id": "flash-other",
+                "state": "done",
+                "updated_at": 1,
+                "spec": {"model": "m", "algorithm": "sft", "gpu": {"type": "H200"}},
+                "cost_usd": 1.25,
+            },
+        ]
+    )
+    assert "A100 PCIe | A100 SXM" in out
+    # the unrelated run is still listed, which is what the crash used to prevent.
+    assert "flash-other" in out
+    assert "H200" in out
+
+
+def test_runs_table_prefers_the_allocated_gpu_over_an_ordered_pin(styled_plain) -> None:
+    """Once allocation lands, the label is the class actually rented, not the authored set."""
+    out = render.runs_table(
+        [
+            {
+                "run_id": "flash-ordered",
+                "state": "running",
+                "updated_at": 1,
+                "spec": {
+                    "model": "m",
+                    "algorithm": "sft",
+                    "gpu": {"type": ["A100 PCIe", "A100 SXM"]},
+                },
+                "remote": {"allocated_gpu": "A100 SXM"},
+            }
+        ]
+    )
+    assert "A100 SXM" in out
+    assert "A100 PCIe" not in out
