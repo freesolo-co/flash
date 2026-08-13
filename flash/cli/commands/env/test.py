@@ -6,9 +6,17 @@ import json
 import math
 import sys
 import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from flash.cli.commands.env.push import _err, _resolve_local_env_entrypoint
+from flash.cli.commands.env.test_evaluations import _check_evaluation_suites
+from flash.cli.commands.env.test_warnings import (
+    _warn_on_low_replay_reward,
+    _warn_on_repeated_rendered_roles,
+    _warn_on_unfinished_replay,
+    _warn_on_uniformly_zero_rewards,
+)
 from flash.cli.ui import render
 
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
@@ -147,145 +155,6 @@ def _carries_thinking_markup(reference_turns: list[str]) -> bool:
     return any("<think>" in turn or "</think>" in turn for turn in reference_turns)
 
 
-# the roles whose adjacency collapses into one rendered block. `tool` is deliberately absent: one
-# assistant message carrying two parallel tool calls is answered by one `tool` message per call,
-# which is the required wire format and what chat templates render as separate delimited blocks --
-# not a collapse. flagging it would train users to edit a correct transcript into a broken one, or
-# to ignore the warning entirely.
-#
-# `user` and `system` stay in. two user turns in a row is how an off-by-one trajectory capture shows
-# up (the completion re-states the question the prompt already asked), and it duplicates that text
-# in the trained string exactly as a doubled assistant turn does.
-_MERGEABLE_ROLES = frozenset({"assistant", "user", "system"})
-
-
-def _repeated_roles(messages: list[dict]) -> list[tuple[int, str]]:
-    """The (index, role) of every message whose role repeats the one before it.
-
-    SFT does not replay a gold completion turn by turn. It renders ONE training string from
-    ``[*prompt_messages, *completion_messages]`` (flash/engine/profiling/sft_workload.py), so the
-    only thing the model learns from is that concatenation -- and nothing in flash validates its
-    role sequence. A multi-turn gold answer returned as assistant turns alone renders as one user
-    question followed by every answer back to back, which trains the model to dump the whole
-    episode into a single reply: the opposite of the behaviour being taught.
-
-    This gate replays those turns individually and scores each one, so it passes either way; the
-    defect exists only at the concatenation, which nothing here exercised.
-    """
-    repeated: list[tuple[int, str]] = []
-    previous = ""
-    for index, message in enumerate(messages):
-        role = str(message.get("role", "")).strip().lower()
-        if role in _MERGEABLE_ROLES and role == previous:
-            repeated.append((index, role))
-        previous = role
-    return repeated
-
-
-def _rendered_roles(prompt: list[dict], completion: list[dict]) -> str:
-    """The rendered role sequence, marking where the completion begins.
-
-    Printed beside the warning because the role ORDER is the defect: a reader needs to see which
-    turns merged and on which side of the seam, and no preview of the message text shows that.
-    """
-    roles = [str(message.get("role", "?")).strip().lower() or "?" for message in prompt]
-    roles.append("|")
-    roles.extend(str(message.get("role", "?")).strip().lower() or "?" for message in completion)
-    return " ".join(roles)
-
-
-def _warn_on_repeated_rendered_roles(
-    prompt: list[dict], completion: list[dict], *, multi_turn: bool
-) -> None:
-    """Warn when the SFT training string would run two assistant turns together.
-
-    Skipped entirely for a multi-turn environment. There, a gold completion holding consecutive
-    assistant turns is the CONTRACT, not a defect: the intervening user turns are produced by
-    `env_reply` during the rollout and are deliberately absent from the dataset -- `_drive_multi_turn`
-    depends on exactly that shape, replaying one reference turn per model turn. Warning about it
-    would fire on every correct multi-turn environment and advise an edit that breaks the replay.
-
-    For a single-turn environment the concatenation IS the trained text, so the same adjacency is a
-    real defect: SFT renders one string from `[*prompt_messages, *completion_messages]`
-    (flash/engine/profiling/sft_workload.py) and nothing else validates it. A completion returned as
-    assistant turns alone then renders as one user question followed by every answer back to back,
-    training the model to dump the whole episode into a single reply.
-
-    Reported for every algorithm, not just sft: one published environment serves all three, so a
-    single-turn env shaped this way is broken for sft whichever algorithm this invocation named.
-
-    Only the RENDERED sequence is checked, never either list alone -- a prompt may legitimately end
-    on an assistant prefill, and the fault is adjacency after concatenation.
-    """
-    if multi_turn or not prompt or not completion:
-        return
-    repeated = _repeated_roles([*prompt, *completion])
-    if not repeated:
-        return
-    print(
-        render.warn(_repeated_roles_message(repeated, len(prompt)))
-        if render.styled()
-        else f"warning: {_repeated_roles_message(repeated, len(prompt))}",
-        file=sys.stderr,
-    )
-    print(f"  rendered roles: {_rendered_roles(prompt, completion)}", file=sys.stderr)
-
-
-def _repeated_roles_message(repeated: list[tuple[int, str]], boundary: int) -> str:
-    """Name each collapsing turn in the region that owns it, with that region's own index.
-
-    Three regions, three different edits, so all three are named rather than folded into one: a
-    repeat inside the prompt is a `prompt_messages`/`start_episode` fault, one at the seam means the
-    prompt ends on a prefill the completion continues, and one inside the completion means the gold
-    answer needs the env's follow-up user turns interleaved. Reporting a prompt-internal or seam
-    collision as "inside sft_completion" sends the author to a file that is correct.
-
-    Indices are rebased onto the region they belong to. A raw offset into the concatenation is not a
-    position the author can look up: with a system prompt prepended, turn 0 of a three-message
-    completion is reported as message 3, which does not exist in the file they open.
-    """
-    inside_prompt = [(index, role) for index, role in repeated if index < boundary]
-    at_seam = [(index, role) for index, role in repeated if index == boundary]
-    inside_completion = [(index, role) for index, role in repeated if index > boundary]
-    parts: list[str] = []
-    if inside_prompt:
-        where = ", ".join(f"message {index} ({role})" for index, role in inside_prompt)
-        parts.append(f"inside prompt_messages ({where})")
-    if at_seam:
-        role = at_seam[0][1]
-        parts.append(
-            f"at the prompt/completion boundary (its first turn is another {role} turn, "
-            "continuing the prompt's last)"
-        )
-    if inside_completion:
-        # rebased onto sft_completion's own indexing, which is what the author can actually look up.
-        where = ", ".join(
-            f"message {index - boundary} ({role})" for index, role in inside_completion
-        )
-        parts.append(f"inside sft_completion ({where})")
-    # the remedy depends on which role doubled, not just where. two assistant turns need the env's
-    # user turns interleaved; a doubled user turn is the opposite fault -- the completion restating
-    # a question the prompt already asked, which is an off-by-one in how the trajectory was captured.
-    doubled = {role for _index, role in repeated}
-    if doubled == {"assistant"}:
-        remedy = (
-            "a gold answer that spans several assistant turns must interleave the user turns it "
-            "was answering"
-        )
-    elif "assistant" not in doubled:
-        remedy = (
-            "a repeated non-assistant turn usually means the trajectory was captured one turn "
-            "early, so the completion restates a turn the prompt already contains"
-        )
-    else:
-        remedy = "each region must alternate roles once concatenated"
-    return (
-        f"sft would train on consecutive same-role turns {' and '.join(parts)}. sft renders one "
-        f"string from prompt_messages + sft_completion, so these turns merge into a single reply -- "
-        f"{remedy}"
-    )
-
-
 def _preview(value: object) -> str:
     if isinstance(value, list):
         parts = []
@@ -303,27 +172,6 @@ def _preview(value: object) -> str:
     if len(text) <= _PREVIEW_CHARS:
         return text
     return f"{text[: _PREVIEW_CHARS - 3]}..."
-
-
-def _scored_text(record: dict) -> str:
-    """The exact text the grader scored, as captured at the scoring call.
-
-    Read from the record rather than rebuilt from ``responses``: a multi-turn env whose
-    ``step_episode`` returns a ``final_response_text`` has the adapter replace the episode's
-    response with that override before scoring, so the replayed turns are not what was graded.
-    Falls back to the replayed turns only when nothing was captured (``None``) -- an episode that
-    failed before it was scored. An empty capture is a real graded value, not a missing one, and
-    an empty answer is exactly the fault a reader needs named.
-
-    Unlike ``_preview`` this preserves whitespace and does not truncate: it is printed with
-    ``repr`` beside a zero reward so a trailing newline, a tab, or a wrapper past the preview
-    cutoff stays visible. Those are the formatting faults that make a correct grader reject a
-    gold answer, so hiding them defeats the diagnostic.
-    """
-    scored = record.get("scored_text")
-    if scored is not None:
-        return str(scored)
-    return "\n".join(str(item) for item in record.get("responses") or ())
 
 
 def _report_scorer_error(record: dict) -> None:
@@ -460,7 +308,7 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
         if gold_finished is None and turns >= len(reference_turns):
             # the gold answer has just run out and its last turn is applied: this is the only
             # moment the reference can be judged on its own, before junk padding touches the state.
-            gold_finished = bool(env.rollout_done(state, max_turns=hard_cap))
+            gold_finished = _episode_completed(env, state, hard_cap)
         if env.rollout_done(state, max_turns=hard_cap):
             break
 
@@ -477,6 +325,12 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     # extra move. rollout_done covers the env having declared the episode over.
     if env_step_pending and not env.rollout_done(state, hard_cap):
         env.env_reply(state["messages"], state)
+    if gold_finished is None:
+        # the gold answer never ran out inside the loop -- it covered the whole episode, so the
+        # break came first and the mid-loop sample never fired. NOW is its moment: the deferred
+        # env_reply above has applied its last turn, which is precisely the state that says whether
+        # a full-length reference completed the episode or merely exhausted the budget.
+        gold_finished = _episode_completed(env, state, hard_cap)
     # decided HERE, not at the break: the last model turn is applied only by the env_reply above, so
     # asking before it would report an env that solves the task on its final allowed turn as one
     # that never finishes -- and send the author to fix termination logic that works.
@@ -487,14 +341,43 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     # five-move gold answer against a twelve-turn cap on an environment no move can ever solve --
     # the exact field case this warning exists for -- is still reported, while a short gold answer
     # on a working env, which simply stopped early, is not blamed for the padding that followed.
+    #
+    # `rollout_done` deliberately is NOT consulted here. the real adapter
+    # (flash/envs/adapter.py `rollout_done`) returns True from `turn >= cap` ALONE, so at the ceiling
+    # it is True for a healthy env and a dead one alike -- ANDing it in made this warning
+    # unsatisfiable in production while the fakes, which override it to a bare `False`, kept the
+    # tests green. what distinguishes the two is the env's own completion signal, which is what
+    # `_episode_completed` reads.
     unfinished = gold_finished is False if gold_finished is not None else True
-    record["hit_turn_cap"] = (
-        stopped_at_ceiling and unfinished and not env.rollout_done(state, max_turns=hard_cap)
-    )
+    record["hit_turn_cap"] = stopped_at_ceiling and unfinished
     record["reward"], record["scorer_error"], record["scored_text"] = _score_with_error(
         env, "", example, state
     )
     record["state"] = state
+
+
+def _episode_completed(env, state: dict, hard_cap: int) -> bool:
+    """Whether the ENVIRONMENT declared this episode over, as opposed to running out of turns.
+
+    `rollout_done` cannot answer this. The real adapter (flash/envs/adapter.py) returns True from
+    `turn >= cap` alone, so at the ceiling it is True for a healthy environment and for one no
+    rollout can ever finish -- which is exactly the distinction the turn-cap warning is built on.
+
+    The env's own completion flag is the signal that separates them, read from the state the adapter
+    itself sets (`state["done"]`). An env that exposes no such flag is treated as finished, so a
+    non-standard state shape produces silence rather than a warning nobody can act on.
+    """
+    if "done" in state:
+        return bool(state.get("done"))
+    # no completion flag to read: fall back to the env's own predicate, but only below the ceiling,
+    # where it still reflects a real decision rather than the cap.
+    turn = int(state.get("turn", 0) or 0)
+    if turn >= hard_cap:
+        return True
+    try:
+        return bool(env.rollout_done(state, max_turns=hard_cap))
+    except (Exception, SystemExit):
+        return True
 
 
 def _junk_reward(env, example: dict) -> float | None:
@@ -503,6 +386,7 @@ def _junk_reward(env, example: dict) -> float | None:
     One stateful-env pass, run only after every real episode has been scored. Callers share this
     single result rather than each driving their own: scoring is not guaranteed to be pure, a
     second pass can bill a paid judge twice, and two probes of the same env could disagree.
+
     """
     try:
         probe = _new_record()
@@ -574,198 +458,158 @@ def _separates_on_turn_rewards(env, example: dict, state: dict | None) -> bool:
     return len({float(turn) for turn in turns}) > 1
 
 
-def _warn_on_uniformly_zero_rewards(
-    rewards: list[float], *, algorithm: str, replayed_any: bool, separates: bool = False
-) -> None:
-    """Warn when every episode this run scored came back exactly zero.
+@dataclass
+class _Tally:
+    """What the episode loop measured, as the two gates below need to read it.
 
-    Deliberately independent of the blocking gate above, which abstains for a non-grpo algorithm,
-    a reference in reasoning markup, a replay that ran out mid-episode, and a junk probe that
-    raised. Each abstention is individually right -- none of them is proof the grader works -- but
-    together they let a run in which nothing scored anything print `overall: PASS` and no other
-    line.
-
-    The two ways a run reaches all-zero are NOT the same finding, so they are not reported with the
-    same words:
-
-    * At least one gold answer was replayed. A working grader is supposed to pay its own reference
-      more than nothing, so this points at the grader or at the shape of the gold answer it was
-      handed.
-    * Every episode was `echo`. Echo replays deliberate junk, and a correct grader SHOULD score
-      junk zero -- so the zero is not itself suspicious. What is worth saying is that no gold
-      answer was ever scored, which means this run carries no evidence either way, and that an
-      empty `sft_completion` is also nothing for SFT to train on.
-
-    For GRPO a constant reward is additionally silent rather than merely uninformative: rewards are
-    mean-centred within each group (`algorithm.norm_adv_by_std_in_grpo=False`,
-    flash/engine/worker/train/rl/verl_config.py), so a constant reward gives zero advantage and zero
-    gradient. Training completes, the loss curve looks unremarkable, and the adapter comes out
-    identical to its warm start. The end-of-run advantage-spread guard catches that only after the
-    GPUs have been paid for (flash/engine/worker/train/rl/checkpoints.py); this catches it before
-    they are allocated.
-
-    Skipped when `separates` says the grader was PROVEN to distinguish answers -- a centered scale
-    paying gold 0.0 and junk -1.0, or a per-turn vector that separates while the scalar is only a
-    placeholder. Both have a real gradient, so calling them unmeasured would be false, and a false
-    alarm on the healthy path is what teaches people to ignore this warning on the broken one.
-
-    Only exact zeros trip it. A nonzero constant is a weaker, separate signal -- a reward may
-    legitimately be constant across three rows -- and is not diagnosed here.
+    One value rather than five loose locals because the gates disagree about which episodes count,
+    and the distinction is the whole subtlety: `replayed`/`replayed_zero` are the BLOCKING gate's
+    evidence and deliberately exclude a thinking-markup or incomplete replay, while `scored_rewards`
+    and `scored_episode` are the advisory warning's and include every policy.
     """
-    if separates or not rewards or any(reward != 0.0 for reward in rewards):
-        return
-    count = len(rewards)
-    if not replayed_any:
-        # deliberately says "no replayable gold answer" rather than "no gold answer": echo is also
-        # chosen for a gold completion that exists but carries no replayable TEXT (an image-only
-        # content block, a native tool-call turn with null content). telling that author to supply
-        # an answer they already supplied sends them in a circle.
-        message = (
-            f"all {count} scored episode(s) returned reward 0.000000, and every one of them "
-            "replayed a deliberately wrong answer because no row supplied a replayable gold one. "
-            "a zero is the correct score for that, so this run is not evidence the reward function "
-            "works. give the rows a gold answer whose assistant turns carry text "
-            "(`sft_completion`, or the row's `output`) and re-run"
+
+    # only replay episodes carry a gold answer to score. an echo episode has none, so its reward
+    # says nothing about the grader and is counted in neither total.
+    replayed: int = 0
+    replayed_zero: list[tuple[dict, dict | None]] = field(default_factory=list)
+    # every finite reward this run scored, whatever the policy or algorithm. the blocking gate
+    # counts only the replay episodes it can hold responsible, and abstains for thinking markup, an
+    # incomplete replay, a non-grpo algorithm, or a junk probe that raised -- so a run where nothing
+    # scored anything reached `overall: PASS` with no line saying so. this list is what makes the
+    # uniformly-zero warning independent of every one of those abstentions.
+    scored_rewards: list[float] = field(default_factory=list)
+    # whether any episode replayed a gold answer at all, including the ones the blocking gate
+    # excludes (reasoning markup, an incomplete replay). an all-echo run scored only deliberate
+    # junk, for which zero is the CORRECT answer, so the warning must not read that as a broken
+    # grader -- but it is still worth saying that nothing was measured.
+    replayed_any: bool = False
+    # the first episode that produced a finite reward, whatever its policy. used only as the subject
+    # of the advisory warning's separation probe.
+    scored_episode: tuple[dict, dict | None] | None = None
+
+    def observe(self, example: dict, record: dict) -> None:
+        """Record one episode that passed its contract checks."""
+        reward = record["reward"]
+        if reward is None:
+            return
+        # recorded for every passing episode, echo included: an echo run whose scores are all zero
+        # is equally unmeasured, and is exactly the shape a replay-only counter misses.
+        self.scored_rewards.append(reward)
+        if self.scored_episode is None:
+            # a probe subject for the advisory warning, kept independently of `replayed_zero`. that
+            # list is the BLOCKING gate's evidence and deliberately excludes a thinking-markup or
+            # incomplete replay -- but a per-turn vector on such an episode still proves the grader
+            # separates, so the warning needs a subject the gate skips.
+            self.scored_episode = (example, record["state"])
+        if record["policy"] != "replay":
+            return
+        self.replayed_any = True
+        # a reference written in reasoning markup cannot be replayed faithfully from here (see
+        # `_carries_thinking_markup`), so its score is not evidence about the grader and is kept out
+        # of the blocking gate's totals. neither is a multi-turn episode whose gold answer ran out
+        # before the rollout did: the graded trajectory is then part reference and part junk, and a
+        # zero says nothing about the reference the gate never ran. the advisory warning still fires
+        # for both: a low reward is worth surfacing either way, it just cannot be the reason to fail.
+        if record["thinking_markup"] or record["replay_incomplete"]:
+            return
+        self.replayed += 1
+        # an exact zero is what a scorer that recognized nothing returns, so it stays the signature
+        # this gate looks for. it is confirmed against a wrong answer once every episode has run,
+        # not here: see `_scores_gold_no_better_than_junk`.
+        if reward == 0.0:
+            self.replayed_zero.append((example, record["state"]))
+
+
+def _check_grader(env, algorithm: str, tally: _Tally) -> bool:
+    """Decide LS-005 and report whatever the run failed to measure.
+
+    Returns whether the grader was shown to recognize its own reference answers. Blocks only when
+    every gold answer scores zero and deliberate junk scores at least as well; centered rewards may
+    legitimately score gold at zero, and partial failures remain warnings. The gate applies only to
+    grpo, which trains from env.reward -- sft and opd use other losses.
+    """
+    # the blocking gate's own condition, unchanged: every episode the gate can hold responsible
+    # scored zero. deliberately NOT widened with "and no other episode scored anything" -- an echo
+    # row or a thinking-markup row that happens to pay 0.5 says nothing about whether the grader
+    # recognizes its references, and letting one disable the block would turn a broken grader's
+    # verdict from FAIL back into PASS.
+    all_accountable_gold_scored_zero = bool(tally.replayed) and (
+        len(tally.replayed_zero) == tally.replayed
+    )
+    uniformly_zero = bool(tally.scored_rewards) and all(
+        reward == 0.0 for reward in tally.scored_rewards
+    )
+    # the probe's subject: the blocking gate's own episode when it has one, otherwise any episode
+    # that scored. the fallback matters -- a gold answer in reasoning markup keeps `replayed_zero`
+    # empty, and without a subject the warning could gather no evidence and fired on graders that
+    # separate perfectly.
+    probe_subject = (
+        tally.replayed_zero[0] if all_accountable_gold_scored_zero else tally.scored_episode
+    )
+    # never probe a run that replayed no gold answer at all: every episode was already `echo`, which
+    # IS the junk answer, so a junk probe would re-score what was just scored and prove nothing.
+    blocking_gate_asks = all_accountable_gold_scored_zero and algorithm == _REWARD_DRIVEN_ALGORITHM
+    probe_worth_running = (
+        probe_subject is not None and tally.replayed_any and (blocking_gate_asks or uniformly_zero)
+    )
+    # the per-turn check is cheap -- one metadata call, no episode driven -- so it runs wherever it
+    # might inform either consumer.
+    separates_on_turns = probe_worth_running and _separates_on_turn_rewards(env, *probe_subject)
+    # the junk probe drives a whole extra episode through user code and can bill a paid judge, so it
+    # is spent only where its answer changes an outcome: the blocking gate asking (grpo, accountable
+    # gold all zero), or the advisory warning about to fire on a run whose gold answers all scored
+    # zero. the second condition is `all_accountable_gold_scored_zero`, NOT merely `uniformly_zero`:
+    # a run whose accountable gold was never zero has nothing for the probe to compare against, and
+    # driving it there bought an unusable number at the cost of an extra billed episode.
+    junk_reward = (
+        _junk_reward(env, probe_subject[0])
+        if probe_worth_running and not separates_on_turns and all_accountable_gold_scored_zero
+        else None
+    )
+    if (
+        algorithm == _REWARD_DRIVEN_ALGORITHM
+        and all_accountable_gold_scored_zero
+        and not separates_on_turns
+        and _scores_gold_no_better_than_junk(junk_reward, 0.0)
+    ):
+        _err(
+            f"all {tally.replayed} replayed gold answer(s) scored zero, no better than a "
+            "deliberately wrong answer; the reward function cannot recognize its own reference "
+            "answers. check the grader and that its runtime dependencies are installed in this "
+            "environment."
         )
-    else:
-        detail = (
-            "every rollout would then carry the same reward, which GRPO centres to a zero "
-            "advantage and a zero gradient: the run would complete, report an unremarkable loss "
-            "curve, and produce an adapter identical to its warm start"
-            if algorithm == _REWARD_DRIVEN_ALGORITHM
-            else "a reward that is constant across every row measures nothing about the environment"
-        )
-        message = (
-            f"all {count} scored episode(s) returned reward 0.000000, so this run measured "
-            f"nothing. {detail}. check the reward function, its runtime dependencies, and that "
-            "the gold answer it scored is in the shape it expects"
-        )
-    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+        return False
+    # the blocking gate abstains far more often than it fires: for sft and opd, for a reference in
+    # reasoning markup, for a replay that ran out mid-episode, for an echo run with no gold answer at
+    # all, and whenever the junk probe raises. in every one of those a run that scored exactly zero
+    # on every episode still printed `overall: PASS` and nothing else -- and a uniformly-zero reward
+    # is never a measurement, whatever produced it. GRPO centres rewards within each group, so a
+    # constant reward is a zero advantage and a zero gradient: training completes, the loss curve
+    # looks unremarkable, and the adapter comes out identical to its warm start. say so here rather
+    # than leave the verdict to speak for it.
+    #
+    # but only when the grader has NOT already been shown to separate. a centered scale that pays
+    # gold 0.0 and junk -1.0 has a perfectly good gradient, and the same is true of an env that
+    # trains from a per-turn vector while its scalar is a placeholder -- both are the shapes the
+    # blocking gate deliberately exempts, and warning about them would send the author of a working
+    # environment to debug a correct reward function. a false alarm on the healthy path is what
+    # teaches people to ignore this warning on the broken path. separation is positive EVIDENCE, not
+    # merely the gate's abstention: a per-turn vector whose values differ, or junk scoring strictly
+    # below the gold zero. a probe that failed leaves `junk_reward` None, which proves nothing and so
+    # does not excuse the run.
+    _warn_on_uniformly_zero_rewards(
+        tally.scored_rewards,
+        algorithm=algorithm,
+        replayed_any=tally.replayed_any,
+        separates=separates_on_turns or (junk_reward is not None and junk_reward < 0.0),
+    )
+    return True
 
 
 def _load_failure(reason: str) -> int:
     _err(f"env test failed: {reason}")
     print("0/0 episodes passed contract checks")
     return _err("overall: FAIL")
-
-
-def _evaluation_example(case) -> dict:
-    example = dict(case.metadata or {})
-    example["input"] = case.input
-    example["output"] = case.expected
-    if case.id is not None:
-        example["id"] = case.id
-    return example
-
-
-def _normalize_prompt_images(env, example: dict, messages: list[dict]) -> None:
-    """Resolve the case's images the way the online command and every training worker do.
-
-    Raises whatever `normalize_prompt_images` raises, so an unreadable, oversized, or malformed
-    image fails this gate with the message the caller would have hit at generation time. Text-only
-    cases -- the vast majority -- return without importing the multimodal machinery at all.
-    """
-    from flash.content.multimodal import record_has_images
-
-    if not record_has_images(example, messages):
-        return
-    from flash.content.multimodal import normalize_prompt_images
-
-    normalize_prompt_images(example, messages, getattr(env, "package_root", None))
-
-
-def _evaluation_response(env, case) -> tuple[str, str]:
-    example = _evaluation_example(case)
-    # build the prompt even though the replayed response does not need it. `flash env eval` sends
-    # every case through prompt_messages() (flash/cli/commands/env/eval.py `_case_messages`), so a prompt
-    # that raises or returns malformed messages for a held-out case is a suite the online command
-    # records a prompt-construction error for. checking only the scorer let this offline gate print
-    # `overall: PASS` for exactly that sidecar.
-    build = getattr(env, "prompt_messages", None)
-    if callable(build):
-        messages = _check_messages(build(example), "prompt")
-        # `prompt_messages()` is only half of the prompt: `flash env eval` then runs
-        # `normalize_prompt_images` (`_remote_prompt_messages`), as every training worker does
-        # before tokenization. the envelope check above sees only the message list, so a case
-        # carrying a top-level `image`/`images` -- a missing or oversized package-relative file --
-        # or a malformed image block inside its prompt passed this gate, and the online command then
-        # recorded prompt-construction failures for a suite reported `overall: PASS`. run the same
-        # normalization here, against the environment's own package root, so both commands reject
-        # the same suites.
-        _normalize_prompt_images(env, example, messages)
-    reference_turns = _reference_turns(_gold_completion(env, example))
-    policy = _resolve_policy(reference_turns)
-    response = (
-        "\n".join(turn for turn in reference_turns if turn)
-        if policy == "replay"
-        else _ECHO_RESPONSE
-    )
-    return policy, response
-
-
-def _check_evaluation_suites(entrypoint: Path, env) -> bool:
-    from flash.envs.evaluations import (
-        _DEFAULT_EVALUATIONS_PATH,
-        EvalSuiteReport,
-        has_evaluations,
-        load_evaluation_suites,
-        normalize_eval_result,
-        validate_evaluation_cases,
-    )
-
-    if not has_evaluations(entrypoint):
-        return True
-    source = entrypoint.parent / _DEFAULT_EVALUATIONS_PATH
-    try:
-        suites = load_evaluation_suites(entrypoint, environment=env)
-    except (Exception, SystemExit) as exc:
-        reason = str(exc) or exc.__class__.__name__
-        _err(f"evaluation checks failed: {reason}")
-        return False
-
-    all_valid = True
-    for suite in suites:
-        results = []
-        try:
-            cases = validate_evaluation_cases(suite, source=source)
-            if not cases:
-                all_valid = False
-                _err(
-                    f"evaluation suite {suite.name} failed contract checks: suite produced no cases"
-                )
-                continue
-            for index, case in enumerate(cases, start=1):
-                _policy, response = _evaluation_response(env, case)
-                scored = suite.score(case, response)
-                result = normalize_eval_result(
-                    case,
-                    response,
-                    scored,
-                    case_id=case.id or str(index),
-                )
-                results.append(result)
-            report = EvalSuiteReport(name=suite.name, results=tuple(results))
-            # a scorer that reported an error did not grade the case. `flash env eval` counts
-            # those as errors and fails the suite, so approving them here would let the offline
-            # gate greenlight exactly the sidecar the online command refuses.
-            errored = [result for result in results if result.error]
-            if errored:
-                all_valid = False
-                detail = ", ".join(f"{result.case_id}: {result.error}" for result in errored)
-                _err(
-                    f"evaluation suite {suite.name} failed contract checks: "
-                    f"{len(errored)}/{report.total} case(s) reported a scoring error ({detail})"
-                )
-                continue
-            print(
-                f"evaluation suite {suite.name}: {report.total}/{report.total} cases "
-                f"passed contract checks mean_score={report.mean_score:.6f}"
-            )
-        except (Exception, SystemExit) as exc:
-            all_valid = False
-            reason = str(exc) or exc.__class__.__name__
-            _err(f"evaluation suite {suite.name} failed contract checks: {reason}")
-    return all_valid
 
 
 def _reject_unsubmittable_param(key: str, value: object) -> None:
@@ -1023,21 +867,7 @@ def cmd_env_test(args) -> int:
 
     episode_count = min(_DEFAULT_EPISODES, len(dataset))
     passed = 0
-    # only replay episodes carry a gold answer to score. an echo episode has none, so its reward
-    # says nothing about the grader and is counted in neither total.
-    replayed = 0
-    replayed_zero: list[tuple[dict, dict | None]] = []
-    # every finite reward this run scored, whatever the policy or algorithm. the blocking gate below
-    # counts only the replay episodes it can hold responsible, and abstains for thinking markup, an
-    # incomplete replay, a non-grpo algorithm, or a junk probe that raised -- so a run where nothing
-    # scored anything reached `overall: PASS` with no line saying so. this list is what makes the
-    # uniformly-zero warning independent of every one of those abstentions.
-    scored_rewards: list[float] = []
-    # whether any episode replayed a gold answer at all, including the ones the blocking gate
-    # excludes (reasoning markup, an incomplete replay). an all-echo run scored only deliberate junk,
-    # for which zero is the CORRECT answer, so the warning below must not read that as a broken
-    # grader -- but it is still worth saying that nothing was measured.
-    replayed_any = False
+    tally = _Tally()
     for index, example in enumerate(dataset[:episode_count], start=1):
         record = _new_record()
         failure: str | None = None
@@ -1065,69 +895,10 @@ def cmd_env_test(args) -> int:
             continue
 
         passed += 1
-        if reward is not None:
-            # recorded for every passing episode, echo included: an echo run whose scores are all
-            # zero is equally unmeasured, and is exactly the shape a replay-only counter misses.
-            scored_rewards.append(reward)
+        tally.observe(example, record)
         if record["policy"] == "replay" and reward is not None:
-            replayed_any = True
-            # a reference written in reasoning markup cannot be replayed faithfully from here (see
-            # `_carries_thinking_markup`), so its score is not evidence about the grader and is kept
-            # out of the blocking gate's totals. neither is a multi-turn episode whose gold answer
-            # ran out before the rollout did: the graded trajectory is then part reference and part
-            # junk, and a zero says nothing about the reference the gate never ran. the advisory
-            # warning below still fires for both: a low reward is worth surfacing either way, it
-            # just cannot be the reason to fail.
-            if not record["thinking_markup"] and not record["replay_incomplete"]:
-                replayed += 1
-                # an exact zero is what a scorer that recognized nothing returns, so it stays the
-                # signature this gate looks for. it is confirmed against a wrong answer once every
-                # episode has run, not here: see `_scores_gold_no_better_than_junk`.
-                if reward == 0.0:
-                    replayed_zero.append((example, record["state"]))
-            if reward <= 0.0:
-                # two different faults produce this same zero, and naming only the grader sends
-                # readers to edit a scorer that is working. the gold completion is the other
-                # candidate: `sft_completion` defaults to the row's raw `output`
-                # (flash/envs/adapter.py), so a dataset whose `output` is a bare value replays that
-                # value verbatim -- which a grader requiring a wrapper (`\boxed{}`, a json object,
-                # a tag) is right to score zero.
-                message = (
-                    f"replay gold answer scored low (reward={reward:.6f}); "
-                    "check the reward function or the gold completion it scored"
-                )
-                print(
-                    render.warn(message) if render.styled() else f"warning: {message}",
-                    file=sys.stderr,
-                )
-                # printed with repr rather than through `_preview`: the whole point of showing this
-                # text is to expose a formatting defect, and `_preview` collapses whitespace and
-                # truncates, so a stray newline or a `\boxed{}` past the cutoff -- exactly the
-                # faults this line exists to reveal -- would be invisible.
-                # labelled by what it is -- the text the grader received -- not "gold answer": when
-                # a multi-turn env overrides the response via `final_response_text`, the scored text
-                # is env-authored and calling it the gold answer sends the reader to edit a dataset
-                # row that was never scored.
-                print(
-                    f"  scored text: {_scored_text(record)!r}",
-                    file=sys.stderr,
-                )
-            if record["hit_turn_cap"]:
-                # a gold trajectory that never terminates is the signature of an env no rollout can
-                # finish -- every move applied twice, a win condition that cannot be reached. the
-                # reward alone hides it: a partial-credit grader pays a respectable score for the
-                # capped attempt, and gold-vs-junk still clears its bar, so the run reads PASS.
-                # what exposes it is the turn count, which is why it is printed as a comparison.
-                message = (
-                    f"replay gold answer never finished: it used all {record['turns']} turn(s) "
-                    "and the environment never reported the episode done. a reference answer that "
-                    "cannot complete an episode means no rollout can either; check the episode "
-                    "termination condition and whether each turn is applied exactly once"
-                )
-                print(
-                    render.warn(message) if render.styled() else f"warning: {message}",
-                    file=sys.stderr,
-                )
+            _warn_on_low_replay_reward(record, reward)
+            _warn_on_unfinished_replay(record)
         # outside the replay branch above: an `echo` episode has no gold answer to blame, but its
         # scorer can still crash, and `replayed` is then zero so the grpo gate below is disabled
         # too. reporting nothing there let `flash env test` exit PASS while every score came from a
@@ -1144,71 +915,9 @@ def cmd_env_test(args) -> int:
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
         return _err("overall: FAIL")
-    # LS-005: block only when every gold answer scores zero and deliberate junk scores at least as
-    # well; centered rewards may legitimately score gold at zero. partial failures remain warnings.
-    # this gate applies only to grpo, which trains from env.reward. sft and opd use other losses.
     # default to grpo so omitting the algorithm cannot disable the blocking check.
     algorithm = getattr(args, "algorithm", None) or _REWARD_DRIVEN_ALGORITHM
-    # one junk probe for this run, shared by the blocking gate and the warning below. driving it
-    # twice would bill a paid judge twice per run and could return two different answers for the
-    # same question, since scoring is not guaranteed to be pure.
-    # only probe when a zero-scoring run is actually in question. the probe drives a whole extra
-    # episode through user code and may bill a paid judge, so a run with any nonzero reward -- or
-    # with no replayed gold answer at all -- must not pay for it.
-    zero_run_in_question = (
-        bool(replayed)
-        and len(replayed_zero) == replayed
-        and bool(scored_rewards)
-        and all(reward == 0.0 for reward in scored_rewards)
-    )
-    # the junk probe drives an extra episode through user code and may bill a paid judge, so it runs
-    # only where its answer can change an outcome: a grpo run whose gold answers all scored zero,
-    # which is exactly when the blocking gate needs it. the per-turn check is cheap by comparison but
-    # is gated the same way so the two stay in step.
-    probe_worth_running = zero_run_in_question and algorithm == _REWARD_DRIVEN_ALGORITHM
-    separates_on_turns = probe_worth_running and _separates_on_turn_rewards(env, *replayed_zero[0])
-    junk_reward = (
-        _junk_reward(env, replayed_zero[0][0])
-        if probe_worth_running and not separates_on_turns
-        else None
-    )
-    grader_recognizes_gold = not (
-        algorithm == _REWARD_DRIVEN_ALGORITHM
-        and zero_run_in_question
-        and not separates_on_turns
-        and _scores_gold_no_better_than_junk(junk_reward, 0.0)
-    )
-    if grader_recognizes_gold:
-        # the blocking gate abstains far more often than it fires: for sft and opd, for a reference
-        # in reasoning markup, for a replay that ran out mid-episode, for an echo run with no gold
-        # answer at all, and whenever the junk probe raises. in every one of those a run that scored
-        # exactly zero on every episode still printed `overall: PASS` and nothing else -- and a
-        # uniformly-zero reward is never a measurement, whatever produced it. GRPO centres rewards
-        # within each group, so a constant reward is a zero advantage and a zero gradient: training
-        # completes, the loss curve looks unremarkable, and the adapter comes out identical to its
-        # warm start. say so here rather than leave the verdict to speak for it.
-        #
-        # but only when the grader has NOT already been shown to separate. a centered scale that
-        # pays gold 0.0 and junk -1.0 has a perfectly good gradient, and the same is true of an env
-        # that trains from a per-turn vector while its scalar is a placeholder -- both are the
-        # shapes the blocking gate deliberately exempts, and warning about them would send the
-        # author of a working environment to debug a correct reward function. a false alarm on the
-        # healthy path is what teaches people to ignore this warning on the broken path.
-        # separation is positive EVIDENCE, not merely the gate's abstention: a per-turn vector whose
-        # values differ, or junk scoring strictly below the gold zero. a probe that failed leaves
-        # `junk_reward` None, which proves nothing and so does not excuse the run.
-        _warn_on_uniformly_zero_rewards(
-            scored_rewards,
-            algorithm=algorithm,
-            replayed_any=replayed_any,
-            separates=separates_on_turns or (junk_reward is not None and junk_reward < 0.0),
-        )
-    if not grader_recognizes_gold:
-        _err(
-            f"all {replayed} replayed gold answer(s) scored zero, no better than a deliberately "
-            "wrong answer; the reward function cannot recognize its own reference answers. check "
-            "the grader and that its runtime dependencies are installed in this environment."
-        )
+    grader_recognizes_gold = _check_grader(env, algorithm, tally)
     # run the evaluation checks even when the grader gate already failed, so one `flash env test`
     # reports every broken surface at once instead of hiding the sidecar's errors behind the
     # reward function's. both gates block; neither short-circuits the other.

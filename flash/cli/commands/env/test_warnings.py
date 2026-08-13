@@ -1,0 +1,292 @@
+"""Advisory warnings for `flash env test`.
+
+Each of these reports a run that passed every contract check while measuring nothing, or measuring
+something the verdict does not describe. They are warnings rather than blocking gates: the shapes
+they catch are strong evidence of a broken environment but not proof, and `flash env test` already
+fails hard on the cases that are certain.
+
+Kept beside `test.py` rather than inside it because the file is at its size limit and these three
+checks form one cohesive group: they share the "passed, but nothing was learned" theme and none of
+them is referenced by the driving loop except through the entry points re-exported here.
+"""
+
+from __future__ import annotations
+
+import sys
+
+from flash.cli.ui import render
+
+# the one algorithm that trains from the environment reward. sft optimizes a supervised loss and opd
+# a teacher token loss; neither reads `env.reward`, so a scorer they never call cannot be evidence
+# of anything for them.
+_REWARD_DRIVEN_ALGORITHM = "grpo"
+
+# the roles whose adjacency collapses into one rendered block. `tool` is deliberately absent: one
+# assistant message carrying two parallel tool calls is answered by one `tool` message per call,
+# which is the required wire format and what chat templates render as separate delimited blocks --
+# not a collapse. flagging it would train users to edit a correct transcript into a broken one, or
+# to ignore the warning entirely.
+#
+# `user` and `system` stay in. two user turns in a row is how an off-by-one trajectory capture shows
+# up (the completion re-states the question the prompt already asked), and it duplicates that text
+# in the trained string exactly as a doubled assistant turn does.
+_MERGEABLE_ROLES = frozenset({"assistant", "user", "system"})
+
+
+def _emit(message: str) -> None:
+    """Print one advisory warning to stderr, styled when the terminal supports it."""
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+
+
+def _scored_text(record: dict) -> str:
+    """The exact text the grader scored, as captured at the scoring call.
+
+    Read from the record rather than rebuilt from ``responses``: a multi-turn env whose
+    ``step_episode`` returns a ``final_response_text`` has the adapter replace the episode's
+    response with that override before scoring, so the replayed turns are not what was graded.
+    Falls back to the replayed turns only when nothing was captured (``None``) -- an episode that
+    failed before it was scored. An empty capture is a real graded value, not a missing one, and
+    an empty answer is exactly the fault a reader needs named.
+
+    Unlike ``_preview`` this preserves whitespace and does not truncate: it is printed with
+    ``repr`` beside a zero reward so a trailing newline, a tab, or a wrapper past the preview
+    cutoff stays visible. Those are the formatting faults that make a correct grader reject a
+    gold answer, so hiding them defeats the diagnostic.
+    """
+    scored = record.get("scored_text")
+    if scored is not None:
+        return str(scored)
+    return "\n".join(str(item) for item in record.get("responses") or ())
+
+
+def _warn_on_low_replay_reward(record: dict, reward: float) -> None:
+    """Warn when a replayed gold answer scored at or below zero, and show what was graded."""
+    if reward > 0.0:
+        return
+    # two different faults produce this same zero, and naming only the grader sends readers to edit
+    # a scorer that is working. the gold completion is the other candidate: `sft_completion`
+    # defaults to the row's raw `output` (flash/envs/adapter.py), so a dataset whose `output` is a
+    # bare value replays that value verbatim -- which a grader requiring a wrapper (`\boxed{}`, a
+    # json object, a tag) is right to score zero.
+    _emit(
+        f"replay gold answer scored low (reward={reward:.6f}); "
+        "check the reward function or the gold completion it scored"
+    )
+    # printed with repr rather than through `_preview`: the whole point of showing this text is to
+    # expose a formatting defect, and `_preview` collapses whitespace and truncates, so a stray
+    # newline or a `\boxed{}` past the cutoff -- exactly the faults this line exists to reveal --
+    # would be invisible. labelled by what it is -- the text the grader received -- not "gold
+    # answer": when a multi-turn env overrides the response via `final_response_text`, the scored
+    # text is env-authored and calling it the gold answer sends the reader to edit a dataset row
+    # that was never scored.
+    print(f"  scored text: {_scored_text(record)!r}", file=sys.stderr)
+
+
+def _warn_on_unfinished_replay(record: dict) -> None:
+    """Warn when the gold trajectory used every turn without the environment reporting done.
+
+    A gold trajectory that never terminates is the signature of an env no rollout can finish --
+    every move applied twice, a win condition that cannot be reached. The reward alone hides it: a
+    partial-credit grader pays a respectable score for the capped attempt, and gold-vs-junk still
+    clears its bar, so the run reads PASS. What exposes it is the turn count, which is why it is
+    printed as a comparison.
+    """
+    if not record["hit_turn_cap"]:
+        return
+    _emit(
+        f"replay gold answer never finished: it used all {record['turns']} turn(s) and the "
+        "environment never reported the episode done. a reference answer that cannot complete an "
+        "episode means no rollout can either; check the episode termination condition and whether "
+        "each turn is applied exactly once"
+    )
+
+
+def _repeated_roles(messages: list[dict]) -> list[tuple[int, str]]:
+    """The (index, role) of every message whose role repeats the one before it.
+
+    SFT does not replay a gold completion turn by turn. It renders ONE training string from
+    ``[*prompt_messages, *completion_messages]`` (flash/engine/profiling/sft_workload.py), so the
+    only thing the model learns from is that concatenation -- and nothing in flash validates its
+    role sequence. A multi-turn gold answer returned as assistant turns alone renders as one user
+    question followed by every answer back to back, which trains the model to dump the whole
+    episode into a single reply: the opposite of the behaviour being taught.
+
+    This gate replays those turns individually and scores each one, so it passes either way; the
+    defect exists only at the concatenation, which nothing here exercised.
+    """
+    repeated: list[tuple[int, str]] = []
+    previous = ""
+    for index, message in enumerate(messages):
+        role = str(message.get("role", "")).strip().lower()
+        if role in _MERGEABLE_ROLES and role == previous:
+            repeated.append((index, role))
+        previous = role
+    return repeated
+
+
+def _rendered_roles(prompt: list[dict], completion: list[dict]) -> str:
+    """The rendered role sequence, marking where the completion begins.
+
+    Printed beside the warning because the role ORDER is the defect: a reader needs to see which
+    turns merged and on which side of the seam, and no preview of the message text shows that.
+    """
+    roles = [str(message.get("role", "?")).strip().lower() or "?" for message in prompt]
+    roles.append("|")
+    roles.extend(str(message.get("role", "?")).strip().lower() or "?" for message in completion)
+    return " ".join(roles)
+
+
+def _warn_on_repeated_rendered_roles(
+    prompt: list[dict], completion: list[dict], *, multi_turn: bool
+) -> None:
+    """Warn when the SFT training string would run two assistant turns together.
+
+    Skipped entirely for a multi-turn environment. There, a gold completion holding consecutive
+    assistant turns is the CONTRACT, not a defect: the intervening user turns are produced by
+    `env_reply` during the rollout and are deliberately absent from the dataset -- `_drive_multi_turn`
+    depends on exactly that shape, replaying one reference turn per model turn. Warning about it
+    would fire on every correct multi-turn environment and advise an edit that breaks the replay.
+
+    For a single-turn environment the concatenation IS the trained text, so the same adjacency is a
+    real defect: SFT renders one string from `[*prompt_messages, *completion_messages]`
+    (flash/engine/profiling/sft_workload.py) and nothing else validates it. A completion returned as
+    assistant turns alone then renders as one user question followed by every answer back to back,
+    training the model to dump the whole episode into a single reply.
+
+    Reported for every algorithm, not just sft: one published environment serves all three, so a
+    single-turn env shaped this way is broken for sft whichever algorithm this invocation named.
+
+    Only the RENDERED sequence is checked, never either list alone -- a prompt may legitimately end
+    on an assistant prefill, and the fault is adjacency after concatenation.
+    """
+    if multi_turn or not prompt or not completion:
+        return
+    repeated = _repeated_roles([*prompt, *completion])
+    if not repeated:
+        return
+    _emit(_repeated_roles_message(repeated, len(prompt)))
+    print(f"  rendered roles: {_rendered_roles(prompt, completion)}", file=sys.stderr)
+
+
+def _repeated_roles_message(repeated: list[tuple[int, str]], boundary: int) -> str:
+    """Name each collapsing turn in the region that owns it, with that region's own index.
+
+    Three regions, three different edits, so all three are named rather than folded into one: a
+    repeat inside the prompt is a `prompt_messages`/`start_episode` fault, one at the seam means the
+    prompt ends on a prefill the completion continues, and one inside the completion means the gold
+    answer needs the env's follow-up user turns interleaved. Reporting a prompt-internal or seam
+    collision as "inside sft_completion" sends the author to a file that is correct.
+
+    Indices are rebased onto the region they belong to. A raw offset into the concatenation is not a
+    position the author can look up: with a system prompt prepended, turn 0 of a three-message
+    completion is reported as message 3, which does not exist in the file they open.
+    """
+    inside_prompt = [(index, role) for index, role in repeated if index < boundary]
+    at_seam = [(index, role) for index, role in repeated if index == boundary]
+    inside_completion = [(index, role) for index, role in repeated if index > boundary]
+    parts: list[str] = []
+    if inside_prompt:
+        where = ", ".join(f"message {index} ({role})" for index, role in inside_prompt)
+        parts.append(f"inside prompt_messages ({where})")
+    if at_seam:
+        role = at_seam[0][1]
+        parts.append(
+            f"at the prompt/completion boundary (its first turn is another {role} turn, "
+            "continuing the prompt's last)"
+        )
+    if inside_completion:
+        # rebased onto sft_completion's own indexing, which is what the author can actually look up.
+        where = ", ".join(
+            f"message {index - boundary} ({role})" for index, role in inside_completion
+        )
+        parts.append(f"inside sft_completion ({where})")
+    # the remedy depends on which role doubled, not just where. two assistant turns need the env's
+    # user turns interleaved; a doubled user turn is the opposite fault -- the completion restating
+    # a question the prompt already asked, which is an off-by-one in how the trajectory was captured.
+    doubled = {role for _index, role in repeated}
+    if doubled == {"assistant"}:
+        remedy = (
+            "a gold answer that spans several assistant turns must interleave the user turns it "
+            "was answering"
+        )
+    elif "assistant" not in doubled:
+        remedy = (
+            "a repeated non-assistant turn usually means the trajectory was captured one turn "
+            "early, so the completion restates a turn the prompt already contains"
+        )
+    else:
+        remedy = "each region must alternate roles once concatenated"
+    return (
+        f"sft would train on consecutive same-role turns {' and '.join(parts)}. sft renders one "
+        f"string from prompt_messages + sft_completion, so these turns merge into a single reply -- "
+        f"{remedy}"
+    )
+
+
+def _warn_on_uniformly_zero_rewards(
+    rewards: list[float], *, algorithm: str, replayed_any: bool, separates: bool = False
+) -> None:
+    """Warn when every episode this run scored came back exactly zero.
+
+    Deliberately independent of the blocking gate above, which abstains for a non-grpo algorithm,
+    a reference in reasoning markup, a replay that ran out mid-episode, and a junk probe that
+    raised. Each abstention is individually right -- none of them is proof the grader works -- but
+    together they let a run in which nothing scored anything print `overall: PASS` and no other
+    line.
+
+    The two ways a run reaches all-zero are NOT the same finding, so they are not reported with the
+    same words:
+
+    * At least one gold answer was replayed. A working grader is supposed to pay its own reference
+      more than nothing, so this points at the grader or at the shape of the gold answer it was
+      handed.
+    * Every episode was `echo`. Echo replays deliberate junk, and a correct grader SHOULD score
+      junk zero -- so the zero is not itself suspicious. What is worth saying is that no gold
+      answer was ever scored, which means this run carries no evidence either way, and that an
+      empty `sft_completion` is also nothing for SFT to train on.
+
+    For GRPO a constant reward is additionally silent rather than merely uninformative: rewards are
+    mean-centred within each group (`algorithm.norm_adv_by_std_in_grpo=False`,
+    flash/engine/worker/train/rl/verl_config.py), so a constant reward gives zero advantage and zero
+    gradient. Training completes, the loss curve looks unremarkable, and the adapter comes out
+    identical to its warm start. The end-of-run advantage-spread guard catches that only after the
+    GPUs have been paid for (flash/engine/worker/train/rl/checkpoints.py); this catches it before
+    they are allocated.
+
+    Skipped when `separates` says the grader was PROVEN to distinguish answers -- a centered scale
+    paying gold 0.0 and junk -1.0, or a per-turn vector that separates while the scalar is only a
+    placeholder. Both have a real gradient, so calling them unmeasured would be false, and a false
+    alarm on the healthy path is what teaches people to ignore this warning on the broken one.
+
+    Only exact zeros trip it. A nonzero constant is a weaker, separate signal -- a reward may
+    legitimately be constant across three rows -- and is not diagnosed here.
+    """
+    if separates or not rewards or any(reward != 0.0 for reward in rewards):
+        return
+    count = len(rewards)
+    if not replayed_any:
+        # deliberately says "no replayable gold answer" rather than "no gold answer": echo is also
+        # chosen for a gold completion that exists but carries no replayable TEXT (an image-only
+        # content block, a native tool-call turn with null content). telling that author to supply
+        # an answer they already supplied sends them in a circle.
+        message = (
+            f"all {count} scored episode(s) returned reward 0.000000, and every one of them "
+            "replayed a deliberately wrong answer because no row supplied a replayable gold one. "
+            "a zero is the correct score for that, so this run is not evidence the reward function "
+            "works. give the rows a gold answer whose assistant turns carry text "
+            "(`sft_completion`, or the row's `output`) and re-run"
+        )
+    else:
+        detail = (
+            "every rollout would then carry the same reward, which GRPO centres to a zero "
+            "advantage and a zero gradient: the run would complete, report an unremarkable loss "
+            "curve, and produce an adapter identical to its warm start"
+            if algorithm == _REWARD_DRIVEN_ALGORITHM
+            else "a reward that is constant across every row measures nothing about the environment"
+        )
+        message = (
+            f"all {count} scored episode(s) returned reward 0.000000, so this run measured "
+            f"nothing. {detail}. check the reward function, its runtime dependencies, and that "
+            "the gold answer it scored is in the shape it expects"
+        )
+    _emit(message)

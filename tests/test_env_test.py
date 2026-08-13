@@ -10,6 +10,7 @@ import pytest
 
 import flash.cli as cli
 from flash.cli.commands.env.test import cmd_env_test
+from flash.envs.adapter import FreesoloEnvironment
 from flash.envs.base import RolloutReward
 
 
@@ -791,8 +792,10 @@ def test_env_test_reports_the_text_the_scorer_actually_received(monkeypatch, tmp
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    # the scorer really did receive the override, so that is the only honest thing to print.
-    assert graded == ["ENV_OVERRODE"]
+    # the scorer really did receive the override, so that is the only honest thing to print. every
+    # call sees it, the real episode and the junk probe alike -- the env replaces the graded text
+    # whatever was replayed, which is the whole point of the override.
+    assert set(graded) == {"ENV_OVERRODE"}
     assert "scored text: 'ENV_OVERRODE'" in captured.err
     assert "scored text: 'RAW_TURN'" not in captured.err
 
@@ -847,8 +850,9 @@ def test_env_test_reports_an_empty_override_as_the_scored_text(monkeypatch, tmp_
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    # the grader really did receive the empty override, so that is what must be reported.
-    assert graded == [""]
+    # the grader really did receive the empty override, so that is what must be reported. asserted
+    # as a set: the junk probe scores this env too, and it also sees the override.
+    assert set(graded) == {""}
     assert "scored text: ''" in captured.err
     # the replayed turn was never scored; naming it would send the reader to the wrong place.
     assert "scored text: 'RAW_TURN'" not in captured.err
@@ -2382,6 +2386,67 @@ def test_env_test_warns_on_a_dead_environment_whose_gold_answer_is_short(
     captured = capsys.readouterr()
     assert "episode 1: policy=replay turns=12" in captured.out
     assert "replay gold answer never finished: it used all 12 turn(s)" in captured.err
+
+
+class _RealRolloutDoneDeadEnv(_DeadEnvWithShortGoldEnv):
+    """The dead environment, judged by the REAL `rollout_done` instead of a fake override.
+
+    Every other multi-turn fixture here overrides `rollout_done` to a bare `False`, which no
+    published environment does: the adapter's own implementation returns True from `turn >= cap`
+    ALONE (flash/envs/adapter.py), independently of whether the episode was ever won. Consulting it
+    to decide the turn-cap warning therefore made the warning unsatisfiable against real
+    environments while these fakes kept the tests green -- the warning was dead code that passed.
+
+    Binding the adapter's own function rather than restating its logic is deliberate: a copy would
+    drift the moment `rollout_done` changed, which is the same way the gap opened.
+    """
+
+    rollout_done = FreesoloEnvironment.rollout_done
+
+
+def test_env_test_warns_on_a_dead_environment_under_real_rollout_done_semantics(
+    monkeypatch, tmp_path, capsys
+):
+    """The turn-cap warning must survive an env whose `rollout_done` is True at the ceiling.
+
+    This is the production shape: at `turn >= cap` the real adapter reports done for a healthy
+    environment and for one no rollout can ever finish, so the two are indistinguishable by that
+    signal. `state["done"]` is what separates them, and only a fixture using the real method proves
+    the warning reads it.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _RealRolloutDoneDeadEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=replay turns=12" in captured.out
+    assert "replay gold answer never finished: it used all 12 turn(s)" in captured.err
+
+
+class _RealRolloutDoneHealthyEnv(_MultiTurnEnv):
+    """A healthy env carrying the real `rollout_done`, to prove the warning is not unconditional.
+
+    Same method as the dead fixture above and a two-turn gold answer that finishes the episode on
+    its own, so any warning here would be firing on a correct environment.
+    """
+
+    max_turns = 4
+    rollout_done = FreesoloEnvironment.rollout_done
+
+
+def test_env_test_stays_quiet_for_a_healthy_env_under_real_rollout_done_semantics(
+    monkeypatch, tmp_path, capsys
+):
+    """A working environment must stay silent even though its `rollout_done` is the real one."""
+    env_dir = _environment_dir(tmp_path)
+    env = _RealRolloutDoneHealthyEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "never finished" not in captured.err
 
 
 def test_env_test_warns_when_the_completion_repeats_the_prompts_last_user_turn(
