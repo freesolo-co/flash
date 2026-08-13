@@ -450,6 +450,7 @@ def _redact_secret_fields(
     schema_property_map: bool = False,
     schema_context: bool = False,
     secret_schema_definition: bool = False,
+    secret_schema_property: bool = False,
     response_root: bool = False,
     choice_list: bool = False,
     choice: bool = False,
@@ -475,12 +476,13 @@ def _redact_secret_fields(
             secret_schema_definition = referenced_schema_definition
         else:
             secret_schema_definition = secret_schema_definition or referenced_schema_definition
+        redact_schema_literals = secret_schema_definition or secret_schema_property
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
             schema_definition = schema_property_map and _is_schema_definition(item)
             current_schema_path = (*schema_definition_path, str(key))
             referenced_secret_definition = current_schema_path in active_secret_schema_refs
-            if secret_schema_definition and key in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
+            if redact_schema_literals and key in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                 redacted[key] = _redact_schema_literal(item, depth=depth + 1, flag=flag)
             elif _is_secret_key(key, allow_token=logprob_entries) and not schema_definition:
                 redacted[key] = "[redacted]"
@@ -503,8 +505,9 @@ def _redact_secret_fields(
                     ),
                     schema_context=child_schema_context,
                     secret_schema_definition=secret_schema_definition
-                    or (schema_definition and _is_secret_key(key))
                     or referenced_secret_definition,
+                    secret_schema_property=secret_schema_property
+                    or (schema_definition and _is_secret_key(key)),
                     response_root=False,
                     choice_list=response_root and key == "choices" and isinstance(item, list),
                     choice=choice_list,
@@ -527,6 +530,7 @@ def _redact_secret_fields(
                     secret_schema_definition
                     or (*schema_definition_path, str(index)) in (secret_schema_refs or set())
                 ),
+                secret_schema_property=secret_schema_property,
                 choice=choice_list,
                 logprobs=logprobs,
                 logprob_entries=logprob_entries,

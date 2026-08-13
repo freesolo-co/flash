@@ -3835,6 +3835,71 @@ def test_annotation_only_secret_named_schema_stays_schema_shaped(keyword: str) -
     assert stored["metadata"]["password"] == "[redacted]"
 
 
+def test_secret_named_schema_literals_cross_embedded_resource_boundaries() -> None:
+    literals = {
+        "default": "SECRET-DEFAULT",
+        "const": "SECRET-CONST",
+        "enum": ["SECRET-ENUM"],
+        "examples": ["SECRET-EX"],
+    }
+    identified = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "password": {
+                "$id": "https://example.com/pw",
+                "type": "string",
+                **literals,
+            }
+        },
+    }
+    nested = {
+        "$schema": "x",
+        "type": "object",
+        "properties": {
+            "password": {
+                "$id": "https://example.com/pw",
+                "type": "object",
+                "properties": {
+                    "inner": {
+                        "$id": "https://example.com/pw/i",
+                        "default": "SECRET-INNER",
+                    }
+                },
+            }
+        },
+    }
+    control = {
+        "$schema": identified["$schema"],
+        "type": "object",
+        "properties": {"password": {"type": "string", **literals}},
+    }
+    redacted_literals = {
+        "default": "[redacted]",
+        "const": "[redacted]",
+        "enum": ["[redacted]"],
+        "examples": ["[redacted]"],
+    }
+
+    stored_identified = traces._redact_secret_fields(identified)
+    stored_nested = traces._redact_secret_fields(nested)
+    stored_control = traces._redact_secret_fields(control)
+
+    assert stored_identified["properties"]["password"] == {
+        "$id": "https://example.com/pw",
+        "type": "string",
+        **redacted_literals,
+    }
+    assert stored_nested["properties"]["password"]["properties"]["inner"] == {
+        "$id": "https://example.com/pw/i",
+        "default": "[redacted]",
+    }
+    assert stored_control["properties"]["password"] == {
+        "type": "string",
+        **redacted_literals,
+    }
+
+
 def test_secret_named_schema_literals_are_redacted_without_losing_structure(
     trace_api, monkeypatch
 ) -> None:
