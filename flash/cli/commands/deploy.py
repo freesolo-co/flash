@@ -233,10 +233,13 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
     raw_step = current.get("checkpoint_step")
     try:
         served_step = None if raw_step is None else int(raw_step)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         # a proxy or older plane can answer 2xx with a step this client cannot read. that is an
         # unreadable current record like any other, NOT a reason to fail the deploy: leaving the
         # conversion unguarded let an advisory read traceback out of the command it decorates.
+        # all three arms are reachable from one JSON body: `json.loads` accepts the non-standard
+        # `Infinity`/`NaN` literals, and int() answers those with OverflowError and ValueError
+        # respectively -- so catching only the obvious two still crashed the deploy.
         return None
     if served_step == requested_step:
         return None

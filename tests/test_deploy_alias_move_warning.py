@@ -8,6 +8,7 @@ serving regression instead of the deploy that caused it.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -173,7 +174,22 @@ def test_the_advisory_read_is_bounded_well_under_the_client_default() -> None:
     assert deploy_module._ALIAS_WARNING_READ_SECONDS < 60.0
 
 
-@pytest.mark.parametrize("bad_step", ["abc", "", [], {}, object(), float("nan")])
+@pytest.mark.parametrize(
+    "bad_step",
+    [
+        "abc",
+        "",
+        [],
+        {},
+        object(),
+        # `json.loads` accepts the non-standard `NaN`/`Infinity` literals, so a single 2xx body
+        # reaches int() with each of these. they raise ValueError and OverflowError respectively,
+        # and a guard that catches only the obvious exceptions still crashes the deploy.
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ],
+)
 def test_an_unreadable_checkpoint_step_cannot_fail_the_deploy(bad_step) -> None:
     """A 2xx carrying a step this client cannot parse is an unreadable record, not a crash.
 
@@ -183,6 +199,21 @@ def test_an_unreadable_checkpoint_step_cannot_fail_the_deploy(bad_step) -> None:
     current = {"run_id": "flash-1", "state": "ready", "checkpoint_step": bad_step}
 
     assert _alias_move_warning(_Client(current), "flash-1", 50) is None
+
+
+def test_a_non_finite_step_is_reachable_from_a_real_response_body() -> None:
+    """Anchor the case above in the decoder the client actually uses, not an invented value.
+
+    `float("inf")` in a parametrize list only proves the guard catches a value a test made up.
+    The client decodes with `json.loads`, which accepts the non-standard `Infinity` and `NaN`
+    literals, so a control plane emitting either really does hand this code a non-finite step.
+    """
+    decoded = json.loads(b'{"state": "ready", "checkpoint_step": Infinity}')
+
+    assert decoded["checkpoint_step"] == float("inf")
+    with pytest.raises(OverflowError):
+        int(decoded["checkpoint_step"])
+    assert _alias_move_warning(_Client({**decoded, "run_id": "flash-1"}), "flash-1", 50) is None
 
 
 def test_a_numeric_string_step_is_still_compared_as_a_number() -> None:
