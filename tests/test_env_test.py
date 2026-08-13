@@ -425,7 +425,7 @@ def test_env_test_auto_falls_back_to_echo_for_empty_reference(monkeypatch, tmp_p
     # the CORRECT score for the deliberate junk echo replays. what is reported is the weaker, true
     # statement -- no gold answer was ever scored, so the run is evidence of nothing.
     assert "check the reward function, its runtime dependencies" not in captured.err
-    assert "no row supplied a gold one" in captured.err
+    assert "no row supplied a replayable gold one" in captured.err
     # exactly ONE warning, keeping the half of this test's original invariant that still holds: the
     # clean echo path emits nothing else. asserting only the expected wording would let a future
     # spurious warning (a role check or cap check misfiring on this shape) reach users unnoticed.
@@ -1835,14 +1835,14 @@ def test_env_test_warns_when_sft_would_train_on_consecutive_assistant_turns(
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    assert "consecutive assistant turns" in captured.err
+    assert "consecutive same-role turns" in captured.err
     # the collision is inside the completion here, so the message must send the reader to
     # interleave its turns rather than to the prompt...
     assert "inside sft_completion" in captured.err
     # ...and it must use SFT_COMPLETION's own indices. a raw offset into the concatenation is not a
     # position the author can look up: with a prompt prepended, turn 1 would be reported as some
     # higher number that may not even exist in the file they open.
-    assert "inside sft_completion (message 1, message 2)" in captured.err
+    assert "inside sft_completion (message 1 (assistant), message 2 (assistant))" in captured.err
     # the rendered role sequence is the evidence: it shows WHICH turns merged and on which side
     # of the prompt/completion boundary, which no preview of the message text conveys.
     assert "rendered roles: user | assistant assistant assistant" in captured.err
@@ -1862,7 +1862,7 @@ def test_env_test_does_not_warn_on_a_multi_turn_gold_answer(monkeypatch, tmp_pat
 
     assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
     captured = capsys.readouterr()
-    assert "consecutive assistant turns" not in captured.err
+    assert "consecutive same-role turns" not in captured.err
     assert "overall: PASS" in captured.out
 
 
@@ -1890,7 +1890,7 @@ def test_env_test_does_not_warn_on_parallel_tool_result_turns(monkeypatch, tmp_p
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    assert "consecutive assistant turns" not in captured.err
+    assert "consecutive same-role turns" not in captured.err
     assert "overall: PASS" in captured.out
 
 
@@ -1917,7 +1917,7 @@ def test_env_test_blames_the_prompt_for_a_repeat_inside_the_prompt(monkeypatch, 
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    assert "inside prompt_messages (message 1)" in captured.err
+    assert "inside prompt_messages (message 1 (assistant))" in captured.err
     assert "inside sft_completion" not in captured.err
 
 
@@ -1953,7 +1953,7 @@ def test_env_test_names_both_regions_when_a_completion_collides_and_collapses(
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
     assert "at the prompt/completion boundary" in captured.err
-    assert "inside sft_completion (message 1)" in captured.err
+    assert "inside sft_completion (message 1 (assistant))" in captured.err
 
 
 def test_env_test_warns_on_a_same_role_seam_at_the_prompt_boundary(monkeypatch, tmp_path, capsys):
@@ -1978,7 +1978,7 @@ def test_env_test_warns_on_a_same_role_seam_at_the_prompt_boundary(monkeypatch, 
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    assert "consecutive assistant turns at the prompt/completion boundary" in captured.err
+    assert "consecutive same-role turns at the prompt/completion boundary" in captured.err
     assert "rendered roles: user assistant | assistant" in captured.err
 
 
@@ -2132,7 +2132,12 @@ def test_env_test_does_not_warn_when_the_episode_finishes_on_its_last_allowed_tu
 
 
 class _ShortGoldMultiTurnEnv(_MultiTurnEnv):
-    """A working env whose dataset row supplies a gold answer shorter than the episode."""
+    """A WORKING env whose dataset row supplies a gold answer shorter than the episode.
+
+    The environment really does terminate -- on its third turn, well inside the four-turn cap -- so
+    the only thing unusual here is the short reference. That is what makes it the control: reaching
+    the end of a healthy episode must not be reported as a termination fault.
+    """
 
     max_turns = 4
 
@@ -2146,6 +2151,9 @@ class _ShortGoldMultiTurnEnv(_MultiTurnEnv):
 
     def env_reply(self, messages, state):
         state["turn"] += 1
+        # terminates on its own, unlike the dead env above: the short gold answer is the ONLY
+        # difference, so a warning here would be blaming the reference for the padding.
+        state["done"] = state["turn"] >= 3
         reply = {"role": "user", "content": "keep going"}
         messages.append(reply)
         return [reply]
@@ -2174,7 +2182,9 @@ def test_env_test_does_not_blame_termination_for_a_gold_answer_that_ran_out(
 
     assert cmd_env_test(_args(env_dir)) == 0
     captured = capsys.readouterr()
-    assert "episode 1: policy=replay turns=4" in captured.out
+    # the episode ran past the one gold turn on junk padding and still ended on the env's own
+    # signal, inside the cap -- so there is nothing to report.
+    assert "episode 1: policy=replay turns=3" in captured.out
     assert "never finished" not in captured.err
 
 
@@ -2240,3 +2250,185 @@ def test_env_test_does_not_warn_when_one_episode_scores_nonzero(monkeypatch, tmp
     captured = capsys.readouterr()
     assert "measured nothing" not in captured.err
     assert "overall: PASS" in captured.out
+
+
+def test_env_test_does_not_call_a_run_measured_nothing_when_junk_scores_worse(
+    monkeypatch, tmp_path, capsys
+):
+    """A centered scale paying gold 0.0 and junk -1.0 separates by a full point.
+
+    The blocking gate already exempts this shape (`centered rewards may legitimately score gold at
+    zero`), and the advisory warning has to honour the same evidence: GRPO gets a real gradient
+    here, so "this run measured nothing" would simply be false. False alarms on the healthy path are
+    what teach people to ignore the warning on the broken path it was written for.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(
+        rows=[{"input": "2 + 2?", "output": "4"}, {"input": "2 + 3?", "output": "5"}]
+    )
+    monkeypatch.setattr(
+        env,
+        "reward",
+        lambda completion, example, state=None: 0.0 if completion == example["output"] else -1.0,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "cannot recognize its own reference answers" not in captured.err
+    assert "measured nothing" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_does_not_call_a_run_measured_nothing_when_turn_rewards_separate(
+    monkeypatch, tmp_path, capsys
+):
+    """`credit_assignment="per_turn"` trains from the turn vector; the scalar is a placeholder.
+
+    The blocking gate consults `_separates_on_turn_rewards` for exactly this reason, and the
+    advisory warning must too -- a turn vector of (1.0, 0.0) is the signal this training mode
+    optimizes, so the run measured plenty.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "2 + 2?", "output": "4"}], reward=0.0)
+    monkeypatch.setattr(
+        env,
+        "rollout_rewards_many",
+        lambda pairs: [RolloutReward(episode=0.0, turns=(1.0, 0.0))],
+        raising=False,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    assert "measured nothing" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_says_replayable_when_the_gold_answer_carries_no_text(
+    monkeypatch, tmp_path, capsys
+):
+    """An image-only gold completion IS a gold answer; it just cannot be replayed as text.
+
+    Echo is chosen whenever the gold answer yields no replay text, not only when the row supplied
+    nothing. Telling this author to "give the rows a gold answer" sends them to add one they
+    already have, and they re-run to the identical message.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "describe it", "output": "x"}], reward=0.0)
+    monkeypatch.setattr(
+        env,
+        "sft_completion",
+        lambda example: [
+            {"role": "assistant", "content": [{"type": "image", "image": "board.png"}]}
+        ],
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "no row supplied a replayable gold one" in captured.err
+    # the remedy must name the actual fault: the turns carry no text to replay.
+    assert "whose assistant turns carry text" in captured.err
+
+
+class _DeadEnvWithShortGoldEnv(_MultiTurnEnv):
+    """The field case exactly: a five-move gold answer against a twelve-turn cap, unsolvable.
+
+    Real datasets carry minimal solutions, not cap-length ones, so this -- not a gold answer padded
+    out to the ceiling -- is the shape the warning has to catch.
+    """
+
+    max_turns = 12
+
+    def dataset(self):
+        return [
+            {
+                "input": "solve the board",
+                "output": [{"role": "assistant", "content": f"move {n}"} for n in range(1, 6)],
+            }
+        ]
+
+    def env_reply(self, messages, state):
+        state["turn"] += 1
+        reply = {"role": "user", "content": "keep going"}
+        messages.append(reply)
+        return [reply]
+
+    def rollout_done(self, state, max_turns=None):
+        # every move applied twice: no sequence of moves ever satisfies the win condition.
+        return False
+
+    def reward(self, completion, example, state=None):
+        self.scored_state = state
+        return 0.62
+
+
+def test_env_test_warns_on_a_dead_environment_whose_gold_answer_is_short(
+    monkeypatch, tmp_path, capsys
+):
+    """A five-move solution burning a twelve-turn cap is the signature that surfaced the bug.
+
+    Excluding every short gold answer to avoid blaming the junk padding would silence exactly this
+    case, since a minimal solution is shorter than the cap by definition. What distinguishes them is
+    whether the environment had finished at the moment the gold answer ran out -- here it had not,
+    and it never would have.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _DeadEnvWithShortGoldEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=replay turns=12" in captured.out
+    assert "replay gold answer never finished: it used all 12 turn(s)" in captured.err
+
+
+def test_env_test_warns_when_the_completion_repeats_the_prompts_last_user_turn(
+    monkeypatch, tmp_path, capsys
+):
+    """An off-by-one trajectory capture duplicates the question in the trained string.
+
+    Restricting the check to the assistant role would miss it: the doubled turn here is `user`, and
+    it merges in the rendered text exactly as a doubled assistant turn does. Only `tool` is exempt,
+    because parallel tool calls legitimately render as back-to-back tool results.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "2 + 2?", "output": "4"}])
+    monkeypatch.setattr(
+        env,
+        "sft_completion",
+        lambda example: [
+            {"role": "user", "content": example["input"]},
+            {"role": "assistant", "content": example["output"]},
+        ],
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "at the prompt/completion boundary (its first turn is another user turn" in captured.err
+    # the remedy names the real fault rather than telling them to interleave user turns.
+    assert "captured one turn early" in captured.err
+
+
+def test_env_test_scores_the_junk_probe_once_per_run(monkeypatch, tmp_path, capsys):
+    """The probe drives a whole extra episode through user code and may bill a paid judge.
+
+    Both the blocking gate and the advisory warning need its answer, so they share one result: two
+    passes would double the cost and, since scoring is not guaranteed to be pure, could return two
+    different answers to the same question.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "2 + 2?", "output": "4"}], reward=0.0)
+    scored: list[str] = []
+    monkeypatch.setattr(
+        env,
+        "reward",
+        lambda completion, example, state=None: scored.append(completion) or 0.0,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) != 0
+    # one real episode plus exactly one junk probe.
+    assert scored == ["4", "test"]

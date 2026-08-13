@@ -42,32 +42,43 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     looks unremarkable, W&B looks healthy, and the adapter comes out identical to its warm start.
     The end-of-run advantage-spread guard catches that only after the GPUs are paid for. An
     all-`echo` run is reported differently and more weakly, because zero is the _correct_ score for
-    the deliberate junk echo replays - what is wrong there is that no gold answer was ever scored.
+    the deliberate junk echo replays - what is wrong there is that no _replayable_ gold answer was
+    ever scored, which includes a real gold completion whose turns carry no text (image-only
+    content, a native tool-call turn). It stays silent when the grader was proven to separate - a
+    centered scale paying gold 0.0 and junk -1.0, or a per-turn vector that separates while the
+    scalar is only a placeholder - since both have a real gradient and calling them unmeasured
+    would be false. The junk probe behind that judgement runs at most once per run, shared with the
+    blocking gate rather than driven twice, so a paid judge is not billed twice.
   - **A gold replay that never terminates.** An environment applying every move twice can solve no
     board, yet gold scored 0.60-0.65, beat a junk answer, and burned the full turn cap - clearing
     every existing check. What exposed it in the field was reading `turns=12` on a board with a
     five-move solution, a comparison the verdict never made. An episode stopped by the hard turn cap
     rather than the environment's own done signal now says so. The verdict is drawn after the
     deferred final `env_reply`, so an environment that solves its task on the last allowed turn is
-    not misreported; an episode whose gold answer ran out early is excluded too, since the junk the
-    driver pads with cannot advance the environment and reaching the cap is then the padding's
-    doing rather than the reference's.
+    not misreported. A gold answer shorter than the episode is judged at the moment it ran out
+    rather than at the end: the junk the driver pads with cannot advance the environment, so the
+    final state says nothing about the reference either way. That keeps both halves honest - a
+    five-move solution against a twelve-turn cap on an unsolvable board (the field case, since real
+    datasets carry minimal solutions) is still reported, while a short gold answer on a working
+    environment is not blamed for the padding that followed it.
   - **A gold completion whose rendered role sequence collapses.** SFT does not replay a completion
     turn by turn; it renders one training string from `prompt_messages + sft_completion`, and
     nothing validated that concatenation. On a single-turn environment a gold answer returned as
     assistant turns alone rendered as one user question followed by every answer back to back,
     training the model to dump the whole episode into a single reply - the opposite of the
     behaviour being taught. Because this gate scored each turn separately, it passed either way.
-    The rendered role sequence is now checked for consecutive assistant turns and printed.
+    The rendered role sequence is now checked for consecutive same-role turns and printed.
 
     The check is scoped to where the defect is real. It is skipped entirely for multi-turn
     environments, where consecutive assistant turns are the contract rather than a fault - the
     intervening user turns come from `env_reply` at rollout time and are deliberately absent from
-    the dataset. Only the `assistant` role is checked, so the back-to-back `tool` messages that
-    parallel tool calls require are not flagged. Each collapsing turn is attributed to the region
-    that owns it - `prompt_messages`, the seam, or `sft_completion` - with that region's own
-    indices, and all applicable regions are named rather than only the first, since they are
-    different edits.
+    the dataset. `tool` is exempt, since parallel tool calls are answered by one `tool` message per
+    call and chat templates render each as its own block; `user` and `system` are not, because a
+    doubled user turn is how an off-by-one trajectory capture shows up and it duplicates that text
+    in the trained string just as a doubled assistant turn does. Each collapsing turn is attributed
+    to the region that owns it - `prompt_messages`, the seam, or `sft_completion` - with that
+    region's own indices and the role that doubled, and all applicable regions are named rather
+    than only the first, since they are different edits.
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always
