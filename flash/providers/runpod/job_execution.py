@@ -573,7 +573,11 @@ def _classify_stall(context: _PollContext, state: _PollState, status: Any) -> Po
     # Only for the no-worker case: once health shows one coming up, the queue timer is suppressed
     # and the setup grace legitimately governs the cold start, unscaled, as it always did.
     now = _jobs.time.time()
-    if status == "IN_QUEUE" and not _worker_is_coming_up(state.worker_coming_up_at, now):
+    if (
+        status == "IN_QUEUE"
+        and not state.ever_saw_worker
+        and not _worker_is_coming_up(state.worker_coming_up_at, now)
+    ):
         # The wait is exempt, so the clock this function measures has to be exempt with it: it
         # anchors on the last status CHANGE, which for a job queued from the start is the moment it
         # entered the queue. Leaving it there would bank the whole queued wait against the cold
@@ -582,13 +586,15 @@ def _classify_stall(context: _PollContext, state: _PollState, status: Any) -> Po
         # time to boot at all. Roll the anchor forward while the exemption holds so the grant
         # starts the cold-start budget from zero, exactly as an immediate grant does.
         #
-        # Only until the FIRST grant, though. `worker_coming_up_at` is a TTL'd sighting, so health
-        # that alternates between a placed worker and an empty snapshot re-enters this branch on
-        # every gap; rolling the anchor there would rearm the cold start indefinitely and let a
-        # wedged paid worker run to the outer wall deadline instead of the setup grace. Past the
-        # first grant the wait is a cold start, and the setup grace owns it.
-        if not state.ever_saw_worker:
-            state.last_progress = now
+        # Strictly PRE-grant, hence `ever_saw_worker` gating the branch itself rather than just the
+        # re-anchor. `worker_coming_up_at` is a TTL'd sighting that goes false again on any health
+        # gap, so exempting on it alone means a worker granted and then lost -- health reporting it
+        # once, then empty -- keeps skipping the stall check forever. The queue timer (rearmed by
+        # the same gap) then runs to the scaled capacity grace and reports `no_capacity` for a GPU
+        # that WAS granted, which is both the wrong limit and the wrong label: it can trip the
+        # supervisor's weight-cache drop on a run that never had a capacity problem. Past the first
+        # grant every observation belongs to the setup timer.
+        state.last_progress = now
         return None
     if now - state.last_progress <= stall_limit:
         return None

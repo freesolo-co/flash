@@ -900,6 +900,53 @@ def test_a_worker_that_stays_placed_does_not_renew_its_setup_budget_forever(monk
     )
 
 
+def test_a_worker_granted_then_lost_is_stalled_not_reported_as_no_capacity(monkeypatch):
+    # A worker granted once and then gone from health (permanent gap, job still IN_QUEUE) must stay
+    # with the SETUP timer. Exempting the stall check on `worker_coming_up_at` alone did not: that
+    # is a TTL'd sighting, so the gap re-entered the exemption forever, the stall check never ran,
+    # and the queue timer -- rearmed by the same gap -- ran to the scaled capacity grace and
+    # reported `no_capacity` for a GPU RunPod HAD granted.
+    #
+    # Both halves are wrong and the label is the worse one: `no_capacity` can trip the supervisor's
+    # weight-cache drop on a run that never had a capacity problem. Pristine `dev` reports `stalled`
+    # here, so this is a regression this PR must not introduce, not a behavior change.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    now = {"t": 0.0}
+
+    def health(_eid, _fp, **_kw):
+        # placed for the first stretch, then health never reports it again.
+        return {"workers": {"initializing": 1} if now["t"] <= 600.0 else {}}
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    # 120s steps so every poll clears the 90s health-probe throttle.
+    ticks = itertools.count(start=0, step=120.0)
+
+    def tick():
+        now["t"] = next(ticks)
+        return now["t"]
+
+    monkeypatch.setattr(jobs.time, "time", tick)
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        deadline_at=500_000.0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", (
+        f"a granted-then-lost worker was reported as {res.failure!r}; past the first grant the "
+        f"setup timer owns the wait, not the capacity timer ({res.detail})"
+    )
+    assert "limit 3000s" in res.detail, res.detail
+
+
 def test_flapping_health_cannot_rearm_the_cold_start_budget_forever(monkeypatch):
     # The queued-wait stall exemption keys on `worker_coming_up_at`, which is a TTL'd SIGHTING and
     # therefore goes false again on any health gap. So endpoint health that alternates between a
