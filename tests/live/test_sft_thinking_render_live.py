@@ -15,7 +15,9 @@ import pytest
 from flash.engine.profiling.workload_profile import (
     count_rendered_reasoning_spans,
     reasoned_assistant_turns,
-    without_authored_reasoning,
+    reasoning_marker_prefix,
+    reasoning_span_texts,
+    with_marked_reasoning,
 )
 
 pytestmark = pytest.mark.live
@@ -165,57 +167,60 @@ def test_the_real_template_renders_two_empty_blocks_for_two_bare_trailing_turns(
     assert reasoned_assistant_turns(messages) == 1
 
 
-def test_the_baseline_render_differs_from_the_full_render_only_by_authored_reasoning(
-    tokenizer,
-) -> None:
+def test_the_marked_render_keeps_the_full_renders_span_sequence(tokenizer) -> None:
     """The property the survivor count rests on, checked against the shipped template.
 
-    ``without_authored_reasoning`` must remove exactly the assistant reasoning and change nothing
-    else, so both renders apply the same boundary rule to the same positions and their span counts
-    differ only by the blocks that survived.
+    Marking changes reasoning TEXT only, so the template sees identical roles in identical
+    positions and both renders carry the same spans in the same order. That is what lets the marked
+    render say which turn owns each span while the real render says where that span ends; if
+    marking could add, drop, or reorder a span the two would no longer address the same thing.
     """
-    baseline = _render(tokenizer, without_authored_reasoning(MULTITURN))
     full = _render(tokenizer, MULTITURN)
+    prefix = reasoning_marker_prefix(full)
+    marked = _render(tokenizer, with_marked_reasoning(MULTITURN, prefix))
 
-    assert count_rendered_reasoning_spans(baseline) == 0
-    assert count_rendered_reasoning_spans(full) - count_rendered_reasoning_spans(baseline) == 1
-    # the answers and turn structure are untouched: only the reasoning is gone
+    assert count_rendered_reasoning_spans(marked) == count_rendered_reasoning_spans(full) == 1
+    # the answers and turn structure are untouched: only reasoning text differs
     for answer in ("a1", "a2", "a3"):
-        assert answer in baseline
-    assert baseline.count("<|im_start|>") == full.count("<|im_start|>")
+        assert answer in marked
+    assert marked.count("<|im_start|>") == full.count("<|im_start|>")
+    # exactly the surviving turn is identified, and it is the LAST assistant turn (index 6) -- the
+    # template strips the earlier two, so their markers never reach the render
+    spans = reasoning_span_texts(marked)
+    assert f"{prefix}6 " in spans[0]
+    assert not any(f"{prefix}{index} " in spans[0] for index in (2, 4))
 
 
-def test_the_real_template_promotes_a_quoted_think_span_once_reasoning_content_is_gone(
-    tokenizer,
-) -> None:
-    """The two traps in building a baseline for a ``reasoning_content`` turn.
+def test_a_quoted_think_span_never_carries_a_marker(tokenizer) -> None:
+    """A ``<think>`` the answer merely QUOTES is answer text, and marking must not credit it.
 
-    With the field removed the template falls back to parsing ``content``, so a ``<think>`` span
-    the answer merely QUOTES is promoted into that turn's reasoning and renders as a real span --
-    a span the completion never authored, which would cancel a genuine survivor. Deleting the quote
-    instead is equally wrong: the full render keeps it verbatim beside the field's reasoning.
-    ``without_authored_reasoning`` therefore defuses the delimiters, keeping the text while
-    rendering nothing.
+    This turn supplies its reasoning through ``reasoning_content`` and quotes the format in its
+    answer, so the real template renders TWO spans: the field's reasoning and the verbatim quote.
+    Only the first is this turn's reasoning. The marker rides inside the reasoning, so the quote
+    can never be mistaken for a surviving block however the answer is written.
     """
-    answer = "answer shows <think>example</think> format"
     messages = [
         {"role": "user", "content": "u1"},
-        {"role": "assistant", "content": answer, "reasoning_content": "real reasoning"},
+        {
+            "role": "assistant",
+            "content": "answer shows <think>example</think> format",
+            "reasoning_content": "real reasoning",
+        },
     ]
     full = _render(tokenizer, messages)
     # the full render carries BOTH the field's reasoning and the answer's quote, verbatim
     assert "real reasoning" in full
     assert "<think>example</think>" in full
+    assert count_rendered_reasoning_spans(full) == 2
 
-    # dropping the field alone would promote the quote to real reasoning
-    naive = _render(tokenizer, [messages[0], {"role": "assistant", "content": answer}])
-    assert count_rendered_reasoning_spans(naive) == 1
+    prefix = reasoning_marker_prefix(full)
+    marked = _render(tokenizer, with_marked_reasoning(messages, prefix))
+    spans = reasoning_span_texts(marked)
 
-    baseline = _render(tokenizer, without_authored_reasoning(messages))
-    assert "real reasoning" not in baseline
-    # the answer text survives, but no longer as a think span
-    assert "example" in baseline
-    assert count_rendered_reasoning_spans(baseline) == 0
+    assert count_rendered_reasoning_spans(marked) == 2
+    # the reasoning span carries the marker; the quoted span never does
+    assert [prefix in span for span in spans] == [True, False]
+    assert "example" in spans[1]
 
 
 def test_the_real_template_prefers_reasoning_content_over_an_inline_span(tokenizer) -> None:

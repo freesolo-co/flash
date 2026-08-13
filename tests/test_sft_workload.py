@@ -468,7 +468,10 @@ class ThinkingTokenizer(FakeTokenizer):
     * reasoning survives only on assistant turns AFTER the last non-tool user message
       (``loop.index0 > ns.last_query_index``), not merely on the last turn;
     * a trailing assistant turn ALWAYS opens a ``<think>`` block, empty when that turn authored no
-      reasoning. That empty block is why survival is counted as non-empty spans.
+      reasoning. That empty block is why survival is counted as non-empty spans;
+    * ``reasoning_content`` is read in PREFERENCE to an inline span. A fake that only ever splits
+      ``content`` would tear an answer apart at a ``<think>`` tag the answer merely quotes, and
+      then disagree with the real template about which text is this turn's reasoning.
 
     ``tests/test_sft_workload_live.py`` pins this fake against the real tokenizer.
     """
@@ -504,10 +507,19 @@ class ThinkingTokenizer(FakeTokenizer):
             else:
                 content = str(raw or "")
             reasoning = ""
+            supplied = message.get("reasoning_content")
             # the split is ASSISTANT-only in the real template: a literal <think> span in a system
             # or user message is passed through verbatim, which is what lets prompt text contribute
             # a rendered span that is never supervised.
-            if message.get("role") == "assistant" and "</think>" in content:
+            if (
+                message.get("role") == "assistant"
+                and isinstance(supplied, str)
+                and supplied.strip()
+            ):
+                # the field wins over an inline span, and `content` stays whole: any <think> the
+                # answer quotes is answer text, not this turn's reasoning.
+                reasoning = supplied.strip()
+            elif message.get("role") == "assistant" and "</think>" in content:
                 reasoning = content.split("</think>")[0].split("<think>")[-1].strip()
                 content = content.split("</think>")[-1].lstrip("\n")
             if message.get("role") == "assistant" and index > last_query:
@@ -966,3 +978,172 @@ def test_a_reasoned_assistant_turn_in_the_prompt_does_not_cancel_a_surviving_tar
     assert prepared.authored_reasoning_turns == 1
     assert prepared.rendered_reasoning_spans == 1
     assert "authored reasoning blocks" not in capsys.readouterr().err
+
+
+def test_an_earlier_surviving_block_is_not_reported_lost_when_a_later_one_is_truncated(
+    capsys,
+) -> None:
+    """Each surviving span is measured against the cap at ITS OWN end offset.
+
+    Two consecutive trailing assistant turns both keep their reasoning, and the cap falls between
+    the two blocks. Measuring one span's position in a render that does not contain it -- as any
+    scheme comparing offsets from two DIFFERENT renders must -- reads the earlier, fully retained
+    block as ending where the later one does, and reports it truncated. The row would then claim
+    zero survivors and warn that the template dropped every block, while the first block is in fact
+    supervised.
+    """
+    completion = [
+        {"role": "assistant", "content": "<think>" + "early " * 6 + "</think>a1"},
+        {"role": "assistant", "content": "<think>" + "late " * 40 + "</think>a2"},
+    ]
+    # the fake tokenizer is one token per character: the first block closes at 53 and the second at
+    # 273, so this cap falls between them and retains exactly one of the two.
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        ThinkingEnvironment(completion),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    assert prepared.authored_reasoning_turns == 2
+    # the first block fits and is supervised; only the second is cut away by the cap
+    assert prepared.rendered_reasoning_spans == 1
+    assert "dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
+
+
+def test_a_quoting_answer_on_a_dropped_turn_is_not_credited_as_a_survivor(capsys) -> None:
+    """A turn whose reasoning the template dropped stays dropped, however its answer is written.
+
+    The early turn supplies reasoning through ``reasoning_content`` and its ANSWER quotes the
+    ``<think>`` format. The template strips that turn's reasoning but renders the quote verbatim, so
+    any scheme that asks "did perturbing this turn change the span count?" sees the quote move and
+    credits the turn. Survival is an identity question: the quote is not this turn's reasoning and
+    can never stand in for it.
+    """
+    completion = [
+        {
+            "role": "assistant",
+            "content": "write it as <think>like this</think> ok",
+            "reasoning_content": "early reasoning",
+        },
+        {"role": "user", "content": "next"},
+        {"role": "assistant", "content": "<think>late</think>a2"},
+    ]
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        ThinkingEnvironment(completion),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    assert prepared.authored_reasoning_turns == 2
+    # only the final turn's reasoning reaches the loss; the quoted tags are answer text
+    assert prepared.rendered_reasoning_spans == 1
+    assert "dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
+
+
+def test_an_image_rows_visual_tokens_are_charged_against_the_reasoning_cap() -> None:
+    """On an image row the cap is spent on visual tokens before any text reaches it.
+
+    Training truncates the ids the PROCESSOR produced, in which each image has expanded into many
+    visual tokens; the text render contains none of them. Measuring a reasoning block against the
+    raw cap therefore calls it retained when the expansion has already pushed it past the end of
+    the supervised span, overstating how much reasoning reaches the loss.
+    """
+    import base64
+    import io as _io
+
+    from PIL import Image
+
+    buffer = _io.BytesIO()
+    Image.new("RGB", (4, 4), "red").save(buffer, format="PNG")
+    image_uri = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    class ImageEnvironment(FakeEnvironment):
+        multi_turn = True
+
+        def __init__(self):
+            super().__init__()
+            self._rows = [{"prompt": "describe", "answer": "ignored", "image": image_uri}]
+
+        def sft_completion(self, row):
+            return [{"role": "assistant", "content": "<think>" + "why " * 4 + "</think>a"}]
+
+    class ExpandingProcessor:
+        """A processor whose single image expands into ``visual`` extra ids, as a real one does."""
+
+        # the row's reasoning block closes 40 characters into the text render, so a cap of 200
+        # clears it easily on text alone; these visual tokens are what actually spend the budget.
+        visual = 180
+
+        def __init__(self):
+            # the multimodal path renders text through the PROCESSOR's tokenizer, so the two must
+            # be the same object the reasoning check measures with
+            self.tokenizer = ThinkingTokenizer()
+
+        def apply_chat_template(
+            self, messages, *, tokenize, return_dict, return_tensors, enable_thinking, **_kwargs
+        ):
+            text = "".join(
+                block.get("text") or ""
+                for message in messages
+                for block in (
+                    message["content"]
+                    if isinstance(message.get("content"), list)
+                    else [{"type": "text", "text": str(message.get("content") or "")}]
+                )
+                if isinstance(block, dict)
+            )
+            ids = [3 + ord(char) % 89 for char in text] + [7] * self.visual
+            return {"input_ids": [ids], "attention_mask": [[1] * len(ids)]}
+
+    spec = replace(
+        _spec(),
+        # image-bearing rows are refused outright for a model the catalog says cannot train on them
+        model="Qwen/Qwen3.5-4B",
+        train=replace(_spec().train, max_context_tokens=200, max_examples=0),
+    )
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        ImageEnvironment(),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        processor_loader=lambda _model, _revision: ExpandingProcessor(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    # the block closes 40 characters into the text render, well inside the 200-token cap, but the
+    # image's 180 visual tokens are charged first and leave it past the end of the supervised span
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 0

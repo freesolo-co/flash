@@ -149,68 +149,76 @@ def _message_text(content: object) -> str:
     return ""
 
 
-def _answer_without_think_tags(text: str, *, reasoning_is_inline: bool) -> str:
-    """An assistant turn's text with its own reasoning removed and any leftover tags defused.
+def reasoning_marker_prefix(text: str) -> str:
+    """A marker stem guaranteed absent from ``text``, so a marker cannot match user content.
 
-    Which text is reasoning depends on where the turn's reasoning came from, and getting this
-    backwards is a real bug in both directions:
-
-    * ``reasoning_is_inline`` -- the template parses the span out of ``content``, so text through
-      the last ``</think>`` is this turn's reasoning and goes.
-    * otherwise ``reasoning_content`` supplied it and ``content`` is entirely answer. Splitting it
-      here would delete answer text the full render keeps, leaving the baseline short so the
-      deleted span counts as a survivor.
-
-    Either way a ``<think>`` tag the ANSWER merely quotes has to stop being a tag without ceasing
-    to be text: with the reasoning removed, the template would otherwise parse that quote as this
-    turn's reasoning and render a span the completion never authored, cancelling a real survivor.
-    Neutering the delimiters keeps the text, and roughly its token count, while rendering nothing.
+    Extended rather than assumed unique: a dataset that happens to contain the stem would otherwise
+    let its own text answer "did this turn's reasoning survive?".
     """
-    answer = text.split("</think>")[-1].lstrip("\n") if reasoning_is_inline else text
-    # the tag is defused by breaking the delimiter, not by deleting the words: the text and its
-    # rough token count stay, and neither the template nor the span pattern sees a tag.
-    return answer.replace("<think>", "(think)").replace("</think>", "(/think)")
+    prefix = "flashreasoningmark"
+    while prefix in text:
+        prefix += "x"
+    return prefix
 
 
-def without_authored_reasoning(messages: list[dict]) -> list[dict]:
-    """The same messages with assistant reasoning removed, structure and positions untouched.
+def _marked_inline_reasoning(content: object, marker: str) -> object:
+    """``content`` with ``marker`` placed just inside its first ``<think>`` opener."""
+    if isinstance(content, str):
+        return content.replace("<think>", f"<think>{marker}", 1)
+    if not isinstance(content, list):
+        return content
+    marked: list = []
+    placed = False
+    for block in content:
+        if (
+            not placed
+            and isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+            and "<think>" in block["text"]
+        ):
+            marked.append(
+                {**block, "text": block["text"].replace("<think>", f"<think>{marker}", 1)}
+            )
+            placed = True
+        else:
+            marked.append(block)
+    return marked
 
-    Rendering this alongside the real messages isolates the reasoning the completion contributes:
-    both renders run the template's ``last_query_index`` rule over identical roles in identical
-    positions, so the two differ only by the spans the assistant turns authored.
 
-    Subtracting a PROMPT-ONLY render cannot do this. A reasoned assistant turn at the end of the
-    prompt is final in the prompt-only render and keeps its span, but the completion's later user
-    turn moves the boundary past it and the full render strips it -- so the subtraction removes a
-    span the full render no longer has, and erases a surviving completion span with it.
+def with_marked_reasoning(messages: list[dict], prefix: str) -> list[dict]:
+    """The same messages with each reasoning-authoring assistant turn's reasoning stamped.
+
+    Marking makes survival an IDENTITY question instead of a counting one, which is the only way to
+    answer it correctly. Counting spans across a render with one turn's reasoning REMOVED gets two
+    cases wrong, both silently:
+
+    * a ``<think>`` tag an ANSWER merely quotes is an ordinary non-empty span, indistinguishable
+      from reasoning by count. Removing a turn perturbs that quote too, so the count can fall for a
+      turn whose reasoning the template actually dropped, and the loss goes unreported.
+    * the two renders are different strings, so span offsets in one do not address the other, and a
+      later span shifting makes an earlier one look truncated.
+
+    A marker rides INSIDE the reasoning, so it appears in the rendered span if and only if the
+    template kept that specific turn's reasoning. Quoted tags carry no marker and can never be
+    credited. Only reasoning text changes, so the template's ``last_query_index`` rule sees
+    identical roles in identical positions and the marked render keeps the full render's span
+    sequence -- which is what lets survival be read from one render and offsets from the other.
     """
-    stripped: list[dict] = []
-    for message in messages:
+    marked: list[dict] = []
+    for index, message in enumerate(messages):
         copied = dict(message)
-        if copied.get("role") == "assistant":
-            reasoning = copied.pop("reasoning_content", None)
-            # the template reads `reasoning_content` in preference to an inline span, so the field
-            # decides which half of `content` is this turn's reasoning.
-            inline = not (isinstance(reasoning, str) and reasoning.strip())
-            text = copied.get("content")
-            if isinstance(text, str):
-                copied["content"] = _answer_without_think_tags(text, reasoning_is_inline=inline)
-            elif isinstance(text, list):
-                copied["content"] = [
-                    {
-                        **block,
-                        "text": _answer_without_think_tags(
-                            block["text"], reasoning_is_inline=inline
-                        ),
-                    }
-                    if isinstance(block, dict)
-                    and block.get("type") == "text"
-                    and isinstance(block.get("text"), str)
-                    else block
-                    for block in text
-                ]
-        stripped.append(copied)
-    return stripped
+        if copied.get("role") == "assistant" and reasoned_assistant_turns([message]):
+            marker = f"{prefix}{index} "
+            reasoning = copied.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip():
+                # the template reads this field in preference to an inline span, so it is the
+                # reasoning and the marker belongs in it
+                copied["reasoning_content"] = marker + reasoning
+            else:
+                copied["content"] = _marked_inline_reasoning(copied.get("content"), marker)
+        marked.append(copied)
+    return marked
 
 
 def reasoning_span_end_offsets(text: str) -> list[int]:
@@ -220,6 +228,15 @@ def reasoning_span_end_offsets(text: str) -> list[int]:
     tokens, so the caller needs where each span ENDS to compare against the cap.
     """
     return [match.end() for match in _NON_EMPTY_THINK.finditer(text)]
+
+
+def reasoning_span_texts(text: str) -> list[str]:
+    """Each non-empty ``<think>`` span's rendered text, in order.
+
+    Paired positionally with ``reasoning_span_end_offsets`` of the UNMARKED render: the marked text
+    says which turn owns each span, the real text says where that span ends.
+    """
+    return _NON_EMPTY_THINK.findall(text)
 
 
 def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:

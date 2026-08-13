@@ -15,13 +15,14 @@ from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
 from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
-    count_rendered_reasoning_spans,
     reasoned_assistant_turns,
+    reasoning_marker_prefix,
     reasoning_span_end_offsets,
+    reasoning_span_texts,
     rendered_reasoning_loss_warning,
     sft_sample_policy,
     unpacked_batch_warning,
-    without_authored_reasoning,
+    with_marked_reasoning,
 )
 from flash.engine.worker.entry.sft import (
     _pretokenize_completion_only,
@@ -328,59 +329,52 @@ def _row_reasoning(
 ) -> tuple[int, int]:
     """One row's (authored reasoning turns, reasoning spans that survive into the SUPERVISED span).
 
-    Survivors are the full render's spans minus those of a BASELINE render of the same row with the
-    completion's reasoning stripped. The whole render cannot be counted directly: the template's
-    reasoning split is assistant-only, so a literal ``<think>...</think>`` written into a system or
-    user message renders a real span that is never supervised, and counting it would offset a
-    target's lost reasoning and silence the warning.
+    Survival is answered by IDENTITY, not by counting: the row is rendered a second time with each
+    reasoning-authoring turn's reasoning stamped with a marker naming that turn, and a turn survives
+    when its marker appears in a rendered span. Counting spans across renders cannot answer it,
+    because two different things are indistinguishable by count:
 
-    The baseline is a re-render rather than the prompt render because the two must apply the
-    template's ``last_query_index`` boundary to the same positions. A reasoned assistant turn at the
-    end of the prompt is trailing in a prompt-only render and keeps its span, but the completion's
-    later user turn moves the boundary past it and the full render strips it -- subtracting the
-    prompt render would then remove a span the full render never had, cancelling a completion span
-    that did reach the loss and firing a false warning. Same messages, same positions, one
-    difference.
+    * a ``<think>`` tag an ANSWER merely quotes renders a real non-empty span. It is never this
+      turn's reasoning, but it is counted like one, so quoted tags could cover dropped turns.
+    * the template's reasoning split is assistant-only, so a literal span written into a system or
+      user message renders a span that is never supervised at all.
 
-    Each authored turn is probed SEPARATELY, by re-rendering the row with only that turn's reasoning
-    removed. Summing spans across the whole render cannot work: a ``<think>`` tag an ANSWER merely
-    quotes is a real non-empty span in supervised text and is indistinguishable from reasoning, so
-    an answer quoting the format could cover several dropped turns and silence the warning. A per
-    turn probe is immune -- the quote renders identically in both, so only that turn's own reasoning
-    moves the count.
+    A marker rides inside the reasoning itself, so neither can ever be credited: only text the
+    template chose to keep as THIS turn's reasoning carries THIS turn's marker.
+
+    Only reasoning text differs between the two renders, so the template's ``last_query_index`` rule
+    sees identical roles in identical positions and both renders carry the same span sequence. That
+    pairing is what lets the marked render say WHICH turn owns each span while the real render says
+    where that span ends -- offsets are only ever read from the render they belong to, never carried
+    across.
 
     A survivor also has to fit inside ``max_length``: the cap slices the token row, so a block past
-    it never reaches the loss. A turn counts only when the render THROUGH the span it contributes
-    still tokenizes within the cap. Truncation is judged per turn rather than per row because the
-    cap usually cuts the answer tail while leaving an earlier reasoning block whole, and discarding
+    it never reaches the loss. A turn counts only when the render THROUGH its own span still
+    tokenizes within the cap. Truncation is judged per span rather than per row because the cap
+    usually cuts the answer tail while leaving an earlier reasoning block whole, and discarding
     every span on a truncated row would warn that reasoning was dropped from a row whose reasoning
     the template kept.
     """
-    authored_indexes = [
-        index
-        for index, message in enumerate(completion_messages)
-        if reasoned_assistant_turns([message])
-    ]
-    if not authored_indexes:
-        # nothing authored means nothing to lose, and the baseline would equal the full render.
+    authored = reasoned_assistant_turns(completion_messages)
+    if not authored:
+        # nothing authored means nothing to lose, and the marked render would equal the full one.
         # skipped rather than rendered so a dataset with no reasoning pays nothing for this check.
         return 0, 0
-    full_spans = count_rendered_reasoning_spans(full_text)
-    full_ends = reasoning_span_end_offsets(full_text)
+    ends = reasoning_span_end_offsets(full_text)
+    prefix = reasoning_marker_prefix(full_text)
+    marked_spans = reasoning_span_texts(
+        render([*prompt_messages, *with_marked_reasoning(completion_messages, prefix)])
+    )
+    if len(marked_spans) != len(ends):
+        # marking changed the span sequence, so the two renders no longer address the same spans.
+        # unreachable by construction; treated as "cannot tell" rather than guessed at, because a
+        # wrong survivor count here silently mis-states how much reasoning reaches the loss.
+        return authored, 0
     survivors = 0
-    for index in authored_indexes:
-        probe = list(completion_messages)
-        probe[index] = without_authored_reasoning([probe[index]])[0]
-        probe_text = render([*prompt_messages, *probe])
-        if count_rendered_reasoning_spans(probe_text) >= full_spans:
-            continue  # the template dropped this turn's reasoning: removing it changed nothing
-        # the span this turn contributed is the one the probe lost; it reaches the loss only if the
-        # render through its closing tag still fits the cap.
-        probe_ends = set(reasoning_span_end_offsets(probe_text))
-        lost = [end for end in full_ends if end not in probe_ends] or full_ends[-1:]
-        if _encoded_length(tokenizer, full_text[: lost[-1]]) <= max_length:
+    for span, end in zip(marked_spans, ends, strict=True):
+        if prefix in span and _encoded_length(tokenizer, full_text[:end]) <= max_length:
             survivors += 1
-    return len(authored_indexes), survivors
+    return authored, survivors
 
 
 def _tokenize_prompt_rows(
@@ -463,13 +457,19 @@ def _tokenize_prompt_rows(
             }
             text = render_transcript([*normalized.messages, *completion_messages])
             sampled_texts.append(text)
+            # training truncates the PROCESSOR's ids, which expand each image into visual tokens the
+            # text render never contains, so measuring a span against the raw cap would call a block
+            # retained that the visual tokens had already pushed past it. every image is in the
+            # prompt (`_reject_image_completion` above), so the expansion is a constant shift on
+            # every completion position: charging it to the budget puts the two back in scale.
+            visual_inflation = max(0, untruncated_length - _encoded_length(tokenizer, text))
             reasoning_by_index[row_index] = _row_reasoning(
                 normalized.messages,
                 completion_messages,
                 full_text=text,
                 render=render_transcript,
                 tokenizer=tokenizer,
-                max_length=max_length,
+                max_length=max_length - visual_inflation,
             )
         else:
             text = render_transcript([*prompt_messages, *completion_messages])
