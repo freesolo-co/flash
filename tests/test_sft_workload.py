@@ -522,20 +522,19 @@ class ThinkingTokenizer(FakeTokenizer):
             elif message.get("role") == "assistant" and "</think>" in content:
                 reasoning = content.split("</think>")[0].split("<think>")[-1].strip()
                 content = content.split("</think>")[-1].lstrip("\n")
-            # the assistant HEADER and the closing <|im_end|> are both part of the reasoning
-            # layout, not decoration: the template only opens a <think> block straight after the
-            # header, and <|im_end|> is what bounds one turn's reasoning from the next turn's. a
-            # fake that drops either renders a shape no structural parser can read -- without the
-            # header there is no anchor to find, and without the terminator one turn's block runs
-            # into the following turn's closer.
-            if message.get("role") == "assistant" and index > last_query:
-                parts.append(
-                    f"<|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{content}<|im_end|>"
-                )
-            elif message.get("role") == "assistant":
-                parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+            # EVERY turn carries the full header/terminator frame, because that frame is the
+            # reasoning layout rather than decoration: the template only opens a <think> block
+            # straight after an assistant header, and a header only counts as one when it follows
+            # the previous turn's <|im_end|>. a fake that renders bare content leaves the first
+            # header unprefixed and the turns unbounded, so a structural parser either finds no
+            # anchor or lets one turn's block run into the next turn's closer -- shapes the real
+            # template never produces.
+            role = message.get("role")
+            if role == "assistant" and index > last_query:
+                body = f"<think>\n{reasoning}\n</think>\n\n{content}"
             else:
-                parts.append(content)
+                body = content
+            parts.append(f"<|im_start|>{role}\n{body}<|im_end|>\n")
         text = "".join(parts)
         return text + ("<|im_start|>assistant\n<think>\n" if add_generation_prompt else "")
 
@@ -770,7 +769,11 @@ def test_reasoning_in_a_dropped_row_is_not_reported_against_the_retained_rows(ca
                 {"role": "assistant", "content": "a2"},
             ]
 
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=64, max_examples=0))
+    # between the retained row's whole render (87) and the dropped row's prompt alone (458), so the
+    # long row loses its completion to the cap while the short row keeps its block intact. a cap
+    # under 87 would truncate the RETAINED row's reasoning too, and the warning it raised would
+    # look like the dropped row leaking into the count while proving nothing about it.
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
     spec = replace(
         spec,
         thinking=True,
@@ -823,7 +826,9 @@ def test_reasoning_the_cap_kept_is_not_reported_as_dropped(capsys) -> None:
     row would warn that the template dropped reasoning it actually kept.
     """
     completion = [{"role": "assistant", "content": "<think>kept</think>" + "tail " * 80}]
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=64, max_examples=0))
+    # one token per character: the block's closing tag ends at 76 and the row runs to 489, so this
+    # cap keeps the reasoning whole while still cutting most of the answer tail.
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
     spec = replace(
         spec,
         thinking=True,
@@ -1011,9 +1016,9 @@ def test_an_earlier_surviving_block_is_not_reported_lost_when_a_later_one_is_tru
         {"role": "assistant", "content": "<think>" + "early " * 6 + "</think>a1"},
         {"role": "assistant", "content": "<think>" + "late " * 40 + "</think>a2"},
     ]
-    # the fake tokenizer is one token per character: the first block closes at 53 and the second at
-    # 273, so this cap falls between them and retains exactly one of the two.
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
+    # the fake tokenizer is one token per character: the first block closes at 107 and the second
+    # at 360, so this cap falls between them and retains exactly one of the two.
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=200, max_examples=0))
     spec = replace(
         spec,
         thinking=True,
@@ -1139,6 +1144,77 @@ def test_an_empty_reasoning_field_is_authoritative_over_a_tag_the_answer_quotes(
     assert "reasoning" not in capsys.readouterr().err
 
 
+def test_reasoning_that_quotes_the_assistant_header_is_still_found(capsys) -> None:
+    """A header the reasoning QUOTES is content, and must not open a phantom turn.
+
+    Treating any ``<|im_start|>assistant\\n<think>\\n`` as a turn boundary pulls the search horizon
+    in front of the template's own closer, so the block is never found at all and an intact
+    survivor reports as dropped -- the one failure the endpoint rules are supposed to exclude. A
+    real header always follows the previous turn's terminator; a quoted one does not.
+    """
+    completion = [
+        {
+            "role": "assistant",
+            "reasoning_content": "the format is:\n<|im_start|>assistant\n<think>\nand so on",
+            "content": "answer",
+        }
+    ]
+    prepared = _thinking_prepared(completion)
+
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 1
+    assert "the chat template dropped" not in capsys.readouterr().err
+
+
+def test_a_tool_response_bounds_the_span_of_the_turn_before_it(capsys) -> None:
+    """A block ends at its own turn even when no LATER turn opens reasoning of its own.
+
+    A ``<tool_response>`` user turn does not reset the template's ``last_query_index``, so the
+    assistant before it KEEPS its reasoning. If the scan advances its horizon only at the next
+    REASONING turn, that trailing tool message leaves the block unbounded: the span runs through
+    the answer and the turn terminator into the tool output, and ends at a closer the tool text
+    merely quotes. A cap between the real closer and the quoted one then scores intact reasoning as
+    truncated -- a cap warning for a row that lost nothing.
+    """
+
+    class ToolEnvironment(ThinkingEnvironment):
+        def sft_completion(self, row):
+            return [
+                {"role": "assistant", "reasoning_content": "REAL", "content": "a1"},
+                # tool output that happens to contain the template's own closer layout
+                {
+                    "role": "user",
+                    "content": "<tool_response>before\n</think>\n\nafter</tool_response>",
+                },
+            ]
+
+    # between the block's real closer (76) and the closer quoted in the tool output (140): the
+    # unbounded span would reach past this cap, the correctly bounded one ends well before it.
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        ToolEnvironment([]),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 1
+    # the block fits: it ends at its own closer, not at the one quoted in the tool output
+    assert prepared.profile.truncated_reasoning_spans == 0
+    assert "cut off" not in capsys.readouterr().err
+
+
 def test_reasoning_that_mentions_the_turn_terminator_is_still_found(capsys) -> None:
     """A literal ``<|im_end|>`` inside reasoning is content, not the end of the turn.
 
@@ -1171,10 +1247,10 @@ def test_a_cap_landing_on_the_answer_separator_does_not_report_lost_reasoning(ca
     nothing, and an understated survival percentage.
     """
     completion = [{"role": "assistant", "content": "<think>short</think>answer text"}]
-    # the fake is one token per character: the closing tag ends at 49 and the span at 51, so this
+    # the fake is one token per character: the closing tag ends at 77 and the span at 79, so this
     # cap retains the whole block and only a span-end measurement would call it truncated. a cap
-    # below 49 would cut the block under either rule and could not tell them apart.
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=49, max_examples=0))
+    # below 77 would cut the block under either rule and could not tell them apart.
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=77, max_examples=0))
     spec = replace(
         spec,
         thinking=True,
@@ -1213,7 +1289,9 @@ def test_reasoning_containing_a_balanced_tag_is_measured_to_its_real_end(capsys)
             "reasoning_content": "start <think>x</think> " + "rest " * 12,
         }
     ]
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=40, max_examples=0))
+    # one token per character: the INNER closer ends at 85 and the real one at 154, so this cap
+    # falls between them -- an early end would call the cut block retained.
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
     spec = replace(
         spec,
         thinking=True,

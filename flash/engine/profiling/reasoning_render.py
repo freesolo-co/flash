@@ -15,7 +15,18 @@ _TURN_END = "<|im_end|>"
 # the template opens reasoning in exactly one place: straight after an assistant header. that
 # anchor is what separates a block the template OWNS from the same characters appearing as
 # ordinary text elsewhere, and it is where a block's start is taken from.
-_TEMPLATE_REASONING_START = re.compile(rf"<\|im_start\|>assistant\n(?P<open>{_THINK_OPEN})\n")
+#
+# a REAL header always follows the previous turn's terminator, or begins the render. requiring that
+# is what keeps a header QUOTED inside a block from reading as the start of a new turn: text can
+# contain the header characters, but only the template can put them after `<|im_end|>`.
+_TEMPLATE_REASONING_START = re.compile(
+    rf"(?:\A|{re.escape(_TURN_END)}\n)<\|im_start\|>assistant\n(?P<open>{_THINK_OPEN})\n"
+)
+# the start of ANY real turn, reasoning-bearing or not. the horizon has to advance on every turn
+# rather than only on the next reasoning one: a turn that authored no reasoning -- a tool response,
+# a bare answer -- still ends the previous turn, and a scan that ignores it runs past the block's
+# own closer into whatever those later turns contain.
+_TEMPLATE_TURN_START = re.compile(rf"(?:\A|{re.escape(_TURN_END)}\n)<\|im_start\|>\w+\n")
 # the block's own closer: the newline-delimited form the template emits before the answer.
 _TEMPLATE_REASONING_END = f"\n{_THINK_CLOSE}\n\n"
 
@@ -42,20 +53,33 @@ def reasoning_spans(text: str) -> list[tuple[int, int]]:
       about, and a cap landing between that quoted closer and the real one then scores a cut block
       as fully retained -- overstating what reaches the loss, the direction that hides the problem.
 
-    The turn's terminator is the LAST ``<|im_end|>`` at or before the next assistant header, not
-    the first one after the anchor: reasoning that mentions the token literally would otherwise end
-    the scan before the template's own closer, returning no span at all and reporting an intact
-    survivor as dropped.
+    The turn's terminator is the LAST ``<|im_end|>`` at or before the next turn's header, not the
+    first one after the anchor: reasoning that mentions the token literally would otherwise end the
+    scan before the template's own closer, returning no span at all and reporting an intact
+    survivor as dropped. That horizon is the next header of ANY role -- a tool response or a bare
+    answer ends the turn just as an assistant one does, and stopping only at the next REASONING
+    turn would let a block run into text those later turns contain.
 
-    Both endpoint rules read the rendered text alone, which cannot separate a closer quoted at the
-    END of the reasoning from one quoted at the START of the answer -- those two rows render
-    identically and want opposite answers. Callers that need that distinction pair these spans with
-    a marker stamped into the reasoning itself (see ``sft_workload._row_reasoning``); the residual
-    error here is bounded to a span end that runs into answer text, never to a missed block.
+    Both the anchor and that horizon require a REAL header -- one following the previous turn's
+    terminator -- so reasoning that quotes the header layout cannot open a phantom turn or pull the
+    horizon in front of the closer. A quote is text; only the template writes a header after
+    ``<|im_end|>``.
+
+    What remains ambiguous is a transcript whose text contains the two TOGETHER, verbatim: a
+    ``<|im_end|>`` newline and a header. Those bytes are what a turn boundary IS, so no rule reading
+    the rendered text alone can tell them from one, and such a row reports no span for the turn.
+    Reaching it takes a transcript that writes the control-token layout out in full rather than
+    merely mentioning ``<think>`` or ``<|im_end|>``, both of which are handled above.
+
+    Both endpoint rules read the rendered text alone, which likewise cannot separate a closer quoted
+    at the END of the reasoning from one quoted at the START of the answer -- those two rows render
+    identically and want opposite answers. Callers that need either distinction pair these spans
+    with a marker stamped into the reasoning itself (see ``sft_workload._row_reasoning``), which is
+    what keeps a mis-bounded span from being counted as a survivor.
     """
     spans: list[tuple[int, int]] = []
     for match in _TEMPLATE_REASONING_START.finditer(text):
-        next_turn = _TEMPLATE_REASONING_START.search(text, match.end())
+        next_turn = _TEMPLATE_TURN_START.search(text, match.end())
         horizon = len(text) if next_turn is None else next_turn.start()
         turn_end = text.rfind(_TURN_END, match.end(), horizon)
         limit = horizon if turn_end < 0 else turn_end

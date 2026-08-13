@@ -17,10 +17,15 @@ from flash.engine.profiling.workload_profile import (
     reasoned_assistant_turns,
     reasoning_marker_prefix,
     reasoning_span_texts,
+    reasoning_spans,
     with_marked_reasoning,
 )
 
 pytestmark = pytest.mark.live
+
+# spelled out rather than imported from the module under test: a test that borrowed the parser's
+# own constant would still pass if that constant were wrong.
+TURN_END = "<|im_end|>"
 
 # the smallest catalog model that ships the thinking template; the template is shared across the
 # Qwen3.5 family, so the 0.8B render is the same rule the 4B and 27B students apply.
@@ -225,6 +230,91 @@ def test_a_quoted_think_span_never_carries_a_marker(tokenizer) -> None:
     # the one span is the reasoning, and it carries the marker; the quote is answer text
     assert [prefix in span for span in spans] == [True]
     assert "example" not in spans[0]
+
+
+def test_reasoning_quoting_an_assistant_header_is_found_whole(tokenizer) -> None:
+    """Reasoning that quotes a turn header must not cut its own span short.
+
+    The header characters are ordinary text inside a block, so a scan that anchors on the header
+    alone finds a second, spurious turn start mid-block and reports the surrounding real block as
+    missing entirely. That is the opposite of a spurious extra span: the block silently vanishes
+    from the survival count and the warning fires on a run that lost nothing. Only the template can
+    place a header after the previous turn's terminator, which is what separates the two.
+    """
+    messages = [
+        {"role": "user", "content": "u1"},
+        {
+            "role": "assistant",
+            "content": "a1",
+            "reasoning_content": "a turn starts with <|im_start|>assistant\n<think>\n like so",
+        },
+    ]
+    full = _render(tokenizer, messages)
+    # the quote really is in the render, character for character
+    assert "<|im_start|>assistant\n<think>\n like so" in full
+    # and the turn is still ONE block, found whole rather than cut at the quote
+    assert count_rendered_reasoning_spans(full) == 1
+
+    prefix = reasoning_marker_prefix(full)
+    marked = _render(tokenizer, with_marked_reasoning(messages, prefix))
+    spans = reasoning_span_texts(marked)
+
+    assert [prefix in span for span in spans] == [True]
+    assert "like so" in spans[0]
+
+
+def test_a_reasoning_span_stops_at_its_own_turn_not_a_later_tool_message(tokenizer) -> None:
+    """A block ends at its own turn even when no LATER turn opens reasoning of its own.
+
+    A tool response does not reset ``last_query_index``, so the assistant before it keeps its
+    reasoning -- and if the scan only stops at the next REASONING turn, a trailing tool message
+    leaves it unbounded. The span then runs through the answer, the turn terminator, and into the
+    tool output, where a quoted closer ends it. A context cap between the real closer and that
+    quoted one reports intact reasoning as truncated.
+    """
+    messages = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1", "reasoning_content": "REAL"},
+        # tool output that happens to contain the template's own closer layout
+        {"role": "user", "content": "<tool_response>before\n</think>\n\nafter</tool_response>"},
+    ]
+    full = _render(tokenizer, messages)
+    spans = reasoning_spans(full)
+
+    assert len(spans) == 1
+    body = full[spans[0][0] : spans[0][1]]
+    assert "REAL" in body
+    # the block stops at its own closer: it does not reach the answer, the terminator, or the tool
+    assert body == "<think>\nREAL\n</think>\n\n"
+    assert "after" not in body
+    assert TURN_END not in body
+
+
+def test_a_verbatim_turn_boundary_inside_reasoning_is_the_documented_ambiguity(tokenizer) -> None:
+    """Pins the ONE shape the rendered text genuinely cannot resolve, so it stays known.
+
+    A quoted header alone is content, and a quoted ``<|im_end|>`` alone is content -- both are
+    handled. Written out TOGETHER they are byte-identical to a real turn boundary, which is what a
+    turn boundary is, so no rule reading the render alone can tell them apart and the turn reports
+    no span. This asserts the current behavior rather than endorsing it: the marker pairing in
+    ``_row_reasoning`` is what stops such a row being miscounted as a survivor, and a change here
+    should be a deliberate one.
+    """
+    messages = [
+        {"role": "user", "content": "u1"},
+        {
+            "role": "assistant",
+            "content": "a1",
+            # the control-token layout written out in full, not merely mentioned
+            "reasoning_content": "see <|im_end|>\n<|im_start|>user\n then more",
+        },
+    ]
+    full = _render(tokenizer, messages)
+
+    # the reasoning IS in the render, and the template did keep it
+    assert "see <|im_end|>" in full
+    # but its bytes are a turn boundary, so the block is not resolvable from the text
+    assert reasoning_spans(full) == []
 
 
 def test_the_real_template_prefers_reasoning_content_over_an_inline_span(tokenizer) -> None:
