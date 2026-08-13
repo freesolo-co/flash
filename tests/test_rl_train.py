@@ -4632,6 +4632,46 @@ def test_bridge_refuses_every_image_block_spelling(block_type):
         bridge.step({"session_id": "a", "completion_text": "answer"})
 
 
+@pytest.mark.parametrize("block_type", ["video", "audio", "tool_use", "input_file"])
+def test_bridge_refuses_a_non_text_reply_block_instead_of_dropping_it(block_type):
+    # the flattener keeps `type == "text"` and joins it, so any other block contributes NOTHING and
+    # disappears. that is the stringified-image defect wearing a different type: the env meant the
+    # model to see something, the model never saw it, and the run still looks healthy.
+    env = _BridgeEnv(
+        replies=[
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "look"}, {"type": block_type, "data": "x"}],
+            }
+        ],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="unsupported type"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+def test_bridge_refuses_a_malformed_text_block_rather_than_flattening_it_to_nothing():
+    # a text block with no string text flattens to "", so the turn silently loses its content.
+    env = _BridgeEnv(
+        replies=[{"role": "user", "content": [{"type": "text", "text": None}]}],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="missing its text"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+def test_bridge_refuses_a_non_object_reply_block():
+    env = _BridgeEnv(replies=[{"role": "user", "content": ["plain string"]}], done_after=99)
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="must be an object"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
 def test_bridge_flattens_a_text_only_block_reply_instead_of_stringifying_it():
     # text blocks ARE representable, so they must not become a repr either: an env that returns
     # openai-style text blocks would otherwise train the model on "[{'type': 'text', ...}]".

@@ -41,6 +41,32 @@ _SINGLE_TURN_SCORE_FLUSH_WAIT_S = 0.1
 _SINGLE_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
 
 
+def _reject_unrepresentable_reply_blocks(content: list) -> None:
+    """Refuse every reply block this transcript cannot carry, not just the image ones.
+
+    ``message_content_text`` keeps ``type == "text"`` blocks and joins them, which means any OTHER
+    block -- video, audio, a tool-use payload, a type this code has never heard of -- contributes
+    nothing and vanishes without a trace. that is the same silent corruption as the stringified
+    image: the environment intended the model to see something, the model never saw it, and every
+    metric still reports a healthy run. so the flattening below is only allowed to run once the
+    content is known to be text and nothing but text.
+    """
+    for position, block in enumerate(content):
+        if not isinstance(block, dict):
+            raise ValueError(
+                f"environment reply content block {position} must be an object, not "
+                f"{type(block).__name__}"
+            )
+        block_type = block.get("type")
+        if block_type != "text":
+            raise ValueError(
+                f"environment reply content block {position} has unsupported type {block_type!r}; "
+                "a multi-turn GRPO environment reply can carry text blocks only"
+            )
+        if not isinstance(block.get("text"), str):
+            raise ValueError(f"environment reply text block {position} is missing its text")
+
+
 def _env_reply_message(message: dict) -> dict:
     """one environment reply message, as the role/content text the child transcript can carry.
 
@@ -49,20 +75,24 @@ def _env_reply_message(message: dict) -> dict:
     fail -- it produces the python repr, and the model then reads a literal
     ``[{'type': 'image_url', ...}]`` as its prompt text while every metric reports a healthy run.
 
-    an image block is refused outright instead. the media a rollout conditions on is fixed from the
-    initial prompt (see ``_EpisodePrompt``), so a mid-episode image cannot reach the engine no matter
-    what this returns; stringifying it would train on the repr of a dropped image. refusing is the
-    interim contract until per-turn media is threaded into the rollout, and it is LOUD -- the bridge
-    turns a raise into a 400 that fails the episode -- because silence is the actual defect here.
+    a block the transcript cannot represent is refused outright instead. the media a rollout
+    conditions on is fixed from the initial prompt (see ``_EpisodePrompt``), so a mid-episode image
+    cannot reach the engine no matter what this returns; stringifying it would train on the repr of
+    a dropped image, and dropping it would train on a turn the environment never wrote. refusing is
+    the interim contract until per-turn media is threaded into the rollout, and it is LOUD -- the
+    bridge turns a raise into a 400 that fails the episode -- because silence is the actual defect.
     """
     content = message.get("content")
     if isinstance(content, list):
+        # images get their own message ahead of the generic guard: it is the one unsupported block
+        # with an action attached, so saying which one it is beats naming the type alone.
         if content_has_images(content):
             raise ValueError(
                 "environment reply carries an image block; multi-turn GRPO conditions every turn on "
                 "the media from the INITIAL prompt, so an image returned by step_episode cannot "
                 "reach the model. return text, or put the image in the initial prompt"
             )
+        _reject_unrepresentable_reply_blocks(content)
         # text-only blocks are a shape this transcript CAN represent exactly, so flatten them
         # through the same definition of "the text of a message" the graders and reward path use.
         return {"role": str(message.get("role", "")), "content": message_content_text(content)}
