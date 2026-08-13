@@ -1079,9 +1079,13 @@ in a sensible value, so only override with a reason.
 For thinking models, each turn's `max_completion_tokens` is shared between `<think>` reasoning and
 its final answer or action, so undersizing it can truncate the action and teach the model to stop
 reasoning. In multi-turn runs, also size `max_context_tokens` for the accumulated transcript or later
-turns can run out of context. Watch `truncation_rate`; truncation counts model turns not ending in
-EOS or a configured stop and is not strictly `finish_reason=length`. OPD runs also report a
-per-step `discarded_rollouts` count alongside that rate.
+turns can run out of context. Watch `truncation_rate`, but know what it measures on each algorithm.
+In OPD it counts model turns that did not end in EOS or a configured stop, and OPD additionally
+reports a per-step `discarded_rollouts` count alongside it. In GRPO it comes from verl's
+episode-level clipping, so a single turn hitting the cap does not raise it on its own: that turn
+ends the episode early, which leaves the concatenated response short of the widened capacity verl
+measures against. On multi-turn GRPO, treat a zero rate as "no episode filled its response budget",
+not as "no turn was cut off", and read episode length against the environment's turn limit instead.
 
 Neither metric detects the other way `max_context_tokens` shortens an episode. When an environment
 reply would leave no room to generate, both multi-turn loops stop _before_ dispatching the next
