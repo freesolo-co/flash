@@ -473,7 +473,9 @@ def _chat_reply(payload: Any) -> str | None:
     """
     if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
         return None
-    if payload.get("error"):
+    if payload.get("error") is not None:
+        # a null error is the success shape of providers that always emit the key. any non-null value
+        # is ambiguous training data and is skipped here; raw export still preserves the full envelope.
         return None
     if not payload["choices"]:
         return None
@@ -534,6 +536,27 @@ def _usable_payload(value: Any) -> bool:
     return value is not None and (not isinstance(value, str) or bool(value.strip()))
 
 
+def _utf8_safe_text(value: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return value.encode("utf-16", errors="surrogatepass").decode("utf-16", errors="replace")
+    return value
+
+
+def _normalize_utf8_strings(value: Any) -> Any:
+    if isinstance(value, str):
+        return _utf8_safe_text(value)
+    if isinstance(value, dict):
+        return {
+            _utf8_safe_text(key) if isinstance(key, str) else key: _normalize_utf8_strings(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_normalize_utf8_strings(item) for item in value]
+    return value
+
+
 def _json_dump(
     value: Any,
     *,
@@ -546,12 +569,14 @@ def _json_dump(
     if value is None:
         return None
     serialized = json.dumps(
-        sanitize_json_value(
-            value,
-            max_string=max_string,
-            max_depth=max_depth,
-            max_collection=max_collection,
-            flag=flag,
+        _normalize_utf8_strings(
+            sanitize_json_value(
+                value,
+                max_string=max_string,
+                max_depth=max_depth,
+                max_collection=max_collection,
+                flag=flag,
+            )
         ),
         ensure_ascii=False,
         sort_keys=True,

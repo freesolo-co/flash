@@ -99,6 +99,13 @@ class SseDoneGate:
                 self._line_start = 0
                 self._scan_start = 0
             elif not content.startswith(b"data:") and len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
+                if self._line_start < len(self._buffer):
+                    forwarded.extend(self._buffer[: self._line_start])
+                    del self._buffer[: self._line_start]
+                    self._line_start = 0
+                    self._scan_start = 0
+                    self._holding_done_candidate = False
+                    continue
                 self._settle_bounded_done()
                 return [bytes(forwarded)] if forwarded else []
 
@@ -536,7 +543,12 @@ class SseAccumulator:
     def _consume_event(self) -> None:
         if not self._event_data:
             return
-        data = b"\n".join(self._event_data)
+        event_data = self._event_data
+        if len(event_data) > 1 and event_data[0] == b"[DONE]":
+            # a later data line proves the first one was not a terminal event. discard that candidate
+            # before parsing the remaining joined payload so an oversized open event stays recordable.
+            event_data = event_data[1:]
+        data = b"\n".join(event_data)
         self._event_data.clear()
         self._event_data_bytes = 0
         if not data:

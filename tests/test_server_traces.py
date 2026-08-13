@@ -23,7 +23,7 @@ from flash.server.platform.traces import (
     sanitize_json_value,
     store_trace,
 )
-from flash.server.routes import trace_sse, traces
+from flash.server.routes import trace_redaction, trace_sse, traces
 
 _PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 _OTHER_PROJECT_ID = "22222222-2222-4222-8222-222222222222"
@@ -965,6 +965,33 @@ def test_done_gate_releases_a_large_partial_second_data_line() -> None:
     assert gate.terminated is False
     assert gate.done_event is None
     assert gate._buffer == b""
+
+
+def test_done_gate_releases_oversized_closed_comment_before_later_data() -> None:
+    stream = (
+        b"data: [DONE]\n"
+        b":"
+        + b"x" * 1_200
+        + b'\ndata: {"choices":[{"index":0,"delta":{"content":"AFTER"}}]}\n\n'
+        + b"data: [DONE]\n\n"
+    )
+    assert len(stream) == 1_290
+    gate = trace_sse.SseDoneGate()
+    accumulator = trace_sse.SseAccumulator()
+
+    relayed = gate.feed(stream)
+    relayed.extend(gate.finish())
+    for chunk in relayed:
+        accumulator.feed(chunk)
+    if gate.done_event is not None:
+        accumulator.feed(gate.done_event)
+    accumulator.finish()
+
+    assert b"".join(relayed) + (gate.done_event or b"") == stream
+    assert len(b"".join(relayed) + (gate.done_event or b"")) == 1_290
+    assert b"AFTER" in b"".join(relayed)
+    assert accumulator.output()["choices"][0]["message"]["content"] == "AFTER"
+    assert accumulator.defect is None
 
 
 def test_done_gate_bounds_a_newline_free_non_data_suffix() -> None:
@@ -2583,11 +2610,24 @@ def test_an_absent_or_assistant_reply_role_still_exports(trace_api, role) -> Non
     ("error", "exported"),
     [
         ({"message": "upstream model failure", "type": "server_error"}, False),
+        ("upstream model failure", False),
         (None, True),
-        ({}, True),
-        (False, True),
+        ({}, False),
+        (False, False),
+        ([], False),
+        (0, False),
+        ("", False),
     ],
-    ids=["meaningful-error", "null", "empty-object", "false"],
+    ids=[
+        "object-error",
+        "string-error",
+        "null",
+        "empty-object",
+        "false",
+        "empty-list",
+        "zero",
+        "empty-string",
+    ],
 )
 def test_records_skip_only_meaningful_top_level_error_envelopes(
     trace_api, error: object, exported: bool
@@ -2612,6 +2652,15 @@ def test_records_skip_only_meaningful_top_level_error_envelopes(
     assert raw["records"][0]["spans"][0]["output_payload"] == response
     assert records["records"] == ([{"input": "hello", "output": "good"}] if exported else [])
     assert records["skipped"] == (0 if exported else 1)
+
+
+def test_records_accept_absent_and_per_choice_error_fields() -> None:
+    absent = _reply_envelope("good")
+    nested = _reply_envelope("good")
+    nested["choices"][0]["error"] = {"message": "choice metadata"}
+
+    assert platform_traces._chat_reply(absent) == "good"
+    assert platform_traces._chat_reply(nested) == "good"
 
 
 def test_a_text_only_reply_still_exports_after_tool_call_filtering(trace_api) -> None:
@@ -3749,6 +3798,93 @@ def test_percent_encoded_secret_schema_refs_are_redacted(trace_api, monkeypatch,
     assert stored["$defs"]["Alpha"]["default"] == "[redacted]"
     assert stored["$defs"]["Alpha"]["const"] == "[redacted]"
     assert stored["$defs"]["Alpha"]["enum"] == ["[redacted]"]
+
+
+def test_secret_schema_ref_with_extension_keyword_redacts_neutral_target() -> None:
+    assert traces._is_secret_key("Widget") is False
+    schema = {
+        "type": "object",
+        "properties": {
+            "api_key": {"$ref": "#/$defs/Widget", "vendorKeyword": True},
+        },
+        "$defs": {
+            "Widget": {
+                "type": "string",
+                "default": "SECRET-M1-DEFAULT",
+                "enum": ["SECRET-M1-ENUM"],
+            }
+        },
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["$defs"]["Widget"] == {
+        "type": "string",
+        "default": "[redacted]",
+        "enum": ["[redacted]"],
+    }
+
+
+def test_schema_resource_uris_normalize_scheme_and_host_only() -> None:
+    assert traces._is_secret_key("Widget") is False
+    schema = {
+        "$id": "https://Example.com/schema",
+        "type": "object",
+        "properties": {
+            "api_key": {"$ref": "https://example.com/schema#/$defs/Widget"},
+        },
+        "$defs": {
+            "Widget": {
+                "type": "string",
+                "default": "SECRET-M2",
+                "enum": ["SECRET-M2-ENUM"],
+            }
+        },
+    }
+    distinct_paths = {
+        "$id": "https://example.com/root",
+        "type": "object",
+        "properties": {
+            "api_key": {"$ref": "https://EXAMPLE.com/A#/$defs/Widget"},
+        },
+        "$defs": {
+            "Upper": {
+                "$id": "https://example.com/A",
+                "$defs": {"Widget": {"default": "UPPER"}},
+            },
+            "Lower": {
+                "$id": "https://example.com/a",
+                "$defs": {"Widget": {"default": "lower"}},
+            },
+        },
+    }
+
+    userinfo = "https://User:Pass@Example.com/schema"
+    stored = traces._redact_secret_fields(schema)
+    control = traces._redact_secret_fields(distinct_paths)
+
+    assert (
+        trace_redaction._canonical_resource_uri(userinfo) == "https://User:Pass@example.com/schema"
+    )
+    assert stored["$defs"]["Widget"] == {
+        "type": "string",
+        "default": "[redacted]",
+        "enum": ["[redacted]"],
+    }
+    assert control["$defs"]["Upper"]["$defs"]["Widget"]["default"] == "[redacted]"
+    assert control["$defs"]["Lower"]["$defs"]["Widget"]["default"] == "lower"
+
+
+def test_overlapping_secret_values_are_redacted_longest_first() -> None:
+    short = "sk-plane-abcdefghijklmnop"
+    longer = "sk-plane-abcdefghijklmnop-PROVIDER-TAIL"
+    text = f"authorization: Bearer {longer}"
+
+    assert traces._redact_secret_string(text, (short, longer)) == "authorization: Bearer [redacted]"
+    assert traces._redact_secret_string(text, (longer, short)) == "authorization: Bearer [redacted]"
+    assert traces._redact_secret_string(text, (short, longer, longer)) == (
+        "authorization: Bearer [redacted]"
+    )
 
 
 def test_embedded_schema_resource_id_refs_redact_the_local_target() -> None:
@@ -5346,6 +5482,50 @@ def test_ordinary_content_with_a_production_budget_is_not_defective() -> None:
 
     assert accumulator.defect is None
     assert accumulator.truncated is False
+
+
+def test_json_dump_replaces_lone_surrogates_and_preserves_unicode() -> None:
+    ordinary = "héllo 日本語 🎉"
+    payload = {
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": "\ud800"}},
+        ],
+        "ordinary": ordinary,
+    }
+
+    serialized = platform_traces._json_dump(payload)
+
+    assert serialized is not None
+    assert "\ud800" not in serialized
+    assert "�" in serialized
+    assert ordinary in serialized
+    assert "\\u00e9" not in serialized
+    assert "\\u65e5" not in serialized
+    assert "\\ud83c" not in serialized
+    restored = json.loads(serialized)
+    assert restored["choices"][0]["message"]["content"] == "�"
+    assert restored["ordinary"] == ordinary
+
+
+def test_a_surrogate_response_is_stored_instead_of_dropped(trace_api, monkeypatch) -> None:
+    body = b'{"choices":[{"index":0,"message":{"role":"assistant","content":"\\ud800"}}]}'
+    _StaticAsyncClient.response = httpx.Response(
+        200,
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 200
+    assert response.content == body
+    assert response.headers.get(traces._RECORD_FAILED_HEADER) is None
+    raw = _raw(trace_api)
+    assert raw["traces"] == 1
+    assert (
+        raw["records"][0]["spans"][0]["output_payload"]["choices"][0]["message"]["content"] == "�"
+    )
 
 
 def test_a_surrogate_in_a_stream_does_not_interrupt_the_relay(trace_api, monkeypatch) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import unquote, urldefrag, urljoin
+from urllib.parse import unquote, urldefrag, urljoin, urlsplit, urlunsplit
 
 from flash.server.platform import traces as platform_traces
 
@@ -129,10 +129,10 @@ def _is_schema_definition(value: Any) -> bool:
         # "[redacted]" and turned a valid schema into an invalid one.
         return True
     keys = [key for key in value if not (isinstance(key, str) and key.startswith("x-"))]
-    if any(key not in _JSON_SCHEMA_KEYWORDS for key in keys):
-        return False
     if any(key in _JSON_SCHEMA_STRUCTURAL_KEYWORDS for key in keys):
         return True
+    if any(key not in _JSON_SCHEMA_KEYWORDS for key in keys):
+        return False
     return bool(keys) and all(key not in _JSON_SCHEMA_VALUE_KEYWORDS for key in keys)
 
 
@@ -178,6 +178,18 @@ def _local_schema_pointer(
     return frozenset()
 
 
+def _canonical_resource_uri(uri: str) -> str:
+    scheme, netloc, path, query, fragment = urlsplit(uri)
+    userinfo, user_separator, hostport = netloc.rpartition("@")
+    if hostport.startswith("[") and (host_end := hostport.find("]")) >= 0:
+        hostport = f"[{hostport[1:host_end].casefold()}]{hostport[host_end + 1 :]}"
+    else:
+        host, port_separator, port = hostport.rpartition(":")
+        hostport = f"{host.casefold()}:{port}" if port_separator else hostport.casefold()
+    normalized_netloc = f"{userinfo}@{hostport}" if user_separator else hostport
+    return urlunsplit((scheme.casefold(), normalized_netloc, path, query, fragment))
+
+
 def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[str, ...]]:
     resources: dict[str, tuple[str, ...]] = {}
 
@@ -188,7 +200,7 @@ def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[
             resource_id = node.get("$id")
             if isinstance(resource_id, str):
                 base_uri = urljoin(base_uri, resource_id)
-                resources.setdefault(urldefrag(base_uri)[0], path)
+                resources.setdefault(_canonical_resource_uri(urldefrag(base_uri)[0]), path)
             for key, item in node.items():
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                     collect(item, (*path, str(key)), base_uri, depth + 1)
@@ -259,7 +271,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
                 ref = node.get(keyword)
                 if isinstance(ref, str):
                     resolved_base, fragment = urldefrag(urljoin(scope_uri, ref))
-                    resource_path = resources.get(resolved_base)
+                    resource_path = resources.get(_canonical_resource_uri(resolved_base))
                     if resource_path is not None:
                         resource_ref = f"#{fragment}"
                         pointers = _local_schema_pointer(resource_ref, anchors)
@@ -407,9 +419,9 @@ def _redact_secret_fields(
 
 
 def _redact_secret_string(value: str, secrets: tuple[str, ...]) -> str:
-    for secret in secrets:
-        if len(secret) >= _MIN_SECRET_SUBSTRING_LENGTH:
-            value = value.replace(secret, "[redacted]")
+    eligible_secrets = {secret for secret in secrets if len(secret) >= _MIN_SECRET_SUBSTRING_LENGTH}
+    for secret in sorted(eligible_secrets, key=len, reverse=True):
+        value = value.replace(secret, "[redacted]")
     return value
 
 
