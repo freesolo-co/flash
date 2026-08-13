@@ -1015,3 +1015,44 @@ def test_org_peer_warm_start_recovers_the_context_the_cli_cannot_read() -> None:
     # plain index() finds that one and would assert nothing about the re-warn.
     late = body.index("_print_rl_prompt_budget_warning(status)", submitted)
     assert early < submitted < late
+
+
+def test_source_context_is_reported_as_configured_not_as_trained() -> None:
+    """`_warmstart_source_context` reads the source's AUTHORED max_context_tokens. The source's own
+    worker clamped that to its model architecture exactly as this run's will, so "trained at 8192"
+    states as fact a number nothing here verified -- a source configured for 8192 on a revision
+    capped at 4096 trained at 4096. The sentence exists to say a context is there and is not
+    inherited, and that survives saying "configured with"."""
+    from flash.engine.plan.prompt_budget import rl_prompt_budget, rl_prompt_budget_warning
+
+    message = rl_prompt_budget_warning(
+        rl_prompt_budget(_budget_spec("grpo", {}), warm_start_context=8192)
+    )
+    assert message
+    assert "configured with max_context_tokens=8192" in message
+    assert "trained at" not in message
+    assert "NOT" in message  # the non-inheritance is the point and must survive the hedge
+
+
+def test_locally_derived_budget_names_the_cli_that_derived_it() -> None:
+    """The cli computes the budget from ITS package's recipe constants. On a rolling upgrade the
+    control plane's defaults can differ, and train-schema compatibility does not compare recipe
+    values, so an unqualified number claims to be the submitted run's budget when it is this cli's
+    guess at it. The server's own descriptor is authoritative for the run it accepted, so it carries
+    no marker and gets no caveat -- otherwise every warning would hedge, including the correct one."""
+    from flash import __version__
+    from flash.engine.plan.prompt_budget import rl_prompt_budget, rl_prompt_budget_warning
+
+    local = rl_prompt_budget(_budget_spec("grpo", {}), derived_by="cli")
+    assert local["derived_by"] == "cli"
+    local_message = rl_prompt_budget_warning(local)
+    assert f"this CLI {__version__}" in local_message
+    assert "recipe default may differ" in local_message
+
+    served = rl_prompt_budget(_budget_spec("grpo", {}))
+    assert "derived_by" not in served
+    served_message = rl_prompt_budget_warning(served)
+    assert "Derived locally" not in served_message
+    # the budget itself must be identical either way: the marker annotates provenance, it does not
+    # change the arithmetic.
+    assert served["prompt_budget"] == local["prompt_budget"]

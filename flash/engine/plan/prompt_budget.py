@@ -15,7 +15,15 @@ from flash.engine.plan.vram import (
 )
 
 
-def rl_prompt_budget(spec, *, warm_start_context: int | None = None) -> dict | None:
+def _cli_version() -> str:
+    from flash import __version__
+
+    return str(__version__)
+
+
+def rl_prompt_budget(
+    spec, *, warm_start_context: int | None = None, derived_by: str = ""
+) -> dict | None:
     """The prompt budget a grpo/opd run will train against, derived exactly as its worker derives it.
 
     The workers do not truncate an over-budget prompt and do not raise on one: they DROP it
@@ -62,6 +70,10 @@ def rl_prompt_budget(spec, *, warm_start_context: int | None = None) -> dict | N
     source_context = int(warm_start_context or 0)
     if source_context > 0:
         budget["warm_start_context"] = source_context
+    # only the cli marks itself. the server's descriptor is authoritative for the run it submitted,
+    # so it carries no marker and its warning makes no version caveat.
+    if derived_by:
+        budget["derived_by"] = derived_by
     return budget
 
 
@@ -97,10 +109,24 @@ def rl_prompt_budget_warning(budget: object) -> str | None:
         f"this. Prompts over the budget are DROPPED, not truncated, so the run trains on a "
         f"shorter, biased subset."
     )
+    # the local derivation reads THIS package's recipe constants. when the cli and the control
+    # plane are on different releases the server's defaults can differ, and nothing in the
+    # train-schema compatibility check compares recipe values -- so say which side computed the
+    # number rather than presenting it as the submitted run's. the server-derived descriptor
+    # carries no source, so this qualifies only the locally-derived one.
+    if budget.get("derived_by") == "cli":
+        message += (
+            f" (Derived locally by this CLI {_cli_version()}; if the control plane is on a "
+            f"different release its recipe default may differ.)"
+        )
     source_context = budget.get("warm_start_context")
     if isinstance(source_context, int) and not isinstance(source_context, bool):
+        # "was configured with", not "trained at". this is the source's AUTHORED value, and the
+        # source's own worker clamped it to that model's architecture exactly as this run's will --
+        # so claiming it trained there would state as fact a number we did not verify. the point of
+        # the sentence is that a context exists and is not inherited, which survives the hedge.
         message += (
-            f" The warm-start source trained at max_context_tokens={source_context}; it is NOT "
-            f"inherited."
+            f" The warm-start source was configured with max_context_tokens={source_context}; "
+            f"it is NOT inherited."
         )
     return message + " Set train.max_context_tokens explicitly to choose the budget."

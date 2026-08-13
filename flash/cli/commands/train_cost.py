@@ -93,7 +93,7 @@ def _cmd_train_cost_offline(spec) -> int:
     # a context it did not verify would be a claim rather than a measurement.
     from flash.engine.plan.prompt_budget import rl_prompt_budget
 
-    _print_rl_prompt_budget_warning({"prompt_budget": rl_prompt_budget(spec)})
+    _print_rl_prompt_budget_warning({"prompt_budget": rl_prompt_budget(spec, derived_by="cli")})
     return 0
 
 

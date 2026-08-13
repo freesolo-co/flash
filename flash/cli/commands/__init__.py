@@ -443,7 +443,11 @@ def cmd_train(args) -> int:
     # the warm-start context is resolved here too rather than read off the response: it is the part
     # that names WHICH context is being ignored, and moving the warning earlier without it would
     # trade the finding's headline scenario for the timing fix instead of getting both.
-    local_budget = rl_prompt_budget(spec, warm_start_context=warmstart_source_context(client, spec))
+    local_budget = rl_prompt_budget(
+        spec,
+        warm_start_context=warmstart_source_context(client, spec),
+        derived_by="cli",
+    )
     _print_rl_prompt_budget_warning({"prompt_budget": local_budget})
     status = client.create_run(
         payload,
