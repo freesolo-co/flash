@@ -286,6 +286,24 @@ def test_json_value_conversion_failure_relays_body_and_records_text(trace_api, m
     assert span["status_code"] == "OK"
 
 
+def test_recursive_json_response_relays_body_and_records_text(trace_api, monkeypatch) -> None:
+    body = b"[" * 100_000 + b"]" * 100_000
+    _StaticAsyncClient.response = httpx.Response(
+        200,
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 200
+    assert response.content == body
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["output_payload"] == body.decode()
+    assert span["status_code"] == "OK"
+
+
 def test_huge_integer_request_body_returns_invalid_json(trace_api) -> None:
     body = b'{"number":' + b"9" * 4_301 + b"}"
 
@@ -657,6 +675,23 @@ def test_distinct_sse_delta_field_names_count_toward_the_stream_budget() -> None
     assert accumulator.truncated is True
     assert accumulator.defect is None
     assert len(json.dumps(accumulator.output()).encode()) <= budget
+
+
+def test_distinct_sse_envelope_field_names_count_toward_the_stream_budget() -> None:
+    budget = 5_000
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=budget)
+
+    for index in range(2_000):
+        field = f"extension_{index}_" + "x" * 200
+        event = json.dumps({field: "", "choices": []}).encode()
+        accumulator.feed(b"data: " + event + b"\n\n")
+        if accumulator.truncated:
+            break
+
+    assert accumulator.truncated is True
+    assert accumulator.defect is None
+    assert len(accumulator._envelope) < 2_000
+    assert len(json.dumps(accumulator.output()).encode()) <= budget + 200
 
 
 def test_finish_reasons_count_toward_the_stream_budget() -> None:
@@ -2804,6 +2839,64 @@ def test_secret_named_schema_ref_literals_are_redacted(trace_api, monkeypatch) -
     }
 
 
+@pytest.mark.parametrize("nesting", [0, 9], ids=["shallow", "deep"])
+def test_secret_schema_anchor_ref_literals_are_redacted_transitively(
+    trace_api, monkeypatch, nesting: int
+) -> None:
+    secret_property = {"properties": {"password": {"$ref": "#Credential"}}}
+    for _ in range(nesting):
+        secret_property = {"type": "object", "properties": {"level": secret_property}}
+    schema = {
+        **secret_property,
+        "properties": {
+            **secret_property["properties"],
+            "access_token": {"$ref": "https://example.com/schema#Sibling"},
+            "recovery_token": {"$ref": "#Dynamic"},
+        },
+        "$defs": {
+            "Holder": {"$anchor": "Credential", "$ref": "#Payload"},
+            "Target": {
+                "$anchor": "Payload",
+                "type": "string",
+                "default": "SECRET-ANCHOR",
+            },
+            "Sibling": {
+                "$anchor": "Sibling",
+                "type": "string",
+                "default": "ordinary-default",
+            },
+            "Remote": {
+                "$anchor": "Remote",
+                "$ref": "https://example.com/schema#Sibling",
+            },
+            "Dynamic": {
+                "$dynamicAnchor": "Dynamic",
+                "type": "string",
+                "default": "dynamic-default",
+            },
+        },
+    }
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions",
+        headers=_HEADERS,
+        json={
+            **_REQUEST,
+            "response_format": {"type": "json_schema", "json_schema": {"schema": schema}},
+        },
+    )
+
+    assert response.status_code == 200
+    definitions = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]["response_format"][
+        "json_schema"
+    ]["schema"]["$defs"]
+    assert definitions["Target"]["default"] == "[redacted]"
+    assert definitions["Sibling"]["default"] == "ordinary-default"
+    assert definitions["Dynamic"]["default"] == "dynamic-default"
+
+
 @pytest.mark.parametrize(
     ("ref", "definitions", "path"),
     [
@@ -2978,6 +3071,46 @@ def test_unreferenced_schema_definition_literals_are_not_redacted(trace_api, mon
     assert definitions["Benign"]["default"] == "ordinary-default"
 
 
+@pytest.mark.parametrize("literal_keyword", ["default", "examples"])
+def test_schema_refs_inside_instance_data_do_not_link_unrelated_definitions(
+    trace_api, monkeypatch, literal_keyword: str
+) -> None:
+    instance_data = {"$ref": "#/$defs/Unrelated"}
+    schema = {
+        "type": "object",
+        "properties": {"password": {"$ref": "#/$defs/Outer"}},
+        "$defs": {
+            "Outer": {
+                "type": "object",
+                literal_keyword: [instance_data]
+                if literal_keyword == "examples"
+                else instance_data,
+            },
+            "Unrelated": {
+                "type": "string",
+                "default": "ORDINARY-VALUE",
+            },
+        },
+    }
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions",
+        headers=_HEADERS,
+        json={
+            **_REQUEST,
+            "response_format": {"type": "json_schema", "json_schema": {"schema": schema}},
+        },
+    )
+
+    assert response.status_code == 200
+    definitions = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]["response_format"][
+        "json_schema"
+    ]["schema"]["$defs"]
+    assert definitions["Unrelated"]["default"] == "ORDINARY-VALUE"
+
+
 def test_cyclic_schema_refs_from_a_secret_property_terminate_and_redact(
     trace_api, monkeypatch
 ) -> None:
@@ -3012,6 +3145,120 @@ def test_cyclic_schema_refs_from_a_secret_property_terminate_and_redact(
     ]["json_schema"]["schema"]["definitions"]["Recovery"]
     assert stored_definition["default"] == "[redacted]"
     assert stored_definition["properties"]["next"] == {"$ref": "#/definitions/Recovery"}
+
+
+def _recorded_response_schema(trace_api, monkeypatch, schema: dict) -> dict:
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions",
+        headers=_HEADERS,
+        json={
+            **_REQUEST,
+            "response_format": {"type": "json_schema", "json_schema": {"schema": schema}},
+        },
+    )
+
+    assert response.status_code == 200
+    return _raw(trace_api)["records"][0]["spans"][0]["input_payload"]["response_format"][
+        "json_schema"
+    ]["schema"]
+
+
+def test_secret_schema_pointer_outside_definition_containers_is_redacted(
+    trace_api, monkeypatch
+) -> None:
+    schema = {
+        "properties": {"password": {"$ref": "#/components/Cred"}},
+        "components": {"Cred": {"default": "S1"}},
+    }
+
+    stored = _recorded_response_schema(trace_api, monkeypatch, schema)
+
+    assert stored["components"]["Cred"]["default"] == "[redacted]"
+
+
+def test_nested_definition_name_collision_preserves_unreferenced_literal(
+    trace_api, monkeypatch
+) -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "password": {"$ref": "#/$defs/Cred"},
+            "profile": {
+                "type": "object",
+                "$defs": {"Cred": {"default": "UNRELATED"}},
+            },
+        },
+        "$defs": {"Cred": {"default": "SROOT"}},
+    }
+
+    stored = _recorded_response_schema(trace_api, monkeypatch, schema)
+
+    assert stored["$defs"]["Cred"]["default"] == "[redacted]"
+    assert stored["properties"]["profile"]["$defs"]["Cred"]["default"] == "UNRELATED"
+
+
+def test_duplicate_schema_anchor_declarations_are_all_redacted(trace_api, monkeypatch) -> None:
+    schema = {
+        "properties": {"password": {"$ref": "#Dup"}},
+        "$defs": {
+            "A": {"$anchor": "Dup", "default": "S-FIRST"},
+            "B": {"$anchor": "Dup", "default": "S-SECOND"},
+        },
+    }
+
+    stored = _recorded_response_schema(trace_api, monkeypatch, schema)
+
+    assert stored["$defs"]["A"]["default"] == "[redacted]"
+    assert stored["$defs"]["B"]["default"] == "[redacted]"
+
+
+def test_schema_anchor_outside_definition_containers_is_redacted(trace_api, monkeypatch) -> None:
+    schema = {
+        "properties": {"password": {"$ref": "#External"}},
+        "components": {
+            "Cred": {"$anchor": "External", "default": "S-ANCHOR"},
+        },
+    }
+
+    stored = _recorded_response_schema(trace_api, monkeypatch, schema)
+
+    assert stored["components"]["Cred"]["default"] == "[redacted]"
+
+
+def test_schema_reference_resolution_regressions(trace_api, monkeypatch) -> None:
+    schema = {
+        "properties": {
+            "password": {"$ref": "#/$defs/C"},
+            "recovery_token": {"$ref": "#/$defs/A"},
+            "access_token": {"$ref": "https://x#Remote"},
+            "credential": {"$ref": "#/$defs/LiteralHolder"},
+        },
+        "$defs": {
+            "C": {"default": "DIRECT"},
+            "A": {"$ref": "#/$defs/B"},
+            "B": {"default": "TRANSITIVE"},
+            "Sibling": {"default": "KEEP"},
+            "Remote": {"default": "REMOTE"},
+            "LiteralHolder": {
+                "default": {"$ref": "#/$defs/DefaultTarget"},
+                "examples": [{"$ref": "#/$defs/ExamplesTarget"}],
+            },
+            "DefaultTarget": {"default": "DEFAULT-KEEP"},
+            "ExamplesTarget": {"default": "EXAMPLES-KEEP"},
+        },
+    }
+
+    definitions = _recorded_response_schema(trace_api, monkeypatch, schema)["$defs"]
+
+    assert definitions["C"]["default"] == "[redacted]"
+    assert definitions["B"]["default"] == "[redacted]"
+    assert definitions["Sibling"]["default"] == "KEEP"
+    assert definitions["Remote"]["default"] == "REMOTE"
+    assert definitions["DefaultTarget"]["default"] == "DEFAULT-KEEP"
+    assert definitions["ExamplesTarget"]["default"] == "EXAMPLES-KEEP"
 
 
 def test_a_request_token_field_is_redacted(trace_api, monkeypatch) -> None:

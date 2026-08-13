@@ -288,13 +288,16 @@ class SseAccumulator:
         if self.truncated or self._max_accumulated_bytes is None:
             return not self.truncated
         previous_size = self._overwriting_sizes.get(key, 0)
-        size = self._value_size(value)
+        value_size = self._value_size(value)
+        size = value_size
+        if key not in self._overwriting_sizes:
+            size += self._value_size(key) + 4
         retained_bytes = self._accumulated_bytes - previous_size
         if size > self._max_accumulated_bytes - retained_bytes:
             self.truncated = True
             return False
         self._accumulated_bytes = retained_bytes + size
-        self._overwriting_sizes[key] = size
+        self._overwriting_sizes[key] = value_size
         return True
 
     @property
@@ -381,7 +384,7 @@ class SseAccumulator:
             return
         try:
             payload = json.loads(data)
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             self._note_defect("stream contained an unparseable data event")
             return
         if not isinstance(payload, dict):

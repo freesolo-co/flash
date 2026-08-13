@@ -222,19 +222,45 @@ def _redact_schema_literal(value: Any, *, depth: int) -> Any:
     return "[redacted]"
 
 
-def _local_schema_pointer(ref: str) -> tuple[str, ...] | None:
-    if not ref.startswith("#/"):
-        return None
-    segments = tuple(
-        segment.replace("~1", "/").replace("~0", "~") for segment in ref[2:].split("/")
-    )
-    return segments if segments and segments[0] in {"$defs", "definitions"} else None
+def _local_schema_pointer(
+    ref: str, anchors: Mapping[str, frozenset[tuple[str, ...]]]
+) -> frozenset[tuple[str, ...]]:
+    if ref.startswith("#/"):
+        segments = tuple(
+            segment.replace("~1", "/").replace("~0", "~") for segment in ref[2:].split("/")
+        )
+        return frozenset({segments}) if segments else frozenset()
+    if ref.startswith("#") and len(ref) > 1:
+        return anchors.get(ref[1:], frozenset())
+    return frozenset()
+
+
+def _schema_anchor_pointers(value: Any) -> dict[str, frozenset[tuple[str, ...]]]:
+    anchors: dict[str, set[tuple[str, ...]]] = {}
+
+    def collect(node: Any, path: tuple[str, ...], depth: int) -> None:
+        if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
+            return
+        if isinstance(node, dict):
+            anchor = node.get("$anchor")
+            if isinstance(anchor, str) and path:
+                anchors.setdefault(anchor, set()).add(path)
+            for key, item in node.items():
+                if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
+                    collect(item, (*path, str(key)), depth + 1)
+        elif isinstance(node, list | tuple):
+            for item in node:
+                collect(item, path, depth + 1)
+
+    collect(value, (), 0)
+    return {name: frozenset(paths) for name, paths in anchors.items()}
 
 
 def _secret_schema_definition_refs(value: Any) -> set[tuple[str, ...]]:
     if not isinstance(value, dict) or not isinstance(value.get("properties"), dict):
         return set()
     refs: set[tuple[str, ...]] = set()
+    anchors = _schema_anchor_pointers(value)
 
     def collect_refs(node: Any, node_depth: int) -> set[tuple[str, ...]]:
         if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
@@ -242,10 +268,11 @@ def _secret_schema_definition_refs(value: Any) -> set[tuple[str, ...]]:
         found: set[tuple[str, ...]] = set()
         if isinstance(node, dict):
             ref = node.get("$ref")
-            if isinstance(ref, str) and (pointer := _local_schema_pointer(ref)) is not None:
-                found.add(pointer)
-            for item in node.values():
-                found.update(collect_refs(item, node_depth + 1))
+            if isinstance(ref, str):
+                found.update(_local_schema_pointer(ref, anchors))
+            for key, item in node.items():
+                if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
+                    found.update(collect_refs(item, node_depth + 1))
         elif isinstance(node, list | tuple):
             for item in node:
                 found.update(collect_refs(item, node_depth + 1))
@@ -304,7 +331,9 @@ def _redact_secret_fields(
     if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
         return "[redacted]"
     if isinstance(value, dict):
-        local_secret_schema_refs = _secret_schema_definition_refs(value)
+        local_secret_schema_refs = {
+            (*schema_definition_path, *pointer) for pointer in _secret_schema_definition_refs(value)
+        }
         active_secret_schema_refs = (secret_schema_refs or set()) | local_secret_schema_refs
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
@@ -332,11 +361,7 @@ def _redact_secret_fields(
                     logprob_entries=logprob_entries
                     or (logprobs and key in {"content", "refusal", "top_logprobs"}),
                     secret_schema_refs=active_secret_schema_refs,
-                    schema_definition_path=(
-                        current_schema_path
-                        if schema_definition_path or key in {"$defs", "definitions"}
-                        else ()
-                    ),
+                    schema_definition_path=current_schema_path,
                 )
         return redacted
     if isinstance(value, list | tuple):
@@ -423,7 +448,7 @@ def _usage_tokens(payload: Any) -> tuple[int | None, int | None]:
 def _decoded_payload(response: httpx.Response) -> Any:
     try:
         return response.json()
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return response.text
 
 
@@ -605,7 +630,7 @@ async def _stream_response(
                     if raw_body:
                         try:
                             output_payload: Any = json.loads(raw_output)
-                        except (ValueError, UnicodeDecodeError):
+                        except (ValueError, UnicodeDecodeError, RecursionError):
                             output_payload = _decode_response_bytes(
                                 upstream_response, bytes(raw_output)
                             )
@@ -794,7 +819,7 @@ async def chat_completions(
     raw_body = await _bounded_request_body(request)
     try:
         parsed_body = json.loads(raw_body)
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
     if not isinstance(parsed_body, dict):
         raise HTTPException(status_code=400, detail="Request body must be a JSON object")
