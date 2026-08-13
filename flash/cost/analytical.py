@@ -90,6 +90,49 @@ def step_floor_seconds(gpu: str, completions: int) -> float:
 # by matched multi-card measurements.
 STEP_FLOOR_SHARDED_FRACTION = 0.799
 
+# --- sft training-side startup block + per-step floor -------------------------------------------
+# the flops term alone quoted sft at 28.6x UNDER the realized train wall (geometric, 17 measured
+# runpod arms, 0/17 inside the 0.70-1.43x band). it is the same structural gap the rollout floor
+# above closed for grpo, and it is NOT the cold start in `setup_seconds`: `setup_seconds` and
+# `train_wall` are DISJOINT intervals in the worker (sft_train.py stamps setup before launching the
+# training subprocess, and train_wall wraps `run_verl_training` plus the upload drain), so verl
+# startup, model load, lora wrap and fsdp init sit INSIDE the billed train wall and were priced at
+# zero.
+#
+# the block scales with model size -- measured median implied block 82s at 0.8B against 248s at 4B --
+# so a size-blind constant cannot cover both: at the same in-band count it leaves a 3.75x worst arm
+# and log-sd 0.50, against 2.13x and 0.32 for the size-scaled form below.
+#
+# fitted over 17 arms (2 cards, 2 model sizes, step counts 2/32/64/128/256, including the replicate
+# groups) and selected by holding out an ENTIRE step-count class at a time, the same methodology
+# that chose the rollout floor: a random holdout cannot test whether a form extrapolates to a shape
+# it never saw. least squares lands at (58.3, 44.3, 0.948); the shipped triple is the rounded
+# neighbour that survives holdout best. scored: 28.596x -> 1.013x geometric, 0/17 -> 14/17 in band,
+# worst arm 1135x -> 2.13x, and it holds under a model holdout in both directions (0.8B 1.005x,
+# 4B 1.033x), so the size term is not an artifact of the size that dominates the sample.
+#
+# KNOWN RESIDUAL, and the reason this is not tuned further: the same config on a different runpod
+# HOST CLASS (nvidia driver build) spans 1.56x-1.88x, while replicates within one build agree to
+# 1.01x-1.03x. the quote cannot observe which build it will be handed, so roughly half the remaining
+# per-arm error is hardware the estimator has no input for. re-fitting below that resolution would
+# be fitting the confounder. evidence: /home/azureuser/benchmark/cost-calib-20260801/ISSUES.md.
+SFT_STARTUP_BASE_SECONDS = 60.0
+SFT_STARTUP_SECONDS_PER_PARAM_B = 40.0
+SFT_STEP_FLOOR_SECONDS = 0.8
+
+
+def sft_overhead_seconds(config: RunConfig, steps: int) -> float:
+    """Training-wall seconds an sft run pays outside its flops term.
+
+    A one-time startup block that grows with checkpoint size, plus a per-step floor. Neither is
+    divided by card count: the block is model load and framework init that every rank pays, and the
+    per-step floor is dominated by the same non-shardable publish/sync work as the rollout floor.
+    """
+    n = config.normalized()
+    params_b = total_params_b(n.model_id, n.model_revision)
+    block = SFT_STARTUP_BASE_SECONDS + SFT_STARTUP_SECONDS_PER_PARAM_B * params_b
+    return block + SFT_STEP_FLOOR_SECONDS * max(0, steps)
+
 
 def _step_floor_seconds_for(config: RunConfig, gpu: str) -> float:
     """Step-floor seconds ``config`` pays on ``gpu``; 0 for sft, which runs no rollout."""
@@ -817,12 +860,16 @@ def estimate_cost(
     # training GPU time, so it belongs in the (billed) train term, not setup. Required saves are also
     # synchronous fixed overhead; neither is divided by the number of cards.
     compile_s = compile_seconds(config, gpu)
-    raw_train = compile_s + config.steps * sps + required_save_s
+    # sft pays a startup block and per-step floor inside its BILLED train wall that the flops term
+    # does not model (see sft_overhead_seconds); grpo/opd carry the equivalent in their step floor.
+    sft_overhead_s = sft_overhead_seconds(config, config.steps) if config.method == "sft" else 0.0
+    raw_train = compile_s + config.steps * sps + required_save_s + sft_overhead_s
     if not config.is_grpo and config.train_tokens is not None:
         raw_train = (
             compile_s
             + sft_seconds_for_tokens(config, gpu, config.train_tokens) / speedup
             + required_save_s
+            + sft_overhead_s
         )
     sps = raw_train / config.steps
 
