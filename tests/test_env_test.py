@@ -421,7 +421,11 @@ def test_env_test_auto_falls_back_to_echo_for_empty_reference(monkeypatch, tmp_p
     captured = capsys.readouterr()
     assert "episode 1: policy=echo turns=1 reward=0.000000" in captured.out
     assert "1/1 episodes passed contract checks" in captured.out
-    assert "warning:" not in captured.err
+    # the echo fallback itself is not a fault and must not be reported as a broken grader: zero is
+    # the CORRECT score for the deliberate junk echo replays. what is reported is the weaker, true
+    # statement -- no gold answer was ever scored, so the run is evidence of nothing.
+    assert "check the reward function, its runtime dependencies" not in captured.err
+    assert "no row supplied a gold one" in captured.err
 
 
 def test_env_test_fails_when_every_replayed_gold_answer_scores_zero(monkeypatch, tmp_path, capsys):
@@ -1789,3 +1793,237 @@ def test_scaffolded_environment_documents_the_gold_completion_contract():
     # names the wrapper trap and where per-row scorer state belongs.
     assert "boxed" in _STARTER_ENV_PY
     assert "metadata" in _STARTER_ENV_PY
+
+
+class _AssistantOnlyMultiTurnEnv(_MultiTurnEnv):
+    """A gold completion of assistant turns alone, which is the SFT concatenation defect.
+
+    Each turn scores fine when replayed one at a time -- which is all this gate ever did -- but SFT
+    renders `prompt_messages + sft_completion` into ONE string, so the rendered transcript is a
+    single user question followed by three answers back to back.
+    """
+
+    def dataset(self):
+        return [
+            {
+                "input": "count to three",
+                "output": [
+                    {"role": "assistant", "content": "one"},
+                    {"role": "assistant", "content": "two"},
+                    {"role": "assistant", "content": "three"},
+                ],
+            }
+        ]
+
+
+def test_env_test_warns_when_sft_would_train_on_consecutive_assistant_turns(
+    monkeypatch, tmp_path, capsys
+):
+    """ISSUE-015: an assistant-only gold completion renders as one reply, and passed silently.
+
+    The defect exists only at the concatenation SFT trains on. This command replays the turns
+    individually and scores each one, so every per-turn check passes and the run reported
+    `overall: PASS` -- while the training text taught the model to dump every turn's answer into a
+    single reply, the exact opposite of the multi-turn behaviour being taught.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _AssistantOnlyMultiTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "consecutive same-role turns" in captured.err
+    # the seam is inside the completion here (user | assistant assistant assistant), so the
+    # message must send the reader to interleave its turns rather than to the prompt.
+    assert "inside sft_completion" in captured.err
+    # the rendered role sequence is the evidence: it shows WHICH turns merged and on which side
+    # of the prompt/completion boundary, which no preview of the message text conveys.
+    assert "rendered roles: user | assistant assistant assistant" in captured.err
+
+
+def test_env_test_warns_on_a_same_role_seam_at_the_prompt_boundary(monkeypatch, tmp_path, capsys):
+    """A completion whose first turn collides with the prompt's last is a different edit.
+
+    Two assistant turns inside the completion means "interleave the user turns"; a collision at the
+    seam means "stop prefilling the prompt". Naming the wrong one sends the reader to the wrong
+    file, so the two are reported distinctly.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "finish it", "output": "done"}])
+    # a prompt that ends on an assistant prefill, which is legal on its own.
+    monkeypatch.setattr(
+        env,
+        "prompt_messages",
+        lambda example: [
+            {"role": "user", "content": example["input"]},
+            {"role": "assistant", "content": "the answer is"},
+        ],
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "consecutive same-role turns at the prompt/completion boundary" in captured.err
+    assert "rendered roles: user assistant | assistant" in captured.err
+
+
+def test_env_test_does_not_warn_when_the_gold_completion_interleaves_user_turns(
+    monkeypatch, tmp_path, capsys
+):
+    """The fix for ISSUE-015 must read as clean: several assistant turns are fine when separated.
+
+    A completion legitimately holds many assistant turns as long as the env's own follow-up user
+    prompts sit between them, which is what the rendered SFT string needs.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "count", "output": "one"}])
+    monkeypatch.setattr(
+        env,
+        "sft_completion",
+        lambda example: [
+            {"role": "assistant", "content": "one"},
+            {"role": "user", "content": "and then?"},
+            {"role": "assistant", "content": "two"},
+        ],
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "consecutive same-role turns" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+class _NeverFinishingMultiTurnEnv(_MultiTurnEnv):
+    """An environment no trajectory can complete: gold burns the whole turn cap and never wins.
+
+    This is the dead-environment shape (every move applied twice, so no board is ever solved). A
+    partial-credit grader still pays a respectable score for the capped attempt, and that score
+    still beats junk -- so every existing check passed it.
+    """
+
+    max_turns = 4
+
+    def dataset(self):
+        return [
+            {
+                "input": "solve the board",
+                "output": [{"role": "assistant", "content": "move"}],
+            }
+        ]
+
+    def env_reply(self, messages, state):
+        # never declares the episode done: the driver can only stop at the hard cap.
+        state["turn"] += 1
+        reply = {"role": "user", "content": "keep going"}
+        messages.append(reply)
+        return [reply]
+
+    def rollout_done(self, state, max_turns=None):
+        return max_turns is not None and state["turn"] >= max_turns
+
+    def reward(self, completion, example, state=None):
+        self.scored_state = state
+        # partial credit, comfortably above the junk floor -- which is why gold-vs-junk cleared.
+        return 0.62
+
+
+def test_env_test_warns_when_a_gold_replay_never_terminates(monkeypatch, tmp_path, capsys):
+    """A dead environment passed: gold scored 0.62, beat junk, and burned the full turn cap.
+
+    What actually surfaced the bug in the field was reading `turns=12` on a board with a five-move
+    solution -- a comparison the verdict never made. The reward cannot show it: partial credit for
+    a capped attempt is a perfectly ordinary-looking number.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _NeverFinishingMultiTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    # the run still passes -- this is advisory -- but it no longer passes SILENTLY.
+    assert "overall: PASS" in captured.out
+    assert "replay gold answer never finished: it used all 4 turn(s)" in captured.err
+    assert "no rollout can either" in captured.err
+
+
+def test_env_test_does_not_warn_when_the_environment_declares_the_episode_done(
+    monkeypatch, tmp_path, capsys
+):
+    """An env that finishes on its own must stay clean, including one that ends on its last turn.
+
+    `rollout_done` is asked before the cap is blamed, so an episode that legitimately terminates
+    exactly as its budget runs out is not misreported as having been cut off.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _MultiTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "never finished" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_warns_when_every_episode_scores_zero_under_sft(monkeypatch, tmp_path, capsys):
+    """The blocking gate is grpo-only, so an all-zero sft run printed PASS and nothing else.
+
+    This is the shape that reaches paid GPUs: one published environment serves all three
+    algorithms, and an `output` shape that only the SFT rows satisfy leaves every GRPO/OPD rollout
+    scoring 0.0. Constant reward means zero advantage, so training completes, the loss curve looks
+    unremarkable, W&B looks healthy, and the adapter is identical to its warm start.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(
+        rows=[{"input": "2 + 2?", "output": "4"}, {"input": "2 + 3?", "output": "5"}],
+        reward=0.0,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "all 2 scored episode(s) returned reward 0.000000" in captured.err
+    assert "measured nothing" in captured.err
+
+
+def test_env_test_zero_reward_warning_survives_a_reasoning_markup_reference(
+    monkeypatch, tmp_path, capsys
+):
+    """A `<think>` reference is excluded from the blocking gate, and took the diagnosis with it.
+
+    Abstaining from the blocking verdict is right -- this command cannot replay reasoning markup
+    faithfully -- but abstaining from SAYING the run scored nothing is not.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(
+        rows=[{"input": "2 + 2?", "output": "<think>hmm</think>4"}],
+        reward=0.0,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    captured = capsys.readouterr()
+    # the blocking gate stayed out of it, exactly as designed...
+    assert "cannot recognize its own reference answers" not in captured.err
+    # ...but the run no longer passes without a word about having measured nothing.
+    assert "all 1 scored episode(s) returned reward 0.000000" in captured.err
+
+
+def test_env_test_does_not_warn_when_one_episode_scores_nonzero(monkeypatch, tmp_path, capsys):
+    """A single separating row is enough to prove the grader distinguishes answers.
+
+    The warning must describe uniformity, not merely the presence of a zero: an environment that
+    pays 0.0 for one row and 1.0 for another is working.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(
+        rows=[{"input": "2 + 2?", "output": "4"}, {"input": "2 + 3?", "output": "5"}]
+    )
+    rewards = iter([0.0, 1.0])
+    monkeypatch.setattr(env, "reward", lambda completion, example, state=None: next(rewards))
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "measured nothing" not in captured.err
+    assert "overall: PASS" in captured.out

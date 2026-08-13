@@ -29,6 +29,34 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- `flash env test` reported `overall: PASS` on environments that could not have trained anything,
+  because a well-formed hook return was the only thing it checked. Three silent-pass classes now
+  speak up. It still exits 0 for all three - they are warnings, not new blocking gates - but a run
+  no longer passes without a word about what it found:
+
+  - **Every episode scored 0.0.** The existing blocking gate is GRPO-only and abstains for a
+    reasoning-markup reference, a replay that ran out mid-episode, and a junk probe that raised, so
+    an all-zero run routinely printed `PASS` and nothing else. A constant reward is never a
+    measurement, and for GRPO it is actively silent: rewards are mean-centred within each group, so
+    a constant reward is a zero advantage and a zero gradient - training completes, the loss curve
+    looks unremarkable, W&B looks healthy, and the adapter comes out identical to its warm start.
+    The end-of-run advantage-spread guard catches that only after the GPUs are paid for. An
+    all-`echo` run is reported differently and more weakly, because zero is the _correct_ score for
+    the deliberate junk echo replays - what is wrong there is that no gold answer was ever scored.
+  - **A gold replay that never terminates.** An environment applying every move twice can solve no
+    board, yet gold scored 0.60-0.65, beat a junk answer, and burned the full turn cap - clearing
+    every existing check. What exposed it in the field was reading `turns=12` on a board with a
+    five-move solution, a comparison the verdict never made. An episode stopped by the hard turn cap
+    rather than the environment's own done signal now says so.
+  - **A gold completion whose rendered role sequence collapses.** SFT does not replay a completion
+    turn by turn; it renders one training string from `prompt_messages + sft_completion`, and
+    nothing validated that concatenation. A multi-turn gold answer returned as assistant turns alone
+    rendered as one user question followed by every answer back to back, training the model to dump
+    the whole episode into a single reply - the opposite of the behaviour being taught. Because this
+    gate scored each turn separately, it passed either way. The rendered role sequence is now checked
+    for consecutive same-role turns and printed, and a collision at the prompt/completion seam is
+    named separately from one inside the completion, since they are different edits.
+
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always
   `flash`. On a host where `runpod-flash` owns the `flash` script, the printed
