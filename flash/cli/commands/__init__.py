@@ -397,8 +397,12 @@ def cmd_train(args) -> int:
         # same rule as affordability above: an older server returns no budget, and claiming it was
         # validated would hide exactly the defaulted-budget risk this signal exists to expose. only
         # claim it when the response actually carried one.
+        # "(upper bound)" because the worker clamps engine_len to the model architecture before
+        # subtracting, and that probe cannot run here. an unqualified "prompt budget" in a line
+        # headed "dry-run validated" reads as a verified cutoff, so a user under the printed number
+        # would believe their prompts survive when a pinned revision can still drop them.
         budget_validated = (
-            ", prompt budget" if isinstance(status.get("prompt_budget"), dict) else ""
+            ", prompt budget (upper bound)" if isinstance(status.get("prompt_budget"), dict) else ""
         )
         environment = (
             "it did NOT import or run your environment.py. packaged input/output fields and the "

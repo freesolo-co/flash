@@ -1056,3 +1056,32 @@ def test_locally_derived_budget_names_the_cli_that_derived_it() -> None:
     # the budget itself must be identical either way: the marker annotates provenance, it does not
     # change the arithmetic.
     assert served["prompt_budget"] == local["prompt_budget"]
+
+
+def test_authored_budget_is_marked_an_upper_bound_even_though_it_never_warns() -> None:
+    """The clamp caveat cannot live only in the warning text: `rl_prompt_budget_warning` returns
+    None for every authored context (nothing defaulted, so nothing to warn about), which left the
+    authored path publishing a bare `prompt_budget` that --dry-run prints under the heading
+    "dry-run validated". `engine_len` is pre-clamp for EVERY consumer, so a pinned revision below
+    the catalog cap can still drop prompts under the reported number. The qualifier belongs to the
+    descriptor, not to one of its readers."""
+    from flash.engine.plan.prompt_budget import rl_prompt_budget, rl_prompt_budget_warning
+
+    authored = rl_prompt_budget(
+        _budget_spec("grpo", {"max_context_tokens": 8192, "max_completion_tokens": 4096})
+    )
+    assert authored["context_source"] == "authored"
+    assert rl_prompt_budget_warning(authored) is None  # the silence this test exists because of
+    assert authored["prompt_budget_is_upper_bound"] is True
+
+    # the defaulted path carries it too, so no consumer has to special-case which one it holds.
+    defaulted = rl_prompt_budget(_budget_spec("grpo", {}))
+    assert defaulted["prompt_budget_is_upper_bound"] is True
+
+    # and the dry-run summary must not claim a bare "prompt budget" was validated.
+    from inspect import getsource
+
+    from flash.cli import commands as commands_mod
+
+    body = getsource(commands_mod.cmd_train)
+    assert '", prompt budget (upper bound)"' in body

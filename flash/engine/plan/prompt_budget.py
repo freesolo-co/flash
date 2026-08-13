@@ -66,6 +66,12 @@ def rl_prompt_budget(
         "max_completion": int(max_completion),
         "prompt_budget": int(engine_len) - int(max_completion),
         "context_source": "authored" if authored else "recipe_default",
+        # the descriptor says this itself rather than leaving it to the warning. the warning is
+        # silent for an authored context (nothing defaulted, so nothing to warn about), which left
+        # the authored path publishing a bare integer that dry-run prints and reports validated --
+        # the same overstatement, minus the caveat. engine_len is pre-clamp for every consumer, so
+        # the qualifier belongs to the number, not to one of its readers.
+        "prompt_budget_is_upper_bound": True,
     }
     source_context = int(warm_start_context or 0)
     if source_context > 0:
