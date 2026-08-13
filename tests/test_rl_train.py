@@ -568,27 +568,48 @@ def test_a_deferred_patch_registered_after_its_target_is_imported_applies_immedi
         assert fired == ["now"]
 
 
-def test_a_deferred_body_that_raises_still_fails_closed_through_the_import(tmp_path, monkeypatch):
+def test_a_deferred_body_that_raises_hard_exits_and_cannot_be_retried_around(tmp_path):
     """a fragment that cannot apply must kill the child, not let it train unpatched.
 
-    Deferral changes WHEN a body runs; it must not change what happens when one fails. The
-    exception has to come out of the child's own import of the target, which is how the run dies
-    instead of training with a silently missing patch.
+    Raising is NOT enough here, which is the trap. `wrap_shim_fragment`'s try/except spans the
+    registration, and that has already returned by the time the body runs -- so a raise surfaces as
+    an ordinary ImportError out of the target's import. An importer that catches it and retries
+    then gets a CLEAN load: python drops the failed module from sys.modules and the registry has
+    already popped the callback, so the target comes back with no patch and no marker, and the
+    interpreter keeps running unpatched.
+
+    Runs in a subprocess because the guarantee being tested is `os._exit`, which no in-process
+    assertion can survive. The retry is performed explicitly: reaching it at all is the failure.
     """
     (tmp_path / "flash_defer_boom.py").write_text("VALUE = 1\n")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    sys.modules.pop("flash_defer_boom", None)
-
-    def _explode():
-        raise RuntimeError("fragment could not apply")
-
-    with _defer_registry() as registry:
-        try:
-            registry.register("flash_defer_boom", _explode)
-            with pytest.raises(RuntimeError, match="fragment could not apply"):
-                import flash_defer_boom  # noqa: F401
-        finally:
-            sys.modules.pop("flash_defer_boom", None)
+    probe = tmp_path / "probe.py"
+    # derived from the imported package rather than hardcoded, so the subprocess loads the same
+    # checkout this test session did.
+    repo_root = str(Path(W.__file__).resolve().parents[3])
+    probe.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {repo_root!r})\n"
+        f"sys.path.insert(0, {str(tmp_path)!r})\n"
+        "from flash.engine.worker.train.rl import shims\n"
+        "exec(compile(shims.render_deferred_patch_runtime(), 'sc.py', 'exec'), {})\n"
+        "def boom():\n"
+        "    raise RuntimeError('fragment could not apply')\n"
+        "boom._flash_shim_name = 'boom-fragment'\n"
+        "sys._flash_defer_registry.register('flash_defer_boom', boom)\n"
+        "try:\n"
+        "    import flash_defer_boom\n"
+        "except BaseException:\n"
+        "    pass\n"
+        "import flash_defer_boom as retried\n"
+        "print('REACHED_RETRY', retried.VALUE)\n"
+    )
+    done = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=120)
+    assert done.returncode == backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE, done.stdout
+    # the retry must never be reached: if it is, the child is running with the patch missing.
+    assert "REACHED_RETRY" not in done.stdout
+    # and the message has to name the fragment, not just the module -- several fragments share a
+    # target, so the module alone does not say which patch is missing.
+    assert "boom-fragment" in done.stderr
 
 
 def test_the_rank_device_assert_is_inert_on_a_single_card_run():

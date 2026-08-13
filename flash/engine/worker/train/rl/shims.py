@@ -8,6 +8,8 @@ NOTHING HERE MAY IMPORT torch, verl OR vllm AT FRAGMENT SCOPE -- see `_deferred_
 
 from __future__ import annotations
 
+from flash.engine.worker.verl.child_io import SHIM_FRAGMENT_FAILED_EXIT_CODE
+
 # Why every fragment below defers its imports into a function body.
 #
 # sitecustomize runs at INTERPRETER STARTUP, and ray starts each actor's interpreter BEFORE it
@@ -46,10 +48,39 @@ def render_deferred_patch_runtime() -> str:
     Rendered ONCE per sitecustomize, above the fragments. Idempotent so a caller that emits it
     twice cannot discard callbacks already registered by the first copy.
     """
-    return '''
+    return f'''
 # --- flash: run each verl patch at ITS module's import, not at interpreter startup ---
 # (see train/rl/shims.render_deferred_patch_runtime)
 import sys as _flash_defer_sys
+
+
+def _flash_defer_fail(target, name):
+    """a required patch could not apply: kill the child rather than let it train unpatched.
+
+    ``wrap_shim_fragment``'s try/except cannot cover this. It spans the REGISTRATION, which has
+    already returned by the time the body runs, so a raise here would surface as an ordinary
+    ImportError out of the target's import -- and an importer that catches it and retries gets a
+    clean load: python drops the failed module from sys.modules, this registry has already popped
+    the callback, and the target comes back with NO patch and NO marker. The interpreter then keeps
+    running unpatched until the parent happens to check markers, which for a correctness-critical
+    patch (kl anchoring, save gating, rank/device pinning) means a paid run producing wrong output.
+
+    os._exit is the same escape hatch the wrapper uses: it cannot be swallowed by an except in the
+    importer, by execsitecustomize, or by ray's own import error handling.
+    """
+    import os as _flash_defer_os
+    import traceback as _flash_defer_traceback
+
+    _flash_defer_traceback.print_exc()
+    print(
+        "[flash-verl] required shim fragment " + repr(name) + " failed to apply at the import of "
+        + repr(target) + "; exiting {SHIM_FRAGMENT_FAILED_EXIT_CODE} rather than training unpatched",
+        file=_flash_defer_sys.stderr,
+        flush=True,
+    )
+    _flash_defer_sys.stderr.flush()
+    _flash_defer_os._exit({SHIM_FRAGMENT_FAILED_EXIT_CODE})
+
 
 if not hasattr(_flash_defer_sys, "_flash_defer_registry"):
 
@@ -57,24 +88,33 @@ if not hasattr(_flash_defer_sys, "_flash_defer_registry"):
         """maps a module name to the patches waiting on it, and installs one meta_path finder."""
 
         def __init__(self):
-            self._pending = {}
+            self._pending = {{}}
             self._armed = False
 
         def register(self, target, body):
             # already imported: nothing left to intercept, so apply now. this keeps the contract
             # identical whether or not a parent process happened to import the module first.
             if target in _flash_defer_sys.modules:
-                body()
+                self._apply(target, body)
                 return
             self._pending.setdefault(target, []).append(body)
             if not self._armed:
                 _flash_defer_sys.meta_path.insert(0, self)
                 self._armed = True
 
-        def _run(self, target):
-            # pop first: a body that imports its own target must not re-enter this.
-            for body in self._pending.pop(target, []):
+        def _apply(self, target, body):
+            # every path that runs a body goes through here, so there is one place a failure can
+            # be handled and no way to add a caller that quietly skips the hard exit.
+            try:
                 body()
+            except BaseException:
+                _flash_defer_fail(target, getattr(body, "_flash_shim_name", "<unknown>"))
+
+        def _run(self, target):
+            # pop first: a body that imports its own target must not re-enter this. popping is safe
+            # only because _apply cannot return after a failure -- see _flash_defer_fail.
+            for body in self._pending.pop(target, []):
+                self._apply(target, body)
             if not self._pending:
                 self.uninstall()
 
@@ -276,6 +316,9 @@ def _flash_deferred_body_{tag}():
 {textwrap.indent(applied, "    ")}
 
 
+# the registry reads this to name the fragment in its hard-exit message; without it a failed patch
+# reports only the module it was hooking, which is shared by several fragments.
+_flash_deferred_body_{tag}._flash_shim_name = {marker!r}
 _flash_defer_sys._flash_defer_registry.register({target!r}, _flash_deferred_body_{tag})
 """
 
