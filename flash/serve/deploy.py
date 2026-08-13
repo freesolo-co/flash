@@ -46,7 +46,24 @@ def default_serving_url(channel: str = CHANNEL) -> str:
 DEFAULT_FREESOLO_SERVING_URL = default_serving_url()
 READBACK_DELAY_SECONDS = 0.5
 READBACK_MAX_DELAY_SECONDS = 2.0
-REVISION_READY_BUDGET_SECONDS = 5 * 60.0
+# how long to wait for serving to report a newly registered revision ready. the wait covers a COLD
+# engine: serving pulls the base model, starts the engine, then loads the adapter, and none of that
+# is proportional to the adapter, which is megabytes. so the budget scales with the BASE model.
+#
+# the floor is NOT the old 5 minutes: a 4B deploy was observed timing out on a cold engine and then
+# succeeding in ~4.6 minutes against the now-warm one, so 5 minutes did not even cover the warm case
+# with margin. the floor is doubled to 10 and the per-B term covers a bigger base on top.
+#
+# the cap is the real constraint: this wait is followed by `_SMOKE_BUDGET_SECONDS` (600s) of smoke
+# inside the same deployment attempt, and `_DEPLOYMENT_STALE_SECONDS` (1800s) is when the control
+# plane declares an in-flight attempt abandoned. readiness + smoke must stay under that or a deploy
+# that is still progressing gets reaped, so readiness is capped at 1080s (1080 + 600 = 1680 < 1800).
+#
+# a longer budget costs little: an adapter serving REJECTS raises as soon as the revision reports
+# `failed`, so only a revision that is genuinely still loading waits out the clock.
+REVISION_READY_MIN_BUDGET_SECONDS = 10 * 60.0
+REVISION_READY_MAX_BUDGET_SECONDS = 18 * 60.0
+REVISION_READY_SECONDS_PER_PARAM_B = 20.0
 ACTIVATION_READBACK_ATTEMPTS = 3
 ACTIVATION_READBACK_DELAY_SECONDS = 2.0
 # smoke-retry fallback when a 503 carries no usable Retry-After: keep the prior 2s default rather
@@ -409,7 +426,11 @@ def deploy_adapter(
         )
 
     _wait_revision_ready(
-        revision, subfolder, expected_identity=body, require_provenance=require_provenance
+        revision,
+        subfolder,
+        expected_identity=body,
+        require_provenance=require_provenance,
+        budget_s=revision_ready_budget_seconds(model),
     )
     if before_activate is not None:
         before_activate(revision, checkpoint)
@@ -552,6 +573,25 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
     return advertised
 
 
+def revision_ready_budget_seconds(model: str) -> float:
+    """Readiness budget for a cold serving engine holding ``model``, scaled by base-model size.
+
+    An unknown model keeps the floor: a fork can add a catalog entry, and a revision-pinned id need
+    not be a catalog key, so a lookup miss must not fail a deploy that would otherwise succeed.
+    """
+    from flash.core.catalog import MODELS
+
+    info = MODELS.get(str(model or "").strip())
+    if info is None:
+        return REVISION_READY_MIN_BUDGET_SECONDS
+    # total params, not active: an MoE loads every expert into VRAM even though a token routes
+    # through few, so the cold-start cost tracks the full checkpoint.
+    scaled = REVISION_READY_MIN_BUDGET_SECONDS + REVISION_READY_SECONDS_PER_PARAM_B * max(
+        0.0, float(info.params_b)
+    )
+    return min(scaled, REVISION_READY_MAX_BUDGET_SECONDS)
+
+
 def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
     if retry_after is not None:
         try:
@@ -570,11 +610,17 @@ def _wait_revision_ready(
     *,
     expected_identity: dict | None = None,
     require_provenance: bool = True,
-    budget_s: float = REVISION_READY_BUDGET_SECONDS,
+    budget_s: float = REVISION_READY_MIN_BUDGET_SECONDS,
 ) -> dict:
-    deadline = time.monotonic() + max(0.0, float(budget_s))
+    budget = max(0.0, float(budget_s))
+    deadline = time.monotonic() + budget
     last_state = "registered"
     last_read_error: ServingError | None = None
+    # the loader's own complaint, kept even when serving reports it WITHOUT moving the revision to
+    # `failed`. without this a stuck load times out reporting only the state, and the one piece of
+    # evidence that says which subsystem is at fault is dropped on the floor.
+    last_failure: str | None = None
+    observed_record = False
     first_read = True
     attempt = 0
     retry_after: str | None = None
@@ -614,11 +660,14 @@ def _wait_revision_ready(
             raise ServingError(
                 f"adapter revision {revision} resolved to a different immutable identity"
             )
+        observed_record = True
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         last_state = str(
             metadata.get("lifecycle_state") or record.get("lifecycle_state") or "registered"
         )
         failure = metadata.get("failure")
+        if failure:
+            last_failure = str(failure)
         if last_state == "failed" or record.get("status") == "disabled":
             raise ServingError(
                 f"serving failed to load adapter revision {revision}: {failure or 'unknown error'}"
@@ -633,8 +682,25 @@ def _wait_revision_ready(
             f"adapter revision {revision} readiness could not be confirmed after transient "
             f"serving errors: {last_read_error}"
         ) from last_read_error
+    # a TIMEOUT, not a rejection. the two are distinguishable in code (a rejected adapter raises
+    # "serving failed to load adapter revision" above) but the old message said only that the
+    # revision "remained 'registered'", which reads as a serving fault and sent readers to the wrong
+    # subsystem. say which of the two happened, what the clock actually was, and that a retry is the
+    # correct response to THIS one.
+    details = [f"waited {budget:g}s", f"last state {last_state!r}"]
+    if not observed_record:
+        # serving never returned the record at all: 404 for the whole budget. that is registration
+        # visibility, not a slow load, and it points at a different failure than a stuck loader.
+        details.append("serving never returned the revision record (404 for the whole budget)")
+    if last_failure:
+        details.append(f"loader reported: {last_failure}")
     raise ServingError(
-        f"adapter revision {revision} remained {last_state!r}; the previous alias remains available"
+        f"revision_ready_timeout: adapter revision {revision} did not become ready in time "
+        f"({'; '.join(details)}). the previous alias remains available and serving may still be "
+        "loading, so retrying this deploy is the correct response: a cold engine loading a large "
+        "base model can exceed the budget, and the retry usually succeeds against the now-warm "
+        "engine. this is NOT the same as serving rejecting the adapter, which fails the deployment "
+        "with 'serving failed to load adapter revision'."
     )
 
 
