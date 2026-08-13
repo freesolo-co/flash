@@ -1200,8 +1200,8 @@ instance cannot corrupt each other.
 ### `messages` already ends with the turn you are being asked to apply
 
 Replaying the transcript is the right pattern, but it has one sharp edge worth stating
-explicitly, because getting it wrong produces an environment that looks healthy and trains
-on nothing.
+explicitly, because getting it wrong produces an environment that looks healthy in every
+check you are likely to run while quietly stepping the wrong state.
 
 In `step_episode(example, messages, assistant_response)`, the action to apply arrives in
 `assistant_response`, and `messages[-1]` is **that same turn, already appended**. The worker
