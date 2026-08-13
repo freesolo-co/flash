@@ -3006,7 +3006,7 @@ def test_merge_is_refused_when_its_output_cannot_fit_beside_the_checkpoint(monke
 
     launched = []
     monkeypatch.setattr(
-        verl_checkpoints.subprocess, "run", lambda *a, **kw: launched.append(a) or None
+        verl_checkpoints, "_run_merger", lambda *a, **kw: launched.append(a) or None
     )
     monkeypatch.setattr(
         verl_checkpoints.shutil,
@@ -3060,9 +3060,9 @@ def test_merge_headroom_allows_the_merge_when_there_is_room(monkeypatch, tmp_pat
 
     launched = []
     monkeypatch.setattr(
-        verl_checkpoints.subprocess,
-        "run",
-        lambda *a, **kw: launched.append(a) or SimpleNamespace(returncode=0),
+        verl_checkpoints,
+        "_run_merger",
+        lambda *a, **kw: launched.append(a) or None,
     )
     monkeypatch.setattr(
         verl_checkpoints.shutil,
@@ -3234,7 +3234,7 @@ def _enospc_merge_setup(monkeypatch, tmp_path, *, free_bytes, error):
         free["value"] = free_bytes
         raise error
 
-    monkeypatch.setattr(verl_checkpoints.subprocess, "run", fake_merge)
+    monkeypatch.setattr(verl_checkpoints, "_run_merger", fake_merge)
     monkeypatch.setattr(
         verl_checkpoints.shutil,
         "disk_usage",
@@ -3368,7 +3368,7 @@ def test_the_disk_is_sampled_before_the_merge_tree_is_freed(monkeypatch, tmp_pat
 
     events: list[str] = []
     real_rmtree = verl_checkpoints.shutil.rmtree
-    failing_merge = verl_checkpoints.subprocess.run
+    failing_merge = verl_checkpoints._run_merger
     merged = {"started": False}
 
     def marking_merge(*args, **kwargs):
@@ -3377,7 +3377,7 @@ def test_the_disk_is_sampled_before_the_merge_tree_is_freed(monkeypatch, tmp_pat
         merged["started"] = True
         return failing_merge(*args, **kwargs)
 
-    monkeypatch.setattr(verl_checkpoints.subprocess, "run", marking_merge)
+    monkeypatch.setattr(verl_checkpoints, "_run_merger", marking_merge)
 
     def watching_rmtree(path, *args, **kwargs):
         # the function also clears any stale merge tree BEFORE running the merger; only the cleanup
@@ -3438,6 +3438,192 @@ def test_the_headroom_guard_does_not_suggest_an_unreachable_config_key(monkeypat
     assert "save_every" in str(caught.value)
 
 
+def test_the_disk_advice_names_a_lever_an_exact_save_run_can_reach(monkeypatch, tmp_path):
+    """advice that only works for periodic runs is the same trap as naming an unmanaged key.
+
+    `train.save_every` is consulted only when `train.save_at_steps` is empty. With exact steps set,
+    `sft_train_runner` derives `save_freq` from `reduce(gcd, save_at_steps)` and the watcher must
+    publish every step that was asked for -- so a run that fills the disk on an exact save cannot
+    change its schedule through `save_every` at all. Telling it to raise `save_every` sends the user
+    to a knob with no effect, which is exactly the failure the `disk_gb` advice above was fixed for.
+
+    Both messages are asserted: the headroom guard and the exhaustion classifier are separate
+    call sites and either one could regress on its own.
+    """
+    import inspect
+    from functools import reduce
+    from math import gcd
+
+    from flash.engine.worker import sft_train_runner
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    # the premise, not a restatement of it: save_freq really does ignore save_every for exact runs.
+    source = inspect.getsource(sft_train_runner)
+    assert "reduce(gcd, options.save_at_steps) if options.save_at_steps else" in source, (
+        "the save_freq derivation changed; re-check whether save_every can reach an exact-save run"
+    )
+    assert reduce(gcd, (300, 450, 750)) == 150
+
+    actor_dir = tmp_path / "global_step_9"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=1 << 40, free=1024),
+    )
+
+    with pytest.raises(verl_checkpoints.MergeDiskHeadroomError) as headroom:
+        verl_checkpoints.require_merge_headroom(str(actor_dir), str(tmp_path / "adapter_merge"))
+
+    with pytest.raises(verl_checkpoints.MergeDiskExhaustedError) as exhausted:
+        verl_checkpoints.raise_for_merge_disk_exhaustion(
+            RuntimeError("unexpected pos 100 vs 88"), str(actor_dir), str(tmp_path / "m_merge")
+        )
+
+    for message in (str(headroom.value), str(exhausted.value)):
+        assert "save_at_steps" in message, (
+            "exact-save runs are told to use a knob they cannot reach"
+        )
+
+
+def test_a_layout_error_after_a_successful_merge_is_not_called_a_full_disk(monkeypatch, tmp_path):
+    """a merger that exited 0 did not short-write, however little room it left behind.
+
+    The missing-`adapter_config.json` error is raised only after the merger returns successfully,
+    and the full-model write it just completed is precisely what leaves the volume near its limit.
+    Classifying on free space alone therefore replaces an actionable layout message with
+    `MergeDiskExhaustedError` -- and that error asserts the underlying failure was a short write,
+    which here is simply false. This is the misdiagnosis the whole change exists to prevent,
+    reintroduced in the opposite direction.
+    """
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "global_step_350"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+
+    # the merge starts with room and consumes it: the headroom guard has to pass first, or the
+    # export never reaches the layout check this is about.
+    free = {"value": 1 << 40}
+
+    def successful_merge_with_wrong_layout(cmd, env):
+        # exits 0, writes the full model, and puts the adapter somewhere flash does not read.
+        target = tmp_path / "adapter_merge"
+        (target / "peft_adapter").mkdir(parents=True)
+        (target / "peft_adapter" / "adapter_config.json").write_text("{}")
+        free["value"] = 1024  # the full-model write is what leaves the volume near its limit
+
+    monkeypatch.setattr(verl_checkpoints, "_run_merger", successful_merge_with_wrong_layout)
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=0, free=free["value"]),
+    )
+
+    with pytest.raises(verl_checkpoints.MergerOutputLayoutError) as caught:
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+
+    assert "adapter_config.json" in str(caught.value)
+    assert not isinstance(caught.value, verl_checkpoints.MergeDiskExhaustedError)
+
+
+def test_the_mergers_own_enospc_survives_the_subprocess_boundary(monkeypatch, tmp_path):
+    """the child's "No space left on device" has to reach the classifier.
+
+    The merger runs as a subprocess, so its safetensors ENOSPC is text in the CHILD's output, not an
+    exception here. Uncaptured, it goes to the inherited stderr and `CalledProcessError.output` is
+    `None`, leaving the free-space sample as the only signal -- which misses a quota-backed
+    exhaustion, where the write fails with ENOSPC while `disk_usage` still reports the volume as
+    having room. The disk is deliberately reported as roomy so only the captured text can pass this.
+    """
+    import subprocess as subprocess_module
+
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "global_step_350"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+
+    child_output = (
+        "SafetensorError: Error while serializing: I/O error: No space left on device (os error 28)"
+    )
+
+    def quota_exhausted_merge(cmd, env):
+        raise subprocess_module.CalledProcessError(1, cmd, output=child_output)
+
+    monkeypatch.setattr(verl_checkpoints, "_run_merger", quota_exhausted_merge)
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
+    )
+
+    with pytest.raises(verl_checkpoints.MergeDiskExhaustedError):
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+
+
+def test_the_merger_streams_its_output_instead_of_buffering_it(tmp_path):
+    """capturing the child's ENOSPC must not cost live progress logging.
+
+    `capture_output=True` would satisfy the test above while withholding every line until the
+    merger exits -- minutes of silence on a large model, and the reason a lagging publish looks
+    hung. This drives a real child that prints, pauses, then prints again, and requires the first
+    line to be visible before the process ends.
+    """
+    import subprocess as subprocess_module
+    import sys
+
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    # marker in the FIRST line only; the child stays alive after printing it.
+    child = "import sys,time; print('merging shard 1'); sys.stdout.flush(); time.sleep(2)"
+
+    seen: list[tuple[str, bool]] = []
+    real_print = print
+
+    def timing_print(line, **kwargs):
+        seen.append((str(line).strip(), child_done()))
+        real_print(line, **kwargs)
+
+    holder: dict[str, subprocess_module.Popen] = {}
+    real_popen = verl_checkpoints.subprocess.Popen
+
+    def tracking_popen(*args, **kwargs):
+        holder["p"] = real_popen(*args, **kwargs)
+        return holder["p"]
+
+    def child_done() -> bool:
+        return holder["p"].poll() is not None
+
+    verl_checkpoints.subprocess.Popen = tracking_popen
+    builtins_print = verl_checkpoints.print if hasattr(verl_checkpoints, "print") else None
+    verl_checkpoints.print = timing_print
+    try:
+        verl_checkpoints._run_merger([sys.executable, "-c", child], dict(os.environ))
+    finally:
+        verl_checkpoints.subprocess.Popen = real_popen
+        if builtins_print is None:
+            del verl_checkpoints.print
+        else:
+            verl_checkpoints.print = builtins_print
+
+    assert seen, "the child's output never reached the parent"
+    assert seen[0] == ("merging shard 1", False), (
+        f"the first line arrived only after the child exited (buffered, not streamed): {seen}"
+    )
+
+
 def test_the_adapter_is_moved_out_of_the_merge_tree_not_copied(monkeypatch, tmp_path):
     """the export must never hold two copies of the adapter at once.
 
@@ -3478,7 +3664,7 @@ def test_the_adapter_is_moved_out_of_the_merge_tree_not_copied(monkeypatch, tmp_
             duplicated.extend(sorted(os.listdir(lora_dir)))
         return real_rmtree(path, *args, **kwargs)
 
-    monkeypatch.setattr(verl_checkpoints.subprocess, "run", fake_merge)
+    monkeypatch.setattr(verl_checkpoints, "_run_merger", fake_merge)
     monkeypatch.setattr(verl_checkpoints.shutil, "rmtree", watching_rmtree)
     monkeypatch.setattr(
         verl_checkpoints.shutil,
@@ -3874,7 +4060,7 @@ def test_a_failed_merge_does_not_strand_the_merge_tree(monkeypatch, tmp_path):
         (merge_out / "model-00001-of-00002.safetensors").write_bytes(b"w" * 65536)
         raise subprocess.CalledProcessError(1, "verl.model_merger")
 
-    monkeypatch.setattr(verl_checkpoints.subprocess, "run", dying_merge)
+    monkeypatch.setattr(verl_checkpoints, "_run_merger", dying_merge)
     monkeypatch.setattr(
         verl_checkpoints.shutil,
         "disk_usage",

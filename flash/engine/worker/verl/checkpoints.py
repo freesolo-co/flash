@@ -25,6 +25,16 @@ class MergeDiskExhaustedError(RuntimeError):
     """the merge started with room and then ran the disk out partway through writing its output."""
 
 
+class MergerOutputLayoutError(RuntimeError):
+    """the merger exited successfully but did not put the adapter where flash reads it.
+
+    Its own type so the disk classifier can tell it apart from a write that failed. It is raised
+    only AFTER the merger exited 0, which means the full-model write completed -- and that write
+    routinely finishes with the volume near its limit, so a free-space check alone would read this
+    as exhaustion and replace an actionable layout message with a wrong one.
+    """
+
+
 # free bytes below which the filesystem the merge was writing to counts as exhausted. the merger
 # needs gigabytes and stops the instant it cannot get another block, so a genuine ENOSPC leaves
 # essentially nothing; a merge that died of something else partway through leaves far more than
@@ -37,6 +47,19 @@ _MERGE_DISK_EXHAUSTED_FREE_BYTES = 64 * 1024 * 1024
 # and torch errors arrive as printed output rather than as exceptions -- but a failure raised in
 # THIS process (an os.replace of the merged files, say) still carries the string or the errno.
 _ENOSPC_MARKERS = ("no space left on device", "errno 28", "os error 28")
+
+# the one remedy a config can actually reach, and it has to name both schedules. `train.save_every`
+# is only consulted when `train.save_at_steps` is empty: with exact steps set, `save_freq` comes from
+# `reduce(gcd, save_at_steps)` (flash/engine/worker/sft_train_runner.py), and the watcher must
+# publish every step that was asked for -- so telling an exact-save run to raise `save_every` names
+# a knob that cannot change its schedule. Disk size is not an alternative to offer: `[gpu] disk_gb`
+# is in MANAGED_GPU_KEYS (flash/core/spec.py) and the public schema rejects it, so the volume is
+# sized by the runner from the model's catalog `min_disk_gb` and no config can raise it.
+_FEWER_CHECKPOINTS_ADVICE = (
+    "publish fewer checkpoints: raise train.save_every (save_every == the run's total steps "
+    "publishes only the final adapter), or drop entries from train.save_at_steps if the run sets "
+    "them -- exact steps override save_every and are always published."
+)
 
 
 def _model_shard_bytes(path: str) -> int:
@@ -111,13 +134,36 @@ def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
     raise MergeDiskHeadroomError(
         f"cannot export the adapter: merging {ckpt_actor_dir} needs about "
         f"{need / 1e9:.1f} GB beside it but only {free / 1e9:.1f} GB is free. "
-        # deliberately does NOT suggest raising [gpu] disk_gb: that key is in MANAGED_GPU_KEYS
-        # (flash/core/spec.py), so the public schema rejects it with "unknown key(s): disk_gb" and
-        # anyone following that advice just loses time. disk is sized by the runner from the
-        # model's catalog min_disk_gb. save_every is the only lever a config can actually reach.
-        "save fewer checkpoints with a larger train.save_every (save_every == the run's total "
-        "steps publishes only the final adapter)."
+        + _FEWER_CHECKPOINTS_ADVICE
     )
+
+
+def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
+    """run the merger, streaming its output, and keep any ENOSPC it printed.
+
+    The merger is a subprocess, so the evidence that a full disk killed it -- safetensors'
+    ``I/O error: No space left on device`` -- is text in the CHILD's output, not an exception in
+    this process. Left uncaptured it goes straight to the inherited stderr and
+    ``CalledProcessError.output``/``.stderr`` are both ``None``, so the classifier has nothing to
+    read and a quota-backed failure (which can leave the volume reporting free space) is missed.
+
+    Captured by streaming rather than by ``capture_output``: the merge takes minutes on a large
+    model and swallowing its progress until it exits would be its own regression. Lines are
+    forwarded as they arrive, and the ENOSPC evidence is recognized IN FLIGHT instead of from a tail
+    buffer -- in the run this comes from, the message was several hundred lines above the final
+    error, further back than any bounded tail worth holding.
+    """
+    process = subprocess.Popen(
+        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    enospc_line = ""
+    with process:
+        for line in process.stdout or ():
+            print(line, end="", flush=True)
+            if not enospc_line and any(m in line.lower() for m in _ENOSPC_MARKERS):
+                enospc_line = line.strip()
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, cmd, output=enospc_line or None)
 
 
 def _free_bytes(path: str) -> int | None:
@@ -140,6 +186,13 @@ def _enospc_error(error: BaseException) -> bool:
         # underlying failure only in its message ("I/O error: No space left on device (os error
         # 28)"), so the text is the sole evidence for that writer.
         if any(marker in str(current).lower() for marker in _ENOSPC_MARKERS):
+            return True
+        # a subprocess failure renders as "Command ... returned non-zero exit status N", which never
+        # contains the child's own message: the captured output has to be read as well.
+        captured = getattr(current, "output", None) or getattr(current, "stderr", None)
+        if isinstance(captured, bytes):
+            captured = captured.decode("utf-8", "replace")
+        if captured and any(marker in captured.lower() for marker in _ENOSPC_MARKERS):
             return True
         current = current.__cause__ or current.__context__
     return False
@@ -175,6 +228,11 @@ def raise_for_merge_disk_exhaustion(
     to do with space (a layout change, an OOM in the child), and relabelling those as a full disk
     would send the next diagnosis somewhere just as wrong as the one this exists to prevent.
     """
+    if isinstance(error, MergerOutputLayoutError) and not _enospc_error(error):
+        # the merger exited 0, so nothing was short-written; the full-model write it just completed
+        # is simply why the disk is now tight. sampling free space here would swap an actionable
+        # layout error for a disk error that is not what happened.
+        return
     free = _free_bytes(merge_out)
     if not _enospc_error(error) and (free is None or free > _MERGE_DISK_EXHAUSTED_FREE_BYTES):
         return
@@ -183,9 +241,8 @@ def raise_for_merge_disk_exhaustion(
         f"ran out of disk while merging {ckpt_actor_dir} into {merge_out}: "
         f"{free_text} free on that filesystem. publishing a checkpoint materializes the FULL base "
         "model beside the checkpoint it reads, so a small lora adapter still needs room for a whole "
-        "model copy. the underlying error is a short write, not a corrupt checkpoint. save fewer "
-        "checkpoints with a larger train.save_every (save_every == the run's total steps publishes "
-        "only the final adapter)."
+        "model copy. the underlying error is a short write, not a corrupt checkpoint. "
+        + _FEWER_CHECKPOINTS_ADVICE
     ) from error
 
 
@@ -400,7 +457,7 @@ def export_peft_adapter(
     # when the merger dies or writes an unexpected layout would strand tens of gb on the exact
     # disk this guard exists to protect, and the next save would inherit less room than this one.
     try:
-        subprocess.run(
+        _run_merger(
             [
                 python_bin,
                 "-m",
@@ -413,12 +470,11 @@ def export_peft_adapter(
                 "--target_dir",
                 merge_out,
             ],
-            check=True,
-            env=merge_env,
+            merge_env,
         )
         lora_dir = os.path.join(merge_out, "lora_adapter")
         if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
-            raise RuntimeError(
+            raise MergerOutputLayoutError(
                 f"verl model_merger did not produce a peft adapter at {lora_dir} (no adapter_config.json); "
                 "the merger output layout must be adjusted for this verl version."
             )
