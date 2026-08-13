@@ -1267,42 +1267,79 @@ def test_undeploy_works_when_the_member_index_is_missing(client):
     assert response.json()["disabled_revisions"] == [REVISION]
 
 
-def test_undeploy_repairs_a_partial_member_index(client):
-    """Index EXISTENCE is not index completeness, and only completeness makes undeploy correct.
+def test_a_registration_that_dies_mid_write_leaves_no_unreachable_revision(client):
+    """A crash between a revision's two writes must never orphan it OUTSIDE the member index.
 
-    Registration writes the revision record and indexes it as two operations, so a container that
-    dies between them leaves a `members:` key that exists and is nonempty while missing exactly the
-    revision that was mid-registration. A repair gated on emptiness sees a populated index, skips
-    the scan, and the orphaned revision survives undeploy as `ready` -- resident on the GPU and
-    directly callable by its immutable id after DELETE answered 200.
+    Registration writes the revision record and indexes it as two Dict operations, so one of the
+    two interrupted states is reachable and the write order decides which. Record first: the index
+    does not name the record, undeploy cannot reach it, and it stays `ready`, resident on the GPU,
+    and directly callable by its immutable id after DELETE answered 200. Index first: the index
+    names a record that does not exist, which the disable loop skips harmlessly.
 
-    The alias id is the completeness signal: `_ensure_run_alias` indexes the alias and the revision
-    together, so an index without the alias is one that was interrupted. That keeps the check a
-    single indexed read rather than the keyspace scan the lock's TTL cannot afford.
+    Detecting the bad state instead is not an option, which is why the order carries the weight:
+    knowing that a NONEMPTY index is missing a revision means enumerating the run's revisions, and
+    that is the unbounded keyspace scan the lock's non-renewable TTL rules out.
+
+    Driven by letting the record write raise, which is where a dying container stops.
     """
     _register_and_ready(client)
     module = client.app.state.generated_module
-    orphan = "run-abc@step-30." + "e" * 40
-    module.adapter_records[module._record_key(orphan)] = {
-        "adapter_id": orphan,
-        "status": "ready",
-        "base_model": BASE_MODEL,
+    step, digest = 40, "f" * 40
+    second = f"{RUN_ID}@step-{step}." + digest
+    payload = {
+        **REGISTRATION,
+        "adapter_id": second,
+        "checkpoint": f"{RUN_ID}/step-{step}",
         "metadata": {
-            "record_type": "revision",
-            "run_id": RUN_ID,
-            "lifecycle_state": "ready",
+            **REGISTRATION["metadata"],
+            "checkpoint_step": step,
+            "hf_revision": digest,
         },
     }
-    # The interrupted state: the record exists, the index does not name it, and the index is not
-    # empty -- it still lists the revision whose registration completed.
-    module.adapter_records[module._members_key(RUN_ID)] = [REVISION]
+    records = module.adapter_records
 
-    response = client.delete(f"/adapters/{REVISION}")
-    assert response.status_code == 200, f"undeploy returned {response.status_code}"
-    assert module.adapter_records[module._record_key(orphan)]["status"] == "disabled", (
-        "a revision missing from a NONEMPTY member index survived undeploy as `ready`, so it stays "
-        "resident and callable by its immutable id after undeploy reported the run was taken down"
+    class _DyingDict(type(records)):
+        """Fails the record write, so only whatever ran BEFORE it survives the crash."""
+
+        @property
+        def put(self):
+            def _write(key, value, skip_if_exists=False):
+                if key == module._record_key(second):
+                    raise RuntimeError("container died mid-registration")
+                return self._put(key, value, skip_if_exists=skip_if_exists)
+
+            return _Aio(_write)
+
+    dying = _DyingDict()
+    dying.update(records)
+    module.adapter_records = dying
+    try:
+        with pytest.raises(RuntimeError, match="container died"):
+            client.post("/adapters", json=payload)
+    finally:
+        # Back to the ordinary dict, carrying whatever the crashed registration left behind: the
+        # point of the rest of this test is that undeploy survives that state.
+        records.clear()
+        records.update(dying)
+        module.adapter_records = records
+
+    # The crash landed where intended: no record for the revision.
+    assert module._record_key(second) not in module.adapter_records, (
+        "the record write was supposed to fail, so this test is not exercising the crash window"
     )
+    members = module.adapter_records.get(module._members_key(RUN_ID)) or []
+    assert second in members, (
+        "registration writes the record before indexing it, so a crash between the two strands the "
+        "revision OUTSIDE its run's member index: undeploy walks the index, never reaches it, and "
+        "reports 200 while it stays resident and callable by its immutable id"
+    )
+    # And the index naming a record that does not exist is harmless -- undeploy skips it.
+    response = client.delete(f"/adapters/{REVISION}")
+    assert response.status_code == 200, (
+        f"undeploy returned {response.status_code} over an index entry whose record is absent, so "
+        "the surviving crash state is not actually the harmless one"
+    )
+    assert module.adapter_records[module._record_key(REVISION)]["status"] == "disabled"
 
 
 def test_a_registration_landing_during_the_disable_pass_is_still_undeployed(client):
@@ -2914,6 +2951,47 @@ def test_a_warm_reclaim_that_fails_still_leaves_a_marker(client):
     assert response.status_code == 200, f"undeploy returned {response.status_code}"
     assert revision in module.discarded, (
         "undeploy did not retry the reclaim the warm path deferred after its failure"
+    )
+
+
+def test_a_failed_reclaim_during_eviction_still_leaves_a_marker(client, engine, monkeypatch):
+    """`Engine.unregister`'s reclaim is the ORDINARY undeploy path, and it had no retry either.
+
+    Distinct from the settle-path warm reclaim: this one runs during eviction, after undeploy has
+    already written `disabled`. Its `rmtree` failure was suppressed outright on the reasoning that
+    "the run's own DELETE pass carries the retry marker" -- but that pass only marks the COLD path,
+    so a failure here left the download on the volume with nothing anywhere that would collect it.
+    Undeploy passes over already-disabled records, and the id is a hash of the adapter id, so the
+    directory outlives the app.
+
+    Driven against the real `Engine.unregister` body rather than the fixture's stub, since the stub
+    replaces the whole method and the suppression under test lives inside it.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    assert client.delete(f"/adapters/{REVISION}").status_code == 200
+    record = module.adapter_records[module._record_key(REVISION)]
+    assert record["status"] == "disabled", "undeploy did not disable the record"
+    # Undeploy clears the marker on success, so the state under test starts without one.
+    assert not (record.get("metadata") or {}).get("cache_reclaim_pending")
+
+    async def _reclaim_fails(adapter_id):
+        raise OSError("input/output error on the volume")
+
+    monkeypatch.setattr(module, "_discard_cached_adapter", _reclaim_fails)
+    instance = engine.__new__(engine)
+    instance._locks = {}
+    instance._loaded = {}
+    instance._int_ids = {}
+    _run_awaitable(engine.unregister(instance, REVISION))
+
+    marked = (module.adapter_records[module._record_key(REVISION)].get("metadata") or {}).get(
+        "cache_reclaim_pending"
+    )
+    assert marked is True, (
+        "eviction swallowed a failed reclaim without marking it, so the download is orphaned: the "
+        "record is already `disabled`, every later undeploy passes over it, and nothing collects "
+        "the directory for the life of the app"
     )
 
 
