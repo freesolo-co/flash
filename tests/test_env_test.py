@@ -2512,6 +2512,59 @@ def test_env_test_warns_when_a_per_example_cap_stops_an_unfinished_replay(
     assert "replay gold answer never finished: it used all 3 turn(s)" in captured.err
 
 
+class _PerExampleCapHealthyEnv(_PerExampleCapDeadEnv):
+    """The same per-example budget, on an environment that actually finishes inside it.
+
+    Differs from the dead fixture above in exactly two ways: the episode is declared over on the
+    last turn the budget allows, and the gold answer is long enough to reach it. Lowering the
+    ceiling to the per-example cap must not turn "used its whole budget" into evidence of a defect:
+    a run that finishes on its final allowed turn is healthy, and warning at it would fire on a
+    correct environment.
+
+    The gold answer must cover all three turns. Inheriting the dead fixture's two-move dataset
+    makes this a different scenario entirely -- a reference that runs out before the episode does,
+    which the driver then pads with junk -- and that case is reported by design.
+    """
+
+    def dataset(self):
+        return [
+            {
+                "input": "solve the board",
+                "output": [{"role": "assistant", "content": f"move {n}"} for n in range(1, 4)],
+            }
+        ]
+
+    def env_reply(self, messages, state):
+        state["turn"] += 1
+        state["done"] = state["turn"] >= 3
+        reply = {"role": "user", "content": "keep going"}
+        messages.append(reply)
+        return [reply]
+
+    def reward(self, completion, example, state=None):
+        self.scored_state = state
+        return 1.0
+
+
+def test_env_test_does_not_warn_when_an_episode_finishes_on_its_per_example_cap(
+    monkeypatch, tmp_path, capsys
+):
+    """Using the whole per-example budget is not the same as never finishing.
+
+    The paired negative for the test above: same cap, same turn count, opposite completion signal.
+    Without both, a fix that simply lowered the ceiling would pass the positive case while warning
+    on every environment that uses its budget fully.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _PerExampleCapHealthyEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "overall: PASS" in captured.out
+    assert "never finished" not in captured.err
+
+
 def test_env_test_warns_when_the_completion_repeats_the_prompts_last_user_turn(
     monkeypatch, tmp_path, capsys
 ):
