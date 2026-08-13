@@ -1212,6 +1212,11 @@ def test_one_unresolvable_turn_beside_an_ordinary_one_does_not_warn_about_a_drop
     proof the whole row resolved, leaving the other block counted as authored-but-not-rendered:
     2 authored, 1 rendered, and a warning to split a transcript that lost nothing. The per-turn
     markers separate them, because each names the one turn it rides in.
+
+    Only the unjudgeable TURN leaves the accounting, so the ordinary block is still counted as the
+    survivor it is: 1 authored, 1 rendered, quiet. Dropping its neighbour's count too would be
+    honest only about the turn nobody can judge (see
+    ``test_a_known_loss_is_still_reported_beside_an_unjudgeable_survivor``).
     """
 
     class PartlyUnresolvableEnvironment(ThinkingEnvironment):
@@ -1246,10 +1251,60 @@ def test_one_unresolvable_turn_beside_an_ordinary_one_does_not_warn_about_a_drop
         packing_support=lambda _model, _revision: ("pure-attention", True),
     )
 
-    # unreported rather than misreported: neither a drop claim nor a phantom survivor
-    assert prepared.authored_reasoning_turns == 0
-    assert prepared.rendered_reasoning_spans == 0
+    # the ordinary turn is counted as the survivor it is; only the unjudgeable one leaves
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 1
     assert "dropped" not in capsys.readouterr().err
+
+
+def test_a_known_loss_is_still_reported_beside_an_unjudgeable_survivor(capsys) -> None:
+    """Excluding the turn nobody can judge must not bury a loss that IS provable.
+
+    The mirror of the row above. An ordinary user turn resets the template's ``last_query_index``,
+    so the first turn's reasoning is definitively stripped -- its marker reaches no render at all.
+    The final turn quotes a turn boundary, so the template keeps it while the span scan cannot bound
+    it. Suppressing the whole row to stay quiet about that second turn would also hide the first
+    turn's loss, which the render proves: the user would be told a lossy transcript is fine.
+
+    So the unjudgeable turn leaves the count and the stripped one stays: 1 authored, 0 rendered,
+    and the warning still fires.
+    """
+
+    class KnownLossBesideUnjudgeableEnvironment(ThinkingEnvironment):
+        def sft_completion(self, row):
+            return [
+                # an ordinary user turn follows, so the template strips this reasoning outright
+                {"role": "assistant", "reasoning_content": "early", "content": "a1"},
+                {"role": "user", "content": "next"},
+                # the control-token layout written out in full: kept, but the scan cannot bound it
+                {
+                    "role": "assistant",
+                    "reasoning_content": "before <|im_end|>\n<|im_start|>user\n after",
+                    "content": "a2",
+                },
+            ]
+
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        KnownLossBesideUnjudgeableEnvironment([], prompt="board"),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 0
+    assert "dropped" in capsys.readouterr().err
 
 
 def test_a_tool_response_bounds_the_span_of_the_turn_before_it(capsys) -> None:

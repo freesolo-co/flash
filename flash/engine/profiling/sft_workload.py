@@ -382,22 +382,27 @@ def _row_reasoning(
     prefix = reasoning_marker_prefix(full_text)
     marked_render = render([*prompt_messages, *with_marked_reasoning(completion_messages, prefix)])
     marked_spans = reasoning_span_texts(marked_render)
-    if any(
-        marker in marked_render and not any(marker in span for span in marked_spans)
+    unjudgeable = sum(
+        1
         for marker in reasoning_markers(completion_messages, prefix)
-    ):
+        if marker in marked_render and not any(marker in span for span in marked_spans)
+    )
+    if unjudgeable:
         # the template KEPT reasoning the span scan could not locate: a marker rides only inside
         # text the template chose to keep, so a marker in the render with no span containing it
         # means the scan failed to bound a block that survived -- not that the template dropped it.
-        # reporting a drop here would tell the user to split a transcript that lost nothing, so the
-        # row is left unreported. reachable when reasoning quotes a turn boundary verbatim (see
-        # ``reasoning_spans``); a row the template really stripped keeps no marker at all.
+        # reporting a drop here would tell the user to split a transcript that lost nothing.
+        # reachable when reasoning quotes a turn boundary verbatim (see ``reasoning_spans``); a row
+        # the template really stripped keeps no marker at all.
         #
-        # asked PER TURN, because turns in one row are answered differently: a row that pairs an
-        # unlocatable block with an ordinary one has a surviving marker inside a resolved span, and
-        # a check for the shared prefix would read that as the whole row being resolvable while the
-        # other block sits unlocated -- reporting it as dropped, the false warning this prevents.
-        return _RowReasoning(0, 0, 0)
+        # asked PER TURN, because turns in one row are answered differently. only the unjudgeable
+        # TURN leaves the accounting, never its whole row: a neighbour whose marker is absent from
+        # the render was definitively stripped, and zeroing the row to stay quiet about the turn
+        # that cannot be judged would bury that known loss with it.
+        authored -= unjudgeable
+        if not authored:
+            # every authored turn was unjudgeable, so the row supports no claim either way.
+            return _RowReasoning(0, 0, 0)
     if len(marked_spans) != len(ends):
         # marking changed the span sequence, so the two renders no longer address the same spans.
         # unreachable by construction; treated as "cannot tell" rather than guessed at, because a

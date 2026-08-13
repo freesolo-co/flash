@@ -427,6 +427,57 @@ def test_one_unresolvable_block_beside_a_resolvable_one_keeps_its_marker(tokeniz
     assert any(prefix in span for span in marked_spans)
 
 
+def test_a_stripped_marker_is_absent_while_an_unjudgeable_one_survives(tokenizer) -> None:
+    """The two ways a marker can fail to sit in a span, told apart by the shipped template.
+
+    An unjudgeable turn is excluded from the row's accounting while a stripped neighbour is still
+    counted as lost, and the only thing separating those cases is whether the marker reached the
+    render at all. That discriminator is asserted here against the real template, because the
+    offline test can only claim it:
+
+    * the first turn is followed by an ordinary user turn, so ``last_query_index`` strips its
+      reasoning and its marker reaches NO render -- a provable loss;
+    * the last turn quotes a turn boundary verbatim, so the template keeps it while the span scan
+      cannot bound it -- its marker is in the render but in no span.
+
+    Both markers are missing from every span, so a check that only asked "is this marker in a span"
+    would treat them identically and bury the provable loss.
+    """
+    prompt = [{"role": "user", "content": "u1"}]
+    completion = [
+        {"role": "assistant", "content": "a1", "reasoning_content": "early"},
+        # an ordinary user turn, unlike a tool turn, DOES reset last_query_index
+        {"role": "user", "content": "next"},
+        {
+            "role": "assistant",
+            "content": "a2",
+            # the control-token layout written out in full, not merely mentioned
+            "reasoning_content": f"see {TURN_END}\n<|im_start|>user\n then more",
+        },
+    ]
+    full = _render(tokenizer, prompt + completion)
+
+    assert reasoned_assistant_turns(completion) == 2
+    # the template stripped the first block outright and kept the second
+    assert "early" not in full
+    assert "then more" in full
+
+    prefix = reasoning_marker_prefix(full)
+    marked = _render(tokenizer, prompt + with_marked_reasoning(completion, prefix))
+    markers = reasoning_markers(completion, prefix)
+    assert len(markers) == 2
+    stripped, unjudgeable = markers[0], markers[1]
+
+    # the discriminator: absent from the render entirely vs present but unlocatable
+    assert stripped not in marked
+    assert unjudgeable in marked
+
+    marked_spans = reasoning_span_texts(marked)
+    # neither sits in a span, which is why presence in the RENDER is what separates them
+    assert not any(stripped in span for span in marked_spans)
+    assert not any(unjudgeable in span for span in marked_spans)
+
+
 def test_the_real_template_prefers_reasoning_content_over_an_inline_span(tokenizer) -> None:
     """Pins the ``reasoning_content`` branch of ``reasoned_assistant_turns`` to the template."""
     messages = [
