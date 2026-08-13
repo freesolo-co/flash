@@ -2717,6 +2717,168 @@ def test_a_binary_der_private_key_is_detected(tmp_path):
     assert credential_in_file(public) is None
 
 
+def test_every_rfc_8410_curve_is_detected_not_just_the_25519_pair(tmp_path):
+    """The four RFC 8410 OIDs are `1.3.101.{110,111,112,113}`, final byte 0x6e-0x71.
+
+    Naming only 0x6e and 0x70 covered X25519 and Ed25519 and left Ed448 and X448 undetected, so a
+    real private key on either of those curves published intact. They are one contiguous range.
+    """
+    import subprocess
+
+    from flash.env_secrets import credential_in_file
+
+    for algorithm in ("ED25519", "X25519", "ED448", "X448"):
+        path = tmp_path / f"{algorithm}.der"
+        subprocess.run(
+            ["openssl", "genpkey", "-algorithm", algorithm, "-outform", "DER", "-out", str(path)],
+            check=True,
+            capture_output=True,
+        )
+        assert credential_in_file(path) == "a private key", algorithm
+
+        # the public half of the same key carries the same OID and must still publish
+        public = tmp_path / f"{algorithm}.pub.der"
+        subprocess.run(
+            [
+                "openssl",
+                "pkey",
+                "-in",
+                str(path),
+                "-inform",
+                "DER",
+                "-pubout",
+                "-outform",
+                "DER",
+                "-out",
+                str(public),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        assert credential_in_file(public) is None, algorithm
+
+
+def test_an_openpgp_secret_key_is_detected_armoured_and_binary(tmp_path):
+    """`gpg --export-secret-keys` writes a private key in two forms and neither was caught.
+
+    Armoured, the header is `-----BEGIN PGP PRIVATE KEY BLOCK-----`, and `[A-Z ]*PRIVATE KEY-----`
+    cannot match the trailing ` BLOCK`. Binary, there is no text header at all and the key material
+    is neither base64 nor DER, so every other check passed it through.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("gpg") is None:
+        pytest.skip("gpg is not installed")
+
+    from flash.env_secrets import credential_in_file
+
+    home = tmp_path / "gnupg"
+    home.mkdir(mode=0o700)
+    env = {"GNUPGHOME": str(home), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    subprocess.run(
+        [
+            "gpg",
+            "--batch",
+            "--passphrase",
+            "",
+            "--quick-gen-key",
+            "test@example.com",
+            "default",
+            "default",
+            "never",
+        ],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    def _export(*flags: str) -> bytes:
+        return subprocess.run(
+            [
+                "gpg",
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                *flags,
+                "test@example.com",
+            ],
+            check=True,
+            capture_output=True,
+            env=env,
+        ).stdout
+
+    armoured = tmp_path / "secret.asc"
+    armoured.write_bytes(_export("--export-secret-keys", "--armor"))
+    assert credential_in_file(armoured) == "a private key block"
+
+    binary = tmp_path / "secret.gpg"
+    binary.write_bytes(_export("--export-secret-keys"))
+    assert credential_in_file(binary) == "a private key"
+
+    # the PUBLIC keyring is meant to be shared: packet tags 6 and 14, not 5 and 7
+    for flags, name in ((("--export", "--armor"), "public.asc"), (("--export",), "public.gpg")):
+        public = tmp_path / name
+        public.write_bytes(_export(*flags))
+        assert credential_in_file(public) is None, name
+
+
+def test_the_openpgp_packet_header_does_not_fire_on_ordinary_binaries():
+    """Anchored at offset 0, because searching for these bytes anywhere would refuse real files.
+
+    The header is only a couple of constrained bytes; matched anywhere it would hit roughly once
+    per megabyte of arbitrary data, which is a false refusal on every model shard in a package.
+    """
+    import random
+
+    from flash.env_secrets import _is_openpgp_secret_key
+
+    # measured 1 in 4,400 on tag plus version alone, and 1 in 108,000 once the algorithm byte is
+    # required too. 40,000 draws would fail essentially always at the former rate and pass at this
+    # one, which is what makes this a regression test rather than a coincidence.
+    #
+    # SEEDED, not `os.urandom`: at 1 in 108,000 an unseeded run of this size fails a few times in
+    # ten by luck alone, and a security check that goes red at random gets switched off.
+    draws = random.Random(0)
+    assert not any(_is_openpgp_secret_key(draws.randbytes(16)) for _ in range(40_000))
+    # a real ELF, a zip and a PNG all start with bytes that must not be read as a packet tag
+    for head in (
+        b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        b"PK\x03\x04\x14\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00",
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+    ):
+        assert not _is_openpgp_secret_key(head), head
+
+
+def test_a_hex_body_under_an_issuer_prefix_is_a_placeholder_not_a_key():
+    """The all-hex carve-out belongs to the assignment-anchored patterns only.
+
+    It exists because a legacy W&B key IS 40 hex characters, and `abcdef...` reads as
+    all-lowercase-alpha, i.e. as a placeholder. Applying it to every pattern refused
+    `hf_deadbeefdeadbeefdeadbeefdeadbeef` -- the canonical hex placeholder -- because the hex test
+    ran before the rule that would have cleared it. An issued `hf_`/`fslo_` body is base62, so one
+    confined to `[a-f]` with no digit is not a shape they take.
+    """
+    from flash.env_secrets import _credential_kind
+
+    for placeholder in (
+        b"hf_deadbeefdeadbeefdeadbeefdeadbeef",
+        b"fslo_deadbeefdeadbeefdeadbeefdeadbeef",
+    ):
+        assert _credential_kind(placeholder) is None, placeholder
+
+    # real keys under the same prefixes are still refused
+    assert _credential_kind(f"hf_{_FAKE_KEY_BODY}".encode()) == "a Hugging Face token"
+    assert _credential_kind(f"fslo_{_FAKE_KEY_BODY}".encode()) == "a Freesolo API key"
+
+    # and the W&B key the carve-out exists for is still refused, its placeholder still allowed
+    real = b"WANDB_API_KEY=d5c7bfe532fe1fe056b940909986e48aee4f5112"
+    assert _credential_kind(real) == "a Weights & Biases API key"
+    assert _credential_kind(b"WANDB_API_KEY=your_wandb_api_key_here_replace_before_push") is None
+
+
 def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
     """`Warning:` is prose; `Proc-Type:` and `DEK-Info:` are RFC 1421 encrypted-key headers.
 

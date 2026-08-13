@@ -135,10 +135,14 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
 # `Warning:` or `Note:`, which is prose about a key rather than a key, and reopens the very false
 # positive the base64 requirement exists to close.
 _LITERAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
+    #
+    # `(?: BLOCK)?` because OpenPGP armours as `-----BEGIN PGP PRIVATE KEY BLOCK-----`. Without it
+    # the trailing word made the header unmatchable and a `gpg --export-secret-keys --armor` file
+    # published intact -- `[A-Z ]*` reaches `PGP PRIVATE KEY`, but nothing followed ` BLOCK`.
     (
         "a private key block",
         re.compile(
-            rb"-----BEGIN [A-Z ]*PRIVATE KEY-----[\r\n\s]*"
+            rb"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\r\n\s]*"
             rb"(?:[A-Za-z0-9+/=]{32,}|Proc-Type:|DEK-Info:)"
         ),
     ),
@@ -153,9 +157,13 @@ _LITERAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     (
         "a private key",
         re.compile(
-            # PKCS#8 PrivateKeyInfo, by algorithm: RSA, Ed25519/X25519, EC
+            # PKCS#8 PrivateKeyInfo, by algorithm: RSA, the RFC 8410 curves, EC.
+            #
+            # The RFC 8410 OIDs are `1.3.101.{110,111,112,113}` = X25519, X448, Ed25519, Ed448,
+            # whose final byte is 0x6e, 0x6f, 0x70, 0x71. Naming only the 25519 pair let a real
+            # Ed448 or X448 key publish intact; the four are one contiguous range.
             rb"\x02\x01\x00\x30.\x06(?:\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
-            rb"|\x03\x2b\x65[\x6e\x70]|\x07\x2a\x86\x48\xce\x3d\x02\x01)"
+            rb"|\x03\x2b\x65[\x6e-\x71]|\x07\x2a\x86\x48\xce\x3d\x02\x01)"
             # PKCS#1 RSAPrivateKey: version 0 then a long-form modulus INTEGER
             rb"|\x30\x82..\x02\x01\x00\x02\x82"
             # SEC1 ECPrivateKey: version 1, a curve-sized scalar, then the [0] curve parameters
@@ -293,7 +301,7 @@ _UNREADABLE_ARCHIVE = (
 )
 
 
-def _is_high_entropy(body: bytes) -> bool:
+def _is_high_entropy(body: bytes, *, hex_is_issued: bool = False) -> bool:
     """Whether a key body looks issued rather than hand-written.
 
     An issued token is random over its alphabet, so each rejected shape below is one a real key
@@ -321,11 +329,18 @@ def _is_high_entropy(body: bytes) -> bool:
     environment could not be published. The exemption existed for the all-hex legacy key
     (`abcdef...` is all-lowercase-alpha, which reads as a placeholder), so that one case is
     admitted explicitly below rather than by exempting the whole group.
+
+    `hex_is_issued` carries that admission, and only the assignment-anchored patterns set it. It
+    is what tells an all-hex W&B key from `hf_deadbeefdeadbeefdeadbeefdeadbeef`: applying it to
+    every pattern refused the canonical hex placeholder under an issuer prefix, because the hex
+    test ran before the all-lowercase-alpha rule that would have cleared it. Withholding it costs
+    no real token -- an issued `hf_`/`fslo_`/`sk-` body is base62, so one confined to `[a-f]` with
+    no digit at all is not a shape they take.
     """
     text = body.decode("ascii", "ignore").replace("_", "").replace("-", "")
     if len(set(text)) <= 2:
         return False
-    if _HEX_BODY.fullmatch(text):
+    if hex_is_issued and _HEX_BODY.fullmatch(text):
         # a full-length hex body is a key or a hash, never a hand-written placeholder: the
         # convention is words (`your_key_here`), and those are not confined to `[a-f]`.
         return True
@@ -337,12 +352,15 @@ def _match(data: bytes) -> str | None:
     for kind, pattern in _LITERAL_PATTERNS:
         if pattern.search(data):
             return kind
-    for kind, pattern in _TOKEN_PATTERNS + _ASSIGNED_PATTERNS:
-        for match in pattern.finditer(data):
-            # the alternations above put the body in whichever group matched; the rest are None.
-            body = next((group for group in match.groups() if group), b"")
-            if _is_high_entropy(body):
-                return kind
+    # only the assignment-anchored group admits an all-hex body: its W&B key is issued as hex,
+    # while an issuer-prefixed token is base62, so an all-hex body there is the placeholder.
+    for group, hex_is_issued in ((_TOKEN_PATTERNS, False), (_ASSIGNED_PATTERNS, True)):
+        for kind, pattern in group:
+            for match in pattern.finditer(data):
+                # the alternations put the body in whichever group matched; the rest are None.
+                body = next((found for found in match.groups() if found), b"")
+                if _is_high_entropy(body, hex_is_issued=hex_is_issued):
+                    return kind
     return None
 
 
@@ -486,6 +504,10 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     while chunk := handle.read(_SCAN_CHUNK_BYTES):
         if deadline is not None and time.monotonic() > deadline:
             raise _Unscannable("takes too long to decompress")
+        if not carry and _is_openpgp_secret_key(chunk[:16]):
+            # only ever at offset 0, and `carry` is empty only on the first chunk. Every file and
+            # every archive member reaches this, so the binary export is covered wherever it sits.
+            return "a private key"
         if not carry and depth:
             # tar as well as the compressed magics: a tar's own members are literal, but a
             # COMPRESSED member inside one is not, so an oversized tar that went past the buffer
@@ -518,6 +540,47 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
 def _looks_compressed(head: bytes) -> bool:
     """Whether `head` begins a compressed container this scan can expand."""
     return head.startswith(_COMPRESSED_MAGIC)
+
+
+def _is_openpgp_secret_key(head: bytes) -> bool:
+    """Whether `head` begins an unarmoured OpenPGP secret key packet.
+
+    `gpg --export-secret-keys` without `--armor` writes raw packets: no text header for the PEM
+    pattern to match, and the key material inside is neither base64 nor DER, so every other check
+    here passes it through. The armoured form of the same key is caught by its header, which made
+    the binary form the way to publish a private key intact.
+
+    Matched on the packet header rather than on a byte pattern anywhere in the file. An OpenPGP
+    packet's first byte has bit 7 set, and its tag is 5 (secret key) or 7 (secret subkey) -- old
+    format `0x94-0x97` and `0x95`, new format `0xc5`/`0xc7` -- followed by the length and then
+    version 4 or 6. The corresponding PUBLIC key tags are 6 and 14 (`0x98`/`0x99`, `0xc6`), so the
+    tag alone distinguishes a secret key from the public half that is meant to be shared.
+
+    Anchoring at offset 0 is what keeps this from firing on ordinary binaries. These are only a
+    handful of constrained bytes, and searching for them anywhere would match roughly once per
+    megabyte of arbitrary data -- a false refusal on every model shard in the package.
+
+    The ALGORITHM byte is checked as well as the tag and version. Tag plus version alone is about
+    twelve bits of signal, which measured 1 in 4,400 on random bytes: high enough that a package of
+    binary shards would eventually be refused over nothing. The public-key algorithm is a small
+    registry, and requiring it takes the same measurement to 1 in 108,000 (8/256 * 2/256 * 12/256
+    predicts 1 in 87,000). That is a head-anchored test on the FIRST bytes of a member, not a
+    search, so it is one draw per file rather than one per megabyte.
+    """
+    # RFC 4880 and 9580 public-key algorithms: RSA, Elgamal, DSA, ECDH/ECDSA/EdDSA, and the RFC
+    # 9580 curve IDs. A byte outside this registry is not a key packet.
+    algorithms = frozenset((1, 2, 3, 16, 17, 18, 19, 22, 25, 26, 27, 28))
+    tag_old, tag_new = head[0] & 0xFC, head[0]
+    if tag_old not in (0x94, 0x9C) and tag_new not in (0xC5, 0xC7):
+        return False
+    # old format carries the length in 1, 2 or 4 bytes as selected by the low two bits; new format
+    # always in the byte after the tag. The version byte follows, and only 4 and 6 are issued.
+    lengths = {0x00: 2, 0x01: 3, 0x02: 5}
+    offset = 2 if tag_new in (0xC5, 0xC7) else lengths.get(head[0] & 0x03, 0)
+    if offset == 0 or len(head) <= offset or head[offset] not in (4, 6):
+        return False
+    # then a four-byte creation timestamp, then the algorithm
+    return len(head) > offset + 5 and head[offset + 5] in algorithms
 
 
 def _looks_like_tar(source: Path | bytes) -> bool:
