@@ -348,13 +348,41 @@ async def _discard_cached_adapter(adapter_id: str) -> None:
     the call; the difference is that they now choose to.
     """
     current = await adapter_records.get.aio(_record_key(adapter_id))
-    if isinstance(current, dict) and current.get("status") == "disabled":
-        # `ignore_errors` stays FALSE so a failed unlink surfaces. `missing_ok` behavior is kept by
-        # tolerating an already-absent directory: a reclaim that ran before is a success, not an
-        # error, and re-running one is exactly what a retried undeploy does.
-        directory = f"{{ADAPTER_DIR}}/{{_adapter_digest(adapter_id)}}"
-        if os.path.exists(directory):
-            await asyncio.to_thread(shutil.rmtree, directory)
+    if not isinstance(current, dict) or current.get("status") != "disabled":
+        return
+    # The generation the disabled check was made against. A pre-delete status sample is not enough
+    # on its own: `rmtree` is filesystem work and the record can be re-registered while it runs, so
+    # the new settle can be downloading into or loading from this very directory as the stale
+    # reclaim deletes it. The accepted registration then fails mid-load, or commits `ready` with its
+    # cached files gone -- and retaining a pending marker does not put those files back.
+    #
+    # `settle_attempt` is the generation: registration stamps a fresh one on every POST it accepts,
+    # including the reset of a disabled record. Re-reading it after the delete and comparing tells a
+    # directory that is still garbage from one a registration has taken over.
+    generation = (current.get("metadata") or {{}}).get("settle_attempt")
+    # `ignore_errors` stays FALSE so a failed unlink surfaces. `missing_ok` behavior is kept by
+    # tolerating an already-absent directory: a reclaim that ran before is a success, not an error,
+    # and re-running one is exactly what a retried undeploy does.
+    directory = f"{{ADAPTER_DIR}}/{{_adapter_digest(adapter_id)}}"
+    if not os.path.exists(directory):
+        return
+    await asyncio.to_thread(shutil.rmtree, directory)
+    # RE-CHECKED after the delete, and raising when it lost the race. This cannot un-delete the
+    # files, so it is not a fix for the deletion itself -- it is what stops the caller recording
+    # success for a directory a live registration now owns. Undeploy's caller catches this and
+    # keeps `cache_reclaim_pending`, and settle turns it into a `failed` record with a real reason,
+    # so the operator sees a load that must be retried rather than a revision that reads `ready`
+    # and 500s on first chat. A revision re-registered mid-reclaim has to download again either
+    # way; the difference is whether anything says so.
+    latest = await adapter_records.get.aio(_record_key(adapter_id))
+    if isinstance(latest, dict) and (
+        latest.get("status") != "disabled"
+        or (latest.get("metadata") or {{}}).get("settle_attempt") != generation
+    ):
+        raise RuntimeError(
+            f"{{adapter_id}} was re-registered while its cache was being reclaimed, so its "
+            f"downloaded weights were deleted out from under the new registration. redeploy it."
+        )
 
 
 async def _mark_lora_release_pending(adapter_id: str) -> None:
@@ -1691,8 +1719,21 @@ def api():
             # a NONEMPTY index is missing a revision means enumerating that run's revisions, which
             # is the unbounded keyspace scan the lock's non-renewable TTL cannot afford.
             await _remember_member(run_id, adapter_id)
-            await _write(record)
+            # The ALIAS is created before the revision record is exposed, not after it. Both are
+            # fallible Dict work, and the ordering decides what a failure between them looks like to
+            # the client: `_ensure_run_alias` raising after `_write` returned a 5xx over a durable
+            # record that already reads `registered` with a matching identity, so the client's
+            # ambiguous-registration recovery concluded the POST had landed and polled that record
+            # for its full readiness budget -- but nothing had queued a settle, so it could never
+            # leave `registered`, and the retry that would have repaired it was never sent.
+            #
+            # Created first, a failure here leaves no visible revision record at all, so the client
+            # sees an ordinary 5xx, its readback finds nothing, and it re-raises the real error. The
+            # alias is idempotent and starts `disabled` pointing at nothing, so an alias left behind
+            # by a failed registration takes no traffic and the next POST repairs it -- the same
+            # repair the identical-registration path above already performs on every retry.
             await _ensure_run_alias(run_id, adapter_id)
+            await _write(record)
 
         # Spawned, NOT `asyncio.create_task`: this web function scales horizontally and to zero, so a
         # task parked in one container's event loop dies with that container -- and because the very
@@ -1973,6 +2014,8 @@ def api():
         # reentrant -- a nested acquire waits on a lease this very call holds and 409s at the
         # deadline -- so the cold branch records here and clears below.
         cleared: list[str] = []
+        # Revisions whose cold release FAILED, marked after the lock so a later DELETE retries it.
+        restrand: list[str] = []
         # `restranded` joins the dispatch: those are revisions an EARLIER undeploy disabled but
         # could not finish evicting, so they carry a marker and still hold their claim. They are
         # not in `disabled_revisions` -- that list holds only what THIS pass transitioned -- so
@@ -2096,22 +2139,41 @@ def api():
                     # delete anything that is no longer disabled.
                     if revision_id not in reclaimable:
                         reclaimable.append(revision_id)
+                    revived = False
+                    released = False
                     with contextlib.suppress(Exception):  # releasing is best effort, like eviction
                         current = await adapter_records.get.aio(_record_key(revision_id))
                         if isinstance(current, dict) and current.get("status") != "disabled":
-                            continue  # revived under this lock's protection; its claim is not ours
-                        await _release_lora_int_id(_lora_int_id(revision_id), revision_id)
+                            revived = True  # revived under this lock; its claim is not ours
+                        else:
+                            await _release_lora_int_id(_lora_int_id(revision_id), revision_id)
+                            released = True
+                    if revived:
+                        continue
+                    if released:
                         # CLEARED here too, the mirror of the warm branch. A `restranded` revision
                         # reaches this path carrying `lora_release_pending`, and the release above
                         # is exactly the recovery the marker was asking for -- so leaving it set
                         # made every later DELETE re-queue the revision for a reclaim and an
-                        # eviction with nothing left to free. Inside the suppress and after the
-                        # release, so a failed release keeps the marker and the retry stays alive.
+                        # eviction with nothing left to free.
                         cleared.append(revision_id)
+                    else:
+                        # And MARKED when it failed, which the bare suppress silently skipped. This
+                        # branch sets no `cache_reclaim_pending` either, so a transient Dict failure
+                        # here left the claim held by an already-disabled revision with nothing
+                        # recording it -- the next DELETE passes over the record, no operation ever
+                        # retries the release, and a future adapter colliding on those 31 bits is
+                        # refused for the life of the app. Recorded outside the run lock below,
+                        # because `_mark_lora_release_pending` takes that same lock and it is not
+                        # reentrant.
+                        restrand.append(revision_id)
         # Outside the lock, for the reentrancy reason above.
         for revision_id in cleared:
             with contextlib.suppress(Exception):
                 await _clear_lora_release_pending(revision_id)
+        for revision_id in restrand:
+            with contextlib.suppress(Exception):
+                await _mark_lora_release_pending(revision_id)
         # The deferred reclaims, run whether or not anything is warm. Unlike eviction, this has no
         # cheaper time to happen: undeploy is the last event in the run's life, so skipping here
         # leaves the directory on the volume for good. It is also bounded -- one `rmtree` per

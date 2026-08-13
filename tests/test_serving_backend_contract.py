@@ -4742,3 +4742,138 @@ def test_a_chat_load_refuses_a_revision_undeployed_mid_flight(client, engine, mo
     assert revision not in instance._loaded, (
         "the disabled revision was cached on this replica and would answer the next generate"
     )
+
+
+def test_a_cold_release_that_fails_marks_the_claim_for_a_retry(client, monkeypatch):
+    """The cold branch owes a marker when its release fails, exactly as the warm branch does.
+
+    A bare `suppress` around the release swallowed a transient Dict failure and left the claim held
+    by an already-disabled revision with nothing recording it. This path sets no
+    `cache_reclaim_pending` either, so the next DELETE passes over the record, no operation ever
+    retries the release, and a future adapter colliding on those 31 bits is refused for the life of
+    the app.
+    """
+    module = client.app.state.generated_module
+    run_id = "cold-release-fails"
+    revision = f"{run_id}@final." + "9" * 40
+    int_id = module._lora_int_id(revision)
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "revision", "lifecycle_state": "ready"},
+    }
+    module.adapter_records[module._record_key(run_id)] = {
+        "adapter_id": run_id,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "alias", "alias_of": revision},
+    }
+    module.adapter_records[module._members_key(run_id)] = [run_id, revision]
+    module.adapter_records[module._lora_id_key(int_id)] = revision
+    module.runners.count = 0  # cold, so the release branch is the one that runs
+
+    real_release = module._release_lora_int_id
+
+    async def _release_raises(_int_id, _adapter_id):
+        raise RuntimeError("dict unavailable")
+
+    monkeypatch.setattr(module, "_release_lora_int_id", _release_raises)
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+
+    record = module.adapter_records[module._record_key(revision)]
+    assert (record.get("metadata") or {}).get("lora_release_pending"), (
+        "the cold release failed and nothing recorded it, so the claim stays held by a disabled "
+        "revision and no later delete will ever retry the release"
+    )
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) == revision, (
+        "precondition: the failed release must have left the claim in place"
+    )
+
+    # And the marker has to be load-bearing: a later healthy undeploy must finish the release.
+    monkeypatch.setattr(module, "_release_lora_int_id", real_release)
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) is None, (
+        "the retry never released the claim, so the marker is not what the recovery keys off"
+    )
+
+
+def test_a_reclaim_that_loses_a_race_to_re_registration_reports_it(client, monkeypatch, tmp_path):
+    """Deleting a directory a fresh registration has taken over must not be reported as success.
+
+    A pre-delete status sample cannot fence `rmtree`: the record can be re-registered while the
+    filesystem work runs, so the new settle may be downloading into or loading from this very
+    directory as the stale reclaim deletes it. The accepted registration then fails mid-load, or
+    commits `ready` with its cached files gone. Raising does not un-delete them -- it is what stops
+    the caller recording success, so the failure is reported instead of surfacing as a `ready`
+    revision that 500s on first chat.
+    """
+    module = client.app.state.generated_module
+    revision = "reclaim-races@final." + "a" * 40
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "disabled",
+        "metadata": {"run_id": "reclaim-races", "record_type": "revision", "settle_attempt": "old"},
+    }
+    directory = tmp_path / module._adapter_digest(revision)
+    directory.mkdir()
+    (directory / "adapter_model.safetensors").write_text("weights")
+    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
+
+    real_rmtree = module.shutil.rmtree
+
+    def _rmtree_then_reregister(path, *args, **kwargs):
+        # The race: a POST is accepted while the delete runs, stamping a new generation.
+        real_rmtree(path, *args, **kwargs)
+        module.adapter_records[module._record_key(revision)] = {
+            "adapter_id": revision,
+            "status": "registered",
+            "metadata": {
+                "run_id": "reclaim-races",
+                "record_type": "revision",
+                "settle_attempt": "new",
+            },
+        }
+
+    monkeypatch.setattr(module.shutil, "rmtree", _rmtree_then_reregister)
+
+    with pytest.raises(RuntimeError, match="re-registered while its cache was being reclaimed"):
+        _run_awaitable(module._discard_cached_adapter(revision))
+
+
+def test_a_registration_that_cannot_index_its_alias_exposes_no_record(client, monkeypatch):
+    """A revision must never be visible without a settle queued behind it.
+
+    `_ensure_run_alias` raising after `_write` returned a 5xx over a durable record already reading
+    `registered` with a matching identity. The client's ambiguous-registration recovery treats that
+    as "the POST landed" and polls the record for its full readiness budget -- but nothing queued a
+    settle, so it can never leave `registered`, and the retry that would have repaired it is never
+    sent. The deploy dies as a timeout with the engine perfectly healthy.
+    """
+    module = client.app.state.generated_module
+    # The shipped fixture verbatim: this endpoint validates the id against its own provenance, so a
+    # hand-built body risks a 422 that never reaches the alias code being tested.
+    body = dict(REGISTRATION)
+    revision = REVISION
+    run_id = RUN_ID
+
+    calls: list[str] = []
+    real_remember = module._remember_member
+
+    async def _fail_on_alias(target_run, adapter_id):
+        calls.append(adapter_id)
+        # The alias's own index write is the fallible step being modeled.
+        if adapter_id == target_run:
+            raise RuntimeError("dict unavailable")
+        return await real_remember(target_run, adapter_id)
+
+    monkeypatch.setattr(module, "_remember_member", _fail_on_alias)
+
+    # The raise propagates, which is a 500 to a real client -- exactly the status that triggers the
+    # ambiguous-registration recovery. TestClient re-raises it rather than rendering the response.
+    with pytest.raises(RuntimeError, match="dict unavailable"):
+        client.post("/adapters", json=body)
+
+    assert dict.get(module.adapter_records, module._record_key(revision)) is None, (
+        "the revision record is visible after a failed registration, so the client's readback "
+        "finds a matching identity, concludes the post landed, and polls a record no settle will "
+        "ever advance -- instead of retrying the idempotent post that would repair it"
+    )
