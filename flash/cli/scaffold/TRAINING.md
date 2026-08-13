@@ -1218,7 +1218,7 @@ def step_episode(self, example, messages, assistant_response):
     for message in messages[:-1]:
         if message["role"] == "assistant":
             state = self.apply(state, message["content"])
-    state = self.apply(state, assistant_response)   # the newest action, exactly once
+    state = self.apply(state, assistant_response)  # the newest action, exactly once
     ...
 ```
 
