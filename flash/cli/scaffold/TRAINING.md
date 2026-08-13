@@ -1226,33 +1226,52 @@ def step_episode(self, example, messages, assistant_response):
 
 If your `start_episode` **does** seed an assistant message (a worked example, a demonstration
 turn), that message is sitting in `messages` looking exactly like a move, and the loop above
-would apply your own demo to the real state. Do not try to fix this by recomputing the prompt
-length: Flash may prepend a system message carrying the training contract, so
-`len(self.start_episode(...))` can be one short of the real prefix, and the offset silently
-leaks the demo back in. Mark your own actions instead, so the boundary is carried by the data
-rather than by a count that has to stay in sync:
+would apply your own demo to the real state. The cleanest fix is to not seed one: put worked
+examples in the user or system text of the prompt, where no replay loop can mistake them for
+actions. Do not reach for a prompt length instead. Flash may prepend a system message carrying
+the training contract, so `len(self.start_episode(...))` can come out one short of the real
+prefix, and the offset then leaks the demo back in silently.
+
+Parse the transcript instead, and parse it the same way on both paths:
 
 ```python
-ACTION = re.compile(r"^<move>(.*)</move>$", re.DOTALL)  # your own action syntax
+ACTION = re.compile(r"<move>(.*?)</move>", re.DOTALL)  # your own action syntax
+
+
+def action_of(content: str) -> str:
+    found = ACTION.search(content)
+    if found is None:  # a generated turn carrying no action is a bug worth seeing
+        raise ValueError(f"no action in assistant turn: {content[:120]!r}")
+    return found.group(1)
+
 
 for message in messages[:-1]:
-    if message["role"] == "assistant" and (m := ACTION.match(message["content"].strip())):
-        state = self.apply(state, m.group(1))
+    if message["role"] == "assistant":
+        state = self.apply(state, action_of(message["content"]))
+state = self.apply(state, action_of(assistant_response))  # the newest action, exactly once
 ```
 
-A demo written in prose does not match, and a real action does, whatever Flash puts in front of
-your prompt. That is the property a count cannot give you. Two limits to be honest about: a
-demo written in your _own_ action syntax is indistinguishable from a move, so write demos in
-prose or a visibly different form; and an anchored pattern like the one above will not match an
-action buried in surrounding reasoning, which drops that turn silently. If your models emit
-reasoning around their actions, search rather than anchor, and prefer failing loudly on an
-assistant turn that parses to nothing over skipping it.
+**Search, do not anchor.** With `thinking = true` the transcript keeps the raw turn, so a prior
+action reaches you as `<think>...</think><move>...</move>`. A start-anchored pattern matches
+none of those, and the loop then rebuilds nothing but the newest move while looking like it
+replayed the whole episode.
+
+**Give `apply` one representation.** The replayed turns and `assistant_response` have to arrive
+in the same shape. Passing the unwrapped payload for replayed turns and the raw text for the
+newest one gives a single action two meanings, so the transition it produces depends on which
+call is looking at it.
+
+Raising on an assistant turn that parses to nothing is the right default, and it is also why a
+seeded assistant demo is worth avoiding: no parser can tell a demo apart from a malformed
+generated turn. If you must seed one, skip rather than raise, and write the demo in a form your
+pattern cannot match. Prose is safe; your own action syntax is not.
 
 Either shape rebuilds state from the actions alone, which is right when your observations are a
 deterministic function of them. If an observation carries information the actions do not (a
-sampled outcome, a tool result, anything external), replay it too: iterate the same
-`messages[:-1]` and branch on `message["role"]` so both the actions and the state-bearing
-observations are folded back in.
+sampled outcome, a tool result, anything external), replay it too, matching it the way you
+match actions rather than branching on role alone: the user-role messages include the entire
+opening prompt from `start_episode`, and a loop that treats every user message as an
+observation will try to fold your task description into the state.
 
 Replaying all of `messages` and then applying `assistant_response` again applies the **newest**
 action twice on every call. Earlier actions still appear once; it is the turn you were handed
