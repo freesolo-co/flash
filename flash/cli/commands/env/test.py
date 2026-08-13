@@ -147,6 +147,14 @@ def _carries_thinking_markup(reference_turns: list[str]) -> bool:
     return any("<think>" in turn or "</think>" in turn for turn in reference_turns)
 
 
+# the only role whose merge causes the trained-behaviour defect this check exists for. `tool` is
+# deliberately excluded: one assistant message carrying two parallel tool calls is answered by two
+# `tool` messages in a row, which is the required wire format and what chat templates render as
+# separate delimited blocks -- not a collapse. flagging it would train users to edit a correct
+# transcript into a broken one, or to ignore the warning entirely.
+_MERGEABLE_ROLE = "assistant"
+
+
 def _repeated_roles(messages: list[dict]) -> list[tuple[int, str]]:
     """The (index, role) of every message whose role repeats the one before it.
 
@@ -164,7 +172,7 @@ def _repeated_roles(messages: list[dict]) -> list[tuple[int, str]]:
     previous = ""
     for index, message in enumerate(messages):
         role = str(message.get("role", "")).strip().lower()
-        if role and role == previous:
+        if role == _MERGEABLE_ROLE and role == previous:
             repeated.append((index, role))
         previous = role
     return repeated
@@ -182,38 +190,82 @@ def _rendered_roles(prompt: list[dict], completion: list[dict]) -> str:
     return " ".join(roles)
 
 
-def _warn_on_repeated_rendered_roles(prompt: list[dict], completion: list[dict]) -> None:
-    """Warn when the SFT training string would run two same-role turns together.
+def _warn_on_repeated_rendered_roles(
+    prompt: list[dict], completion: list[dict], *, multi_turn: bool
+) -> None:
+    """Warn when the SFT training string would run two assistant turns together.
 
-    Reported for every algorithm, not just sft: one published environment serves all three, so an
-    environment whose gold completion is shaped this way is broken for sft whichever algorithm this
-    invocation happened to name.
+    Skipped entirely for a multi-turn environment. There, a gold completion holding consecutive
+    assistant turns is the CONTRACT, not a defect: the intervening user turns are produced by
+    `env_reply` during the rollout and are deliberately absent from the dataset -- `_drive_multi_turn`
+    depends on exactly that shape, replaying one reference turn per model turn. Warning about it
+    would fire on every correct multi-turn environment and advise an edit that breaks the replay.
 
-    Only the RENDERED sequence is checked, never either list alone: a prompt may legitimately end
-    with an assistant turn (a few-shot preamble, a prefill), and a completion may legitimately hold
-    several assistant turns as long as the env's own user turns separate them. The fault is
-    adjacency after concatenation -- which is what training renders, and what neither list shows on
-    its own.
+    For a single-turn environment the concatenation IS the trained text, so the same adjacency is a
+    real defect: SFT renders one string from `[*prompt_messages, *completion_messages]`
+    (flash/engine/profiling/sft_workload.py) and nothing else validates it. A completion returned as
+    assistant turns alone then renders as one user question followed by every answer back to back,
+    training the model to dump the whole episode into a single reply.
+
+    Reported for every algorithm, not just sft: one published environment serves all three, so a
+    single-turn env shaped this way is broken for sft whichever algorithm this invocation named.
+
+    Only the RENDERED sequence is checked, never either list alone -- a prompt may legitimately end
+    on an assistant prefill, and the fault is adjacency after concatenation.
     """
-    if not prompt or not completion:
+    if multi_turn or not prompt or not completion:
         return
     repeated = _repeated_roles([*prompt, *completion])
     if not repeated:
         return
-    boundary = len(prompt)
-    # name the seam separately: two assistant turns INSIDE the completion and a completion whose
-    # first turn collides with the prompt's last are different edits -- interleave the env's user
-    # turns, versus stop prefilling the prompt.
-    at_seam = any(index == boundary for index, _role in repeated)
-    where = "at the prompt/completion boundary" if at_seam else "inside sft_completion"
-    roles = ", ".join(f"message {index} ({role})" for index, role in repeated)
-    message = (
-        f"sft would train on consecutive same-role turns {where}: {roles}. sft renders one string "
-        "from prompt_messages + sft_completion, so these turns merge into a single reply -- a "
-        "multi-turn gold answer must interleave the follow-up user turns it was answering"
+    print(
+        render.warn(_repeated_roles_message(repeated, len(prompt)))
+        if render.styled()
+        else f"warning: {_repeated_roles_message(repeated, len(prompt))}",
+        file=sys.stderr,
     )
-    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
     print(f"  rendered roles: {_rendered_roles(prompt, completion)}", file=sys.stderr)
+
+
+def _repeated_roles_message(repeated: list[tuple[int, str]], boundary: int) -> str:
+    """Name each collapsing turn in the region that owns it, with that region's own index.
+
+    Three regions, three different edits, so all three are named rather than folded into one: a
+    repeat inside the prompt is a `prompt_messages`/`start_episode` fault, one at the seam means the
+    prompt ends on a prefill the completion continues, and one inside the completion means the gold
+    answer needs the env's follow-up user turns interleaved. Reporting a prompt-internal or seam
+    collision as "inside sft_completion" sends the author to a file that is correct.
+
+    Indices are rebased onto the region they belong to. A raw offset into the concatenation is not a
+    position the author can look up: with a system prompt prepended, turn 0 of a three-message
+    completion is reported as message 3, which does not exist in the file they open.
+    """
+    inside_prompt = [index for index, _role in repeated if index < boundary]
+    at_seam = [index for index, _role in repeated if index == boundary]
+    inside_completion = [index for index, _role in repeated if index > boundary]
+    parts: list[str] = []
+    if inside_prompt:
+        where = ", ".join(f"message {index}" for index in inside_prompt)
+        parts.append(f"inside prompt_messages ({where})")
+    if at_seam:
+        parts.append(
+            "at the prompt/completion boundary (its first turn continues the prompt's last)"
+        )
+    if inside_completion:
+        # rebased onto sft_completion's own indexing, which is what the author can actually look up.
+        where = ", ".join(f"message {index - boundary}" for index in inside_completion)
+        parts.append(f"inside sft_completion ({where})")
+    remedy = (
+        "a gold answer that spans several assistant turns must interleave the user turns it was "
+        "answering"
+        if inside_completion
+        else "each region must alternate roles once concatenated"
+    )
+    return (
+        f"sft would train on consecutive assistant turns {' and '.join(parts)}. sft renders one "
+        f"string from prompt_messages + sft_completion, so these turns merge into a single reply -- "
+        f"{remedy}"
+    )
 
 
 def _preview(value: object) -> str:
@@ -349,6 +401,11 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     turns = 0
     # mirrors the worker's own flag: True while the newest turn has not been through env_reply.
     env_step_pending = False
+    # whether the loop ended at the trainer's ceiling rather than on the env's own signal. this is
+    # only HALF the verdict: the last model turn has not been applied yet at that point (see the
+    # deferred env_reply below), so an env that finishes exactly on its last allowed turn still
+    # looks unfinished here. the conclusion is drawn after that turn is applied.
+    stopped_at_ceiling = False
     while True:
         if policy == "replay" and turns < len(reference_turns):
             content = reference_turns[turns]
@@ -366,11 +423,9 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
         turns += 1
         record["turns"] = turns
         if turns >= hard_cap or env.rollout_done(state, max_turns=hard_cap):
-            # distinguish the two exits the worker also distinguishes: the env declaring the
-            # episode over, versus the trainer's hard cap cutting it off. only the second is
-            # evidence that no trajectory can finish, and `rollout_done` is asked first so an env
-            # that finishes exactly ON its last allowed turn is not misreported as capped.
-            record["hit_turn_cap"] = not env.rollout_done(state, max_turns=hard_cap)
+            # only the ceiling counts as being cut off. an env that declared itself done, or one
+            # that ended by yielding no reply below, finished on its own terms.
+            stopped_at_ceiling = turns >= hard_cap
             break
         env_msgs = env.env_reply(state["messages"], state)
         env_step_pending = False
@@ -396,6 +451,19 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     # extra move. rollout_done covers the env having declared the episode over.
     if env_step_pending and not env.rollout_done(state, hard_cap):
         env.env_reply(state["messages"], state)
+    # decided HERE, not at the break: the last model turn is applied only by the env_reply above, so
+    # asking before it would report an env that solves the task on its final allowed turn as one
+    # that never finishes -- and send the author to fix termination logic that works.
+    #
+    # `replay_incomplete` disqualifies the verdict entirely. once the gold answer runs out the
+    # driver pads with junk, and junk cannot advance the env, so reaching the ceiling is the
+    # padding's doing rather than the reference's. blaming the episode's termination there points
+    # at the wrong file: the real fault is a gold answer shorter than the episode.
+    record["hit_turn_cap"] = (
+        stopped_at_ceiling
+        and not record["replay_incomplete"]
+        and not env.rollout_done(state, max_turns=hard_cap)
+    )
     record["reward"], record["scorer_error"], record["scored_text"] = _score_with_error(
         env, "", example, state
     )
@@ -1022,7 +1090,9 @@ def cmd_env_test(args) -> int:
         # is per-row user code, so one row may interleave its turns correctly while another does
         # not, and an `echo` episode -- whose gold answer holds no assistant turn at all -- can
         # still render a broken role sequence.
-        _warn_on_repeated_rendered_roles(record["prompt"], record["completion"])
+        _warn_on_repeated_rendered_roles(
+            record["prompt"], record["completion"], multi_turn=bool(env.multi_turn)
+        )
 
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:

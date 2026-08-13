@@ -47,15 +47,27 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     board, yet gold scored 0.60-0.65, beat a junk answer, and burned the full turn cap - clearing
     every existing check. What exposed it in the field was reading `turns=12` on a board with a
     five-move solution, a comparison the verdict never made. An episode stopped by the hard turn cap
-    rather than the environment's own done signal now says so.
+    rather than the environment's own done signal now says so. The verdict is drawn after the
+    deferred final `env_reply`, so an environment that solves its task on the last allowed turn is
+    not misreported; an episode whose gold answer ran out early is excluded too, since the junk the
+    driver pads with cannot advance the environment and reaching the cap is then the padding's
+    doing rather than the reference's.
   - **A gold completion whose rendered role sequence collapses.** SFT does not replay a completion
     turn by turn; it renders one training string from `prompt_messages + sft_completion`, and
-    nothing validated that concatenation. A multi-turn gold answer returned as assistant turns alone
-    rendered as one user question followed by every answer back to back, training the model to dump
-    the whole episode into a single reply - the opposite of the behaviour being taught. Because this
-    gate scored each turn separately, it passed either way. The rendered role sequence is now checked
-    for consecutive same-role turns and printed, and a collision at the prompt/completion seam is
-    named separately from one inside the completion, since they are different edits.
+    nothing validated that concatenation. On a single-turn environment a gold answer returned as
+    assistant turns alone rendered as one user question followed by every answer back to back,
+    training the model to dump the whole episode into a single reply - the opposite of the
+    behaviour being taught. Because this gate scored each turn separately, it passed either way.
+    The rendered role sequence is now checked for consecutive assistant turns and printed.
+
+    The check is scoped to where the defect is real. It is skipped entirely for multi-turn
+    environments, where consecutive assistant turns are the contract rather than a fault - the
+    intervening user turns come from `env_reply` at rollout time and are deliberately absent from
+    the dataset. Only the `assistant` role is checked, so the back-to-back `tool` messages that
+    parallel tool calls require are not flagged. Each collapsing turn is attributed to the region
+    that owns it - `prompt_messages`, the seam, or `sft_completion` - with that region's own
+    indices, and all applicable regions are named rather than only the first, since they are
+    different edits.
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always
