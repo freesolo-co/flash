@@ -6690,10 +6690,12 @@ def test_transfer_queue_init_that_never_returns_fails_with_the_resource_state(mo
     # with no timeout, so an unsatisfiable reservation stops the run before a single gpu is touched --
     # silently, because tq's logger defaults to WARNING. without a deadline the run burns the whole
     # setup grace period at 0% gpu and is reported as a generic stall.
-    import flash.engine.worker.train.opd.child.plugin as plugin
+    # patch the watchdog module, not the plugin: the plugin re-exports this name, so patching the
+    # re-export rebinds a copy the caller never reads and the probe runs unpatched.
+    import flash.engine.worker.train.opd.child.rollout_watchdog as watchdog
 
     monkeypatch.setattr(
-        plugin,
+        watchdog,
         "_describe_ray_resources",
         lambda: "cluster CPU=1.0 GPU=1.0, free CPU=0.0 GPU=0.0",
     )
@@ -7322,3 +7324,26 @@ def test_transient_teacher_worker_failure_is_retriable():
             None,
             teacher_worker_failure=("transient", "bridge timed out"),
         )
+
+
+def test_the_rollout_watchdog_is_copied_into_the_child_workdir():
+    # the plugin imports the watchdog under its flat name at child-import time. flash is not
+    # importable in the verl interpreter, so if this file is not copied beside the plugin the child
+    # dies at import -- before any bound is installed, which would restore the wedge this fixes.
+    import inspect
+
+    from flash.engine.worker import opd_train_runner
+
+    source = inspect.getsource(opd_train_runner)
+    assert '("train/opd/child/rollout_watchdog.py", "flash_opd_rollout_watchdog.py")' in source
+
+
+def test_the_watchdog_reexport_and_definition_are_the_same_object():
+    # the plugin re-exports these for its existing callers. if the re-export ever drifts from the
+    # definition, patching one would leave the other live -- the exact trap that made the
+    # transfer-queue test pass against an unpatched probe.
+    import flash.engine.worker.train.opd.child.plugin as plugin
+    import flash.engine.worker.train.opd.child.rollout_watchdog as watchdog
+
+    assert plugin._bounded_replay_buffer_sample is watchdog._bounded_replay_buffer_sample
+    assert plugin._init_transfer_queue is watchdog._init_transfer_queue

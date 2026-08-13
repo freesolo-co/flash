@@ -506,6 +506,9 @@ def _write_child_shims(
         ("train/opd/child/plugin.py", "flash_opd_plugin.py"),
         # the plugin imports this by its flat name at child-import time, so it has to land next to it.
         ("train/opd/child/bridge.py", "flash_opd_bridge.py"),
+        # likewise: the plugin imports the watchdog flat at child-import time, and without it the
+        # child dies with NameError before any bound is ever installed.
+        ("train/opd/child/rollout_watchdog.py", "flash_opd_rollout_watchdog.py"),
         ("train/opd/child/structured.py", "flash_opd_structured.py"),
         ("train/opd/child/multiturn.py", "flash_opd_multiturn.py"),
         ("train/core/child/glue.py", "flash_multiturn_glue.py"),
