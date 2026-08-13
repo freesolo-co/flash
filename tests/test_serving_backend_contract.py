@@ -3147,6 +3147,39 @@ def test_a_padded_sha_is_stored_normalized_not_as_the_caller_sent_it(client):
     )
 
 
+def test_a_fractional_checkpoint_step_is_refused_rather_than_truncated(client):
+    """`int()` truncates, so coercing alone resolves a stated contradiction in the caller's favor.
+
+    `checkpoint_step: 10.9` against an `@step-10` id names two different steps in one request.
+    Truncating accepts it and answers 202, which tells the caller the value they sent was
+    understood. The id is the identity, so the only honest answer is the 422 the mismatch already
+    produces for every other disagreeing value.
+
+    Only LOSSY conversions are refused, not differences in type: `"10"` and `10.0` name step 10
+    unambiguously and the client has always been free to send either, so rejecting on type would
+    break callers over spelling rather than over meaning.
+    """
+
+    def _register_step(value):
+        return client.post(
+            "/adapters",
+            json={
+                **REGISTRATION,
+                "metadata": {**REGISTRATION["metadata"], "checkpoint_step": value},
+            },
+        ).status_code
+
+    assert _register_step(10.9) == 422, (
+        "a fractional step was truncated to match the id, so a request naming two different steps "
+        "was accepted as though it named one"
+    )
+    for equivalent in (10, 10.0, "10"):
+        assert _register_step(equivalent) in (200, 202), (
+            f"checkpoint_step={equivalent!r} names step 10 unambiguously but was rejected; the "
+            f"guard is refusing spellings rather than contradictions"
+        )
+
+
 def test_padded_provenance_is_stored_canonically_not_as_sent(client):
     """Every field the agreement check normalizes must be STORED normalized, not just compared.
 

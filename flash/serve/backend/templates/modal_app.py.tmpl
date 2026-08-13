@@ -1387,11 +1387,29 @@ def api():
         # string or a dict, and an uncaught raise here is a 500 for what is a malformed REQUEST.
         # An uncoercible value can never equal the parsed step, so it falls into `mismatched` and
         # is reported as the 422 it is.
+        #
+        # But `int()` TRUNCATES, so coercing alone would accept `10.9` against an `@step-10` id --
+        # a contradiction the caller stated explicitly, silently resolved in its favor. The record
+        # is written from the parsed step so nothing downstream sees the fraction, which makes this
+        # purely a question of what the endpoint should say: a caller who names two different steps
+        # in one request has sent a malformed registration, and answering 202 teaches them the
+        # value they supplied was understood. Rejecting rather than truncating keeps "the id IS the
+        # identity" true for the one field where a lossy conversion could quietly disagree with it.
         if supplied_step is not None:
             try:
-                supplied_step = int(supplied_step)
+                exact = int(supplied_step)
             except (TypeError, ValueError):
                 supplied_step = repr(supplied_step)
+            else:
+                # Only a LOSSY conversion is refused, not a mere difference in type. `"10"` and
+                # `10.0` both name step 10 unambiguously and the client has always been free to
+                # send either, so rejecting on `isinstance` would break callers over spelling. A
+                # float that does not round-trip is the actual contradiction, and it is the only
+                # shape `int()` can silently rewrite.
+                lossy = isinstance(supplied_step, float) and (
+                    supplied_step != exact or supplied_step != supplied_step
+                )
+                supplied_step = repr(supplied_step) if lossy else exact
         mismatched = [
             f"{{name}}={{supplied!r}} (id says {{expected!r}})"
             for name, supplied, expected in (

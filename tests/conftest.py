@@ -16,6 +16,29 @@ import pytest
 PLACEHOLDER_HF_REVISION = "0" * 40
 
 
+def _positive_finite_seconds(raw: str) -> float:
+    """A readiness budget `_wait_ready` can actually reach the end of.
+
+    `type=float` accepts `nan` and `inf`, and neither produces a bounded run. Every comparison
+    against a NaN deadline is false, so the loop never sees it expire AND its sleep bound collapses
+    to zero -- the suite spins on a backend stuck at `registered` instead of failing. An infinite
+    deadline hangs the same way, more obviously. Zero and negatives are refused too: they make the
+    budget expire before the first poll, so the suite reports a timeout no backend could have
+    avoided.
+    """
+    try:
+        value = float(raw)
+    except ValueError:
+        raise pytest.UsageError(
+            f"--conformance-ready-timeout must be a number, got {raw!r}"
+        ) from None
+    if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+        raise pytest.UsageError(
+            f"--conformance-ready-timeout must be a positive, finite number of seconds, got {raw!r}"
+        )
+    return value
+
+
 def pytest_addoption(parser):
     """Register the serving-conformance flags.
 
@@ -57,7 +80,7 @@ def pytest_addoption(parser):
     )
     group.addoption(
         "--conformance-ready-timeout",
-        type=float,
+        type=_positive_finite_seconds,
         # The CLIENT's budget, not a generous one. `deploy_adapter` gives up at
         # REVISION_READY_BUDGET_SECONDS (300s) and fails the deploy, so a suite that waits longer
         # certifies a backend `flash models deploy` cannot actually drive: conformance green would

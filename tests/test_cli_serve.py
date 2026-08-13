@@ -8,8 +8,10 @@ failure is caught before anything is written or deployed.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -596,6 +598,82 @@ def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, ca
         assert "export FREESOLO_INTERNAL_KEY=$(" in text
         assert 'FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"' in text
         assert "FLASH_SERVING_KEY=$(python" not in text, "the generated key is discarded inline"
+
+
+def test_the_key_warning_survives_a_cold_start_on_the_first_probe(monkeypatch):
+    """A slow first request must not silence the one warning about a public GPU endpoint.
+
+    This probe runs immediately after `modal deploy`, against a web function that has not served a
+    request yet, so a cold start or a transient transport error on the first call is ordinary. The
+    caller treats an unreadable answer as "say nothing", so a single attempt made that indequately
+    silent: the deploy looked clean while the app accepted unauthenticated writes.
+    """
+    attempts = {"n": 0}
+    monkeypatch.setattr(serve_cmd, "HEALTHZ_RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    import urllib.request
+
+    class _Payload:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _urlopen(target, timeout=None):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise TimeoutError("cold start")
+        return _Payload()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(serve_cmd.json, "load", lambda _: {"ok": True, "requires_key": False})
+
+    assert serve_cmd._healthz("https://acme--flash-serve-api.modal.run") == {
+        "ok": True,
+        "requires_key": False,
+    }, "the probe gave up while the app was still cold, so no key warning could be printed"
+    assert attempts["n"] == 3, f"the probe did not retry: {attempts['n']} attempt(s)"
+
+
+def test_the_key_probe_gives_up_within_its_budget(monkeypatch):
+    """Retrying must stay bounded: this is advisory, on a deploy that already succeeded."""
+    attempts = {"n": 0}
+    import urllib.request
+
+    def _always_fails(target, timeout=None):
+        attempts["n"] += 1
+        raise TimeoutError("never comes up")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _always_fails)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    assert serve_cmd._healthz("https://acme.modal.run", budget_s=0.0) is None
+    assert attempts["n"] == 1, (
+        f"a zero budget still made {attempts['n']} attempts; the probe is not bounded by it"
+    )
+
+
+def test_deploy_instructions_quote_a_path_with_spaces(tmp_path, monkeypatch, capsys):
+    """These lines are meant to be COPIED into a shell, so an unquoted path is a broken command.
+
+    `--output` accepts any writable path. One containing a space splits into two arguments when
+    pasted, so the instruction for deploying the file that was just written fails to deploy it --
+    and the keyless-warning variant leaves a public endpoint up after the user did exactly what
+    they were told.
+    """
+    spaced = tmp_path / "my apps" / "flash_serving_app.py"
+    spaced.parent.mkdir()
+    spaced.write_text("# generated\n")
+
+    monkeypatch.setattr(serve_cmd, "_healthz", lambda url: {"ok": True, "requires_key": False})
+    serve_cmd._warn_if_unauthenticated("https://acme.modal.run", spaced)
+    warning = capsys.readouterr().err
+    assert f"modal deploy {shlex.quote(str(spaced))}" in warning, (
+        f"the redeploy instruction did not quote a path containing a space: {warning}"
+    )
+    assert f"modal deploy {spaced}\n" not in warning, "the unquoted form is still being printed"
 
 
 def test_the_deploy_output_points_at_the_control_plane_process(tmp_path, monkeypatch, capsys):

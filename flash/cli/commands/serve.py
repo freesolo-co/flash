@@ -9,6 +9,7 @@ account, and print the environment variable that connects the two.
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -241,7 +242,13 @@ def cmd_serve_setup(args) -> int:
     print(f"  gpu    {gpu.name}  (~${gpu.usd_hr:.2f}/hr while serving, $0 idle)")
 
     if dry_run:
-        print(f"\ndry run: not deploying. deploy it yourself with:\n  modal deploy {destination}")
+        # Quoted, because this line is meant to be COPIED into a shell. `--output` accepts any
+        # writable path, and one containing a space splits into two arguments when pasted -- so the
+        # instruction for deploying the file we just wrote fails to deploy it.
+        print(
+            f"\ndry run: not deploying. deploy it yourself with:\n"
+            f"  modal deploy {shlex.quote(str(destination))}"
+        )
         return 0
 
     if not getattr(args, "yes", False):
@@ -250,7 +257,10 @@ def cmd_serve_setup(args) -> int:
             f"this starts a {gpu.name} container on first use [y/N] "
         )
         if not _confirm(prompt):
-            print(f"not deployed. run `modal deploy {destination}` when ready.", file=sys.stderr)
+            print(
+                f"not deployed. run `modal deploy {shlex.quote(str(destination))}` when ready.",
+                file=sys.stderr,
+            )
             return 1
 
     return _deploy(destination)
@@ -307,17 +317,40 @@ def _control_plane_instructions(url: str) -> str:
     )
 
 
-def _healthz(url: str) -> dict | None:
-    """The app's own /healthz, or None if it cannot be read. Never raises: this is advisory."""
-    try:
-        import urllib.request
+HEALTHZ_STARTUP_BUDGET_SECONDS = 90.0
+HEALTHZ_RETRY_DELAY_SECONDS = 5.0
 
-        with urllib.request.urlopen(f"{url}/healthz", timeout=15) as response:
-            payload = json.load(response)
-    # broad on purpose: a warning must never fail a deploy that already succeeded
-    except Exception:
-        return None
-    return payload if isinstance(payload, dict) else None
+
+def _healthz(url: str, budget_s: float = HEALTHZ_STARTUP_BUDGET_SECONDS) -> dict | None:
+    """The app's own /healthz, or None if it cannot be read. Never raises: this is advisory.
+
+    Retried for a bounded startup window rather than asked once. This runs immediately after
+    `modal deploy`, against a web function that has not served a request yet, so the first call
+    routinely meets a cold start or a transport error that has nothing to do with the app's
+    configuration. A single probe answering None is indistinguishable from "the app came up fine",
+    and the caller treats None as "say nothing" -- so a slow cold start silently swallowed the one
+    warning that tells a user their public GPU endpoint accepts unauthenticated writes.
+
+    Bounded because it is still advisory: this is a fixed extra wait on a deploy that has already
+    succeeded, taken only while the answer is unreadable, and never a reason to fail the command.
+    """
+    import time
+    import urllib.request
+
+    deadline = time.monotonic() + max(0.0, float(budget_s))
+    while True:
+        try:
+            with urllib.request.urlopen(f"{url}/healthz", timeout=15) as response:
+                payload = json.load(response)
+        # broad on purpose: a warning must never fail a deploy that already succeeded
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            return payload
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(HEALTHZ_RETRY_DELAY_SECONDS, remaining))
 
 
 def _warn_if_unauthenticated(url: str, app_file: Path | None = None) -> None:
@@ -343,7 +376,7 @@ def _warn_if_unauthenticated(url: str, app_file: Path | None = None) -> None:
         "'import secrets; print(secrets.token_urlsafe(32))')\n"
         f"  modal secret create {SECRET_NAME} HF_TOKEN=hf_... "
         'FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"\n'
-        f"  modal deploy {app_file if app_file is not None else DEFAULT_APP_FILE}",
+        f"  modal deploy {shlex.quote(str(app_file if app_file is not None else DEFAULT_APP_FILE))}",
         file=sys.stderr,
     )
 
