@@ -9,7 +9,7 @@ _POST_DONE_SUFFIX_LIMIT = 1024
 _UTF8_BOM = b"\xef\xbb\xbf"
 
 
-def _line_end(data: bytes, start: int = 0) -> tuple[int, int] | None:
+def _line_end(data: bytes | bytearray, start: int = 0) -> tuple[int, int] | None:
     for index in range(start, len(data)):
         byte = data[index]
         if byte == 0x0A:
@@ -21,11 +21,17 @@ def _line_end(data: bytes, start: int = 0) -> tuple[int, int] | None:
     return None
 
 
+def _resume_scan_at(data: bytes | bytearray) -> int:
+    return max(0, len(data) - (1 if data.endswith(b"\r") else 0))
+
+
 class SseDoneGate:
     def __init__(self) -> None:
-        self._buffer = b""
-        self._done = bytearray()
-        self._event_has_data = False
+        self._buffer = bytearray()
+        self._line_start = 0
+        self._scan_start = 0
+        self._event_data: list[bytes] = []
+        self._holding_done_candidate = False
         self.done_event: bytes | None = None
 
     @property
@@ -35,80 +41,86 @@ class SseDoneGate:
     def feed(self, chunk: bytes) -> list[bytes]:
         if self.done_event is not None:
             return []
-        self._buffer += chunk
-        if self._done:
-            self._consume_done_suffix()
-            return []
+        self._buffer.extend(chunk)
+        forwarded = bytearray()
 
-        cursor = 0
-        while (line_end := _line_end(self._buffer, cursor)) is not None:
+        while (line_end := _line_end(self._buffer, self._scan_start)) is not None:
             line, next_cursor = line_end
-            content = self._buffer[cursor:line]
+            content = bytes(self._buffer[self._line_start : line])
+            self._line_start = next_cursor
+            self._scan_start = next_cursor
             if not content:
-                self._event_has_data = False
-            elif content.startswith(b"data:"):
+                event_data = b"\n".join(self._event_data)
+                if self._holding_done_candidate and event_data == b"[DONE]":
+                    self.done_event = bytes(self._buffer[:next_cursor])
+                    self._buffer.clear()
+                    self._line_start = 0
+                    self._scan_start = 0
+                    return [bytes(forwarded)] if forwarded else []
+                forwarded.extend(self._buffer[:next_cursor])
+                del self._buffer[:next_cursor]
+                self._line_start = 0
+                self._scan_start = 0
+                self._event_data.clear()
+                self._holding_done_candidate = False
+                continue
+            if content.startswith(b"data:"):
                 data = content[len(b"data:") :].strip()
-                if not self._event_has_data and data == b"[DONE]":
-                    forwarded = self._buffer[:cursor]
-                    self._done.extend(self._buffer[cursor:next_cursor])
-                    self._buffer = self._buffer[next_cursor:]
-                    self._consume_done_suffix()
-                    return [forwarded] if forwarded else []
-                self._event_has_data = True
-            cursor = next_cursor
+                if not self._event_data and data == b"[DONE]":
+                    self._holding_done_candidate = True
+                self._event_data.append(data)
+            if not self._holding_done_candidate:
+                forwarded.extend(self._buffer[:next_cursor])
+                del self._buffer[:next_cursor]
+                self._line_start = 0
+                self._scan_start = 0
+            elif len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
+                self._settle_bounded_done()
+                return [bytes(forwarded)] if forwarded else []
 
-        trailing = self._buffer[cursor:]
-        if _could_be_done_line(trailing):
-            retained = trailing[-_POST_DONE_SUFFIX_LIMIT:]
-            forwarded = self._buffer[:cursor] + trailing[: -len(retained)]
-            self._buffer = retained
+        if self._holding_done_candidate:
+            if len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
+                self._settle_bounded_done()
+            else:
+                self._scan_start = _resume_scan_at(self._buffer)
+            return [bytes(forwarded)] if forwarded else []
+
+        trailing = bytes(self._buffer)
+        if not self._event_data and _could_be_done_line(trailing):
+            if len(trailing) > _POST_DONE_SUFFIX_LIMIT:
+                retained = trailing[-_POST_DONE_SUFFIX_LIMIT:]
+                forwarded.extend(trailing[: -len(retained)])
+                self._buffer = bytearray(retained)
+            self._scan_start = _resume_scan_at(self._buffer)
         elif trailing.endswith(b"\r"):
-            forwarded = self._buffer[:-1]
-            self._buffer = b"\r"
+            if len(trailing) > 1:
+                forwarded.extend(trailing[:-1])
+                del self._buffer[:-1]
+            self._line_start = 0
+            self._scan_start = 0
         else:
-            forwarded = self._buffer
-            self._buffer = b""
-        return [forwarded] if forwarded else []
+            forwarded.extend(self._buffer)
+            self._buffer.clear()
+            self._line_start = 0
+            self._scan_start = 0
+        return [bytes(forwarded)] if forwarded else []
 
     def finish(self) -> list[bytes]:
-        if self._done:
-            self._done.extend(self._buffer)
-            self._buffer = b""
-            self.done_event = bytes(self._done)
-            self._done.clear()
-            return []
-        forwarded = self._buffer
-        self._buffer = b""
+        forwarded = bytes(self._buffer)
+        self._buffer.clear()
+        self._line_start = 0
+        self._scan_start = 0
+        self._event_data.clear()
+        self._holding_done_candidate = False
         return [forwarded] if forwarded else []
 
-    def _consume_done_suffix(self) -> None:
-        # a `data: [DONE]` line can be followed by further lines of the SAME event: in SSE only a
-        # blank line ends one. those continuation lines belong to the terminator and are relayed
-        # with it, so they are retained rather than dropped -- dropping them made the relay lossy.
-        while True:
-            if len(self._done) + len(self._buffer) > _POST_DONE_SUFFIX_LIMIT:
-                # an upstream that sends `[DONE]` and then never delimits it would otherwise grow
-                # this buffer without bound, outside the accumulator's budget. settle on what the
-                # terminator already is and stop retaining the rest.
-                self._settle_done()
-                return
-            line_end = _line_end(self._buffer)
-            if line_end is None:
-                return
-            line, next_cursor = line_end
-            blank = not self._buffer[:line]
-            self._done.extend(self._buffer[:next_cursor])
-            self._buffer = self._buffer[next_cursor:]
-            if blank:
-                # the delimiter closed the event; anything past it is post-terminator data that
-                # this gate has already decided to stop at, so it must not be relayed later.
-                self._settle_done()
-                return
-
-    def _settle_done(self) -> None:
-        self.done_event = bytes(self._done)
-        self._done.clear()
-        self._buffer = b""
+    def _settle_bounded_done(self) -> None:
+        self.done_event = bytes(self._buffer[: min(self._line_start, _POST_DONE_SUFFIX_LIMIT)])
+        self._buffer.clear()
+        self._line_start = 0
+        self._scan_start = 0
+        self._event_data.clear()
+        self._holding_done_candidate = False
 
 
 def _could_be_done_line(line: bytes) -> bool:
@@ -216,6 +228,8 @@ class SseAccumulator:
         self._max_accumulated_bytes = max_accumulated_bytes
         self._accumulated_bytes = 0
         self._overwriting_sizes: dict[str, int] = {}
+        self._choice_extension_sizes: dict[int, dict[str, int]] = {}
+        self._scan_start = 0
         self._at_stream_start = True
         self.truncated = False
         self.usage: Any = None
@@ -236,31 +250,36 @@ class SseAccumulator:
             self._at_stream_start = False
             if self._buffer.startswith(_UTF8_BOM):
                 self._buffer = self._buffer[len(_UTF8_BOM) :]
-        while (line_end := _line_end(self._buffer)) is not None:
+        while (line_end := _line_end(self._buffer, self._scan_start)) is not None:
             line, next_cursor = line_end
             fragment = self._buffer[:line]
             self._buffer = self._buffer[next_cursor:]
+            self._scan_start = 0
             if (
                 self._max_accumulated_bytes is not None
                 and len(fragment) > self._max_accumulated_bytes
             ):
                 self._buffer = b""
+                self._scan_start = 0
                 self.truncated = True
                 return
             self._consume_line(fragment)
             if self.truncated or self._done:
                 return
+        self._scan_start = _resume_scan_at(self._buffer)
         if (
             self._max_accumulated_bytes is not None
             and len(self._buffer) > self._max_accumulated_bytes
         ):
             self._buffer = b""
+            self._scan_start = 0
             self.truncated = True
 
     def finish(self) -> None:
         if self._buffer:
             self._consume_line(self._buffer.rstrip(b"\r"))
             self._buffer = b""
+            self._scan_start = 0
         self._consume_event()
 
     def _note_defect(self, reason: str) -> None:
@@ -291,19 +310,26 @@ class SseAccumulator:
         return True
 
     def _reserve_overwriting(self, key: str, value: Any) -> bool:
+        return self._reserve_overwriting_in(self._overwriting_sizes, key, value)
+
+    def _reserve_choice_extension(self, index: int, key: str, value: Any) -> bool:
+        sizes = self._choice_extension_sizes.setdefault(index, {})
+        return self._reserve_overwriting_in(sizes, key, value)
+
+    def _reserve_overwriting_in(self, sizes: dict[str, int], key: str, value: Any) -> bool:
         if self.truncated or self._max_accumulated_bytes is None:
             return not self.truncated
-        previous_size = self._overwriting_sizes.get(key, 0)
+        previous_size = sizes.get(key, 0)
         value_size = self._value_size(value)
         size = value_size
-        if key not in self._overwriting_sizes:
+        if key not in sizes:
             size += self._value_size(key) + 4
         retained_bytes = self._accumulated_bytes - previous_size
         if size > self._max_accumulated_bytes - retained_bytes:
             self.truncated = True
             return False
         self._accumulated_bytes = retained_bytes + size
-        self._overwriting_sizes[key] = value_size
+        sizes[key] = value_size
         return True
 
     @property
@@ -433,8 +459,7 @@ class SseAccumulator:
             for key, value in choice.items():
                 if key in {"index", "delta", "logprobs", "finish_reason", "message"}:
                     continue
-                retained_key = key if key not in state["extensions"] else None
-                if self._reserve(value, retained_key=retained_key):
+                if self._reserve_choice_extension(index, key, value):
                     state["extensions"][key] = value
             if "delta" in choice:
                 delta = choice["delta"]

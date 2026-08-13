@@ -603,6 +603,22 @@ def test_done_gate_does_not_terminate_on_done_inside_multiline_data_event(
     assert gate.terminated is False
 
 
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n", b"\r"], ids=["lf", "crlf", "cr"])
+def test_done_gate_does_not_terminate_when_done_precedes_multiline_data(
+    line_ending: bytes,
+) -> None:
+    first = line_ending.join([b"data: [DONE]", b'data: {"notice":1}']) + line_ending * 2
+    later = b'data: {"choices":[{"delta":{"content":"LATER"}}]}' + line_ending * 2
+    gate = trace_sse.SseDoneGate()
+
+    forwarded = gate.feed(first)
+    forwarded.extend(gate.feed(later))
+    forwarded.extend(gate.finish())
+
+    assert b"".join(forwarded) == first + later
+    assert gate.terminated is False
+
+
 def test_done_gate_bounds_an_unterminated_done_candidate() -> None:
     gate = trace_sse.SseDoneGate()
 
@@ -801,6 +817,23 @@ def test_choice_level_extension_fields_count_toward_the_stream_budget() -> None:
     assert len(json.dumps(accumulator.output()).encode()) <= budget + 200
 
 
+def test_repeated_choice_extensions_do_not_recharge_the_stream_budget() -> None:
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=1_000)
+    safety = "s" * 100
+
+    for _ in range(20):
+        event = json.dumps(
+            {"choices": [{"index": 0, "delta": {"content": "x"}, "safety": safety}]}
+        ).encode()
+        accumulator.feed(b"data: " + event + b"\n\n")
+
+    assert accumulator.truncated is False
+    assert accumulator.defect is None
+    assert accumulator.output()["choices"][0]["safety"] == safety
+    assert accumulator.output()["choices"][0]["message"]["content"] == "x" * 20
+    assert accumulator._accumulated_bytes < 300
+
+
 def test_finish_reasons_count_toward_the_stream_budget() -> None:
     budget = 100_000
     accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=budget)
@@ -823,6 +856,26 @@ def test_unterminated_sse_line_is_bounded_by_the_accumulation_budget() -> None:
 
     assert accumulator.truncated is True
     assert accumulator._buffer == b""
+
+
+def test_unterminated_sse_line_scans_each_byte_once(monkeypatch) -> None:
+    scanned_bytes = 0
+    original_line_end = trace_sse._line_end
+
+    def counted_line_end(data: bytes | bytearray, start: int = 0):
+        nonlocal scanned_bytes
+        result = original_line_end(data, start)
+        scanned_bytes += (result[0] + 1 if result is not None else len(data)) - start
+        return result
+
+    monkeypatch.setattr(trace_sse, "_line_end", counted_line_end)
+    accumulator = trace_sse.SseAccumulator()
+    chunk = b"x" * (16 * 1024)
+
+    for _ in range(64):
+        accumulator.feed(chunk)
+
+    assert scanned_bytes == 1024 * 1024
 
 
 @pytest.mark.parametrize(
@@ -3043,7 +3096,79 @@ def test_secret_schema_anchor_ref_literals_are_redacted_transitively(
     ]["schema"]["$defs"]
     assert definitions["Target"]["default"] == "[redacted]"
     assert definitions["Sibling"]["default"] == "ordinary-default"
-    assert definitions["Dynamic"]["default"] == "dynamic-default"
+    # `recovery_token` is a secret-named property, and in 2020-12 `$dynamicAnchor` also declares an
+    # ordinary plain-name fragment, so its `$ref: "#Dynamic"` genuinely reaches this definition.
+    assert definitions["Dynamic"]["default"] == "[redacted]"
+
+
+def test_secret_schema_dynamic_ref_literals_are_redacted(trace_api, monkeypatch) -> None:
+    schema = {
+        "type": "object",
+        "properties": {"password": {"$dynamicRef": "#Credential"}},
+        "$defs": {
+            "Dynamic": {
+                "$dynamicAnchor": "Credential",
+                "type": "string",
+                "default": "SECRET-DYNAMIC",
+            },
+            "Static": {
+                "$anchor": "Credential",
+                "type": "string",
+                "default": "SECRET-STATIC",
+            },
+            "Ordinary": {"default": "KEEP"},
+        },
+    }
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions",
+        headers=_HEADERS,
+        json={
+            **_REQUEST,
+            "response_format": {"type": "json_schema", "json_schema": {"schema": schema}},
+        },
+    )
+
+    assert response.status_code == 200
+    definitions = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]["response_format"][
+        "json_schema"
+    ]["schema"]["$defs"]
+    assert definitions["Dynamic"]["default"] == "[redacted]"
+    assert definitions["Static"]["default"] == "[redacted]"
+    assert definitions["Ordinary"]["default"] == "KEEP"
+
+
+def test_static_ref_resolves_a_dynamic_anchor(trace_api, monkeypatch) -> None:
+    # `$dynamicAnchor` also declares an ordinary plain-name fragment, so a plain `$ref` reaches it.
+    # resolving the two keywords against separate anchor maps left this pairing unredacted.
+    schema = {
+        "type": "object",
+        "properties": {"password": {"$ref": "#Credential"}},
+        "$defs": {
+            "Dynamic": {"$dynamicAnchor": "Credential", "default": "SECRET-DYNAMIC"},
+            "Ordinary": {"default": "KEEP"},
+        },
+    }
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions",
+        headers=_HEADERS,
+        json={
+            **_REQUEST,
+            "response_format": {"type": "json_schema", "json_schema": {"schema": schema}},
+        },
+    )
+
+    assert response.status_code == 200
+    definitions = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]["response_format"][
+        "json_schema"
+    ]["schema"]["$defs"]
+    assert definitions["Dynamic"]["default"] == "[redacted]"
+    assert definitions["Ordinary"]["default"] == "KEEP"
 
 
 @pytest.mark.parametrize(

@@ -237,14 +237,16 @@ def _local_schema_pointer(
 
 def _schema_anchor_pointers(value: Any, *, depth: int = 0) -> dict[str, frozenset[tuple[str, ...]]]:
     anchors: dict[str, set[tuple[str, ...]]] = {}
+    keywords = ("$anchor", "$dynamicAnchor")
 
     def collect(node: Any, path: tuple[str, ...], depth: int) -> None:
         if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
             return
         if isinstance(node, dict):
-            anchor = node.get("$anchor")
-            if isinstance(anchor, str) and path:
-                anchors.setdefault(anchor, set()).add(path)
+            for keyword in keywords:
+                anchor = node.get(keyword)
+                if isinstance(anchor, str) and path:
+                    anchors.setdefault(anchor, set()).add(path)
             for key, item in node.items():
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                     collect(item, (*path, str(key)), depth + 1)
@@ -260,6 +262,9 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
     if not isinstance(value, dict):
         return set()
     refs: set[tuple[str, ...]] = set()
+    # `$dynamicAnchor` also declares an ordinary plain-name fragment, so a static `$ref` resolves
+    # to it as well. one map serves both keywords: splitting them let `{"$ref": "#Name"}` miss a
+    # `$dynamicAnchor: "Name"` target and persist its literals.
     anchors = _schema_anchor_pointers(value, depth=depth)
 
     def collect_refs(node: Any, node_depth: int) -> set[tuple[str, ...]]:
@@ -267,9 +272,10 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
             return set()
         found: set[tuple[str, ...]] = set()
         if isinstance(node, dict):
-            ref = node.get("$ref")
-            if isinstance(ref, str):
-                found.update(_local_schema_pointer(ref, anchors))
+            for keyword in ("$ref", "$dynamicRef"):
+                ref = node.get(keyword)
+                if isinstance(ref, str):
+                    found.update(_local_schema_pointer(ref, anchors))
             for key, item in node.items():
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                     found.update(collect_refs(item, node_depth + 1))
