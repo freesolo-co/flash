@@ -494,15 +494,13 @@ def _classify_queue_state(
         # capacity timer forever, so it expires after WORKER_COMING_UP_TTL_S.
         state.worker_coming_up_at = now if (usable or recovering) else None
         if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
-            # name the budget this wait is spending. the queue timer only arms while the job is
-            # actually starved, so an armed timer is the only case with a countdown to report: a
-            # worker that is coming up is governed by the much larger setup grace instead, and
-            # printing a capacity countdown there would tell the operator to expect the wrong
-            # deadline. before it arms there is nothing to count, so say only what is queued.
-            # `usable or recovering` is the same evidence that clears the timer two lines above.
-            # read it here rather than the timer's own `since`, which is still armed from the
-            # classify pass that ran BEFORE this health read: on the first queued poll of a normal
-            # cold start that would print a capacity deadline which evaporates one poll later.
+            # name the budget this wait is spending, so a queued line separates "still inside its
+            # grace" from "wedged". only a starved wait has a countdown to report: a worker that is
+            # coming up is governed by the much larger setup grace instead. gate on
+            # `usable or recovering` -- the same evidence that clears the timer two lines above --
+            # and not on the timer's `since`, which is still armed from the classify pass that ran
+            # BEFORE this health read, so a normal cold start would advertise a capacity deadline
+            # that evaporates one poll later.
             budget = ""
             if state.queued_timer.since is not None and not (usable or recovering):
                 budget = "; " + _jobs.queue_wait_note(
