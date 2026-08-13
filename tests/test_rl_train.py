@@ -2221,6 +2221,8 @@ def test_reward_server_rejects_out_of_range_index_before_lookup(index):
 
 
 def test_reward_bridge_lookup_failure_raises(monkeypatch):
+    # the index is IN range, so the scorer's own IndexError is the ENV failing, not a bad request:
+    # it is reported as a server fault carrying the cause rather than as a malformed-payload 400.
     def missing_example(idx, solution_str):
         raise IndexError(idx)
 
@@ -2230,7 +2232,7 @@ def test_reward_bridge_lookup_failure_raises(monkeypatch):
         ns: dict = {}
         src = rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL")
         exec(compile(src, "<reward>", "exec"), ns)
-        with pytest.raises(RuntimeError, match="reward bridge request failed"):
+        with pytest.raises(RuntimeError, match=r"could not serve the request .*IndexError: 99"):
             ns["compute_score"](
                 "flash_env",
                 "answer",
@@ -2268,11 +2270,99 @@ def test_reward_server_reports_thread_exhaustion_as_a_server_fault():
         server.shutdown()
 
 
+@pytest.mark.parametrize(
+    "env_error",
+    [IndexError("list index out of range"), KeyError("grader internal lookup failed")],
+)
+def test_an_env_raising_indexerror_or_keyerror_is_a_server_fault_not_a_bad_request(env_error):
+    """Classifying by exception TYPE reintroduces the bug one layer down.
+
+    The bridge rejects a bad index with IndexError and an unknown session with KeyError, so a tuple
+    of those types around the ROUTE CALL also catches the same types raised by a user env deep
+    inside its own scoring -- reporting a valid request as malformed. ScoreBatcher re-raises a GRPO
+    batch error into every waiter as-is, so one env KeyError would 400 every request in the batch.
+    """
+
+    def failing_env_scorer(index, solution_str):
+        raise env_error
+
+    server, url = rl_train.start_reward_server(failing_env_scorer, example_count=4)
+    try:
+        req = urllib.request.Request(
+            url + "/score",
+            data=json.dumps({"index": 0, "solution_str": "x"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 503, (
+            "the request was valid and the ENV failed; blaming the caller is the original bug"
+        )
+        assert type(env_error).__name__ in exc_info.value.read().decode()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"index": 1e309, "solution_str": "x"}, "not an integer"),  # json inf -> int() overflows
+        ([], "must be a json object"),  # valid json, invalid request object
+        ({"solution_str": "x"}, "missing required field"),
+    ],
+)
+def test_a_malformed_request_shape_is_a_client_error_not_a_server_fault(payload, expected):
+    """A body this bridge cannot read is the caller's fault, so it must not read as unavailable."""
+    server, url = rl_train.start_reward_server(lambda i, s: 1.0, example_count=4)
+    try:
+        req = urllib.request.Request(
+            url + "/score",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 400
+        body = exc_info.value.read().decode()
+        assert expected in body
+        # the private class name is not something a caller can act on.
+        assert "_Bad" not in body, "an internal exception class leaked into the client message"
+    finally:
+        server.shutdown()
+
+
+def test_the_generated_single_turn_reward_module_surfaces_the_bridges_cause(monkeypatch):
+    """The REAL single-turn caller must not drop the detail the server now supplies.
+
+    `HTTPError` is a `URLError` subclass, so a single `except URLError` catches it first and never
+    reads the body -- leaving "HTTP Error 503: Service Unavailable", which names no cause. Asserting
+    on the server response alone would pass while the user-visible path stayed detail-free.
+    """
+
+    def exhausted(index, solution_str):
+        raise RuntimeError("can't start new thread")
+
+    server, url = rl_train.start_reward_server(exhausted, example_count=4)
+    try:
+        monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
+        ns: dict = {}
+        src = rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL")
+        exec(compile(src, "<reward>", "exec"), ns)
+        with pytest.raises(RuntimeError) as exc_info:
+            ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": 0})
+        message = str(exc_info.value)
+        assert "can't start new thread" in message, "the cause never reached the training loop"
+        assert "could not serve" in message
+    finally:
+        server.shutdown()
+
+
 def test_reward_server_still_rejects_a_malformed_request_as_a_client_error():
     """The 5xx split must not turn genuine client errors into server faults.
 
     A non-integer index and an unknown session id are the caller's fault at any capacity, so both
     stay 400 -- otherwise the new status would tell a caller to retry a request that can never work.
+    A no-regression guard, not evidence of the split: these were 400 under the old catch-all too.
     """
     bridge = rl_train.MultiTurnBridge(
         _BridgeEnv(),
