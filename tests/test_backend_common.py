@@ -1999,14 +1999,44 @@ def _bound_silence_watchdog(tail, *, tick_s=30.0, parent_activity=None):
     return watchdog, torn_down
 
 
+def test_verl_child_silence_watchdog_gives_a_resumed_run_the_same_setup_exemption():
+    """A resumed opd run seeds `progress["step"]` from resume_step (opd_train_runner.py), so a
+    bare `step > 0` test reads as "training is running" while ray and the model are still loading
+    and the child has produced no output at all. That armed the kill path during a setup phase a
+    fresh run is exempt from, so a slow resume could be torn down for being slow.
+    """
+    resumed = vc.ChildOutputTail()
+    resumed.record("ray: loading model\n")
+    resumed_watchdog, resumed_torn_down = _bound_silence_watchdog(resumed)
+
+    fresh = vc.ChildOutputTail()
+    fresh.record("ray: loading model\n")
+    fresh_watchdog, fresh_torn_down = _bound_silence_watchdog(fresh)
+
+    for _ in range(130):
+        resumed_watchdog.observe(40)
+        fresh_watchdog.observe(0)
+
+    # neither has completed a step under THIS process, so both are still in setup.
+    assert resumed_torn_down == fresh_torn_down == []
+
+    # and the exemption ends the moment either advances: a wedge after real progress still fires.
+    for _ in range(130):
+        resumed_watchdog.observe(41)
+        fresh_watchdog.observe(1)
+    assert resumed_torn_down == fresh_torn_down == [True]
+
+
 def test_verl_child_silence_watchdog_tears_down_and_raises_at_the_threshold():
     tail = vc.ChildOutputTail()
     tail.record("step: 1\n")
     watchdog, torn_down = _bound_silence_watchdog(tail)
 
+    # the first observation latches the baseline, so the child must advance past it before the
+    # watchdog considers a step to be running. this is the state a real wedge is in.
     assert watchdog.observe(1) == 0
     for _ in range(120):
-        watchdog.observe(1)
+        watchdog.observe(2)
 
     assert torn_down == [True]
     with pytest.raises(RuntimeError, match="no output for 3600s while training was running"):
@@ -2023,7 +2053,7 @@ def test_run_verl_training_tears_down_a_silent_child_and_raises_the_named_failur
             time.sleep(0.01)
         assert tail.written > 0
         assert watchdog.observe(1) == 0
-        assert watchdog.observe(1) == 1
+        assert watchdog.observe(2) == 1
 
     observer = threading.Thread(target=trip_after_first_output)
     observer.start()
