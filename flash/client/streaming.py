@@ -49,6 +49,19 @@ def _read_capped_response(resp: object, max_bytes: int, deadline: float | None =
     from flash.client.http import ClientError
 
     read_size = _DOWNLOAD_CHUNK_BYTES if deadline is None else _DEADLINE_CHUNK_BYTES
+    read = resp.read  # type: ignore[attr-defined]
+    if deadline is not None:
+        # the deadline is only checked BETWEEN reads, so it can only bound this loop if each read
+        # returns promptly. `read(n)` on a buffered reader blocks until all n bytes arrive, so a
+        # peer trickling a short body holds a single call open past the deadline and the check
+        # never runs -- measured at 12s against a 2s deadline. `read1` returns what has already
+        # arrived, which lets the check run. size 1 is the equivalent fallback for a reader
+        # without it (the chat stream reader makes the same trade).
+        read1 = getattr(resp, "read1", None)
+        if read1 is not None:
+            read = read1
+        else:
+            read_size = 1
     chunks: list[bytes] = []
     total = 0
     while True:
@@ -57,7 +70,7 @@ def _read_capped_response(resp: object, max_bytes: int, deadline: float | None =
                 f"the control plane's response body stalled after {total} bytes "
                 "and exceeded its overall deadline"
             )
-        chunk = resp.read(read_size)  # type: ignore[attr-defined]
+        chunk = read(read_size)
         if not chunk:
             break
         total += len(chunk)

@@ -661,7 +661,13 @@ class ApiClient:
             "GET", "/v1/deployments", timeout=timeout, require={"deployments": [dict]}
         )["deployments"]
 
-    def _serving_deployment(self, base_run_id: str, timeout: float | None) -> dict | None:
+    def _serving_deployment(
+        self,
+        base_run_id: str,
+        timeout: float | None,
+        *,
+        body_deadline: float | None = None,
+    ) -> dict | None:
         """The run's servable deployment record, or None when it has none.
 
         Read from the run-scoped route rather than the listing. `/v1/deployments` walks every run
@@ -669,9 +675,20 @@ class ApiClient:
         an account with a long run history the poll's cost grows with that history and a wait can
         expire scanning unrelated runs while the requested revision is already ready
         `/v1/runs/{run_id}/deploy` resolves the one run directly.
+
+        ``body_deadline`` additionally bounds the read in WALL-CLOCK time. ``timeout`` alone is a
+        per-socket-operation bound, so a peer that trickles bytes just inside it can hold the read
+        open indefinitely; a caller that must return within a fixed budget has to pass both (see
+        ``env_list``). ``--wait`` polling deliberately does not: it owns a deadline spanning many
+        reads and recomputes each one's share.
         """
         try:
-            deployment = self._request("GET", f"/v1/runs/{base_run_id}/deploy", timeout=timeout)
+            deployment = self._request(
+                "GET",
+                f"/v1/runs/{base_run_id}/deploy",
+                timeout=timeout,
+                body_deadline=body_deadline,
+            )
         except ApiError as exc:
             # a run the key cannot see reads the same as one that is not deployed. the listing said
             # "absent" by omitting the row; saying it by raising would turn a vanished deployment
@@ -718,15 +735,24 @@ class ApiClient:
                 return None
         return deployment
 
-    def deployed_checkpoint(self, run_id: str, timeout: float | None = None) -> dict | None:
+    def deployed_checkpoint(
+        self,
+        run_id: str,
+        timeout: float | None = None,
+        *,
+        body_deadline: float | None = None,
+    ) -> dict | None:
         """Whatever checkpoint the run serves right now, whichever step that is.
 
         The counterpart to ``deployment_for``, which answers the narrower "is MY revision live?"
         and hides any other. A caller about to deploy needs the opposite: the record it is about
         to displace is by definition the one the step filter drops.
+
+        ``body_deadline`` bounds the whole read in wall-clock time; ``timeout`` alone bounds each
+        socket operation, which a peer trickling bytes just inside it can extend without limit.
         """
         base_run_id, _ = _parse_adapter_target(run_id)
-        return self._serving_deployment(base_run_id, timeout)
+        return self._serving_deployment(base_run_id, timeout, body_deadline=body_deadline)
 
     def chat(
         self,

@@ -28,10 +28,12 @@ class _Client:
         self.deploy_calls: list[tuple] = []
         self.read_calls: list[tuple] = []
         self.read_timeouts: list[float | None] = []
+        self.read_deadlines: list[float | None] = []
 
-    def deployed_checkpoint(self, run_id, timeout=None):
+    def deployed_checkpoint(self, run_id, timeout=None, *, body_deadline=None):
         self.read_calls.append(run_id)
         self.read_timeouts.append(timeout)
+        self.read_deadlines.append(body_deadline)
         if self._raises is not None:
             raise self._raises
         return self._current
@@ -195,6 +197,21 @@ def test_the_advisory_read_is_bounded_well_under_the_client_default() -> None:
 
     assert client.read_timeouts == [deploy_module._ALIAS_WARNING_READ_SECONDS]
     assert deploy_module._ALIAS_WARNING_READ_SECONDS < 60.0
+
+
+def test_the_advisory_read_is_bounded_in_wall_clock_not_just_per_socket_read() -> None:
+    """A socket timeout alone does not bound the read, and this read must be bounded.
+
+    `timeout` restarts on every byte that arrives, so a proxy trickling a response just inside
+    it holds the GET open for as long as it likes -- unbounded in exactly the way the advisory
+    read must not be, since the deploy the user actually asked for waits behind it. Only the
+    wall-clock body deadline bounds the whole read.
+    """
+    client = _Client(_ready(100))
+
+    _alias_move_warning(client, "flash-1", 50)
+
+    assert client.read_deadlines == [deploy_module._ALIAS_WARNING_READ_SECONDS]
 
 
 @pytest.mark.parametrize(

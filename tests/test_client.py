@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -858,11 +859,16 @@ def test_export_rejects_malformed_checkpoint_ref():
 
 
 def _deployment_reader(monkeypatch, client, record, *, status=None):
-    """Patch the run-scoped deployment read; record the calls it receives."""
+    """Patch the run-scoped deployment read; record the calls it receives.
+
+    Each call is recorded as `(method, path, timeout, body_deadline)` -- both bounds, because
+    they bound different things: `timeout` restarts on every byte received, so only the wall-clock
+    `body_deadline` bounds a whole read.
+    """
     calls: list[tuple] = []
 
-    def request(method, path, body=None, timeout=None, progress=None):
-        calls.append((method, path, timeout))
+    def request(method, path, body=None, timeout=None, progress=None, body_deadline=None):
+        calls.append((method, path, timeout, body_deadline))
         if status is not None:
             raise ApiError(status, "boom")
         return record
@@ -884,7 +890,7 @@ def test_deployment_for_reads_the_run_scoped_route_not_the_listing(monkeypatch):
     # the id is carried onto the returned record: `models deploy --wait` prints this in place of
     # the POST body, so dropping it renders an empty run field and omits it from the json.
     assert client.deployment_for("flash-1") == {"state": "queued", "run_id": "flash-1"}
-    assert calls == [("GET", "/v1/runs/flash-1/deploy", None)]
+    assert calls == [("GET", "/v1/runs/flash-1/deploy", None, None)]
 
 
 def test_deployment_for_keeps_a_run_id_already_on_the_record(monkeypatch):
@@ -907,7 +913,7 @@ def test_deployment_for_asks_about_the_base_run_not_the_checkpoint_ref(monkeypat
         "checkpoint_step": 40,
         "run_id": "flash-1",
     }
-    assert calls == [("GET", "/v1/runs/flash-1/deploy", None)]
+    assert calls == [("GET", "/v1/runs/flash-1/deploy", None, None)]
 
 
 def test_deployment_for_requires_the_requested_checkpoint_step(monkeypatch):
@@ -960,7 +966,7 @@ def test_deployed_checkpoint_reports_whatever_step_is_serving(monkeypatch):
         "run_id": "flash-1",
     }
     # the same run-scoped route, so it costs one read and never walks the account's history.
-    assert calls == [("GET", "/v1/runs/flash-1/deploy", None)]
+    assert calls == [("GET", "/v1/runs/flash-1/deploy", None, None)]
     # `deployment_for` keeps filtering, so no existing caller changes behaviour.
     assert client.deployment_for("flash-1/step-50") is None
 
@@ -1027,7 +1033,90 @@ def test_deployment_for_bounds_the_read(monkeypatch):
     calls = _deployment_reader(monkeypatch, client, {"state": "undeployed"})
 
     assert client.deployment_for("flash-1", timeout=3.0) is None
-    assert calls == [("GET", "/v1/runs/flash-1/deploy", 3.0)]
+    assert calls == [("GET", "/v1/runs/flash-1/deploy", 3.0, None)]
+
+
+def test_deployed_checkpoint_takes_a_wall_clock_deadline(monkeypatch):
+    """`timeout` restarts on every byte received, so alone it does not bound a whole read.
+
+    The advisory pre-deploy read runs before a deploy the user actually asked for, so it needs the
+    bound that holds regardless of how the bytes arrive. `--wait` polling deliberately passes no
+    deadline: it owns one spanning many reads and recomputes each read's share.
+    """
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    calls = _deployment_reader(monkeypatch, client, {"state": "undeployed"})
+
+    assert client.deployed_checkpoint("flash-1", timeout=5.0, body_deadline=5.0) is None
+    assert calls == [("GET", "/v1/runs/flash-1/deploy", 5.0, 5.0)]
+
+
+@contextlib.contextmanager
+def _trickling_server(body: bytes, gap: float):
+    """A server that dribbles one byte at a time, like a slow proxy relaying a response."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            for byte in body:
+                try:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return  # the client gave up on its deadline, which is the point
+                time.sleep(gap)
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.wallclock
+def test_a_wall_clock_deadline_bounds_a_body_that_arrives_a_byte_at_a_time():
+    """The deadline is checked between reads, so it only bounds a read that returns promptly.
+
+    `read(n)` on a buffered reader blocks until all n bytes arrive, so a peer trickling a short
+    body keeps one call inside the socket timeout indefinitely and the between-reads check never
+    runs: measured at 12s against a 2s deadline before this was fixed. Reading whatever has
+    already arrived is what makes the deadline real, so this asserts the elapsed time rather than
+    just the raised error -- the error alone was already raised while the bound was ineffective.
+    """
+    body = b'{"state": "ready", "checkpoint_step": 100}'
+    # every byte lands well inside the socket timeout, so nothing here is a socket-level stall.
+    with _trickling_server(body, gap=0.3) as url:
+        client = ApiClient(url, "fslo-user-test", timeout=60)
+        start = time.monotonic()
+        with pytest.raises(ClientError, match="stalled"):
+            client.deployed_checkpoint("flash-1", timeout=2.0, body_deadline=0.5)
+        elapsed = time.monotonic() - start
+
+    # generous against CI scheduling noise, and still far under the ~12s of the unbounded read.
+    assert elapsed < 5.0, f"the deadline did not bound the read: {elapsed:.2f}s"
+
+
+def test_a_complete_body_still_reads_whole_under_a_deadline():
+    """Reading in smaller pieces must not truncate a body that arrives normally.
+
+    The deadline path reads what has already arrived rather than a fixed count, so a body
+    delivered across several chunks has to be reassembled rather than cut at the first one.
+    """
+    payload = {"state": "ready", "checkpoint_step": 100, "pad": "x" * 200_000}
+    body = json.dumps(payload).encode()
+    with _fixed_2xx_server("application/json", body) as url:
+        client = ApiClient(url, "fslo-user-test", timeout=30)
+        got = client.deployed_checkpoint("flash-1", timeout=30.0, body_deadline=30.0)
+
+    assert got["pad"] == payload["pad"]
+    assert got["checkpoint_step"] == 100
 
 
 @contextlib.contextmanager

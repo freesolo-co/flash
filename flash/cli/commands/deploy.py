@@ -60,6 +60,9 @@ _PERMANENT_POLL_STATUSES = frozenset({401, 403})
 # the pre-deploy alias read is advisory, so it must not spend the client's default 60s budget
 # deciding whether to print a warning: a stalled read would delay every real deploy behind a
 # line nobody asked for. short enough to stay unnoticed, long enough for a healthy plane.
+# it is spent as BOTH bounds: as a socket timeout it only bounds each individual read, so a
+# proxy trickling bytes just inside it holds the deploy open indefinitely -- exactly the delay
+# this exists to prevent. as a wall-clock body deadline too, it bounds the whole read.
 _ALIAS_WARNING_READ_SECONDS = 5.0
 
 
@@ -214,7 +217,11 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
     try:
         # not `deployment_for`: its step filter hides exactly the record this asks about, a
         # DIFFERENT checkpoint holding the alias.
-        current = client.deployed_checkpoint(base_run_id, timeout=_ALIAS_WARNING_READ_SECONDS)
+        current = client.deployed_checkpoint(
+            base_run_id,
+            timeout=_ALIAS_WARNING_READ_SECONDS,
+            body_deadline=_ALIAS_WARNING_READ_SECONDS,
+        )
     except (ApiError, ClientError):
         # the deploy itself is the authority on whether it can proceed. failing it here would turn
         # a warning nobody asked for into an outage of the command it decorates.

@@ -148,7 +148,13 @@ class _FakeClient:
                 return {**deployment, "run_id": entry["run_id"]}
         return None
 
-    def deployed_checkpoint(self, run_id: str, timeout: float | None = None) -> dict | None:
+    def deployed_checkpoint(
+        self,
+        run_id: str,
+        timeout: float | None = None,
+        *,
+        body_deadline: float | None = None,
+    ) -> dict | None:
         # the real client reads the run-scoped route, NOT the listing: routing this through
         # `deployments` would let the pre-deploy warning's read land in the rollback-lookup
         # assertions of the `--wait` tests, which instrument that method.

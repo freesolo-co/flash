@@ -36,13 +36,21 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   operation on the first, and read as a serving regression rather than the deploy that caused
   it. The warning names both checkpoints and points at `flash models chat <run-id>/step-N`,
   which addresses a checkpoint directly and does not depend on where the id points. It is
-  advisory: the deploy still proceeds, the pre-deploy read is bounded well under the client's
-  default timeout so a stalled plane cannot hold a deploy behind it, and a control plane that
-  cannot answer (or answers with a checkpoint step this client cannot read) does not fail the
-  command. A deployment whose activation outcome was never settled still warns, but without
+  advisory: the deploy still proceeds, the pre-deploy read is bounded in wall-clock time well
+  under the client's default timeout so a slow plane cannot hold a deploy behind it, and a
+  control plane that cannot answer (or answers with a checkpoint step this client cannot read)
+  does not fail the command. A deployment whose activation outcome was never settled still warns, but without
   naming a checkpoint: that record's step describes the incoming attempt rather than what the id
   currently serves, and the authoritative target is server-side only, so the warning says the
   live checkpoint cannot be determined and points at `flash models deployments`.
+
+- A response deadline did not actually bound a response that arrived slowly. The deadline is
+  checked between reads, but each read asked for a fixed number of bytes and blocked until all of
+  them arrived, so a peer trickling a short body kept one read inside the socket timeout
+  indefinitely and the check never ran: a 2s deadline took 12s on a 42-byte body, and 61s when
+  the socket timeout was the client default. Reading whatever has already arrived lets the check
+  run, which bounds every stall shape. This affected `flash env list`, whose deadline exists to
+  stop a slow environment hub hanging the command, as well as the new pre-deploy read.
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always
