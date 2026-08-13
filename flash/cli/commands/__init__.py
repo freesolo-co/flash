@@ -425,6 +425,7 @@ def cmd_train(args) -> int:
         else:
             print(json.dumps(status, indent=2))
         _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
+        _print_reasoning_loss_warning(status)
         return 0
     status = client.create_run(
         payload,
@@ -433,6 +434,7 @@ def cmd_train(args) -> int:
     )
     run_id = status["run_id"]
     _print_unpacked_batch_warning(status, spec)  # a real submit overrides batch_size the same way
+    _print_reasoning_loss_warning(status)  # and trains on whatever reasoning the template kept
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
@@ -948,6 +950,7 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _cmd_train_cost_offline,
     _cmd_train_cost_sft,
     _legacy_train_key_rejection_detail,
+    _print_reasoning_loss_warning,
     _print_sft_cost,
     _print_train_schema_compatibility,
     _print_unpacked_batch_warning,

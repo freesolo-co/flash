@@ -118,11 +118,18 @@ def test_creation_time_is_provenance_and_never_moves_the_measurement() -> None:
 def test_content_digest_covers_every_measured_field() -> None:
     """Guards the one risk of splitting the digest off ``asdict``: a field silently uncovered.
 
-    Only ``created_at`` may sit outside the digest. Anything else added to the schema without a
-    deliberate ``compare=False`` must move the digest, or a tampered value would round-trip.
+    Only provenance and advisory measurements may sit outside the digest. Anything else added to
+    the schema without a deliberate ``compare=False`` must move the digest, or a tampered value
+    would round-trip.
+
+    The reasoning counts are listed here deliberately. They describe the dataset's rendered text,
+    not the token and step contract the quote freezes, and the worker legitimately measures
+    different values because it executes ``environment.py`` while the estimate reads raw records.
+    Folding them into the digest would fire the profile-drift warning on a run whose billing
+    contract never moved. Nothing is authorized off them: they only choose whether a warning prints.
     """
     base = _profile()
-    provenance = {"created_at"}
+    provenance = {"created_at", "authored_reasoning_turns", "rendered_reasoning_spans"}
 
     for name in SftWorkloadProfile.__dataclass_fields__:
         if name in provenance:

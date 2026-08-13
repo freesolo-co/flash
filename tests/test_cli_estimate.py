@@ -577,6 +577,90 @@ def test_sft_cost_stays_quiet_about_batching_when_the_run_is_packed(tmp_path, mo
     assert "sequence packing is OFF" not in err
 
 
+def test_sft_cost_warns_the_client_that_the_template_dropped_reasoning(
+    tmp_path, monkeypatch, capsys
+):
+    """The quote is where the user can still act on it, so the quote has to say it.
+
+    Control-plane profiling runs inside the server process, so the measurement's own stderr is not
+    the submitting client's. The counts ride on the returned profile and the line is rendered here,
+    before any training GPU is allocated.
+    """
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "estimated_cost_usd": 1.25,
+                "workload_profile": {
+                    **EXACT_PROFILE,
+                    "authored_reasoning_turns": 4,
+                    "rendered_reasoning_spans": 1,
+                },
+            }
+        ),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "dropped 3 of 4 authored reasoning blocks" in err
+    # the actionable half: what to do about it
+    assert "K single-turn rows" in err
+
+
+def test_a_real_sft_submit_warns_about_dropped_reasoning_before_the_run_starts(
+    tmp_path, monkeypatch, capsys
+):
+    """The submit path spends the money, so it cannot be the one that stays quiet."""
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "run_id": "run-thinking",
+                "workload_profile": {
+                    **EXACT_PROFILE,
+                    "authored_reasoning_turns": 4,
+                    "rendered_reasoning_spans": 1,
+                },
+            }
+        ),
+    )
+
+    args = _sft_args(tmp_path)
+    args.cost = False
+    args.background = True
+
+    rc = cmd_train(args)
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "dropped 3 of 4 authored reasoning blocks" in err
+
+
+def test_sft_cost_stays_quiet_when_every_authored_block_survives(tmp_path, monkeypatch, capsys):
+    """A dataset the template renders whole must not be told to restructure itself."""
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "estimated_cost_usd": 1.25,
+                "workload_profile": {
+                    **EXACT_PROFILE,
+                    "authored_reasoning_turns": 4,
+                    "rendered_reasoning_spans": 4,
+                },
+            }
+        ),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "authored reasoning blocks" not in err
+
+
 def test_sft_cost_omits_aggregates_the_profile_did_not_report(tmp_path, monkeypatch, capsys):
     """A partial profile drops rows rather than defaulting them to zero."""
     _use_client(

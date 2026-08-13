@@ -486,6 +486,15 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
             # run trains on. a dropped row contributes neither its authored reasoning nor its
             # survivors, which would otherwise be reported against a retained-row denominator.
             row_authored, row_rendered = tokenized.reasoning_by_index.get(row_index, (0, 0))
+            # survivors are counted on the untruncated render, so a row the cap cut cannot claim
+            # them: the block may sit past the cap and never reach the loss. counting zero keeps the
+            # reported survival an UNDER-estimate on those rows rather than an over-estimate, since
+            # the warning exists to surface lost reasoning. re-measuring after truncation is not
+            # available here -- the supervised span begins inside the template's pre-opened <think>,
+            # so the decoded target has no opening delimiter to match. the existing truncation
+            # warning names these rows and their required max_context_tokens.
+            if tokenized.untruncated_by_index[row_index] > len(row["input_ids"]):
+                row_rendered = 0
             authored_reasoning += row_authored
             rendered_reasoning += row_rendered
         else:
@@ -629,6 +638,8 @@ def _build_sft_profile(
         authoritative_steps=horizon.authoritative_steps,
         packing_efficiency=measurements.real_tokens / measurements.padded_compute_tokens,
         sample_policy=sft_sample_policy(max_examples),
+        authored_reasoning_turns=retained.authored_reasoning_turns,
+        rendered_reasoning_spans=retained.rendered_reasoning_spans,
     )
 
 

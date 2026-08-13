@@ -793,6 +793,47 @@ def test_block_form_assistant_content_counts_as_authored_reasoning(capsys) -> No
     assert "dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
 
 
+def test_a_truncated_row_does_not_claim_its_reasoning_reached_the_loss(capsys) -> None:
+    """Survivors are counted on the untruncated render, so a capped row cannot claim them.
+
+    The surviving block may sit past ``max_context_tokens`` and never reach the loss at all.
+    Reporting it as a survivor would understate the real reasoning loss while quoting an exact
+    survival percentage, so a truncated row contributes zero survivors and the figure stays an
+    under-estimate.
+    """
+    long_reasoning = "<think>" + "survivor " * 30 + "</think>a2"
+    completion = [
+        {"role": "assistant", "content": "<think>lost</think>a1"},
+        {"role": "user", "content": "next"},
+        {"role": "assistant", "content": long_reasoning},
+    ]
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=64, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        ThinkingEnvironment(completion),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    # the row IS retained and IS truncated: it is trained on, with its reasoning cut away
+    assert prepared.profile.retained_examples == 1
+    assert prepared.profile.truncated_examples == 1
+    assert prepared.authored_reasoning_turns == 2
+    # so it claims no survivors, rather than the 1 the untruncated render showed
+    assert prepared.rendered_reasoning_spans == 0
+    assert "dropped 2 of 2 authored reasoning blocks" in capsys.readouterr().err
+
+
 def test_a_reasoned_assistant_turn_in_the_prompt_does_not_cancel_a_surviving_target_block(
     capsys,
 ) -> None:

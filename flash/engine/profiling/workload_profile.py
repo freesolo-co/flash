@@ -14,8 +14,10 @@ ROLLOUT_PROFILE_KINDS = ("grpo", "opd")
 # 3 removes the deleted per-run worker environment map from both profile identity payloads. 4 adds
 # the authored [environment] pip digest, which changes the installed worker stack and so cannot be
 # absent from identity. old cached profiles use a different identity shape, so reject them and
-# re-profile.
-WORKLOAD_PROFILE_SCHEMA_VERSION = 4
+# re-profile. 5 serializes the reasoning-loss counts so the submitting client can render that
+# warning; they are digest-free, but `from_dict` requires an exact field set, so a profile cached
+# under 4 cannot be rebuilt and has to re-profile.
+WORKLOAD_PROFILE_SCHEMA_VERSION = 5
 # 2 lets a gdn hybrid pack when the installed stack proves it can reset example boundaries, where 1
 # always answered exact-unpacked. the same config therefore resolves to a different packing_mode and
 # examples_per_update, so a profile cached under 1 quotes a step count this policy would not: it has
@@ -390,6 +392,19 @@ class SftWorkloadProfile:
     authoritative_steps: int
     packing_efficiency: float
     sample_policy: str
+    # reasoning authored by the retained rows' assistant turns, and how much of it the chat template
+    # actually renders into the supervised span. carried on the profile rather than only printed
+    # where it is measured: control-plane profiling runs inside the server, so its stderr is not the
+    # submitting client's. the CLI renders the warning from these two counts, like the packing
+    # override, and a user sees it before a training gpu is allocated.
+    #
+    # `compare=False` keeps them out of `_content()`, so they change neither the content digest nor
+    # worker parity. they are a property of the dataset's rendered text rather than of the token and
+    # step contract the quote freezes, and the worker legitimately measures different counts because
+    # it executes environment.py while the estimate reads raw records -- folding them into parity
+    # would fire the drift warning on a run whose billing contract never moved.
+    authored_reasoning_turns: int = field(default=0, compare=False)
+    rendered_reasoning_spans: int = field(default=0, compare=False)
     schema_version: int = WORKLOAD_PROFILE_SCHEMA_VERSION
     kind: str = SFT_PROFILE_KIND
     # unix seconds stamped by the control-plane profile producer. 0.0 on worker recomputation.
@@ -430,6 +445,8 @@ class SftWorkloadProfile:
             "examples_per_update": self.examples_per_update,
             "derived_steps": self.derived_steps,
             "authoritative_steps": self.authoritative_steps,
+            "authored_reasoning_turns": self.authored_reasoning_turns,
+            "rendered_reasoning_spans": self.rendered_reasoning_spans,
         }
         for name, value in counts.items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -507,6 +524,10 @@ class SftWorkloadProfile:
         return {
             **self._content(),
             "created_at": float(self.created_at),
+            # serialized but digest-free, so the client can render the reasoning-loss warning from
+            # the quote without the counts entering the frozen contract
+            "authored_reasoning_turns": int(self.authored_reasoning_turns),
+            "rendered_reasoning_spans": int(self.rendered_reasoning_spans),
             "content_digest": self.content_digest,
         }
 

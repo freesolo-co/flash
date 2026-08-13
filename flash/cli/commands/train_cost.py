@@ -17,7 +17,10 @@ from flash.client import ApiError, ClientError
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
-from flash.engine.profiling.workload_profile import unpacked_batch_warning
+from flash.engine.profiling.workload_profile import (
+    rendered_reasoning_loss_warning,
+    unpacked_batch_warning,
+)
 from flash.schema import spec_and_train_keys_from_file, train_schema_metadata
 
 
@@ -190,6 +193,33 @@ def _print_unpacked_batch_warning(status: object, spec) -> None:
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
+def _print_reasoning_loss_warning(status: object) -> None:
+    """Warn that the chat template drops authored reasoning before a training GPU is allocated.
+
+    Control-plane profiling runs inside the server, so the measurement's own stderr never reaches
+    the submitting client. The counts travel on the quote's profile and the line is rendered here,
+    which is the only place the user can act on it while restructuring is still free.
+    """
+    profile = status.get("workload_profile") if isinstance(status, dict) else None
+    if not isinstance(profile, dict):
+        return
+    authored = profile.get("authored_reasoning_turns")
+    rendered = profile.get("rendered_reasoning_spans")
+    if isinstance(authored, bool) or not isinstance(authored, int):
+        return
+    if isinstance(rendered, bool) or not isinstance(rendered, int):
+        return
+    rows = profile.get("retained_examples")
+    message = rendered_reasoning_loss_warning(
+        authored_turns=authored,
+        rendered_spans=rendered,
+        rows=rows if isinstance(rows, int) and not isinstance(rows, bool) else 0,
+    )
+    if not message:
+        return
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+
+
 def _print_sft_cost(status: dict, spec) -> None:
     total = status.get("estimated_cost_usd") if isinstance(status, dict) else None
     if not isinstance(total, (int, float)) or isinstance(total, bool):
@@ -215,6 +245,7 @@ def _print_sft_cost(status: dict, spec) -> None:
         file=sys.stderr,
     )
     _print_unpacked_batch_warning(status, spec)
+    _print_reasoning_loss_warning(status)
 
 
 def _legacy_train_key_rejection_detail(
