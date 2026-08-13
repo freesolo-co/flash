@@ -1009,9 +1009,23 @@ def test_chat_resolves_the_alias_to_its_immutable_revision(http, deployed, chat_
 def test_undeploy_disables_the_alias_and_its_revisions(http, adapter_source, run_id, ready_timeout):
     """Not using the `deployed` fixture: this test IS the teardown, so it owns the whole run."""
     body = _registration(run_id, adapter_source)
-    _register(http, body)
-    _wait_ready(http, body["adapter_id"], ready_timeout, expected=body)
-    assert _activate(http, body["adapter_id"], None).status_code == 200
+    try:
+        _register(http, body)
+        _wait_ready(http, body["adapter_id"], ready_timeout, expected=body)
+        assert _activate(http, body["adapter_id"], None).status_code == 200
+    except BaseException:
+        # The registration LANDED and something after it failed -- a readiness timeout, a
+        # nonconforming activation. Those failures are exactly what this suite exists to diagnose
+        # on a live backend, so they are the likely outcome, not the rare one; without this the
+        # run's revision stays registered, its artifact stays cached, and its LoRA can stay
+        # resident on somebody's GPU after a failed conformance run.
+        #
+        # Every other test in this file has a `finally` that deletes its run, and this one is the
+        # exception only because the DELETE below is its subject. So the cleanup is on the failure
+        # path alone: on success the assertions own the teardown and must observe it themselves.
+        with contextlib.suppress(Exception):
+            http.delete(f"/adapters/{run_id}")
+        raise
 
     response = http.delete(f"/adapters/{run_id}")
     assert response.status_code == 200, f"undeploy returned {response.status_code}"

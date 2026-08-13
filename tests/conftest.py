@@ -75,7 +75,12 @@ def pytest_addoption(parser):
     )
     group.addoption(
         "--conformance-repo-type",
-        default="dataset",
+        # None, NOT "dataset". `_option` reads the flag first and falls back to the environment
+        # only when the flag is falsy, so a nonempty argparse default wins unconditionally and
+        # makes FLASH_CONFORMANCE_REPO_TYPE inert -- an operator who exports `model` still
+        # registers the artifact as a dataset, and it fails to load on a model repo. The default
+        # is applied in the fixture instead, after the environment has had its turn.
+        default=None,
         help="repo_type sent at registration (default: dataset, matching flash)",
     )
     group.addoption(
