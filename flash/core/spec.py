@@ -193,13 +193,20 @@ def persisted_gpu_head(spec: dict[str, Any] | None) -> str:
     The head is right whenever the classes rank in authored order (including every scalar pin, where
     it is exact), and wrong otherwise.
 
-    That is acceptable here only because of what the callers do with it. All of them prefer
-    ``remote.allocated_gpu`` -- the class actually rented -- and reach this reader only when it is
-    absent, which is the narrow submit-to-handle-persist window. A wrong guess there names an
-    endpoint that does not exist, and every one of these sites is already best-effort about a name
-    that resolves to nothing: the reaper protects a name that is not listed, teardown deletes
-    nothing. That is strictly better than today's list, which raises before naming anything at all
-    and so protects and deletes nothing in EVERY case, ordered-pin runs included.
+    That is acceptable here only because of what the callers do with it, which splits in two.
+
+    The ones REPORTING a class -- billing, reconcile, the run registry -- must not report a guess
+    when the truth is on hand, so they read ``remote.allocated_gpu`` first and reach this only in
+    the narrow submit-to-handle-persist window before allocation stamps one.
+
+    The ones NAMING AN ENDPOINT -- teardown in ``attach``/``runtime``, the idle reaper -- pass it to
+    ``endpoint_name(canonical_gpu(gpu), _run_suffix(run_id))``, which is a deterministic
+    reconstruction and not a report. They cannot prefer ``allocated_gpu`` in general: the reaper
+    walks stored runs whose remote may hold nothing, and teardown runs after the parse already
+    failed. A wrong guess there names an endpoint that does not exist, and each site is already
+    best-effort about a name resolving to nothing -- the reaper protects an unlisted name, teardown
+    deletes nothing. Strictly better than a raw list, which raises before naming anything at all and
+    so protects and deletes nothing in EVERY case, ordered-pin runs included.
     """
     gpu = (spec or {}).get("gpu")
     raw = gpu.get("type") if isinstance(gpu, dict) else None
