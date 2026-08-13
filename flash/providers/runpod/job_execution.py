@@ -548,21 +548,29 @@ def _update_heartbeat(context: _PollContext, state: _PollState) -> None:
     if new_key == state.last_hb_key:
         return
     state.last_hb_key = new_key
-    if stage is None:
-        return
-    hb_ts = new_key[2]
-    hb_step = new_key[1]
     hb_attempt = _attempt_int(new_key[3])
-    is_training_hb = is_training_heartbeat(stage, hb_step)
     if hb_attempt != context.current_attempt:
-        # non-current heartbeat: ignore so stale progress never tightens the stall window.
+        # non-current heartbeat: ignore so stale progress never tightens the stall window, and so a
+        # previous attempt's worker -- which ran on an allocation this attempt no longer holds --
+        # never stands as proof that THIS attempt was granted one.
         return
     # a heartbeat for THIS attempt was written by a worker that ran, so it proves a grant on its own.
     # that matters on the reattach path: recovery starts with `ever_saw_worker` false and, if the job
     # was already requeued before attaching, never gets to observe the earlier IN_PROGRESS. with
     # health also unreadable the job would look never-granted, stay exempt from the stall check, and
     # finally be reported `no_capacity` despite having demonstrably run.
+    #
+    # deliberately ABOVE the `stage is None` return: that return drops liveness pings, which are most
+    # of what setup publishes (`sft_model_load`, `*_data_loading`, `*_configuring`). A ping proves a
+    # worker ran just as well as a staged heartbeat -- it must not advance the stall clock, which is
+    # why it still returns below, but it is evidence of a grant, and only the grant question is
+    # settled here.
     state.ever_saw_worker = True
+    if stage is None:
+        return
+    hb_ts = new_key[2]
+    hb_step = new_key[1]
+    is_training_hb = is_training_heartbeat(stage, hb_step)
     if hb_attempt > state.last_hb_attempt:
         # fresh attempt: reset ts baseline and re-derive seen_training_hb so cold-start grace rearms.
         state.last_hb_attempt = hb_attempt

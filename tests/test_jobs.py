@@ -1025,6 +1025,86 @@ def test_a_current_attempt_heartbeat_proves_a_grant_on_the_reattach_path(monkeyp
     )
 
 
+def test_a_liveness_ping_for_this_attempt_proves_a_grant(monkeypatch):
+    # `ever_saw_worker` was latched below `surface_heartbeat`'s `stage is None` return, which drops
+    # liveness pings -- and liveness pings are most of what setup publishes (`sft_model_load`,
+    # `*_data_loading`, `*_configuring`). So a reattached job whose worker was pinging through model
+    # load, with health unreadable, still looked never-granted: exempt from the stall check, then
+    # reported `no_capacity` (which can trip the supervisor's weight-cache drop) for a GPU it plainly
+    # had. A ping must not advance the stall CLOCK -- that is what the `stage is None` return is for,
+    # and it still happens -- but it is proof a worker ran.
+    #
+    # This PR's scaled grace makes it worse than `dev`, not merely equal: `dev` mislabels at 1200s,
+    # a 4-card shape here waited 4200s for the same wrong answer.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+
+    def dead_health(_eid, _fp, **_kw):
+        raise RuntimeError("health endpoint unavailable")
+
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", dead_health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    # one liveness ping for the current attempt, then silence: a real setup stage, `liveness` set,
+    # so `surface_heartbeat` returns stage None exactly as it does in production.
+    beats = iter([{"stage": "sft_model_load", "ts": 100.0, "attempt": 0, "liveness": True}])
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: next(beats, None),
+        deadline_at=500_000.0,
+        current_attempt=0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", (
+        f"a job whose worker sent a liveness ping for THIS attempt reported {res.failure!r}; the "
+        f"ping proves a worker ran, so this is a lost worker, not absent capacity ({res.detail})"
+    )
+    assert "limit 3000s" in res.detail, res.detail
+
+
+def test_a_stale_attempt_liveness_ping_does_not_prove_a_grant(monkeypatch):
+    # The grant latch moved above the `stage is None` return, so it now sees liveness pings. It must
+    # stay BELOW the attempt guard: a previous attempt's worker ran on an allocation this attempt no
+    # longer holds, so its ping says nothing about whether this one was ever granted a GPU.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+
+    def dead_health(_eid, _fp, **_kw):
+        raise RuntimeError("health endpoint unavailable")
+
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", dead_health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    beats = iter([{"stage": "sft_model_load", "ts": 100.0, "attempt": 3, "liveness": True}])
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: next(beats, None),
+        deadline_at=500_000.0,
+        current_attempt=0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "no_capacity", (
+        f"a ping from attempt 3 was treated as proof that attempt 0 held a GPU (got "
+        f"{res.failure!r}); only a heartbeat for the CURRENT attempt proves this grant ({res.detail})"
+    )
+
+
 def test_a_requeued_job_that_already_ran_is_not_reported_as_no_capacity(monkeypatch):
     # `ever_saw_worker` was latched only from endpoint-health snapshots, which go quiet whenever the
     # health endpoint is unreachable (`_probe_worker_coming_up_at` swallows the error, and the
