@@ -17,9 +17,11 @@ import functools
 import http.client
 import json
 import os
+import re
 import tempfile
 import types
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # duplicated rather than imported from the plugin: this module is copied flat into the child
@@ -28,6 +30,10 @@ import urllib.request
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
 _FAILURE_FALLBACK_MAX_CHARS = 8192
+_SECRET_DETAIL = re.compile(
+    r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
+    r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)"
+)
 
 
 def _plugin():
@@ -204,6 +210,42 @@ def _write_cycle_commit_failure_fallback(classification: str, message: str) -> N
         os.environ.get("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", ""),
         classification,
         message,
+    )
+
+
+def _safe_child_failure_detail(error: Exception) -> str:
+    message = str(error)
+    secrets = {
+        value
+        for name, value in os.environ.items()
+        if value
+        and any(marker in name.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
+    }
+    for secret in sorted(secrets, key=len, reverse=True):
+        for needle in {secret, urllib.parse.quote(secret, safe="")}:
+            if len(needle) >= 8:
+                message = message.replace(needle, "<redacted>")
+                continue
+            left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""
+            right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
+            message = re.sub(f"{left}{re.escape(needle)}{right}", "<redacted>", message)
+    message = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", message)
+    return _SECRET_DETAIL.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        message,
+    )
+
+
+def _write_child_failure_fallback(
+    classification: str,
+    stage: str,
+    error: Exception,
+) -> None:
+    detail = _safe_child_failure_detail(error)
+    _write_failure_fallback(
+        os.environ.get("FLASH_OPD_CHILD_FAILURE_PATH", ""),
+        classification,
+        f"[stage={stage}] {type(error).__name__}: {detail}",
     )
 
 

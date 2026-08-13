@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import http.client
 import importlib.metadata
@@ -4373,6 +4374,96 @@ def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(monk
         )
 
 
+@pytest.mark.parametrize(
+    ("stage", "failure_path"),
+    [("multiturn_start", "/multiturn/start"), ("score", "/multiturn/score")],
+)
+def test_multiturn_catch_all_writes_stage_type_and_message_before_exit(
+    monkeypatch, tmp_path, stage, failure_path
+):
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.child.multiturn import build_flash_multi_turn_agent_loop
+    from flash.engine.worker.train.opd.child.plugin import _write_child_failure_fallback
+
+    child_failure_path = str(tmp_path / "child-failure")
+    bridge_token = "bridge-secret-token"
+    monkeypatch.setenv("FLASH_OPD_CHILD_FAILURE_PATH", child_failure_path)
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_URL", "http://127.0.0.1:4444")
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", bridge_token)
+    monkeypatch.setenv("FLASH_OPD_SEED", "42")
+    monkeypatch.setenv("FLASH_OPD_MAX_TURNS", "2")
+    monkeypatch.setenv("FLASH_OPD_MAX_MODEL_LEN", "128")
+    monkeypatch.setenv(
+        "FLASH_OPD_ENV_CAPABILITIES",
+        json.dumps(["new_rollout_state", "record_model_turn", "env_reply", "rollout_done"]),
+    )
+
+    class ChildExit(BaseException):
+        def __init__(self, code):
+            super().__init__(code)
+            self.code = code
+
+    def child_exit(code):
+        raise ChildExit(code)
+
+    def post_json(_url, _token, path, _payload):
+        if path == failure_path:
+            raise ValueError(f"invalid payload token={bridge_token}")
+        if path == "/multiturn/start":
+            return {"max_turns": 1}
+        if path == "/multiturn/close":
+            return {"ok": True}
+        raise AssertionError(path)
+
+    registered = {}
+
+    def register(name):
+        return lambda cls: registered.setdefault(name, cls) or cls
+
+    class AgentLoopBase:
+        def __init__(self):
+            self.loop = asyncio.get_running_loop()
+
+        async def apply_chat_template(self, _messages):
+            return [10, 11]
+
+        async def _run_turns(self, _sampling_params, outputs, **_kwargs):
+            outputs.append(SimpleNamespace(prompt_ids=[10], response_ids=[11], extra_fields={}))
+
+    loop_type = build_flash_multi_turn_agent_loop(
+        register=register,
+        agent_loop_base=AgentLoopBase,
+        agent_loop_output=SimpleNamespace,
+        post_json=post_json,
+        score_failure_handler=lambda error: (_ for _ in ()).throw(error),
+        child_failure_handler=_write_child_failure_fallback,
+        deterministic_seed=lambda *_args, **_kwargs: 1,
+        process_exit=child_exit,
+    )
+    loop_type._run_turns = AgentLoopBase._run_turns
+
+    async def run_loop():
+        return await loop_type().run(
+            {},
+            raw_prompt=[{"role": "user", "content": "q"}],
+            global_steps=1,
+            index=0,
+            session_id=0,
+        )
+
+    with pytest.raises(ChildExit) as exit_error:
+        asyncio.run(run_loop())
+
+    assert exit_error.value.code == 86
+    fallback = _read_classified_failure_fallback(child_failure_path)
+    assert fallback == (
+        "permanent",
+        f"[stage={stage}] ValueError: invalid payload token=<redacted>",
+    )
+    record = next(tmp_path.glob("child-failure.*.permanent.json")).read_text()
+    assert bridge_token not in record
+
+
 def test_explicit_multiturn_score_rejection_bypasses_delivery_handler():
     from flash.engine.worker.train.opd.child.multiturn import _post_multiturn_score
 
@@ -5156,6 +5247,7 @@ def _reconcile_opd_failure(truncation_window: _TruncationWindow):
         abandonment_failure_path="",
         mutation_failure_path="",
         cycle_commit_failure_path="",
+        child_failure_path="",
     )
     opd_runner._reconcile_child_failures(
         workload,
@@ -5337,6 +5429,58 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
 
     assert reconciled == [None]
     assert result.final_accounting["loss_curve"] == [0.5]
+
+
+@pytest.mark.parametrize(
+    ("classification", "return_code", "error_type"),
+    [("transient", 87, "RetriableInfraError"), ("permanent", 86, "RuntimeError")],
+)
+def test_parent_surfaces_child_failure_record_with_classification(
+    monkeypatch, tmp_path, classification, return_code, error_type
+):
+    import flash.engine.worker.opd_train_runner as opd_runner
+    from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.child.plugin import _write_child_failure_fallback
+
+    child_failure_path = str(tmp_path / "child-failure")
+    monkeypatch.setenv("FLASH_OPD_CHILD_FAILURE_PATH", child_failure_path)
+    _write_child_failure_fallback(classification, "generate", ValueError("invalid rollout state"))
+    expected_type = RetriableInfraError if error_type == "RetriableInfraError" else RuntimeError
+    workload = SimpleNamespace(
+        score_delivery_failure_path="",
+        resample_failure_path="",
+        abandonment_failure_path="",
+        mutation_failure_path="",
+        cycle_commit_failure_path="",
+        child_failure_path=child_failure_path,
+    )
+    bridge = SimpleNamespace(
+        teacher_failure=None,
+        mutation_failure=None,
+        _record_mutation_failure=lambda *_args: None,
+    )
+
+    with pytest.raises(expected_type) as error:
+        opd_runner._reconcile_child_failures(
+            workload,
+            bridge,
+            return_code,
+            truncation_window=None,
+        )
+
+    assert "[stage=generate] ValueError: invalid rollout state" in str(error.value)
+
+
+def test_specific_failure_wins_over_generic_child_failure():
+    with pytest.raises(RuntimeError) as error:
+        _raise_verl_failure(
+            86,
+            None,
+            mutation_failure=("permanent", "marker rejected"),
+            child_failure=("permanent", "[stage=generate] ValueError: hidden generic detail"),
+        )
+
+    assert str(error.value) == "permanent optimizer marker failure: marker rejected"
 
 
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
@@ -6055,6 +6199,7 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypat
         abandonment_failure_path=str(tmp_path / "abandonment-failure"),
         resample_failure_path=str(tmp_path / "resample-failure"),
         cycle_commit_failure_path=str(tmp_path / "cycle-commit-failure"),
+        child_failure_path=str(tmp_path / "child-failure"),
     )
     assert child["FLASH_OPD_BRIDGE_URL"] == "http://127.0.0.1:4444"
     assert child["FLASH_OPD_BRIDGE_TOKEN"] == "bridge-token"
@@ -6065,6 +6210,7 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypat
     assert child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] == str(tmp_path / "abandonment-failure")
     assert child["FLASH_OPD_RESAMPLE_FAILURE_PATH"] == str(tmp_path / "resample-failure")
     assert child["FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH"] == str(tmp_path / "cycle-commit-failure")
+    assert child["FLASH_OPD_CHILD_FAILURE_PATH"] == str(tmp_path / "child-failure")
     assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_plugin"
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert "PARASAIL_API_KEY" not in child

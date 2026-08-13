@@ -165,6 +165,7 @@ def _raise_verl_failure(
     cycle_commit_failure: tuple[str, str] | None = None,
     no_signal_failure: tuple[str, str] | None = None,
     score_delivery_failure: tuple[str, str] | None = None,
+    child_failure: tuple[str, str] | None = None,
     *,
     truncation_window: _TruncationWindow | None = None,
 ) -> None:
@@ -198,9 +199,11 @@ def _raise_verl_failure(
             )
         raise RuntimeError(f"permanent teacher failure: {message}")
     if return_code == _TRANSIENT_TEACHER_EXIT:
-        raise _w.RetriableInfraError("transient teacher bridge failure")
+        detail = f": {child_failure[1]}" if child_failure is not None else ""
+        raise _w.RetriableInfraError(f"transient teacher bridge failure{detail}")
     if return_code == _PERMANENT_TEACHER_EXIT:
-        raise RuntimeError("permanent teacher bridge failure")
+        detail = f": {child_failure[1]}" if child_failure is not None else ""
+        raise RuntimeError(f"permanent teacher bridge failure{detail}")
     if truncation_window is not None and truncation_window.indicates_completion_cap:
         raise RuntimeError(
             f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "
@@ -209,6 +212,11 @@ def _raise_verl_failure(
             f"truncated at the configured max_completion_tokens={int(truncation_window.max_completion)}, "
             "so the completion cap is likely too small"
         )
+    if child_failure is not None:
+        classification, message = child_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(f"transient teacher bridge failure: {message}")
+        raise RuntimeError(f"permanent teacher bridge failure: {message}")
     raise RuntimeError(f"verl OPD subprocess exited with status {return_code}")
 
 

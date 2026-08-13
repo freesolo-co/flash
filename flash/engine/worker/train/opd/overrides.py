@@ -400,6 +400,7 @@ def _build_opd_child_env(
     abandonment_failure_path: str = "",
     resample_failure_path: str = "",
     cycle_commit_failure_path: str = "",
+    child_failure_path: str = "",
 ) -> dict[str, str]:
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
@@ -422,6 +423,8 @@ def _build_opd_child_env(
         child["FLASH_OPD_RESAMPLE_FAILURE_PATH"] = resample_failure_path
     if cycle_commit_failure_path:
         child["FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH"] = cycle_commit_failure_path
+    if child_failure_path:
+        child["FLASH_OPD_CHILD_FAILURE_PATH"] = child_failure_path
     if multi_turn:
         child.update(
             {

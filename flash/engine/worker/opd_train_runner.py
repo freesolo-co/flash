@@ -57,6 +57,7 @@ class _WorkloadState:
     abandonment_failure_path: str
     resample_failure_path: str
     cycle_commit_failure_path: str
+    child_failure_path: str
     train_file: str
     val_file: str
     lora_rank: int
@@ -352,6 +353,7 @@ def _prepare_workload(
     abandonment_failure_path = os.path.join(workdir, "abandonment-failure")
     resample_failure_path = os.path.join(workdir, "resample-failure")
     cycle_commit_failure_path = os.path.join(workdir, "cycle-commit-failure")
+    child_failure_path = os.path.join(workdir, "child-failure")
     for path in (data_dir, shim_dir, local_dir, export_root):
         os.makedirs(path, exist_ok=True)
     materialized_images: dict[int, list[dict[str, str]]] = {}
@@ -409,6 +411,7 @@ def _prepare_workload(
         abandonment_failure_path,
         resample_failure_path,
         cycle_commit_failure_path,
+        child_failure_path,
         train_file,
         val_file,
         lora_rank,
@@ -769,6 +772,7 @@ def _build_child_env(
         abandonment_failure_path=workload.abandonment_failure_path,
         resample_failure_path=workload.resample_failure_path,
         cycle_commit_failure_path=workload.cycle_commit_failure_path,
+        child_failure_path=workload.child_failure_path,
     )
 
 
@@ -798,6 +802,7 @@ def _reconcile_child_failures(
     cycle_commit_failure = _opd_train._read_classified_failure_fallback(
         workload.cycle_commit_failure_path
     )
+    child_failure = _opd_train._read_classified_failure_fallback(workload.child_failure_path)
     _opd_train._raise_verl_failure(
         return_code,
         bridge.teacher_failure,
@@ -805,6 +810,7 @@ def _reconcile_child_failures(
         cycle_commit_failure,
         no_signal_failure,
         score_delivery_failure,
+        child_failure,
         truncation_window=truncation_window,
     )
 

@@ -1044,6 +1044,48 @@ def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
     assert steady_state_commits_per_hour <= 5.0
 
 
+def test_first_console_snapshot_precedes_the_stall_teardown():
+    """A wedged run must produce a console artifact before the stall classifier tears it down.
+
+    The hourly interval is longer than BOTH stall limits, so a periodic uploader that waits a full
+    interval for its first snapshot can never fire for a run that hangs -- which is exactly the run
+    whose console is the only evidence of why it hung. Multi-turn OPD wedges died this way: the
+    child hard-exits without a traceback, and the artifact that would have carried the stderr was
+    never uploaded because teardown always won the race.
+    """
+    import importlib
+    import inspect
+
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers.runpod.serverless import endpoints
+
+    # poll_job's stall defaults are the deadlines the first snapshot has to beat. `jobs` has to be
+    # imported first: it is mid-cycle with job_execution, so importing job_execution alone raises
+    # ImportError. done through importlib so import sorting cannot reorder the two.
+    importlib.import_module("flash.providers.runpod.jobs")
+    poll_job = importlib.import_module("flash.providers.runpod.job_execution").poll_job
+
+    stall_defaults = inspect.signature(poll_job).parameters
+    training_stall_s = stall_defaults["stall_after_s"].default
+    setup_grace_s = stall_defaults["setup_grace_s"].default
+
+    for first_snapshot_s in (
+        endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S,
+        _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S,
+    ):
+        assert first_snapshot_s < training_stall_s
+        assert first_snapshot_s < setup_grace_s
+        # the defect this guards: the steady interval alone outlives both deadlines.
+        assert setup_grace_s < endpoints._CONSOLE_UPLOAD_INTERVAL_S
+
+    # _train_body ships as SOURCE to the worker, so it inlines these two numbers rather than
+    # referencing the constants (test_train_body_imports_every_name_it_uses enforces that). pin the
+    # literals here so the shipped uploader cannot drift away from the deadlines above.
+    body = inspect.getsource(endpoints._train_body)
+    assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S})" in body
+    assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_INTERVAL_S})" in body
+
+
 def test_min_cuda_for_uses_the_gpu_class_floor():
     # the CUDA floor is a property of the GPU class, not of the image tag
     from flash.providers.runpod.serverless.endpoints import min_cuda_for

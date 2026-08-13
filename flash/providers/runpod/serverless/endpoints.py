@@ -24,6 +24,13 @@ from flash.providers.runpod.gpus import flash_gpu
 FLASH_SDK_LOCK = threading.Lock()
 
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
+# the periodic uploader waits a full interval before its FIRST snapshot, but a wedged run is torn
+# down well before that: 1200s on the training stall limit and 3000s on the setup grace, both under
+# the hourly interval. so the hourly upload could never fire for the runs that need it most, and
+# they died carrying no console artifact at all. take one early snapshot, then settle into the
+# hourly cadence -- this costs one extra commit per run, not per hour, so the shared-artifact-repo
+# rate budget the interval exists to protect is unchanged.
+_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
 
 _ENDPOINT_CACHE: dict[str, Any] = {}
 
@@ -562,12 +569,21 @@ def _train_body(input_data: dict) -> dict:
         def run_mode(mode: str, check: bool) -> int:
             """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
             console = f"/tmp/console_{mode}.txt"
-            interval = 3600.0
             stop_upload = threading.Event()
 
             def _upload_loop() -> None:
-                while not stop_upload.wait(interval):
-                    _upload_console(mode)  # best-effort; swallows its own errors
+                # literals, not the module-level upload constants: only this function's SOURCE
+                # ships to the worker, so referencing one by name is a NameError before training.
+                # test_first_console_snapshot_precedes_the_stall_teardown pins these two numbers to
+                # those constants so the shipped uploader cannot drift.
+                #
+                # first snapshot early so a run torn down inside the stall window still has one,
+                # then the steady hourly cadence.
+                if stop_upload.wait(600.0):
+                    return
+                _upload_console(mode)  # best-effort; swallows its own errors
+                while not stop_upload.wait(3600.0):
+                    _upload_console(mode)
 
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()

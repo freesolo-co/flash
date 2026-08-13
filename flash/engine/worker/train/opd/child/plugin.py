@@ -482,7 +482,8 @@ def _build_flash_teacher_extensions():
                 )
             except FlashTeacherBridgeError as error:
                 _exit_for_score_failure(error)
-            except Exception:
+            except Exception as error:
+                _write_child_failure_fallback("permanent", "teacher", error)
                 os._exit(_PERMANENT_TEACHER_EXIT)
             teacher_ids = torch.tensor(payload["teacher_ids"], dtype=torch.int32).unsqueeze(-1)
             teacher_logprobs = torch.tensor(
@@ -873,6 +874,7 @@ def _install_verl_extensions() -> None:
         agent_loop_output=AgentLoopOutput,
         post_json=_post_json,
         score_failure_handler=_exit_for_score_failure,
+        child_failure_handler=_write_child_failure_fallback,
         deterministic_seed=deterministic_rollout_seed,
         permanent_teacher_exit=_PERMANENT_TEACHER_EXIT,
         transient_teacher_exit=_TRANSIENT_TEACHER_EXIT,
@@ -926,6 +928,7 @@ try:
         _update_actor_after_teacher_cycle_commit,
         _wrap_optimizer_with_mutation_notice,
         _write_abandonment_failure_fallback,
+        _write_child_failure_fallback,
         _write_cycle_commit_failure_fallback,
         _write_failure_fallback,
         _write_mutation_failure_fallback,
@@ -949,6 +952,7 @@ except ImportError:
         _update_actor_after_teacher_cycle_commit,
         _wrap_optimizer_with_mutation_notice,
         _write_abandonment_failure_fallback,
+        _write_child_failure_fallback,
         _write_cycle_commit_failure_fallback,
         _write_failure_fallback,
         _write_mutation_failure_fallback,
