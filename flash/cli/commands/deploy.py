@@ -346,6 +346,32 @@ def _hub_repo_gated_errors() -> tuple[type[BaseException], ...]:
     return ()
 
 
+def _hf_repo_exists(api: object, repository: str, token: str) -> bool:
+    """Whether the destination is already there, for hubs with no exact write probe.
+
+    Only ever used to decide that the CREATION rules do not apply. An error is reported as "does not
+    exist" so an unreachable or unreadable Hub keeps the stricter creation path rather than silently
+    waving the export through.
+    """
+    repo_exists = getattr(api, "repo_exists", None)
+    if not callable(repo_exists):
+        return False
+    try:
+        return bool(repo_exists(repository, repo_type="model", token=token))
+    except Exception:
+        return False
+
+
+def _hf_hub_version() -> str:
+    """The installed hub version for messages, without importing the package at module scope."""
+    try:
+        from huggingface_hub import __version__
+
+        return str(__version__)
+    except Exception:
+        return "<1.5"
+
+
 def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
     """return the token account after verifying the destination namespace when hub is installed."""
     try:
@@ -389,7 +415,20 @@ def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
     # actually needs. asking the org role first would refuse a `contributor` who can write this
     # very repo, because a role is a coarser fact than the permission being checked.
     auth_check = getattr(api, "auth_check", None)
-    if callable(auth_check) and "write" in inspect.signature(auth_check).parameters:
+    exact_probe = callable(auth_check) and "write" in inspect.signature(auth_check).parameters
+    if not exact_probe and _hf_repo_exists(api, repository, token):
+        # `auth_check(..., write=True)` only exists from huggingface-hub 1.5, and this package still
+        # supports >=1.2, so on 1.2-1.4 there is no exact write probe. the rules below are CREATION
+        # rules and a destination that already exists is not being created, so applying them here
+        # would reject the org `contributor` this ordering was fixed to admit. degrade to a warning,
+        # exactly as this function already does when the Hub is unreachable or the package is absent.
+        print(
+            f"warning: huggingface-hub {_hf_hub_version()} cannot check write access to an "
+            f"existing repo; proceeding without verifying {repository}",
+            file=sys.stderr,
+        )
+        return account
+    if exact_probe:
         try:
             auth_check(repository, repo_type="model", token=token, write=True)
             return account

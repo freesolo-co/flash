@@ -2636,6 +2636,111 @@ def test_export_allows_an_org_contributor_who_can_write_the_exact_repo(
     assert "hf_secret" not in capsys.readouterr().err
 
 
+def test_export_allows_an_org_contributor_on_a_hub_too_old_for_the_write_probe(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """`auth_check(..., write=True)` landed in huggingface-hub 1.5, but this package supports >=1.2.
+
+    On 1.2-1.4 there is no exact write probe, so the guard skips it. What follows are CREATION
+    rules, and they must not run for a destination that already exists: an `acme` contributor who
+    can write `acme/model` would be refused on a supported hub version.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "contributor"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        # the pre-1.5 signature: present, but with no `write` parameter to ask for write access.
+        def auth_check(self, repo_id, *, repo_type=None, token=None):
+            return
+
+        def repo_exists(self, repo_id, *, repo_type=None, token=None):
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.4.0"),
+    )
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 0
+    )
+    assert any(call[0] == "export" for call in fake_client.calls)
+    err = capsys.readouterr().err
+    assert "1.4.0" in err, "the unverified export must say which hub could not check it"
+    assert "hf_secret" not in err
+
+
+def test_export_still_applies_creation_rules_on_an_old_hub_when_the_repo_is_absent(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """The old-hub bypass is scoped to an EXISTING destination.
+
+    A repo that is not there yet is genuinely being created, so the namespace rules still decide.
+    Skipping them here would turn a missing exact probe into a way to create a repo in an org this
+    token has no write access to -- the wrong-namespace export this preflight exists to stop.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "contributor"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        def auth_check(self, repo_id, *, repo_type=None, token=None):
+            return
+
+        def repo_exists(self, repo_id, *, repo_type=None, token=None):
+            return False
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.4.0"),
+    )
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 1
+    )
+    assert not any(call[0] == "export" for call in fake_client.calls)
+    err = capsys.readouterr().err
+    assert "cannot create" in err
+    assert "hf_secret" not in err
+
+
 def test_export_refuses_a_gated_destination_instead_of_treating_it_as_creatable(
     fake_client, monkeypatch, capsys
 ) -> None:
