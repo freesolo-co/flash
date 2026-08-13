@@ -2795,6 +2795,99 @@ def test_export_keeps_the_creation_rules_when_existence_is_inconclusive(
     assert "hf_secret" not in err
 
 
+def test_export_proceeds_when_the_exact_repo_probe_cannot_reach_the_hub(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A timeout or DNS failure from `auth_check` is not a verdict on the token's permissions.
+
+    Reporting it as "cannot write to <repo>" blames the user's access for a network fault, and the
+    upload runs on the control plane regardless. The whoami path above already degrades this way.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "write"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        def auth_check(self, repo_id, *, repo_type=None, token=None, write=False):
+            raise OSError("temporary failure in name resolution")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.27.0"),
+    )
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 0
+    )
+    assert any(call[0] == "export" for call in fake_client.calls)
+    err = capsys.readouterr().err
+    assert "cannot write to" not in err, "an unreachable Hub must not read as a permission verdict"
+    assert "hf_secret" not in err
+
+
+def test_export_warning_does_not_echo_the_token_from_a_hub_exception(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """The degrade warnings quote the exception, and a local credential rejection quotes the token.
+
+    httpx raises `Illegal header value b'Bearer <token>'` for a token with an internal newline, so
+    interpolating the exception verbatim prints the credential into stderr, logs and bug reports.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "write"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        def auth_check(self, repo_id, *, repo_type=None, token=None, write=False):
+            raise ValueError("Illegal header value b'Bearer hf_secret\\nINJECT'")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.27.0"),
+    )
+    _run(
+        [
+            "models",
+            "export",
+            "--adapter-id",
+            "flash-1",
+            "--repository",
+            "acme/model",
+            "--api-key",
+            "hf_secret",
+        ]
+    )
+    err = capsys.readouterr().err
+    assert "hf_secret" not in err
+    # the exception is still shown: it is the only clue to what actually failed.
+    assert "Illegal header value" in err
+
+
 def test_export_refuses_a_gated_destination_instead_of_treating_it_as_creatable(
     fake_client, monkeypatch, capsys
 ) -> None:

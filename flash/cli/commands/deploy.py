@@ -363,6 +363,19 @@ def _hf_repo_confirmed_to_exist(api: object, repository: str, token: str) -> boo
         return False
 
 
+def _without_token(text: str, token: str) -> str:
+    """`text` with the token removed, for the warnings that quote a hub exception.
+
+    A local credential rejection quotes what it was handed: httpx raises "Illegal header value
+    b'Bearer <token>'" for a token containing a newline, so interpolating the exception prints the
+    credential to stderr and into any log or pasted bug report. The exception is still worth showing
+    -- it is the only clue to what went wrong -- so redact rather than drop it.
+    """
+    if not token:
+        return text
+    return text.replace(token, "<redacted>")
+
+
 def _hf_hub_version() -> str:
     """The installed hub version for messages, without importing the package at module scope.
 
@@ -398,8 +411,8 @@ def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
         # package is simply absent. degrade to that behaviour rather than invent a new hard blocker.
         if _hf_status_code(exc) is None:
             print(
-                f"warning: could not reach HuggingFace to verify the export namespace ({exc}); "
-                "proceeding without the check",
+                "warning: could not reach HuggingFace to verify the export namespace "
+                f"({_without_token(str(exc), token)}); proceeding without the check",
                 file=sys.stderr,
             )
             return None
@@ -448,6 +461,17 @@ def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
             absent = bool(missing) and isinstance(exc, missing)
             if absent and isinstance(exc, _hub_repo_gated_errors()):
                 absent = False
+            if not absent and _hf_status_code(exc) is None:
+                # the Hub never answered -- a timeout, DNS or connection error rather than a
+                # verdict. reporting that as "cannot write" blames the user's permissions for a
+                # network fault, and the upload runs on the control plane anyway. warn and proceed,
+                # exactly as the whoami path above already does for the same class of failure.
+                print(
+                    f"warning: could not verify write access to {repository} "
+                    f"({_without_token(str(exc), token)}); proceeding without the check",
+                    file=sys.stderr,
+                )
+                return account
             if not absent:
                 raise ClientError(
                     f"HuggingFace token resolves to account {account}, but it cannot write to "
