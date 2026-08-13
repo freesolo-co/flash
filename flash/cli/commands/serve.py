@@ -529,9 +529,18 @@ def cmd_serve_status(args) -> int:
     #
     # A GET of an id that cannot exist: authentication runs before the record read, so a rejected
     # key is 401/403 and an accepted one is 404. Read-only and side-effect free either way, which
-    # registering something would not be. Only when the backend says it authenticates at all --
-    # against one that does not, every key is accepted and there is nothing to verify.
-    if payload.get("requires_key") is True:
+    # registering something would not be.
+    #
+    # `is not False`, NOT `is True`. `requires_key` is optional by contract, so ABSENCE is the
+    # backend declining to say -- and a protected custom backend that omits it was skipped by the
+    # probe entirely, reported `ready` with a missing or wrong key, and then 401'd on the very next
+    # deploy: exactly the misconfiguration this command exists to catch. Only an explicit `false`
+    # is a backend stating it does not authenticate, and only that may skip the probe.
+    #
+    # The same polarity `_warn_if_unauthenticated` already uses, and the fallback is safe in both
+    # directions: probing an genuinely open backend costs one 404 read of a made-up id, which is
+    # the pass answer anyway. Skipping wrongly costs a failed deploy.
+    if payload.get("requires_key") is not False:
         import urllib.error
 
         probe = f"flash-serve-status-probe-{uuid.uuid4().hex}"

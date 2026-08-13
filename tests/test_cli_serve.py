@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import types
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -369,8 +370,12 @@ def test_status_sends_the_internal_key_the_way_deploy_does(monkeypatch, capsys):
 
     seen: list[tuple[str, dict]] = []
 
-    def _fake_request(url, headers):
+    def _fake_request(url, headers, path="/healthz"):
         seen.append((url, headers))
+        if path != "/healthz":
+            # The key probe. This health payload omits `requires_key`, which is the backend making
+            # no claim -- so status probes rather than assuming open, and 404 is the pass answer.
+            raise urllib.error.HTTPError(url, 404, "not found", {}, None)
         return {
             "ok": True,
             "base_models": ["Qwen/Qwen3.5-4B"],
@@ -381,7 +386,7 @@ def test_status_sends_the_internal_key_the_way_deploy_does(monkeypatch, capsys):
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "sekrit")
     monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
     assert serve_cmd.cmd_serve_status(_args()) == 0
-    assert seen == [("https://acme.modal.run", {"X-Freesolo-Internal-Key": "sekrit"})], (
+    assert seen == [("https://acme.modal.run", {"X-Freesolo-Internal-Key": "sekrit"})] * 2, (
         "status did not send the internal key, so an authenticated backend reads as unreachable"
     )
 
@@ -967,6 +972,46 @@ def test_status_skips_the_key_probe_on_a_backend_without_one(monkeypatch, capsys
     assert serve_cmd.cmd_serve_status(_args()) == 0
     assert asked == ["/healthz"]
     assert "ready. deploy a run" in capsys.readouterr().out
+
+
+def test_status_probes_the_key_when_the_backend_makes_no_claim(monkeypatch, capsys):
+    """An OMITTED `requires_key` must still be probed, because the field is optional.
+
+    The contract explicitly makes it optional, so absence is a backend declining to say -- not a
+    backend declaring itself open. Treated as open, a protected custom backend that omits the field
+    skipped the probe entirely, printed `ready` with a missing or wrong key, and 401'd on the very
+    next deploy: exactly the misconfiguration this command exists to diagnose.
+    """
+    from flash.serve import urls as urls_mod
+
+    asked: list[str] = []
+
+    def _fake_request(url, headers, path="/healthz"):
+        asked.append(path)
+        if path == "/healthz":
+            # No `requires_key` at all. Everything else is a conforming health payload.
+            return {
+                "ok": True,
+                "base_models": ["Qwen/Qwen3.5-4B"],
+                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
+            }
+        raise urllib.error.HTTPError(url, 401, "invalid serving key", {}, None)
+
+    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "wrong")
+    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+
+    code = serve_cmd.cmd_serve_status(_args())
+    out = capsys.readouterr()
+    assert any(p != "/healthz" for p in asked), (
+        "a backend that omits `requires_key` was never probed, so a wrong key reads as ready"
+    )
+    assert code == 1, (
+        "status reported ready against a protected backend that omits `requires_key`, so the "
+        "next deploy 401s on a backend this command just called ready"
+    )
+    assert "ready. deploy a run" not in out.out
+    assert "FREESOLO_INTERNAL_KEY" in out.err
 
 
 def test_status_does_not_report_ready_when_the_read_back_fabricates_a_record(monkeypatch, capsys):
