@@ -15,6 +15,9 @@ from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
 from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
+    count_rendered_reasoning_spans,
+    reasoned_assistant_turns,
+    rendered_reasoning_loss_warning,
     sft_sample_policy,
     unpacked_batch_warning,
 )
@@ -41,6 +44,8 @@ class PreparedSftWorkload:
     sampled_texts: list[str]
     multiturn_targets: int
     coerced_singleturn_targets: int
+    authored_reasoning_turns: int
+    rendered_reasoning_spans: int
 
 
 def _serialize_multimodal_inputs(values: dict) -> bytes:
@@ -257,6 +262,8 @@ class _TokenizedSftRows:
     sampled_texts: list[str]
     multiturn_targets: int
     coerced_singleturn_targets: int
+    authored_reasoning_turns: int
+    rendered_reasoning_spans: int
     dropped: int
 
 
@@ -317,6 +324,12 @@ def _tokenize_prompt_rows(
     sampled_texts: list[str] = []
     multiturn_targets = 0
     coerced_singleturn_targets = 0
+    # counted over the COMPLETION messages and the rendered text of every row, not a sample: this is
+    # the comparison that shows reasoning being dropped at render time, and a sample would let a
+    # cheap row hide an expensive one. only completion turns count, because reasoning in the prompt
+    # history is context the model reads rather than supervision it is trained on.
+    authored_reasoning_turns = 0
+    rendered_reasoning_spans = 0
     for row_index, (
         example,
         prompt_messages,
@@ -358,14 +371,15 @@ def _tokenize_prompt_rows(
                 ),
                 "multimodal_inputs": multimodal_inputs,
             }
-            sampled_texts.append(
-                tokenizer.apply_chat_template(
-                    [*normalized.messages, *completion_messages],
-                    tokenize=False,
-                    add_generation_prompt=False,
-                    enable_thinking=spec.thinking,
-                )
+            text = tokenizer.apply_chat_template(
+                [*normalized.messages, *completion_messages],
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=spec.thinking,
             )
+            sampled_texts.append(text)
+            authored_reasoning_turns += reasoned_assistant_turns(completion_messages)
+            rendered_reasoning_spans += count_rendered_reasoning_spans(text)
         else:
             text = tokenizer.apply_chat_template(
                 [*prompt_messages, *completion_messages],
@@ -380,6 +394,8 @@ def _tokenize_prompt_rows(
                 enable_thinking=spec.thinking,
             )
             sampled_texts.append(text)
+            authored_reasoning_turns += reasoned_assistant_turns(completion_messages)
+            rendered_reasoning_spans += count_rendered_reasoning_spans(text)
             text_specs.append({"text": text, "prompt_text": prompt_text, "row_index": row_index})
 
     dropped = 0
@@ -405,6 +421,8 @@ def _tokenize_prompt_rows(
         sampled_texts=sampled_texts,
         multiturn_targets=multiturn_targets,
         coerced_singleturn_targets=coerced_singleturn_targets,
+        authored_reasoning_turns=authored_reasoning_turns,
+        rendered_reasoning_spans=rendered_reasoning_spans,
         dropped=dropped,
     )
 
@@ -690,6 +708,17 @@ def prepare_sft_workload(
     )
     if warning:
         print(f"warning: [train] {warning}", file=sys.stderr)
+    # emitted from here rather than the training worker so it reaches the estimate too: by the time
+    # the worker logs it the gpu is already allocated, and the whole point is to let the user
+    # restructure the dataset before paying for a run that trains on a fraction of its reasoning.
+    # counted over every row, and only over rows the run keeps.
+    reasoning_warning = rendered_reasoning_loss_warning(
+        authored_turns=tokenized.authored_reasoning_turns,
+        rendered_spans=tokenized.rendered_reasoning_spans,
+        rows=len(retained.rows),
+    )
+    if reasoning_warning:
+        print(f"warning: [train] {reasoning_warning}", file=sys.stderr)
     return PreparedSftWorkload(
         rows=retained.rows,
         profile=profile,
@@ -699,4 +728,6 @@ def prepare_sft_workload(
         sampled_texts=tokenized.sampled_texts,
         multiturn_targets=tokenized.multiturn_targets,
         coerced_singleturn_targets=tokenized.coerced_singleturn_targets,
+        authored_reasoning_turns=tokenized.authored_reasoning_turns,
+        rendered_reasoning_spans=tokenized.rendered_reasoning_spans,
     )

@@ -457,3 +457,175 @@ def test_a_cap_that_does_not_bind_reports_no_truncation_and_stays_quiet(capsys) 
     assert prepared.profile.untruncated_max_length < 4096
 
     assert "max_context_tokens" not in capsys.readouterr().err
+
+
+class ThinkingTokenizer(FakeTokenizer):
+    """A tokenizer whose chat template reproduces Qwen3.5's ``<think>`` placement rule.
+
+    Transcribed from ``Qwen/Qwen3.5-0.8B``'s own template rather than paraphrased, because the two
+    details that make the warning necessary are both easy to get wrong from memory:
+
+    * reasoning survives only on assistant turns AFTER the last non-tool user message
+      (``loop.index0 > ns.last_query_index``), not merely on the last turn;
+    * a trailing assistant turn ALWAYS opens a ``<think>`` block, empty when that turn authored no
+      reasoning. That empty block is why survival is counted as non-empty spans.
+
+    ``tests/test_sft_workload_live.py`` pins this fake against the real tokenizer.
+    """
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        enable_thinking,
+        **_kwargs,
+    ):
+        assert not tokenize
+        last_query = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if message.get("role") == "user"
+                and not str(message.get("content") or "").startswith("<tool_response>")
+            ),
+            default=-1,
+        )
+        parts = []
+        for index, message in enumerate(messages):
+            content = str(message.get("content") or "")
+            reasoning = ""
+            if "</think>" in content:
+                reasoning = content.split("</think>")[0].split("<think>")[-1].strip()
+                content = content.split("</think>")[-1].lstrip("\n")
+            if message.get("role") == "assistant" and index > last_query:
+                parts.append(f"<think>\n{reasoning}\n</think>\n\n{content}")
+            else:
+                parts.append(content)
+        text = "".join(parts)
+        return text + ("<think>\n" if add_generation_prompt else "")
+
+
+class ThinkingEnvironment(FakeEnvironment):
+    multi_turn = True
+
+    def __init__(self, completion):
+        super().__init__()
+        self._rows = [{"prompt": "board", "answer": "ignored"}]
+        self._completion = completion
+
+    def sft_completion(self, row):
+        return [dict(message) for message in self._completion]
+
+
+def _thinking_prepared(completion):
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    return prepare_sft_workload(
+        spec,
+        ThinkingEnvironment(completion),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+
+_MULTITURN_TARGET = [
+    {"role": "assistant", "content": "<think>first</think>a1"},
+    {"role": "user", "content": "next"},
+    {"role": "assistant", "content": "<think>second</think>a2"},
+    {"role": "user", "content": "next"},
+    {"role": "assistant", "content": "<think>third</think>a3"},
+]
+
+
+def test_a_multiturn_thinking_target_warns_that_the_template_ate_its_reasoning(capsys) -> None:
+    """The defect: 3 authored reasoning blocks, 1 trained on, and nothing said so.
+
+    A green ``flash env test`` and a correct-looking dataset both survive this, because the stored
+    messages were never wrong -- only the render is. The warning has to name how much was lost,
+    since "some reasoning was dropped" cannot be acted on.
+    """
+    prepared = _thinking_prepared(_MULTITURN_TARGET)
+
+    assert prepared.authored_reasoning_turns == 3
+    assert prepared.rendered_reasoning_spans == 1
+
+    warning = capsys.readouterr().err
+    assert "dropped 2 of 3 authored reasoning blocks" in warning
+    assert "33%" in warning
+    # the actionable half: without the restructuring instruction the user's only reading is
+    # "turn thinking off", which discards the reasoning the dataset was built to teach.
+    assert "K single-turn rows" in warning
+
+
+def test_a_final_position_thinking_target_keeps_its_reasoning_and_stays_quiet(capsys) -> None:
+    """The paired control. Without it the assertions above pass for a warning wired to always fire."""
+    prepared = _thinking_prepared([{"role": "assistant", "content": "<think>only</think>a"}])
+
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 1
+    assert "authored reasoning blocks" not in capsys.readouterr().err
+
+
+def test_reasoning_stripped_to_nothing_is_not_read_as_one_surviving_block(capsys) -> None:
+    """The trap that makes naive ``count("<think>")`` wrong, and it fires on the WORST input.
+
+    Reasoning on every turn but the last renders one EMPTY ``<think>`` block. Counting raw opening
+    tags scores that as one survivor, so the transcript that lost ALL of its reasoning is the one
+    that would report the smallest loss.
+    """
+    prepared = _thinking_prepared(
+        [
+            {"role": "assistant", "content": "<think>first</think>a1"},
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "a2"},
+        ]
+    )
+
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 0
+
+    warning = capsys.readouterr().err
+    assert "dropped 1 of 1 authored reasoning blocks" in warning
+    assert "0%" in warning
+
+
+def test_a_dataset_with_no_authored_reasoning_stays_quiet(capsys) -> None:
+    """The other control: the always-injected empty block must not be read as lost reasoning.
+
+    Every thinking render carries one empty ``<think>`` block, so a rule keyed on tags rather than
+    content would warn about dropped reasoning for a dataset that authored none.
+    """
+    prepared = _thinking_prepared([{"role": "assistant", "content": "plain answer"}])
+
+    assert prepared.authored_reasoning_turns == 0
+    assert prepared.rendered_reasoning_spans == 0
+    assert "authored reasoning blocks" not in capsys.readouterr().err
+
+
+def test_reasoning_carried_in_reasoning_content_counts_as_authored(capsys) -> None:
+    """The template reads ``reasoning_content`` ahead of an inline span, so the source count must too.
+
+    Counting only literal ``<think>`` in ``content`` would score these rows as reasoning-free and
+    report no loss for a transcript that is losing all of it.
+    """
+    prepared = _thinking_prepared(
+        [
+            {"role": "assistant", "content": "a1", "reasoning_content": "first"},
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "a2", "reasoning_content": "second"},
+        ]
+    )
+
+    assert prepared.authored_reasoning_turns == 2
+    assert "dropped" in capsys.readouterr().err

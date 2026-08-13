@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -50,6 +51,13 @@ def sft_sample_policy(max_examples: object) -> str:
     except (TypeError, ValueError):
         cap = 0
     return SFT_SAMPLE_POLICY_PREFIX if cap > 0 else SFT_SAMPLE_POLICY_FULL
+
+
+# a <think> span carrying actual reasoning. the closing tag is required and the body must hold a
+# non-space character: the thinking template emits `<think>\n\n</think>` on a trailing assistant
+# turn that authored no reasoning, and counting that as surviving reasoning would report 100%
+# survival for a transcript whose reasoning was entirely stripped.
+_NON_EMPTY_THINK = re.compile(r"<think>\s*\S.*?</think>", re.DOTALL)
 
 
 # why a run resolved to `exact-unpacked`, keyed by the architecture label the packing decision
@@ -113,6 +121,70 @@ def unpacked_batch_warning(
         "sizes the gpu for an auto-sized run, so changing it can change the quote and move the card. "
         "the default learning rate is tuned for a batched update: expect noisier steps, "
         "and lower train.learning_rate if you are comparing against a packed run."
+    )
+
+
+def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:
+    """Assistant turns that author reasoning, counted from the SOURCE messages.
+
+    Both shapes the chat template accepts count: a literal ``<think>...</think>`` span inside
+    ``content``, and a separate ``reasoning_content`` field. The template reads the second in
+    preference to the first, so a row that uses it would otherwise look reasoning-free here while
+    rendering reasoning, and the comparison below would under-report the drop.
+    """
+    turns = 0
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            turns += 1
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and _NON_EMPTY_THINK.search(content):
+            turns += 1
+    return turns
+
+
+def count_rendered_reasoning_spans(text: str) -> int:
+    """NON-EMPTY ``<think>`` spans in rendered text -- the reasoning that reaches the loss.
+
+    Counting ``text.count("<think>")`` overstates this. Qwen3.5's template opens a ``<think>``
+    block on every trailing assistant turn whether or not that turn authored reasoning, so a
+    transcript whose reasoning was entirely stripped still renders one EMPTY block and would score
+    as one surviving block instead of zero -- the exact case the warning exists to catch.
+    """
+    return len(_NON_EMPTY_THINK.findall(text))
+
+
+def rendered_reasoning_loss_warning(
+    *,
+    authored_turns: int,
+    rendered_spans: int,
+    rows: int,
+) -> str | None:
+    """One user-facing line when the chat template drops authored reasoning at render time.
+
+    Qwen3.5's template keeps reasoning only on assistant turns AFTER the last real user query and
+    strips it from earlier history, so a K-turn gold transcript delivers roughly 1/K of its
+    reasoning to the loss. Nothing else reports this: the rendered text is what trains, the stored
+    messages were never wrong, and ``flash env test`` passes either way.
+
+    Silent when nothing was authored (the existing thinking-mode check owns that case) and when
+    everything survived. Reports the measurement rather than a fixed threshold: any drop is real
+    lost supervision, and the count is exact rather than sampled.
+    """
+    if authored_turns <= 0 or rendered_spans >= authored_turns:
+        return None
+    lost = authored_turns - rendered_spans
+    return (
+        f"the chat template dropped {lost} of {authored_turns} authored reasoning blocks across "
+        f"{rows} SFT rows; only {rendered_spans} reach the loss "
+        f"({rendered_spans / authored_turns:.0%}). this template keeps <think> only on assistant "
+        "turns after the last user message and strips it from earlier history, so a multi-turn "
+        "transcript trains on a fraction of its reasoning and on a tag layout inference never "
+        "produces. split each K-turn transcript into K single-turn rows, so every turn's reasoning "
+        "sits in the final assistant target where the template keeps it."
     )
 
 
