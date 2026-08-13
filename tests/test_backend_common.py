@@ -1999,6 +1999,28 @@ def _bound_silence_watchdog(tail, *, tick_s=30.0, parent_activity=None):
     return watchdog, torn_down
 
 
+def test_verl_child_silence_timeout_stays_under_the_provider_stall_deadline():
+    """The worker only gets to CLASSIFY a wedge if it fires before the provider kills the run.
+
+    Once a step is reported the poller switches to its training limit, and worker heartbeats are
+    throttled, so a wedged run is torn down as a generic "no worker progress" at roughly the sum of
+    the two. A silence timeout above that never names anything -- which is this watchdog's entire
+    purpose -- so the relationship is pinned rather than left to a comment.
+    """
+    from flash.engine.worker import _HB_MIN_INTERVAL_S
+
+    # read off the source rather than imported: importing the provider module from here is circular
+    # at collection time, and the default in its signature is the value the poller actually runs.
+    source = pathlib.Path("flash/providers/runpod/job_execution.py").read_text()
+    stall_after_s = float(re.search(r"stall_after_s: float = ([0-9.]+)", source).group(1))
+    provider_deadline = _HB_MIN_INTERVAL_S + stall_after_s
+    assert provider_deadline > vc.VERL_CHILD_SILENCE_TIMEOUT_S
+
+    # and it must still clear the longest LEGITIMATE silence: one teacher request that exhausts its
+    # retry budget is 105s x 4 attempts + (2 + 4 + 8)s backoff, and opd batches them serially.
+    assert vc.VERL_CHILD_SILENCE_TIMEOUT_S > 105.0 * 4 + 14.0
+
+
 def test_verl_child_silence_watchdog_gives_a_resumed_run_the_same_setup_exemption():
     """A resumed opd run seeds `progress["step"]` from resume_step (opd_train_runner.py), so a
     bare `step > 0` test reads as "training is running" while ray and the model are still loading
@@ -2035,17 +2057,19 @@ def test_verl_child_silence_watchdog_tears_down_and_raises_at_the_threshold():
     # the first observation latches the baseline, so the child must advance past it before the
     # watchdog considers a step to be running. this is the state a real wedge is in.
     assert watchdog.observe(1) == 0
-    for _ in range(120):
+    for _ in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0)):
         watchdog.observe(2)
 
     assert torn_down == [True]
-    with pytest.raises(RuntimeError, match="no output for 3600s while training was running"):
+    expected = f"no output for {vc.VERL_CHILD_SILENCE_TIMEOUT_S:.0f}s while training was running"
+    with pytest.raises(RuntimeError, match=expected):
         watchdog.raise_if_failed()
 
 
 def test_run_verl_training_tears_down_a_silent_child_and_raises_the_named_failure():
     tail = vc.ChildOutputTail()
-    watchdog = vc.VerlChildSilenceWatchdog(tail, tick_s=3600.0)
+    # one tick IS the whole timeout, so the second silent observation trips it.
+    watchdog = vc.VerlChildSilenceWatchdog(tail, tick_s=vc.VERL_CHILD_SILENCE_TIMEOUT_S)
 
     def trip_after_first_output():
         deadline = time.monotonic() + 5.0
@@ -2057,8 +2081,9 @@ def test_run_verl_training_tears_down_a_silent_child_and_raises_the_named_failur
 
     observer = threading.Thread(target=trip_after_first_output)
     observer.start()
+    expected = f"no output for {vc.VERL_CHILD_SILENCE_TIMEOUT_S:.0f}s while training was running"
     try:
-        with pytest.raises(RuntimeError, match="no output for 3600s while training was running"):
+        with pytest.raises(RuntimeError, match=expected):
             vc.run_verl_training(
                 ["bash", "-c", "echo 'step: 1'; sleep 30"],
                 env=dict(os.environ),

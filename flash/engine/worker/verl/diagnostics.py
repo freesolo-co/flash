@@ -30,11 +30,20 @@ _CHILD_TAIL_LINE_CHARS = 300
 # how many retained lines ride along on a pre-first-step heartbeat. narrower than what is retained:
 # this payload is uploaded every tick, so it stays small enough not to bloat the snapshot.
 STALL_TAIL_LINES = 15
-# one teacher request can spend 105s x 4 attempts + (2 + 4 + 8)s backoff = 434s while
-# the child waits silently, and opd batches those requests serially. parent activity resets opd's
-# counter after each completed interaction; the full hour remains the conservative grpo floor for
-# long rollouts and checkpoint callbacks. ticks are derived from the heartbeat cadence at runtime.
-VERL_CHILD_SILENCE_TIMEOUT_S = 60.0 * 60.0
+# bounded from ABOVE by the provider, not just from below by healthy silence. once a step is
+# reported the poller switches to its training limit (`stall_after_s`, 1200s) and heartbeats are
+# throttled to `_HB_MIN_INTERVAL_S` (900s), so a wedge is torn down as a generic "no worker
+# progress" at roughly 2100s. a threshold above that never gets to classify anything: the whole
+# point is for the worker to name the failure first.
+#
+# from below: one teacher request can spend 105s x 4 attempts + (2 + 4 + 8)s backoff = 434s while
+# the child waits silently, and opd batches those requests serially. parent activity resets the
+# counter after each completed interaction, which caps healthy teacher-bound silence at one batch
+# (~14 ticks) rather than letting it accumulate across them.
+#
+# 30 min sits between: 4x the healthy peak, and ~35 min of headroom under the provider deadline.
+# ticks are derived from the heartbeat cadence at runtime.
+VERL_CHILD_SILENCE_TIMEOUT_S = 30.0 * 60.0
 _RETRIABLE_VERL_CHILD_SIGNATURES = (
     "cudaErrorDevicesUnavailable",
     "CUDA-capable device(s) is/are busy or unavailable",

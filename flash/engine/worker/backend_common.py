@@ -908,6 +908,7 @@ from flash.engine.worker.verl.diagnostics import (  # noqa: E402,F401
     RAY_FAILURE_LOGS,
     RAY_LOG_TAIL_BYTES,
     STALL_TAIL_LINES,
+    VERL_CHILD_SILENCE_TIMEOUT_S,
     ChildOutputTail,
     ChildTailStaleness,
     VerlChildSilenceWatchdog,
