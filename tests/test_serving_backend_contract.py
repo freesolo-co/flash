@@ -3166,6 +3166,80 @@ def test_a_resident_adapter_whose_id_was_taken_refuses_and_evicts_itself(client,
     )
 
 
+def test_a_failed_reclaim_eviction_keeps_the_resident_adapter_findable(client, engine):
+    """A reclaim that cannot evict must leave the orphan in `_int_ids`.
+
+    Same invariant `_lora_request`'s stale sweep already holds, and the reclaim path contradicted
+    it. If `remove_lora` fails, this adapter is STILL resident under the int id; clearing the index
+    anyway makes it unfindable, and the winner's later load on this replica consults exactly that
+    index, sees nothing to evict, and calls `add_lora` over an id vLLM still has bound -- which
+    fails, or answers from the old weights under the new revision.
+    """
+    module = client.app.state.generated_module
+    int_id = module._lora_int_id(REVISION)
+    collider = "run-other@final." + "b" * 40
+    module.adapter_records[module._lora_id_key(int_id)] = collider
+
+    async def _remove_lora(value):
+        raise RuntimeError("vllm refused to unload")
+
+    instance = engine.__new__(engine)
+    instance._locks = {}
+    instance._loaded = {REVISION: object()}
+    instance._int_ids = {int_id: REVISION}
+    instance.engine = types.SimpleNamespace(remove_lora=_remove_lora)
+
+    result = _run_awaitable_result(
+        engine.register(instance, {**REGISTRATION, "adapter_id": REVISION})
+    )
+
+    assert result["ok"] is False, "a cached adapter whose id another run owns reported ready"
+    assert instance._int_ids.get(int_id) == REVISION, (
+        "a failed eviction cleared the int-id index while the adapter was still resident, so the "
+        "orphan is invisible to the sweep that would evict it before reusing the id"
+    )
+    assert REVISION not in instance._loaded, (
+        "the refused adapter stayed serveable from `_loaded` despite holding no claim"
+    )
+
+
+def test_a_reclaim_does_not_evict_a_lora_the_winner_already_loaded(client, engine):
+    """Eviction must be ownership-scoped, not issued blind after the claim was lost.
+
+    `owner` is read before an await, so the winner can complete its own sweep and `add_lora` in the
+    gap. Evicting on that stale read kicks the rightful holder off the GPU while its record still
+    reads `ready` -- an adapter that silently stops answering, which is worse than the state this
+    path exists to clean up. `_int_ids` naming somebody else is exactly that signal.
+    """
+    module = client.app.state.generated_module
+    int_id = module._lora_int_id(REVISION)
+    winner = "run-winner@final." + "a" * 40
+    module.adapter_records[module._lora_id_key(int_id)] = winner
+
+    removed: list[int] = []
+
+    async def _remove_lora(value):
+        removed.append(value)
+
+    instance = engine.__new__(engine)
+    instance._locks = {}
+    instance._loaded = {REVISION: object()}
+    # The winner already swept and loaded under this int on this same container.
+    instance._int_ids = {int_id: winner}
+    instance.engine = types.SimpleNamespace(remove_lora=_remove_lora)
+
+    result = _run_awaitable_result(
+        engine.register(instance, {**REGISTRATION, "adapter_id": REVISION})
+    )
+
+    assert result["ok"] is False, "the loser of the claim race reported ready"
+    assert removed == [], (
+        "the reclaim evicted a lora the winner had already loaded under this int id, so the "
+        "winner's record reads `ready` while nothing is resident and it silently stops answering"
+    )
+    assert instance._int_ids.get(int_id) == winner, "the winner's index entry was clobbered"
+
+
 def test_a_failed_load_reclaims_its_downloaded_weights(client):
     """A terminally failed revision must not keep its download forever.
 

@@ -218,9 +218,17 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
         if deadline - time.monotonic() <= 0:
             # Completed, but not in time. Not honored, for the same reason the client does not.
             break
-        if response.status_code != 404:
+        if response.status_code >= 500:
+            # TRANSIENT, exactly as the client treats it: `_wait_revision_ready` re-raises only a
+            # `status_code < 500` and lets everything else fall through to another poll. A backend
+            # that answers 503 while its engine container starts is the ordinary scale-to-zero
+            # case, and failing the run on the first one would reject a backend every real deploy
+            # tolerates. The overall deadline still ends the wait.
+            retry_after = response.headers.get("Retry-After")
+        elif response.status_code != 404:
             assert response.status_code == 200, (
-                f"read-back returned {response.status_code}: {response.text[:400]}"
+                f"read-back returned {response.status_code}: {response.text[:400]}. a non-404 4xx "
+                f"is a hard failure for the client too -- it re-raises any status below 500"
             )
             record = _record(response.json())
             last = _lifecycle_state(record)
@@ -421,15 +429,20 @@ def test_a_constrained_registration_serves_a_constrained_completion(
     }
     try:
         _register(http, body)
-        record = _record(http.get(f"/adapters/{body['adapter_id']}").json())
+        # Asserted on the record `_wait_ready` returns, NOT on an immediate read. Registration may
+        # answer 202 before the record is visible, and the client accommodates that -- it polls,
+        # treating 404 as "not registered yet". Reading straight after the POST demands
+        # read-after-write visibility the contract never required, so an asynchronous backend that
+        # `flash models deploy` drives fine would fail here on a legitimate 404.
+        #
+        # Reaching `ready` is itself the assertion for the load-time rejection case: a constraint
+        # the engine will not accept settles the revision `failed`, and `_wait_ready` fails on it.
+        record = _wait_ready(http, body["adapter_id"], ready_timeout)
         assert record.get("structured_outputs") == body["structured_outputs"], (
             f"read-back structured_outputs={record.get('structured_outputs')!r}, registered "
             f"{body['structured_outputs']!r}. The client compares this exactly, so every "
             f"constrained deploy against this backend will be refused as a different artifact."
         )
-        # Reaching `ready` is itself the assertion for the load-time rejection case: a constraint
-        # the engine will not accept settles the revision `failed`, and `_wait_ready` fails on it.
-        _wait_ready(http, body["adapter_id"], ready_timeout)
         assert _activate(http, body["adapter_id"], None).status_code == 200
 
         response = http.post(

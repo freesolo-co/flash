@@ -799,10 +799,35 @@ class Engine:
             if owner == adapter_id:
                 self._int_ids[int_id] = adapter_id
                 return
+            # EVICT FIRST, CLEAR ONLY ON CONFIRMATION -- the same ordering `_lora_request`'s stale
+            # sweep uses, and for the same two reasons.
+            #
+            # Clearing `_int_ids` unconditionally was wrong in the case the entry exists for: if
+            # `remove_lora` fails, adapter A is STILL resident under this int, and with no index
+            # entry nothing can find it again. A later load of the winner B on this replica
+            # consults `_int_ids`, sees nothing to evict, and calls `add_lora` over an id vLLM
+            # still has bound to A -- which either fails or answers from A's weights under B's
+            # revision. Keeping the entry costs one `max_loras` slot on a container that is about
+            # to recycle, and leaves the orphan discoverable by the sweep that knows how to evict
+            # it.
+            #
+            # And the eviction is guarded by ownership rather than issued blind. `owner` was read
+            # before this await, so B can finish its own sweep and `add_lora` in the gap; evicting
+            # then kicks the rightful holder off the GPU while its record still reads `ready`.
+            # `_int_ids` naming somebody else is exactly that signal, so this only removes a LoRA
+            # this container still believes is its own.
+            stale = self._int_ids.get(int_id)
+            evicted = True
+            if stale is None or stale == adapter_id:
+                try:
+                    await self.engine.remove_lora(int_id)
+                except Exception:  # best effort: the raise below is the real report
+                    evicted = False
+                if evicted and self._int_ids.get(int_id) == adapter_id:
+                    self._int_ids.pop(int_id, None)
+            # Dropped from `_loaded` regardless: this container may not serve an adapter it does
+            # not hold the claim for, and `_int_ids` is what keeps a failed eviction findable.
             self._loaded.pop(adapter_id, None)
-            with contextlib.suppress(Exception):  # best effort: the raise below is the real report
-                await self.engine.remove_lora(int_id)
-            self._int_ids.pop(int_id, None)
             raise RuntimeError(
                 f"lora id {{int_id}} is held by {{owner}}, so this container's cached copy of "
                 f"{{adapter_id}} cannot be re-established. redeploy under a different run id."
@@ -1724,8 +1749,20 @@ def api():
             # claim touches no GPU, and routing it through `Engine` would boot the container the
             # warm check just established is not running. `_release_lora_int_id` is already
             # ownership-checked, so releasing a claim another adapter has since taken is a no-op.
+            #
+            # The record is RE-READ first, and the list alone is not enough to justify the release.
+            # `disabled_revisions` was captured under the lock, but `_engine_is_warm` runs after it
+            # and takes an engine round trip -- ample room for a re-registration of the same
+            # revision to be accepted, re-claim the id, and start settling. Releasing on the stale
+            # list then pops the LIVE claim out from under that settle, which reports `ready`
+            # holding nothing: precisely the unclaimed-ready state this release was added to
+            # prevent, reintroduced from the other direction. The check is ownership-scoped by the
+            # record's own status, so only a revision that is still disabled has its claim dropped.
             for revision_id in disabled_revisions:
                 with contextlib.suppress(Exception):  # releasing is best effort, like eviction
+                    current = await adapter_records.get.aio(_record_key(revision_id))
+                    if isinstance(current, dict) and current.get("status") != "disabled":
+                        continue  # revived while we checked warmth; its new claim is not ours
                     await _release_lora_int_id(_lora_int_id(revision_id), revision_id)
         # The deferred reclaims, run whether or not anything is warm. Unlike eviction, this has no
         # cheaper time to happen: undeploy is the last event in the run's life, so skipping here
