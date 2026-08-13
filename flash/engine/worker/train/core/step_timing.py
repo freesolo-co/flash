@@ -357,7 +357,9 @@ def wall_deadline_risk(
     """Report a steady-state projection that will not fit the run's remaining wall allowance.
 
     None when it fits, or when either side is unmeasurable: this warning exists to be acted on, so a
-    guess would spend the user's attention on a number that never justified it.
+    guess would spend the user's attention on a number that never justified it. An allowance of zero
+    is measured, not unmeasurable -- the deadline has simply elapsed -- and is the one case where
+    this fires hardest.
 
     Both sides are measured against the SAME clock -- what remains to be trained versus what remains
     to be spent -- so the comparison stays valid on a resumed run, where absolute step counts and
@@ -368,7 +370,14 @@ def wall_deadline_risk(
     )
     if projected is None:
         return None
-    if remaining_wall_seconds is None or remaining_wall_seconds <= 0:
+    if remaining_wall_seconds is None:
+        return None
+    # only None is unmeasurable. `_remaining_worker_wall_seconds` CLAMPS an elapsed deadline to 0.0,
+    # so a zero allowance is a measurement -- the strongest one this warning can make -- and dropping
+    # it silenced the row at exactly the moment the work definitively cannot fit: it fired at 1s
+    # remaining and went quiet at 0s. a negative value cannot come from the clamp, so it can only be
+    # a caller passing something this function has no basis to reason about.
+    if remaining_wall_seconds < 0:
         return None
     if projected <= remaining_wall_seconds * _WALL_RISK_FRACTION:
         return None

@@ -94,6 +94,64 @@ def test_a_step_that_cannot_finish_in_the_wall_allowance_warns():
     assert fields["projected_remaining_s"] / 3600 > 24
 
 
+def test_an_elapsed_deadline_still_warns_rather_than_going_quiet():
+    """A zero allowance is measured, not unmeasurable, and is the strongest case this warning has.
+
+    ``_remaining_worker_wall_seconds`` clamps an elapsed deadline to 0.0, so treating <= 0 as
+    "unknown" silenced the row at exactly the moment the work definitively cannot fit: it fired at
+    1s remaining and went quiet at 0s, with hours of projected work still to run.
+    """
+    clock = step_timing.StepClock()
+    clock.record(0.0)
+    clock.record(600.0)
+
+    elapsed = step_timing.step_timing_fields(
+        clock, current_step=1, total_steps=_HORIZON, remaining_wall_seconds=0.0
+    )
+    assert elapsed["wall_deadline_at_risk"] is True
+    assert elapsed["remaining_wall_s"] == 0.0
+    assert elapsed["projected_remaining_s"] > 0
+
+    # one second earlier must not be the only moment it warns.
+    nearly = step_timing.step_timing_fields(
+        clock, current_step=1, total_steps=_HORIZON, remaining_wall_seconds=1.0
+    )
+    assert nearly["wall_deadline_at_risk"] is True
+
+
+def test_a_negative_allowance_is_not_a_measurement():
+    """The clamp cannot produce one, so it can only be a caller with nothing meaningful to say."""
+    clock = step_timing.StepClock()
+    clock.record(0.0)
+    clock.record(600.0)
+
+    fields = step_timing.step_timing_fields(
+        clock, current_step=1, total_steps=_HORIZON, remaining_wall_seconds=-5.0
+    )
+    assert fields["step_duration_s"] == 600.0
+    assert "wall_deadline_at_risk" not in fields
+    assert "remaining_wall_s" not in fields
+
+
+def test_the_panel_omits_a_zero_wall_instead_of_naming_it():
+    """The row must not read "against 0s of wall time left" -- it drops the clause and warns anyway."""
+    pairs = dict(
+        step_timing_pairs(
+            {
+                "step_duration_s": 92.0,
+                "projected_remaining_s": 16376.0,
+                "remaining_wall_s": 0.0,
+                "wall_deadline_at_risk": True,
+            },
+            running=True,
+        )
+    )
+
+    assert "0s of wall time left" not in pairs["wall limit"]
+    # a zero allowance can never "only just fit", so it takes the cutoff wording.
+    assert "expected to be cut off" in pairs["wall limit"]
+
+
 def test_the_warning_needs_both_sides_measured():
     """A run with no configured deadline still reports its pace, and never guesses at a risk."""
     clock = step_timing.StepClock()
