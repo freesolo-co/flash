@@ -775,21 +775,73 @@ def test_queued_line_never_quotes_a_grace_that_outlasts_a_shorter_running_one():
     # the capacity timer keeps counting underneath it. Neither can win by fixed priority. A job 800s
     # into a 900s capacity grace that then reports unhealthy has 100s left, not the 240s a naive
     # "unhealthy always wins" rule would promise -- the same false remaining-time, inverted.
-    from flash.providers.runpod.jobs import queue_wait_note
-
-    late = queue_wait_note(
-        True, None, 0.0, 800.0, unhealthy_grace_s=240.0, queue_grace_s=900.0, on_last_gpu=True
-    )
+    late = _note(800.0, unhealthy=True)
     assert "capacity grace" in late, late
     assert "of 900s" in late, late
     assert "unhealthy" not in late, late
 
     # and the converse still holds: once unhealthy is the nearer deadline, it is the one reported.
-    early = queue_wait_note(
-        True, 100.0, 0.0, 200.0, unhealthy_grace_s=240.0, queue_grace_s=900.0, on_last_gpu=True
-    )
+    early = _note(200.0, unhealthy=True, unhealthy_since=100.0)
     assert "unhealthy grace" in early, early
     assert "capacity" not in early, early
+
+
+def _note(now, **kw):
+    """queue_wait_note with production-shaped defaults; override one deadline per assertion."""
+    from flash.providers.runpod.jobs import queue_wait_note
+
+    return queue_wait_note(
+        now,
+        **{
+            "unhealthy": False,
+            "unhealthy_since": None,
+            "unhealthy_grace_s": 240.0,
+            "throttled": False,
+            "throttled_since": None,
+            "throttled_grace_s": 900.0,
+            "queued_since": 0.0,
+            "queue_grace_s": 900.0,
+            "on_last_gpu": True,
+            "absolute_deadline": None,
+            **kw,
+        },
+    )
+
+
+def test_queued_line_reports_a_throttled_grace_shorter_than_the_capacity_one():
+    # poll_job takes throttled_grace_s as its OWN argument -- the two are not locked together, and
+    # test_poll_job_fast_fails_on_stuck_throttled_worker exercises 300s throttled against 100000s
+    # queue. Quoting capacity there would promise ~28 hours immediately before a 300s fast-fail.
+    binding = _note(
+        60.0, throttled=True, throttled_since=0.0, throttled_grace_s=300.0, queue_grace_s=100_000.0
+    )
+    assert "throttled grace" in binding, binding
+    assert "of 300s" in binding, binding
+    assert "capacity" not in binding, binding
+
+    # when the throttled grace is the LONGER one (the stall_kwargs default pairs them equal, and a
+    # throttled timer can only arm later), the capacity timer still binds and is what gets quoted.
+    not_binding = _note(400.0, throttled=True, throttled_since=390.0, throttled_grace_s=900.0)
+    assert "capacity grace" in not_binding, not_binding
+
+
+def test_queued_line_reports_the_run_wall_deadline_when_it_is_the_nearest():
+    # On a late retry or reattachment the run-global wall clock can be nearer than any grace:
+    # poll_job checks it before every status read and returns `stalled`. Quoting a 900s capacity
+    # grace to an attempt with 30s of run left is the same false remaining-time.
+    wall = _note(0.0, absolute_deadline=30.0)
+    assert "30s left of the run wall deadline" in wall, wall
+    assert "capacity" not in wall, wall
+
+    # a distant wall deadline must not displace the grace that will actually fire first.
+    grace = _note(800.0, absolute_deadline=100_000.0)
+    assert "capacity grace" in grace, grace
+    assert "wall" not in grace, grace
+
+    # never a negative countdown: poll_job returns `stalled` on the next read, and "-5s left"
+    # would read as a bug rather than as the deadline having passed.
+    passed = _note(100.0, absolute_deadline=95.0)
+    assert "0s left of the run wall deadline" in passed, passed
 
 
 def test_queued_line_omits_a_capacity_countdown_while_a_worker_is_coming_up(monkeypatch):

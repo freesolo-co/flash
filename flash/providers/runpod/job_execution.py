@@ -502,13 +502,17 @@ def _classify_queue_state(
             budget = ""
             if not (usable or recovering):
                 note = _jobs.queue_wait_note(
-                    bool(workers.get("unhealthy")),
-                    state.unhealthy_timer.since,
-                    state.queued_timer.since,
                     now,
-                    context.unhealthy_grace_s,
-                    context.queue_grace_s,
-                    context.on_last_gpu,
+                    unhealthy=bool(workers.get("unhealthy")),
+                    unhealthy_since=state.unhealthy_timer.since,
+                    unhealthy_grace_s=context.unhealthy_grace_s,
+                    throttled=bool(workers.get("throttled")),
+                    throttled_since=state.throttled_timer.since,
+                    throttled_grace_s=context.throttled_grace_s,
+                    queued_since=state.queued_timer.since,
+                    queue_grace_s=context.queue_grace_s,
+                    on_last_gpu=context.on_last_gpu,
+                    absolute_deadline=context.absolute_deadline,
                 )
                 budget = f"; {note}" if note else ""
             context.say(f"queued; workers: {workers}{budget}")

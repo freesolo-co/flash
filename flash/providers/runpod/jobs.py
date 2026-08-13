@@ -311,13 +311,18 @@ def capacity_escalation_note(on_last_gpu: bool) -> str:
 
 
 def queue_wait_note(
+    now: float,
+    *,
     unhealthy: bool,
     unhealthy_since: float | None,
-    queued_since: float | None,
-    now: float,
     unhealthy_grace_s: float,
+    throttled: bool,
+    throttled_since: float | None,
+    throttled_grace_s: float,
+    queued_since: float | None,
     queue_grace_s: float,
     on_last_gpu: bool,
+    absolute_deadline: float | None,
 ) -> str:
     """The budget clause on a "still queued" line: how long we have waited of how long we will.
 
@@ -326,22 +331,25 @@ def queue_wait_note(
     throwing away queue position.
 
     Report the deadline that will actually FIRE, which means the one with the LEAST TIME LEFT.
-    Several graces govern a queued job, they differ in length, and they run concurrently: an
-    unhealthy worker is neither usable nor initializing, so the capacity timer keeps counting
-    underneath it. Neither timer can be given fixed priority. Quoting the unhealthy grace (240s,
-    which stall_kwargs never widens) on a job already 800s into a 900s capacity grace would promise
-    240s when 100s remain -- the same false remaining-time this note exists to prevent, inverted.
-
-    The throttled timer is not a candidate: stall_kwargs gives it the same grace as the capacity
-    timer, and it can only arm later, so the capacity timer always binds first.
+    Four independent deadlines can end a queued wait -- the capacity, unhealthy and throttled
+    graces, and the run's absolute wall deadline -- they run CONCURRENTLY, and poll_job takes each
+    grace as its own argument, so none may be given fixed priority. Any of the shorter ones can
+    expire first: an unhealthy worker is neither usable nor initializing, so the capacity timer
+    keeps counting underneath it, and quoting a 240s unhealthy grace on a job already 800s into a
+    900s capacity grace would promise 240s when 100s remain. Whichever is nearest is the honest
+    number, because that is the one the operator will actually hit.
 
     Returns "" when nothing is counting down yet, so the caller prints the bare queued line.
     """
+    # (remaining, waited, budget, label, clause). a not-yet-armed timer has charged no time: this
+    # poll is the one that arms it, and the arming happens after this line is printed.
     candidates = []
     if unhealthy:
-        # not yet armed -> this poll is the one that arms it, so no time has been charged.
         waited = 0.0 if unhealthy_since is None else now - unhealthy_since
         candidates.append((unhealthy_grace_s - waited, waited, unhealthy_grace_s, "unhealthy", ""))
+    if throttled:
+        waited = 0.0 if throttled_since is None else now - throttled_since
+        candidates.append((throttled_grace_s - waited, waited, throttled_grace_s, "throttled", ""))
     if queued_since is not None:
         waited = now - queued_since
         # the escalation fact ONLY, like `capacity_escalation_note`: on_last_gpu is also true when
@@ -353,9 +361,16 @@ def queue_wait_note(
             else ""
         )
         candidates.append((queue_grace_s - waited, waited, queue_grace_s, "capacity", clause))
+    if absolute_deadline is not None:
+        # the run-global wall clock, which poll_job checks before every status read. on a late
+        # retry or reattachment it can be shorter than any grace, and it is not a grace at all --
+        # nothing "arms" it -- so it is reported as the remaining budget rather than time served.
+        candidates.append((absolute_deadline - now, 0.0, absolute_deadline - now, "run wall", ""))
     if not candidates:
         return ""
     _, waited, grace, label, clause = min(candidates, key=lambda c: c[0])
+    if label == "run wall":
+        return f"{int(max(grace, 0.0))}s left of the run wall deadline"
     # never quote more elapsed than the budget: this line is printed before the timer is checked,
     # so the poll that fails would otherwise read "waited 360s of 240s". at the cap it says what
     # the operator needs -- the budget is spent -- and the failure detail carries the exact figure.
