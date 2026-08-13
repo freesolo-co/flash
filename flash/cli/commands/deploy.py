@@ -398,11 +398,10 @@ def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
             continue
         entity = scope.get("entity") or {}
         entity_name = str(entity.get("name") or entity.get("id") or "")
-        entity_type = str(entity.get("type") or "").lower()
-        if (
-            entity_name.casefold() in {owner.casefold(), repository.casefold()}
-            or entity_type == "user"
-        ):
+        # only a scope naming the destination counts. crediting every user-typed scope would accept
+        # a token whose write grant covers some unrelated repo of its own, which is the silent
+        # wrong-namespace export this preflight exists to stop.
+        if entity_name.casefold() in {owner.casefold(), repository.casefold()}:
             permissions.update(scope.get("permissions") or ())
     if not ({"repo.write", "repo.content.write"} & permissions):
         raise ClientError(

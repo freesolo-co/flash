@@ -2590,6 +2590,109 @@ def test_export_rejects_unwritable_namespace_before_control_plane(
     assert not any(call[0] == "export" for call in fake_client.calls)
 
 
+def test_export_rejects_fine_grained_scope_for_a_different_namespace(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A write scope on the token's own repo says nothing about the org it is exporting into.
+
+    alice can write in `acme` by org role, so the namespace gate passes, but her only fine-grained
+    grant covers `alice/*`. Crediting it because it is user-typed would wave through exactly the
+    wrong-namespace export this preflight exists to stop.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "write"}],
+                "auth": {
+                    "accessToken": {
+                        "role": "fineGrained",
+                        "fineGrained": {
+                            "global": [],
+                            "scoped": [
+                                {
+                                    "entity": {"name": "alice", "type": "user"},
+                                    "permissions": ["repo.write"],
+                                }
+                            ],
+                        },
+                    }
+                },
+            }
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/secret-model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "acme/secret-model" in err
+    assert "hf_secret" not in err
+    assert not any(call[0] == "export" for call in fake_client.calls)
+
+
+def test_export_accepts_fine_grained_scope_naming_the_destination(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """The same shape, scoped to the destination org, is the case that must still export."""
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "write"}],
+                "auth": {
+                    "accessToken": {
+                        "role": "fineGrained",
+                        "fineGrained": {
+                            "global": [],
+                            "scoped": [
+                                {
+                                    "entity": {"name": "acme", "type": "org"},
+                                    "permissions": ["repo.write"],
+                                }
+                            ],
+                        },
+                    }
+                },
+            }
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/secret-model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 0
+    )
+    assert any(call[0] == "export" for call in fake_client.calls)
+    assert "hf_secret" not in capsys.readouterr().err
+
+
 def test_export_matching_namespace_proceeds_after_preflight(
     fake_client, monkeypatch, capsys
 ) -> None:
