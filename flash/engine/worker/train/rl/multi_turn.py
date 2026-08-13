@@ -10,6 +10,7 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -67,6 +68,7 @@ class MultiTurnBridge:
         max_turns: int,
         per_turn_credit: bool = False,
         on_episode_scored: Callable[[object, object, float], None] | None = None,
+        grading: Callable[[], contextlib.AbstractContextManager] | None = None,
         score_batch_size: int = _MULTI_TURN_SCORE_BATCH_SIZE,
         score_flush_wait_s: float = _MULTI_TURN_SCORE_FLUSH_WAIT_S,
         session_lease_s: float = _MULTI_TURN_SESSION_LEASE_S,
@@ -79,6 +81,8 @@ class MultiTurnBridge:
         self._max_turns = int(max_turns)
         self._per_turn_credit = bool(per_turn_credit)
         self._on_episode_scored = on_episode_scored
+        # defaults to a no-op so every non-training caller (tests, profiling) works unwired.
+        self._grading = grading if grading is not None else contextlib.nullcontext
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every stateful episode touch below happens under this lock.
         self._lock = threading.Lock()
@@ -210,8 +214,11 @@ class MultiTurnBridge:
 
         takes the same lock every other env touch takes, so scoring never overlaps a concurrent
         episode's ``env_reply``. the win is that one lock acquisition now covers a whole batch.
+
+        ``grading`` spans the call for the silence watchdog: episodes are recorded only after the
+        whole batch returns, so nothing else marks the parent alive while a slow judge runs.
         """
-        with self._lock:
+        with self._grading(), self._lock:
             return score_rollouts(self._env, requests)
 
     def score(self, payload: dict) -> dict:

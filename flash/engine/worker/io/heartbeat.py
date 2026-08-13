@@ -318,6 +318,12 @@ class RewardObservabilityBuffer:
         # across ticks to tell a child blocked on parent-side reward scoring -- a slow user scorer
         # or a judge api -- from a child that has actually wedged.
         self._scored_ever = 0
+        # batched scoring calls currently inside the user's env. `_scored_ever` cannot see in there:
+        # single-turn coalesces up to 64 requests into ONE `scores_breakdown_many` that returns
+        # everything at once, so a judge slower than the silence threshold leaves every
+        # completion-side counter flat for the whole batch and the run is torn down mid-grade. a
+        # depth is the only signal that exists before the call finishes.
+        self._grading_depth = 0
         # generations the count has already sealed, oldest first, each waiting for the step line
         # that names it. a QUEUE rather than a flag: stdout can fall a whole generation behind, and
         # a flag would let the second seal overwrite the first, dropping a generation and
@@ -473,6 +479,31 @@ class RewardObservabilityBuffer:
             if self._published and self._published_step == int(step):
                 return self._published[-1]
             return None
+
+    @contextlib.contextmanager
+    def grading(self):
+        """mark the parent as grading for the duration of one batched scoring call.
+
+        wraps the env call itself, so the silence watchdog sees the batch START rather than only its
+        completions. that is what makes a judge slower than the silence threshold survive: inside one
+        `scores_breakdown_many` there is no completion to count until every item is done.
+        """
+        with self._lock:
+            self._grading_depth += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._grading_depth -= 1
+
+    def reward_grading_in_flight(self) -> bool:
+        """is the parent inside a batched scoring call right now?
+
+        depth rather than a flag: batches overlap across reward-server threads, and a flag cleared by
+        the first to finish would report idle while the rest are still grading.
+        """
+        with self._lock:
+            return self._grading_depth > 0
 
     def reward_activity_count(self) -> int:
         """completions scored since this buffer was created, monotonic across generations."""

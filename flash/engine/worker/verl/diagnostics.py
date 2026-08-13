@@ -245,10 +245,14 @@ class VerlChildSilenceWatchdog:
         tick_s: float,
         baseline_step: int = 0,
         parent_activity: Callable[[], int] | None = None,
+        parent_busy: Callable[[], bool] | None = None,
     ) -> None:
         self._tail = tail
         self._staleness = ChildTailStaleness()
         self._parent_activity = parent_activity
+        # "the parent is inside a unit of work right now", as opposed to "it finished another one".
+        # a long enough single call makes the count alone useless, so both are consulted.
+        self._parent_busy = parent_busy
         self._parent_activity_count: int | None = None
         self._silent_tick_limit = max(1, math.ceil(VERL_CHILD_SILENCE_TIMEOUT_S / tick_s))
         self._silence_seconds = self._silent_tick_limit * tick_s
@@ -292,6 +296,15 @@ class VerlChildSilenceWatchdog:
                         and count != self._parent_activity_count
                     )
                     self._parent_activity_count = count
+            if not parent_active and self._parent_busy is not None:
+                # a counter only moves BETWEEN units of parent work. one batched scoring call can
+                # outlast the whole silence budget on its own -- grpo coalesces up to 64 completions
+                # into a single env call -- so progress alone cannot keep a healthy run alive.
+                # "currently inside that call" is the missing edge, and it is a predicate, not a count.
+                # suppressed like the count probe above: a failing optional probe must not disarm the
+                # watchdog, and must not cost the child-silence sample either.
+                with contextlib.suppress(Exception):
+                    parent_active = bool(self._parent_busy())
             silent_ticks = self._staleness.observe(self._tail.written, active=parent_active)
             # "this child has completed a step", not "step is positive": measured against the
             # baseline it started from, so a resume gets the same setup exemption a fresh run gets.

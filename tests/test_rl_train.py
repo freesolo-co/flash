@@ -5148,7 +5148,7 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
         "# index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order. "
         'env_prompts=[p["env_prompt"] for p in prompts], max_turns=int(inp["max_turns"]), '
         'per_turn_credit=bool(inp["per_turn_credit"]), '
-        "on_episode_scored=observability.record, )" in src
+        "on_episode_scored=observability.record, grading=observability.grading, )" in src
     )
     assert 'if inp["multi_turn"] else None' in src
 
@@ -5865,10 +5865,13 @@ def test_grpo_hands_the_silence_watchdog_its_parent_side_reward_counter():
     """
     src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
 
-    assert (
-        "_StepMetricState(reward_activity=reward_runtime.observability.reward_activity_count)"
-        in (src)
-    )
+    assert "_StepMetricState.for_reward_runtime(reward_runtime)" in src
+
+    # the factory binds BOTH parent-side probes. asserting on the call site alone would not notice
+    # one of them going missing, and either one alone leaves a blind spot the other covers.
+    factory = " ".join(inspect.getsource(rl_train._StepMetricState.for_reward_runtime).split())
+    assert "reward_activity=reward_runtime.observability.reward_activity_count" in factory
+    assert "reward_busy=reward_runtime.observability.reward_grading_in_flight" in factory
 
     # and the field is not merely stored: it reaches the watchdog that consumes it.
     scored = [0]
@@ -5887,6 +5890,38 @@ def test_grpo_hands_the_silence_watchdog_its_parent_side_reward_counter():
         state.silence_watchdog.observe(2)
 
     assert torn_down == [], "grpo's parent-side grading did not reach the silence watchdog"
+
+
+def test_one_grading_call_longer_than_the_silence_budget_is_not_a_wedge():
+    """The counter only moves BETWEEN units of parent work, and single-turn coalesces up to 64
+    completions into ONE `scores_breakdown_many`. Nothing is recorded until that call returns, so a
+    judge slower than the silence budget leaves `_scored_ever` flat for the entire batch and the run
+    is torn down mid-grade -- the same mid-batch blind spot the OPD `on_scored` path closed.
+    """
+    from flash.engine.worker.verl import diagnostics as vc
+
+    buffer = RewardObservabilityBuffer()
+    state = rl_train._StepMetricState(
+        reward_activity=buffer.reward_activity_count,
+        reward_busy=buffer.reward_grading_in_flight,
+    )
+    state.child_tail.record("step: 1\n")
+    torn_down = []
+    state.silence_watchdog.bind_process(
+        teardown=lambda: torn_down.append(True), is_running=lambda: True
+    )
+
+    ticks = int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0)
+    with buffer.grading():
+        # one batch, three times the whole budget, recording nothing until it returns.
+        for _ in range(ticks * 3):
+            state.silence_watchdog.observe(2)
+        assert torn_down == [], "a run inside a single long grading call was torn down"
+
+    # once the call returns the exemption ends: a child that stays silent after it is still a wedge.
+    for _ in range(ticks + 1):
+        state.silence_watchdog.observe(2)
+    assert torn_down == [True], "the busy gate kept the watchdog disarmed after grading finished"
 
 
 def test_a_preview_before_the_first_boundary_still_shows_a_rollout():
