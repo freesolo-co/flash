@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import http.client
 import importlib.metadata
@@ -5920,6 +5921,100 @@ def test_remote_distillation_config_declares_every_field_post_init_assigns():
         f"__post_init__ assigns {sorted(undeclared)} but they are not in _mutable_fields; "
         "verl will raise FrozenInstanceError at worker startup"
     )
+
+
+def test_multi_turn_rollout_marks_its_prompt_failed_before_hard_exiting(monkeypatch):
+    """A dying rollout must clear its own "running" marker, or the trainer waits on it forever.
+
+    The loop runs in a ray actor, so `os._exit` kills that actor alone: the driver's dispatch was
+    fire-and-forget and ray reports nothing back, leaving verl's `_run_prompt` handler -- the only
+    writer of "failure" -- unreached.
+    """
+    from flash.engine.worker.train.opd.child import multiturn as opd_multiturn
+
+    class ChildExit(Exception):
+        def __init__(self, code):
+            self.code = code
+
+    class _Base:
+        def __init__(self):
+            pass
+
+    registered = {}
+    marked = []
+
+    async def fake_mark(kwargs):
+        marked.append(dict(kwargs))
+
+    loop_cls = opd_multiturn.build_flash_multi_turn_agent_loop(
+        register=lambda name: lambda cls: registered.setdefault(name, cls) or cls,
+        agent_loop_base=_Base,
+        agent_loop_output=object,
+        post_json=lambda *a, **k: {},
+        score_failure_handler=lambda error: None,
+        deterministic_seed=lambda *a, **k: 0,
+        process_exit=lambda code: (_ for _ in ()).throw(ChildExit(code)),
+        mark_prompt_failed=fake_mark,
+    )
+
+    loop = loop_cls()
+
+    async def boom(sampling_params, **kwargs):
+        raise RuntimeError("teacher is gone")
+
+    loop._run = boom
+
+    with pytest.raises(ChildExit) as exit_info:
+        asyncio.run(loop.run({}, uid="prompt-7"))
+
+    assert exit_info.value.code == 86
+    # the marker must be written BEFORE the exit, not merely attempted at some point
+    assert marked == [{"uid": "prompt-7"}], (
+        "the rollout hard-exited without marking its prompt failed; the trainer's "
+        "ReplayBuffer.sample would poll a 'running' marker nobody will ever clear"
+    )
+
+
+def test_replay_buffer_refuses_to_train_on_a_batch_a_failed_rollout_shrank():
+    """Clearing the marker unblocks the trainer; it must not silently train on what survived.
+
+    verl's `sample` returns only the "success" keys, and `_balance_batch` pads a short batch back
+    to a divisible size -- so without this guard a dead rollout downgrades from a visible hang to
+    an invisible partial-batch train.
+    """
+    from flash.engine.worker.train.opd.child.multiturn import build_flash_replay_buffer
+
+    class _StubReplayBuffer:
+        def __init__(self):
+            self.partitions = {"train": {}}
+            self.lock = threading.Lock()
+
+        def close(self):
+            pass
+
+        def sample(self, partition_id, global_steps=None, batch_size=None):
+            return SimpleNamespace(
+                keys=[
+                    key
+                    for key, tag in self.partitions[partition_id].items()
+                    if tag["status"] == "success"
+                ],
+                partition_id=partition_id,
+            )
+
+    buffer = build_flash_replay_buffer(_StubReplayBuffer)()
+    buffer.partitions["train"] = {
+        "prompt-a": {"global_steps": 3, "status": "success"},
+        "prompt-b": {"global_steps": 3, "status": "failure"},
+    }
+
+    with pytest.raises(RuntimeError, match="rollout failed for 1 prompt"):
+        buffer.sample("train", global_steps=3)
+
+    # a step whose rollouts all succeeded is untouched, and a failure recorded for a DIFFERENT
+    # step must not fail this one
+    buffer.partitions["train"]["prompt-b"] = {"global_steps": 99, "status": "failure"}
+    assert buffer.sample("train", global_steps=3).keys == ["prompt-a"]
 
 
 def test_agent_loops_are_registered_under_an_importable_qualname():

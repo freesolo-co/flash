@@ -35,6 +35,7 @@ except ImportError:  # in-tree (parent process, tests, lint)
 __all__ = [
     "EnvGlueTokenizer",
     "build_flash_multi_turn_agent_loop",
+    "build_flash_replay_buffer",
     "dedup_seam_terminator",
     "normalize_token_ids",
     "prepare_assistant_turn",
@@ -383,6 +384,80 @@ async def _opd_run_turns(
         prefix_ids.extend(glue_ids)
 
 
+async def _mark_prompt_failed(kwargs: dict[str, Any]) -> None:
+    """Record this prompt as failed in the transfer queue before the actor hard-exits.
+
+    verl marks every prompt "running" on dispatch (`AgentLoopManagerTQ.generate_sequences`) and
+    rewrites it in exactly two places: "finished" when the rollout returns, "failure" when
+    `_run_prompt` catches. A hard exit reaches neither, and the trainer's `ReplayBuffer.sample`
+    waits on "running" forever. Writing the tag here restores the failure edge the exit destroys.
+
+    The key is the prompt `uid`, which verl forwards into the loop's kwargs alongside the prompt
+    itself. The partition is always "train": verl decides it from `trajectory["validate"]`, which
+    `_run_agent_loop` consumes without forwarding, and flash's OPD overrides pin
+    `trainer.val_before_train=false` and `trainer.test_freq=-1`, so an OPD run dispatches no
+    validation rollout to mark. Reading a "validate" key off these kwargs would be dead code --
+    the dispatcher pops it from the batch before building the per-prompt payload.
+
+    This runs on the way to a hard exit and must not raise: the exit code is the run's diagnosis,
+    and an exception here would replace it with a bare actor traceback while leaving the marker
+    exactly as stuck as before.
+    """
+    try:
+        try:
+            import transfer_queue as tq
+        except ImportError:
+            from verl.utils.transferqueue_utils import tq
+
+        await tq.async_kv_put(
+            key=kwargs["uid"],
+            partition_id="train",
+            tag={"status": "failure"},
+        )
+    except Exception:  # pragma: no cover - defensive, the exit code is the real diagnosis
+        pass
+
+
+def build_flash_replay_buffer(ReplayBuffer):
+    """A replay buffer that fails the step when a rollout marked its prompt failed.
+
+    The other half of the fix above. Clearing the marker wakes the trainer, but verl's `sample`
+    returns only the "success" keys, so a dead rollout does not stop the step -- it silently
+    shrinks the batch, and `_balance_batch` pads it back to a divisible size. Without this guard
+    the wedge merely downgrades from a visible hang to an invisible partial-batch train, which is
+    worse: a hang is at least diagnosable, while a padded short batch publishes a model trained on
+    data the run never collected.
+
+    Raising reaches the parent as a nonzero child exit, the only channel that carries a rollout
+    failure out of the verl child -- the rollout dies in a ray actor whose exit code ray never
+    reports to the driver.
+    """
+
+    class FlashReplayBuffer(ReplayBuffer):
+        def sample(
+            self,
+            partition_id: str,
+            global_steps: int | None = None,
+            batch_size: int | None = None,
+        ):
+            batch = super().sample(partition_id, global_steps=global_steps, batch_size=batch_size)
+            with self.lock:
+                failed = sorted(
+                    key
+                    for key, tag in self.partitions[partition_id].items()
+                    if tag.get("global_steps") == global_steps and tag.get("status") == "failure"
+                )
+            if failed:
+                raise RuntimeError(
+                    f"flash OPD rollout failed for {len(failed)} prompt(s) at step "
+                    f"{global_steps} (first: {failed[0]}); refusing to train on the "
+                    f"{len(batch.keys)} rollout(s) that did survive"
+                )
+            return batch
+
+    return FlashReplayBuffer
+
+
 def build_flash_multi_turn_agent_loop(
     *,
     register,
@@ -394,9 +469,11 @@ def build_flash_multi_turn_agent_loop(
     permanent_teacher_exit: int = 86,
     transient_teacher_exit: int = 87,
     process_exit=None,
+    mark_prompt_failed=None,
 ):
     """build and register the child loop without importing verl in the parent interpreter."""
     exit_process = process_exit or os._exit
+    mark_failed = mark_prompt_failed or _mark_prompt_failed
 
     class FlashMultiTurnAgentLoop(agent_loop_base):
         async def run(self, sampling_params: dict[str, Any], **kwargs):
@@ -408,6 +485,14 @@ def build_flash_multi_turn_agent_loop(
                     if getattr(error, "classification", None) == "transient"
                     else permanent_teacher_exit
                 )
+                # this loop runs inside a ray AgentLoopWorkerTQ ACTOR, not the driver, so the exit
+                # code below never reaches flash: the driver's `generate_sequences` already returned
+                # (its tasks are fire-and-forget) and ray reports nothing to the trainer. verl's
+                # `_run_prompt` handler is the only writer that turns this prompt's "running" marker
+                # into "failure", and `os._exit` skips it, so `ReplayBuffer.sample` -- an unbounded
+                # `while True` with no deadline or actor-health check -- polls a marker nobody will
+                # ever clear. mark the prompt BEFORE exiting so the trainer wakes and fails.
+                await mark_failed(kwargs)
                 exit_process(exit_code)
                 raise AssertionError("multi-turn OPD process exit returned unexpectedly") from error
 
