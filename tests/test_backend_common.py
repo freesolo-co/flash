@@ -2004,18 +2004,15 @@ def _bound_silence_watchdog(tail, *, tick_s=30.0, baseline_step=0, parent_activi
 def test_verl_child_silence_timeout_stays_under_the_provider_stall_deadline():
     """The worker only gets to CLASSIFY a wedge if it fires before the provider kills the run.
 
-    Once a step is reported the poller switches to its training limit, and worker heartbeats are
-    throttled, so a wedged run is torn down as a generic "no worker progress" at roughly the sum of
-    the two. A silence timeout above that never names anything -- which is this watchdog's entire
-    purpose -- so the relationship is pinned rather than left to a comment.
+    The deadline is `stall_after_s` ALONE, and it is the value production passes, not the default in
+    `poll_until_complete`'s signature -- no caller uses that default. The heartbeat throttle window
+    does not extend it either: `surface_heartbeat` returns stage None for a liveness ping and never
+    advances the stall key, so the clock runs from the last real heartbeat. A silence timeout above
+    that never names anything, which is this watchdog's entire purpose.
     """
-    from flash.engine.worker import _HB_MIN_INTERVAL_S
+    from flash.providers.runpod.jobs import stall_kwargs
 
-    # read off the source rather than imported: importing the provider module from here is circular
-    # at collection time, and the default in its signature is the value the poller actually runs.
-    source = pathlib.Path("flash/providers/runpod/job_execution.py").read_text()
-    stall_after_s = float(re.search(r"stall_after_s: float = ([0-9.]+)", source).group(1))
-    provider_deadline = _HB_MIN_INTERVAL_S + stall_after_s
+    provider_deadline = float(stall_kwargs()["stall_after_s"])
     assert provider_deadline > vc.VERL_CHILD_SILENCE_TIMEOUT_S
 
     # and it must still clear the longest LEGITIMATE silence: one teacher request that exhausts its
