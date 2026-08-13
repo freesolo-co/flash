@@ -1177,8 +1177,10 @@ matching `step_episode` call — an environment that appends one reward per `ste
 comes up exactly one short on precisely the episodes that hit the cap. Count the assistant
 entries in `episode.turns`, not the number of steps you took and not the assistant messages
 in `episode.messages` (those include any few-shot demo the prompt carried in). If your
-`step_episode` returns assistant-role observations, they land in `episode.turns` too, so match
-your actions there the same way you match them on replay rather than counting by role alone.
+`step_episode` returns assistant-role observations, they land in `episode.turns` too and inflate
+this count, so tell them apart by something you control rather than by whether the turn parses:
+a malformed sampled turn still needs its own finite reward, and dropping it produces exactly the
+too-few case above.
 
 **Do not verify this by the absence of a warning** — a missing key produces no output at
 all. There are three distinct silent-fallback layers on this path, two of which emit
