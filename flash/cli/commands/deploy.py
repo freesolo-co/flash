@@ -230,6 +230,23 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
     if str(current.get("state") or "") not in _DEPLOYMENT_READY_STATES and not unknown_activation:
         # nothing is being served off the alias yet, so nothing is lost by moving it.
         return None
+    cli = _commands().CLI_NAME
+    tail = (
+        f"so every client using bare `{base_run_id}` changes model. address a specific "
+        f"checkpoint with `{cli} models chat {base_run_id}/step-N` to compare them."
+    )
+    if unknown_activation:
+        # this record's `checkpoint_step` names the INCOMING attempt, not what the alias holds:
+        # the plane resolves the live target from `adapter_alias_target` / `previous_deployment`,
+        # and both are server-side (`public_deployment` strips the predecessor). naming a
+        # checkpoint here would report the wrong one -- worse than naming none -- so say only what
+        # this side can actually stand behind.
+        return (
+            f"{base_run_id} has a deployment whose activation never settled, so the checkpoint "
+            f"it currently serves cannot be determined from here; deploying "
+            f"{_served_step_label(requested_step)} may move that shared model id, "
+            f"{tail} run `{cli} models deployments` to see the current state first."
+        )
     raw_step = current.get("checkpoint_step")
     try:
         served_step = None if raw_step is None else int(raw_step)
@@ -243,15 +260,10 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
         return None
     if served_step == requested_step:
         return None
-    cli = _commands().CLI_NAME
-    # an unsettled activation is not a claim about what is live: say "may serve", or the line
-    # asserts a checkpoint the plane itself has not confirmed.
-    serves = "may currently serve" if unknown_activation else "currently serves"
     return (
-        f"{base_run_id} {serves} {_served_step_label(served_step)}; deploying "
+        f"{base_run_id} currently serves {_served_step_label(served_step)}; deploying "
         f"{_served_step_label(requested_step)} moves that shared model id onto the new "
-        f"checkpoint, so every client using bare `{base_run_id}` changes model. address a "
-        f"specific checkpoint with `{cli} models chat {base_run_id}/step-N` to compare them."
+        f"checkpoint, {tail}"
     )
 
 

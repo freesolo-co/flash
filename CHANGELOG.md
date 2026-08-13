@@ -39,8 +39,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   advisory: the deploy still proceeds, the pre-deploy read is bounded well under the client's
   default timeout so a stalled plane cannot hold a deploy behind it, and a control plane that
   cannot answer (or answers with a checkpoint step this client cannot read) does not fail the
-  command. A deployment whose activation outcome was never settled is reported as one that _may_
-  be serving, rather than being assumed to serve nothing.
+  command. A deployment whose activation outcome was never settled still warns, but without
+  naming a checkpoint: that record's step describes the incoming attempt rather than what the id
+  currently serves, and the authoritative target is server-side only, so the warning says the
+  live checkpoint cannot be determined and points at `flash models deployments`.
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always

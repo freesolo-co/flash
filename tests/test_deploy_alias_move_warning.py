@@ -106,6 +106,20 @@ def test_only_a_servable_revision_can_be_displaced(state: str) -> None:
     assert _alias_move_warning(_Client(current), "flash-1", 50) is None
 
 
+def _unsettled(step):
+    """A `reconciling` record whose activation outcome was never recorded.
+
+    Its `checkpoint_step` is the INCOMING attempt. The plane resolves what the alias really holds
+    from `adapter_alias_target` / `previous_deployment`, neither of which reaches the client.
+    """
+    return {
+        "run_id": "flash-1",
+        "state": "reconciling",
+        "checkpoint_step": step,
+        "activation_outcome_unknown": True,
+    }
+
+
 def test_an_unsettled_activation_may_already_hold_the_alias() -> None:
     """`reconciling` + `activation_outcome_unknown` is the case the alias is MOST likely to move.
 
@@ -113,30 +127,39 @@ def test_an_unsettled_activation_may_already_hold_the_alias() -> None:
     the authoritative target through `_activation_predecessor` when it does. Reading the state
     alone as "not serving" silenced the warning precisely where it is needed.
     """
-    current = {
-        "run_id": "flash-1",
-        "state": "reconciling",
-        "checkpoint_step": 100,
-        "activation_outcome_unknown": True,
-    }
-
-    warning = _alias_move_warning(_Client(current), "flash-1", 50)
+    warning = _alias_move_warning(_Client(_unsettled(100)), "flash-1", 50)
 
     assert warning is not None
-    # it is not confirmed live, so the line must not assert that it is.
-    assert "may currently serve step-100" in warning
+    assert "activation never settled" in warning
+    assert "step-50" in warning
 
 
-def test_an_unsettled_activation_on_the_same_step_still_displaces_nothing() -> None:
-    """Redeploying the step already being activated moves the alias onto what it is heading to."""
-    current = {
-        "run_id": "flash-1",
-        "state": "reconciling",
-        "checkpoint_step": 50,
-        "activation_outcome_unknown": True,
-    }
+def test_an_unsettled_activation_does_not_name_a_checkpoint_it_cannot_know() -> None:
+    """`checkpoint_step` there is the incoming attempt, so naming it would name the WRONG one.
 
-    assert _alias_move_warning(_Client(current), "flash-1", 50) is None
+    `tests/test_server_api.py` covers an attempted final revision while the alias still serves
+    step-20: the record's own step describes neither what is live nor what will be displaced, and
+    the predecessor that does is stripped by `public_deployment`. Saying "serves step-N" from this
+    field is a confident wrong answer, which is worse than declining to name one.
+    """
+    warning = _alias_move_warning(_Client(_unsettled(100)), "flash-1", 50)
+
+    assert warning is not None
+    assert "step-100" not in warning
+    assert "serves step-" not in warning
+    assert "cannot be determined" in warning
+
+
+def test_an_unsettled_activation_warns_even_on_the_same_step() -> None:
+    """Equality with an untrustworthy step proves nothing, so it cannot buy silence.
+
+    A settled record suppresses the warning on a same-step redeploy because the step is then a
+    fact. Here it is the incoming attempt, so the alias may still be on something else entirely.
+    """
+    warning = _alias_move_warning(_Client(_unsettled(50)), "flash-1", 50)
+
+    assert warning is not None
+    assert "activation never settled" in warning
 
 
 def test_a_settled_ready_record_is_stated_as_fact() -> None:
