@@ -48,6 +48,7 @@ from flash.engine.worker.train.opd.prompts import (
     encode_shifted_group_metadata,
 )
 from flash.engine.worker.train.opd.scoring import score_rollout
+from flash.engine.worker.verl.parent_work import OPDParentActivity, ParentWorkGauge
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
 if TYPE_CHECKING:  # annotation-only: `opd_train` imports this module, so a runtime import
@@ -68,7 +69,7 @@ def _opd_train():
     return opd_train
 
 
-class _TeacherAlignmentBridge:
+class _TeacherAlignmentBridge(OPDParentActivity):
     def __init__(
         self,
         *,
@@ -122,6 +123,11 @@ class _TeacherAlignmentBridge:
         self._mutation_lock = threading.Lock()
         self._mutation_notified = False
         self._stats_lock = threading.Lock()
+        # environment calls running in the parent right now. the teacher counter cannot see them:
+        # the env hooks run HERE while the child blocks on the step response, and none of them
+        # advance a teacher total, so a slow tool call or api inside a turn is indistinguishable
+        # from a wedge on the child's tail alone.
+        self._env_work = ParentWorkGauge()
         self.generated_tokens = int(state.get("generated_tokens", 0))
         self.teacher_input_tokens = int(state.get("teacher_input_tokens", 0))
         self.teacher_output_tokens = int(state.get("teacher_output_tokens", 0))
@@ -189,22 +195,6 @@ class _TeacherAlignmentBridge:
     def teacher_failure(self) -> tuple[str, str] | None:
         with self._stats_lock:
             return self._teacher_failure
-
-    def _count_teacher_ok(self) -> None:
-        """record ONE completed teacher request, as it completes.
-
-        the multi-turn path hands its whole turn list to `score_many`, which runs
-        OPD_TEACHER_SCORING_CONCURRENCY at a time. counting the batch after it returns leaves this
-        total frozen for as long as the batch takes -- 3 waves of 434s worst-case retries is 1302s,
-        past the silence threshold -- so a healthy child blocked on scoring would look wedged.
-        """
-        with self._stats_lock:
-            self.teacher_ok += 1
-
-    def teacher_activity_count(self) -> int:
-        """completed teacher interactions, including transient and permanent failures."""
-        with self._stats_lock:
-            return self.teacher_ok + self.teacher_transient + self.teacher_error
 
     def _promote_recovered_teacher_failure(self, failure: tuple[str, str]) -> None:
         with self._stats_lock:
@@ -515,7 +505,7 @@ class _TeacherAlignmentBridge:
                     raise ValueError("flash OPD bridge rollout session id was reused")
                 existing["lease_deadline"] = now + self.session_lease_s
                 return {"max_turns": existing["turn_limit"]}
-            with self._env_lock:
+            with self._env_lock, self._env_work.working():
                 state = self.active_env.new_rollout_state(prompt.example)
                 initial_messages = state.get("prompt") or state.get("messages")
                 initial_messages = validate_transcript_messages(
@@ -607,7 +597,8 @@ class _TeacherAlignmentBridge:
             # routine no-signal rollout into a permanent paid failure. the grpo bridge already
             # returns before its own `record_model_turn` on exactly this predicate.
             if not terminal:
-                self.active_env.record_model_turn(state, completion_text)
+                with self._env_work.working():
+                    self.active_env.record_model_turn(state, completion_text)
                 session["messages"].append({"role": "assistant", "content": completion_text})
             messages: list[dict] = []
             next_prefix = [*accepted_prefix, *response_ids]
@@ -617,18 +608,25 @@ class _TeacherAlignmentBridge:
                 # env call and appends a user turn no model turn will ever answer.
                 assistant_turns = turn_ordinal + 1
                 turn_limit = session["turn_limit"]
-                terminal = assistant_turns >= turn_limit or self.active_env.rollout_done(
-                    state, turn_limit
-                )
+                with self._env_work.working():
+                    terminal = assistant_turns >= turn_limit or self.active_env.rollout_done(
+                        state, turn_limit
+                    )
             if not terminal:
-                messages = self.active_env.env_reply(session["messages"], state)
+                # every hook here is parent-side user code the child is BLOCKED on, and none of
+                # them advance a teacher total, so on the child's tail alone a slow tool call or
+                # api is indistinguishable from a wedge. `env_reply` is the usual offender, but
+                # `rollout_done` runs the same user code and is on the same critical path.
+                with self._env_work.working():
+                    messages = self.active_env.env_reply(session["messages"], state)
                 messages = validate_transcript_messages(messages, source="environment reply")
                 session["messages"].extend(messages)
                 # the env's reply may itself end the episode (rollout_done consults the updated
                 # state); recheck before gluing a next-turn prompt no model turn will answer.
-                terminal = not messages or self.active_env.rollout_done(
-                    state, session["turn_limit"]
-                )
+                with self._env_work.working():
+                    terminal = not messages or self.active_env.rollout_done(
+                        state, session["turn_limit"]
+                    )
                 if not terminal:
                     assert self._env_glue is not None
                     next_prefix.extend(

@@ -635,6 +635,9 @@ def _build_child_callbacks(
         tick_s=_opd_train._heartbeat._LIVENESS_TICK_S,
         baseline_step=resume_step,
         parent_activity=getattr(bridge, "teacher_activity_count", None),
+        # the teacher counter covers scoring; this covers the env turns between scores, which run
+        # in the parent while the child blocks on the step response and advance no teacher total.
+        parent_busy=getattr(bridge, "env_work_in_flight", None),
     )
 
     def liveness_fields() -> dict[str, object]:

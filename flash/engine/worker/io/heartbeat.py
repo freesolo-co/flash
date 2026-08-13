@@ -22,6 +22,7 @@ from flash.engine.result.rollout_samples import (
 )
 from flash.engine.worker.perf import gpu_diagnostics
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.verl.parent_work import ParentWorkGauge
 
 # Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
 # cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
@@ -323,7 +324,7 @@ class RewardObservabilityBuffer:
         # everything at once, so a judge slower than the silence threshold leaves every
         # completion-side counter flat for the whole batch and the run is torn down mid-grade. a
         # depth is the only signal that exists before the call finishes.
-        self._grading_depth = 0
+        self._grading_work = ParentWorkGauge()
         # generations the count has already sealed, oldest first, each waiting for the step line
         # that names it. a QUEUE rather than a flag: stdout can fall a whole generation behind, and
         # a flag would let the second seal overwrite the first, dropping a generation and
@@ -480,7 +481,6 @@ class RewardObservabilityBuffer:
                 return self._published[-1]
             return None
 
-    @contextlib.contextmanager
     def grading(self):
         """mark the parent as grading for the duration of one batched scoring call.
 
@@ -488,22 +488,11 @@ class RewardObservabilityBuffer:
         completions. that is what makes a judge slower than the silence threshold survive: inside one
         `scores_breakdown_many` there is no completion to count until every item is done.
         """
-        with self._lock:
-            self._grading_depth += 1
-        try:
-            yield
-        finally:
-            with self._lock:
-                self._grading_depth -= 1
+        return self._grading_work.working()
 
     def reward_grading_in_flight(self) -> bool:
-        """is the parent inside a batched scoring call right now?
-
-        depth rather than a flag: batches overlap across reward-server threads, and a flag cleared by
-        the first to finish would report idle while the rest are still grading.
-        """
-        with self._lock:
-            return self._grading_depth > 0
+        """is the parent inside a batched scoring call right now?"""
+        return self._grading_work.in_flight()
 
     def reward_activity_count(self) -> int:
         """completions scored since this buffer was created, monotonic across generations."""

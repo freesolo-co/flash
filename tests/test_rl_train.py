@@ -4732,7 +4732,7 @@ def test_a_thread_queued_behind_a_hung_env_turn_does_not_report_itself_busy():
 
         # it is waiting for the lock, doing NO env work. marking it busy here would mean a hung env
         # keeps resetting silence on every tick, and the watchdog could never name the wedge.
-        assert observability._grading_depth == 0, (
+        assert observability._grading_work._depth == 0, (
             "a thread queued on the env lock counted itself as busy, which would disarm the "
             "watchdog for as long as the env stays hung"
         )

@@ -2586,6 +2586,69 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
     assert response["terminal"] is False
 
 
+def test_opd_marks_the_parent_busy_inside_every_environment_hook():
+    """OPD's activity counter covers TEACHER completions only, and the env hooks between them run
+    in the parent too. None of them advance a teacher total while the child blocks on the step
+    response, so a slow tool call or api inside ANY of them looks exactly like a wedge on the
+    child's tail -- the same gap the GRPO bridge closes with its own busy signal.
+
+    Asserted hook by hook rather than in aggregate: whichever one is left unwrapped is the one a
+    user's slow implementation will sit in, and a single-hook test passes while the rest are bare.
+    """
+    seen: dict[str, list[bool]] = {}
+
+    class ObservingEnv(_RecordingEnv):
+        """each hook reports what the gauge said from INSIDE its own call."""
+
+        def _note(self, hook):
+            seen.setdefault(hook, []).append(bridge.env_work_in_flight())
+
+        def new_rollout_state(self, example):
+            self._note("new_rollout_state")
+            return super().new_rollout_state(example)
+
+        def record_model_turn(self, state, text):
+            self._note("record_model_turn")
+            return super().record_model_turn(state, text)
+
+        def rollout_done(self, state, turn_limit):
+            self._note("rollout_done")
+            return super().rollout_done(state, turn_limit)
+
+        def env_reply(self, messages, state):
+            self._note("env_reply")
+            return super().env_reply(messages, state)
+
+    bridge = _multiturn_bridge(ObservingEnv())
+    bridge.start_multiturn(
+        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+    )
+
+    bridge.step_multiturn(
+        {
+            "session_id": "s1",
+            "turn_ordinal": 0,
+            "accepted_prefix": [10, 11],
+            "raw_response_ids": [65],
+            "response_ids": [65],
+            "completion_text": "A",
+            "termination": "stop",
+            "stop_reason": "stop",
+            "truncated": False,
+            "skip_reason": "",
+        }
+    )
+
+    for hook in ("new_rollout_state", "record_model_turn", "rollout_done", "env_reply"):
+        assert seen.get(hook), f"{hook} never ran, so this asserts nothing about it"
+        assert all(seen[hook]), (
+            f"the parent was not marked busy inside {hook}; a slow user implementation there "
+            "would read as child silence and the watchdog would kill a healthy run"
+        )
+    # and it is released, or the watchdog stays disarmed for the rest of the run.
+    assert not bridge.env_work_in_flight()
+
+
 def test_multimodal_bridge_scores_frozen_images_through_structured_teacher_messages(
     monkeypatch,
 ):
