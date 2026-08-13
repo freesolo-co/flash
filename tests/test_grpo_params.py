@@ -809,7 +809,9 @@ def test_unset_context_reports_the_recipe_default_budget_and_warns() -> None:
     # the warning has to carry the DROP semantics, not just the number: a budget alone reads as a
     # capacity note, and the danger is specifically that over-budget rows are deleted, not shortened.
     message = rl_prompt_budget_warning(grpo)
-    assert "2048-token prompt budget" in message
+    # "at most 2048", not "2048": the worker clamps engine_len to the model architecture before
+    # subtracting, so the printed number is an upper bound. see the upper-bound test below.
+    assert "at most 2048 tokens" in message
     assert "DROPPED, not truncated" in message
 
     # an authored context is the user's own choice -> nothing surprising to report.
@@ -902,3 +904,38 @@ def test_sft_has_no_prompt_budget_because_it_truncates_instead_of_dropping() -> 
     )
     assert rl_prompt_budget(spec) is None
     assert rl_prompt_budget_warning(None) is None
+
+
+def test_defaulted_budget_warning_states_an_upper_bound_not_an_exact_threshold() -> None:
+    """The worker clamps engine_len to the model architecture BEFORE subtracting the completion
+    budget (`train/rl/inputs.py`: clamp_engine_len at 223, subtraction at 232), and that probe reads
+    the hf config, which the control plane cannot do. So a pinned revision whose
+    max_position_embeddings sits below the catalog cap makes the real threshold lower than the
+    number we print. Promising an exact cutoff would tell the user that prompts under it survive
+    while some are still dropped -- the precise false reassurance this warning exists to prevent."""
+    from flash.engine.plan.prompt_budget import rl_prompt_budget, rl_prompt_budget_warning
+
+    message = rl_prompt_budget_warning(rl_prompt_budget(_budget_spec("grpo", {})))
+    assert message
+    assert "at most" in message
+    assert "can be smaller" in message
+    # the drop semantics must survive the hedging: a budget reported as a bare capacity number
+    # reads as harmless, and deletion of the long tail is what makes a defaulted budget dangerous.
+    assert "DROPPED" in message
+
+
+def test_real_submit_warns_before_create_run_while_the_config_is_still_free() -> None:
+    """The server starts _run_job_background before create_run returns, so a warning derived from
+    the RESPONSE arrives once the run is already provisioning and cannot be reconfigured. The budget
+    comes off the local spec, so the CLI can warn for free before submitting. Asserting only that
+    the warning fires would pass on the broken ordering; the order is the whole finding."""
+    from inspect import getsource
+
+    from flash.cli import commands as commands_mod
+
+    body = getsource(commands_mod.cmd_train)
+    warned = body.index('_print_rl_prompt_budget_warning({"prompt_budget": rl_prompt_budget(spec)')
+    # the REAL submit, not the dry-run call earlier in the same function: that one is nested in a
+    # try block, so its indentation is what tells the two apart.
+    submitted = body.index("\n    status = client.create_run(")
+    assert warned < submitted

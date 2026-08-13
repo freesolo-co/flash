@@ -75,6 +75,11 @@ def rl_prompt_budget_warning(budget: object) -> str | None:
     a capacity note, and the reason a defaulted one is dangerous is specifically that over-budget
     prompts are deleted from the dataset rather than shortened -- silently, and biased toward the
     longest examples.
+
+    It also has to say "at most". ``engine_len`` is unclamped here (see ``rl_prompt_budget``), so a
+    pinned revision whose ``max_position_embeddings`` is below the catalog cap makes the worker's
+    real threshold LOWER than the number printed. Stating the budget as exact would tell a user that
+    prompts under it survive, when some of them are still dropped.
     """
     if not isinstance(budget, dict) or budget.get("context_source") != "recipe_default":
         return None
@@ -85,11 +90,12 @@ def rl_prompt_budget_warning(budget: object) -> str | None:
         return None
     algorithm = str(budget.get("algorithm") or "").upper() or "RL"
     message = (
-        f"train.max_context_tokens is unset, so {algorithm} derives a {prompt_budget}-token prompt "
-        f"budget from the recipe default (engine {budget.get('engine_len')} minus "
-        f"max_completion_tokens {max_completion}), not from the model's context. Prompts longer "
-        f"than {prompt_budget} tokens are DROPPED, not truncated, so the run trains on a shorter, "
-        f"biased subset."
+        f"train.max_context_tokens is unset, so {algorithm} derives a prompt budget of at most "
+        f"{prompt_budget} tokens from the recipe default (engine {budget.get('engine_len')} minus "
+        f"max_completion_tokens {max_completion}), not from the model's context. The worker clamps "
+        f"the engine length to the model architecture first, so its budget can be smaller than "
+        f"this. Prompts over the budget are DROPPED, not truncated, so the run trains on a "
+        f"shorter, biased subset."
     )
     source_context = budget.get("warm_start_context")
     if isinstance(source_context, int) and not isinstance(source_context, bool):

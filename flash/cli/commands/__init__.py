@@ -433,6 +433,13 @@ def cmd_train(args) -> int:
         _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
         _print_rl_prompt_budget_warning(status)
         return 0
+    from flash.engine.plan.prompt_budget import rl_prompt_budget
+
+    # BEFORE create_run, not after: the server starts _run_job_background before it returns, so a
+    # warning printed on the response arrives once the run is already provisioning and can no longer
+    # be reconfigured. the budget is derived from the local spec, so nothing forces us to wait for
+    # the server to tell us a number we can compute here for free.
+    _print_rl_prompt_budget_warning({"prompt_budget": rl_prompt_budget(spec)})
     status = client.create_run(
         payload,
         runtime_secrets=runtime_secrets,
@@ -440,8 +447,6 @@ def cmd_train(args) -> int:
     )
     run_id = status["run_id"]
     _print_unpacked_batch_warning(status, spec)  # a real submit overrides batch_size the same way
-    # a real submit derives the same budget and drops the same prompts, so it warns the same way
-    _print_rl_prompt_budget_warning(status)
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
