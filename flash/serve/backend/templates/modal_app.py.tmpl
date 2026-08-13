@@ -1449,6 +1449,21 @@ def api():
                 if attempt is not None and isinstance(current, dict):
                     if (current.get("metadata") or {{}}).get("settle_attempt") != attempt:
                         raise
+                # The LIFECYCLE too, because the attempt token cannot see an undeploy. A DELETE
+                # landing after registration released the run lock but before `spawn` raised
+                # disables this revision WITHOUT stamping a new token, so the guard above matches
+                # and this stale record was written back as `failed` -- resurrecting a revision the
+                # user already undeployed, over a DELETE that answered 200 and named it in
+                # `disabled_revisions`. A `failed` record also reads back as neither `disabled` nor
+                # gone, which is what the undeploy contract promises.
+                #
+                # Only a record still `registered` may take this write. Anything else -- disabled by
+                # an undeploy, or already terminal -- is a newer decision than this failed enqueue,
+                # and raising hands the caller its 5xx without touching the record.
+                if isinstance(current, dict):
+                    state = (current.get("metadata") or {{}}).get("lifecycle_state")
+                    if current.get("status") != "registered" or state != "registered":
+                        raise
                 record["status"] = "failed"
                 record["metadata"] = {{
                     **(record.get("metadata") or {{}}),

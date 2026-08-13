@@ -2536,6 +2536,61 @@ def test_a_stale_enqueue_failure_does_not_overwrite_a_newer_attempt(client):
     )
 
 
+def test_an_undeploy_landing_before_a_failed_enqueue_is_not_overwritten(client):
+    """A DELETE that lands after the run lock is released must survive the enqueue failure.
+
+    The attempt-token guard cannot see an undeploy: a DELETE disables the revision WITHOUT stamping
+    a new `settle_attempt`, so the token still matches and the stale `registered` record was written
+    back as `failed`. That resurrects a revision the user already undeployed, over a DELETE that
+    answered 200 and named it in `disabled_revisions` -- and `failed` reads back as neither
+    `disabled` nor gone, which is what the undeploy contract promises.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    ready = dict(client.get(f"/adapters/{REVISION}").json()["adapter"])
+    # Back to `registered` so a re-registration reaches the spawn at all. The token stays the
+    # CURRENT one, and the failing request will stamp its own -- which the simulated DELETE then
+    # leaves untouched, exactly as a real undeploy does.
+    module.adapter_records[module._record_key(REVISION)] = {
+        **ready,
+        "status": "registered",
+        "metadata": {**ready["metadata"], "lifecycle_state": "registered"},
+    }
+
+    spawned_with: list = []
+
+    def _refuse_after_an_undeploy_lands(record):
+        spawned_with.append(record)
+        # The undeploy carries THIS request's attempt token forward untouched, because a DELETE has
+        # no reason to stamp one. That is precisely what the token check cannot detect.
+        current = dict(module.adapter_records[module._record_key(REVISION)])
+        module.adapter_records[module._record_key(REVISION)] = {
+            **current,
+            "status": "disabled",
+            "metadata": {**(current.get("metadata") or {}), "lifecycle_state": "disabled"},
+        }
+        raise RuntimeError("queue unavailable")
+
+    original = module.settle_adapter
+    module.settle_adapter = types.SimpleNamespace(spawn=_refuse_after_an_undeploy_lands)
+    try:
+        with pytest.raises(RuntimeError, match="queue unavailable"):
+            client.post("/adapters", json=REGISTRATION)
+    finally:
+        module.settle_adapter = original
+
+    assert spawned_with, "the registration never reached the enqueue, so nothing was under test"
+    record = dict.get(module.adapter_records, module._record_key(REVISION))
+    assert record["status"] == "disabled", (
+        "a failed enqueue overwrote a concurrent undeploy, so a revision the user already "
+        f"undeployed reads back as {record['status']} rather than disabled"
+    )
+    assert (record.get("metadata") or {}).get("lifecycle_state") == "disabled", (
+        "the undeploy's lifecycle state was replaced by the enqueue failure's, so the DELETE "
+        "reported success over a revision that no longer reads disabled"
+    )
+
+
 def test_undeploy_reports_when_registrations_outran_its_passes(client):
     """A run that keeps receiving registrations must not report a complete undeploy.
 
