@@ -31,6 +31,7 @@ import flash.engine.worker as W
 from flash.engine.worker import backend_common, rl_train, sft_train
 from flash.engine.worker.entry import rl
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
+from flash.engine.worker.train.core import step_timing
 from flash.engine.worker.train.rl import shims as verl_shims
 
 
@@ -5433,10 +5434,22 @@ def test_step_intervals_exclude_the_span_before_the_first_step():
     inflate the step wall and understate the idle share on exactly the short runs where the
     startup cost dominates. N step lines bound N-1 steps, never N.
     """
-    assert rl_train._step_intervals([100.0, 110.0, 122.0]) == [10.0, 12.0]
+    assert step_timing.step_intervals([100.0, 110.0, 122.0]) == [10.0, 12.0]
     # a single step line bounds no whole step: nothing is known about what came before it or after.
-    assert rl_train._step_intervals([100.0]) == []
-    assert rl_train._step_intervals([]) == []
+    assert step_timing.step_intervals([100.0]) == []
+    assert step_timing.step_intervals([]) == []
+
+
+def test_post_run_step_intervals_come_from_the_same_clock_the_heartbeat_reads():
+    """One record, so the run's metadata and its live pace cannot disagree about a step.
+
+    ``reward_gpu_idle_fraction`` is derived from these intervals. A second raw list would keep the
+    reprints and blocking-upload spans the clock excludes, so the finished run would report a step
+    cost the operator never saw while it was running.
+    """
+    source = inspect.getsource(rl_train)
+    assert "step_intervals=state.step_clock.intervals()" in source
+    assert "step_line_times" not in source
 
 
 def test_the_profile_hook_returns_its_reading_to_the_caller():

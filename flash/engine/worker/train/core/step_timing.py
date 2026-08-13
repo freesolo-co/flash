@@ -48,9 +48,10 @@ def step_intervals(step_line_times: list[float]) -> list[float]:
     including it is exactly the 5.6x error this module exists to prevent. Nothing is known about the
     span after the last line either, since the run may still be inside that step.
 
-    This is the shared definition; ``flash.engine.worker.train.rl.verl_config._step_intervals``
-    delegates here so the RL post-run metadata and the live heartbeat cannot drift apart on what a
-    step is.
+    This is the raw definition, and ``StepClock`` is what callers actually keep: it applies the other
+    exclusions (reprinted step numbers, spans containing a blocking upload) on top. RL's post-run
+    ``step_intervals`` metadata reads that same clock rather than a parallel unfiltered list, so a
+    finished run cannot report a step cost the operator never saw while it was running.
     """
     return [
         later - earlier for earlier, later in itertools.pairwise(step_line_times) if later > earlier
@@ -105,11 +106,18 @@ class StepClock:
         lines. Timing them would measure the validation pass or the resume init and publish it as
         the cost of a step, which is the same class of error as counting warmup.
 
+        Only an IMMEDIATE repeat is skipped, not every non-advancing number. The step patterns these
+        callers scan with differ -- SFT and OPD use ``run_verl_training``'s looser ``step:\\s*(\\d+)``,
+        which also matches ``global_step:9`` inside a checkpoint path, where RL's gate requires a
+        word boundary. A monotonic rule would let one such spurious high number suppress every real
+        step after it and freeze the published pace at whatever it last measured, which is worse
+        than the repeat it set out to exclude: a wrong number that never corrects itself.
+
         ``step`` is optional because a caller that cannot identify the step is better off timing
         every line than timing none; only a caller that KNOWS a number repeated can skip it.
         """
         if step is not None:
-            if self._last_step is not None and int(step) <= self._last_step:
+            if self._last_step is not None and int(step) == self._last_step:
                 return
             self._last_step = int(step)
         if self._break_after_last and self._times:

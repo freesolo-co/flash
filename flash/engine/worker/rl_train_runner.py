@@ -79,12 +79,12 @@ class _StepMetricState:
     loss_curve: list[float] = field(default_factory=list)
     adv_spread_history: list[float] = field(default_factory=list)
     last_dump_step: list[int] = field(default_factory=lambda: [-1])
-    step_line_times: list[float] = field(default_factory=list)
     metrics_last: list[dict] = field(default_factory=list)
     sent_first_metrics: bool = False
-    # the same step lines as ``step_line_times``, read live rather than at teardown. kept alongside
-    # it because that list is the post-run metadata's unbounded record, while this one is bounded to
-    # a recent window (see StepClock) so a long run's rate tracks what the trainer is doing now.
+    # the sole record of when step lines arrived, read both live and at teardown. one clock rather
+    # than a parallel raw list: the exclusions it applies (warmup, reprints, spans containing a
+    # blocking upload) are what makes an interval a step, so a second unfiltered record would let the
+    # post-run metadata and the live heartbeat publish different answers for the same run.
     step_clock: step_timing.StepClock = field(default_factory=step_timing.StepClock)
 
 
@@ -471,9 +471,7 @@ def _ingest_step_metrics(
     sent_first_metrics = state.sent_first_metrics
     step_metrics = parse_verl_step_metrics(line)
     if step_metrics is not None:
-        now = time.time()
-        state.step_line_times.append(now)
-        state.step_clock.record(now, step_metrics.get("step"))
+        state.step_clock.record(time.time(), step_metrics.get("step"))
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]

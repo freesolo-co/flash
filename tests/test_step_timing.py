@@ -165,6 +165,30 @@ def test_a_replayed_step_number_is_not_timed_as_a_step():
     assert unnumbered.intervals() == [92.0]
 
 
+def test_a_spurious_step_number_does_not_suppress_every_later_step():
+    """The dedup skips an IMMEDIATE repeat, never every non-advancing number.
+
+    SFT and OPD scan with ``run_verl_training``'s looser ``step:\\s*(\\d+)``, which also matches
+    ``global_step:9`` inside a checkpoint path where RL's gate requires a word boundary. Under a
+    monotonic rule one such spurious high number would silently drop every real step after it and
+    freeze the published pace -- a wrong number that never corrects itself, which is worse than the
+    reprint the dedup exists to exclude.
+    """
+    clock = step_timing.StepClock()
+    for arrival, step in ((0.0, 1), (92.0, 9), (184.0, 2), (276.0, 3), (368.0, 4)):
+        clock.record(arrival, step)
+    # steps 2, 3 and 4 are real and must still be measured despite the bogus 9.
+    assert clock.intervals() == [92.0, 92.0, 92.0, 92.0]
+    assert clock.step_seconds() == 92.0
+
+    # a resumed run replaying its resume step is still excluded: that repeat is immediate.
+    resumed = step_timing.StepClock()
+    resumed.record(0.0, 5)
+    resumed.record(50.0, 5)
+    resumed.record(142.0, 6)
+    assert resumed.intervals() == [142.0]
+
+
 def test_a_span_containing_blocking_work_is_not_timed():
     """The stdout consumer timestamps a step line when it READS it.
 
@@ -179,6 +203,31 @@ def test_a_span_containing_blocking_work_is_not_timed():
     clock.record(392.0, 2)
     assert clock.intervals() == [92.0]
     assert clock.step_seconds() == 92.0
+
+
+def test_breaking_on_every_step_would_leave_nothing_measured():
+    """Why SFT and OPD break only on a heartbeat that COMMITTED, not on every step.
+
+    Their ``on_step`` runs once per step inside the stdout loop. Declaring a block unconditionally
+    splits the record at every line, so no segment ever holds two -- and a trainer that published a
+    pace would go silent. ``heartbeat()`` returns whether it actually uploaded, which is the signal
+    that separates a blocking commit from a throttled no-op.
+    """
+    every_step = step_timing.StepClock()
+    for index in range(10):
+        every_step.record(float(index) * 92.0, index)
+        every_step.note_blocking_work()
+    assert every_step.intervals() == []
+    assert every_step.step_seconds() is None
+
+    # breaking only on the committed ones keeps the rest measurable.
+    throttled = step_timing.StepClock()
+    for index in range(10):
+        throttled.record(float(index) * 92.0, index)
+        if index == 4:  # the one upload that actually committed
+            throttled.note_blocking_work()
+    assert throttled.step_seconds() == 92.0
+    assert len(throttled.intervals()) == 8  # nine gaps, less the one that held the upload
 
 
 def test_the_projection_amortizes_saves_that_the_pace_excludes():
