@@ -4608,8 +4608,10 @@ def test_child_failure_record_survives_cancellation_during_the_close_request(mon
     assert exits == []
     assert _read_classified_failure_fallback(child_failure_path) == (
         "permanent",
-        "[stage=generate] ValueError: multi-turn rollout prompt ids do not match "
-        "the frozen flash prompt",
+        (
+            "[stage=generate] ValueError: multi-turn rollout prompt ids do not match "
+            "the frozen flash prompt"
+        ),
     )
 
 
