@@ -536,6 +536,34 @@ def _check_env_push_limits(
         )
 
 
+def _check_env_push_credentials(
+    env_root: Path, *, entrypoint: Path, include_full_tree: bool
+) -> None:
+    """Refuse to publish a tree that carries a credential, before anything is copied or uploaded.
+
+    Filename filters answer the wrong question. `_ENV_PUSH_SECRET_PATTERNS` drops files *named*
+    like secret stores, so the sourceable shell file convention (`env.sh`, `setenv.sh`,
+    `secrets.sh`) sails straight through and a plain `flash env push .` published a live
+    `FREESOLO_API_KEY` into an org-shared hub repo, permanently in its git history.
+
+    Runs as its own pass rather than inside `_check_env_push_limits` so an oversized tree still
+    fails on stats alone instead of being read end to end first. The files it reads here are the
+    same ones the copy below reads, so this costs one warm re-read, not a second walk of real I/O.
+    """
+    from flash.cli.commands.env.secrets import reject_credential_bearing_files
+
+    # the entrypoint is published too -- and is the one file a hardcoded key is most likely to sit
+    # in -- but it is never yielded by the sidecar walk, which excludes it by construction.
+    reject_credential_bearing_files(
+        [
+            (entrypoint, Path(entrypoint.name)),
+            *_iter_env_sidecar_files(
+                env_root, entrypoint=entrypoint, include_full_tree=include_full_tree
+            ),
+        ]
+    )
+
+
 def _copy_env_sidecars(
     env_root: Path, dest: Path, *, entrypoint: Path, include_full_tree: bool
 ) -> None:
@@ -696,6 +724,9 @@ def cmd_env_push(args) -> int:
             entrypoint=entrypoint,
             include_full_tree=include_full_tree,
             env_name=env_name,
+        )
+        _check_env_push_credentials(
+            env_root, entrypoint=entrypoint, include_full_tree=include_full_tree
         )
     except (OSError, ValueError) as exc:
         return _err(f"cannot publish {src}: {exc}")

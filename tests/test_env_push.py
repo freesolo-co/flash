@@ -1531,3 +1531,138 @@ def test_push_directory_still_rejects_two_real_candidate_modules(monkeypatch, tm
     monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
 
     assert cli.cmd_env_push(_args(env_dir)) == 1
+
+
+# a body with a digit and a capital, so it reads as issued rather than hand-written. Assembled
+# from parts so the literal is not itself a credential-shaped string in this repository.
+_FAKE_KEY_BODY = "a1B2c3D4" * 6
+
+
+def test_push_refuses_shell_env_file_holding_a_live_api_key(monkeypatch, tmp_path, capsys):
+    """A sourceable shell env file is named like tooling, so only a content scan can catch it.
+
+    `_ENV_PUSH_SECRET_PATTERNS` drops files NAMED like secret stores; `env.sh` matches none of them
+    (`*.env` matches a file ending in `.env`). Publishing it committed a working FREESOLO_API_KEY
+    into an org-shared hub repo, permanently in its git history.
+    """
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "env.sh").write_text(f'export FREESOLO_API_KEY="fslo_{_FAKE_KEY_BODY}"\n')
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+    err = capsys.readouterr().err
+    assert "env.sh" in err
+    assert "Freesolo API key" in err
+    # the refusal must not echo the credential it just found: this text reaches terminals and logs.
+    assert _FAKE_KEY_BODY not in err
+    # refused before the upload, not merely filtered out of it
+    assert not cap
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents", "kind"),
+    [
+        ("setenv.sh", 'export HF_TOKEN="hf_{body}"', "Hugging Face"),
+        ("secrets.sh", 'export GITHUB_TOKEN="ghp_{body}"', "GitHub"),
+        ("bootstrap.sh", 'export PRIME_KEY="pit_{body}"', "Prime Intellect"),
+        ("notes.md", "my key is sk-ant-{body} do not share", "Anthropic"),
+        # a .pem is already dropped by NAME, so the uncovered case is a private key pasted into a
+        # file whose name says nothing -- which is how a deploy key reaches a bootstrap script.
+        ("bootstrap.py", '# -----BEGIN RSA PRIVATE KEY-----\nKEY = "MIIEow=="\n', "private key"),
+    ],
+)
+def test_push_refuses_any_published_file_carrying_a_credential(
+    monkeypatch, tmp_path, capsys, filename, contents, kind
+):
+    # the whole sourceable-secrets-file convention is uncovered by name, and a credential pasted
+    # into a note or a stray .pem is not named like a secret store at all.
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / filename).write_text(contents.format(body=_FAKE_KEY_BODY))
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+    assert kind in capsys.readouterr().err
+
+
+def test_push_refuses_credential_hardcoded_in_python_source(monkeypatch, tmp_path, capsys):
+    """Python source is exempt from the filename filter entirely, so only content can judge it.
+
+    `_ignore_env_push_path` skips the pattern check for `.py`/`.pyi` so helper modules travel
+    instead of breaking the worker with ModuleNotFoundError. A key pasted into a helper therefore
+    had nothing standing between it and the hub.
+    """
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text(
+        "import helper\n\ndef load_environment(**k):\n    return None\n"
+    )
+    (env_dir / "helper.py").write_text(f'KEY = "fslo_{_FAKE_KEY_BODY}"\n')
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+    assert "helper.py" in capsys.readouterr().err
+
+
+def test_push_refuses_credential_in_the_entrypoint_itself(monkeypatch, tmp_path, capsys):
+    # the entrypoint is published but never yielded by the sidecar walk, so scanning only the
+    # sidecars would leave the likeliest place for a hardcoded key unchecked.
+    env_file = tmp_path / "environment.py"
+    env_file.write_text(
+        f'KEY = "fslo_{_FAKE_KEY_BODY}"\n\ndef load_environment(**k):\n    return None\n'
+    )
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
+
+    assert cli.cmd_env_push(_args(env_file)) == 1
+    assert "environment.py" in capsys.readouterr().err
+
+
+def test_push_allows_ordinary_environments_and_datasets(monkeypatch, tmp_path):
+    """The scan must not refuse a real environment; a false refusal blocks every publish.
+
+    Each case below is drawn from something that actually occurs in published environments: an
+    `AKIA...` access key id is a PUBLIC identifier that AWS puts in signed URLs in the clear, so it
+    appears verbatim in web-scraped training data, and `hf_hub_download` is ordinary code.
+    """
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text(
+        "from huggingface_hub import hf_hub_download\n\ndef load_environment(**k):\n    return None\n"
+    )
+    dataset = env_dir / "dataset"
+    dataset.mkdir()
+    (dataset / "train.jsonl").write_text(
+        '{"prompt": "describe this image", '
+        '"image": "http://s3.amazonaws.com/x.jpg?AWSAccessKeyId=AKIAJ6IHWSU3BX3X7X3Q&Expires=1"}\n'
+    )
+    # a hand-written placeholder is snake_case English, carrying neither digit nor capital
+    (env_dir / "conftest_helper.py").write_text('STUB = "fslo_retry_after_close"\n')
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    assert "dataset/train.jsonl" in _members(cap["package_b64"])
+
+
+def test_credential_scan_reads_across_chunk_boundaries_and_skips_binaries(tmp_path):
+    from flash.cli.commands.env.secrets import _SCAN_CHUNK_BYTES, credential_in_file
+
+    # a key split across the chunk boundary is the case a naive per-chunk scan misses
+    straddle = tmp_path / "straddle.txt"
+    straddle.write_text("x" * (_SCAN_CHUNK_BYTES - 10) + f"fslo_{_FAKE_KEY_BODY}" + "y" * 20)
+    assert credential_in_file(straddle) == "a Freesolo API key"
+
+    # binary members (weights, images, compressed shards) are not where credentials live, and
+    # scanning random bytes is the one way this check could refuse a publish carrying no key
+    binary = tmp_path / "weights.bin"
+    binary.write_bytes(b"\x00\x01" + f"fslo_{_FAKE_KEY_BODY}".encode())
+    assert credential_in_file(binary) is None
+
+    # an undecodable byte is not a credential character, so a mixed-encoding file stays scannable
+    mixed = tmp_path / "mixed.txt"
+    mixed.write_bytes(b"\xff\xfe caf\xe9 " + f"fslo_{_FAKE_KEY_BODY}".encode())
+    assert credential_in_file(mixed) == "a Freesolo API key"
