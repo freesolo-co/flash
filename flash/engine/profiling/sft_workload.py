@@ -17,6 +17,7 @@ from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
     count_rendered_reasoning_spans,
     reasoned_assistant_turns,
+    reasoning_span_end_offsets,
     rendered_reasoning_loss_warning,
     sft_sample_policy,
     unpacked_batch_warning,
@@ -303,12 +304,27 @@ def _sft_completion_with_provenance(env, example: dict) -> tuple[list[dict], boo
     return env.sft_completion(example), False
 
 
+def _encoded_length(tokenizer, text: str) -> int:
+    """Token count of ``text``, for either the batched or unbatched ``input_ids`` shape.
+
+    A tokenizer handed a single string may answer with one id list or with a batch holding one
+    row. Reading ``len()`` off the batch would count ROWS -- always 1 -- and silently declare every
+    span to be within the cap.
+    """
+    ids = tokenizer(text)["input_ids"]
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    return len(ids)
+
+
 def _row_reasoning(
     prompt_messages: list[dict],
     completion_messages: list[dict],
     *,
     full_text: str,
     render: Callable[[list[dict]], str],
+    tokenizer,
+    max_length: int,
 ) -> tuple[int, int]:
     """One row's (authored reasoning turns, reasoning spans that survive into the SUPERVISED span).
 
@@ -325,15 +341,46 @@ def _row_reasoning(
     prompt render would then remove a span the full render never had, cancelling a completion span
     that did reach the loss and firing a false warning. Same messages, same positions, one
     difference.
+
+    Each authored turn is probed SEPARATELY, by re-rendering the row with only that turn's reasoning
+    removed. Summing spans across the whole render cannot work: a ``<think>`` tag an ANSWER merely
+    quotes is a real non-empty span in supervised text and is indistinguishable from reasoning, so
+    an answer quoting the format could cover several dropped turns and silence the warning. A per
+    turn probe is immune -- the quote renders identically in both, so only that turn's own reasoning
+    moves the count.
+
+    A survivor also has to fit inside ``max_length``: the cap slices the token row, so a block past
+    it never reaches the loss. A turn counts only when the render THROUGH the span it contributes
+    still tokenizes within the cap. Truncation is judged per turn rather than per row because the
+    cap usually cuts the answer tail while leaving an earlier reasoning block whole, and discarding
+    every span on a truncated row would warn that reasoning was dropped from a row whose reasoning
+    the template kept.
     """
-    authored = reasoned_assistant_turns(completion_messages)
-    if authored == 0:
+    authored_indexes = [
+        index
+        for index, message in enumerate(completion_messages)
+        if reasoned_assistant_turns([message])
+    ]
+    if not authored_indexes:
         # nothing authored means nothing to lose, and the baseline would equal the full render.
         # skipped rather than rendered so a dataset with no reasoning pays nothing for this check.
         return 0, 0
-    baseline = render([*prompt_messages, *without_authored_reasoning(completion_messages)])
-    rendered = count_rendered_reasoning_spans(full_text) - count_rendered_reasoning_spans(baseline)
-    return authored, max(0, rendered)
+    full_spans = count_rendered_reasoning_spans(full_text)
+    full_ends = reasoning_span_end_offsets(full_text)
+    survivors = 0
+    for index in authored_indexes:
+        probe = list(completion_messages)
+        probe[index] = without_authored_reasoning([probe[index]])[0]
+        probe_text = render([*prompt_messages, *probe])
+        if count_rendered_reasoning_spans(probe_text) >= full_spans:
+            continue  # the template dropped this turn's reasoning: removing it changed nothing
+        # the span this turn contributed is the one the probe lost; it reaches the loss only if the
+        # render through its closing tag still fits the cap.
+        probe_ends = set(reasoning_span_end_offsets(probe_text))
+        lost = [end for end in full_ends if end not in probe_ends] or full_ends[-1:]
+        if _encoded_length(tokenizer, full_text[: lost[-1]]) <= max_length:
+            survivors += 1
+    return len(authored_indexes), survivors
 
 
 def _tokenize_prompt_rows(
@@ -421,6 +468,8 @@ def _tokenize_prompt_rows(
                 completion_messages,
                 full_text=text,
                 render=render_transcript,
+                tokenizer=tokenizer,
+                max_length=max_length,
             )
         else:
             text = render_transcript([*prompt_messages, *completion_messages])
@@ -436,6 +485,8 @@ def _tokenize_prompt_rows(
                 completion_messages,
                 full_text=text,
                 render=render_transcript,
+                tokenizer=tokenizer,
+                max_length=max_length,
             )
             text_specs.append({"text": text, "prompt_text": prompt_text, "row_index": row_index})
 
@@ -486,15 +537,6 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
             # run trains on. a dropped row contributes neither its authored reasoning nor its
             # survivors, which would otherwise be reported against a retained-row denominator.
             row_authored, row_rendered = tokenized.reasoning_by_index.get(row_index, (0, 0))
-            # survivors are counted on the untruncated render, so a row the cap cut cannot claim
-            # them: the block may sit past the cap and never reach the loss. counting zero keeps the
-            # reported survival an UNDER-estimate on those rows rather than an over-estimate, since
-            # the warning exists to surface lost reasoning. re-measuring after truncation is not
-            # available here -- the supervised span begins inside the template's pre-opened <think>,
-            # so the decoded target has no opening delimiter to match. the existing truncation
-            # warning names these rows and their required max_context_tokens.
-            if tokenized.untruncated_by_index[row_index] > len(row["input_ids"]):
-                row_rendered = 0
             authored_reasoning += row_authored
             rendered_reasoning += row_rendered
         else:

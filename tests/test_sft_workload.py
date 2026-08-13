@@ -793,13 +793,99 @@ def test_block_form_assistant_content_counts_as_authored_reasoning(capsys) -> No
     assert "dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
 
 
-def test_a_truncated_row_does_not_claim_its_reasoning_reached_the_loss(capsys) -> None:
-    """Survivors are counted on the untruncated render, so a capped row cannot claim them.
+def test_reasoning_the_cap_kept_is_not_reported_as_dropped(capsys) -> None:
+    """Truncation is judged per span, not per row: the cap usually cuts only the answer tail.
 
-    The surviving block may sit past ``max_context_tokens`` and never reach the loss at all.
-    Reporting it as a survivor would understate the real reasoning loss while quoting an exact
-    survival percentage, so a truncated row contributes zero survivors and the figure stays an
-    under-estimate.
+    A single final assistant turn whose ``<think>`` block sits entirely inside the retained tokens
+    loses nothing, however much of its answer the cap removes. Discarding every span on a truncated
+    row would warn that the template dropped reasoning it actually kept.
+    """
+    completion = [{"role": "assistant", "content": "<think>kept</think>" + "tail " * 80}]
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=64, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        ThinkingEnvironment(completion),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    # the row IS truncated, but only past the reasoning block
+    assert prepared.profile.truncated_examples == 1
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 1
+    assert "authored reasoning blocks" not in capsys.readouterr().err
+
+
+def test_an_answer_quoting_think_is_not_credited_when_reasoning_content_is_stripped(
+    capsys,
+) -> None:
+    """``reasoning_content`` is the reasoning, so ``content`` is answer text and stays intact.
+
+    Splitting the answer on ``</think>`` as well would delete a span the full render still has, so
+    the baseline would come up short and credit that quoted span as a survivor -- offsetting an
+    earlier block the template really dropped and silencing the warning.
+    """
+    prepared = _thinking_prepared(
+        [
+            {"role": "assistant", "content": "<think>lost</think>a1"},
+            {"role": "user", "content": "next"},
+            {
+                "role": "assistant",
+                "content": "answer shows <think>example</think> format",
+                "reasoning_content": "real reasoning",
+            },
+        ]
+    )
+
+    assert prepared.authored_reasoning_turns == 2
+    # only the final turn's reasoning survives; the quoted span cancels rather than counting
+    assert prepared.rendered_reasoning_spans == 1
+    assert "dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
+
+
+def test_an_answer_quoting_think_tags_cannot_mask_turns_the_template_dropped(capsys) -> None:
+    """Survivors are probed per turn, so quoted tags cannot pay for dropped reasoning.
+
+    A ``<think>`` tag inside a supervised answer is a real non-empty span, indistinguishable in the
+    rendered text from reasoning. Summing spans across the render lets an answer that quotes the
+    format cover several stripped turns and silence the warning entirely. Re-rendering with one
+    turn's reasoning removed is immune: the quote is identical in both renders.
+    """
+    prepared = _thinking_prepared(
+        [
+            {"role": "assistant", "content": "<think>first</think>a1"},
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "<think>second</think>a2"},
+            {"role": "user", "content": "next"},
+            {
+                "role": "assistant",
+                "content": "quotes <think>x</think> and <think>y</think> here",
+                "reasoning_content": "real reasoning",
+            },
+        ]
+    )
+
+    assert prepared.authored_reasoning_turns == 3
+    # two quoted spans would otherwise bring the count to 3 and report no loss at all
+    assert prepared.rendered_reasoning_spans == 1
+    assert "dropped 2 of 3 authored reasoning blocks" in capsys.readouterr().err
+
+
+def test_a_truncated_row_does_not_claim_reasoning_the_cap_removed(capsys) -> None:
+    """A block past ``max_context_tokens`` never reaches the loss, so it is not a survivor.
+
+    Reporting it would understate the real reasoning loss while quoting an exact survival
+    percentage.
     """
     long_reasoning = "<think>" + "survivor " * 30 + "</think>a2"
     completion = [

@@ -149,6 +149,29 @@ def _message_text(content: object) -> str:
     return ""
 
 
+def _answer_without_think_tags(text: str, *, reasoning_is_inline: bool) -> str:
+    """An assistant turn's text with its own reasoning removed and any leftover tags defused.
+
+    Which text is reasoning depends on where the turn's reasoning came from, and getting this
+    backwards is a real bug in both directions:
+
+    * ``reasoning_is_inline`` -- the template parses the span out of ``content``, so text through
+      the last ``</think>`` is this turn's reasoning and goes.
+    * otherwise ``reasoning_content`` supplied it and ``content`` is entirely answer. Splitting it
+      here would delete answer text the full render keeps, leaving the baseline short so the
+      deleted span counts as a survivor.
+
+    Either way a ``<think>`` tag the ANSWER merely quotes has to stop being a tag without ceasing
+    to be text: with the reasoning removed, the template would otherwise parse that quote as this
+    turn's reasoning and render a span the completion never authored, cancelling a real survivor.
+    Neutering the delimiters keeps the text, and roughly its token count, while rendering nothing.
+    """
+    answer = text.split("</think>")[-1].lstrip("\n") if reasoning_is_inline else text
+    # the tag is defused by breaking the delimiter, not by deleting the words: the text and its
+    # rough token count stay, and neither the template nor the span pattern sees a tag.
+    return answer.replace("<think>", "(think)").replace("</think>", "(/think)")
+
+
 def without_authored_reasoning(messages: list[dict]) -> list[dict]:
     """The same messages with assistant reasoning removed, structure and positions untouched.
 
@@ -165,22 +188,38 @@ def without_authored_reasoning(messages: list[dict]) -> list[dict]:
     for message in messages:
         copied = dict(message)
         if copied.get("role") == "assistant":
-            copied.pop("reasoning_content", None)
+            reasoning = copied.pop("reasoning_content", None)
+            # the template reads `reasoning_content` in preference to an inline span, so the field
+            # decides which half of `content` is this turn's reasoning.
+            inline = not (isinstance(reasoning, str) and reasoning.strip())
             text = copied.get("content")
-            if isinstance(text, str) and "</think>" in text:
-                copied["content"] = text.split("</think>")[-1].lstrip("\n")
+            if isinstance(text, str):
+                copied["content"] = _answer_without_think_tags(text, reasoning_is_inline=inline)
             elif isinstance(text, list):
                 copied["content"] = [
-                    {**block, "text": block["text"].split("</think>")[-1].lstrip("\n")}
+                    {
+                        **block,
+                        "text": _answer_without_think_tags(
+                            block["text"], reasoning_is_inline=inline
+                        ),
+                    }
                     if isinstance(block, dict)
                     and block.get("type") == "text"
                     and isinstance(block.get("text"), str)
-                    and "</think>" in block["text"]
                     else block
                     for block in text
                 ]
         stripped.append(copied)
     return stripped
+
+
+def reasoning_span_end_offsets(text: str) -> list[int]:
+    """Character offsets just past each non-empty ``<think>`` span's closing tag.
+
+    A truncated row keeps a rendered span only when the whole block fits inside the retained
+    tokens, so the caller needs where each span ENDS to compare against the cap.
+    """
+    return [match.end() for match in _NON_EMPTY_THINK.finditer(text)]
 
 
 def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:
