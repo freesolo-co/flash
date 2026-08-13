@@ -298,6 +298,29 @@ def _episode_turn_rewards(score_payload, turn_spans):
     return None
 
 
+async def _validated_episode_prompt(loop_self, raw_prompt):
+    """prepare one episode's prompt: extract the media, THEN validate the transcript shape.
+
+    ORDER MATTERS, which is why the two live in one function rather than as separate statements a
+    later edit could reorder. an image prompt does not arrive as text: verl's RLHFDataset rewrites
+    the parquet's string content into blocks, splitting on the `<image>` placeholder and
+    substituting an image block (rl_dataset.py `_build_messages`), so `raw_prompt` is
+    [{"type": "image", ...}, {"type": "text", ...}] for exactly the rows flash writes for a
+    multimodal job. the media has to come out of those ORIGINAL blocks first, or the pixels are
+    gone by the time the rollout asks for them.
+
+    the validation is a GATE, not a value: unlike the opd loop -- which sends its validated prompt
+    on to the bridge -- this loop generates from `prompt_ids`, so the flattened text is discarded.
+    it still runs, because it is what rejects a transcript this loop cannot represent (unsupported
+    blocks, tool-call metadata) before the episode is paid for. blocks are permitted in that check
+    precisely because the prompt above already holds the media and the block-rendered ids.
+    """
+    messages = [dict(message) for message in raw_prompt]
+    prompt = await _prepare_episode_prompt(loop_self, messages)
+    validate_transcript_messages(messages, source="initial prompt", allow_content_blocks=True)
+    return prompt
+
+
 async def _grpo_run(
     self,
     sampling_params: dict[str, Any],
@@ -306,20 +329,7 @@ async def _grpo_run(
     agent_loop_output,
     **kwargs,
 ):
-    # ORDER MATTERS. an image prompt does not arrive as text: verl's RLHFDataset rewrites the
-    # parquet's string content into blocks, splitting on the `<image>` placeholder and substituting
-    # an image block (rl_dataset.py `_build_messages`), so `raw_prompt` is
-    # [{"type": "image", ...}, {"type": "text", ...}] for exactly the rows flash writes for a
-    # multimodal job. the media has to come out of those ORIGINAL blocks before the transcript is
-    # flattened to text, or the pixels are gone by the time anything asks for them.
-    raw_prompt = [dict(message) for message in kwargs["raw_prompt"]]
-    prompt = await _prepare_episode_prompt(self, raw_prompt)
-    # flattened only AFTER extraction, and only for the text-shaped uses that follow (the bridge
-    # transcript and the inter-turn glue). blocks are permitted here precisely because
-    # _prepare_episode_prompt already holds the decoded media and the block-rendered prompt ids.
-    raw_prompt = validate_transcript_messages(
-        raw_prompt, source="initial prompt", allow_content_blocks=True
-    )
+    prompt = await _validated_episode_prompt(self, kwargs["raw_prompt"])
     prompt_ids = prompt.prompt_ids
     mm_processor_kwargs = prompt.mm_processor_kwargs
     settings = _EpisodeSettings()
