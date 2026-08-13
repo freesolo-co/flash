@@ -124,15 +124,30 @@ def raise_for_classified_verl_exit(return_code: int, tail: ChildOutputTail) -> N
     # the one that explains the rest. it is also permanent in the way a cuda oom is not: a
     # larger-VRAM class whose nodes ship the same system ram fails identically.
     host_ram_evidence = tail.host_ram_kill_evidence
+    oom_evidence = tail.cuda_oom_evidence
     if host_ram_evidence is not None:
+        # both signals present: the tail keeps only the FIRST of each, so it cannot say which
+        # resource ended the run -- a worker killed for host pressure and a worker that hit a real
+        # allocator OOM can both print here. report both rather than asserting the gpu was fine,
+        # but still do not escalate VRAM: a bigger card cannot fix the half that is host RAM, and
+        # the operator needs to see the ram kill to know a VRAM-only remedy is incomplete.
+        #
+        # the cuda evidence is DESCRIBED, never quoted. `is_cuda_oom` classifies this very string,
+        # so echoing the matched token would make the message re-match and re-enable the VRAM
+        # escalation this branch exists to prevent.
+        both = (
+            " a gpu allocator OOM was ALSO reported by some worker; the child output does not say "
+            "which ended the run, so treat system RAM as scarce and re-check VRAM after fixing it."
+            if oom_evidence is not None
+            else " gpu memory was not the scarce resource, so retrying on a larger-VRAM class of "
+            "the same node shape fails identically."
+        )
         raise RuntimeError(
             f"verl subprocess exited with status {return_code} after ray killed its workers: "
-            f"{host_ram_evidence}. this is HOST RAM (system memory) exhaustion, not a gpu OOM -- "
-            "gpu memory was not the scarce resource, so retrying on a larger-VRAM class of the same "
-            "node shape fails identically. select a gpu class whose nodes carry more system RAM; "
-            "the worker-process floor is set by process COUNT, which prompts_per_step does not change."
+            f"{host_ram_evidence}. this is a HOST RAM (system memory) kill, not a gpu OOM.{both} "
+            "select a gpu class whose nodes carry more system RAM; the worker-process floor is set "
+            "by process COUNT, which prompts_per_step does not change."
         )
-    oom_evidence = tail.cuda_oom_evidence
     if oom_evidence is not None:
         raise RuntimeError(
             f"verl subprocess exited with status {return_code} after reporting {oom_evidence}"

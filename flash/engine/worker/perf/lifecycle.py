@@ -87,8 +87,15 @@ def is_cuda_oom(exc: BaseException | None) -> bool:
             return True
     except Exception:
         pass
-    if cuda_oom_message_evidence(str(exc)) is not None:
+    message = str(exc)
+    if cuda_oom_message_evidence(message) is not None:
         return True
+    # explicit host-RAM evidence outranks the allocator counter. `cuda_oom_count()` is CUMULATIVE
+    # and process-wide: one recovered allocator OOM earlier in the run leaves it above zero for
+    # every later failure, which would re-classify a known ray host-RAM kill as a cuda OOM and
+    # escalate VRAM again. a failure that named its own cause is not diagnosed by a stale counter.
+    if host_ram_kill_evidence(message) is not None:
+        return False
     return cuda_oom_count() > 0
 
 
