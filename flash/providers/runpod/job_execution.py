@@ -695,6 +695,13 @@ def poll_job(
         if provider_status is None:
             continue
         status = provider_status.get("status")
+        if status is not None and status != "IN_QUEUE":
+            # leaving the queue proves RunPod granted a worker, whatever health says. the two
+            # health-derived latch sites go quiet when the health endpoint is unreachable (both
+            # swallow their errors), and RunPod can requeue a job that already ran -- which would
+            # otherwise leave the requeued job looking never-granted, exempt from the setup-stall
+            # check forever.
+            state.ever_saw_worker = True
         if status != state.last_status:
             say(f"job {handle.job_id}: {status}")
             state.last_status = status

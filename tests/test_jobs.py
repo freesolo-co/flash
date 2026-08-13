@@ -900,6 +900,65 @@ def test_a_worker_that_stays_placed_does_not_renew_its_setup_budget_forever(monk
     )
 
 
+def test_a_requeued_job_that_already_ran_is_not_reported_as_no_capacity(monkeypatch):
+    # `ever_saw_worker` was latched only from endpoint-health snapshots, which go quiet whenever the
+    # health endpoint is unreachable (`_probe_worker_coming_up_at` swallows the error, and the
+    # periodic health block ends in a bare except). RunPod can requeue a job that already ran, so
+    # with health dead the requeued job looked never-granted: it skipped the setup-stall check
+    # forever and was finally reported `no_capacity` for a worker it demonstrably had -- and
+    # `no_capacity` can trip the supervisor's weight-cache drop.
+    #
+    # An IN_PROGRESS observation is itself proof of a grant, independent of health. Pristine `dev`
+    # reports `stalled` here, so this is a regression to avoid, not a behavior change.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    now = {"t": 0.0}
+
+    # count STATUS READS rather than keying on the clock: one loop iteration consumes several
+    # time.time() calls, so a wall-clock window can be stepped straight over without ever being
+    # observed (an earlier version of this test did exactly that and passed against broken code).
+    reads = {"n": 0}
+
+    def job_status(_eid, _jid, **_kw):
+        # queued, then RUNNING (the grant), then requeued by RunPod and never scheduled again.
+        reads["n"] += 1
+        if reads["n"] <= 2:
+            return {"status": "IN_QUEUE"}
+        if reads["n"] <= 4:
+            return {"status": "IN_PROGRESS"}
+        return {"status": "IN_QUEUE"}
+
+    def dead_health(_eid, _fp, **_kw):
+        raise RuntimeError("health endpoint unavailable")
+
+    monkeypatch.setattr(runpod_api, "job_status", job_status)
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", dead_health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+
+    def tick():
+        now["t"] = next(ticks)
+        return now["t"]
+
+    monkeypatch.setattr(jobs.time, "time", tick)
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        deadline_at=500_000.0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", (
+        f"a job that reached IN_PROGRESS and was requeued reported {res.failure!r}; leaving the "
+        f"queue proves a grant even when health reads fail ({res.detail})"
+    )
+    assert "limit 3000s" in res.detail, res.detail
+
+
 def test_a_worker_granted_then_lost_is_stalled_not_reported_as_no_capacity(monkeypatch):
     # A worker granted once and then gone from health (permanent gap, job still IN_QUEUE) must stay
     # with the SETUP timer. Exempting the stall check on `worker_coming_up_at` alone did not: that
