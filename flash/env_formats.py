@@ -72,18 +72,27 @@ _SKIPPABLE_FRAME_HEADER = 8
 _MAX_SKIPPABLE_FRAMES = 16
 
 
-def _after_skippable_frames(head: bytes) -> bytes:
-    """`head` advanced past any leading zstd/LZ4 skippable frames.
+def _after_skippable_frames(head: bytes) -> tuple[bytes, bool]:
+    """`head` advanced past any leading zstd/LZ4 skippable frames, and whether it ran out.
+
+    The flag is the whole point of the second return value. `head` is a bounded prefix of the
+    stream, so a frame declaring a payload longer than what is left slices to empty -- which
+    matches no magic and read as "not a compressed stream at all". A 70 KiB skippable frame in
+    front of a zstd frame was enough to publish the credential behind it. Running out is not
+    evidence of anything, so it is reported and the caller refuses instead.
 
     Returned rather than mutated in place so the caller keeps the original bytes for the checks
     that must see the true start of the file.
     """
     for _ in range(_MAX_SKIPPABLE_FRAMES):
         if not head.startswith(_SKIPPABLE_FRAME_MAGIC) or len(head) < _SKIPPABLE_FRAME_HEADER:
-            return head
+            return head, False
         size = int.from_bytes(head[4:_SKIPPABLE_FRAME_HEADER], "little")
+        if _SKIPPABLE_FRAME_HEADER + size > len(head):
+            return b"", True
         head = head[_SKIPPABLE_FRAME_HEADER + size :]
-    return head
+    # More frames than any real stream carries, and the format is still undecided.
+    return b"", True
 
 
 def _looks_compressed(head: bytes) -> bool:
@@ -269,6 +278,20 @@ def _file_size(source: Path) -> int | None:
         return None
 
 
+def _read_at(source: Path | bytes, start: int, size: int) -> bytes | None:
+    """`size` bytes of `source` from `start`, or None if they cannot be read."""
+    if start < 0:
+        return None
+    try:
+        if isinstance(source, Path):
+            with source.open("rb") as handle:
+                handle.seek(start)
+                return handle.read(size)
+    except OSError:
+        return None
+    return source[start : start + size] if isinstance(source, bytes) else None
+
+
 def _zip_directory_entries(
     source: Path | bytes, tail: bytes, offset: int, limit: int
 ) -> int | None:
@@ -294,15 +317,16 @@ def _zip_directory_entries(
     # so its true start is that position minus its size.
     if (shift := _zip_concat_shift(source, tail, offset, size, start)) is None:
         return None
-    start += shift
-    try:
-        if isinstance(source, Path):
-            with source.open("rb") as handle:
-                handle.seek(start)
-                directory = handle.read(size)
-        else:
-            directory = source[start : start + size]
-    except OSError:
+    # Both candidate starts are tried, the recorded one first. The computed shift assumes the
+    # directory ends where the classic end record begins, which a zip64 archive breaks: its own
+    # end record and locator sit in between, so the shift came out as their combined length (76
+    # bytes) on an archive that had no stub at all and the walk landed mid-record. Reading the
+    # recorded offset settles that case, and the shifted one still covers a genuine stub.
+    for candidate in dict.fromkeys((start, start + shift)):
+        directory = _read_at(source, candidate, size)
+        if directory is not None and directory[:4] == b"PK\x01\x02":
+            break
+    else:
         return None
     count, cursor = 0, 0
     while cursor + _ZIP_CENTRAL_HEADER_BYTES <= len(directory):
@@ -365,5 +389,10 @@ def _zip_member_count(source: Path | bytes, limit: int = _MAX_ARCHIVE_MEMBERS) -
         # zip at all, and refusing here made a tar carrying a forged end record abandon the scan
         # before the tar handler ran. `ZipFile` rejects a genuinely malformed archive on its own,
         # and the per-member loop still enforces the same bound on one that opens.
-        return 0
-    return int.from_bytes(tail[zip64 + 32 : zip64 + 40], "little")
+        return max(total, walked or 0)
+    # The walked count wins here too. A zip64 archive states its total in 64 bits, so forging that
+    # field down needs no `0xffff` sentinel and the walk above was being discarded on exactly the
+    # archives large enough for the bound to matter -- a 70,000-entry zip64 patched to claim one
+    # member reported one while `ZipFile` still materialized all 70,000.
+    claimed = int.from_bytes(tail[zip64 + 32 : zip64 + 40], "little")
+    return max(claimed, walked or 0)

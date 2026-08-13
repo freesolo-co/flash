@@ -33,7 +33,7 @@ import zipfile
 import zlib
 from collections.abc import Iterator
 from pathlib import Path
-from typing import IO, NoReturn
+from typing import IO, NoReturn, Protocol
 
 from flash.env_formats import (
     _MAX_ARCHIVE_MEMBERS,
@@ -137,104 +137,34 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     ),
 )
 
-# A PEM header only means a key is present when the BODY follows it. The header alone is something
-# documentation says -- "if you see -----BEGIN RSA PRIVATE KEY----- in a log, redact it" -- and
-# refusing on it blocks a legitimate publish over prose about credentials. Requiring a base64 line
-# after the header keeps every real key (they all carry one) and drops the mention of one.
-#
-# The second alternative is the encrypted form, whose body is preceded by RFC 1421 headers instead
-# of starting with base64. It names those two headers exactly: a general `[A-Za-z-]+:` also accepts
-# `Warning:` or `Note:`, which is prose about a key rather than a key, and reopens the very false
-# positive the base64 requirement exists to close.
-_LITERAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
-    #
-    # `(?: BLOCK)?` because OpenPGP armours as `-----BEGIN PGP PRIVATE KEY BLOCK-----`. Without it
-    # the trailing word made the header unmatchable and a `gpg --export-secret-keys --armor` file
-    # published intact -- `[A-Z ]*` reaches `PGP PRIVATE KEY`, but nothing followed ` BLOCK`.
-    #
-    # `_ARMOR_HEADERS` skips the RFC 4880 armor headers that sit between the BEGIN line and the
-    # body. Requiring base64 IMMEDIATELY after the header caught only the headerless export: an
-    # armour carrying `Version:` or `Comment:` -- what most implementations emit, and what a
-    # hand-annotated backup carries -- went undetected again.
-    #
-    # Those five keys are named exactly, for the same reason `Proc-Type:`/`DEK-Info:` are below. A
-    # general `[A-Za-z-]+:` would also skip `Warning:` and `Note:`, which is prose about a key
-    # rather than a key, and reopens the false positive the base64 requirement exists to close.
-    (
-        "a private key block",
-        re.compile(
-            rb"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\r\n\s]*"
-            rb"(?:(?:Version|Comment|MessageID|Hash|Charset):[^\r\n]*[\r\n\s]*)*"
-            rb"(?:[A-Za-z0-9+/=]{32,}|Proc-Type:|DEK-Info:)"
-        ),
-    ),
-    # The same key in DER: the binary encoding a PEM block base64-wraps. `openssl ... -outform DER`
-    # writes it, and it carries no text marker at all, so the PEM pattern above cannot see it.
-    #
-    # Anchored on the ASN.1 that distinguishes a private key from a public one rather than on the
-    # algorithm OID alone, which a certificate or public key carries too. In PKCS#8 that is the
-    # `INTEGER 0` version field preceding the AlgorithmIdentifier (a SubjectPublicKeyInfo has no
-    # version); in PKCS#1 it is the same version INTEGER before the modulus; in SEC1 it is
-    # `INTEGER 1` followed by the private scalar as an OCTET STRING of a curve-sized length.
-    (
-        "a private key",
-        re.compile(
-            # PKCS#8 PrivateKeyInfo, by algorithm: RSA, the RFC 8410 curves, EC.
-            #
-            # The RFC 8410 OIDs are `1.3.101.{110,111,112,113}` = X25519, X448, Ed25519, Ed448,
-            # whose final byte is 0x6e, 0x6f, 0x70, 0x71. Naming only the 25519 pair let a real
-            # Ed448 or X448 key publish intact; the four are one contiguous range.
-            # DSA is `1.2.840.10040.4.1` (`2a 86 48 ce 38 04 01`). Its AlgorithmIdentifier is a
-            # SEQUENCE rather than the 1-byte length the others use, so the `\x30.` above does not
-            # cover it: `openssl pkcs8 -topk8 -nocrypt -outform DER` on a real 1024-bit DSA key
-            # produced a file every branch here passed as clean.
-            rb"\x02\x01\x00\x30.\x06(?:\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
-            rb"|\x03\x2b\x65[\x6e-\x71]|\x07\x2a\x86\x48\xce\x3d\x02\x01)"
-            rb"|\x02\x01\x00\x30\x82..\x06\x07\x2a\x86\x48\xce\x38\x04\x01"
-            rb"|\x02\x01\x00\x30\x81.\x06\x07\x2a\x86\x48\xce\x38\x04\x01"
-            rb"|\x02\x01\x00\x30[\x00-\x7f]\x06\x07\x2a\x86\x48\xce\x38\x04\x01"
-            # PKCS#1 RSAPrivateKey: version 0 then the modulus INTEGER, whose length may be stated
-            # in any of DER's three forms. Requiring `\x02\x82` recognised only 2048-bit and larger
-            # keys: `openssl rsa -outform DER -traditional` writes `02 81 81` for a 1024-bit key
-            # and a short-form `02 41` for a 512-bit one, so both published intact. `0x81` and
-            # `0x82` introduce a 1- and 2-byte length; a short form below 0x80 IS the length, and
-            # is bounded from 0x40 up so an ordinary `02 01 00 02 xx` byte sequence does not match.
-            rb"|\x30\x82..\x02\x01\x00\x02(?:\x82..|\x81.|[\x40-\x7f])\x00"
-            # SEC1 ECPrivateKey: version 1, a curve-sized scalar, then the [0] curve parameters
-            rb"|\x02\x01\x01\x04(?:\x20.{32}|\x30.{48}|\x42.{66})\xa0"
-            # EncryptedPrivateKeyInfo: `openssl pkcs8 -topk8 -passout` in DER. The plaintext key is
-            # inside an OCTET STRING, so none of the structures above appear anywhere in the file
-            # and it published intact -- the ARMOURED form of the same key was caught by its
-            # `-----BEGIN ENCRYPTED PRIVATE KEY-----` header, which made DER the way past.
-            #
-            # Anchored on the encryption-algorithm OID in the AlgorithmIdentifier: PBES2
-            # (1.2.840.113549.1.5.13) or a pkcs-12 PBE (1.2.840.113549.1.12.1.x). A passphrase is
-            # not much protection for a key in a public repository, and the OIDs appear only in a
-            # key that is actually encrypted.
-            rb"|\x30.{1,4}?\x30.\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0d"
-            rb"|\x30.{1,4}?\x30.\x06\x0a\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x01.",
-            re.DOTALL,
-        ),
-    ),
-    # The same key as a JSON Web Key. Node's `privateKey.export({format: "jwk"})` and every JOSE
-    # library write this, `.json` and `.jwk` are ordinary publishable files, and the encoding
-    # carries neither a PEM header nor DER structure -- so a complete RSA or EC private key passed
-    # every check above as clean.
-    #
-    # Anchored on the PRIVATE members, not on JWK-ness: a public JWK is meant to be shared and
-    # differs only by their absence. `d` is the private exponent or scalar in every key type; for
-    # RSA the CRT parameters accompany it. Requiring a `kty` alongside keeps this off arbitrary
-    # JSON that happens to carry a short `"d"` field.
-    (
-        "a private key",
-        re.compile(
-            rb"\"kty\"\s*:\s*\"(?:RSA|EC|OKP|oct)\"[\s\S]{0,4096}?"
-            rb"\"(?:d|dp|dq|qi)\"\s*:\s*\"[A-Za-z0-9+/\-_]{20,}={0,2}\""
-            rb"|\"(?:d|dp|dq|qi)\"\s*:\s*\"[A-Za-z0-9+/\-_]{20,}={0,2}\"[\s\S]{0,4096}?"
-            rb"\"kty\"\s*:\s*\"(?:RSA|EC|OKP|oct)\""
-        ),
-    ),
-)
+
+class _Searchable(Protocol):
+    """What this module needs of a pattern: `search(data)` returning a match or None.
+
+    `re.Pattern[bytes]` satisfies it, and so does a detector built from more than one pattern.
+    """
+
+    def search(self, data: bytes, /) -> re.Match[bytes] | None: ...
+
+
+class _JwkPrivateKey:
+    """A private JSON Web Key: a `kty` naming a key type, plus at least one private member.
+
+    Presented as a pattern object because `_match` iterates `(kind, pattern)` pairs and calls
+    `.search`; the two markers cannot be one regex without reintroducing the span between them.
+    """
+
+    _KTY = re.compile(rb"\"kty\"\s*:\s*\"(?:RSA|EC|OKP|oct)\"")
+    # `d` is the private exponent or scalar in every key type; for RSA the CRT parameters
+    # accompany it. A public JWK carries none of these, which is exactly what separates the two.
+    _PRIVATE = re.compile(rb"\"(?:d|dp|dq|qi)\"\s*:\s*\"[A-Za-z0-9+/\-_]{20,}={0,2}\"")
+
+    def search(self, data: bytes) -> re.Match[bytes] | None:
+        """The private member's match when a `kty` accompanies it anywhere in `data`, else None."""
+        if not (private := self._PRIVATE.search(data)):
+            return None
+        return private if self._KTY.search(data) else None
+
 
 # Read in bounded chunks so a large dataset member is never held in memory whole. This costs no
 # more I/O than the publish already pays: `_tar_b64` reads every one of these bytes to gzip them.
@@ -371,6 +301,113 @@ _UNREADABLE_ARCHIVE = (
     # half-written shard in a dataset directory is ordinary, and crashing on it would be a worse
     # bug than the hole being closed.
     tarfile.TarError,
+)
+
+
+# A PEM header only means a key is present when the BODY follows it. The header alone is something
+# documentation says -- "if you see -----BEGIN RSA PRIVATE KEY----- in a log, redact it" -- and
+# refusing on it blocks a legitimate publish over prose about credentials. Requiring a base64 line
+# after the header keeps every real key (they all carry one) and drops the mention of one.
+#
+# The second alternative is the encrypted form, whose body is preceded by RFC 1421 headers instead
+# of starting with base64. It names those two headers exactly: a general `[A-Za-z-]+:` also accepts
+# `Warning:` or `Note:`, which is prose about a key rather than a key, and reopens the very false
+# positive the base64 requirement exists to close.
+_LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
+    #
+    # `(?: BLOCK)?` because OpenPGP armours as `-----BEGIN PGP PRIVATE KEY BLOCK-----`. Without it
+    # the trailing word made the header unmatchable and a `gpg --export-secret-keys --armor` file
+    # published intact -- `[A-Z ]*` reaches `PGP PRIVATE KEY`, but nothing followed ` BLOCK`.
+    #
+    # `_ARMOR_HEADERS` skips the RFC 4880 armor headers that sit between the BEGIN line and the
+    # body. Requiring base64 IMMEDIATELY after the header caught only the headerless export: an
+    # armour carrying `Version:` or `Comment:` -- what most implementations emit, and what a
+    # hand-annotated backup carries -- went undetected again.
+    #
+    # Those five keys are named exactly, for the same reason `Proc-Type:`/`DEK-Info:` are below. A
+    # general `[A-Za-z-]+:` would also skip `Warning:` and `Note:`, which is prose about a key
+    # rather than a key, and reopens the false positive the base64 requirement exists to close.
+    (
+        "a private key block",
+        re.compile(
+            rb"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\r\n\s]*"
+            rb"(?:(?:Version|Comment|MessageID|Hash|Charset):[^\r\n]*[\r\n\s]*)*"
+            rb"(?:[A-Za-z0-9+/=]{32,}|Proc-Type:|DEK-Info:)"
+        ),
+    ),
+    # The same key in DER: the binary encoding a PEM block base64-wraps. `openssl ... -outform DER`
+    # writes it, and it carries no text marker at all, so the PEM pattern above cannot see it.
+    #
+    # Anchored on the ASN.1 that distinguishes a private key from a public one rather than on the
+    # algorithm OID alone, which a certificate or public key carries too. In PKCS#8 that is the
+    # `INTEGER 0` version field preceding the AlgorithmIdentifier (a SubjectPublicKeyInfo has no
+    # version); in PKCS#1 it is the same version INTEGER before the modulus; in SEC1 it is
+    # `INTEGER 1` followed by the private scalar as an OCTET STRING of a curve-sized length.
+    (
+        "a private key",
+        re.compile(
+            # PKCS#8 PrivateKeyInfo, by algorithm: RSA, the RFC 8410 curves, EC.
+            #
+            # The RFC 8410 OIDs are `1.3.101.{110,111,112,113}` = X25519, X448, Ed25519, Ed448,
+            # whose final byte is 0x6e, 0x6f, 0x70, 0x71. Naming only the 25519 pair let a real
+            # Ed448 or X448 key publish intact; the four are one contiguous range.
+            # DSA is `1.2.840.10040.4.1` (`2a 86 48 ce 38 04 01`). Its AlgorithmIdentifier is a
+            # SEQUENCE rather than the 1-byte length the others use, so the `\x30.` above does not
+            # cover it: `openssl pkcs8 -topk8 -nocrypt -outform DER` on a real 1024-bit DSA key
+            # produced a file every branch here passed as clean.
+            rb"\x02\x01\x00\x30.\x06(?:\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
+            rb"|\x03\x2b\x65[\x6e-\x71]|\x07\x2a\x86\x48\xce\x3d\x02\x01)"
+            # DSA `1.2.840.10040.4.1` and DH `1.2.840.113549.1.3.1`, each across the three
+            # AlgorithmIdentifier length forms. DH is `dhKeyAgreement`: `openssl genpkey
+            # -paramfile` writes it, `openssl pkey -check` accepts it, and every branch above
+            # passed the resulting DER as clean.
+            rb"|\x02\x01\x00\x30(?:\x82..|\x81.|[\x00-\x7f])\x06"
+            rb"(?:\x07\x2a\x86\x48\xce\x38\x04\x01|\x09\x2a\x86\x48\x86\xf7\x0d\x01\x03\x01)"
+            # PKCS#1 RSAPrivateKey: version 0 then the modulus INTEGER, whose length may be stated
+            # in any of DER's three forms. Requiring `\x02\x82` recognised only 2048-bit and larger
+            # keys: `openssl rsa -outform DER -traditional` writes `02 81 81` for a 1024-bit key
+            # and a short-form `02 41` for a 512-bit one, so both published intact. `0x81` and
+            # `0x82` introduce a 1- and 2-byte length; a short form below 0x80 IS the length, and
+            # is bounded from 0x40 up so an ordinary `02 01 00 02 xx` byte sequence does not match.
+            rb"|\x30\x82..\x02\x01\x00\x02(?:\x82..|\x81.|[\x40-\x7f])\x00"
+            # SEC1 ECPrivateKey: version 1, a curve-sized scalar, then the [0] curve parameters
+            rb"|\x02\x01\x01\x04(?:\x20.{32}|\x30.{48}|\x42.{66})\xa0"
+            # EncryptedPrivateKeyInfo: `openssl pkcs8 -topk8 -passout` in DER. The plaintext key is
+            # inside an OCTET STRING, so none of the structures above appear anywhere in the file
+            # and it published intact -- the ARMOURED form of the same key was caught by its
+            # `-----BEGIN ENCRYPTED PRIVATE KEY-----` header, which made DER the way past.
+            #
+            # Anchored on the encryption-algorithm OID in the AlgorithmIdentifier: PBES2
+            # (1.2.840.113549.1.5.13) or a pkcs-12 PBE (1.2.840.113549.1.12.1.x). A passphrase is
+            # not much protection for a key in a public repository, and the OIDs appear only in a
+            # key that is actually encrypted.
+            rb"|\x30.{1,4}?\x30.\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0d"
+            rb"|\x30.{1,4}?\x30.\x06\x0a\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x01.",
+            re.DOTALL,
+        ),
+    ),
+    # The same key as a JSON Web Key. Node's `privateKey.export({format: "jwk"})` and every JOSE
+    # library write this, `.json` and `.jwk` are ordinary publishable files, and the encoding
+    # carries neither a PEM header nor DER structure -- so a complete RSA or EC private key passed
+    # every check above as clean.
+    #
+    # Anchored on the PRIVATE members, not on JWK-ness: a public JWK is meant to be shared and
+    # differs only by their absence. `d` is the private exponent or scalar in every key type; for
+    # RSA the CRT parameters accompany it. Requiring a `kty` alongside keeps this off arbitrary
+    # JSON that happens to carry a short `"d"` field.
+    (
+        "a private key",
+        # Two independent markers rather than one pattern spanning both. Requiring them within a
+        # window of each other was wrong in both directions: JWK members may appear in any order
+        # with arbitrary extension members between them, so 5 KiB of metadata between `kty` and
+        # `d` published a real RSA key; and the `[\s\S]{0,4096}?` that spanned the gap backtracked
+        # over every position of a near-matching body, which took 4.2 seconds per MiB of
+        # `"kty":"RSA",` repeated -- about 18 minutes for a permitted 256 MiB package.
+        #
+        # Order-independent and window-free, so it is exact on a real key either way round, and
+        # each half is anchored on a literal that fails fast on ordinary JSON.
+        _JwkPrivateKey(),
+    ),
 )
 
 
@@ -608,7 +645,9 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
             # Past any skippable frames first: zstd and LZ4 both allow a metadata envelope before
             # the real frame, and a head-only check saw that envelope's magic, matched neither
             # list, and passed the compressed frame behind it through as ordinary content.
-            head = _after_skippable_frames(chunk[:_SKIPPABLE_SCAN_BYTES])
+            head, truncated = _after_skippable_frames(chunk[:_SKIPPABLE_SCAN_BYTES])
+            if truncated:
+                raise _Unscannable("begins with a frame prelude too long to read past")
             for magic, fmt in _UNEXPANDABLE_MAGIC:
                 if head.startswith(magic):
                     raise _Unscannable(f"contains a {fmt} archive this check cannot expand")
@@ -833,13 +872,16 @@ def credential_in_file(path: Path, *, deadline: float | None = None) -> str | No
     Raises `_Unscannable` if an archive is too expensive to finish expanding, which the
     caller turns into a refusal: unverifiable is not the same as clean.
     """
-    with path.open("rb") as handle:
-        # no deadline on the file's own bytes: that read is bounded by the package size limit
-        if kind := _scan_stream(handle):
-            return kind
-    # `is_zipfile` is consulted inside, so a self-extracting archive is expanded despite its stub
     if deadline is None:
         deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
+    with path.open("rb") as handle:
+        # The package budget covers the file's own bytes too. Leaving it off looked safe because
+        # the read is bounded by the package size limit, but the limit bounds BYTES and this
+        # bounds TIME: matching cost is not uniform per byte, so a large file of adversarial
+        # near-matches held a worker far longer than its size suggested.
+        if kind := _scan_stream(handle, deadline=deadline):
+            return kind
+    # `is_zipfile` is consulted inside, so a self-extracting archive is expanded despite its stub
     return _credential_in_container(path, deadline=deadline, depth=1)
 
 
@@ -878,10 +920,13 @@ def _redacted(name: str) -> str:
     masked = name.encode("utf-8", "surrogatepass")
     for _kind, pattern in _TOKEN_PATTERNS + _ASSIGNED_PATTERNS:
         masked = pattern.sub(_mask, masked)
-    # A name detected only through base64 has no plaintext body to mask, so masking cannot help:
-    # printing any of it prints the encoded key. Withhold the name and give the author the
-    # directory instead, which is enough to find a file they just tried to publish.
-    if _match_base64(masked):
+    # A name detected only through base64, or as a whole key structure, has no plaintext body to
+    # mask, so masking cannot help: printing any of it prints the key. A compact private JWK fits
+    # in a 129-character filename, and every pattern above left it untouched, so the refusal
+    # printed the complete Ed25519 scalar to the terminal and any collected logs. Withhold the
+    # name and give the author the directory instead, which is enough to find a file they just
+    # tried to publish.
+    if any(pattern.search(masked) for _kind, pattern in _LITERAL_PATTERNS) or _match_base64(masked):
         parent = name.rsplit("/", 1)[0] if "/" in name else ""
         return (
             f"{parent}/<a file whose name encodes a credential>"

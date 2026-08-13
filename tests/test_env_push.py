@@ -3669,3 +3669,157 @@ def test_a_directory_the_scan_cannot_enter_is_refused(tmp_path):
             reject_credential_bearing_package(package, display={})
     finally:
         hidden.chmod(0o755)
+
+
+def test_a_frame_prelude_too_long_to_read_past_refuses(tmp_path):
+    """A skippable frame bigger than the lookahead must not read as "not compressed at all".
+
+    zstd and LZ4 both allow a metadata envelope before the real frame, and the format check reads a
+    bounded prefix. A frame declaring more payload than that prefix holds sliced the lookahead to
+    empty, which matched no magic, so the compressed frame behind it was treated as ordinary
+    content and a credential inside it published. The size is attacker-chosen, so the bound cannot
+    be raised out of the problem; running out has to refuse instead.
+    """
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    zstd = bytes([0x28, 0xB5, 0x2F, 0xFD])
+    for payload in (8, 70 << 10):
+        frame = (
+            bytes([0x50, 0x2A, 0x4D, 0x18]) + (payload).to_bytes(4, "little") + b"\x00" * payload
+        )
+        stream = tmp_path / f"prelude-{payload}.zst"
+        stream.write_bytes(frame + zstd + b"\x11" * 256)
+        with pytest.raises(_Unscannable):
+            credential_in_file(stream)
+
+    # a file that merely opens with the skippable magic and is not compressed still publishes
+    ordinary = tmp_path / "not-compressed.bin"
+    ordinary.write_bytes(
+        bytes([0x50, 0x2A, 0x4D, 0x18]) + (4).to_bytes(4, "little") + b"abcd" + b"plain\n" * 20
+    )
+    assert credential_in_file(ordinary) is None
+
+
+def test_a_private_jwk_is_found_however_far_its_members_sit_apart(tmp_path):
+    """JWK members may appear in any order with arbitrary extension members between them.
+
+    Requiring `kty` and the private member within a window of each other was wrong twice over: 5
+    KiB of metadata between them published a real RSA key, and the span that bridged the gap
+    backtracked over every position of a near-match, which cost 4.2 seconds per MiB of
+    `"kty":"RSA",` repeated -- roughly 18 minutes for a permitted 256 MiB package.
+    """
+    from flash.env_secrets import credential_in_file
+
+    scalar = "a1B2c3D4" * 8
+    for name, body in (
+        ("compact.jwk", f'{{"kty":"RSA","d":"{scalar}"}}'),
+        ("padded.jwk", f'{{"kty":"RSA","note":"{"x" * 5000}","d":"{scalar}"}}'),
+        ("reordered.jwk", f'{{"d":"{scalar}","note":"{"y" * 5000}","kty":"EC"}}'),
+    ):
+        key = tmp_path / name
+        key.write_text(body)
+        assert credential_in_file(key) == "a private key", name
+
+    # a PUBLIC jwk carries no private member and must still publish, however large
+    public = tmp_path / "public.jwk"
+    public.write_text(f'{{"kty":"RSA","n":"{"n" * 5000}","e":"AQAB"}}')
+    assert credential_in_file(public) is None
+
+
+def test_a_dh_private_key_in_der_is_detected(tmp_path):
+    """`dhKeyAgreement` is a PKCS#8 algorithm like any other, and its key is just as private.
+
+    Enumerating RSA, the RFC 8410 curves, EC and DSA left `1.2.840.113549.1.3.1` uncovered, so a
+    key `openssl pkey -check` accepts published intact.
+    """
+    from flash.env_secrets import credential_in_file
+
+    # PrivateKeyInfo: version 0, then the dhKeyAgreement AlgorithmIdentifier
+    der = tmp_path / "dh.der"
+    der.write_bytes(
+        b"\x30\x82\x01\x21\x02\x01\x00\x30\x81\x95\x06\x09"
+        b"\x2a\x86\x48\x86\xf7\x0d\x01\x03\x01" + b"\x00" * 64
+    )
+    assert credential_in_file(der) == "a private key"
+
+
+def test_a_filename_that_is_itself_a_private_key_is_never_echoed(tmp_path):
+    """The refusal must not print the key it is refusing.
+
+    A compact private JWK fits in a 129-character filename. Masking covered only the token and
+    assignment patterns, so the key structures were echoed verbatim -- the refusal printed a
+    complete Ed25519 private scalar to the terminal and anything collecting its output.
+    """
+    from flash.env_secrets import _redacted, credential_in_name
+
+    scalar = "ntpBr8-RhhOkeezY5aeBh2wrN4xaQ-CIq0s6j_A26FQ"
+    name = f'keys/{{"crv":"Ed25519","d":"{scalar}","kty":"OKP"}}'
+    assert credential_in_name(name) == "a private key"
+    redacted = _redacted(name)
+    assert scalar not in redacted
+    assert "keys/" in redacted  # the directory survives so the author can find it
+
+    # ordinary names are untouched, and a token keeps its issuer prefix for the same reason
+    assert _redacted("data/train.jsonl") == "data/train.jsonl"
+    assert _redacted(f"cache-fslo_{_FAKE_KEY_BODY}.json") == "cache-fslo_***.json"
+
+
+def test_a_zip64_member_count_cannot_be_forged_downward(tmp_path):
+    """A zip64 archive states its total in 64 bits, so forging it needs no `0xffff` sentinel.
+
+    The directory walk that defeats a forged classic count was computed and then discarded on the
+    zip64 branch -- exactly the archives large enough for the bound to matter. A 70,000-entry
+    archive patched to claim one member reported one while `ZipFile` still materialized all of
+    them, restoring the memory cost the pre-check exists to avoid.
+    """
+    import struct
+    import zipfile
+
+    from flash.env_formats import _zip_member_count
+
+    archive = tmp_path / "many.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED, allowZip64=True) as writing:
+        for index in range(70_000):
+            writing.writestr(f"f{index}", b"")
+    raw = bytearray(archive.read_bytes())
+    record = raw.rfind(b"PK\x06\x06")
+    raw[record + 24 : record + 32] = struct.pack("<Q", 1)
+    raw[record + 32 : record + 40] = struct.pack("<Q", 1)
+    archive.write_bytes(bytes(raw))
+
+    assert _zip_member_count(archive, 100) > 100
+
+    # an ordinary zip64 archive under the limit still reports its real, small count
+    small = tmp_path / "few.zip"
+    with zipfile.ZipFile(small, "w", zipfile.ZIP_STORED, allowZip64=True) as writing:
+        writing.writestr("a.txt", b"hello")
+        writing.writestr("b.txt", b"world")
+    assert _zip_member_count(small, 100) == 2
+
+
+def test_the_package_deadline_bounds_the_raw_file_scan(tmp_path):
+    """The size limit bounds bytes; only the deadline bounds time.
+
+    Matching cost is not uniform per byte, so a large file of adversarial near-matches held a
+    worker far longer than its size suggested while the budget was applied only to decompression.
+    """
+    import contextlib
+    import time
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    adversarial = tmp_path / "slow.json"
+    adversarial.write_bytes(b'"kty":"RSA",' * ((4 << 20) // 12))
+    started = time.monotonic()
+    # refusing is the fail-closed outcome; returning None inside the budget is also fine
+    with contextlib.suppress(_Unscannable):
+        credential_in_file(adversarial, deadline=time.monotonic() + 0.5)
+    assert time.monotonic() - started < 30
+
+    # a real key is still found, and an ordinary file still publishes
+    key = tmp_path / "key.jwk"
+    key.write_text('{"kty":"RSA","d":"' + "a1B2c3D4" * 8 + '"}')
+    assert credential_in_file(key) == "a private key"
+    ordinary = tmp_path / "rows.jsonl"
+    ordinary.write_bytes(b'{"text":"ordinary training row"}\n' * 20_000)
+    assert credential_in_file(ordinary) is None
