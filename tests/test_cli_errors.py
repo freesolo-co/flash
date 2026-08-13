@@ -143,17 +143,15 @@ def test_unexpected_error_suggestion_redacts_abbreviated_credential_flags():
         assert parser.parse_args(argv).api_key == "fs_SUPERSECRET", "abbreviation must be real"
         assert not any("fs_SUPERSECRET" in part for part in _redacted_args(argv))
 
-    # the HF token on `models export` uses the same flag name and needs the same coverage.
-    export = _redacted_args(["models", "export", "--api-k", "hf_SUPERSECRET"])
-    assert not any("hf_SUPERSECRET" in part for part in export)
-
-    # `--api` is ambiguous (--api-key vs --api-url), so argparse binds nothing and there is no
-    # value to leak. redaction agrees with the parser rather than inventing a match.
-    ambiguous_accepted = False
-    with contextlib.suppress(SystemExit):
-        parser.parse_args(["login", "--api", "fs_SUPERSECRET"])
-        ambiguous_accepted = True
-    assert not ambiguous_accepted, "an ambiguous abbreviation must not bind a credential"
+    # which prefixes are ambiguous depends on the SUBPARSER. `flash login` also defines --api-url,
+    # so `--api` is refused there; `flash models export` does not, so `--ap`, `--api` and `--api-`
+    # are all accepted and bind the HuggingFace token. the required args are supplied because an
+    # incomplete command exits on those first, which hides whether the abbreviation was accepted.
+    export = ["models", "export", "--adapter-id", "a1", "--repository", "alice/m"]
+    for flag in ("--ap", "--api", "--api-", "--api-k", "--api-key"):
+        for argv in ([*export, flag, "hf_SUPERSECRET"], [*export, f"{flag}=hf_SUPERSECRET"]):
+            assert parser.parse_args(argv).api_key == "hf_SUPERSECRET", f"{flag} must bind"
+            assert not any("hf_SUPERSECRET" in part for part in _redacted_args(argv))
 
 
 def test_train_without_login_fails_fast():

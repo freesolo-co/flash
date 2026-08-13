@@ -64,10 +64,6 @@ from flash.core.catalog import ALGORITHMS
 # argv flags whose VALUE is a credential, so it must never be echoed back to the user. both the
 # freesolo key (`flash login`) and the HuggingFace token (`flash models export`) use this name.
 _CREDENTIAL_FLAGS = frozenset({"--api-key"})
-# long options that share a prefix with a credential flag and would make an abbreviation ambiguous.
-# argparse refuses an ambiguous abbreviation, so it never binds a value and cannot leak one; this
-# only exists so the redaction agrees with the parser about which spellings are real.
-_CREDENTIAL_PREFIX_RIVALS = frozenset({"--api-url"})
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
@@ -864,17 +860,17 @@ def _is_credential_flag(arg: str) -> bool:
     `api_key`. Matching the full spelling exactly would leave those spellings unredacted and print
     the key -- the redaction would look correct while missing every abbreviated invocation.
 
-    A bare prefix is deliberately NOT enough: `--api` is ambiguous between `--api-key` and
-    `--api-url`, so argparse rejects it and no value is ever bound. Redacting it anyway would be
-    harmless here, but requiring a unique match keeps this in step with what the parser accepts.
+    Ambiguity is deliberately NOT consulted. Whether `--api` is ambiguous depends on the SUBPARSER:
+    `flash login` also defines `--api-url` so argparse refuses it there, but `flash models export`
+    defines no such option, so `--ap`, `--api` and `--api-` are all unambiguous there and bind the
+    HuggingFace token. Judging ambiguity against a fixed rival list gets that case exactly backwards
+    and leaves the token printable. Erring the other way is free: if the parser does reject the
+    spelling, nothing was bound, and redacting an argument in an already-failing command loses
+    nothing.
     """
     if not arg.startswith("--") or len(arg) <= 2:
         return False
-    if not any(flag.startswith(arg) for flag in _CREDENTIAL_FLAGS):
-        return False
-    # ambiguity is judged against the rival options too: `--api` matches `--api-key` here, but
-    # argparse still refuses it because `--api-url` also starts that way.
-    return not any(rival.startswith(arg) for rival in _CREDENTIAL_PREFIX_RIVALS)
+    return any(flag.startswith(arg) for flag in _CREDENTIAL_FLAGS)
 
 
 def _redacted_args(raw_args: list[str]) -> list[str]:
