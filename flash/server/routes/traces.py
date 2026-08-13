@@ -231,27 +231,25 @@ def _local_schema_pointer(ref: str) -> tuple[str, ...] | None:
     return segments if segments and segments[0] in {"$defs", "definitions"} else None
 
 
-def _secret_schema_definition_refs(value: Any, *, depth: int) -> set[tuple[str, ...]]:
-    if (
-        depth >= platform_traces._MAX_PAYLOAD_DEPTH
-        or not isinstance(value, dict)
-        or not isinstance(value.get("properties"), dict)
-    ):
+def _secret_schema_definition_refs(value: Any) -> set[tuple[str, ...]]:
+    if not isinstance(value, dict) or not isinstance(value.get("properties"), dict):
         return set()
     refs: set[tuple[str, ...]] = set()
 
-    def collect_refs(node: Any, node_depth: int) -> None:
+    def collect_refs(node: Any, node_depth: int) -> set[tuple[str, ...]]:
         if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-            return
+            return set()
+        found: set[tuple[str, ...]] = set()
         if isinstance(node, dict):
             ref = node.get("$ref")
             if isinstance(ref, str) and (pointer := _local_schema_pointer(ref)) is not None:
-                refs.add(pointer)
+                found.add(pointer)
             for item in node.values():
-                collect_refs(item, node_depth + 1)
+                found.update(collect_refs(item, node_depth + 1))
         elif isinstance(node, list | tuple):
             for item in node:
-                collect_refs(item, node_depth + 1)
+                found.update(collect_refs(item, node_depth + 1))
+        return found
 
     def collect_secret_properties(node: Any, node_depth: int) -> None:
         if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
@@ -261,14 +259,31 @@ def _secret_schema_definition_refs(value: Any, *, depth: int) -> set[tuple[str, 
             if isinstance(properties, dict):
                 for key, schema in properties.items():
                     if _is_secret_key(key) and _is_schema_definition(schema):
-                        collect_refs(schema, node_depth + 1)
-            for item in node.values():
-                collect_secret_properties(item, node_depth + 1)
+                        refs.update(collect_refs(schema, 0))
+                    collect_secret_properties(schema, node_depth + 1)
+            for key, item in node.items():
+                if key != "properties":
+                    collect_secret_properties(item, node_depth + 1)
         elif isinstance(node, list | tuple):
             for item in node:
                 collect_secret_properties(item, node_depth + 1)
 
-    collect_secret_properties(value, depth)
+    def resolve(pointer: tuple[str, ...]) -> Any:
+        target: Any = value
+        for segment in pointer:
+            if not isinstance(target, dict) or segment not in target:
+                return None
+            target = target[segment]
+        return target
+
+    collect_secret_properties(value, 0)
+    pending = list(refs)
+    while pending:
+        target = resolve(pending.pop())
+        for pointer in collect_refs(target, 0):
+            if pointer not in refs:
+                refs.add(pointer)
+                pending.append(pointer)
     return refs
 
 
@@ -289,7 +304,7 @@ def _redact_secret_fields(
     if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
         return "[redacted]"
     if isinstance(value, dict):
-        local_secret_schema_refs = _secret_schema_definition_refs(value, depth=depth)
+        local_secret_schema_refs = _secret_schema_definition_refs(value)
         active_secret_schema_refs = (secret_schema_refs or set()) | local_secret_schema_refs
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
@@ -373,12 +388,16 @@ def _sanitize_for_trace(value: Any, secrets: tuple[str, ...], *, response: bool 
     return _redact_secret_values(_redact_secret_fields(value, response_root=response), secrets)
 
 
-def _safe_provider_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
+def _safe_provider_response_headers(
+    headers: Mapping[str, str], *, status_code: int
+) -> dict[str, str]:
     safe: dict[str, str] = {}
     for name, value in headers.items():
         normalized = name.casefold()
-        if normalized in _SAFE_PROVIDER_RESPONSE_HEADERS or normalized.startswith(
-            _SAFE_PROVIDER_RESPONSE_HEADER_PREFIXES
+        if (
+            normalized in _SAFE_PROVIDER_RESPONSE_HEADERS
+            or normalized.startswith(_SAFE_PROVIDER_RESPONSE_HEADER_PREFIXES)
+            or (300 <= status_code < 400 and normalized == "location")
         ):
             safe[name] = value
     return safe
@@ -659,7 +678,9 @@ async def _non_streaming_response(
     except httpx.HTTPError:
         return await _upstream_failure_response(context)
 
-    response_headers = _safe_provider_response_headers(upstream_headers)
+    response_headers = _safe_provider_response_headers(
+        upstream_headers, status_code=upstream_status
+    )
     if response_too_large:
         await _record_trace(context, output_payload=None, error=_UPSTREAM_TOO_LARGE_ERROR)
         response_headers["content-type"] = "application/json"
@@ -853,7 +874,9 @@ async def chat_completions(
         except httpx.HTTPError:
             await client.aclose()
             return await _upstream_failure_response(context)
-        response_headers = _safe_provider_response_headers(upstream_response.headers)
+        response_headers = _safe_provider_response_headers(
+            upstream_response.headers, status_code=upstream_response.status_code
+        )
         response_headers.update({"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
         media_type: str | None = "text/event-stream"
         # relay the provider's own content type whenever the body is not an event stream, whatever

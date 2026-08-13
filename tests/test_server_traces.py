@@ -643,6 +643,22 @@ def test_repeated_sse_envelope_fields_do_not_consume_the_stream_budget() -> None
     assert accumulator.output()["choices"][0]["message"]["content"] == fragment * 512
 
 
+def test_distinct_sse_delta_field_names_count_toward_the_stream_budget() -> None:
+    budget = 5_000
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=budget)
+
+    for index in range(2_000):
+        field = f"extension_{index}_" + "x" * 200
+        event = json.dumps({"choices": [{"index": 0, "delta": {field: ""}}]}).encode()
+        accumulator.feed(b"data: " + event + b"\n\n")
+        if accumulator.truncated:
+            break
+
+    assert accumulator.truncated is True
+    assert accumulator.defect is None
+    assert len(json.dumps(accumulator.output()).encode()) <= budget
+
+
 def test_finish_reasons_count_toward_the_stream_budget() -> None:
     budget = 100_000
     accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=budget)
@@ -1028,14 +1044,22 @@ def test_a_redirect_is_recorded_but_not_exported_as_a_training_target(
     _StaticAsyncClient.response = httpx.Response(
         307,
         content=redirect_body,
-        headers={"content-type": "text/html", "location": "https://provider.example/login"},
+        headers={
+            "content-type": "text/html",
+            "location": "https://provider.example/login",
+            "set-cookie": "unsafe=1",
+        },
     )
     monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
 
-    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json=_REQUEST, follow_redirects=False
+    )
 
     assert response.status_code == 307
     assert response.content == redirect_body
+    assert response.headers["location"] == "https://provider.example/login"
+    assert "set-cookie" not in response.headers
     raw = _raw(trace_api)
     span = raw["records"][0]["spans"][0]
     assert span["status_code"] == "ERROR"
@@ -2825,20 +2849,43 @@ def test_secret_schema_local_pointer_literals_are_redacted(
     assert stored["default"] == "[redacted]"
 
 
-def test_deeply_nested_secret_named_schema_ref_reaches_root_definitions(
-    trace_api, monkeypatch
+@pytest.mark.parametrize(
+    ("nesting", "transitive"),
+    [
+        (0, False),
+        (8, False),
+        (9, False),
+        (10, False),
+        (11, False),
+        (12, False),
+        (0, True),
+        (9, True),
+        (11, True),
+    ],
+    ids=lambda value: str(value).casefold(),
+)
+def test_deep_secret_schema_refs_redact_only_reachable_definitions(
+    trace_api, monkeypatch, nesting: int, transitive: bool
 ) -> None:
     secret = "third-party-secret-abc123"
-    schema = {
-        "type": "object",
-        "properties": {
-            "profile": {
-                "type": "object",
-                "properties": {"password": {"$ref": "#/$defs/Benign"}},
-            }
+    property_ref = "#/$defs/Outer" if transitive else "#/$defs/Leaf"
+    nested_schema = {"properties": {"password": {"$ref": property_ref}}}
+    for _ in range(nesting):
+        nested_schema = {"type": "object", "properties": {"lvl": nested_schema}}
+    definitions = {
+        "Leaf": {
+            "type": "string",
+            "default": secret,
+            "const": secret,
+            "enum": [secret],
+            "examples": [secret],
+            "example": secret,
         },
-        "$defs": {"Benign": {"type": "string", "default": secret}},
+        "Sibling": {"type": "string", "default": "ordinary-default"},
     }
+    if transitive:
+        definitions["Outer"] = {"$ref": "#/$defs/Leaf"}
+    schema = {**nested_schema, "$defs": definitions}
     _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
     monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
 
@@ -2852,10 +2899,17 @@ def test_deeply_nested_secret_named_schema_ref_reaches_root_definitions(
     )
 
     assert response.status_code == 200
-    stored_schema = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]["response_format"][
-        "json_schema"
-    ]["schema"]
-    assert stored_schema["$defs"]["Benign"]["default"] == "[redacted]"
+    stored_definitions = _raw(trace_api)["records"][0]["spans"][0]["input_payload"][
+        "response_format"
+    ]["json_schema"]["schema"]["$defs"]
+    leaf = stored_definitions["Leaf"]
+    assert leaf["type"] == "string"
+    assert leaf["default"] == "[redacted]"
+    assert leaf["const"] == "[redacted]"
+    assert leaf["enum"] == ["[redacted]"]
+    assert leaf["examples"] == ["[redacted]"]
+    assert leaf["example"] == "[redacted]"
+    assert stored_definitions["Sibling"]["default"] == "ordinary-default"
 
 
 def test_nested_secret_named_schema_ref_literals_are_redacted(trace_api, monkeypatch) -> None:
@@ -3317,6 +3371,7 @@ def test_a_streamed_redirect_stays_raw_even_when_recording_fails(trace_api, monk
                 headers={
                     "content-type": "text/html; charset=utf-8",
                     "location": "https://provider.example/login",
+                    "set-cookie": "unsafe=1",
                 },
                 stream=type(self).body,
                 request=request,
@@ -3333,11 +3388,16 @@ def test_a_streamed_redirect_stays_raw_even_when_recording_fails(trace_api, monk
     monkeypatch.setattr(traces, "store_trace", _capture)
 
     response = trace_api.post(
-        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+        "/v1/chat/completions",
+        headers=_HEADERS,
+        json={**_REQUEST, "stream": True},
+        follow_redirects=False,
     )
 
     assert response.status_code == 307
     assert response.headers["content-type"].startswith("text/html")
+    assert response.headers["location"] == "https://provider.example/login"
+    assert "set-cookie" not in response.headers
     assert response.content == redirect_body
     assert b"freesolo-record-failed" not in response.content
     span = stored[0]["spans"][0]

@@ -272,10 +272,12 @@ class SseAccumulator:
         # the explicit truncation marker remains the authoritative export signal.
         return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
 
-    def _reserve(self, value: Any) -> bool:
+    def _reserve(self, value: Any, *, retained_key: str | None = None) -> bool:
         if self.truncated or self._max_accumulated_bytes is None:
             return not self.truncated
         size = self._value_size(value)
+        if retained_key is not None:
+            size += self._value_size(retained_key) + 4
         if size > self._max_accumulated_bytes - self._accumulated_bytes:
             self.truncated = True
             return False
@@ -451,7 +453,8 @@ class SseAccumulator:
         for key, value in delta.items():
             if key in {"role", "function_call", "tool_calls"}:
                 continue
-            if not self._reserve(value):
+            retained_key = key if key not in message else None
+            if not self._reserve(value, retained_key=retained_key):
                 return
             if isinstance(value, dict) and isinstance(message.get(key), dict):
                 _merge_fragment_dict(message[key], value)
