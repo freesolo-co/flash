@@ -1475,6 +1475,37 @@ def test_alias_thinking_verification_targets_the_mutable_alias(monkeypatch):
     assert out["alias_thinking_latency_s"] >= 0.0
 
 
+def test_alias_thinking_verification_matches_the_smoke_request_shape(monkeypatch):
+    """Only the model id may differ from the revision smoke.
+
+    This asks a second model id with the same prompt; if the budget or the stop sequences differed
+    too, a failure here would be ambiguous between "the alias lost its reasoning" and "this request
+    was shaped differently". A run that terminates on a delimiter is the case that bites: without
+    its stops the generation runs past the answer to max_tokens.
+    """
+    spec = _smoke_spec(
+        algorithm="grpo",
+        thinking=True,
+        max_completion_tokens=8192,
+        stop_sequences=("</answer>",),
+    )
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("<think>2+2 is 4</think>The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    _run_smoke(spec)
+    serving._verify_alias_thinking("run-1", spec, _SMOKE_REVISION)
+
+    smoke_call, alias_call = calls
+    assert alias_call["stop"] == smoke_call["stop"] == ["</answer>"]
+    assert alias_call["max_tokens"] == smoke_call["max_tokens"]
+    assert alias_call["messages"] == smoke_call["messages"]
+    assert alias_call["temperature"] == smoke_call["temperature"]
+
+
 def test_alias_thinking_verification_rejects_a_silent_reasoning_channel(monkeypatch):
     """The reproduced shape: healthy generation, `finish_reason: stop`, and no reasoning at all."""
     monkeypatch.setattr(

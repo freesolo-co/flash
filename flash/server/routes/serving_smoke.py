@@ -437,15 +437,28 @@ def _verify_alias_thinking(
     """
     started = time.monotonic()
     deadline = started + budget_s
+    # the same budget and stop sequences the revision smoke just used: this asks a different model
+    # id, so any other difference would make a failure here ambiguous between the alias and the
+    # request. reasoning spends tokens before content, and a run that terminates on a delimiter
+    # rather than EOS otherwise generates past its answer to max_tokens.
+    train = getattr(spec, "train", None)
+    stop_sequences = [str(value) for value in (getattr(train, "stop_sequences", ()) or ())]
+    max_tokens = max(256, resolve_smoke_completion_tokens(spec))
+    capacity = serving_completion_token_capacity(
+        spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
+    )
+    if capacity is not None:
+        max_tokens = min(max_tokens, capacity)
 
     def _alias_call(timeout_s: float = budget_s):
         return _app.serve_chat(
             run_id=run_id,
             messages=[{"role": "user", "content": _SMOKE_PROMPT}],
             temperature=0.0,
-            max_tokens=resolve_smoke_completion_tokens(spec),
+            max_tokens=max_tokens,
             thinking=True,
             timeout_s=timeout_s,
+            stop=stop_sequences or None,
         )
 
     try:
