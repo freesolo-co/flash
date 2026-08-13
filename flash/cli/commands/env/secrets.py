@@ -126,6 +126,26 @@ _COMPRESSED_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7z
 # -- the largest here expands in about 3 seconds -- finishes long inside it.
 _MAX_DECOMPRESS_SECONDS = 60.0
 
+# Everything the standard library raises for an archive it cannot read. There is no single base
+# class to catch, and most of these are not OSError, so each omission crashed `flash env push` with
+# a traceback on an ordinary corrupt shard: an encrypted member raises RuntimeError, an
+# unimplemented compression method NotImplementedError, a corrupt deflate stream zlib.error, and a
+# corrupt xz lzma.LZMAError (which inherits straight from Exception).
+#
+# Shallow corruption is a trap when testing this: truncating near the end of an xz stream raises
+# EOFError, which was already caught, so the bug looks absent. The distinct error only appears when
+# the damage is deep enough that the decompressor rejects the data rather than running out of it.
+_UNREADABLE_ARCHIVE = (
+    OSError,
+    EOFError,
+    ValueError,
+    RuntimeError,
+    NotImplementedError,
+    zipfile.BadZipFile,
+    zlib.error,
+    lzma.LZMAError,
+)
+
 
 def _is_high_entropy(body: bytes) -> bool:
     """Whether a key body looks issued rather than hand-written.
@@ -213,24 +233,18 @@ def _credential_in_compressed(path: Path) -> str | None:
 
     A container that will not open is not an error, and neither is one that fails partway through
     reading. An unsupported, truncated or corrupt archive falls back to the literal scan of its own
-    bytes, which is the coverage it had before. Refusing to publish it, or crashing on it, would be
-    a worse bug than the hole being closed: a half-written shard in a dataset directory is ordinary.
-    The caught set is deliberately wide, because the standard library reports these through no
-    single base class: an encrypted member raises RuntimeError, a member compressed with a method
-    zipfile does not implement raises NotImplementedError, and a corrupt deflate stream raises
-    zlib.error -- none of which is an OSError, so each one aborted the publish with a traceback.
+    bytes, which is the coverage it had before. Crashing on it would be a worse bug than the hole
+    being closed: a half-written shard in a dataset directory is ordinary.
+
+    Each zip member is guarded SEPARATELY. Wrapping the whole loop meant one unreadable entry
+    abandoned every entry behind it, so a single encrypted member at the top of an archive hid a
+    real key further down and the publish succeeded -- the same silent-pass bypass the expansion
+    budget refuses, arriving through error handling instead.
     """
     deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
     try:
         if zipfile.is_zipfile(path):
-            with zipfile.ZipFile(path) as archive:
-                for info in archive.infolist():
-                    if info.is_dir():
-                        continue
-                    with archive.open(info) as member:
-                        if kind := _scan_stream(member, deadline=deadline):
-                            return kind
-            return None
+            return _credential_in_zip(path, deadline=deadline)
         with path.open("rb") as raw:
             header = raw.read(6)
         opener = {b"BZh": bz2.open, b"\xfd7zXZ\x00": lzma.open}.get(
@@ -239,16 +253,23 @@ def _credential_in_compressed(path: Path) -> str | None:
         )
         with opener(path, "rb") as stream:
             return _scan_stream(stream, deadline=deadline)
-    except (
-        OSError,
-        EOFError,
-        ValueError,
-        RuntimeError,
-        NotImplementedError,
-        zipfile.BadZipFile,
-        zlib.error,
-    ):
+    except _UNREADABLE_ARCHIVE:
         return None
+
+
+def _credential_in_zip(path: Path, *, deadline: float) -> str | None:
+    """The kind of credential in any readable member of a zip, or None."""
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            try:
+                with archive.open(info) as member:
+                    if kind := _scan_stream(member, deadline=deadline):
+                        return kind
+            except _UNREADABLE_ARCHIVE:
+                continue  # this member is opaque; the rest of the archive still gets scanned
+    return None
 
 
 def credential_in_file(path: Path) -> str | None:

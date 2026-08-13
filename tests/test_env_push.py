@@ -1993,6 +1993,105 @@ def test_push_refuses_an_archive_too_expensive_to_scan(monkeypatch, tmp_path, ca
     assert "too long to decompress" in capsys.readouterr().err
 
 
+def test_an_unreadable_zip_member_does_not_hide_the_members_behind_it(tmp_path):
+    """Each member is guarded separately, so one opaque entry cannot mask the rest.
+
+    Guarding the whole loop meant a single encrypted member at the top of an archive abandoned the
+    scan of everything after it, and a real key further down published with exit 0 -- the same
+    silent pass the expansion budget refuses, arriving through error handling instead.
+    """
+    import zipfile
+
+    from flash.cli.commands.env.secrets import credential_in_file
+
+    def _build(name: str, *, encrypt_first: bool):
+        path = tmp_path / name
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("aaa_first.txt", "harmless content " * 20)
+            archive.writestr("zzz_second.sh", f'export KEY="fslo_{_FAKE_KEY_BODY}"\n')
+        if not encrypt_first:
+            return path
+        # mark ONLY the first member encrypted, in both its headers
+        raw = bytearray(path.read_bytes())
+        for offset, signature in ((6, b"PK\x03\x04"), (8, b"PK\x01\x02")):
+            index = raw.find(signature)
+            raw[index + offset] |= 0x01
+        path.write_bytes(bytes(raw))
+        return path
+
+    # the control: without the bad member the key is found, so the archive itself is scannable
+    assert credential_in_file(_build("clean.zip", encrypt_first=False)) == "a Freesolo API key"
+    assert credential_in_file(_build("guarded.zip", encrypt_first=True)) == "a Freesolo API key"
+
+
+def test_every_member_unreadable_is_not_an_error(tmp_path):
+    import zipfile
+
+    from flash.cli.commands.env.secrets import credential_in_file
+
+    path = tmp_path / "opaque.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("only.txt", "x" * 200)
+    raw = bytearray(path.read_bytes())
+    for index in range(len(raw) - 4):
+        if raw[index : index + 4] == b"PK\x03\x04":
+            raw[index + 6] |= 0x01
+        elif raw[index : index + 4] == b"PK\x01\x02":
+            raw[index + 8] |= 0x01
+    path.write_bytes(bytes(raw))
+
+    assert credential_in_file(path) is None
+
+
+def test_a_corrupt_xz_does_not_crash_the_publish(tmp_path):
+    """`lzma.LZMAError` inherits straight from Exception, so it needs naming explicitly.
+
+    Shallow corruption is a trap here: truncating near the end of the stream raises EOFError, which
+    was already caught, and the bug looks absent. Only damage deep enough that the decompressor
+    rejects the data -- rather than running out of it -- produces LZMAError.
+    """
+    import lzma
+
+    from flash.cli.commands.env.secrets import _UNREADABLE_ARCHIVE, credential_in_file
+
+    assert issubclass(lzma.LZMAError, _UNREADABLE_ARCHIVE)
+
+    corrupt = tmp_path / "shard.xz"
+    good = lzma.compress(b"y" * 200_000)
+    middle = len(good) // 2
+    corrupt.write_bytes(
+        good[:middle] + bytes(b ^ 0xFF for b in good[middle : middle + 200]) + good[middle + 200 :]
+    )
+    assert credential_in_file(corrupt) is None
+
+    # a valid xz member is still expanded and scanned
+    valid = tmp_path / "valid.xz"
+    valid.write_bytes(lzma.compress(f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode()))
+    assert credential_in_file(valid) == "a Freesolo API key"
+
+
+def test_the_expansion_budget_is_not_swallowed_by_the_per_member_handler(monkeypatch, tmp_path):
+    """A timeout must still refuse, not be mistaken for an unreadable member and skipped."""
+    import zipfile
+
+    from flash.cli.commands.env import secrets
+    from flash.cli.commands.env.secrets import (
+        _UNREADABLE_ARCHIVE,
+        _ExpansionBudgetExceeded,
+        credential_in_file,
+    )
+
+    assert not issubclass(_ExpansionBudgetExceeded, _UNREADABLE_ARCHIVE)
+
+    path = tmp_path / "slow.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("big.txt", "\0" * (4 << 20))
+
+    monkeypatch.setattr(secrets, "_MAX_DECOMPRESS_SECONDS", -1.0)
+    with pytest.raises(_ExpansionBudgetExceeded):
+        credential_in_file(path)
+
+
 def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
     """`Warning:` is prose; `Proc-Type:` and `DEK-Info:` are RFC 1421 encrypted-key headers.
 
