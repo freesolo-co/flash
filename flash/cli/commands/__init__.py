@@ -394,6 +394,12 @@ def cmd_train(args) -> int:
         # equally not a verification -- so treat anything but an explicit True as unverified.
         affordability_verified = status.pop("affordability_verified", None) is True
         cost = "and cost" if affordability_verified else "but NOT cost"
+        # same rule as affordability above: an older server returns no budget, and claiming it was
+        # validated would hide exactly the defaulted-budget risk this signal exists to expose. only
+        # claim it when the response actually carried one.
+        budget_validated = (
+            ", prompt budget" if isinstance(status.get("prompt_budget"), dict) else ""
+        )
         environment = (
             "it did NOT import or run your environment.py. packaged input/output fields and the "
             "statically readable training contract were tokenized together; tokens, retention, "
@@ -406,7 +412,7 @@ def cmd_train(args) -> int:
         )
         print(
             "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
-            f"runtime-secret presence, warm-start source, serving context cap, prompt budget, "
+            f"runtime-secret presence, warm-start source, serving context cap{budget_validated}, "
             f"{cost}. {environment}",
             file=sys.stderr,
         )

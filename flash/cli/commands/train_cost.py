@@ -91,7 +91,7 @@ def _cmd_train_cost_offline(spec) -> int:
     # off. the derivation is pure spec arithmetic, so it agrees with the server's. the warm-start
     # source context is deliberately NOT passed -- this path cannot read the source run, and naming
     # a context it did not verify would be a claim rather than a measurement.
-    from flash.engine.plan.vram import rl_prompt_budget
+    from flash.engine.plan.prompt_budget import rl_prompt_budget
 
     _print_rl_prompt_budget_warning({"prompt_budget": rl_prompt_budget(spec)})
     return 0
@@ -204,7 +204,7 @@ def _print_rl_prompt_budget_warning(status: object) -> None:
     before a training gpu is allocated. The worker's own `dropped N prompts` line lands in the
     worker log only after allocation, which is too late to change the config for free.
     """
-    from flash.engine.plan.vram import rl_prompt_budget_warning
+    from flash.engine.plan.prompt_budget import rl_prompt_budget_warning
 
     budget = status.get("prompt_budget") if isinstance(status, dict) else None
     message = rl_prompt_budget_warning(budget)

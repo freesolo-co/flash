@@ -124,12 +124,18 @@ def prepare_job(
     estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
     # derive the rl prompt budget from the same resolved spec the quote is built from, so the
     # reported budget describes the run that was actually priced and submitted.
-    from flash.engine.plan.vram import rl_prompt_budget
+    from flash.engine.plan.prompt_budget import rl_prompt_budget
 
     prompt_budget = rl_prompt_budget(
         worker_spec,
+        # the SOURCE lookup reads public_spec, not worker_spec: _prepare_init_from_adapter has
+        # already rewritten worker_spec's init_from_adapter to the internal `<repo>:<phase>/...`
+        # storage locator, and parse_checkpoint_ref only accepts the public `<run_id>[/step-N]`
+        # grammar -- so passing worker_spec here silently resolves nothing and the warning could
+        # never name the context it exists to name. The budget itself still comes off worker_spec,
+        # which is the spec the quote and the run are built from.
         warm_start_context=_runner()._warmstart_source_context(
-            worker_spec, owner_org_id=owner_org_id, owner_key_id=owner_key_id
+            public_spec, owner_org_id=owner_org_id, owner_key_id=owner_key_id
         ),
     )
     return _runner().PreparedJob(

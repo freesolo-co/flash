@@ -750,12 +750,9 @@ def test_prompt_budget_report_equals_what_the_worker_derives() -> None:
     probe unavailable on the control plane. Clamping only ever SHRINKS the length, so the reported
     budget is an upper bound: it can never claim more room than the worker allows.
     """
+    from flash.engine.plan.prompt_budget import rl_prompt_budget
     from flash.engine.plan.recipe import RECIPE
-    from flash.engine.plan.vram import (
-        grpo_completion_len,
-        opd_completion_len,
-        rl_prompt_budget,
-    )
+    from flash.engine.plan.vram import grpo_completion_len, opd_completion_len
 
     def worker_budget(algorithm, ctx, completion, thinking):
         # mirrors train/rl/inputs.py:_resolve_sequence_lengths and opd_train_runner._prepare_prompts
@@ -798,8 +795,8 @@ def test_unset_context_reports_the_recipe_default_budget_and_warns() -> None:
     """The defaulted budget is the case the #1065 submit guard cannot see: it returns early when
     max_context_tokens is unset, so a run continuing an 8192-token sft silently trains at 2048
     (grpo) or 1024 (opd). Reporting it is the whole point of the field."""
+    from flash.engine.plan.prompt_budget import rl_prompt_budget, rl_prompt_budget_warning
     from flash.engine.plan.recipe import RECIPE
-    from flash.engine.plan.vram import rl_prompt_budget, rl_prompt_budget_warning
 
     grpo = rl_prompt_budget(_budget_spec("grpo", {"max_completion_tokens": 4096}))
     assert grpo["context_source"] == "recipe_default"
@@ -829,7 +826,7 @@ def test_prompt_budget_names_the_warm_start_context_it_does_not_inherit() -> Non
     unset and silently retrains at 2048, with nothing connecting the two numbers. The child does NOT
     inherit the source context (that would move sizing, allocation and cost), so the warning names
     it instead."""
-    from flash.engine.plan.vram import rl_prompt_budget, rl_prompt_budget_warning
+    from flash.engine.plan.prompt_budget import rl_prompt_budget, rl_prompt_budget_warning
 
     spec = _budget_spec("grpo", {"max_completion_tokens": 4096})
     budget = rl_prompt_budget(spec, warm_start_context=8192)
@@ -845,11 +842,54 @@ def test_prompt_budget_names_the_warm_start_context_it_does_not_inherit() -> Non
     assert "warm_start_context" not in rl_prompt_budget(spec)
 
 
+def test_warmstart_source_context_reads_the_public_reference(monkeypatch) -> None:
+    """The source lookup must be given the PUBLIC spec.
+
+    `_prepare_init_from_adapter` rewrites `worker_spec.train.init_from_adapter` into the internal
+    `<repo>:<phase>/<run_id>` storage locator, and `parse_checkpoint_ref` accepts only the public
+    `<run_id>[/step-N]` grammar. Handing the lookup a worker spec therefore resolves nothing and the
+    warning silently loses the context it exists to name -- a failure that looks exactly like "this
+    run has no warm start", which is why it needs its own test rather than an injected value.
+    """
+    from dataclasses import replace
+
+    import flash.runner as runner
+    from flash.schema import parse_checkpoint_ref
+
+    source = _budget_spec("grpo", {"max_context_tokens": 8192, "max_completion_tokens": 4096})
+    monkeypatch.setattr(runner, "get_status", lambda run_id: object())
+    monkeypatch.setattr(runner, "_warmstart_source_is_authorized", lambda *a, **k: True)
+    monkeypatch.setattr(runner, "effective_spec_from_status", lambda status: source)
+
+    public = _budget_spec("grpo", {"init_from_adapter": "run-source-1"})
+    assert parse_checkpoint_ref(public.train.init_from_adapter) is not None
+    assert runner._warmstart_source_context(public) == 8192
+
+    # the internal locator the worker spec carries is NOT parseable, so a caller that passes the
+    # worker spec gets None. This is the regression: it must not be what prepare_job hands over.
+    # built by hand because the schema rejects the internal grammar it is only ever assigned
+    # post-parse, inside _prepare_init_from_adapter.
+    internal = replace(
+        public,
+        train=replace(public.train, init_from_adapter="org/repo:adapters/run-source-1"),
+    )
+    assert parse_checkpoint_ref(internal.train.init_from_adapter) is None
+    assert runner._warmstart_source_context(internal) is None
+
+    # and prepare_job must hand over the public one, not the worker one.
+    import inspect
+
+    from flash.runner import submit as submit_mod
+
+    call = inspect.getsource(submit_mod.prepare_job)
+    assert "_warmstart_source_context(\n            public_spec" in call
+
+
 def test_sft_has_no_prompt_budget_because_it_truncates_instead_of_dropping() -> None:
     """sft shortens an over-long row and reports truncated_examples/untruncated_max_length through
     its workload profile. Emitting a drop-semantics budget for it would describe behaviour it does
     not have."""
-    from flash.engine.plan.vram import rl_prompt_budget, rl_prompt_budget_warning
+    from flash.engine.plan.prompt_budget import rl_prompt_budget, rl_prompt_budget_warning
 
     spec = spec_from_dict(
         {

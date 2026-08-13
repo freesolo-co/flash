@@ -190,7 +190,7 @@ class RunStatus:
     gpu_status: dict | None = None
     workload_profile_input_digest: str | None = None
     workload_profile: dict | None = None
-    # Submit-time derived grpo/opd prompt budget (flash.engine.plan.vram.rl_prompt_budget). The
+    # Submit-time derived grpo/opd prompt budget (flash.engine.plan.prompt_budget). The
     # workers DROP over-budget prompts rather than truncating them, and only say so in the worker
     # log after a gpu is already allocated -- so the budget and whether it was authored or defaulted
     # are recorded here, where --dry-run and `runs status` can show them before anything is paid for.
