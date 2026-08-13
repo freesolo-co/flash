@@ -199,19 +199,29 @@ _ZIP_TAIL_BYTES = (64 << 10) + 64
 # Length is instead bounded by `_decode_windows` below, which slides a window over the run.
 _BASE64_RUN = re.compile(rb"[A-Za-z0-9+/]{24,}={0,2}")
 
-# A fixed-width wrapped base64 block: two or more full-width lines, then a shorter final line. The
-# widths are the two conventions in use -- 76 for MIME (`base64.encodebytes`, mail, many
-# `kubectl -o yaml` outputs) and 64 for PEM bodies. Joining ONLY these leaves ordinary adjacent
-# lines alone, so no arbitrary pair of values is welded into a run that decodes to something
-# neither line contained.
+# A fixed-width wrapped base64 block: one or more full-width lines, then a final line of any
+# length. The widths are the two conventions in use -- 76 for MIME (`base64.encodebytes`, mail,
+# many `kubectl -o yaml` outputs) and 64 for PEM bodies. Joining ONLY these leaves ordinary
+# adjacent lines alone, so no arbitrary pair of values is welded into a run that decodes to
+# something neither line contained.
+#
+# ONE full line is enough to qualify, not two. Requiring two meant the commonest shape of all --
+# a blob just over the width, so one full line plus a short tail -- never joined, and a key
+# straddling its single break decoded into neither side.
+#
+# `\r?\n` because a Windows checkout or a YAML export wraps with CRLF, and matching only `\n` left
+# every CRLF blob unjoined. The `\r` is dropped along with the `\n` when the block is joined.
 _WRAPPED_BLOCK = re.compile(
-    rb"(?:[A-Za-z0-9+/]{76}\n){2,}[A-Za-z0-9+/]{1,76}={0,2}"
-    rb"|(?:[A-Za-z0-9+/]{64}\n){2,}[A-Za-z0-9+/]{1,64}={0,2}"
+    rb"(?:[A-Za-z0-9+/]{76}\r?\n)+[A-Za-z0-9+/]{1,76}={0,2}"
+    rb"|(?:[A-Za-z0-9+/]{64}\r?\n)+[A-Za-z0-9+/]{1,64}={0,2}"
 )
 # A necessary condition for the block above: a full-width line of base64 followed by a break. Cheap
 # to reject, and it fails on essentially every real file, so the expensive alternation only runs
 # where a wrapped block could actually be.
-_WRAPPED_HINT = re.compile(rb"[A-Za-z0-9+/]{64}\n")
+_WRAPPED_HINT = re.compile(rb"[A-Za-z0-9+/]{64}\r?\n")
+# The break itself, removed when a block is joined. Both endings, so a CRLF blob joins into a
+# continuous run rather than one still carrying stray `\r` bytes outside the base64 alphabet.
+_WRAPPED_BREAK = re.compile(rb"\r?\n")
 
 # How much of one base64 run to decode at a time, and how far the windows overlap. The overlap
 # exceeds the encoded length of the longest possible match (4/3 of `_MAX_BODY` plus its prefix), so
@@ -397,7 +407,7 @@ def _unwrapped(data: bytes) -> bytes:
     """
     if b"\n" not in data or not _WRAPPED_HINT.search(data):
         return data
-    return _WRAPPED_BLOCK.sub(lambda match: match.group(0).replace(b"\n", b""), data)
+    return _WRAPPED_BLOCK.sub(lambda match: _WRAPPED_BREAK.sub(b"", match.group(0)), data)
 
 
 def _decode_windows(run: bytes) -> Iterator[bytes]:

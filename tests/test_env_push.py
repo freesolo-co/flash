@@ -2630,6 +2630,53 @@ def test_a_credential_in_line_wrapped_base64_is_decoded(tmp_path):
     assert _credential_kind(pair) is None
 
 
+def _wrapped(raw: bytes, width: int, eol: bytes) -> bytes:
+    """`raw` base64-encoded and broken every `width` characters with `eol`."""
+    import base64
+
+    body = base64.b64encode(raw)
+    return eol.join(body[i : i + width] for i in range(0, len(body), width))
+
+
+def test_a_credential_crossing_a_crlf_or_single_line_break_is_decoded():
+    """The two shapes the first wrapping pass could not join.
+
+    It required two or more FULL-width lines, so the commonest blob of all -- one just over the
+    width, i.e. one full line plus a short tail -- never joined, and it matched only `\\n`, so a
+    Windows checkout or a YAML export wrapping with CRLF never joined either. Both leave a key
+    that straddles the break decoding into neither side: 20 of 70 offsets missed on CRLF, 3 on
+    the two-line blob.
+
+    Sweeping the key across the boundary is what exposes this. A single placement is not enough --
+    a 53-byte key fits inside one 76-column line, so a fixed fixture reports "caught" from the
+    per-line run while the join is doing nothing.
+    """
+    from flash.env_secrets import _credential_kind
+
+    secret = f"fslo_{_FAKE_KEY_BODY}".encode()
+    for width in (76, 64):
+        for eol in (b"\n", b"\r\n"):
+            for pad in range(70):
+                # a tail of filler forces several lines; no tail is the one-full-line-plus-tail
+                # shape, which is the case that never joined at all
+                for tail in (b"", b"Q" * 40):
+                    blob = _wrapped(b"P" * pad + secret + tail, width, eol)
+                    if eol not in blob:
+                        continue  # too short to wrap, so nothing to join
+                    assert _credential_kind(blob) == "a Freesolo API key", (width, eol, pad, tail)
+
+    # control: adjacent full-width lines of unrelated data must still not be welded together
+    import base64
+
+    unrelated = (
+        base64.b64encode(b"first value here, long enough to fill a line" * 2)[:76]
+        + b"\r\n"
+        + base64.b64encode(b"second unrelated value entirely" * 2)[:76]
+        + b"\r\n"
+    )
+    assert _credential_kind(unrelated) is None
+
+
 def test_a_binary_der_private_key_is_detected(tmp_path):
     """A DER key is the same key a PEM block base64-wraps, with no text marker to match.
 
