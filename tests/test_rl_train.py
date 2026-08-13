@@ -4675,6 +4675,21 @@ def test_bridge_score_converts_a_non_finite_episode_to_zero():
         assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.0}
 
 
+def test_per_turn_credit_without_turn_rewards_warns_once_and_keeps_fallback(capsys):
+    env = _BridgeEnv(episode=0.75)
+    bridge = _bridge(env, per_turn_credit=True)
+    for index, session_id in enumerate(("a", "b")):
+        bridge.start({"index": index, "session_id": session_id})
+        bridge.step({"session_id": session_id, "completion_text": "answer"})
+        assert bridge.score({"session_id": session_id, "turn_count": 1}) == {
+            "score": 0.75,
+            "turns": None,
+        }
+
+    warning = "per-turn credit was requested"
+    assert capsys.readouterr().out.count(warning) == 1
+
+
 def test_bridge_hands_each_scored_episode_to_the_sample_recorder():
     # multi-turn has no per-completion breakdown -- the env scores a whole episode to a scalar --
     # so the transcript IS the only thing this path can publish for `flash runs log`.

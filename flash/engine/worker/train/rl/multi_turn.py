@@ -82,6 +82,7 @@ class MultiTurnBridge:
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every stateful episode touch below happens under this lock.
         self._lock = threading.Lock()
+        self._warned_missing_turn_rewards = False
         self._sessions: dict[str, dict] = {}
         self._session_lease_s = float(session_lease_s)
         # score many episodes under one lock-held env call so judge work can use the env's own
@@ -262,6 +263,16 @@ class MultiTurnBridge:
         # unusable one to None (multiturn_reward_scoring), so nothing further is checked here.
         # None means this episode falls back to episode credit; the shim widens that fallback to
         # the whole group so a group is never centred on a mix of the two.
+        if reward.turns is None:
+            with self._lock:
+                warn = not self._warned_missing_turn_rewards
+                self._warned_missing_turn_rewards = True
+            if warn:
+                print(
+                    "[rl-verl] per-turn credit was requested, but the environment returned no "
+                    "usable per_turn_rewards metadata; this run falls back to episode-level credit",
+                    flush=True,
+                )
         turns = None if reward.turns is None else [float(value) for value in reward.turns]
         return {"score": episode, "turns": turns}
 

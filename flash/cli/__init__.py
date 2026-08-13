@@ -296,8 +296,11 @@ def _add_auth_commands(sub: argparse._SubParsersAction) -> None:
     )
     login.add_argument(
         "--api-key",
-        help="your freesolo API key (default: FREESOLO_API_KEY); create it at "
-        "https://freesolo.co/sign-in",
+        help=(
+            "your freesolo API key (default: FREESOLO_API_KEY); prefer the environment variable "
+            "because argument values are visible in process listings; create a key at "
+            "https://freesolo.co/sign-in"
+        ),
     )
     login.add_argument(
         "--freesolo-url",
@@ -687,6 +690,11 @@ def _add_runs_commands(sub: argparse._SubParsersAction) -> None:
         action="store_true",
         help="poll status until the run ends without replaying logs",
     )
+    runs_status.add_argument(
+        "--json",
+        action="store_true",
+        help="print machine-readable run status",
+    )
     runs_status.set_defaults(func=cmd_status)
 
     runs_log = runs_sub.add_parser(
@@ -757,8 +765,10 @@ def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
     )
     export.add_argument(
         "--api-key",
-        help="HuggingFace token with write access to --repository "
-        "(default: HF_TOKEN from your shell or a local .env / .env.local)",
+        help=(
+            "HuggingFace token with write access to --repository; prefer HF_TOKEN or a local "
+            ".env / .env.local because argument values are visible in process listings"
+        ),
     )
     export.add_argument(
         "--public",

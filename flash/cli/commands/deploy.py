@@ -302,6 +302,117 @@ def cmd_deploy(args) -> int:
     return 1 if dep.get("state") == "failed" or waited_but_unservable else 0
 
 
+def _hub_repo_missing_errors() -> tuple[type[BaseException], ...]:
+    """The hub errors that mean "the destination does not exist yet", not "you may not write".
+
+    Imported lazily and tolerantly for the same reason as flash/serve/export.py's `_hub_error_types`:
+    the CLI must stay importable without huggingface_hub. An empty tuple never matches, so a hub too
+    old to export these names fails closed on the strict branch rather than waving an export through.
+    """
+    for module in ("huggingface_hub.errors", "huggingface_hub.utils"):
+        try:
+            return (
+                __import__(module, fromlist=["RepositoryNotFoundError"]).RepositoryNotFoundError,
+            )
+        except (ImportError, AttributeError):
+            continue
+    return ()
+
+
+def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
+    """return the token account after verifying the destination namespace when hub is installed."""
+    try:
+        from huggingface_hub import HfApi
+    except ModuleNotFoundError as exc:
+        if exc.name != "huggingface_hub":
+            raise
+        return None
+
+    import inspect
+
+    api = HfApi()
+    try:
+        identity = api.whoami(token=token)
+    except Exception as exc:
+        raise ClientError(
+            "HuggingFace token preflight failed before export. Check HF_TOKEN or --api-key and "
+            "retry."
+        ) from exc
+    account = str(identity.get("name") or identity.get("username") or "").strip()
+    if not account:
+        raise ClientError(
+            "HuggingFace authenticated the token but returned no account name, so Flash could not "
+            "verify the export namespace. Update huggingface-hub or verify the token manually."
+        )
+    print(f"HuggingFace token resolves to account {account}", file=sys.stderr)
+
+    owner = repository.partition("/")[0].strip()
+    org_role = ""
+    for org in identity.get("orgs") or ():
+        if not isinstance(org, dict) or str(org.get("name") or "").casefold() != owner.casefold():
+            continue
+        org_role = str(org.get("role") or org.get("roleInOrg") or "").lower()
+        break
+    namespace_writable = owner.casefold() == account.casefold() or org_role in {"write", "admin"}
+    if not namespace_writable:
+        raise ClientError(
+            f"HuggingFace token resolves to account {account}, which has no verified write role in "
+            f"the requested namespace {owner}. Use --repository {account}/<repo>, choose an org where "
+            "this account has write access, or set HF_TOKEN to the intended account."
+        )
+
+    auth_check = getattr(api, "auth_check", None)
+    supports_write_check = (
+        callable(auth_check) and "write" in inspect.signature(auth_check).parameters
+    )
+    if supports_write_check:
+        try:
+            auth_check(repository, repo_type="model", token=token, write=True)
+            return account
+        except Exception as exc:
+            # a missing destination cannot be checked directly. creation permission is instead
+            # established from the token scope and the user/org role below. match the class rather
+            # than its name so a hub subclass of "repo is not there" is not read as "cannot write",
+            # which would refuse an export into a repo the token is allowed to create.
+            if not isinstance(exc, _hub_repo_missing_errors()):
+                raise ClientError(
+                    f"HuggingFace token resolves to account {account}, but it cannot write to "
+                    f"{repository}. Grant this token write access to that model repo or set HF_TOKEN "
+                    "to a token that can write there."
+                ) from exc
+
+    access_token = (identity.get("auth") or {}).get("accessToken") or {}
+    token_role = str(access_token.get("role") or "").lower()
+    if token_role == "write":
+        return account
+    if token_role != "fineGrained".lower():
+        raise ClientError(
+            f"HuggingFace token resolves to account {account}, but Flash could not verify write "
+            f"scope for the new destination {repository}. Use a write token for that namespace, "
+            "or create the repo first so Flash can check its exact write permission."
+        )
+
+    permissions = set(access_token.get("fineGrained", {}).get("global") or ())
+    for scope in access_token.get("fineGrained", {}).get("scoped") or ():
+        if not isinstance(scope, dict):
+            continue
+        entity = scope.get("entity") or {}
+        entity_name = str(entity.get("name") or entity.get("id") or "")
+        entity_type = str(entity.get("type") or "").lower()
+        if (
+            entity_name.casefold() in {owner.casefold(), repository.casefold()}
+            or entity_type == "user"
+        ):
+            permissions.update(scope.get("permissions") or ())
+    if not ({"repo.write", "repo.content.write"} & permissions):
+        raise ClientError(
+            f"HuggingFace token resolves to account {account}, but its fine-grained scopes do not "
+            f"verify write access for {repository}. Add repository-content write access for that "
+            "namespace or use a write token."
+        )
+    return account
+
+
 def cmd_export(args) -> int:
     from flash.client.runtime_secrets import resolve_hf_token
 
@@ -311,9 +422,16 @@ def cmd_export(args) -> int:
             "no HuggingFace token: pass `--api-key <hf_...>`, or set HF_TOKEN "
             "(export it in your shell or put it in a local .env / .env.local)"
         )
+    if args.api_key:
+        print(
+            "warning: --api-key is visible in process listings; prefer HF_TOKEN or a local "
+            ".env / .env.local",
+            file=sys.stderr,
+        )
+    _hf_identity_and_write_access(args.repository, hf_token)
     client = _commands().client_from_config()
     progress = (
-        f"exporting adapter {args.adapter_id} to {args.repository} — "
+        f"exporting adapter {args.adapter_id} to {args.repository}; "
         "downloading then re-uploading; this can take a minute..."
     )
     print(render.note(progress) if render.styled() else progress, file=sys.stderr)
