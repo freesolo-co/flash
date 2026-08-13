@@ -342,7 +342,8 @@ let the allocator pick the cheapest fitting validated class, while `train.hf_rep
 platform-managed. For controlled experiments, `[gpu] provider` restricts allocation to one
 provider and `[gpu] type` pins one exact active validated GPU class, or an ordered list of
 acceptable ones (`type = ["A100 PCIe", "A100 SXM"]`) when the run needs a narrower search than
-managed allocation but still wants somewhere to go if the first class is out of capacity. Run artifacts are stored in a
+managed allocation but still wants somewhere to go if the first class is out of capacity.
+Run artifacts are stored in a
 private environment-scoped repo with content-addressed Flash code snapshots. Set `seed` only at the
 top level. Compose or tweak configs without editing files: `--config extra.toml` (deep-merge) and
 `--set key=value` (e.g. `--set train.epochs=3`). `--gpus N` is
@@ -662,7 +663,7 @@ spending another GPU run:
 | Local-only env path in config                                                 | Config validation says there is no local path mode                                                                                                                                       | Publish first, then use the returned slug in `[environment] id`. `flash train` only runs published env ids, not local paths.                                                                                                                                                                                                                                                                                                    |
 | Config knobs are in the wrong table                                           | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys                                                                                                                          | Put `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`.                                                                                                                                                                                                                                                                                       |
 | GPU selection is not what you expected                                        | Leaving `[gpu] type` unset may select a different fitting class as prices or capacity change                                                                                             | Set `[gpu] type` to an active validated class to hard-pin it, to a list (`["A100 PCIe", "A100 SXM"]`) to allow several, or leave it unset for managed cheapest-fit allocation. `train.hf_repo` remains platform-managed.                                                                                                                                                                                                        |
-| A pinned run fails with `every GPU class this run can use is out of capacity` | The pinned class had no capacity, and no other class was allowed, so there was nowhere to fail over                                                                                      | Widen the search: drop the `[gpu] type` pin for managed allocation, name alternatives with `type = ["A100 PCIe", "A100 SXM"]`, or drop `[gpu] provider`. Flash stops on the first `no_capacity` once every allowed class has been tried, rather than re-queueing on a class the provider has already refused.                                                                                                                   |
+| A pinned run fails with `every GPU class this run can use is out of capacity` | The pinned class had no capacity, and no other class was allowed, so there was nowhere to fail over                                                                                      | Widen the search: drop the `[gpu] type` pin for managed allocation, name alternatives with `type = ["A100 PCIe", "A100 SXM"]`, or drop `[gpu] provider`. Flash stops once every allowed class has refused capacity twice, rather than re-queueing on a class the provider keeps refusing. One refusal always earns a retry, since a momentary shortage is not a sold-out class.                                                 |
 | Secrets are not available on the worker                                       | Reward code works locally but remote logs show missing API keys or auth failures                                                                                                         | List secret names under `[environment] secrets = [...]`, export those env vars locally before submit, or put them in local `.env` / `.env.local`. Never hard-code secret values in the config.                                                                                                                                                                                                                                  |
 | Scorer dependency is missing on the worker                                    | Reward code works locally but every reward is `0.0` remotely; the import your scorer needs is installed in your venv, not the worker's                                                   | List the packages your scorer imports under `[environment] pip = ["pymongo>=4.6"]`. They are installed alongside Flash's own worker requirement. `flash env test` names the failing import locally before you spend a GPU on it. Entries name packages only: pip options and URLs with inline credentials are rejected, because the spec is stored and uploaded in plaintext (put the credential in `[environment] secrets`).   |
 | Wrong model / thinking setting                                                | Config validation fails, or chat behavior does not match the run                                                                                                                         | Config validation is authoritative for model and thinking compatibility. Thinking is a run-level choice, and `flash models chat` does not expose an override flag.                                                                                                                                                                                                                                                              |
@@ -1374,12 +1375,15 @@ cannot hold the run, or that the pinned `[gpu] provider` cannot provision, is re
 rather than when allocation reaches it.
 
 **When capacity runs out.** A `no_capacity` verdict is about the class, not the host, so once every
-allowed class has been tried Flash stops instead of re-queueing. Re-submitting to a class the
-provider has already refused asks the identical question, and each attempt can hold the queue for a
-full 900-second capacity grace, so retrying a sold-out pin five times costs over an hour of wall
-clock and cannot succeed. The run fails with the classes to widen to. Failures that a fresh box can
-genuinely clear (a stalled worker, a preemption, a transient poll error) keep their full retry
-budget.
+allowed class has refused twice Flash stops instead of re-queueing. Re-submitting to a class the
+provider keeps refusing asks the identical question, and each attempt can hold the queue for a full
+900-second capacity grace, so retrying a sold-out pin five times costs over an hour of wall clock
+and cannot succeed. The run fails with the classes to widen to.
+
+Twice, not once, and counted per class. A single `no_capacity` can be a momentary shortage or a
+transient search failure, and a market that was dry a minute ago often has a card now, so every
+class gets a confirming look before it is written off. Failures that a fresh box can genuinely clear
+(a stalled worker, a preemption, a transient poll error) keep their full retry budget.
 
 ## Multi-GPU training and `gpu.count` pins
 
