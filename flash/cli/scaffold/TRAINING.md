@@ -1209,11 +1209,9 @@ records the model's turn onto the transcript first, then steps the environment w
 list. The two arguments describe one action, not two.
 
 So a replaying environment must stop before the final message, and take the newest action
-from `assistant_response`:
-
-The simplest environment to get right is one whose opening prompt contains no assistant
-message at all. Then every assistant message in the transcript is a real action, and the only
-bound you need is the newest turn:
+from `assistant_response`. The simplest case is an environment whose opening prompt contains
+no assistant message at all: every assistant message in the transcript is then a real action,
+and the newest turn is the only bound you need.
 
 ```python
 def step_episode(self, example, messages, assistant_response):
