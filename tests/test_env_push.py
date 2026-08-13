@@ -1653,21 +1653,93 @@ def test_push_allows_ordinary_environments_and_datasets(monkeypatch, tmp_path):
     assert "dataset/train.jsonl" in _members(cap["package_b64"])
 
 
-def test_credential_scan_reads_across_chunk_boundaries_and_skips_binaries(tmp_path):
-    from flash.cli.commands.env.secrets import _SCAN_CHUNK_BYTES, credential_in_file
+def test_credential_scan_reads_across_chunk_boundaries_and_into_binaries(tmp_path):
+    import sqlite3
 
-    # a key split across the chunk boundary is the case a naive per-chunk scan misses
+    from flash.cli.commands.env.secrets import (
+        _MAX_BODY,
+        _SCAN_CHUNK_BYTES,
+        _SCAN_OVERLAP_BYTES,
+        credential_in_file,
+    )
+
+    # the overlap must exceed the longest match any pattern can produce, which is what makes the
+    # boundary case a guarantee rather than a likelihood. bodies are bounded for exactly this.
+    assert _MAX_BODY + len("github_pat_") < _SCAN_OVERLAP_BYTES
+
+    # a key split across the chunk boundary is the case a naive per-chunk scan misses. the
+    # longest body the patterns admit is the worst case, so it is the one worth pinning.
     straddle = tmp_path / "straddle.txt"
-    straddle.write_text("x" * (_SCAN_CHUNK_BYTES - 10) + f"fslo_{_FAKE_KEY_BODY}" + "y" * 20)
+    longest = ("a1B2c3D4" * 40)[:_MAX_BODY]
+    straddle.write_text("x" * (_SCAN_CHUNK_BYTES - 100) + f"fslo_{longest}" + "y" * 20)
     assert credential_in_file(straddle) == "a Freesolo API key"
 
-    # binary members (weights, images, compressed shards) are not where credentials live, and
-    # scanning random bytes is the one way this check could refuse a publish carrying no key
-    binary = tmp_path / "weights.bin"
-    binary.write_bytes(b"\x00\x01" + f"fslo_{_FAKE_KEY_BODY}".encode())
-    assert credential_in_file(binary) is None
+    # binary members are scanned too. skipping them was a hole, not a saving: a key in a sqlite
+    # state file is as published as one in a shell script, and sqlite writes NUL bytes into its
+    # first 16 bytes, so a "skip on an early NUL" rule hands that file through untouched.
+    db = tmp_path / "state.sqlite"
+    con = sqlite3.connect(db)
+    con.execute("create table t (v text)")
+    con.execute("insert into t values (?)", (f"fslo_{_FAKE_KEY_BODY}",))
+    con.commit()
+    con.close()
+    assert b"\x00" in db.read_bytes()[:16]
+    assert credential_in_file(db) == "a Freesolo API key"
 
     # an undecodable byte is not a credential character, so a mixed-encoding file stays scannable
     mixed = tmp_path / "mixed.txt"
     mixed.write_bytes(b"\xff\xfe caf\xe9 " + f"fslo_{_FAKE_KEY_BODY}".encode())
     assert credential_in_file(mixed) == "a Freesolo API key"
+
+
+def test_push_scans_generated_members_and_resists_post_scan_mutation(monkeypatch, tmp_path):
+    """The staged package is what gets scanned, so generated members are covered too.
+
+    Scanning the SOURCE tree left three holes, all of which published a credential with exit 0:
+    the synthesized README embeds `--name` verbatim, the generated entrypoint alias embeds the
+    entrypoint filename, and between reading a source file and copying it any local process could
+    rewrite it -- the archive then carried bytes nothing had ever scanned.
+    """
+    from flash.cli.commands.env import push as envpush
+
+    # 1. a credential passed as the env NAME lands in the synthesized README
+    env_dir = tmp_path / "named"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
+    assert cli.cmd_env_push(_args(env_dir, name=f"sk-or-v1-{_FAKE_KEY_BODY}")) == 1
+
+    # 2. a file rewritten AFTER its scan must not reach the archive unscanned
+    mutated = tmp_path / "mutated"
+    mutated.mkdir()
+    (mutated / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (mutated / "env.sh").write_text("export SAFE=1\n")
+    real_copy = envpush._copy_env_sidecars
+
+    def _rewrite_then_copy(env_root, dest, *, entrypoint, include_full_tree):
+        (env_root / "env.sh").write_text(f'export KEY="fslo_{_FAKE_KEY_BODY}"\n')
+        return real_copy(env_root, dest, entrypoint=entrypoint, include_full_tree=include_full_tree)
+
+    monkeypatch.setattr(envpush, "_copy_env_sidecars", _rewrite_then_copy)
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(mutated)) == 1
+    assert not cap, "a post-scan mutation reached the upload"
+
+
+def test_push_refuses_every_issued_openai_key_family(tmp_path):
+    from flash.cli.commands.env.secrets import _credential_kind
+
+    # sk-svcacct- and sk-admin- carry project- and org-wide authority. Neither is reachable
+    # through the bare `sk-` branch: the subtype's own hyphen ends its alphanumeric run early.
+    for prefix in ("sk-proj-", "sk-svcacct-", "sk-admin-"):
+        body = "Ab3xK9zQ_mN2pR7t-VwXyZ0123456789abcd"
+        assert _credential_kind(f"{prefix}{body}".encode()) == "an OpenAI API key", prefix
+
+    # a legacy key carries its `T3BlbkFJ` watermark around body index 20. Requiring 31 more
+    # characters *after* the first capital put that squarely in the miss zone.
+    legacy = "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20
+    assert _credential_kind(legacy.encode()) == "an OpenAI API key"
+
+    # ...while a lowercase-hex body of the same length stays an ordinary content hash.
+    assert _credential_kind(b"https://cdn.example/a/sk-0123456789abcdef0123456789abcdef.js") is None
