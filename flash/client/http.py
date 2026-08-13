@@ -661,24 +661,15 @@ class ApiClient:
             "GET", "/v1/deployments", timeout=timeout, require={"deployments": [dict]}
         )["deployments"]
 
-    def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
-        """The current deployment record for one run, or None when it is not listed.
-
-        ``deploy`` returns as soon as the record is persisted, which is normally before the
-        requested revision is servable. This is the read side a caller needs to tell "queued"
-        from "actually ready".
-
-        ``timeout`` bounds the single request. A caller polling against its own deadline needs
-        that: the default client timeout is 60s, so one stalled read inside a `--wait 5` would
-        overshoot the bound the user asked for by an order of magnitude.
+    def _serving_deployment(self, base_run_id: str, timeout: float | None) -> dict | None:
+        """The run's servable deployment record, or None when it has none.
 
         Read from the run-scoped route rather than the listing. `/v1/deployments` walks every run
-        the key owns and loads each one's status before this picks a single record out, so on an
-        account with a long run history the poll's cost grows with that history and the wait can
+        the key owns and loads each one's status before a caller picks a single record out, so on
+        an account with a long run history the poll's cost grows with that history and a wait can
         expire scanning unrelated runs while the requested revision is already ready
         `/v1/runs/{run_id}/deploy` resolves the one run directly.
         """
-        base_run_id, step = _parse_adapter_target(run_id)
         try:
             deployment = self._request("GET", f"/v1/runs/{base_run_id}/deploy", timeout=timeout)
         except ApiError as exc:
@@ -695,6 +686,27 @@ class ApiClient:
         # the listing's meaning: neither is a revision anyone can serve.
         if str(deployment.get("state") or "") in {"undeployed", "dry_run"}:
             return None
+        if not deployment.get("run_id"):
+            # `models deploy --wait` prints this record in place of the POST body, so without the
+            # id styled output renders an empty run field and the json omits it entirely.
+            deployment = {**deployment, "run_id": base_run_id}
+        return deployment
+
+    def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
+        """The deployment record for the checkpoint named in ``run_id``, or None.
+
+        ``deploy`` returns as soon as the record is persisted, which is normally before the
+        requested revision is servable. This is the read side a caller needs to tell "queued"
+        from "actually ready".
+
+        ``timeout`` bounds the single request. A caller polling against its own deadline needs
+        that: the default client timeout is 60s, so one stalled read inside a `--wait 5` would
+        overshoot the bound the user asked for by an order of magnitude.
+        """
+        base_run_id, step = _parse_adapter_target(run_id)
+        deployment = self._serving_deployment(base_run_id, timeout)
+        if deployment is None:
+            return None
         # the requested step is part of the identity, not decoration. matching on the run id
         # alone lets `deploy RUN/step-40 --wait` settle on whichever revision happens to be
         # deployed -- an older one still marked ready, or a replacement another shell deployed
@@ -704,11 +716,17 @@ class ApiClient:
             # None is the final adapter, an int is RUN/step-N (see the deployments renderer).
             if (listed if listed is None else int(listed)) != step:
                 return None
-        if not deployment.get("run_id"):
-            # `models deploy --wait` prints this record in place of the POST body, so without the
-            # id styled output renders an empty run field and the json omits it entirely.
-            deployment = {**deployment, "run_id": base_run_id}
         return deployment
+
+    def deployed_checkpoint(self, run_id: str, timeout: float | None = None) -> dict | None:
+        """Whatever checkpoint the run serves right now, whichever step that is.
+
+        The counterpart to ``deployment_for``, which answers the narrower "is MY revision live?"
+        and hides any other. A caller about to deploy needs the opposite: the record it is about
+        to displace is by definition the one the step filter drops.
+        """
+        base_run_id, _ = _parse_adapter_target(run_id)
+        return self._serving_deployment(base_run_id, timeout)
 
     def chat(
         self,

@@ -944,6 +944,44 @@ def test_deployment_for_matches_the_final_adapters_null_step(monkeypatch):
     assert client.deployment_for("flash-1/step-40") is None
 
 
+def test_deployed_checkpoint_reports_whatever_step_is_serving(monkeypatch):
+    """`deployed_checkpoint` answers "what does this run serve now?", not "is MY step live?".
+
+    The step filter is right for `--wait`, which must not settle for another shell's revision, and
+    wrong for a caller asking what its deploy is about to displace: there the deployed checkpoint
+    differing from the requested one is the entire question.
+    """
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    calls = _deployment_reader(monkeypatch, client, {"state": "ready", "checkpoint_step": 100})
+
+    assert client.deployed_checkpoint("flash-1/step-50") == {
+        "state": "ready",
+        "checkpoint_step": 100,
+        "run_id": "flash-1",
+    }
+    # the same run-scoped route, so it costs one read and never walks the account's history.
+    assert calls == [("GET", "/v1/runs/flash-1/deploy", None)]
+    # `deployment_for` keeps filtering, so no existing caller changes behaviour.
+    assert client.deployment_for("flash-1/step-50") is None
+
+
+@pytest.mark.parametrize("state", ["undeployed", "dry_run"])
+def test_deployed_checkpoint_still_hides_a_never_deployed_run(monkeypatch, state):
+    """Dropping the step check does not make an undeployed run into something being displaced."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    _deployment_reader(monkeypatch, client, {"state": state, "checkpoint_step": 100})
+
+    assert client.deployed_checkpoint("flash-1/step-50") is None
+
+
+def test_deployed_checkpoint_reports_an_unknown_run_as_absent(monkeypatch):
+    """A 404 is "nothing deployed", the same answer the listing gave by omitting the row."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    _deployment_reader(monkeypatch, client, None, status=404)
+
+    assert client.deployed_checkpoint("flash-1") is None
+
+
 @pytest.mark.parametrize("state", ["undeployed", "dry_run"])
 def test_deployment_for_reports_a_never_deployed_run_as_absent(monkeypatch, state):
     """The route answers for an undeployed run with a synthesized record instead of 404.

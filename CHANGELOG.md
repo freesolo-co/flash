@@ -29,6 +29,16 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- `flash models deploy` now warns before it moves the shared `<run-id>` model id onto a
+  different checkpoint. Every checkpoint of a run is served under that one id, so deploying
+  `<run-id>/step-50` while `step-100` was live silently changed what `<run-id>` served for
+  everyone using it — which made "deploy a second checkpoint to compare" a destructive
+  operation on the first, and read as a serving regression rather than the deploy that caused
+  it. The warning names both checkpoints and points at `flash models chat <run-id>/step-N`,
+  which addresses a checkpoint directly and does not depend on where the id points. It is
+  advisory: the deploy still proceeds, and a control plane that cannot answer the pre-deploy
+  read does not fail the command.
+
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always
   `flash`. On a host where `runpod-flash` owns the `flash` script, the printed

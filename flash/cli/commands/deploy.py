@@ -189,6 +189,49 @@ def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
     return None
 
 
+def _served_step_label(step) -> str:
+    """Name a deployment's checkpoint the way the user addressed it: `step-N`, or `final`."""
+    return "final" if step is None else f"step-{int(step)}"
+
+
+def _alias_move_warning(client, base_run_id: str, requested_step: int | None) -> str | None:
+    """Warn when deploying moves the shared `<run_id>` alias off a different checkpoint.
+
+    `deploy` registers under the bare run id whatever step it is given, so deploying a second
+    checkpoint of the same run does not stand up a second endpoint -- it repoints the one alias,
+    and everyone chatting bare `<run_id>` silently changes model. That makes "deploy another
+    checkpoint to compare" a destructive operation on the first, which reads as a serving fault
+    rather than the deploy that caused it.
+
+    Best-effort by construction: the read is advisory, so a plane that cannot answer must not
+    stop the deploy. Returns None when nothing is being displaced -- no deployment, the same
+    checkpoint again, or an unreadable current record.
+    """
+    try:
+        # not `deployment_for`: its step filter hides exactly the record this asks about, a
+        # DIFFERENT checkpoint holding the alias.
+        current = client.deployed_checkpoint(base_run_id)
+    except (ApiError, ClientError):
+        # the deploy itself is the authority on whether it can proceed. failing it here would turn
+        # a warning nobody asked for into an outage of the command it decorates.
+        return None
+    if current is None:
+        return None
+    if str(current.get("state") or "") not in _DEPLOYMENT_READY_STATES:
+        # nothing is being served off the alias yet, so nothing is lost by moving it.
+        return None
+    served_step = current.get("checkpoint_step")
+    if (served_step if served_step is None else int(served_step)) == requested_step:
+        return None
+    cli = _commands().CLI_NAME
+    return (
+        f"{base_run_id} currently serves {_served_step_label(served_step)}; deploying "
+        f"{_served_step_label(requested_step)} moves that shared model id onto the new "
+        f"checkpoint, so every client using bare `{base_run_id}` changes model. address a "
+        f"specific checkpoint with `{cli} models chat {base_run_id}/step-N` to compare them."
+    )
+
+
 def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
     """True when the requested revision is not the one now served.
 
@@ -229,8 +272,18 @@ def cmd_deploy(args) -> int:
             file=sys.stderr,
         )
         return 1
-    base_run_id, _step = parsed
+    base_run_id, step = parsed
     client = _commands().client_from_config()
+    # before the POST: after it the alias has already moved, and a warning about a checkpoint that
+    # is no longer served reads as history rather than a decision the reader still has. a dry run
+    # registers nothing, so it displaces nothing and gets no warning.
+    if not args.dry_run:
+        alias_warning = _alias_move_warning(client, base_run_id, step)
+        if alias_warning:
+            print(
+                render.warn(alias_warning) if render.styled() else f"warning: {alias_warning}",
+                file=sys.stderr,
+            )
     dep = client.deploy(args.run_id, dry_run=args.dry_run)
     wait_seconds = getattr(args, "wait", None)
     # a dry run creates no deployment to poll for, so --wait has nothing to observe. test against
