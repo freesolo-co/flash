@@ -190,6 +190,17 @@ class _TeacherAlignmentBridge:
         with self._stats_lock:
             return self._teacher_failure
 
+    def _count_teacher_ok(self) -> None:
+        """record ONE completed teacher request, as it completes.
+
+        the multi-turn path hands its whole turn list to `score_many`, which runs
+        OPD_TEACHER_SCORING_CONCURRENCY at a time. counting the batch after it returns leaves this
+        total frozen for as long as the batch takes -- 3 waves of 434s worst-case retries is 1302s,
+        past the silence threshold -- so a healthy child blocked on scoring would look wedged.
+        """
+        with self._stats_lock:
+            self.teacher_ok += 1
+
     def teacher_activity_count(self) -> int:
         """completed teacher interactions, including transient and permanent failures."""
         with self._stats_lock:
@@ -684,11 +695,9 @@ class _TeacherAlignmentBridge:
                 # it. handing the full list over keeps the same concurrency ceiling while letting a
                 # finished worker start the next item immediately. `executor.map` preserves input
                 # order, so the zip with `scorable` below is unchanged.
-                teacher_batches = self.teacher.score_many(items)
+                teacher_batches = self.teacher.score_many(items, on_scored=self._count_teacher_ok)
                 if len(teacher_batches) != len(scorable):
                     raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
-                with self._stats_lock:
-                    self.teacher_ok += len(teacher_batches)
                 for position, teacher_score in zip(scorable, teacher_batches, strict=True):
                     teacher_input_tokens = teacher_score.input_tokens
                     teacher_output_tokens = teacher_score.output_tokens

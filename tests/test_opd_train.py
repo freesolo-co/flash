@@ -1024,11 +1024,13 @@ class _ScoreManyTeacherAdapter:
     def score(self, prompt_text, completion_text):
         return self._with_usage(self.teacher.score(prompt_text, completion_text))
 
-    def score_many(self, items):
-        return [
-            self._with_usage(self.teacher.score(prompt_text, completion_text))
-            for prompt_text, completion_text in items
-        ]
+    def score_many(self, items, *, on_scored=None):
+        scores = []
+        for prompt_text, completion_text in items:
+            scores.append(self._with_usage(self.teacher.score(prompt_text, completion_text)))
+            if on_scored is not None:
+                on_scored()
+        return scores
 
 
 def _text_bridge(teacher, *, mutation_callback=None):
@@ -4223,7 +4225,7 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
             self.batch_sizes = []
             self.next_index = 0
 
-        def score_many(self, items):
+        def score_many(self, items, *, on_scored=None):
             self.batch_sizes.append(len(items))
             results = []
             for _item in items:
@@ -4240,6 +4242,8 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
                         ]
                     )
                 )
+                if on_scored is not None:
+                    on_scored()
             return results
 
     # turn count is derived from the measured concurrency ceiling so the case stays MEANINGFUL if
@@ -4277,6 +4281,53 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
     assert [_teacher_logsum(turn) for turn in result["turns"]] == [
         -float(index) for index in range(1, turns + 1)
     ]
+
+
+def test_multiturn_teacher_progress_is_visible_before_the_batch_returns(monkeypatch):
+    # the silence watchdog reads `teacher_ok` to tell a child blocked on a slow teacher from a child
+    # that has wedged. multi-turn hands its whole turn list to score_many in ONE call, so counting
+    # the batch after it returned froze that number for the length of the batch: at the teacher's
+    # 434s worst case per request, three waves is 1302s of apparent silence and the watchdog would
+    # tear down a healthy run. asserting the final total cannot catch that -- it is identical either
+    # way -- so this samples the counter WHILE the batch is still running.
+    observed: list[int] = []
+
+    class WatchedTeacher:
+        def score_many(self, items, *, on_scored=None):
+            results = []
+            for _item in items:
+                results.append(
+                    _teacher_score([TeacherToken(text="AB", logprob=-1.0, start=0, end=2)])
+                )
+                if on_scored is not None:
+                    on_scored()
+                observed.append(bridge.teacher_ok)
+            return results
+
+    turns = 4
+    bridge = _text_bridge(WatchedTeacher())
+    monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
+    bridge._sessions["session-1"] = {
+        "turns": [
+            {
+                "prompt_ids": [10, 11],
+                "response_ids": [65, 66],
+                "completion_text": "AB",
+                "context_messages": [{"role": "user", "content": "question"}],
+                "truncated": False,
+                "skip_reason": "",
+            }
+            for _index in range(turns)
+        ],
+        "score_cache": None,
+        "score_lock": threading.Lock(),
+        "lease_deadline": time.monotonic() + 60,
+    }
+
+    bridge.score_multiturn("session-1")
+
+    assert observed == [1, 2, 3, 4]
+    assert bridge.teacher_ok == turns
 
 
 def test_multiturn_transient_bridge_failure_latches_terminal_cause():

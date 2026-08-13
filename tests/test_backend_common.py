@@ -2067,6 +2067,35 @@ def test_verl_child_silence_watchdog_gives_a_resumed_run_the_same_setup_exemptio
     assert resumed_torn_down == fresh_torn_down == [True]
 
 
+def test_a_child_blocked_on_a_slow_parent_side_scorer_is_not_read_as_a_wedge():
+    """Both rl paths score OUTSIDE the child: grpo's rewards and opd's teacher both run in the
+    parent over the localhost bridge. A child waiting on a slow user scorer or a judge api prints
+    nothing at all, so on the tail alone it is indistinguishable from a wedge -- and the threshold
+    is now tight enough that a genuinely slow scorer would cross it. The parent's completed-work
+    counter is the only signal that separates them.
+    """
+    scored = 0
+
+    tail = vc.ChildOutputTail()
+    tail.record("step: 1\n")
+    watchdog, torn_down = _bound_silence_watchdog(tail, parent_activity=lambda: scored)
+
+    # a scorer slow enough to outlast the threshold several times over, but still making progress.
+    peak = 0
+    for tick in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0) * 4):
+        if tick % 10 == 0:  # one completion graded every 10 ticks, child silent throughout
+            scored += 1
+        peak = max(peak, watchdog.observe(2))
+
+    assert torn_down == [], "a run whose parent was still grading completions was torn down"
+    assert peak < int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0)
+
+    # and the gate is progress, not merely having a counter: once grading stops, silence resumes.
+    for _ in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0) + 1):
+        watchdog.observe(2)
+    assert torn_down == [True]
+
+
 def test_verl_child_silence_watchdog_tears_down_and_raises_at_the_threshold():
     tail = vc.ChildOutputTail()
     tail.record("step: 1\n")

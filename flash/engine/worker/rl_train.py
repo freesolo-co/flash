@@ -376,7 +376,7 @@ def run_rl_train():
         )
         expected_steps, loggers = configured["expected_steps"], configured["loggers"]
         _w.heartbeat("rl_step", step=0, initial=True)
-        state = _StepMetricState()
+        state = _StepMetricState(reward_activity=reward_runtime.observability.reward_activity_count)
         # equal within-group rewards produce zero advantages and gradients. collect per-step spread;
         # reward mean and pg_loss cannot prove a signal. declare this before the uploader because its
         # publication gate closes over the histories.

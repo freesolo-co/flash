@@ -88,9 +88,15 @@ class _StepMetricState:
     # so they travel with it rather than as two more parameters through the child call.
     child_tail: ChildOutputTail = field(default_factory=ChildOutputTail)
     silence_watchdog: VerlChildSilenceWatchdog | None = None
+    # grpo's rewards are scored PARENT-side over the localhost bridge, so a child waiting on a slow
+    # user scorer or a judge api prints nothing while real work is happening. without this the
+    # watchdog cannot tell that from a wedge, exactly as opd cannot without its teacher counter.
+    reward_activity: Callable[[], int] | None = None
 
     def __post_init__(self) -> None:
-        self.silence_watchdog = VerlChildSilenceWatchdog(self.child_tail, tick_s=_LIVENESS_TICK_S)
+        self.silence_watchdog = VerlChildSilenceWatchdog(
+            self.child_tail, tick_s=_LIVENESS_TICK_S, parent_activity=self.reward_activity
+        )
 
 
 @dataclass

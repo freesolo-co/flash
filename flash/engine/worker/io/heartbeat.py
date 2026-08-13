@@ -314,6 +314,10 @@ class RewardObservabilityBuffer:
         # the boundary entirely caller-driven.
         self._generation_size = max(0, int(generation_size))
         self._scored_this_generation = 0
+        # lifetime count, never reset with the generation above. the silence watchdog compares it
+        # across ticks to tell a child blocked on parent-side reward scoring -- a slow user scorer
+        # or a judge api -- from a child that has actually wedged.
+        self._scored_ever = 0
         # generations the count has already sealed, oldest first, each waiting for the step line
         # that names it. a QUEUE rather than a flag: stdout can fall a whole generation behind, and
         # a flag would let the second seal overwrite the first, dropping a generation and
@@ -346,6 +350,7 @@ class RewardObservabilityBuffer:
             self._samples.append((prompt, completion, float(reward)))
             del self._samples[: -self._SAMPLE_BUFFER_LIMIT]
             self._scored_this_generation += 1
+            self._scored_ever += 1
             for breakdown in breakdowns:
                 # a failed grading appends None and still counts: it is a real completion that
                 # scored nothing, so it belongs in the denominator of every name (mirrors trl).
@@ -468,6 +473,11 @@ class RewardObservabilityBuffer:
             if self._published and self._published_step == int(step):
                 return self._published[-1]
             return None
+
+    def reward_activity_count(self) -> int:
+        """completions scored since this buffer was created, monotonic across generations."""
+        with self._lock:
+            return self._scored_ever
 
     def heartbeat_fields(self) -> dict:
         """Return bounded reward metrics and sampled completions for one heartbeat.

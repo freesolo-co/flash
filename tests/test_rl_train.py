@@ -5840,6 +5840,55 @@ def test_the_step_preview_reads_the_generation_that_step_published():
     assert [s["completion"] for s in fields["sampled_completions"]] == ["gen1-a", "gen1-b"]
 
 
+def test_the_silence_watchdogs_reward_counter_survives_a_generation_boundary():
+    """The silence watchdog compares this count ACROSS ticks, so it must never go backwards.
+
+    `_scored_this_generation` resets at every boundary, and reusing it would make the watchdog read
+    a reset as "no progress" -- worse, a run whose generation closed between two ticks could report
+    a LOWER count and look wedged at the exact moment it was busiest.
+    """
+    buffer = RewardObservabilityBuffer(generation_size=2)
+
+    counts = []
+    for completion in ("gen1-a", "gen1-b", "gen2-a", "gen2-b", "gen3-a"):
+        buffer.record("p", completion, 1.0)
+        counts.append(buffer.reward_activity_count())
+
+    assert counts == [1, 2, 3, 4, 5]
+
+
+def test_grpo_hands_the_silence_watchdog_its_parent_side_reward_counter():
+    """grpo grades rewards in the PARENT over the localhost bridge, so a child waiting on a slow
+    user scorer is silent while real work happens. Without this wiring the watchdog sees only the
+    child's tail and tears down a healthy run -- the opd teacher counter closes the same gap on the
+    other rl path. The state object builds the watchdog, so the callback has to arrive with it.
+    """
+    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+
+    assert (
+        "_StepMetricState(reward_activity=reward_runtime.observability.reward_activity_count)"
+        in (src)
+    )
+
+    # and the field is not merely stored: it reaches the watchdog that consumes it.
+    scored = [0]
+    state = rl_train._StepMetricState(reward_activity=lambda: scored[0])
+    state.child_tail.record("step: 1\n")
+    torn_down = []
+    state.silence_watchdog.bind_process(
+        teardown=lambda: torn_down.append(True), is_running=lambda: True
+    )
+
+    from flash.engine.worker.verl import diagnostics as vc
+
+    for tick in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0) * 2):
+        if tick % 10 == 0:
+            scored[0] += 1
+        state.silence_watchdog.observe(2)
+
+    assert torn_down == [], "grpo's parent-side grading did not reach the silence watchdog"
+
+
 def test_a_preview_before_the_first_boundary_still_shows_a_rollout():
     # the fallback direction: with nothing published yet, the open generation is all there is, and
     # blanking the preview would read as "no rollouts" rather than "no boundary yet".
