@@ -1086,6 +1086,51 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_INTERVAL_S})" in body
 
 
+def test_instance_console_upload_loop_snapshots_before_the_first_full_interval(monkeypatch):
+    """Drive the real instance loop: the FIRST wait must be short, later waits the steady interval.
+
+    The constants alone do not prove this. Reverting the loop to `while not stop.wait(interval_s)`
+    leaves every constant untouched and every other test green, while the instance path silently
+    goes back to waiting a full hour before its first snapshot -- past both stall deadlines.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    waits: list[float] = []
+    uploads: list[str] = []
+
+    class _Stop:
+        def wait(self, seconds: float) -> bool:
+            waits.append(seconds)
+            return len(waits) > 3  # let three cycles run, then stop the loop
+
+    monkeypatch.setattr(
+        _instance_bootstrap,
+        "_upload_console_snapshot",
+        lambda _payload, _console, mode: uploads.append(mode),
+    )
+    _instance_bootstrap._console_upload_loop({}, "/tmp/console.txt", "train", 3600.0, _Stop())
+
+    assert waits[0] == _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    assert waits[0] < 3600.0
+    assert waits[1:] == [3600.0, 3600.0, 3600.0]
+    assert uploads == ["train", "train", "train"]
+
+
+def test_instance_console_upload_loop_never_waits_longer_than_the_interval():
+    """A caller passing an interval shorter than the first-snapshot delay must not be lengthened."""
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    waits: list[float] = []
+
+    class _Stop:
+        def wait(self, seconds: float) -> bool:
+            waits.append(seconds)
+            return True  # stop immediately; only the first wait matters here
+
+    _instance_bootstrap._console_upload_loop({}, "/tmp/console.txt", "train", 30.0, _Stop())
+    assert waits == [30.0]
+
+
 def test_min_cuda_for_uses_the_gpu_class_floor():
     # the CUDA floor is a property of the GPU class, not of the image tag
     from flash.providers.runpod.serverless.endpoints import min_cuda_for

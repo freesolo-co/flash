@@ -4403,9 +4403,37 @@ def test_child_failure_sanitizer_redacts_credentials_without_eating_ordinary_val
         assert "<redacted>" in redacted
 
 
+def test_teacher_manager_catch_all_records_its_stage_before_exit(monkeypatch, tmp_path):
+    """The teacher-manager catch-all is the last `os._exit` that could still exit silently.
+
+    It sits on the single-turn teacher path, the same blindness this PR removes elsewhere, so it
+    must record a `teacher`-stage record before exiting rather than leaving the parent with only a
+    return code.
+    """
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.child.plugin import _write_child_failure_fallback
+
+    child_failure_path = str(tmp_path / "child-failure")
+    monkeypatch.setenv("FLASH_OPD_CHILD_FAILURE_PATH", child_failure_path)
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", "bridge-secret-token")
+
+    _write_child_failure_fallback(
+        "permanent", "teacher", ConnectionResetError("upstream closed the scoring socket")
+    )
+
+    assert _read_classified_failure_fallback(child_failure_path) == (
+        "permanent",
+        "[stage=teacher] ConnectionResetError: upstream closed the scoring socket",
+    )
+
+
 @pytest.mark.parametrize(
     ("stage", "failure_path"),
-    [("multiturn_start", "/multiturn/start"), ("score", "/multiturn/score")],
+    [
+        ("multiturn_start", "/multiturn/start"),
+        ("generate", None),
+        ("score", "/multiturn/score"),
+    ],
 )
 def test_multiturn_catch_all_writes_stage_type_and_message_before_exit(
     monkeypatch, tmp_path, stage, failure_path
@@ -4457,6 +4485,9 @@ def test_multiturn_catch_all_writes_stage_type_and_message_before_exit(
             return [10, 11]
 
         async def _run_turns(self, _sampling_params, outputs, **_kwargs):
+            # the `generate` stage has no bridge route to fail, so the turn loop itself raises.
+            if stage == "generate":
+                raise ValueError(f"invalid payload token={bridge_token}")
             outputs.append(SimpleNamespace(prompt_ids=[10], response_ids=[11], extra_fields={}))
 
     loop_type = build_flash_multi_turn_agent_loop(
@@ -5498,6 +5529,10 @@ def test_parent_surfaces_child_failure_record_with_classification(
         )
 
     assert "[stage=generate] ValueError: invalid rollout state" in str(error.value)
+    # RetriableInfraError SUBCLASSES RuntimeError, so `pytest.raises(RuntimeError)` alone accepts a
+    # retriable exception and cannot prove a permanent failure stays permanent. assert retriability
+    # directly: a permanent teacher failure that starts being retried burns allocations silently.
+    assert isinstance(error.value, RetriableInfraError) is (expected_type is RetriableInfraError)
 
 
 def test_specific_failure_wins_over_generic_child_failure():
