@@ -751,6 +751,7 @@ def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatc
         *,
         expected_identity=None,
         require_provenance=True,
+        budget_s=None,
     ):
         captured["require_provenance"] = require_provenance
         return {}
@@ -776,6 +777,86 @@ def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatc
         adapter_prefix="sft/flash-7-with-provenance/seed0",
     )
     assert captured["require_provenance"] is True
+
+
+def test_revision_ready_budget_scales_with_base_model_size():
+    import flash.serve.deploy as d
+
+    # a bigger base takes longer to load onto a cold engine, so it gets a bigger budget. the flat
+    # 5-minute budget this replaced timed out legitimate cold starts that the immediate retry --
+    # against the now-warm engine -- then completed.
+    small = d.revision_ready_budget_seconds("Qwen/Qwen3.5-0.8B")
+    large = d.revision_ready_budget_seconds("Qwen/Qwen3.6-35B-A3B")
+    assert d.REVISION_READY_BUDGET_SECONDS <= small < large
+    # never past the ceiling, which stays inside the 30-minute deployment staleness window so the
+    # poll cannot outlive the record it is polling for.
+    assert large <= d.REVISION_READY_BUDGET_MAX_SECONDS
+
+
+def test_revision_ready_budget_falls_back_to_floor_for_unsizable_models():
+    import flash.serve.deploy as d
+
+    # sizing is an optimization, not a gate: an uncataloged model must not fail the deploy, and
+    # must not silently inherit a larger budget that would extend every genuine failure.
+    for model in (None, "", "not-a-catalog/model"):
+        assert d.revision_ready_budget_seconds(model) == d.REVISION_READY_BUDGET_SECONDS
+
+
+def test_revision_ready_timeout_names_the_timeout_and_the_loader_error(monkeypatch):
+    import flash.serve.deploy as d
+
+    revision = "run-1@final." + "a" * 40
+    # still loading, but the record already carries the loader's own complaint. the bare
+    # "remained 'registered'" dropped it and read as a serving fault.
+    loading = {
+        "adapter_id": revision,
+        "subfolder": "sft/run-1/seed0/adapter",
+        "metadata": {"lifecycle_state": "loading", "failure": "base weights still downloading"},
+    }
+
+    monkeypatch.setattr(d, "READBACK_DELAY_SECONDS", 0)
+    monkeypatch.setattr(
+        d,
+        "_registered_adapter_response",
+        lambda adapter_id, **_kwargs: (loading, types.SimpleNamespace(headers={})),
+    )
+
+    with pytest.raises(d.ServingError) as excinfo:
+        d._wait_revision_ready(revision, loading["subfolder"], budget_s=0.05)
+
+    message = str(excinfo.value)
+    assert "still 'loading' after waiting" in message
+    assert "base weights still downloading" in message
+    # the distinction the CLI could not previously make: a timeout is retryable, a rejection is not
+    assert "timeout, not a rejection" in message
+    assert "failed to load" not in message
+
+
+def test_rejected_revision_still_reports_rejection_not_timeout(monkeypatch):
+    import flash.serve.deploy as d
+
+    revision = "run-1@final." + "a" * 40
+    rejected = {
+        "adapter_id": revision,
+        "subfolder": "sft/run-1/seed0/adapter",
+        "metadata": {"lifecycle_state": "failed", "failure": "adapter rank 64 exceeds the cap"},
+    }
+
+    monkeypatch.setattr(d, "READBACK_DELAY_SECONDS", 0)
+    monkeypatch.setattr(
+        d,
+        "_registered_adapter_response",
+        lambda adapter_id, **_kwargs: (rejected, types.SimpleNamespace(headers={})),
+    )
+
+    with pytest.raises(d.ServingError) as excinfo:
+        d._wait_revision_ready(revision, rejected["subfolder"], budget_s=30.0)
+
+    message = str(excinfo.value)
+    # an actively rejected adapter must NOT be described as a timeout: retrying it is wrong.
+    assert "serving failed to load adapter revision" in message
+    assert "adapter rank 64 exceeds the cap" in message
+    assert "timeout, not a rejection" not in message
 
 
 def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
@@ -859,7 +940,8 @@ def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp
 
     def registered(adapter_id, *, timeout_s=None):
         assert adapter_id == registration_body["adapter_id"]
-        assert timeout_s == d.REVISION_READY_BUDGET_SECONDS
+        # the budget is sized by the base model being loaded, not a flat constant
+        assert timeout_s == d.revision_ready_budget_seconds("Qwen/Qwen3.5-4B")
         clock[0] += timeout_s
         return (
             {
@@ -879,7 +961,7 @@ def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp
         lambda *args, **kwargs: activations.append((args, kwargs)),
     )
 
-    with pytest.raises(d.ServingError, match="remained 'registered'"):
+    with pytest.raises(d.ServingError, match="still 'registered' after waiting"):
         d.deploy_adapter(
             run_id="run-expiry",
             model="Qwen/Qwen3.5-4B",

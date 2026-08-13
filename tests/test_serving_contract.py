@@ -337,6 +337,7 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
         *,
         expected_identity=None,
         require_provenance=True,
+        budget_s=None,
     ):
         assert adapter_revision == revision
         assert expected_identity["metadata"]["hf_revision"] == sha

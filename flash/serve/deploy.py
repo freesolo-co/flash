@@ -46,7 +46,20 @@ def default_serving_url(channel: str = CHANNEL) -> str:
 DEFAULT_FREESOLO_SERVING_URL = default_serving_url()
 READBACK_DELAY_SECONDS = 0.5
 READBACK_MAX_DELAY_SECONDS = 2.0
+# Floor for the readiness poll, which covers a warm engine that already holds the base weights.
+# A flat 5 minutes was the whole budget and it timed out legitimate cold starts: loading a 4B base
+# plus adapter onto a cold engine can exceed it, and the retry immediately afterwards -- against the
+# now-warm engine -- succeeds. Scale the budget with the base model instead of raising the flat
+# number, so a small model keeps a tight bound and a large one gets the time it actually needs.
 REVISION_READY_BUDGET_SECONDS = 5 * 60.0
+# Added per billion base parameters on top of the floor. 20s/B puts a 4B base at ~6.6 minutes and
+# the largest catalog model (35B) at ~16.7 minutes, both inside the 30-minute staleness window that
+# `_DEPLOYMENT_ATTEMPT_IS_STALE` uses to let a newer deploy supersede a wedged attempt: a budget
+# past that would let this poll outlive the record it is polling for.
+REVISION_READY_BUDGET_SECONDS_PER_PARAM_B = 20.0
+# Hard ceiling, kept under the 30-minute staleness window with room for registration and the
+# smoke test that follows. An uncataloged or unsized model falls back to the floor, not this.
+REVISION_READY_BUDGET_MAX_SECONDS = 20 * 60.0
 ACTIVATION_READBACK_ATTEMPTS = 3
 ACTIVATION_READBACK_DELAY_SECONDS = 2.0
 # smoke-retry fallback when a 503 carries no usable Retry-After: keep the prior 2s default rather
@@ -409,7 +422,12 @@ def deploy_adapter(
         )
 
     _wait_revision_ready(
-        revision, subfolder, expected_identity=body, require_provenance=require_provenance
+        revision,
+        subfolder,
+        expected_identity=body,
+        require_provenance=require_provenance,
+        # the poll may be waiting on a cold engine loading THIS base model, so size the budget by it
+        budget_s=revision_ready_budget_seconds(model),
     )
     if before_activate is not None:
         before_activate(revision, checkpoint)
@@ -564,6 +582,30 @@ def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
     return min(READBACK_DELAY_SECONDS * (2**attempt), READBACK_MAX_DELAY_SECONDS)
 
 
+def revision_ready_budget_seconds(model: str | None) -> float:
+    """Readiness budget for loading ``model``'s base weights plus one adapter.
+
+    The engine may be cold, in which case the poll is waiting on the BASE model download and load,
+    not on the adapter -- so the bound has to track base size. Uncataloged or unsized models fall
+    back to the floor: guessing a larger budget for a model we cannot size would extend every
+    genuine failure by the guess.
+    """
+    if not model:
+        return REVISION_READY_BUDGET_SECONDS
+    try:
+        from flash.cost.facts import total_params_b
+
+        params_b = total_params_b(model)
+    except Exception:
+        # sizing is an optimization, never a deploy blocker: an unknown model, a catalog miss, or
+        # an unavailable hub lookup must leave the floor in place rather than fail the deployment.
+        return REVISION_READY_BUDGET_SECONDS
+    if not (isinstance(params_b, int | float) and math.isfinite(params_b) and params_b > 0):
+        return REVISION_READY_BUDGET_SECONDS
+    scaled = REVISION_READY_BUDGET_SECONDS + REVISION_READY_BUDGET_SECONDS_PER_PARAM_B * params_b
+    return min(scaled, REVISION_READY_BUDGET_MAX_SECONDS)
+
+
 def _wait_revision_ready(
     revision: str,
     subfolder: str,
@@ -572,9 +614,14 @@ def _wait_revision_ready(
     require_provenance: bool = True,
     budget_s: float = REVISION_READY_BUDGET_SECONDS,
 ) -> dict:
-    deadline = time.monotonic() + max(0.0, float(budget_s))
+    budget = max(0.0, float(budget_s))
+    deadline = time.monotonic() + budget
     last_state = "registered"
     last_read_error: ServingError | None = None
+    # the loader's own diagnostic, kept even when the state is not (yet) terminal: a revision that
+    # is still loading can already carry the reason it is struggling, and that reason is the whole
+    # content of the timeout report.
+    last_failure: str | None = None
     first_read = True
     attempt = 0
     retry_after: str | None = None
@@ -619,6 +666,8 @@ def _wait_revision_ready(
             metadata.get("lifecycle_state") or record.get("lifecycle_state") or "registered"
         )
         failure = metadata.get("failure")
+        if failure:
+            last_failure = str(failure)
         if last_state == "failed" or record.get("status") == "disabled":
             raise ServingError(
                 f"serving failed to load adapter revision {revision}: {failure or 'unknown error'}"
@@ -633,8 +682,18 @@ def _wait_revision_ready(
             f"adapter revision {revision} readiness could not be confirmed after transient "
             f"serving errors: {last_read_error}"
         ) from last_read_error
+    # NOT a rejection: nothing went wrong, the clock ran out. Say so, and say what the clock was --
+    # the bare "remained 'registered'" reads as a serving fault and sends the reader to the wrong
+    # subsystem. An actively rejected adapter raises "serving failed to load adapter revision"
+    # above, so the two cases are distinguishable from the message alone, and only this one is
+    # worth retrying.
+    detail = f" (last loader error: {last_failure})" if last_failure else ""
     raise ServingError(
-        f"adapter revision {revision} remained {last_state!r}; the previous alias remains available"
+        f"adapter revision {revision} was still {last_state!r} after waiting {budget:g}s for "
+        f"serving to load it{detail}; serving did not reject it, so this is a timeout, not a "
+        f"rejection — a cold engine loading a large base model can exceed the budget, and "
+        f"retrying the same deploy against the now-warm engine usually succeeds. "
+        f"the previous alias remains available"
     )
 
 
