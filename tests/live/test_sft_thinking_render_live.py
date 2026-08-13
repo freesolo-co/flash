@@ -102,11 +102,12 @@ def test_the_real_template_keeps_reasoning_authored_in_final_position(tokenizer)
 
 
 def test_the_real_template_passes_a_prompt_think_span_through_verbatim(tokenizer) -> None:
-    """Why rendered spans are counted net of the prompt render.
+    """A ``<think>`` span written into a PROMPT is content, and never a supervised reasoning block.
 
     The template's reasoning split is ASSISTANT-only, so a literal ``<think>...</think>`` written
-    into a system prompt survives into the render while never being supervised. Counting the full
-    render would let that span offset reasoning stripped from the target and silence the warning.
+    into a system prompt survives into the render verbatim while never being supervised. It is not
+    emitted in the template's reasoning position, so it is not a block the template owns: were it
+    counted, that span would offset reasoning stripped from the target and silence the warning.
     """
     prompt_messages = [
         {"role": "system", "content": "answer as <think>reasoning</think>answer"},
@@ -114,8 +115,9 @@ def test_the_real_template_passes_a_prompt_think_span_through_verbatim(tokenizer
     ]
     prompt = _render(tokenizer, prompt_messages, add_generation_prompt=True)
 
-    assert count_rendered_reasoning_spans(prompt) == 1
+    # the text survives verbatim, but it is prompt content, not a reasoning block
     assert "<think>reasoning</think>" in prompt
+    assert count_rendered_reasoning_spans(prompt) == 0
 
 
 def test_the_real_template_strips_a_prompt_turn_that_the_prompt_only_render_keeps(
@@ -192,12 +194,13 @@ def test_the_marked_render_keeps_the_full_renders_span_sequence(tokenizer) -> No
 
 
 def test_a_quoted_think_span_never_carries_a_marker(tokenizer) -> None:
-    """A ``<think>`` the answer merely QUOTES is answer text, and marking must not credit it.
+    """A ``<think>`` the answer merely QUOTES is answer text, and is not a reasoning span at all.
 
     This turn supplies its reasoning through ``reasoning_content`` and quotes the format in its
-    answer, so the real template renders TWO spans: the field's reasoning and the verbatim quote.
-    Only the first is this turn's reasoning. The marker rides inside the reasoning, so the quote
-    can never be mistaken for a surviving block however the answer is written.
+    answer. The template renders the quote verbatim into the ANSWER, after the closer and the blank
+    line that end the reasoning block, so only the field's reasoning is a block the template owns.
+    Counting the quote would credit a survivor that is not reasoning, overstating what reaches the
+    loss and suppressing the very drop warning this measurement exists to raise.
     """
     messages = [
         {"role": "user", "content": "u1"},
@@ -211,16 +214,17 @@ def test_a_quoted_think_span_never_carries_a_marker(tokenizer) -> None:
     # the full render carries BOTH the field's reasoning and the answer's quote, verbatim
     assert "real reasoning" in full
     assert "<think>example</think>" in full
-    assert count_rendered_reasoning_spans(full) == 2
+    # ... but only the first is structurally a reasoning block
+    assert count_rendered_reasoning_spans(full) == 1
 
     prefix = reasoning_marker_prefix(full)
     marked = _render(tokenizer, with_marked_reasoning(messages, prefix))
     spans = reasoning_span_texts(marked)
 
-    assert count_rendered_reasoning_spans(marked) == 2
-    # the reasoning span carries the marker; the quoted span never does
-    assert [prefix in span for span in spans] == [True, False]
-    assert "example" in spans[1]
+    assert count_rendered_reasoning_spans(marked) == 1
+    # the one span is the reasoning, and it carries the marker; the quote is answer text
+    assert [prefix in span for span in spans] == [True]
+    assert "example" not in spans[0]
 
 
 def test_the_real_template_prefers_reasoning_content_over_an_inline_span(tokenizer) -> None:
