@@ -6153,7 +6153,9 @@ def test_the_liveness_fields_hook_carries_reward_observability():
     assert "**_reward_observability()," in entry
     # and the watchdog's own field is merged BEFORE the reward diagnostics: those call user reward
     # code, so a raising observability read must not skip the tick that advances the silence timer.
-    assert entry.index("silence_watchdog.heartbeat_fields(") < entry.index("**_reward_observability(")
+    assert entry.index("silence_watchdog.heartbeat_fields(") < entry.index(
+        "**_reward_observability("
+    )
 
 
 def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains():
