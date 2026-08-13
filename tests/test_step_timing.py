@@ -521,3 +521,52 @@ def test_the_upload_actually_sends_the_pace_on_the_checkpoint_ping(monkeypatch, 
     assert uploaded, [stage for stage, _ in sent]
     assert uploaded[0]["step_duration_s"] == 92.0
     assert uploaded[0]["projected_remaining_s"] == 17204.0
+
+
+def test_every_step_timestamp_comes_from_a_clock_that_cannot_jump():
+    """These timestamps are only ever read as differences, so a wall clock is the wrong source.
+
+    An NTP correction or a VM resync mid-run moves ``time.time()``: backwards produces a negative
+    span that is silently dropped, forwards inflates the pace, the ETA and the wall-limit warning at
+    once -- and a long training run is exactly where a resync has time to happen.
+
+    Asserted at the call sites because the clock takes a float and cannot tell which one produced
+    it. Read off disk rather than through ``inspect``: these runner modules are imported via their
+    parents and importing one directly raises on a circular import.
+
+    ``_remaining_worker_wall_seconds`` is deliberately not covered here -- its deadline is an
+    absolute instant supplied from outside the process, so it is the one comparison that needs the
+    wall clock.
+    """
+    import ast
+    from pathlib import Path
+
+    import flash
+
+    runners = ("rl_train_runner.py", "sft_train_runner.py", "opd_train_runner.py")
+    worker_dir = Path(flash.__file__).parent / "engine" / "worker"
+    checked = 0
+    for name in runners:
+        path = worker_dir / name
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in {"record", "note_if_blocked"} or not node.args:
+                continue
+            # the receiver has to be the step clock: `.record(` alone also matches unrelated calls.
+            receiver = node.func.value
+            named = (
+                receiver.attr
+                if isinstance(receiver, ast.Attribute)
+                else getattr(receiver, "id", "")
+            )
+            if named != "step_clock":
+                continue
+            timestamp = ast.dump(node.args[0])
+            assert "monotonic" in timestamp, (
+                f"{name}:{node.lineno} times a step off a clock that can jump: {timestamp}"
+            )
+            checked += 1
+    # every trainer records and two of them also time their heartbeat; a passing assertion loop that
+    # visited nothing would be the failure this guards against.
+    assert checked == 5, checked

@@ -535,7 +535,7 @@ def _ingest_step_metrics(
     sent_first_metrics = state.sent_first_metrics
     step_metrics = parse_verl_step_metrics(line)
     if step_metrics is not None:
-        state.step_clock.record(time.time(), step_metrics.get("step"))
+        state.step_clock.record(time.monotonic(), step_metrics.get("step"))
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]

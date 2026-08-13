@@ -634,7 +634,7 @@ def _build_child_callbacks(
 
     def on_step(step: int) -> None:
         progress["step"] = step
-        step_clock.record(time.time(), step)
+        step_clock.record(time.monotonic(), step)
         payload = {"step": step}
         if progress["loss"] is not None:
             payload["loss"] = progress["loss"]
@@ -643,9 +643,9 @@ def _build_child_callbacks(
         # same as SFT: a heartbeat that blocks the stdout loop defers the next step line's timestamp,
         # so that span is not a step. measured, not inferred from the return value -- a failed upload
         # and a 30s wait on the upload lock both block and both report "not committed".
-        started = time.time()
+        started = time.monotonic()
         _opd_train._w.heartbeat("opd_step", **payload, **step_timing_fields())
-        step_clock.note_if_blocked(time.time() - started)
+        step_clock.note_if_blocked(time.monotonic() - started)
 
     def child_heartbeat() -> None:
         # see liveness_fields below: an upload replaces the published snapshot, so every ping that

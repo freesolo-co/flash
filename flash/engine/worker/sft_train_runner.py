@@ -749,7 +749,7 @@ class _SftProgressCallbacks:
 
     def on_step(self, step: int) -> None:
         self.progress.values["step"] = step
-        self.progress.step_clock.record(time.time(), step)
+        self.progress.step_clock.record(time.monotonic(), step)
         payload = {
             "step": step,
             "loss": self.progress.values["loss"],
@@ -760,13 +760,13 @@ class _SftProgressCallbacks:
         # timestamp of the next step line into the following span. time the call rather than read its
         # result: an uncommitted heartbeat may have skipped instantly under the throttle or waited
         # out the upload lock and failed, and only the second is a block.
-        started = time.time()
+        started = time.monotonic()
         _w.heartbeat(
             "sft_step",
             **{key: value for key, value in payload.items() if value is not None},
             **self.step_timing_fields(),
         )
-        self.progress.step_clock.note_if_blocked(time.time() - started)
+        self.progress.step_clock.note_if_blocked(time.monotonic() - started)
 
     def step_timing_fields(self) -> dict[str, float | bool]:
         """Steady-state step timing for one heartbeat; empty until a whole step has been measured.

@@ -122,6 +122,13 @@ class StepClock:
     def record(self, now: float, step: int | None = None) -> None:
         """Note that a step line for ``step`` arrived at ``now``.
 
+        ``now`` must come from ``time.monotonic()``. Only differences are ever read from these
+        timestamps, and a wall clock can be corrected mid-run by NTP or a VM resync: a backward
+        correction produces a negative span that is silently dropped, and a forward one inflates the
+        pace, the ETA and the wall-limit warning together. The run's remaining wall allowance is the
+        one thing here that must stay on ``time.time()``, because its deadline is an absolute instant
+        supplied from outside this process.
+
         A repeated step number closes the segment instead of extending it. verl reprints a step on a
         validation pass and a resumed run replays its resume step -- ``append_step_metrics`` dedupes
         exactly these repeats for the metrics backlog -- and no optimizer update happened between the
