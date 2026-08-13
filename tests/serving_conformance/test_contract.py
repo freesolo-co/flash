@@ -751,39 +751,47 @@ def test_a_non_null_expectation_replaces_the_live_revision(
     """
     first = _registration(run_id, adapter_source, step=10)
     second = _registration(run_id, adapter_source, step=20)
-    for body in (first, second):
-        _register(http, body)
-        _wait_ready(http, body["adapter_id"], ready_timeout)
+    # Undeployed on every path, like the other multi-revision tests here. This one registers two
+    # revisions and leaves the alias ACTIVE, so without the cleanup each suite run against a live
+    # backend leaves a serving run behind -- holding its cached artifacts, its `max_loras` slots,
+    # and (on a scale-to-zero deployment) a reason to keep answering traffic. The suite is meant to
+    # be safe to re-run against a real deployment, which it is not if it accumulates runs.
+    try:
+        for body in (first, second):
+            _register(http, body)
+            _wait_ready(http, body["adapter_id"], ready_timeout)
 
-    assert _activate(http, first["adapter_id"], None).status_code == 200, (
-        "the initial null-expectation activation must succeed before the upgrade can be tested"
-    )
+        assert _activate(http, first["adapter_id"], None).status_code == 200, (
+            "the initial null-expectation activation must succeed before the upgrade can be tested"
+        )
 
-    response = _activate(http, second["adapter_id"], first["adapter_id"])
-    assert response.status_code == 200, (
-        f"activating {second['adapter_id']} with {first['adapter_id']} as the expectation returned "
-        f"{response.status_code}: {response.text[:400]}. this is the ordinary upgrade path -- "
-        f"every deploy after a run's first one names the live revision as its expectation, so a "
-        f"backend that rejects it cannot serve a second checkpoint"
-    )
-    payload = response.json()
-    assert payload.get("previous_adapter_revision") == first["adapter_id"], (
-        f"activation echoed previous_adapter_revision="
-        f"{payload.get('previous_adapter_revision')!r}, expected {first['adapter_id']!r}; the "
-        f"client fails the deploy on exactly this comparison"
-    )
-    assert payload.get("target_adapter_revision") == second["adapter_id"], (
-        f"activation echoed target_adapter_revision={payload.get('target_adapter_revision')!r}, "
-        f"expected {second['adapter_id']!r}"
-    )
+        response = _activate(http, second["adapter_id"], first["adapter_id"])
+        assert response.status_code == 200, (
+            f"activating {second['adapter_id']} with {first['adapter_id']} as the expectation "
+            f"returned {response.status_code}: {response.text[:400]}. this is the ordinary upgrade "
+            f"path -- every deploy after a run's first one names the live revision as its "
+            f"expectation, so a backend that rejects it cannot serve a second checkpoint"
+        )
+        payload = response.json()
+        assert payload.get("previous_adapter_revision") == first["adapter_id"], (
+            f"activation echoed previous_adapter_revision="
+            f"{payload.get('previous_adapter_revision')!r}, expected {first['adapter_id']!r}; the "
+            f"client fails the deploy on exactly this comparison"
+        )
+        assert payload.get("target_adapter_revision") == second["adapter_id"], (
+            f"activation echoed target_adapter_revision="
+            f"{payload.get('target_adapter_revision')!r}, expected {second['adapter_id']!r}"
+        )
 
-    alias = _record(http.get(f"/adapters/{run_id}").json())
-    metadata = alias.get("metadata") if isinstance(alias.get("metadata"), dict) else {}
-    assert metadata.get("alias_of") == second["adapter_id"], (
-        f"the activation reported success but the alias still names "
-        f"{metadata.get('alias_of')!r}; a backend that returns the right provenance without "
-        f"moving the alias serves the OLD checkpoint to every request after an upgrade"
-    )
+        alias = _record(http.get(f"/adapters/{run_id}").json())
+        metadata = alias.get("metadata") if isinstance(alias.get("metadata"), dict) else {}
+        assert metadata.get("alias_of") == second["adapter_id"], (
+            f"the activation reported success but the alias still names "
+            f"{metadata.get('alias_of')!r}; a backend that returns the right provenance without "
+            f"moving the alias serves the OLD checkpoint to every request after an upgrade"
+        )
+    finally:
+        http.delete(f"/adapters/{run_id}")
 
 
 def test_concurrent_activations_of_one_alias_leave_exactly_one_winner(

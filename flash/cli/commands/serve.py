@@ -588,6 +588,26 @@ def cmd_serve_status(args) -> int:
                 file=sys.stderr,
             )
             return 1
+        else:
+            # Reached only when the read-back RETURNED, which for a `uuid4` id that was never
+            # registered means the backend answered 200 with a record it made up. Every branch
+            # above handles a raising response, and without this one a 200 fell past all of them
+            # to `ready` -- so the one outcome that proves the backend does NOT implement
+            # unknown-record semantics was the outcome reported as success.
+            #
+            # It is not a harmless quirk to tolerate. `models deploy` polls this exact route and
+            # compares the record it gets back against the identity it registered; a backend that
+            # fabricates records answers that poll with a mismatch, which the client reads as an
+            # immutability violation and refuses. Telling the operator `ready` here means the
+            # failure surfaces mid-deploy instead of during the command written to diagnose it.
+            print(
+                f"\nthe backend at {shown} answered 200 with a record for an adapter id that was "
+                f"never registered, where the contract requires 404. `{CLI_NAME} models deploy` "
+                f"cross-checks the record it reads back, so a backend that fabricates records "
+                f"fails every deploy.",
+                file=sys.stderr,
+            )
+            return 1
     print(f"\nready. deploy a run with: {CLI_NAME} models deploy <run-id>")
     return 0
 

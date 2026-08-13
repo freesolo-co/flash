@@ -967,3 +967,49 @@ def test_status_skips_the_key_probe_on_a_backend_without_one(monkeypatch, capsys
     assert serve_cmd.cmd_serve_status(_args()) == 0
     assert asked == ["/healthz"]
     assert "ready. deploy a run" in capsys.readouterr().out
+
+
+def test_status_does_not_report_ready_when_the_read_back_fabricates_a_record(monkeypatch, capsys):
+    """A 200 for an id that was never registered is a contract violation, not a passing probe.
+
+    Every other branch of the key probe handles a RAISING response, so a backend that answers the
+    made-up id with a fabricated record returned normally and fell through to `ready` -- the one
+    outcome proving the backend does not implement unknown-record semantics was reported as
+    success. `models deploy` polls this exact route and cross-checks the record against the
+    identity it registered, so a fabricating backend answers that poll with a mismatch the client
+    reads as an immutability violation and refuses.
+    """
+    from flash.serve import urls as urls_mod
+
+    def _fake_request(url, headers, path="/healthz"):
+        if path == "/healthz":
+            return {
+                "ok": True,
+                "requires_key": True,
+                "base_models": ["Qwen/Qwen3.5-4B"],
+                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
+            }
+        # The fabricating backend: a plausible-looking record for an id it has never seen.
+        return {
+            "adapter": {
+                "adapter_id": path.rsplit("/", 1)[-1],
+                "status": "ready",
+                "base_model": "Qwen/Qwen3.5-4B",
+                "metadata": {"lifecycle_state": "ready"},
+            }
+        }
+
+    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "some-key")
+    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+
+    code = serve_cmd.cmd_serve_status(_args())
+    out = capsys.readouterr()
+    assert code == 1, (
+        "status called a record-fabricating backend ready; every deploy against it then fails its "
+        "read-back identity check, which is exactly what this command exists to catch first"
+    )
+    assert "ready. deploy a run" not in out.out
+    assert "404" in out.err, (
+        f"the failure did not name the status the contract requires: {out.err!r}"
+    )
