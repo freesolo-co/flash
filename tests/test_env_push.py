@@ -3823,3 +3823,287 @@ def test_the_package_deadline_bounds_the_raw_file_scan(tmp_path):
     ordinary = tmp_path / "rows.jsonl"
     ordinary.write_bytes(b'{"text":"ordinary training row"}\n' * 20_000)
     assert credential_in_file(ordinary) is None
+
+
+def test_a_jwk_whose_markers_span_a_scan_chunk_is_still_found(tmp_path):
+    """The two JWK markers are order-independent and window-free -- within one buffer.
+
+    A chunked scan re-imposed a window between them at the chunk boundary. A JWK whose `kty` fell
+    in the first chunk and whose `d` fell in the second matched neither half, so a real RSA key
+    over the chunk size published clean. The window between them is unbounded in principle: JWK
+    members may sit any amount of extension metadata apart.
+    """
+    import json
+
+    from flash.env_secrets import _SCAN_CHUNK_BYTES, credential_in_file
+
+    spread = tmp_path / "big.jwk"
+    spread.write_text(
+        json.dumps({"kty": "RSA", "ext": "x" * (_SCAN_CHUNK_BYTES + 4096), "d": "a1B2c3D4" * 8})
+    )
+    assert credential_in_file(spread) == "a private key"
+
+    # the `kty` is what makes it a key: the same private member without one is ordinary JSON
+    ordinary = tmp_path / "rows.json"
+    ordinary.write_text(json.dumps({"note": "x" * (_SCAN_CHUNK_BYTES + 4096), "d": "a1B2c3D4" * 8}))
+    assert credential_in_file(ordinary) is None
+
+
+def test_a_symmetric_jwk_holds_its_secret_in_k_not_d(tmp_path):
+    """An `oct` JWK has no `d` at all -- its whole secret is `k`.
+
+    `oct` was named among the accepted key types while the private-member pattern listed only the
+    asymmetric members, so the one key type where the secret IS the file passed as clean. That is
+    what an HMAC signing key or an `A256GCM` content key exports as.
+    """
+    from flash.env_secrets import credential_in_file
+
+    symmetric = tmp_path / "hmac.jwk"
+    symmetric.write_text('{"kty":"oct","k":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}')
+    assert credential_in_file(symmetric) == "a private key"
+
+    public = tmp_path / "public.jwk"
+    public.write_text(
+        '{"kty":"RSA","n":"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM64","e":"AQAB"}'
+    )
+    assert credential_in_file(public) is None
+
+
+def test_a_short_credential_is_found_in_its_wide_encoding_too(tmp_path):
+    """The wide-run floor must sit at or below the shortest credential any pattern admits.
+
+    At 24 it sat above three of them, so a `pit_` (from 20 characters), `fslo_` (21) or `hf_` (23)
+    key was detected as ASCII and missed in its UTF-16 form -- the encoding the narrowing exists to
+    cover. A run has to hold the whole credential for the narrowed text to match.
+    """
+    from flash.env_secrets import credential_in_file
+
+    for name, text in (
+        ("pit", "pit_R08qzjI6GKFSufrd"),
+        ("fslo", "fslo_WJKY40uvSwMFLZDe"),
+        ("hf", "hf_S2qHx6kwXoIIXGvOoNZY"),
+    ):
+        wide = tmp_path / f"{name}.ps1"
+        wide.write_bytes(f"$env:KEY = '{text}'".encode("utf-16-le"))
+        assert credential_in_file(wide) is not None, f"{name} missed in UTF-16"
+
+    # the padding column is what identifies wide text: an ELF still narrows into nothing
+    binary = tmp_path / "binary.so"
+    binary.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"fos\x00loop_redirections\x00PS3\x00" * 40)
+    assert credential_in_file(binary) is None
+
+
+def test_a_credential_wrapped_in_the_url_safe_alphabet_is_joined(tmp_path):
+    """Line-joining accepted only `+/` while the run pattern accepted `-_` as well.
+
+    A url-safe base64 blob was therefore never recognised as wrapped, its lines were left unjoined,
+    and a credential straddling a break decoded into neither side -- the exact bypass joining
+    exists to close, reachable just by encoding with the other alphabet.
+    """
+    import base64
+
+    from flash.env_secrets import credential_in_file
+
+    raw = b"\xfb\xef\xff" * 10 + b"fslo_AbCdEf0123456789AbCdEf" + b"\xfe\xff\xef" * 3
+    encoded = base64.urlsafe_b64encode(raw)
+    assert b"-" in encoded or b"_" in encoded, "fixture no longer exercises the url-safe alphabet"
+    wrapped = tmp_path / "wrapped.txt"
+    wrapped.write_bytes(b"\n".join(encoded[at : at + 64] for at in range(0, len(encoded), 64)))
+    assert credential_in_file(wrapped) == "a Freesolo API key"
+
+
+def test_a_yaml_block_scalar_value_is_read_as_an_assignment(tmp_path):
+    """YAML may put an assigned value on the FOLLOWING lines rather than after the colon.
+
+    `KEY: |` (literal) and `KEY: >-` (folded) are the commonest multi-line forms, and a `\\s*`
+    between the colon and the body does not cover the indicator characters -- so a key written that
+    way in a `secrets.yaml` or a Helm values file matched nothing and published.
+    """
+    from flash.env_secrets import credential_in_file
+
+    # AWS's own published example value, so the fixture is unmistakably not a live key
+    body = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    for name, text in (
+        ("literal", f"AWS_SECRET_ACCESS_KEY: |\n  {body}\n"),
+        ("folded", f"AWS_SECRET_ACCESS_KEY: >-\n  {body}\n"),
+        ("indented", f"AWS_SECRET_ACCESS_KEY: |2\n  {body}\n"),
+    ):
+        written = tmp_path / f"{name}.yaml"
+        written.write_text(text)
+        assert credential_in_file(written) == "an AWS secret access key", name
+
+    # prose under the same key is still not a credential
+    prose = tmp_path / "readme.yaml"
+    prose.write_text("AWS_SECRET_ACCESS_KEY: read it from the vault at deploy time\n")
+    assert credential_in_file(prose) is None
+
+
+def test_a_raw_zlib_stream_is_expanded_rather_than_scanned_as_bytes(tmp_path):
+    """A bare zlib stream holds its credential nowhere a pattern can see, exactly like a gzip.
+
+    The container list was magic-based and zlib has no fixed magic -- its two header bytes are
+    validated by a divisibility rule -- so the compressed bytes were scanned as if they were
+    content and the stream published intact. `zlib.compress` writes this, as do `.zz` shards and
+    many application caches.
+    """
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    compressed = tmp_path / "shard.zz"
+    compressed.write_bytes(zlib.compress(b"FREESOLO_API_KEY=fslo_AbCdEf0123456789AbCdEf\n"))
+    assert credential_in_file(compressed) == "a Freesolo API key"
+
+    clean = tmp_path / "clean.zz"
+    clean.write_bytes(zlib.compress(b"ordinary training rows, nothing issued here\n" * 50))
+    assert credential_in_file(clean) is None
+
+
+def test_a_self_extracting_rar_or_7z_is_refused_behind_its_stub(tmp_path):
+    """RAR and 7-Zip both ship self-extracting archives: a stub, then the signature, then the body.
+
+    A head-anchored magic test saw the executable stub, matched nothing, and scanned the opaque
+    compressed bytes as if they were content -- the same bypass the zip stub handling closes,
+    reachable with `rar a -sfx` or 7-Zip's `-sfx` switch.
+    """
+    import contextlib
+    import os
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    for name, signature in (("rar", b"Rar!\x1a\x07\x01\x00"), ("7z", b"7z\xbc\xaf\x27\x1c")):
+        packed = tmp_path / f"{name}.exe"
+        packed.write_bytes(b"MZ" + b"\x00" * 4094 + signature + os.urandom(64))
+        with pytest.raises(_Unscannable):
+            credential_in_file(packed)
+
+    # the signature bytes are constrained enough that ordinary content does not trip them
+    ordinary = tmp_path / "notes.md"
+    ordinary.write_text("Rar! archives and 7z archives are both unsupported by this scan.\n")
+    with contextlib.suppress(_Unscannable):
+        assert credential_in_file(ordinary) is None
+
+
+def test_a_pbes1_encrypted_private_key_is_detected(tmp_path):
+    """`1.2.840.113549.1.5` is the whole password-based-encryption arc, not just PBES2's `13`.
+
+    Naming only `05 0d` let every PBES1 variant through: `openssl pkcs8 -topk8 -v1 PBE-SHA1-DES`
+    (and the MD5-DES and RC2-64 forms) writes `05 03`, `05 0a` or `05 0b` and passed as clean. A
+    passphrase is not much protection for a key in a public repository.
+    """
+    import subprocess
+
+    from flash.env_secrets import credential_in_file
+
+    plain = tmp_path / "rsa.pem"
+    generated = subprocess.run(
+        ["openssl", "genrsa", "-out", str(plain), "2048"], capture_output=True
+    )
+    if generated.returncode != 0:
+        pytest.skip("openssl is unavailable")
+    found = 0
+    for algorithm in ("PBE-MD5-DES", "PBE-SHA1-DES", "PBE-SHA1-RC2-64"):
+        encrypted = tmp_path / f"{algorithm}.der"
+        # `-provider legacy` because OpenSSL 3 moved these algorithms out of the default provider
+        options = f"-topk8 -v1 {algorithm} -outform DER -passout pass:x"
+        providers = "-provider legacy -provider default"
+        written = subprocess.run(
+            [
+                "openssl",
+                "pkcs8",
+                "-in",
+                str(plain),
+                "-out",
+                str(encrypted),
+                *options.split(),
+                *providers.split(),
+            ],
+            capture_output=True,
+        )
+        if written.returncode != 0:
+            continue  # this build cannot write the legacy algorithm; the others still prove it
+        found += 1
+        assert credential_in_file(encrypted) == "a private key", algorithm
+    if not found:
+        pytest.skip("this openssl build cannot write PBES1")
+
+
+def test_a_putty_private_key_file_is_detected(tmp_path):
+    """PuTTY's own key format is neither PEM nor DER, and `.ppk` is not a filtered name.
+
+    No `-----BEGIN` header and no ASN.1, so every structure the scan knows passed a complete
+    unencrypted private key as clean.
+    """
+    import base64
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    key = tmp_path / "id.ppk"
+    key.write_bytes(
+        b"PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nComment: deploy\n"
+        b"Public-Lines: 2\nAAAAC3NzaC1lZDI1NTE5AAAAIN\nabcdef\n"
+        b"Private-Lines: 1\n" + base64.b64encode(os.urandom(48)) + b"\nPrivate-MAC: 00\n"
+    )
+    assert credential_in_file(key) == "a private key"
+
+    # the header alone is prose about a key, exactly as for the PEM pattern
+    prose = tmp_path / "guide.md"
+    prose.write_text("A PuTTY-User-Key-File-3: header means a private key. Never commit one.\n")
+    assert credential_in_file(prose) is None
+
+
+def test_the_name_that_gets_written_is_scanned_not_only_the_one_supplied(tmp_path):
+    """Normalization folds separators, so it can turn a passing name into a credential.
+
+    `fslo_abcd1!efgh!ijkl!mnop` carries no key body across the `!`s and passed the raw scan, then
+    normalized to `fslo_abcd1-efgh-ijkl-mnop` -- which IS a Freesolo key, and which is the string
+    committed into the hub path and the commit message. Scanning only the supplied name checked a
+    string the publish never writes.
+    """
+    from flash.env_secrets import credential_in_name
+    from flash.server.domain.envs import _sanitize_name
+
+    folded = "fslo_abcd1!efgh!ijkl!mnop"
+    assert credential_in_name(folded) is None, "fixture no longer exercises the folding"
+    assert credential_in_name(_sanitize_name(folded)) == "a Freesolo API key"
+
+    ordinary = "my-training-environment"
+    assert credential_in_name(ordinary) is None
+    assert credential_in_name(_sanitize_name(ordinary)) is None
+
+
+def test_a_member_count_cannot_be_forged_behind_a_stub_on_a_zip64_archive(tmp_path):
+    """A self-extracting zip64 defeats both offset candidates at once.
+
+    The stub makes every recorded offset short, and the zip64 record and locator between the
+    directory and the classic end record make the computed shift overshoot by their combined 76
+    bytes. Neither candidate landed on the directory, so the walk gave up and the forged count was
+    trusted: a 70,000-entry archive reported one member while `ZipFile` still materialized all of
+    them, restoring the memory cost the pre-check exists to avoid.
+    """
+    import struct
+    import zipfile
+
+    from flash.env_formats import _zip_member_count
+
+    body = tmp_path / "body.zip"
+    with zipfile.ZipFile(body, "w", zipfile.ZIP_STORED, allowZip64=True) as writing:
+        for index in range(70_000):
+            writing.writestr(f"f{index}", b"")
+    raw = bytearray(body.read_bytes())
+    classic = raw.rfind(b"PK\x05\x06")
+    struct.pack_into("<HH", raw, classic + 8, 1, 1)
+    zip64 = raw.rfind(b"PK\x06\x06")
+    struct.pack_into("<QQ", raw, zip64 + 24, 1, 1)
+    packed = tmp_path / "sfx.exe"
+    packed.write_bytes(b"MZ" + b"\x00" * 100 + bytes(raw))
+
+    assert _zip_member_count(packed, 100) > 100
+
+    # an ordinary zip64 archive under the limit still reports its real, small count
+    small = tmp_path / "few.zip"
+    with zipfile.ZipFile(small, "w", zipfile.ZIP_STORED, allowZip64=True) as writing:
+        writing.writestr("a.txt", b"hello")
+        writing.writestr("b.txt", b"world")
+    assert _zip_member_count(small, 100) == 2

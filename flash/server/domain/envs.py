@@ -452,7 +452,14 @@ def validate_publish_inputs(*, package_b64: object, name: object) -> bytes:
     # The NAME is scanned as well as the package. It becomes the hub path and the commit message,
     # so a credential passed as the environment name is published just as permanently as one in a
     # file -- and it never reaches `_reject_credentials`, which only ever sees the extracted tree.
-    if kind := credential_in_name(name):
+    #
+    # The NORMALIZED form is scanned too, because that is what actually gets written. Normalization
+    # folds separators, so a name the patterns reject can become one they match: `fslo_abcd1!efgh!
+    # ijkl!mnop` carries no key body across the `!`s and passed, then normalized to
+    # `fslo_abcd1-efgh-ijkl-mnop`, which IS a Freesolo key -- and that is the string committed into
+    # the hub path and the commit message. Scanning only the raw input checked a string the publish
+    # never writes.
+    if kind := credential_in_name(name) or credential_in_name(_sanitize_name(name)):
         raise EnvPublishError(f"env name contains {kind}; rotate it and use a different name")
     max_encoded = ((_MAX_UPLOAD_BYTES + 2) // 3) * 4 + 3
     if len(package_b64) > max_encoded:

@@ -23,6 +23,11 @@ _ZIP_TAIL_BYTES = (64 << 10) + 64
 # comment. Used to step from one record to the next while counting them.
 _ZIP_CENTRAL_HEADER_BYTES = 46
 
+# The zip64 end-of-central-directory record (56 bytes) plus its locator (20). They sit between the
+# directory and the classic end record on a zip64 archive, which is what makes the shift computed
+# from the classic record overshoot by exactly this much.
+_ZIP64_END_BYTES = 76
+
 # How many members of one archive are inspected before it is refused as unscannable. Defined here
 # because the directory walk below needs a bound of its own, and re-exported through
 # `flash.env_secrets`, which is where the policy is applied and where tests rebind it.
@@ -97,7 +102,29 @@ def _after_skippable_frames(head: bytes) -> tuple[bytes, bool]:
 
 def _looks_compressed(head: bytes) -> bool:
     """Whether `head` begins a compressed container this scan can expand."""
-    return head.startswith(_COMPRESSED_MAGIC)
+    return head.startswith(_COMPRESSED_MAGIC) or _looks_like_zlib(head)
+
+
+def _looks_like_zlib(head: bytes) -> bool:
+    """Whether `head` begins a raw zlib stream (RFC 1950).
+
+    A bare zlib stream is what `zlib.compress` writes, and what a `.zz` shard, a PDF `FlateDecode`
+    payload, and many application caches carry. It holds its credential nowhere a pattern can see,
+    exactly like a gzip -- but the format list was magic-based and zlib has no fixed magic, so the
+    bytes were scanned as if they were content and the stream published intact.
+
+    Identified by the RFC 1950 header rule rather than by a literal: the method nibble must be 8
+    (deflate), the window nibble at most 7, and the two bytes together must be a multiple of 31.
+    That is about 11 bits of constraint, so an arbitrary file trips it roughly once in 2,000 --
+    which is why it is checked LAST and only where a container is already suspected. A false
+    positive costs a decompression attempt that fails and falls through, not a refusal.
+    """
+    return (
+        len(head) >= 2
+        and head[0] & 0x0F == 8
+        and head[0] >> 4 <= 7
+        and int.from_bytes(head[:2], "big") % 31 == 0
+    )
 
 
 def _is_openpgp_secret_key(head: bytes) -> bool:
@@ -322,7 +349,12 @@ def _zip_directory_entries(
     # end record and locator sit in between, so the shift came out as their combined length (76
     # bytes) on an archive that had no stub at all and the walk landed mid-record. Reading the
     # recorded offset settles that case, and the shifted one still covers a genuine stub.
-    for candidate in dict.fromkeys((start, start + shift)):
+    #
+    # A third candidate covers the two TOGETHER. An SFX zip64 has both a stub (so the recorded
+    # offset is short) and the zip64 record and locator between its directory and the classic end
+    # record (so the computed shift overshoots by their combined length). Neither of the first two
+    # candidates lands on the directory, and the walk fell back to the forged count.
+    for candidate in dict.fromkeys((start, start + shift, start + shift - _ZIP64_END_BYTES)):
         directory = _read_at(source, candidate, size)
         if directory is not None and directory[:4] == b"PK\x01\x02":
             break
