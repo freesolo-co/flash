@@ -4658,6 +4658,92 @@ def test_bridge_score_returns_the_episode_reward_for_that_session():
     assert env.scored[0]["messages"][0]["content"] == "answer"
 
 
+def test_bridge_marks_the_parent_busy_while_a_slow_judge_scores_a_batch():
+    """Multi-turn scores a whole batch of terminal episodes in ONE env call and records them only
+    after it returns, exactly like the single-turn path. Without the `grading` guard around that
+    call the silence watchdog sees no parent activity for its whole duration and tears down a
+    healthy run mid-judge.
+    """
+    observability = RewardObservabilityBuffer()
+    seen = []
+
+    class SlowJudgeEnv(_BridgeEnv):
+        def rollout_rewards_many(self, items):
+            # observed from INSIDE the env call, which is the window the guard has to cover.
+            seen.append(observability.reward_grading_in_flight())
+            return super().rollout_rewards_many(items)
+
+    bridge = _bridge(SlowJudgeEnv(episode=0.5), grading=observability.grading)
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.5}
+
+    assert seen == [True], "the parent was not marked busy while the env scored the batch"
+    # and the mark is released, or the watchdog stays disarmed for the rest of the run.
+    assert not observability.reward_grading_in_flight()
+
+
+def test_bridge_marks_the_parent_busy_while_the_env_takes_a_turn():
+    """`env_reply` is parent-side env work the child is BLOCKED on, and it records nothing.
+
+    A slow tool call or api inside a turn is indistinguishable from a wedge on the child's tail
+    alone, exactly like a slow judge, so it needs the same busy mark. Scoring is not reached at all
+    on this path: the episode is still mid-rollout.
+    """
+    observability = RewardObservabilityBuffer()
+    seen = []
+
+    class SlowTurnEnv(_BridgeEnv):
+        def env_reply(self, messages, state):
+            seen.append(observability.reward_grading_in_flight())
+            return super().env_reply(messages, state)
+
+    bridge = _bridge(SlowTurnEnv(done_after=99), grading=observability.grading)
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+
+    assert seen == [True], "the parent was not marked busy while the env took its turn"
+    assert not observability.reward_grading_in_flight()
+
+
+def test_a_thread_queued_behind_a_hung_env_turn_does_not_report_itself_busy():
+    """The busy mark must cover the env CALL, not the wait to be allowed to make it.
+
+    Marking the parent busy while merely queued on `_lock` inverts the fix: a genuinely hung
+    `env_reply` would hold every other thread in a "busy" state forever, silence would reset every
+    tick, and the watchdog could never name the wedge -- teardown would fall back to the slower
+    provider timer, which is the behaviour this whole PR exists to improve on.
+    """
+    observability = RewardObservabilityBuffer()
+    bridge = _bridge(_BridgeEnv(), grading=observability.grading)
+
+    # hold the env lock the way a hung `env_reply` would, then drive the batcher's scoring callback
+    # directly. going through `score()` would not reach it: that method takes the same lock first,
+    # so the thread would block before `_score_batch` ever ran and the assertion below could not
+    # tell the two orderings apart.
+    bridge._lock.acquire()
+    try:
+        queued = threading.Thread(
+            target=lambda: bridge._score_batch([]),
+            daemon=True,
+        )
+        queued.start()
+        time.sleep(0.3)
+
+        # it is waiting for the lock, doing NO env work. marking it busy here would mean a hung env
+        # keeps resetting silence on every tick, and the watchdog could never name the wedge.
+        assert observability._grading_depth == 0, (
+            "a thread queued on the env lock counted itself as busy, which would disarm the "
+            "watchdog for as long as the env stays hung"
+        )
+        assert not observability.reward_grading_in_flight()
+    finally:
+        bridge._lock.release()
+
+    queued.join(timeout=10)
+    assert not observability.reward_grading_in_flight()
+
+
 def test_bridge_score_converts_an_unscorable_episode_to_zero(capsys):
     # nan is score_rollouts' unscorable marker. verl has no equivalent: a nan advantage propagates
     # through the group baseline and poisons every OTHER rollout in the group, so one ungradable

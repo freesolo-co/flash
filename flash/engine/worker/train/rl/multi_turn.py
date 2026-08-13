@@ -199,7 +199,12 @@ class MultiTurnBridge:
             self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
             if self._env.rollout_done(state, self._max_turns):
                 return {"terminal": True, "messages": []}
-            replies = self._env.env_reply(list(state.get("messages") or ()), state)
+            # the env's turn reply is parent-side work the child is BLOCKED on, and it records
+            # nothing: a slow tool call or api here looks exactly like a wedge to the tail alone.
+            # marked busy for the same reason scoring is, and equally inside the lock so a thread
+            # queued behind someone else's slow turn does not report itself as working.
+            with self._grading():
+                replies = self._env.env_reply(list(state.get("messages") or ()), state)
             terminal = bool(self._env.rollout_done(state, self._max_turns))
         return {
             "terminal": terminal,
@@ -216,9 +221,12 @@ class MultiTurnBridge:
         episode's ``env_reply``. the win is that one lock acquisition now covers a whole batch.
 
         ``grading`` spans the call for the silence watchdog: episodes are recorded only after the
-        whole batch returns, so nothing else marks the parent alive while a slow judge runs.
+        whole batch returns, so nothing else marks the parent alive while a slow judge runs. it goes
+        INSIDE the lock deliberately -- wrapping the acquisition too would report the parent busy
+        while this thread is merely queued behind a hung ``env_reply``, which is a wedge the watchdog
+        must still be able to name.
         """
-        with self._grading(), self._lock:
+        with self._lock, self._grading():
             return score_rollouts(self._env, requests)
 
     def score(self, payload: dict) -> dict:
