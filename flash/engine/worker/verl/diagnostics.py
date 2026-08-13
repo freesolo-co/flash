@@ -145,8 +145,9 @@ def raise_for_classified_verl_exit(return_code: int, tail: ChildOutputTail) -> N
         raise RuntimeError(
             f"verl subprocess exited with status {return_code} after ray killed its workers: "
             f"{host_ram_evidence}. this is a HOST RAM (system memory) kill, not a gpu OOM.{both} "
-            "select a gpu class whose nodes carry more system RAM; the worker-process floor is set "
-            "by process COUNT, which prompts_per_step does not change."
+            "select a gpu class whose nodes carry more system RAM; the footprint is dominated by a "
+            "worker-process floor, and the pool size is a divisor of prompts_per_step x group_size "
+            "capped at 8, so lowering prompts_per_step alone usually leaves it unchanged."
         )
     if oom_evidence is not None:
         raise RuntimeError(
