@@ -1116,6 +1116,43 @@ def test_a_closing_tag_quoted_inside_reasoning_does_not_end_the_block_early(
     assert "max_context_tokens cut 1 rendered reasoning" in capsys.readouterr().err
 
 
+def test_a_cap_landing_on_the_answer_separator_does_not_report_lost_reasoning(capsys) -> None:
+    """Truncation is judged at the CLOSING TAG, not at the blank line that follows it.
+
+    The span runs through the ``\\n\\n`` separating reasoning from the answer, because that layout
+    is what identifies the block. The separator is not reasoning, and it costs a real token, so a
+    cap landing between the closing tag and the answer retains every reasoning token while a span
+    measured to its own end reads as cut -- a cap-loss warning naming a remedy for a row that lost
+    nothing, and an understated survival percentage.
+    """
+    completion = [{"role": "assistant", "content": "<think>short</think>answer text"}]
+    # the fake is one token per character: the closing tag ends at 49 and the span at 51, so this
+    # cap retains the whole block and only a span-end measurement would call it truncated. a cap
+    # below 49 would cut the block under either rule and could not tell them apart.
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=49, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        ThinkingEnvironment(completion),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 1
+    assert prepared.truncated_reasoning_spans == 0
+    assert "max_context_tokens cut" not in capsys.readouterr().err
+
+
 def test_reasoning_containing_a_balanced_tag_is_measured_to_its_real_end(capsys) -> None:
     """A span's end is the OUTER closer, even when the reasoning quotes a balanced pair inside it.
 
