@@ -325,35 +325,41 @@ def queue_wait_note(
     within budget from a wedged one, so the operator's natural reaction is to cancel and relaunch,
     throwing away queue position.
 
-    Report the grace that will actually FIRE. Several govern a queued job and they differ: an
-    unhealthy worker dies on unhealthy_grace_s (240s, which stall_kwargs never widens) while the
-    capacity grace is 300s or 900s, so quoting capacity there promises minutes that do not exist.
-    An unhealthy worker is therefore reported against its own grace from the FIRST such poll, before
-    that timer has armed -- the arming happens after this line is printed.
+    Report the deadline that will actually FIRE, which means the one with the LEAST TIME LEFT.
+    Several graces govern a queued job, they differ in length, and they run concurrently: an
+    unhealthy worker is neither usable nor initializing, so the capacity timer keeps counting
+    underneath it. Neither timer can be given fixed priority. Quoting the unhealthy grace (240s,
+    which stall_kwargs never widens) on a job already 800s into a 900s capacity grace would promise
+    240s when 100s remain -- the same false remaining-time this note exists to prevent, inverted.
+
+    The throttled timer is not a candidate: stall_kwargs gives it the same grace as the capacity
+    timer, and it can only arm later, so the capacity timer always binds first.
 
     Returns "" when nothing is counting down yet, so the caller prints the bare queued line.
     """
+    candidates = []
     if unhealthy:
         # not yet armed -> this poll is the one that arms it, so no time has been charged.
         waited = 0.0 if unhealthy_since is None else now - unhealthy_since
-        grace, label, clause = unhealthy_grace_s, "unhealthy grace", ""
-    elif queued_since is not None:
+        candidates.append((unhealthy_grace_s - waited, waited, unhealthy_grace_s, "unhealthy", ""))
+    if queued_since is not None:
         waited = now - queued_since
         # the escalation fact ONLY, like `capacity_escalation_note`: on_last_gpu is also true when
         # the infra retry budget is exhausted with GPU classes still untried, so it must never be
         # reported as "this GPU class is pinned".
-        waited, grace, label = waited, queue_grace_s, "capacity grace"
         clause = (
             " (no further GPU-class escalation follows, so capacity is given longer)"
             if on_last_gpu
             else ""
         )
-    else:
+        candidates.append((queue_grace_s - waited, waited, queue_grace_s, "capacity", clause))
+    if not candidates:
         return ""
+    _, waited, grace, label, clause = min(candidates, key=lambda c: c[0])
     # never quote more elapsed than the budget: this line is printed before the timer is checked,
     # so the poll that fails would otherwise read "waited 360s of 240s". at the cap it says what
     # the operator needs -- the budget is spent -- and the failure detail carries the exact figure.
-    return f"waited {int(min(waited, grace))}s of {int(grace)}s {label}{clause}"
+    return f"waited {int(min(waited, grace))}s of {int(grace)}s {label} grace{clause}"
 
 
 def submit_run(

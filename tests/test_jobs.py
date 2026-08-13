@@ -770,6 +770,28 @@ def test_queued_line_reports_the_deadline_that_will_actually_fire(monkeypatch):
     assert not any("900s" in ln for ln in counted), counted
 
 
+def test_queued_line_never_quotes_a_grace_that_outlasts_a_shorter_running_one():
+    # The two timers run CONCURRENTLY: an unhealthy worker is neither usable nor initializing, so
+    # the capacity timer keeps counting underneath it. Neither can win by fixed priority. A job 800s
+    # into a 900s capacity grace that then reports unhealthy has 100s left, not the 240s a naive
+    # "unhealthy always wins" rule would promise -- the same false remaining-time, inverted.
+    from flash.providers.runpod.jobs import queue_wait_note
+
+    late = queue_wait_note(
+        True, None, 0.0, 800.0, unhealthy_grace_s=240.0, queue_grace_s=900.0, on_last_gpu=True
+    )
+    assert "capacity grace" in late, late
+    assert "of 900s" in late, late
+    assert "unhealthy" not in late, late
+
+    # and the converse still holds: once unhealthy is the nearer deadline, it is the one reported.
+    early = queue_wait_note(
+        True, 100.0, 0.0, 200.0, unhealthy_grace_s=240.0, queue_grace_s=900.0, on_last_gpu=True
+    )
+    assert "unhealthy grace" in early, early
+    assert "capacity" not in early, early
+
+
 def test_queued_line_omits_a_capacity_countdown_while_a_worker_is_coming_up(monkeypatch):
     # A worker that is initializing is governed by the much larger setup grace, not the capacity
     # timer -- which is why the timer is not armed here. Printing a capacity countdown anyway would
