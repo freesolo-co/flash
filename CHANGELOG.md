@@ -29,6 +29,16 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- A thinking run could be redeployed and reported `ready` while its served model returned no
+  reasoning at all. The deployment smoke pins the immutable revision and runs before the alias is
+  flipped, but a bare `model: <run-id>` request resolves to the mutable alias, so nothing ever
+  exercised the surface real requests use: an alias reconciliation that did not re-apply the
+  reasoning configuration was invisible. Observed as the same adapter, at the same immutable
+  revision hash, going from reasoning on 300/300 requests to 0/7 after a redeploy. A thinking
+  deployment whose revision smoked with a thinking block is now verified once against the alias
+  after activation, and the resolved state is exposed on the deployment record as
+  `alias_thinking_tag` so a client can check it. Non-thinking runs are unaffected.
+
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always
   `flash`. On a host where `runpod-flash` owns the `flash` script, the printed
