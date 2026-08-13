@@ -363,16 +363,25 @@ def _hf_repo_confirmed_to_exist(api: object, repository: str, token: str) -> boo
         return False
 
 
+# sub-500 statuses that describe the request's transport rather than this token's access: request
+# timeout, too-early replay, and rate limiting. 5xx is handled by the range check alongside these.
+_HUB_TRANSIENT_STATUSES = frozenset({408, 425, 429})
+
+
 def _hf_status_is_a_verdict(status: int | None) -> bool:
     """Whether an HTTP status is the Hub answering the permission question about this token.
 
     401/403/404 are answers: rejected, forbidden, or no such repo for this token. A missing status
-    (no response at all), 429, and 5xx are not -- they say the Hub was busy or broken, which is a
-    fact about the Hub rather than about the caller's access.
+    (no response at all), 408, 425, 429, and 5xx are not -- they say the Hub was busy, slow or
+    broken, which is a fact about the Hub rather than about the caller's access.
+
+    408 and 425 carry a response, so they reach here rather than the statusless path, but a request
+    timeout and a too-early retry are transport outcomes: nothing about them says this token may not
+    write. Blocking on one would blame the user's permissions for the Hub being slow.
     """
     if status is None:
         return False
-    return status < 500 and status != 429
+    return status < 500 and status not in _HUB_TRANSIENT_STATUSES
 
 
 def _without_token(text: str, token: str) -> str:
@@ -382,10 +391,22 @@ def _without_token(text: str, token: str) -> str:
     b'Bearer <token>'" for a token containing a newline, so interpolating the exception prints the
     credential to stderr and into any log or pasted bug report. The exception is still worth showing
     -- it is the only clue to what went wrong -- so redact rather than drop it.
+
+    The escaped renderings have to go too. httpx builds that message from the header BYTES, so a
+    token holding a real newline appears as the two characters `\\` and `n`, which a literal replace
+    of the token never matches -- the redaction silently does nothing in exactly the case it was
+    written for. Each form is removed longest-first so a shorter one cannot bite a piece out of a
+    longer one and leave the rest of the credential in place.
     """
     if not token:
         return text
-    return text.replace(token, "<redacted>")
+    # repr() of the str and of the utf-8 bytes cover the escapings httpx and friends actually emit;
+    # the [1:-1] strips the quotes repr adds so the inner escaped text is what gets matched.
+    forms = {token, repr(token)[1:-1], repr(token.encode())[2:-1]}
+    for form in sorted(forms, key=len, reverse=True):
+        if form:
+            text = text.replace(form, "<redacted>")
+    return text
 
 
 def _hf_hub_version() -> str:

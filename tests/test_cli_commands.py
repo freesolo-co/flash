@@ -2850,9 +2850,16 @@ def test_export_warning_does_not_echo_the_token_from_a_hub_exception(
 
     httpx raises `Illegal header value b'Bearer <token>'` for a token with an internal newline, so
     interpolating the exception verbatim prints the credential into stderr, logs and bug reports.
+
+    The token here holds a REAL newline and the exception renders the ESCAPED form, which is what
+    httpx actually does -- it builds that message from the header bytes. An earlier version of this
+    test passed a token with no newline against a message containing a literal backslash-n, so the
+    two happened to match and a redaction that only replaced the exact token looked correct.
     """
     import sys
     import types
+
+    token = "hf_secret\nINJECT"
 
     class FakeHfApi:
         def whoami(self, token):
@@ -2863,7 +2870,8 @@ def test_export_warning_does_not_echo_the_token_from_a_hub_exception(
             }
 
         def auth_check(self, repo_id, *, repo_type=None, token=None, write=False):
-            raise ValueError("Illegal header value b'Bearer hf_secret\\nINJECT'")
+            # the bytes repr of the header, escapes and all, exactly as httpx renders it.
+            raise ValueError(f"Illegal header value {b'Bearer ' + token.encode()!r}")
 
     monkeypatch.setitem(
         sys.modules,
@@ -2879,11 +2887,12 @@ def test_export_warning_does_not_echo_the_token_from_a_hub_exception(
             "--repository",
             "acme/model",
             "--api-key",
-            "hf_secret",
+            token,
         ]
     )
     err = capsys.readouterr().err
-    assert "hf_secret" not in err
+    assert "hf_secret" not in err, "the escaped rendering must be redacted too"
+    assert "INJECT" not in err
     # the exception is still shown: it is the only clue to what actually failed.
     assert "Illegal header value" in err
 
@@ -2939,7 +2948,10 @@ def test_export_treats_a_rate_limit_or_outage_as_no_answer_but_still_obeys_a_ver
         capsys.readouterr()
         return code
 
-    for transient in (429, 500, 503):
+    # 408 and 425 carry a response, so they arrive here with a status rather than through the
+    # statusless path -- but a request timeout and a too-early replay are transport outcomes, not
+    # statements about this token's access.
+    for transient in (408, 425, 429, 500, 503):
         assert run_with(transient) == 0, f"{transient} is about the Hub, not about this token"
     for verdict in (401, 403):
         assert run_with(verdict) == 1, f"{verdict} answers the permission question and must block"
