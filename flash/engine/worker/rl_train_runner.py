@@ -256,7 +256,15 @@ def _write_rl_shim(inp, files) -> list[str]:
             # card (see train/rl/shims.render_deferred_patch_runtime). unwrapped -- it only defines
             # the registry and touches no cuda, so there is no patch here that could fail open.
             render_deferred_patch_runtime(),
-            *(wrap_shim_fragment(name, source) for name, source in required_fragments),
+            # records_own_marker: every fragment above defers its patch to the import of the module
+            # it targets, so this wrapper now spans only the REGISTRATION. a marker written here
+            # would prove a callback was queued, not that the patch ran, and the parent's
+            # verify_applied_shim_markers would pass for a child training unpatched. each deferred
+            # body records its own name once the patch is actually installed.
+            *(
+                wrap_shim_fragment(name, source, records_own_marker=True)
+                for name, source in required_fragments
+            ),
             # gated on the key rather than the resolved logger list: that list needs python_bin,
             # which is resolved after this file is written. the shim is inert either way -- it only
             # fires when verl actually calls wandb.init, which requires wandb in the logger list.

@@ -327,8 +327,14 @@ def _exec_shim_fragment(source, namespace=None):
     Draining the registry here rather than importing the target keeps these tests independent of
     whether a stub module is already in ``sys.modules``: the registry applies immediately for an
     imported target and waits for the rest, and this runs whatever is still pending either way.
+
+    A deferred body also records its own applied-shim marker, so the recorder the real
+    sitecustomize always defines above the fragments has to exist here too. It is stubbed rather
+    than pointed at a file: these tests assert on the patch, and the marker contract has its own
+    coverage in ``test_a_deferred_fragment_records_its_marker_only_once_the_patch_applies``.
     """
     namespace = {} if namespace is None else namespace
+    namespace.setdefault("_flash_record_applied_shim", lambda name: None)
     # the registry is cached on `sys` so one sitecustomize can hold many fragments, which also means
     # it OUTLIVES a test. drop any existing one first and uninstall ours after, or a later test
     # inherits this one's pending callbacks and its finder stays on meta_path for the whole session.
@@ -433,6 +439,91 @@ def _defer_registry(tmp_path=None):
             del sys._flash_defer_registry
         if previous is not None:
             sys._flash_defer_registry = previous
+
+
+def test_a_deferred_fragment_records_its_marker_only_once_the_patch_applies(tmp_path, monkeypatch):
+    """the marker must mean "patched", not "queued".
+
+    Deferral moved the patch off sitecustomize time, which silently changed what
+    `wrap_shim_fragment`'s own `_flash_record_applied_shim` call proved: it now sits after the
+    REGISTRATION. A child that armed the registry and then never imported the target would record
+    every marker and train with no patch at all, and the parent's `verify_applied_shim_markers`
+    would wave it through -- the exact fail-closed hole the wrapper exists to close.
+
+    So the marker is written from inside the deferred body, and this pins both halves: nothing at
+    arming time, exactly one on application.
+    """
+    markers = tmp_path / "applied_shims.txt"
+    (tmp_path / "flash_marker_probe.py").write_text("PATCHED = False\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("flash_marker_probe", None)
+    source = verl_shims.render_deferred_patch_runtime() + backend_common.wrap_shim_fragment(
+        "probe-fragment",
+        verl_shims._deferred_patch(
+            "markerprobe",
+            "flash_marker_probe",
+            "import flash_marker_probe as _m\n_m.PATCHED = True\n",
+            "probe-fragment",
+        ),
+        records_own_marker=True,
+    )
+    namespace: dict = {}
+    with _defer_registry():
+        try:
+            exec(
+                compile(
+                    backend_common.render_shim_marker_prologue(str(markers)) + source,
+                    "sitecustomize.py",
+                    "exec",
+                ),
+                namespace,
+            )
+            # armed, not applied: the fragment ran to completion at sitecustomize time and still
+            # owes its marker, because the module it patches has not been imported.
+            assert backend_common.read_applied_shim_markers(str(markers)) == set()
+            with pytest.raises(RuntimeError, match="never proved these required runtime patches"):
+                backend_common.verify_applied_shim_markers(str(markers), ["probe-fragment"])
+
+            import flash_marker_probe
+
+            assert flash_marker_probe.PATCHED is True
+            assert backend_common.read_applied_shim_markers(str(markers)) == {"probe-fragment"}
+            # and the parent now accepts it -- one marker, written once, meaning the patch is in.
+            backend_common.verify_applied_shim_markers(str(markers), ["probe-fragment"])
+            assert markers.read_text().count("probe-fragment") == 1
+        finally:
+            sys.modules.pop("flash_marker_probe", None)
+
+
+def test_every_rl_fragment_defers_its_marker_rather_than_recording_it_at_arming(tmp_path):
+    # the wiring half of the property above: _write_rl_shim must pass records_own_marker for these
+    # fragments, or the wrapper writes the name at registration and the guarantee is gone. asserted
+    # on the composed file, so a future fragment wired the old way fails here.
+    files = _shim_files(tmp_path)
+    inp = {
+        "dp_cards": 2,
+        "reentrant_checkpointing": True,
+        "multimodal": False,
+        "entropy_quantile": None,
+        "per_turn_credit": False,
+        "stop_sequences": (),
+        "image_pad_token_id": None,
+        "structured_outputs": None,
+        "save_at_steps": (),
+        "steps": 20,
+        "warmstart_adapter": None,
+        "kl_coef": 0.0,
+        "multi_turn": False,
+    }
+    expected = rl_train._write_rl_shim(inp, files)
+    source = Path(files["shim_py"]).read_text()
+    for name in expected:
+        # exactly one record call per fragment, and it sits INSIDE the deferred body -- i.e. before
+        # the register() that queues that body, not after it.
+        assert source.count(f"_flash_record_applied_shim({name!r})") == 1
+        marker_at = source.index(f"_flash_record_applied_shim({name!r})")
+        register_after = source.index("_flash_defer_registry.register", marker_at)
+        assert marker_at < register_after
 
 
 def test_the_deferred_registry_runs_patches_at_the_targets_real_import(tmp_path, monkeypatch):

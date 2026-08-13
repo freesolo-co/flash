@@ -431,20 +431,27 @@ def _flash_record_applied_shim(name):
 """
 
 
-def wrap_shim_fragment(name: str, source: str) -> str:
+def wrap_shim_fragment(name: str, source: str, *, records_own_marker: bool = False) -> str:
     """wrap one required sitecustomize fragment so it fails closed and proves it applied.
 
     "" stays "": a feature that is off has nothing to prove. requires the prologue above earlier
     in the same sitecustomize. optional fragments (tf32, the wandb link) stay unwrapped, since they
     swallow their own failures by design and must never be able to kill a paid run.
+
+    ``records_own_marker`` is for fragments that DEFER their patch to a later import (see
+    train/rl/shims._deferred_patch). For those, everything this wrapper spans is registration, so
+    recording the marker here would prove only that a callback was queued -- and the parent's
+    verify_applied_shim_markers would accept a child whose patch never ran. Such a fragment writes
+    its own marker from inside the deferred body instead, and passes True here so the name is not
+    also recorded at arming time.
     """
     if not source:
         return ""
+    recorded = "" if records_own_marker else f"\n    _flash_record_applied_shim({name!r})"
     return f"""
 # --- flash required fragment: {name} (fails closed; see child_io.wrap_shim_fragment) ---
 try:
-{textwrap.indent(source, "    ")}
-    _flash_record_applied_shim({name!r})
+{textwrap.indent(source, "    ")}{recorded}
 except BaseException:
     import os as _flash_shim_os
     import sys as _flash_shim_sys

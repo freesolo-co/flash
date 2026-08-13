@@ -235,10 +235,11 @@ if not getattr(_flash_rank_worker.Worker.__init__, "_flash_rank_checked", False)
     _flash_rank_init._flash_rank_checked = True
     _flash_rank_worker.Worker.__init__ = _flash_rank_init
 ''',
+        "rank-device-assert",
     )
 
 
-def _deferred_patch(tag: str, target: str, body: str) -> str:
+def _deferred_patch(tag: str, target: str, body: str, marker: str) -> str:
     """Run ``body`` when ``target`` finishes importing, rather than at sitecustomize time.
 
     ``target`` is the module the fragment actually patches, so the body runs at the first moment
@@ -253,17 +254,26 @@ def _deferred_patch(tag: str, target: str, body: str) -> str:
     module scope, so a shared function name would let the last fragment silently replace an earlier
     one's body.
 
-    Fail-closed is preserved: an exception in the body propagates out of the child's own import of
-    ``target``, so a fragment that cannot apply still kills the run instead of training unpatched.
+    ``marker`` is the fragment's name, recorded from INSIDE the body once the patch has landed.
+    Deferral moves the work off sitecustomize time, so ``wrap_shim_fragment``'s own
+    ``_flash_record_applied_shim`` call no longer sits after the patch -- it sits after the
+    REGISTRATION, and would prove only that a callback was queued. The parent's
+    ``verify_applied_shim_markers`` would then accept a child whose patch never ran, which is
+    exactly the train-unpatched hole the wrapper exists to close. Recording here keeps one marker
+    meaning one thing: this patch is installed.
+
+    Fail-closed in both directions: an exception in the body propagates out of the child's own
+    import of ``target`` (killing the run), and a body that never runs records no marker (failing
+    the parent's check).
 
     Requires ``render_deferred_patch_runtime()`` earlier in the same sitecustomize.
     """
     import textwrap
 
-    indented = textwrap.indent(textwrap.dedent(body).strip("\n"), "    ")
+    applied = f"{textwrap.dedent(body).strip()}\n_flash_record_applied_shim({marker!r})"
     return f"""
 def _flash_deferred_body_{tag}():
-{indented}
+{textwrap.indent(applied, "    ")}
 
 
 _flash_defer_sys._flash_defer_registry.register({target!r}, _flash_deferred_body_{tag})
@@ -368,6 +378,7 @@ def _flash_ref_disable_adapter(self):
 _flash_ref_impl.FSDPEngine._build_lora_module = _flash_ref_build_lora_module
 _flash_ref_impl.FSDPEngine.disable_adapter = _flash_ref_disable_adapter
 ''',
+        "kl-ref-adapter",
     )
 
 
@@ -418,6 +429,7 @@ if not getattr(
     _flash_so_agent_loop.AgentLoopWorker._run_agent_loop._flash_so_patched = True
     print({_STRUCTURED_OUTPUTS_MARKER!r} + " " + repr(_flash_structured_outputs), flush=True)
 ''',
+        "structured-outputs",
     )
 
 
@@ -467,6 +479,7 @@ if not getattr(
         flush=True,
     )
 ''',
+        "exact-save-steps",
     )
 
 
@@ -513,6 +526,7 @@ if not getattr(_flash_agent_loop.AgentLoopWorker._run_agent_loop, "_flash_stop_p
     _flash_agent_loop.AgentLoopWorker._run_agent_loop._flash_stop_patched = True
     print({_STOP_SEQUENCES_MARKER!r} + " " + repr(_flash_stop_sequences), flush=True)
 ''',
+        "stop-sequences",
     )
 
 
@@ -555,6 +569,7 @@ if not getattr(
     _flash_image_agent_loop.AgentLoopWorker._run_agent_loop._flash_image_pad_patched = True
     print({_IMAGE_PAD_BAN_MARKER!r} + " " + repr(_flash_image_pad_token_id), flush=True)
 """,
+        "image-pad-ban",
     )
 
 
@@ -680,6 +695,7 @@ def _flash_pt_compute_advantage(data, *args, **kwargs):
 
 _flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage
 ''',
+        "per-turn-credit",
     )
 
 
@@ -762,6 +778,7 @@ def _flash_reentrant_build_module(self):
 
 _FlashReentrantEngine._build_module = _flash_reentrant_build_module
 """,
+        "reentrant-checkpointing",
     )
 
 
@@ -867,6 +884,7 @@ if not getattr(_flash_original_ppo_loss, "_flash_entropy_masked", False):
     _flash_losses.ppo_loss = _flash_entropy_masked_ppo_loss
     print({_ENTROPY_QUANTILE_MARKER!r} + " quantile={entropy_quantile:g}", flush=True)
 ''',
+        "entropy-quantile",
     )
 
 
