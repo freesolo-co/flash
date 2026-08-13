@@ -218,6 +218,36 @@ def _exit_for_score_failure(error: FlashTeacherBridgeError) -> None:
     exit_code = (
         _PERMANENT_TEACHER_EXIT if classification == "permanent" else _TRANSIENT_TEACHER_EXIT
     )
+    _exit_teacher_worker(exit_code, classification, str(error))
+
+
+def _write_teacher_worker_failure_fallback(classification: str, message: str) -> None:
+    _write_failure_fallback(
+        os.environ.get("FLASH_OPD_TEACHER_WORKER_FAILURE_PATH", ""),
+        classification,
+        message,
+    )
+
+
+def _exit_teacher_worker(exit_code: int, classification: str, message: str) -> None:
+    """Record why this worker is dying, then exit the process.
+
+    Every teacher-path exit here runs inside a ray agent-loop actor, not the verl child driver. That
+    distinction is the whole bug: `os._exit` kills the actor while the child process lives on, so
+    the exit code never reaches `failures.py:_raise_verl_failure`, which keys on the *child's*
+    return code. The classifier that would name this failure is real and correct and structurally
+    unreachable from here.
+
+    The fallback file is the only channel that survives, because the parent reads it from disk
+    rather than from the child's exit status. It was previously written only when delivery was
+    unknown, so an ordinary teacher rejection -- the common case -- left no evidence at all and the
+    run was reported as a generic wedge. Write it unconditionally.
+
+    Deliberately best-effort: a failure to record must never pre-empt the exit, or a full disk would
+    convert a clean attributable death into the indefinite hang this exists to eliminate.
+    """
+    with contextlib.suppress(Exception):
+        _write_teacher_worker_failure_fallback(classification, message)
     os._exit(exit_code)
 
 

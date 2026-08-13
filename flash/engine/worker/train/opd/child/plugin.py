@@ -14,6 +14,7 @@ import importlib.metadata
 import importlib.util
 import json
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -320,9 +321,13 @@ def _describe_ray_resources() -> str:
     describes correctly.
 
     this is only ever called on the timeout path, so it must not raise: a probe failure here would
-    replace the diagnosis it exists to produce.
+    replace the diagnosis it exists to produce. that includes the import itself -- ray lives only in
+    the isolated verl interpreter, so anywhere else this must degrade to a note, not an ImportError.
     """
-    import ray
+    try:
+        import ray
+    except ImportError:
+        return "ray resources unreadable: ray is not importable here"
 
     try:
         total = ray.cluster_resources()
@@ -482,8 +487,12 @@ def _build_flash_teacher_extensions():
                 )
             except FlashTeacherBridgeError as error:
                 _exit_for_score_failure(error)
-            except Exception:
-                os._exit(_PERMANENT_TEACHER_EXIT)
+            except Exception as error:
+                _exit_teacher_worker(
+                    _PERMANENT_TEACHER_EXIT,
+                    "permanent",
+                    f"unexpected teacher bridge failure: {type(error).__name__}: {error}",
+                )
             teacher_ids = torch.tensor(payload["teacher_ids"], dtype=torch.int32).unsqueeze(-1)
             teacher_logprobs = torch.tensor(
                 payload["teacher_logprobs"], dtype=torch.float32
@@ -549,6 +558,150 @@ def _build_flash_teacher_extensions():
     return FlashBridgeTeacherManager, compute_flash_teacher_logprobs
 
 
+_ROLLOUT_STALL_TIMEOUT_S = 1800.0
+_ROLLOUT_LIVENESS_POLL_S = 15.0
+
+
+def _rollout_stall_timeout_s() -> float:
+    """Seconds of no rollout progress before the step is failed. 0 or less disables the deadline."""
+    raw = os.environ.get("FLASH_OPD_ROLLOUT_STALL_S", "")
+    if not raw:
+        return _ROLLOUT_STALL_TIMEOUT_S
+    try:
+        return float(raw)
+    except ValueError:
+        return _ROLLOUT_STALL_TIMEOUT_S
+
+
+def _dead_agent_loop_workers(workers) -> list[str]:
+    """Names of agent-loop actors that are no longer alive.
+
+    Liveness is asked of ray rather than inferred from elapsed time, because a rollout that is
+    merely slow and one whose worker is gone look identical from the replay buffer. Only a dead
+    actor proves nobody is left to clear the entry.
+
+    A handle that answers is alive; one that raises RayActorError is not. Any other error means the
+    probe itself failed -- ray unreachable, actor busy -- and must NOT be read as death, or a
+    transient blip would kill a healthy run.
+    """
+    import ray
+    from ray.exceptions import RayActorError
+
+    dead: list[str] = []
+    pending = {}
+    for index, worker in enumerate(workers):
+        try:
+            pending[worker.__ray_ready__.remote()] = index
+        except Exception:  # pragma: no cover - handle unusable, treated as unknown not dead
+            continue
+    if not pending:
+        return dead
+    ready, _unready = ray.wait(list(pending), num_returns=len(pending), timeout=0)
+    for reference in ready:
+        try:
+            ray.get(reference)
+        except RayActorError:
+            dead.append(f"agent-loop worker {pending[reference]}")
+        except Exception:  # pragma: no cover - probe failure is not proof of death
+            continue
+    return dead
+
+
+def _bounded_replay_buffer_sample(
+    sample,
+    *,
+    running_entries,
+    dead_workers,
+    stall_timeout_s: float,
+    poll_interval_s: float = _ROLLOUT_LIVENESS_POLL_S,
+    monotonic=None,
+    sleep=None,
+):
+    """Run verl's replay-buffer sample on a worker thread, bounded by liveness and progress.
+
+    verl's ReplayBuffer.sample is `while True: sleep(poll)` and returns only once no entry is still
+    "running". Entries are marked running at dispatch and cleared by the agent-loop actor that owns
+    them: "finished" on success, "failure" from its exception handler. An actor that dies without
+    unwinding -- which os._exit does by design -- writes neither, so the entry stays running forever
+    and the trainer polls a status no living process can ever publish. Observed as 8 allocations,
+    8 wedges, 0 optimizer steps: GPU resident and 0% utilised until a human cancels.
+
+    Two independent exits, because they catch different failures:
+
+      - a dead agent-loop actor is decisive and immediate. this is the observed wedge, and waiting
+        out a timeout to report it would just burn the GPU more slowly.
+      - a stall deadline covers a hang where every actor is alive but no entry ever transitions.
+        it is measured from the last observed progress, not from entry, so a long-but-advancing
+        rollout cannot trip it.
+
+    sample() itself is unbounded and uninterruptible, so it runs on a daemon thread that is
+    deliberately not joined: it is parked in a sleep loop no signal will break, and the exception
+    raised here fails the run anyway.
+    """
+    import threading
+
+    monotonic = monotonic or time.monotonic
+    sleep = sleep or time.sleep
+    result: list[Any] = []
+    failure: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            result.append(sample())
+        except BaseException as error:  # surfaced below, on the caller's thread
+            failure.append(error)
+
+    thread = threading.Thread(target=_run, name="flash-opd-rollout-sample", daemon=True)
+    thread.start()
+    last_progress = monotonic()
+    last_running = running_entries()
+    while True:
+        thread.join(poll_interval_s)
+        if not thread.is_alive():
+            break
+        dead = dead_workers()
+        if dead:
+            raise RuntimeError(
+                f"OPD rollout cannot complete: {', '.join(dead)} died while "
+                f"{last_running} prompt(s) were still marked running. verl clears a prompt entry "
+                "only from the worker that owns it, so those entries can never be cleared and the "
+                "trainer would poll them forever. the worker's own stderr on this pod is the "
+                "definitive record of why it died"
+            )
+        running = running_entries()
+        if running != last_running:
+            last_running = running
+            last_progress = monotonic()
+            continue
+        elapsed = monotonic() - last_progress
+        if stall_timeout_s > 0 and elapsed >= stall_timeout_s:
+            raise RuntimeError(
+                f"OPD rollout made no progress for {elapsed:.0f}s with {running} prompt(s) still "
+                "marked running and every agent-loop worker alive. verl's replay buffer waits "
+                "without a deadline, so this would otherwise hold the gpu indefinitely at 0% "
+                f"utilisation; {_describe_ray_resources()}"
+            )
+        sleep(0)
+    if failure:
+        raise failure[0]
+    return result[0]
+
+
+def _exit_process_for_multiturn(exit_code: int) -> None:
+    """Exit adapter for the multi-turn loop, which supplies an exit code and nothing else.
+
+    The loop has already collapsed the error to one of the two teacher exit codes by the time it
+    calls this, so recover the classification from the code rather than plumbing the exception
+    through a second parameter that every other caller would have to supply.
+    """
+    classification = "transient" if exit_code == _TRANSIENT_TEACHER_EXIT else "permanent"
+    _exit_teacher_worker(
+        exit_code,
+        classification,
+        f"multi-turn OPD rollout failed with teacher exit code {exit_code}",
+    )
+
+
 def _build_flash_ppo_trainer(PPOTrainer, tq, KVBatchMeta):
     import numpy as np
     import torch
@@ -587,6 +740,55 @@ def _build_flash_ppo_trainer(PPOTrainer, tq, KVBatchMeta):
             super().init_workers()
             self.use_teacher_policy = True
             self.distillation_config = omega_conf_to_dataclass(self.config.distillation)
+            self._install_bounded_replay_buffer_sample()
+
+        def _install_bounded_replay_buffer_sample(self):
+            """Bound the replay buffer's unbounded wait once the agent-loop actors exist.
+
+            Wrapping the bound method on the instance rather than subclassing ReplayBuffer keeps
+            verl's own sampling semantics untouched: this only decides how long to wait for it and
+            how to fail, never which entries are returned.
+
+            Installed here rather than in __init__ because the actor handles this consults are
+            created by init_workers.
+            """
+            buffer = self.replay_buffer
+            if getattr(buffer, "_flash_bounded_sample", False):
+                return
+            original_sample = buffer.sample
+
+            def running_entries() -> int:
+                with buffer.lock:
+                    return sum(
+                        1
+                        for partition in buffer.partitions.values()
+                        for tag in partition.values()
+                        if tag.get("status") == "running"
+                    )
+
+            def dead_workers() -> list[str]:
+                manager = getattr(self, "async_rollout_manager", None)
+                workers = getattr(manager, "agent_loop_workers", None) or []
+                if not workers:
+                    return []
+                try:
+                    return _dead_agent_loop_workers(workers)
+                except Exception:
+                    # a probe that cannot run is not evidence of death; the stall deadline still
+                    # bounds the wait.
+                    return []
+
+            @functools.wraps(original_sample)
+            def bounded_sample(*args, **kwargs):
+                return _bounded_replay_buffer_sample(
+                    lambda: original_sample(*args, **kwargs),
+                    running_entries=running_entries,
+                    dead_workers=dead_workers,
+                    stall_timeout_s=_rollout_stall_timeout_s(),
+                )
+
+            buffer.sample = bounded_sample
+            buffer._flash_bounded_sample = True
 
         def step(self, batch_dict, metrics, timing_raw):
             def run_attempt(attempt_ordinal: int):
@@ -876,6 +1078,10 @@ def _install_verl_extensions() -> None:
         deterministic_seed=deterministic_rollout_seed,
         permanent_teacher_exit=_PERMANENT_TEACHER_EXIT,
         transient_teacher_exit=_TRANSIENT_TEACHER_EXIT,
+        # without this the multi-turn loop exits through a bare os._exit, which kills the ray actor
+        # while the child driver survives -- so the prompt entry stays "running" and the trainer
+        # polls a status no living worker can publish. record the cause, then exit.
+        process_exit=_exit_process_for_multiturn,
     )
     globals()["FlashMultiTurnAgentLoop"] = FlashMultiTurnAgentLoop
 
@@ -914,6 +1120,7 @@ try:
         FlashTeacherBridgeError,
         _coordinate_first_mutation_notice,
         _exit_for_score_failure,
+        _exit_teacher_worker,
         _fallback_classification,
         _mutation_distributed,
         _post_json,
@@ -931,12 +1138,14 @@ try:
         _write_mutation_failure_fallback,
         _write_resample_failure_fallback,
         _write_score_delivery_failure_fallback,
+        _write_teacher_worker_failure_fallback,
     )
 except ImportError:
     from flash.engine.worker.train.opd.child.bridge import (  # noqa: F401
         FlashTeacherBridgeError,
         _coordinate_first_mutation_notice,
         _exit_for_score_failure,
+        _exit_teacher_worker,
         _fallback_classification,
         _mutation_distributed,
         _post_json,
@@ -954,6 +1163,7 @@ except ImportError:
         _write_mutation_failure_fallback,
         _write_resample_failure_fallback,
         _write_score_delivery_failure_fallback,
+        _write_teacher_worker_failure_fallback,
     )
 
 

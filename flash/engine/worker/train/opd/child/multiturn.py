@@ -395,7 +395,15 @@ def build_flash_multi_turn_agent_loop(
     transient_teacher_exit: int = 87,
     process_exit=None,
 ):
-    """build and register the child loop without importing verl in the parent interpreter."""
+    """build and register the child loop without importing verl in the parent interpreter.
+
+    `process_exit` is how the caller supplies an exit that records why this worker died before it
+    goes. These exits run inside a ray actor, so a bare `os._exit` kills the actor while the child
+    driver lives on, and the verl prompt entry stays "running" forever with nobody left to clear it.
+    The plugin passes `_exit_teacher_worker` for exactly that reason; this module cannot import it
+    directly because both files land flat in the child workdir and the cycle would fail at import
+    time inside verl. The `os._exit` default keeps the standalone/test path working.
+    """
     exit_process = process_exit or os._exit
 
     class FlashMultiTurnAgentLoop(agent_loop_base):
