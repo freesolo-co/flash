@@ -803,9 +803,39 @@ def _note(now, **kw):
             "queue_grace_s": 900.0,
             "on_last_gpu": True,
             "absolute_deadline": None,
+            "stall_since": 0.0,
+            "stall_limit_s": 3000.0,
             **kw,
         },
     )
+
+
+def test_queued_line_reports_the_no_progress_limit_when_it_is_the_nearest():
+    # _classify_stall runs one call after _classify_queue_state in the SAME loop iteration, using
+    # setup_grace_s (pre-heartbeat) or stall_after_s. poll_job accepts both independently of the
+    # queue graces, so a short stall limit can be the real deadline: quoting "90s of 900s capacity
+    # grace" and then returning `stalled` in that same iteration is the defect this note prevents.
+    binding = _note(90.0, stall_limit_s=60.0)
+    assert "no-progress limit" in binding, binding
+    assert "of 60s" in binding, binding
+    assert "capacity" not in binding, binding
+
+    # the production shape (setup grace ~3000s) leaves the capacity grace binding, as before.
+    not_binding = _note(800.0)
+    assert "capacity grace" in not_binding, not_binding
+
+
+def test_longer_capacity_explanation_is_gated_on_the_grace_actually_in_force():
+    # poll_job exposes on_last_gpu and queue_grace_s independently and never ties the flag to
+    # LAST_GPU_CAPACITY_GRACE_S, so a caller can set on_last_gpu while overriding the grace DOWN.
+    # Claiming capacity "is given longer" would then state a false reason for the real deadline.
+    shortened = _note(10.0, on_last_gpu=True, queue_grace_s=300.0)
+    assert "no further GPU-class escalation follows" in shortened, shortened
+    assert "given longer" not in shortened, shortened
+
+    # when the longer grace really is in force, the explanation for it stays.
+    longer = _note(10.0, on_last_gpu=True, queue_grace_s=900.0)
+    assert "so capacity is given longer" in longer, longer
 
 
 def test_queued_line_reports_a_throttled_grace_shorter_than_the_capacity_one():

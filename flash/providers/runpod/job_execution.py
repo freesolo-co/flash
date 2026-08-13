@@ -513,6 +513,13 @@ def _classify_queue_state(
                     queue_grace_s=context.queue_grace_s,
                     on_last_gpu=context.on_last_gpu,
                     absolute_deadline=context.absolute_deadline,
+                    stall_since=state.last_progress,
+                    # the same choice _classify_stall makes one call later in this iteration.
+                    stall_limit_s=(
+                        context.setup_grace_s
+                        if context.heartbeat_reader is not None and not state.seen_training_hb
+                        else context.stall_after_s
+                    ),
                 )
                 budget = f"; {note}" if note else ""
             context.say(f"queued; workers: {workers}{budget}")
