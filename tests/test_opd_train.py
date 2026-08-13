@@ -2649,6 +2649,47 @@ def test_opd_marks_the_parent_busy_inside_every_environment_hook():
     assert not bridge.env_work_in_flight()
 
 
+def test_an_opd_env_hook_that_raises_still_releases_the_parent_busy_mark():
+    """A leaked busy mark is worse than a missing one: it disarms the watchdog permanently.
+
+    User env code raising is ordinary -- a tool call 500s, a parse error on a malformed action. If
+    the guard released only on the success path, that one raise would pin the parent "busy" for the
+    rest of the run and no wedge could ever be named again. Asserted on this bridge too rather than
+    inferred from the shared gauge: the guard placement is per call site, and a `finally` in the
+    gauge cannot save a hook whose guard was never entered.
+    """
+
+    class ExplodingEnv(_RecordingEnv):
+        def env_reply(self, messages, state):
+            raise ValueError("the user's tool call blew up")
+
+    bridge = _multiturn_bridge(ExplodingEnv())
+    bridge.start_multiturn(
+        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+    )
+
+    with pytest.raises(ValueError, match="blew up"):
+        bridge.step_multiturn(
+            {
+                "session_id": "s1",
+                "turn_ordinal": 0,
+                "accepted_prefix": [10, 11],
+                "raw_response_ids": [65],
+                "response_ids": [65],
+                "completion_text": "A",
+                "termination": "stop",
+                "stop_reason": "stop",
+                "truncated": False,
+                "skip_reason": "",
+            }
+        )
+
+    assert not bridge.env_work_in_flight(), (
+        "a raising env hook leaked the busy mark; the parent would report busy forever and the "
+        "silence watchdog could never name another wedge"
+    )
+
+
 def test_multimodal_bridge_scores_frozen_images_through_structured_teacher_messages(
     monkeypatch,
 ):
