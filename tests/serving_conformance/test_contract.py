@@ -158,8 +158,76 @@ def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
     return min(_CLIENT_READBACK_BASE_DELAY * (2**attempt), _CLIENT_READBACK_MAX_DELAY)
 
 
-def _wait_ready(http, revision: str, timeout: float) -> dict:
+def _requires_provenance(http) -> bool:
+    """Whether this backend advertises `revision_provenance`, asked once and cached.
+
+    The client gates its provenance cross-check on exactly this capability
+    (`_require_serving_capabilities` treats it as PREFERRED, not required), so a mirror that
+    compares provenance unconditionally would fail a backend the client drives happily. Cached on
+    the client object because `_wait_ready` polls in a loop and this cannot become a per-poll
+    request.
+    """
+    cached = getattr(http, "_conformance_requires_provenance", None)
+    if cached is None:
+        payload = http.get("/healthz").json()
+        capabilities = payload.get("capabilities") if isinstance(payload, dict) else None
+        cached = "revision_provenance" in set(capabilities or [])
+        http._conformance_requires_provenance = cached
+    return cached
+
+
+def _identity_mismatch(record: dict, expected: dict, *, require_provenance: bool) -> str | None:
+    """`flash/serve/deploy.py:_matches_revision_identity`, mirrored, naming the field that differs.
+
+    Returns None when the record matches. The client compares these fields on EVERY readiness poll,
+    not once at the end, and raises immediately on the first mismatch -- so a backend that exposes a
+    partial `registered` record and fills the identity in before `ready` fails every real deploy
+    while a suite that only inspects the final record certifies it.
+
+    Compared with a plain `!=`, including `thinking`, because that is what the client uses. Coercing
+    with `bool()` here would be LOOSER than the client: a backend that omits the field answers None,
+    which the client calls a different identity and this would have let pass.
+    """
+    scalar_fields = (
+        "adapter_id",
+        "repo_id",
+        "repo_type",
+        "subfolder",
+        "base_model",
+        "checkpoint",
+        "thinking",
+    )
+    for field in scalar_fields:
+        if record.get(field) != expected.get(field):
+            return f"{field}: {record.get(field)!r} != {expected.get(field)!r}"
+    # Normalized on both sides, exactly as the client does: it compares `(x or None)`, so a backend
+    # may answer "" or omit the field for a request that did not set one.
+    for field in ("org_id", "structured_outputs"):
+        if (record.get(field) or None) != (expected.get(field) or None):
+            return f"{field}: {record.get(field)!r} != {expected.get(field)!r}"
+    if not require_provenance:
+        # Matches the client's own `require_provenance=False` early return: a backend that does not
+        # advertise `revision_provenance` is not expected to echo this metadata, and the immutable
+        # adapter_id already pins the artifact.
+        return None
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    expected_metadata = expected.get("metadata") or {}
+    for field in ("record_type", "run_id", "checkpoint_step", "hf_revision"):
+        if metadata.get(field) != expected_metadata.get(field):
+            return f"metadata.{field}: {metadata.get(field)!r} != {expected_metadata.get(field)!r}"
+    return None
+
+
+def _wait_ready(http, revision: str, timeout: float, expected: dict | None = None) -> dict:
     """Poll to a settled state, honoring Retry-After exactly as the client does.
+
+    `expected` is the registration body, and passing it applies the client's identity check to
+    every visible record rather than only the final one. `_wait_revision_ready` calls
+    `_matches_revision_identity` on each non-404 read BEFORE inspecting its lifecycle and raises on
+    the first mismatch, so an asynchronous backend that first exposes a record missing `org_id` or
+    carrying the wrong provenance, then corrects it on the way to `ready`, fails every real deploy.
+    Checked only at the end, the suite sees the corrected record and passes it. Optional because
+    two call sites drive stub objects rather than a registration.
 
     The deadline bounds each REQUEST and is re-checked after it, not only before. Checked only
     beforehand, a backend that long-polls the read-back is accepted for a `ready` that arrived after
@@ -263,6 +331,18 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
                 time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
                 continue
             record = _record(payload)
+            # Identity BEFORE lifecycle, matching the client's order. It raises on a mismatch
+            # without ever looking at the state, so a record that is both wrong and `ready` is an
+            # identity failure to the client and must be one here.
+            if expected is not None:
+                mismatch = _identity_mismatch(
+                    record, expected, require_provenance=_requires_provenance(http)
+                )
+                assert mismatch is None, (
+                    f"read-back of {revision} exposed a record with a different immutable identity "
+                    f"({mismatch}). the client checks this on EVERY poll and raises at once, so a "
+                    f"record that is corrected before it reaches ready still fails every deploy"
+                )
             last = _lifecycle_state(record)
             if last == "failed" or record.get("status") == "disabled":
                 metadata = record.get("metadata") or {}
@@ -300,7 +380,7 @@ def deployed(http, adapter_source, run_id, ready_timeout):
     body = _registration(run_id, adapter_source)
     try:
         _register(http, body)
-        _wait_ready(http, body["adapter_id"], ready_timeout)
+        _wait_ready(http, body["adapter_id"], ready_timeout, expected=body)
         yield body
     finally:
         # cleanup runs even when the test failed mid-way: these records are permanent on the target.
@@ -540,7 +620,7 @@ def test_a_constrained_registration_serves_a_constrained_completion(
         #
         # Reaching `ready` is itself the assertion for the load-time rejection case: a constraint
         # the engine will not accept settles the revision `failed`, and `_wait_ready` fails on it.
-        record = _wait_ready(http, body["adapter_id"], ready_timeout)
+        record = _wait_ready(http, body["adapter_id"], ready_timeout, expected=body)
         assert record.get("structured_outputs") == body["structured_outputs"], (
             f"read-back structured_outputs={record.get('structured_outputs')!r}, registered "
             f"{body['structured_outputs']!r}. The client compares this exactly, so every "
@@ -599,7 +679,7 @@ def test_reregistering_while_the_first_load_is_pending_is_idempotent(
         _register(http, body)
         # And the run must still converge afterwards: accepting the duplicate is not enough if it
         # wedged the first load or left two settles fighting over one record.
-        _wait_ready(http, body["adapter_id"], ready_timeout)
+        _wait_ready(http, body["adapter_id"], ready_timeout, expected=body)
     finally:
         http.delete(f"/adapters/{run_id}")
 
@@ -620,7 +700,7 @@ def test_a_final_revision_registers_and_reaches_ready(http, adapter_source, run_
     )
     try:
         _register(http, body)
-        record = _wait_ready(http, body["adapter_id"], ready_timeout)
+        record = _wait_ready(http, body["adapter_id"], ready_timeout, expected=body)
         assert (record.get("metadata") or {}).get("checkpoint_step") is None, (
             "a final revision came back with a checkpoint step; the client compares provenance "
             "exactly on its recovery readback and would call this a different immutable identity"
@@ -644,7 +724,7 @@ def test_a_thinking_adapter_registers_and_reaches_ready(
     body = {**_registration(run_id, adapter_source), "thinking": True}
     try:
         _register(http, body)
-        record = _wait_ready(http, body["adapter_id"], ready_timeout)
+        record = _wait_ready(http, body["adapter_id"], ready_timeout, expected=body)
         assert record.get("thinking") is True, (
             f"a thinking adapter read back as {record.get('thinking')!r}; the client compares this "
             f"field exactly, so the deploy fails, and a backend that ignores it renders prompts in "
@@ -759,7 +839,7 @@ def test_a_non_null_expectation_replaces_the_live_revision(
     try:
         for body in (first, second):
             _register(http, body)
-            _wait_ready(http, body["adapter_id"], ready_timeout)
+            _wait_ready(http, body["adapter_id"], ready_timeout, expected=body)
 
         assert _activate(http, first["adapter_id"], None).status_code == 200, (
             "the initial null-expectation activation must succeed before the upgrade can be tested"
@@ -816,7 +896,7 @@ def test_concurrent_activations_of_one_alias_leave_exactly_one_winner(
     try:
         for body in (first, second):
             _register(http, body)
-            _wait_ready(http, body["adapter_id"], ready_timeout)
+            _wait_ready(http, body["adapter_id"], ready_timeout, expected=body)
 
         def activate(revision: str) -> int:
             # One client PER THREAD, but built by the same factory the `http` fixture uses. A
@@ -924,7 +1004,7 @@ def test_undeploy_disables_the_alias_and_its_revisions(http, adapter_source, run
     """Not using the `deployed` fixture: this test IS the teardown, so it owns the whole run."""
     body = _registration(run_id, adapter_source)
     _register(http, body)
-    _wait_ready(http, body["adapter_id"], ready_timeout)
+    _wait_ready(http, body["adapter_id"], ready_timeout, expected=body)
     assert _activate(http, body["adapter_id"], None).status_code == 200
 
     response = http.delete(f"/adapters/{run_id}")
@@ -1085,8 +1165,20 @@ def test_a_wrong_serving_key_is_rejected(serving_client_factory, internal_key, a
     # so the suite reported the registration route as unauthenticated on a backend that rejects
     # every wrongly-keyed valid request. `_registration` builds the same body `deploy_adapter`
     # sends; only the run id differs, and nothing is ever created because the key is wrong.
-    unauthorized_body = _registration("conformance-unauthorized", adapter_source)
-    unauthorized_body["adapter_id"] = revision
+    # Built to be internally CONSISTENT, not merely well-formed. Overriding `adapter_id` after the
+    # helper returned left `checkpoint` and `metadata` describing `@step-10.<real sha>` while the id
+    # said `@final.<zero sha>` -- and a backend that checks the id against its own provenance before
+    # authenticating answers 422 to that, which is the same false pass the malformed-body fix
+    # removed, reintroduced one line later. The whole registration is therefore built from the
+    # final-revision provenance, so the ONLY thing wrong with this request is the key.
+    unauthorized_body = _registration(
+        "conformance-unauthorized", {**adapter_source, "hf_revision": "0" * 40}, step=None
+    )
+    assert unauthorized_body["adapter_id"] == revision, (
+        "the unauthorized probe's body no longer describes the revision it posts to; a backend that "
+        "validates identity before authenticating would answer 422 and this test would report an "
+        "authenticated route as unprotected"
+    )
     probes = (
         ("register", "POST", "/adapters", unauthorized_body),
         ("read back", "GET", f"/adapters/{revision}", None),
@@ -1173,3 +1265,65 @@ def test_a_malformed_readback_is_polled_through_rather_than_failed(monkeypatch):
         "retries and succeeds"
     )
     assert not responses, "the loop stopped early and never reached the valid record"
+
+
+def test_a_corrected_identity_still_fails_the_readiness_wait():
+    """A record whose identity is wrong on an EARLY poll must fail, even if it is fixed by `ready`.
+
+    `_wait_revision_ready` calls `_matches_revision_identity` on every non-404 record BEFORE looking
+    at its lifecycle, and raises at once on a mismatch. So an asynchronous backend that first
+    exposes a partial `registered` record -- `org_id` missing, or the wrong provenance -- and fills
+    it in on the way to `ready` fails every real deploy. Inspecting only the final record certified
+    exactly that backend.
+
+    Takes no live fixtures, so it runs in CI where every `--serving-url` test skips.
+    """
+
+    class _Response:
+        def __init__(self, payload):
+            self.status_code = 200
+            self.headers: dict[str, str] = {}
+            self.text = "{}"
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    expected = {
+        "adapter_id": "rev",
+        "repo_id": "acme/artifacts",
+        "repo_type": "model",
+        "subfolder": "sft/run-abc/adapter",
+        "base_model": "Qwen/Qwen3.5-4B",
+        "checkpoint": "run-abc/step-10",
+        "thinking": False,
+        "org_id": "conformance-org",
+        "metadata": {
+            "record_type": "revision",
+            "run_id": "run-abc",
+            "checkpoint_step": 10,
+            "hf_revision": "a" * 40,
+        },
+    }
+    # The org is dropped on the first read and restored on the second, which is the exact shape the
+    # client rejects: it compares `(record.get("org_id") or None)` and raises without ever reaching
+    # the lifecycle field.
+    partial = {**expected, "org_id": None, "status": "registered"}
+    partial["metadata"] = {**expected["metadata"], "lifecycle_state": "registered"}
+    corrected = {**expected, "status": "ready"}
+    corrected["metadata"] = {**expected["metadata"], "lifecycle_state": "ready"}
+    responses = [_Response(partial), _Response(corrected)]
+
+    def _get(*args, **kwargs):
+        return responses.pop(0)
+
+    # `revision_provenance` advertised, so the mirror applies the same provenance cross-check the
+    # client does against this backend.
+    http = types.SimpleNamespace(get=_get, _conformance_requires_provenance=True)
+    with pytest.raises(AssertionError, match="different immutable identity"):
+        _wait_ready(http, "rev", timeout=30.0, expected=expected)
+    assert responses, (
+        "the wait polled past the mismatched record instead of failing on it, so a backend that "
+        "corrects a wrong identity before it reaches ready passes conformance and then fails "
+        "every real deploy"
+    )

@@ -283,9 +283,38 @@ OpenAI-compatible. The `model` field carries the **alias** (`run-abc`), and the 
 to whichever revision the alias currently targets. Requests also arrive with
 `chat_template_kwargs: {"enable_thinking": bool}` and optionally `stop`.
 
-Return a normal OpenAI chat completion. Three optional response headers let the client verify it
-got what it asked for: `X-Freesolo-Adapter-Revision`, `X-Freesolo-Checkpoint`, and
+Return a normal OpenAI chat completion carrying provenance in **both** a body object and three
+response headers. These were documented as optional, and they are not: a managed plane runs a
+deployment smoke against every deploy, and `_smoke_provenance`
+(`flash/server/routes/serving_smoke.py`) rejects the completion unless all of it is present and
+exact. A backend that returns an otherwise valid completion without them fails every deploy at the
+smoke step.
+
+A `freesolo` object alongside the OpenAI fields:
+
+```json
+{
+  "choices": [
+    { "index": 0, "message": { "role": "assistant", "content": "..." } }
+  ],
+  "freesolo": {
+    "adapter_revision": "run-abc@step-10.<40-hex>",
+    "checkpoint": "run-abc/step-10",
+    "hf_revision": "<40-hex>"
+  }
+}
+```
+
+and the same three values as headers: `X-Freesolo-Adapter-Revision`, `X-Freesolo-Checkpoint`, and
 `X-Freesolo-HF-Revision`.
+
+All three must describe the revision that actually generated the response - the one the alias
+resolved to, not the alias itself. The smoke compares the headers as an exact set, so sending a
+subset, or extra `X-Freesolo-*` provenance headers, fails it. `hf_revision` is the segment after
+the final `.` in the revision id.
+
+Standalone use of `flash models chat` does not check any of this, so a backend that omits it still
+answers chat. It is deployment through a managed plane that requires it.
 
 An unknown or not-yet-activated model is `404` or `503`.
 

@@ -4524,3 +4524,221 @@ def test_a_cold_release_of_a_stranded_claim_clears_its_marker(client):
         "the cold release left the marker set, so every later delete re-queues this revision for "
         "an eviction and a reclaim that have nothing left to do"
     )
+
+
+def test_a_first_undeploy_whose_eviction_fails_marks_the_unsettled_claim(client):
+    """An unsettled claim has to be MARKED, not merely left unmarked.
+
+    Skipping the clear only preserves a marker that is already there, and on the ordinary path
+    there is none: a revision this pass disables arrives clean. So a FIRST undeploy whose
+    `remove_lora` failed kept the claim with nothing recording it, and the next DELETE skips an
+    already-disabled record that carries no marker. The claim then outlives its adapter for the
+    life of the app and refuses a future collider on those 31 bits.
+    """
+    module = client.app.state.generated_module
+    run_id = "first-undeploy-unsettled"
+    revision = f"{run_id}@final." + "3" * 40
+    int_id = module._lora_int_id(revision)
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "revision", "lifecycle_state": "ready"},
+    }
+    module.adapter_records[module._record_key(run_id)] = {
+        "adapter_id": run_id,
+        "status": "ready",
+        "metadata": {"run_id": run_id, "record_type": "alias", "alias_of": revision},
+    }
+    module.adapter_records[module._members_key(run_id)] = [run_id, revision]
+    module.adapter_records[module._lora_id_key(int_id)] = revision
+    module.runners.count = 1
+
+    # The engine answers, but its eviction failed, so it keeps the claim and says so. This is the
+    # real shape of that case -- and it is the FIRST undeploy, so no marker exists yet.
+    async def _rpc_ok_but_eviction_failed(adapter_id):
+        return {"ok": True, "claim_settled": False}
+
+    module.engine_methods["unregister"] = _rpc_ok_but_eviction_failed
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+
+    record = module.adapter_records[module._record_key(revision)]
+    assert (record.get("metadata") or {}).get("lora_release_pending"), (
+        "a first undeploy whose eviction failed left the claim held with no marker, so the next "
+        "delete skips this already-disabled record and nothing ever releases the id"
+    )
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) == revision, (
+        "precondition: the failed eviction must still be holding the claim"
+    )
+
+    # And the marker has to be load-bearing: a later healthy undeploy must re-dispatch off it.
+    dispatched: list[str] = []
+
+    async def _rpc_works(adapter_id):
+        dispatched.append(adapter_id)
+        await module._release_lora_int_id(module._lora_int_id(adapter_id), adapter_id)
+        return {"ok": True, "claim_settled": True}
+
+    module.engine_methods["unregister"] = _rpc_works
+    assert client.delete(f"/adapters/{run_id}").status_code == 200
+    assert revision in dispatched, (
+        "the later undeploy never re-dispatched, so the marker written above is not what the "
+        "recovery keys off"
+    )
+
+
+def test_an_absent_claim_is_not_reported_as_unsettled(client, engine):
+    """`claim_settled` must ask whether THIS revision still holds the claim.
+
+    `_owns_lora_int_id` answers a different question -- "would evicting kick a peer off the GPU" --
+    so an ABSENT claim answers True there. Reusing it made a failed `remove_lora` report an
+    unsettled claim for a revision holding none (one loaded before this app carried claims, or one
+    whose settle already released it), and undeploy then marked it: every later DELETE re-dispatches
+    an eviction and a reclaim forever for a claim that does not exist.
+    """
+    module = client.app.state.generated_module
+    revision = "absent-claim@final." + "4" * 40
+    int_id = module._lora_int_id(revision)
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "disabled",
+        "metadata": {"run_id": "absent-claim", "record_type": "revision"},
+    }
+    # NO claim recorded for this int id, which is the whole point.
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) is None
+
+    async def _remove_fails(_int_id):
+        raise RuntimeError("vllm refused the eviction")
+
+    instance = engine.__new__(engine)
+    instance._locks = {}
+    instance._loaded = {revision: object()}
+    instance._int_ids = {int_id: revision}
+    instance.engine = types.SimpleNamespace(remove_lora=_remove_fails)
+
+    result = _run_awaitable_result(engine.unregister(instance, revision))
+
+    assert result.get("claim_settled") is True, (
+        "a failed eviction reported an unsettled claim for a revision that holds none, so undeploy "
+        "marks it and every later delete re-dispatches eviction and reclaim work forever"
+    )
+
+
+def test_a_failed_load_records_its_terminal_state_even_if_the_release_raises(client, monkeypatch):
+    """The terminal write is what the client waits on; a best-effort release must not cost it.
+
+    `settle_adapter` runs DETACHED, so a transient Dict failure inside `_release_lora_int_id` raised
+    with nothing observing or retrying it, and `_write(current)` never ran. The record then sat at
+    `registered` until the deploy's readiness budget expired, reporting a timeout that reads as a
+    slow GPU rather than the load failure that actually happened.
+    """
+    module = client.app.state.generated_module
+    run_id = "release-raises"
+    revision = f"{run_id}@final." + "5" * 40
+    attempt = "attempt-token"
+    record = {
+        "adapter_id": revision,
+        "status": "registered",
+        "metadata": {
+            "run_id": run_id,
+            "record_type": "revision",
+            "lifecycle_state": "registered",
+            "settle_attempt": attempt,
+        },
+    }
+    module.adapter_records[module._record_key(revision)] = dict(record)
+
+    async def _release_raises(_int_id, _adapter_id):
+        raise RuntimeError("dict unavailable")
+
+    monkeypatch.setattr(module, "_release_lora_int_id", _release_raises)
+
+    async def _register_fails(_record):
+        return {"ok": False, "failure": "adapter rank 128 exceeds max_lora_rank 64"}
+
+    module.engine_methods["register"] = _register_fails
+    module.runners.count = 0  # cold, so the reclaim defers and the marker path is exercised
+
+    module.settle_adapter.local(record)
+
+    stored = module.adapter_records[module._record_key(revision)]
+    metadata = stored.get("metadata") or {}
+    assert metadata.get("lifecycle_state") == "failed", (
+        f"the record is {metadata.get('lifecycle_state')!r}, not `failed`: a raise inside the "
+        f"best-effort claim release skipped the terminal write, so the client polls a `registered` "
+        f"record until its budget expires and reports a timeout instead of the real failure"
+    )
+    assert metadata.get("failure"), "the terminal record carries no failure reason"
+    assert metadata.get("lora_release_pending"), (
+        "the release failed but nothing recorded it, so the claim stays held with no retry"
+    )
+
+
+def test_a_chat_load_refuses_a_revision_undeployed_mid_flight(client, engine, monkeypatch):
+    """The cache-miss load must re-read the lifecycle instead of trusting the record in hand.
+
+    Chat resolves the alias and reads the record on the web container, then calls the engine. An
+    undeploy landing in that window disables the revision, evicts it, and releases its claim.
+    Trusting the snapshot re-claimed the id, downloaded the adapter, and loaded it AFTER the
+    undeploy completed -- and because the record is already `disabled` and carries neither marker,
+    no later DELETE evicts that residency, releases the claim, or reclaims the download. The
+    disabled revision would also go on answering requests.
+    """
+    lora = types.ModuleType("vllm.lora.request")
+    lora.LoRARequest = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora)
+
+    module = client.app.state.generated_module
+    revision = "undeployed-midflight@final." + "6" * 40
+    int_id = module._lora_int_id(revision)
+    # What chat copied while the revision was still live.
+    stale = {
+        "adapter_id": revision,
+        "status": "ready",
+        "metadata": {
+            "run_id": "undeployed-midflight",
+            "record_type": "revision",
+            "lifecycle_state": "ready",
+        },
+    }
+    # What the durable store says by the time the engine runs: undeploy already finished.
+    module.adapter_records[module._record_key(revision)] = {
+        "adapter_id": revision,
+        "status": "disabled",
+        "metadata": {
+            "run_id": "undeployed-midflight",
+            "record_type": "revision",
+            "lifecycle_state": "disabled",
+        },
+    }
+
+    added: list = []
+
+    async def _add_lora(request):
+        added.append(request)
+
+    instance = engine.__new__(engine)
+    instance._locks = {}
+    instance._loaded = {}
+    instance._int_ids = {}
+
+    async def _remove_lora(_int_id):
+        return None
+
+    instance.engine = types.SimpleNamespace(add_lora=_add_lora, remove_lora=_remove_lora)
+
+    with pytest.raises(RuntimeError, match="undeployed while this request was in flight"):
+        _run_awaitable(engine._lora_request(instance, stale))
+
+    assert not added, (
+        "an undeployed revision was loaded onto the gpu from a stale record, so it keeps serving "
+        "after undeploy returned 200 and no later delete can reach the residency"
+    )
+    assert dict.get(module.adapter_records, module._lora_id_key(int_id)) is None, (
+        "the stale load re-claimed the int id an undeploy had already released, and nothing marked "
+        "the disabled record, so the claim is held forever with no retry"
+    )
+    assert revision not in instance._loaded, (
+        "the disabled revision was cached on this replica and would answer the next generate"
+    )

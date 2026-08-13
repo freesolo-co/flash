@@ -700,6 +700,31 @@ class Engine:
             cached = self._loaded.get(adapter_id)
             if cached is not None:
                 return cached
+            # The DURABLE lifecycle is re-read here, because the record in hand may be minutes old.
+            # Chat resolves the alias and reads the record on the web container, then calls the
+            # engine; an undeploy landing in that window disables the revision, evicts it, and
+            # releases its claim. Trusting the snapshot then re-claims the id, downloads the
+            # adapter, and loads it AFTER the undeploy completed -- and because the record is
+            # already `disabled` and carries neither marker, no later DELETE evicts this residency,
+            # releases the claim, or reclaims the download. The disabled revision would also go on
+            # answering requests. Repeated races exhaust `max_loras` slots and volume storage.
+            #
+            # Only the MISS path pays this Dict read. The cache hit above returns without it, which
+            # is what keeps ordinary generate traffic off the round trip -- and a hit is by
+            # definition an adapter this container already loaded, whose undeploy goes through
+            # `unregister` rather than through here.
+            #
+            # A record that is simply absent is treated as live rather than as disabled: `_read`
+            # answering None is the ordinary shape of a Dict hiccup, and refusing on it would fail
+            # loads for a healthy revision. Only an explicit terminal state stops the load.
+            current = await adapter_records.get.aio(_record_key(adapter_id))
+            if isinstance(current, dict):
+                state = (current.get("metadata") or {{}}).get("lifecycle_state")
+                if current.get("status") == "disabled" or state in ("disabled", "failed"):
+                    raise RuntimeError(
+                        f"{{adapter_id}} was undeployed while this request was in flight, so it "
+                        f"will not be loaded again. redeploy the run to serve it."
+                    )
             int_id = _lora_int_id(adapter_id)
             # Refused, not resolved. vLLM addresses a LoRA solely by this int, so a collision would
             # make `add_lora` and `remove_lora` unable to tell the two apart and a chat could answer
@@ -993,7 +1018,17 @@ class Engine:
                     # so is what lets undeploy tell "the rpc returned" apart from "the claim is
                     # dealt with" -- clearing the marker on the former destroyed the recovery on
                     # exactly the retry it exists for.
-                    claim_settled = False
+                    #
+                    # Asked with `_still_holds`, NOT with the `_owns` check above, and the two
+                    # answer different questions. `_owns` asks "would evicting kick a peer off the
+                    # GPU", so an ABSENT claim answers True -- correct for gating the eviction,
+                    # wrong here. Reusing it reported an unsettled claim for a revision holding
+                    # none (an adapter loaded before this app carried claims, or one whose settle
+                    # already released it), and undeploy then marked it: every later DELETE
+                    # re-dispatched an eviction and a reclaim forever, for a claim that does not
+                    # exist. The question this flag answers is "is the claim still held BY THIS
+                    # REVISION", which is exactly what `_still_holds` asks.
+                    claim_settled = not await _still_holds_lora_int_id(int_id, adapter_id)
             # Suppressed HERE, not inside the helper: this is the eviction path, whose contract is
             # that it never fails an undeploy. But suppressing is not the same as forgetting -- a
             # failed `rmtree` leaves the download on the volume, and by this point the record is
@@ -1224,7 +1259,29 @@ async def settle_adapter(record: dict[str, Any]) -> None:
                 # must not stay reserved. Otherwise the claim outlives its adapter permanently:
                 # undeploy skips already-disabled records, and the id is a hash of the adapter id,
                 # so a retry cannot get a different one.
-                await _release_lora_int_id(_lora_int_id(adapter_id), adapter_id)
+                #
+                # CAUGHT, because the terminal write below is what the client is waiting for. An
+                # unguarded await here let a transient Dict failure raise out of a settle that runs
+                # DETACHED -- nothing observes it, nothing retries it -- so `_write(current)` never
+                # ran and the record sat at `registered` until the deploy's five-minute readiness
+                # budget expired. The user then sees a timeout that reads as a slow GPU instead of
+                # the load failure that actually happened. Recording the failure is strictly more
+                # important than releasing the id: `lora_release_pending` gives the claim a later
+                # retry, while a lost terminal state has no recovery at all.
+                released = True
+                try:
+                    await _release_lora_int_id(_lora_int_id(adapter_id), adapter_id)
+                except Exception:
+                    released = False
+                if not released:
+                    # Marked in THIS write, for the same reason the cache deferral is: this branch
+                    # is about to make the record `disabled`, and undeploy passes over disabled
+                    # records that carry no marker, so a mark written separately afterwards could
+                    # be lost to an interleaving write and nothing would ever retry the release.
+                    current["metadata"] = {{
+                        **current["metadata"],
+                        "lora_release_pending": True,
+                    }}
                 discard_cache = True
                 # The reclaim itself runs after the lock, but whether it CAN run now is known
                 # here, and the deferral has to be recorded in this same write. Undeploy passes
@@ -1973,9 +2030,21 @@ def api():
                     # `claim_settled` is the fact itself, computed where the decision is made.
                     # Absent (an older container mid-rollout) is read as settled, matching the
                     # previous behavior rather than marking every revision forever.
+                    #
+                    # And an UNSETTLED claim is MARKED, not merely left alone. Skipping the clear
+                    # only preserves a marker that is already there, which is nothing at all on the
+                    # ordinary path: a revision this pass disabled arrives unmarked, so a first
+                    # undeploy whose `remove_lora` failed kept the claim with no record of it, and
+                    # the next DELETE skips an already-disabled record that carries no marker. The
+                    # claim then outlives its adapter for the life of the app and refuses a future
+                    # collider on those 31 bits -- the exact leak the marker exists to close,
+                    # reached from the one path that reports the failure honestly.
                     if not isinstance(result, dict) or result.get("claim_settled", True):
                         with contextlib.suppress(Exception):
                             await _clear_lora_release_pending(revision_id)
+                    else:
+                        with contextlib.suppress(Exception):
+                            await _mark_lora_release_pending(revision_id)
         else:
             # The COLD counterpart, and it is not optional. `Engine.unregister` is the only
             # successful-undeploy path that releases the durable `loraid:` claim, so skipping it
