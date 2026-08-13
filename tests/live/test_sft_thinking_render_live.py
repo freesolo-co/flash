@@ -27,6 +27,7 @@ pytestmark = pytest.mark.live
 # spelled out rather than imported from the module under test: a test that borrowed the parser's
 # own constant would still pass if that constant were wrong.
 TURN_END = "<|im_end|>"
+THINK_CLOSE = "</think>"
 
 # the smallest catalog model that ships the thinking template; the template is shared across the
 # Qwen3.5 family, so the 0.8B render is the same rule the 4B and 27B students apply.
@@ -415,14 +416,14 @@ def test_one_unresolvable_block_beside_a_resolvable_one_keeps_its_marker(tokeniz
     markers = reasoning_markers(completion, prefix)
     assert len(markers) == 2
     # every marker survives, so neither turn's reasoning was stripped
-    assert all(marker in marked for marker in markers)
+    assert all(head in marked for head, _tail in markers)
 
     marked_spans = reasoning_span_texts(marked)
     # ...but the scan resolves only the ordinary one
     assert len(marked_spans) == 1
     resolved, unresolved = markers[1], markers[0]
-    assert any(resolved in span for span in marked_spans)
-    assert not any(unresolved in span for span in marked_spans)
+    assert any(all(end in span for end in resolved) for span in marked_spans)
+    assert not any(unresolved[0] in span for span in marked_spans)
     # the shared prefix therefore reads as "resolvable" while a kept block sits unlocated
     assert any(prefix in span for span in marked_spans)
 
@@ -466,7 +467,7 @@ def test_a_stripped_marker_is_absent_while_an_unjudgeable_one_survives(tokenizer
     marked = _render(tokenizer, prompt + with_marked_reasoning(completion, prefix))
     markers = reasoning_markers(completion, prefix)
     assert len(markers) == 2
-    stripped, unjudgeable = markers[0], markers[1]
+    stripped, unjudgeable = markers[0][0], markers[1][0]
 
     # the discriminator: absent from the render entirely vs present but unlocatable
     assert stripped not in marked
@@ -476,6 +477,50 @@ def test_a_stripped_marker_is_absent_while_an_unjudgeable_one_survives(tokenizer
     # neither sits in a span, which is why presence in the RENDER is what separates them
     assert not any(stripped in span for span in marked_spans)
     assert not any(unjudgeable in span for span in marked_spans)
+
+
+def test_a_quoted_closer_bounds_the_span_short_of_the_templates_own(tokenizer) -> None:
+    """The mis-bounding the bracket exists to detect, taken from the shipped template.
+
+    Reasoning that quotes a newline-delimited closer and then a turn boundary makes the scan end
+    the block at the QUOTED closer. The offline guard's whole premise is that a head marker can sit
+    inside a span that stopped early, so that premise is checked here against the real template
+    rather than the fake:
+
+    * the span the scan reports ends BEFORE the template's own closer;
+    * the head marker is nonetheless inside it, which is why a head-only check reads it as resolved;
+    * the tail marker is NOT, which is the signal that separates this from an honest span.
+    """
+    prompt = [{"role": "user", "content": "u1"}]
+    completion = [
+        {
+            "role": "assistant",
+            "content": "ANSWER",
+            # a closer, then the boundary layout, both written out in full
+            "reasoning_content": (
+                f"start\n{THINK_CLOSE}\n\n middle {TURN_END}\n<|im_start|>user\n end"
+            ),
+        },
+    ]
+    full = _render(tokenizer, prompt + completion)
+
+    spans = reasoning_spans(full)
+    assert len(spans) == 1
+    # the template's own closer is the LAST one in the render; the scan stopped before it
+    real_close = full.rfind(f"\n{THINK_CLOSE}\n\n") + len(f"\n{THINK_CLOSE}\n\n")
+    assert spans[0][1] < real_close
+
+    prefix = reasoning_marker_prefix(full)
+    marked = _render(tokenizer, prompt + with_marked_reasoning(completion, prefix))
+    ((head, tail),) = reasoning_markers(completion, prefix)
+    marked_spans = reasoning_span_texts(marked)
+    assert len(marked_spans) == 1
+
+    # the head rides inside the short span, so presence alone cannot detect the mis-bounding
+    assert any(head in span for span in marked_spans)
+    # the tail sits past the quoted closer, so it is what the short span is missing
+    assert not any(tail in span for span in marked_spans)
+    assert tail in marked
 
 
 def test_the_real_template_prefers_reasoning_content_over_an_inline_span(tokenizer) -> None:

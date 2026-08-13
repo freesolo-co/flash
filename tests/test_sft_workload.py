@@ -1257,6 +1257,66 @@ def test_one_unresolvable_turn_beside_an_ordinary_one_does_not_warn_about_a_drop
     assert "dropped" not in capsys.readouterr().err
 
 
+def test_a_span_bounded_at_a_quoted_closer_is_not_scored_as_fully_retained(capsys) -> None:
+    """A block the cap CUTS must never read as retained, and a short span is how that happens.
+
+    Reasoning that quotes a newline-delimited ``</think>`` and then, later, a turn boundary pulls
+    the scan's horizon in front of the template's own closer, so the span ends at the QUOTED one.
+    The head marker sits inside that shortened span, so a head-only check calls the turn resolved
+    and then measures truncation against an end offset that is too early: with the cap landing
+    between the quoted closer and the real one, a block training actually cuts is reported as fully
+    retained -- the direction that hides the loss rather than over-warning.
+
+    Bracketing the reasoning is what separates them: a span holding the head WITHOUT the tail
+    stopped before the reasoning ended, so the turn is unjudgeable and leaves the accounting.
+    """
+
+    class QuotedCloserThenBoundaryEnvironment(ThinkingEnvironment):
+        def sft_completion(self, row):
+            return [
+                {
+                    "role": "assistant",
+                    # a closer first, then the boundary layout, both written out in full
+                    "reasoning_content": (
+                        "start\n</think>\n\n middle <|im_end|>\n<|im_start|>user\n end"
+                    ),
+                    "content": "ANSWER",
+                },
+            ]
+
+    # the cap sits between the quoted closer (span end 77) and the template's real one (120), the
+    # only window where the two answers differ. it also has to clear the 63-token prompt: a cap
+    # below that empties every completion and the row is DROPPED before reasoning is ever measured,
+    # so the assertions below would pass on a broken build for the wrong reason.
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        QuotedCloserThenBoundaryEnvironment([], prompt="board"),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    # the row REACHED the measurement. every assertion below is a zero, and a dropped row reports
+    # the same zeros without the guard ever running -- so without this the test would pass on a
+    # build that never executed the code it exists to cover.
+    assert len(prepared.rows) == 1
+
+    # unjudgeable rather than a phantom survivor: never 1 rendered with 0 truncated
+    assert prepared.rendered_reasoning_spans == 0
+    assert prepared.truncated_reasoning_spans == 0
+    assert prepared.authored_reasoning_turns == 0
+
+
 def test_a_known_loss_is_still_reported_beside_an_unjudgeable_survivor(capsys) -> None:
     """Excluding the turn nobody can judge must not bury a loss that IS provable.
 

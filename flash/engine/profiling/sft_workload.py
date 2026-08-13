@@ -384,8 +384,8 @@ def _row_reasoning(
     marked_spans = reasoning_span_texts(marked_render)
     unjudgeable = sum(
         1
-        for marker in reasoning_markers(completion_messages, prefix)
-        if marker in marked_render and not any(marker in span for span in marked_spans)
+        for head, tail in reasoning_markers(completion_messages, prefix)
+        if head in marked_render and not any(head in span and tail in span for span in marked_spans)
     )
     if unjudgeable:
         # the template KEPT reasoning the span scan could not locate: a marker rides only inside
@@ -399,6 +399,10 @@ def _row_reasoning(
         # TURN leaves the accounting, never its whole row: a neighbour whose marker is absent from
         # the render was definitively stripped, and zeroing the row to stay quiet about the turn
         # that cannot be judged would bury that known loss with it.
+        #
+        # BOTH ends have to sit in the span. a span holding only the head stopped at a closer the
+        # reasoning quotes rather than the template's own, so its end offset is too early -- and
+        # measuring truncation against it scores a block the cap cuts as fully retained.
         authored -= unjudgeable
         if not authored:
             # every authored turn was unjudgeable, so the row supports no claim either way.
@@ -413,6 +417,12 @@ def _row_reasoning(
     for span, end in zip(marked_spans, ends, strict=True):
         if prefix not in span:
             continue  # the template dropped this turn's reasoning before the cap ever applied
+        if f"{prefix}e" not in span:
+            # the head without its tail: this span stopped at a closer the reasoning quotes, so
+            # ``end`` points before the block's real close. its turn already left ``authored`` as
+            # unjudgeable, and crediting it here would compare the cap against that early offset
+            # and call a cut block fully retained.
+            continue
         rendered += 1
         if _encoded_length(tokenizer, full_text[:end]) > max_length:
             truncated += 1

@@ -128,8 +128,8 @@ def reasoning_marker_prefix(text: str) -> str:
     return prefix
 
 
-def _reasoning_body_offset(text: str) -> int | None:
-    """Where this turn's reasoning BODY starts, by the template's own rule.
+def _reasoning_body_offset(text: str) -> tuple[int, int] | None:
+    """Where this turn's reasoning BODY starts and ENDS, by the template's own rule.
 
     The template takes the reasoning as the text after the LAST ``<think>`` that precedes the first
     ``</think>``, over the whole concatenated message text. Stamping the first opener instead puts
@@ -146,20 +146,27 @@ def _reasoning_body_offset(text: str) -> int | None:
     turns, so that leading text is present on a turn that authored nothing; treating it as authored
     marks a block the real render does not have, and the resulting span-count mismatch reports the
     whole row as template-dropped -- a total loss warning for a dataset that lost nothing.
+
+    The END comes back with the start because the body is bracketed rather than merely stamped: the
+    closing tag the template will honour is already located here, and a caller re-deriving it would
+    have to repeat this same last-opener-before-first-close rule to find it.
     """
     close = text.find(_THINK_CLOSE)
     if close < 0:
         return None
     open_at = text.rfind(_THINK_OPEN, 0, close)
     body = 0 if open_at < 0 else open_at + len(_THINK_OPEN)
-    return body if text[body:close].strip() else None
+    return (body, close) if text[body:close].strip() else None
 
 
-def _marked_inline_reasoning(content: object, marker: str) -> object:
-    """``content`` with ``marker`` placed at the start of the reasoning the template will keep."""
+def _marked_inline_reasoning(content: object, head: str, tail: str) -> object:
+    """``content`` with the reasoning the template will keep BRACKETED by ``head`` and ``tail``."""
     if isinstance(content, str):
-        offset = _reasoning_body_offset(content)
-        return content if offset is None else content[:offset] + marker + content[offset:]
+        bounds = _reasoning_body_offset(content)
+        if bounds is None:
+            return content
+        start, end = bounds
+        return content[:start] + head + content[start:end] + tail + content[end:]
     if not isinstance(content, list):
         return content
     # the template concatenates the text blocks before splitting, so the delimiters are found on the
@@ -173,23 +180,29 @@ def _marked_inline_reasoning(content: object, marker: str) -> object:
         else None
         for block in content
     ]
-    offset = _reasoning_body_offset("".join(text or "" for text in texts))
-    if offset is None:
+    bounds = _reasoning_body_offset("".join(text or "" for text in texts))
+    if bounds is None:
         return content
+    # both ends are placed in one pass, highest offset first within a block, so inserting the head
+    # cannot shift the tail's index out from under it when the two land in the SAME block.
+    inserts = sorted(zip(bounds, (head, tail), strict=True), reverse=True)
     marked: list = []
     consumed = 0
-    placed = False
+    placed: set[int] = set()
     for block, text in zip(content, texts, strict=True):
-        if text is None or placed:
+        if text is None:
             marked.append(block)
             continue
-        local = offset - consumed
+        stamped = text
+        for offset, marker in inserts:
+            local = offset - consumed
+            # an offset sitting exactly on a block boundary matches the END of one block and the
+            # START of the next, so each end is placed once and only once.
+            if offset not in placed and 0 <= local <= len(text):
+                stamped = stamped[:local] + marker + stamped[local:]
+                placed.add(offset)
         consumed += len(text)
-        if 0 <= local <= len(text):
-            marked.append({**block, "text": text[:local] + marker + text[local:]})
-            placed = True
-        else:
-            marked.append(block)
+        marked.append(block if stamped is text else {**block, "text": stamped})
     return marked
 
 
@@ -203,23 +216,36 @@ def _marks_reasoning(message: dict) -> bool:
     return message.get("role") == "assistant" and bool(reasoned_assistant_turns([message]))
 
 
-def _turn_marker(prefix: str, index: int) -> str:
-    """The marker naming ONE turn.
+def _turn_marker(prefix: str, index: int) -> tuple[str, str]:
+    """The pair of markers BRACKETING one turn's reasoning: ``(head, tail)``.
 
     Per-turn rather than a single shared stamp: survival is asked per turn, and a caller holding
     only the shared prefix cannot tell WHICH turn a surviving marker belongs to -- one located
     block would answer for every other block in the row.
+
+    Bracketing rather than a lone head stamp, because a head alone cannot see a span bounded SHORT.
+    ``reasoning_spans`` ends a block at the last closer below its horizon, and reasoning that quotes
+    a newline-delimited ``</think>`` before quoting a turn boundary pulls that horizon in front of
+    the real closer, so the scan accepts the QUOTED closer as the end. Such a span still contains
+    the head, so a head-only check reads it as resolved and the caller then measures truncation
+    against an end that is too early -- scoring a block the cap cuts as fully retained, the
+    direction that hides the loss. A tail sits after the last reasoning byte, so a span holding the
+    head without it is exactly a span that stopped early.
     """
-    return f"{prefix}{index} "
+    return f"{prefix}{index} ", f" {prefix}e{index}"
 
 
-def reasoning_markers(messages: list[dict], prefix: str) -> list[str]:
-    """The marker ``with_marked_reasoning`` stamps into each reasoning-authoring turn, in order.
+def reasoning_markers(messages: list[dict], prefix: str) -> list[tuple[str, str]]:
+    """The ``(head, tail)`` pair bracketing each reasoning-authoring turn, in order.
 
     Callers need the markers SEPARATELY to ask survival per turn. Searching a render for the shared
     prefix instead answers only "did any reasoning survive", which is the wrong question for a row
     whose turns can be answered differently: one turn the scan resolves would report the row
     resolvable while another turn's block sits unlocated (see ``sft_workload._row_reasoning``).
+
+    Both ends come back because a turn is only judgeable when a span holds BOTH: a span with the
+    head alone was bounded before the reasoning ended (see ``_turn_marker``), and its end offset is
+    then too early to measure truncation against.
     """
     return [
         _turn_marker(prefix, index)
@@ -246,19 +272,23 @@ def with_marked_reasoning(messages: list[dict], prefix: str) -> list[dict]:
     credited. Only reasoning text changes, so the template's ``last_query_index`` rule sees
     identical roles in identical positions and the marked render keeps the full render's span
     sequence -- which is what lets survival be read from one render and offsets from the other.
+
+    The reasoning is BRACKETED, head and tail, so the pair also reports where the block ENDS. A
+    head alone says only that the block survived, never that the scan bounded all of it -- see
+    ``_turn_marker`` for the span that stops at a closer the reasoning merely quotes.
     """
     marked: list[dict] = []
     for index, message in enumerate(messages):
         copied = dict(message)
         if _marks_reasoning(message):
-            marker = _turn_marker(prefix, index)
+            head, tail = _turn_marker(prefix, index)
             reasoning = copied.get("reasoning_content")
             if isinstance(reasoning, str) and reasoning.strip():
                 # the template reads this field in preference to an inline span, so it is the
-                # reasoning and the marker belongs in it
-                copied["reasoning_content"] = marker + reasoning
+                # reasoning and the markers belong in it
+                copied["reasoning_content"] = head + reasoning + tail
             else:
-                copied["content"] = _marked_inline_reasoning(copied.get("content"), marker)
+                copied["content"] = _marked_inline_reasoning(copied.get("content"), head, tail)
         marked.append(copied)
     return marked
 
