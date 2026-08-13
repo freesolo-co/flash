@@ -16,6 +16,7 @@ one implementation of it.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import re
 import time
@@ -25,6 +26,13 @@ import pytest
 from flash.schema import format_adapter_revision
 
 REQUIRED_CAPABILITIES = {"immutable_adapter_revisions", "alias_compare_and_swap"}
+
+# The longest the client will ever wait for ONE request, whatever budget it is given:
+# `flash/serve/deploy.py` clamps every call to `min(60.0, timeout_s)`. Mirrored rather than
+# imported so the suite stays runnable against a backend without flash's serving module installed --
+# and asserted against the real value in `test_the_per_request_cap_still_matches_the_client`, so
+# the copy cannot drift into passing backends the client would time out on.
+_CLIENT_REQUEST_TIMEOUT_CAP = 60.0
 
 # Echoed back verbatim on read-back; the client compares each one to decide whether a revision id
 # still names the artifact it registered.
@@ -127,6 +135,11 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
     the remaining budget as the per-request timeout and breaks on a read that completes past the
     deadline. A backend with slow status reads would otherwise pass conformance and then fail every
     real deploy, which is the one thing this suite exists to rule out.
+
+    The per-request bound is the remaining budget capped at `_CLIENT_REQUEST_TIMEOUT_CAP`, because
+    the budget alone is not what the client allows: `_serving_request` clamps whatever it is handed
+    to 60s. Passing the full remaining budget here would accept a backend whose read-back takes 90s
+    -- inside the suite's overall budget, but past what every real poll permits.
     """
     deadline = time.monotonic() + timeout
     delay = 1.0
@@ -135,7 +148,9 @@ def _wait_ready(http, revision: str, timeout: float) -> dict:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        response = http.get(f"/adapters/{revision}", timeout=remaining)
+        response = http.get(
+            f"/adapters/{revision}", timeout=min(_CLIENT_REQUEST_TIMEOUT_CAP, remaining)
+        )
         if deadline - time.monotonic() <= 0:
             # Completed, but not in time. Not honored, for the same reason the client does not.
             break
@@ -179,6 +194,35 @@ def deployed(http, adapter_source, run_id, ready_timeout):
 
 def _activate(http, revision: str, expected: str | None):
     return http.post(f"/adapters/{revision}/activate", json={"expected_adapter_revision": expected})
+
+
+def test_the_per_request_cap_still_matches_the_client():
+    """The mirrored 60s cap must not drift from the client's real one.
+
+    `_wait_ready` bounds each poll by `_CLIENT_REQUEST_TIMEOUT_CAP` because that is what the client
+    genuinely permits per request, not what the overall budget allows. Copied rather than imported
+    so the suite runs against a backend without flash's serving module installed -- which is exactly
+    the arrangement where a copy rots silently. If `_serving_request` is ever relaxed to 120s, this
+    fails and says so, rather than leaving the suite quietly stricter than the client; and if it is
+    tightened, the suite would otherwise start passing backends that every deploy times out on.
+
+    Takes no fixtures ON PURPOSE. `serving_url` is what skips this suite without `--serving-url`, so
+    a test that requested it would never run in CI -- and a drift guard that only runs when someone
+    has a live backend is not a guard.
+    """
+    from flash.serve import deploy
+
+    source = inspect.getsource(deploy._serving_request)
+    found = re.findall(r"min\((\d+(?:\.\d+)?),", source)
+    assert found, (
+        "could not find the per-request timeout clamp in `_serving_request`; the conformance "
+        "suite's mirrored cap can no longer be checked against the client and may be silently wrong"
+    )
+    assert float(found[0]) == _CLIENT_REQUEST_TIMEOUT_CAP, (
+        f"the client now clamps each request to {found[0]}s but this suite still bounds its polls "
+        f"by {_CLIENT_REQUEST_TIMEOUT_CAP}s. a suite that allows longer than the client passes "
+        f"backends whose read-backs time out on every real deploy"
+    )
 
 
 def test_healthz_advertises_the_required_capabilities(http):
