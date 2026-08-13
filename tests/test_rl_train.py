@@ -6,6 +6,7 @@ import ast
 import asyncio
 import contextlib
 import inspect
+import io
 import json
 import math
 import os
@@ -2238,6 +2239,113 @@ def test_reward_bridge_lookup_failure_raises(monkeypatch):
             )
     finally:
         server.shutdown()
+
+
+def test_reward_server_reports_thread_exhaustion_as_a_server_fault():
+    """Thread exhaustion is 503 WITH its cause, not 400.
+
+    Under rollout concurrency the scoring thread pool can fail to start a thread; the handler used
+    to answer 400 for that, which asserts the caller sent something wrong. Here score_episode
+    cannot produce a 400 at all (it returns a well-formed result carrying `error`), so a 400 sent
+    every reader to the one component provably not at fault.
+    """
+
+    def exhausted(index, solution_str):
+        raise RuntimeError("can't start new thread")
+
+    server, url = rl_train.start_reward_server(exhausted, example_count=4)
+    try:
+        body = json.dumps({"index": 0, "solution_str": "answer"}).encode()
+        req = urllib.request.Request(
+            url + "/score", data=body, headers={"Content-Type": "application/json"}
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 503, "a resource fault must not be reported as a bad request"
+        # the cause has to survive to the client: naming the failing resource is the whole point.
+        assert "can't start new thread" in exc_info.value.read().decode()
+    finally:
+        server.shutdown()
+
+
+def test_reward_server_still_rejects_a_malformed_request_as_a_client_error():
+    """The 5xx split must not turn genuine client errors into server faults.
+
+    A non-integer index and an unknown session id are the caller's fault at any capacity, so both
+    stay 400 -- otherwise the new status would tell a caller to retry a request that can never work.
+    """
+    bridge = rl_train.MultiTurnBridge(
+        _BridgeEnv(),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=2,
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+    try:
+        for path, payload in (
+            ("/score", {"index": "not-an-int", "solution_str": "x"}),
+            ("/multiturn/step", {"session_id": "nope", "completion_text": "x"}),
+        ):
+            req = urllib.request.Request(
+                url + path,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                urllib.request.urlopen(req, timeout=10)
+            assert exc_info.value.code == 400, f"{path} is a client error at any capacity"
+    finally:
+        server.shutdown()
+        bridge.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "expected_fault"),
+    [
+        (503, "RuntimeError: can't start new thread", "could not serve"),
+        (400, "IndexError: index 9 is outside [0, 4)", "rejected"),
+    ],
+)
+def test_the_child_surfaces_the_bridges_error_text_not_just_the_status(
+    monkeypatch, status, detail, expected_fault
+):
+    """`suppress(Exception)` around the raise swallowed the detail-bearing error itself.
+
+    The bridge puts its real cause in the response body, the child decoded it, built the
+    RuntimeError naming it -- and the suppress ate that raise, so the generic "returned HTTP 400"
+    was the ONLY message that could ever escape. The cause must reach the user, and a 5xx must not
+    read as a rejected request.
+    """
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
+
+    def raise_http_error(*_a, **_k):
+        payload = json.dumps({"error": detail}).encode()
+        raise urllib.error.HTTPError(
+            "http://bridge/multiturn/score", status, "err", {}, io.BytesIO(payload)
+        )
+
+    monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", raise_http_error)
+    with pytest.raises(RuntimeError) as exc_info:
+        grpo_multiturn.post_json("http://bridge", "/multiturn/score", {})
+    message = str(exc_info.value)
+    assert detail in message, "the bridge's own cause never reached the caller"
+    assert expected_fault in message
+
+
+def test_the_child_names_the_status_when_the_body_carries_no_detail(monkeypatch):
+    """An undecodable body must still produce a message naming what happened."""
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
+
+    def raise_http_error(*_a, **_k):
+        raise urllib.error.HTTPError(
+            "http://bridge/multiturn/score", 503, "err", {}, io.BytesIO(b"not json")
+        )
+
+    monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", raise_http_error)
+    with pytest.raises(RuntimeError, match=r"could not serve .*HTTP 503 with no error detail"):
+        grpo_multiturn.post_json("http://bridge", "/multiturn/score", {})
 
 
 def test_reward_server_scorer_can_capture_samples():

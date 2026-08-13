@@ -39,6 +39,34 @@ _SINGLE_TURN_SCORE_BATCH_SIZE = 64
 _SINGLE_TURN_SCORE_FLUSH_WAIT_S = 0.1
 _SINGLE_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
 
+# a body that could not be decoded at all: bad Content-Length, bad utf-8, or bad json.
+_UNDECODABLE_BODY_ERRORS = (ValueError, TypeError, UnicodeDecodeError)
+
+
+class _BadRequest(Exception):
+    """A request this bridge is rejecting because the REQUEST is wrong.
+
+    Raised where a payload field is read, so a malformed field is classified by the code that knows
+    it is malformed rather than by exception type at the handler. A bare ``ValueError`` cannot be
+    classified there: an env raising one during scoring is this side failing, not a bad request.
+    """
+
+
+def request_int(payload: dict, key: str) -> int:
+    """Read one required integer payload field, or reject the request."""
+    try:
+        return int(payload[key])
+    except KeyError as exc:
+        raise _BadRequest(f"missing required field {key!r}") from exc
+    except (TypeError, ValueError) as exc:
+        raise _BadRequest(f"field {key!r} is not an integer: {payload[key]!r}") from exc
+
+
+# what the bridge rejects deliberately: a malformed field (_BadRequest), an index outside the
+# dataset (IndexError), and an unknown or duplicate session id (KeyError). anything else reaching
+# the handler is this side failing to serve a well-formed request.
+_BAD_REQUEST_ERRORS = (_BadRequest, IndexError, KeyError)
+
 # size the listen backlog for the full prompts_per_step * group_size connection burst.
 # socketserver's default of 5 resets overflowed clients, and bridge_post intentionally does not retry.
 # a fixed backlog only moves the cliff; linux may clamp this value to somaxconn.
@@ -136,7 +164,7 @@ class MultiTurnBridge:
         return stale
 
     def start(self, payload: dict) -> dict:
-        index = int(payload["index"])
+        index = request_int(payload, "index")
         if index < 0 or index >= len(self._examples):
             raise IndexError(
                 f"multi-turn example index {index} is outside [0, {len(self._examples)})"
@@ -215,7 +243,7 @@ class MultiTurnBridge:
             return score_rollouts(self._env, requests)
 
     def score(self, payload: dict) -> dict:
-        turn_count = int(payload["turn_count"])
+        turn_count = request_int(payload, "turn_count")
         with self._lock:
             session = self._session(payload)
             state = session["state"]
@@ -356,7 +384,7 @@ def start_reward_server(
     )
 
     def _score_route(payload: dict) -> dict:
-        index = int(payload["index"])
+        index = request_int(payload, "index")
         if index < 0 or index >= example_count:
             raise IndexError(f"reward example index {index} is outside [0, {example_count})")
         solution_str = payload.get("solution_str", "")
@@ -382,14 +410,35 @@ def start_reward_server(
             try:
                 n = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(n).decode("utf-8"))
-                result = route(payload)
-            except Exception as exc:
-                print(f"[rl-verl] reward server request failed: {exc}", flush=True)
-                body = json.dumps({"error": str(exc)}).encode()
-                self.send_response(400)
+            except _UNDECODABLE_BODY_ERRORS as exc:
+                status = 400
+                detail = f"{type(exc).__name__}: {exc}"
             else:
+                try:
+                    result = route(payload)
+                except _BAD_REQUEST_ERRORS as exc:
+                    # the request itself is wrong: an index outside the dataset, or an unknown or
+                    # duplicate session id. no retry or capacity change makes it succeed.
+                    status = 400
+                    detail = f"{type(exc).__name__}: {exc}"
+                except Exception as exc:
+                    # the request was fine and this side could not serve it -- thread exhaustion
+                    # ("can't start new thread") under rollout concurrency is the case that drove
+                    # this split. 400 blamed the caller's payload and sent every reader to score
+                    # code that cannot produce one, so a resource fault reads as a 5xx here.
+                    status = 503
+                    detail = f"{type(exc).__name__}: {exc}"
+                else:
+                    status = 200
+            if status == 200:
                 body = json.dumps(result).encode()
-                self.send_response(200)
+            else:
+                print(
+                    f"[rl-verl] reward server request failed ({status}) for {self.path}: {detail}",
+                    flush=True,
+                )
+                body = json.dumps({"error": detail}).encode()
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
