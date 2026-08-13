@@ -364,6 +364,12 @@ class TrainSpec:
         save_at_steps = parse_positive_int_tuple(self.save_at_steps, name="train.save_at_steps")
         object.__setattr__(self, "max_steps", max_steps)
         object.__setattr__(self, "save_at_steps", save_at_steps)
+        # a nonpositive interval is not a cadence. the public schema already rejects one, but a
+        # persisted or internally built spec reaches this dataclass directly, so canonicalize it to
+        # the unset sentinel every save_freq site already resolves to its algorithm default. leaving
+        # it signed would make the horizon clamp read it as an interval of one and checkpoint every
+        # single step.
+        object.__setattr__(self, "save_every", parse_max_steps(self.save_every))
         effective_max_steps = max_steps or 0
         if save_at_steps and effective_max_steps <= 0:
             raise ValueError("train.save_at_steps requires positive train.max_steps")
