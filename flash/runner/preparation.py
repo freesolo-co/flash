@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -162,6 +163,38 @@ def _prepare_init_from_adapter(
         raise _runner().WarmStartPreparationError(str(exc)) from exc
 
 
+def _require_warmstart_expert_targets(config: Mapping[str, Any], model_id: str) -> None:
+    """reject a warm-start source that never adapted the model's fused routed experts.
+
+    the worker enforces this too, but only after the gpus are rented: the failure surfaced at
+    ``stage=rl_adapter_loading`` on an allocated 2x H200, and the run was then billed as
+    ``cost: 0.0`` even though the rental was real. the source adapter's config is already fetched
+    here, so the same contract costs nothing at submit and the user finds out before paying.
+
+    an adapter exported before the ``restore_fused_expert_targets`` fix is NOT rejected: verl's
+    exporter dropped ``target_parameters`` while flattening the wrapped expert modules into
+    ``target_modules`` as ``experts``/``base_layer``, so that pair is the fingerprint of a correctly
+    trained adapter with a lossy config, and the worker recovers it from the adapter's own tensors.
+    only a config that shows neither the targets nor that fingerprint is genuinely missing the
+    expert training, which no amount of retrying will fix.
+    """
+    from flash.engine.worker.model.adapter import lora_target_parameters
+
+    required = set(lora_target_parameters(model_id) or ())
+    if not required:
+        return
+    if required <= {str(t) for t in (config.get("target_parameters") or ())}:
+        return
+    modules = config.get("target_modules")
+    owners = {t.split(".")[-2] for t in required if "." in t} | {"base_layer"}
+    if isinstance(modules, (list, tuple)) and owners & {str(m) for m in modules}:
+        return  # lossy-but-recoverable legacy export; the worker restores it from the weights
+    raise ValueError(
+        f"train.init_from_adapter source did not train the fused routed experts required by "
+        f"{model_id} (missing {sorted(required)}); warm start would silently leave them unadapted"
+    )
+
+
 def _prepare_init_from_adapter_inner(
     spec: JobSpec,
     *,
@@ -255,6 +288,7 @@ def _prepare_init_from_adapter_inner(
         ),
     )
     config = load_hf_adapter_config(storage, token, revision)
+    _require_warmstart_expert_targets(config, spec.model)
     metadata = preflight_init_adapter_lora_rank(
         worker_spec, token=token, config_loader=lambda _ref, _token, _revision: config
     )

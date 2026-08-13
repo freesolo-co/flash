@@ -35,18 +35,78 @@ def lora_target_parameters(model_id: str | None) -> list[str] | None:
     return None
 
 
-def validate_lora_target_parameters(config: dict, model_id: str) -> None:
-    """fail closed when a warm-start adapter omits required fused expert parameters."""
+def adapter_has_fused_expert_tensors(adapter_dir: str | None, model_id: str) -> bool:
+    """did this adapter actually train the model's fused routed experts?
+
+    the weights, not the config, are the ground truth: peft wraps each targeted `nn.Parameter` in a
+    `ParamWrapper` whose lora tensors sit under the OWNING MODULE's path
+    (`...mlp.experts.lora_A.default.weight`, and `...mlp.experts.base_layer.lora_A.default.weight`
+    once a second parameter on the same module is wrapped). the targeted parameter's own name --
+    `gate_up_proj` / `down_proj` -- never appears in a tensor key, so the check is for the presence
+    of expert lora tensors, not for one key per required entry.
+    """
+    targets = lora_target_parameters(model_id)
+    if not targets or not adapter_dir:
+        return False
+    try:
+        keys = _read_adapter_tensor_keys(adapter_dir) or []
+    except Exception:
+        return False
+    # the owning-module segment shared by every targeted parameter ("mlp.experts.*" -> "experts").
+    owners = {t.split(".")[-2] for t in targets if "." in t}
+    return any("lora_" in key and any(f".{owner}." in key for owner in owners) for key in keys)
+
+
+def validate_lora_target_parameters(
+    config: dict, model_id: str, adapter_dir: str | None = None
+) -> None:
+    """fail closed when a warm-start adapter omits required fused expert parameters.
+
+    `target_parameters` is the only thing that adapts a fused routed-expert `nn.Parameter`, so an
+    adapter that lacks it really is unusable for warm start. but the saved config is not a reliable
+    record of what was trained: verl's exporter rebuilds `adapter_config.json` from rank, alpha and
+    `target_modules` alone, so it wrote `target_parameters: null` for every adapter produced before
+    `restore_fused_expert_targets` began repairing the export. rejecting on the config alone
+    therefore condemned correctly-trained adapters -- including ones that deploy and serve -- with
+    advice ("retrain with the current Flash version") that reproduced the same file.
+
+    so when the config is silent, fall back to the adapter's own tensors, which record what was
+    actually adapted. only a directory with no expert lora tensors is rejected, and that adapter is
+    genuinely missing the expert training this model requires.
+
+    the recovery is written back to `adapter_config.json`, not just to the caller's dict, because
+    the consumer is verl: flash hands it the adapter DIRECTORY (`model.lora_adapter_path`) and it
+    loads that path itself through `PeftModel.from_pretrained`. an in-memory repair would leave the
+    file peft actually reads unchanged, and the load would fail on the same config this call just
+    accepted -- the repair has to reach the same bytes.
+    """
     required = set(lora_target_parameters(model_id) or ())
     if not required:
         return
     actual = set(config.get("target_parameters") or ())
     missing = sorted(required - actual)
-    if missing:
+    if not missing:
+        return
+    if actual or not adapter_has_fused_expert_tensors(adapter_dir, model_id):
         raise ValueError(
             f"warm-start adapter for {model_id} omits required expert targets {missing}; "
             "retrain the source adapter with the current Flash version"
         )
+    # config dropped the field, weights prove the experts were trained: recover in the caller's
+    # dict and in the file, so both this run's reader and verl's own load see the real targeting.
+    from flash.engine.worker.verl.checkpoints import restore_fused_expert_targets
+
+    restore_fused_expert_targets(config, model_id)
+    config_path = os.path.join(str(adapter_dir), "adapter_config.json")
+    with open(config_path, encoding="utf-8") as config_file:
+        on_disk = json.load(config_file)
+    restore_fused_expert_targets(on_disk, model_id)
+    with open(config_path, "w", encoding="utf-8") as config_file:
+        json.dump(on_disk, config_file, indent=2)
+    print(
+        f"[init-adapter] recovered fused expert targets {sorted(required)} from adapter weights; "
+        "the source config predates the export fix"
+    )
 
 
 def make_lora(model_id: str | None = None):

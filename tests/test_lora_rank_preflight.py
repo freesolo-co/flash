@@ -309,3 +309,40 @@ def test_lora_rank_uses_schema_adapter_storage_ref_parser():
         "owner/runs",
         "sft/source-run/checkpoints/step-40",
     )
+
+
+def test_submit_rejects_a_warmstart_source_that_never_trained_the_fused_experts():
+    """the expert contract is checked at submit, not after the gpus are rented.
+
+    the worker-side check ran at ``stage=rl_adapter_loading``, so a bad warm-start source was only
+    discovered once 2x H200 were allocated -- and the dead run still reported ``cost: 0.0`` against
+    a real rental. the source adapter's config is already fetched during preparation, so the same
+    contract costs nothing here.
+    """
+    from flash.runner.preparation import _require_warmstart_expert_targets
+
+    moe = "Qwen/Qwen3.6-35B-A3B"
+    targets = ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
+
+    # a correctly exported adapter passes.
+    _require_warmstart_expert_targets(
+        {"target_parameters": targets, "target_modules": ["q_proj"]}, moe
+    )
+    # so does a pre-fix verl export: it dropped target_parameters but flattened the wrapped expert
+    # modules into target_modules, which is the fingerprint the worker recovers from the weights.
+    _require_warmstart_expert_targets(
+        {"target_parameters": None, "target_modules": ["q_proj", "experts", "base_layer"]}, moe
+    )
+    # a non-moe model has no expert contract at all.
+    _require_warmstart_expert_targets({"target_parameters": None}, "Qwen/Qwen3.5-9B")
+
+    # neither the targets nor the fingerprint: the experts were genuinely never adapted.
+    with pytest.raises(ValueError, match="fused routed experts"):
+        _require_warmstart_expert_targets(
+            {"target_parameters": None, "target_modules": ["q_proj", "v_proj"]}, moe
+        )
+    # a partial target set is not silently topped up.
+    with pytest.raises(ValueError, match="fused routed experts"):
+        _require_warmstart_expert_targets(
+            {"target_parameters": ["mlp.experts.gate_up_proj"], "target_modules": ["q_proj"]}, moe
+        )
