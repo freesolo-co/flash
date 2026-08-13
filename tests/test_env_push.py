@@ -2092,6 +2092,121 @@ def test_the_expansion_budget_is_not_swallowed_by_the_per_member_handler(monkeyp
         credential_in_file(path)
 
 
+def test_a_credential_nested_two_containers_deep_is_still_found(tmp_path):
+    """Expansion recurses: stopping at one level treated an inner container as final content.
+
+    A zip holding a gzipped shard is an ordinary way to ship a dataset, and the inner member's
+    bytes contain the credential nowhere a regex can see, so a key one layer further in published
+    with exit 0.
+    """
+    import gzip
+    import io
+    import zipfile
+
+    from flash.cli.commands.env.secrets import credential_in_file
+
+    secret = f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode()
+
+    two_deep = tmp_path / "dataset.zip"
+    with zipfile.ZipFile(two_deep, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("shard.jsonl.gz", gzip.compress(secret))
+    assert credential_in_file(two_deep) == "a Freesolo API key"
+
+    middle = io.BytesIO()
+    with zipfile.ZipFile(middle, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("inner.gz", gzip.compress(secret))
+    three_deep = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(three_deep, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("middle.zip", middle.getvalue())
+    assert credential_in_file(three_deep) == "a Freesolo API key"
+
+
+def test_a_zip_behind_an_executable_stub_is_still_expanded(tmp_path):
+    """A self-extracting archive leads with `MZ`, not `PK`, so leading magic cannot find it.
+
+    `zipfile.is_zipfile` scans for the end-of-central-directory record and recognises it correctly;
+    testing the first six bytes did not, so the container was never expanded.
+    """
+    import io
+    import zipfile
+
+    from flash.cli.commands.env.secrets import credential_in_file
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("env.sh", f'export KEY="fslo_{_FAKE_KEY_BODY}"\n')
+
+    sfx = tmp_path / "installer.exe"
+    sfx.write_bytes(b"MZ\x90\x00" + b"\x00" * 2000 + payload.getvalue())
+
+    # the premise: it does not look like a zip, but it is one
+    assert not sfx.read_bytes().startswith(b"PK")
+    assert zipfile.is_zipfile(sfx)
+    assert credential_in_file(sfx) == "a Freesolo API key"
+
+
+def test_a_base64_encoded_credential_is_decoded_and_found(tmp_path):
+    """A Kubernetes Secret stores every value base64-encoded, sharing no substring with the key.
+
+    Measured before adopting this: 630,011 base64-shaped runs across 8,769 real hub files decode to
+    zero credential matches, so decoding candidates costs no legitimate publish.
+    """
+    import base64
+
+    from flash.cli.commands.env.secrets import _credential_kind, credential_in_file
+
+    encoded = base64.b64encode(f"fslo_{_FAKE_KEY_BODY}".encode()).decode()
+    manifest = tmp_path / "secret.yaml"
+    manifest.write_text(f"apiVersion: v1\nkind: Secret\ndata:\n  api-key: {encoded}\n")
+    assert credential_in_file(manifest) == "a Freesolo API key"
+
+    # an encoded whole file, which is how a sourceable env file travels in a manifest
+    whole = base64.b64encode(f'export FREESOLO_API_KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode())
+    assert _credential_kind(b"data:\n  env.sh: " + whole) == "a Freesolo API key"
+
+    # ordinary prose and short tokens must not be decoded into false positives
+    assert _credential_kind(b"the quick brown fox jumps over the lazy dog repeatedly") is None
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    [
+        "fslo_YOUR_API_KEY_HERE",
+        "fslo_REPLACE_ME_WITH_YOUR_KEY",
+        "fslo_CHANGEME_BEFORE_RUNNING",
+        "fslo_XXXXXXXXXXXXXXXX",
+        "fslo_your_api_key_here",
+        "fslo_retry_after_close",
+    ],
+)
+def test_scaffolding_placeholders_do_not_refuse_the_publish(placeholder):
+    """A false refusal tells the author to rotate a key that never existed.
+
+    Testing for "a digit or a capital" caught the lowercase convention and missed the uppercase and
+    repeated-character ones, so a scaffolded environment could not be published at all. That is the
+    failure mode that gets a check switched off.
+    """
+    from flash.cli.commands.env.secrets import _credential_kind
+
+    assert _credential_kind(placeholder.encode()) is None
+
+
+@pytest.mark.parametrize(
+    ("credential", "kind"),
+    [
+        ("fslo_aB3xK9zQmN2pR7tVwXyZ0123", "a Freesolo API key"),
+        ("hf_AbCdEf0123456789012345", "a Hugging Face token"),
+        ("sk-ant-Ab3xK9zQ_mN2pR7t-VwXyZ0123456789", "an Anthropic API key"),
+        ("ghp_AbCdEf0123456789012345", "a GitHub token"),
+    ],
+)
+def test_issued_keys_are_still_caught_after_narrowing_the_entropy_test(credential, kind):
+    """The placeholder allowance must not open a hole: issued bodies are mixed-case with digits."""
+    from flash.cli.commands.env.secrets import _credential_kind
+
+    assert _credential_kind(credential.encode()) == kind
+
+
 def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
     """`Warning:` is prose; `Proc-Type:` and `DEK-Info:` are RFC 1421 encrypted-key headers.
 

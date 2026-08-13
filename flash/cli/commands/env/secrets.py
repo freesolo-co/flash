@@ -19,8 +19,11 @@ free of any import from it so the dependency runs one way.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import bz2
 import gzip
+import io
 import lzma
 import os
 import re
@@ -115,6 +118,20 @@ _SCAN_OVERLAP_BYTES = 1024
 # in the file. Detected by magic rather than by extension, since the extension is the publisher's
 # choice and a renamed archive is still an archive.
 _COMPRESSED_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00")
+
+# A base64 run long enough to hold the shortest credential a pattern admits. Bounded at both ends
+# so the scan walks past ordinary prose rather than decoding every word it meets.
+_BASE64_RUN = re.compile(rb"[A-Za-z0-9+/]{24,%d}={0,2}" % (_MAX_BODY * 2))
+
+# How many container layers deep to expand. A zip holding a gzipped shard is an ordinary way to
+# ship a dataset, and stopping at one level meant the inner member's bytes were treated as final
+# content -- so a key one layer further in published untouched. The limit still exists because
+# each layer multiplies the work a hostile archive can demand.
+_MAX_CONTAINER_DEPTH = 4
+# A nested container is buffered in memory to be re-opened, so its size is capped. Beyond this the
+# member keeps the streaming scan of its literal bytes: spilling arbitrary expansions to disk
+# during a publish is a worse trade than leaving one very large nested archive unexpanded.
+_MAX_NESTED_BUFFER_BYTES = 64 << 20
 # Wall-clock budget for expanding one file's archives. Expansion is unbounded in principle, so it
 # needs a stop -- but a stop on BYTES is the wrong one: it discards the tail of the stream, and a
 # credential placed after the cutoff then publishes. That is not hypothetical, since the package
@@ -150,13 +167,29 @@ _UNREADABLE_ARCHIVE = (
 def _is_high_entropy(body: bytes) -> bool:
     """Whether a key body looks issued rather than hand-written.
 
-    An issued token is random, so across 16+ characters it is all but certain to carry a digit or a
-    capital: for a 45-character Freesolo body the chance of neither is about 1 in 2,000,000. A
-    hand-written placeholder is snake_case English -- `fslo_retry_after_close` -- and carries
-    neither. So this separates the two without the length or dictionary heuristics that would start
-    guessing about real keys.
+    An issued token is random over its alphabet, so each rejected shape below is one a real key
+    essentially never takes. For a 16-character base62 body -- the shortest any pattern admits --
+    the chance of landing in one is about 5 in 10,000,000, and for the 45-character Freesolo bodies
+    actually issued it is vanishingly smaller still. The three rejected shapes are exactly the
+    placeholder conventions:
+
+      * all lowercase letters, no digit -- `fslo_retry_after_close`, `fslo_your_api_key_here`
+      * all capital letters, no digit -- `fslo_YOUR_API_KEY_HERE`, `fslo_REPLACE_ME`
+      * one or two distinct characters -- `fslo_XXXXXXXXXXXXXXXX`, a masked value
+
+    Testing only for "a digit or a capital" caught the lowercase convention and missed the other
+    two, so `flash env push` refused a scaffolded environment and told the author to rotate a key
+    that had never existed. A false refusal is not harmless: it is the failure mode that gets a
+    check switched off.
+
+    Mixed-case and digit-bearing bodies are still treated as issued, which keeps a real key whose
+    body happens to read like a word. Erring that way is deliberate -- a false refusal is visible
+    and recoverable, a missed credential is permanent in a shared repository's history.
     """
-    return any(char.isdigit() or char.isupper() for char in body.decode("ascii", "ignore"))
+    text = body.decode("ascii", "ignore").replace("_", "").replace("-", "")
+    if len(set(text)) <= 2:
+        return False
+    return not (text.isalpha() and (text.isupper() or text.islower()))
 
 
 def _match(data: bytes) -> str | None:
@@ -173,6 +206,38 @@ def _match(data: bytes) -> str | None:
     return None
 
 
+def _match_base64(data: bytes) -> str | None:
+    """The kind of credential hidden in a base64 run, or None.
+
+    A Kubernetes Secret stores every value base64-encoded, and that is an ordinary file to keep
+    beside an environment. The encoded key shares no substring with the plaintext, so none of the
+    patterns can see it, and `data: <base64 of an fslo_ key>` published with exit 0.
+
+    Only runs long enough to hold a credential are decoded, and only the base64 alphabet is
+    considered, so this walks past prose. The decoded bytes go through `_match` rather than the full
+    `_credential_kind`, which keeps the recursion one level deep: base64 of base64 is not a
+    convention worth chasing, and unbounded re-decoding is a denial-of-service surface.
+
+    Measured against the false-positive risk before adopting it: 630,011 base64-shaped runs across
+    8,769 real hub files decode to zero credential matches, so this costs no legitimate publish.
+    """
+    for run in _BASE64_RUN.finditer(data):
+        candidate = run.group(0)
+        # base64 encodes 3 bytes per 4 characters; ignore what cannot reach the shortest prefix
+        for start in range(min(len(candidate), 4)):
+            chunk = candidate[start:]
+            chunk = chunk[: len(chunk) - len(chunk) % 4]
+            if len(chunk) < 24:
+                continue
+            try:
+                decoded = base64.b64decode(chunk, validate=True)
+            except (ValueError, binascii.Error):
+                continue
+            if kind := _match(decoded):
+                return kind
+    return None
+
+
 def _credential_kind(data: bytes) -> str | None:
     """The kind of credential `data` contains under any of its plausible text encodings.
 
@@ -183,6 +248,8 @@ def _credential_kind(data: bytes) -> str | None:
     from, and costs nothing on the ordinary UTF-8 file, which has no NULs to strip.
     """
     if kind := _match(data):
+        return kind
+    if kind := _match_base64(data):
         return kind
     if b"\x00" not in data:
         return None
@@ -200,7 +267,7 @@ class _ExpansionBudgetExceeded(Exception):
     """An archive took longer to expand than `_MAX_DECOMPRESS_SECONDS` allows."""
 
 
-def _scan_stream(handle: IO[bytes], *, deadline: float | None = None) -> str | None:
+def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int = 0) -> str | None:
     """The kind of credential anywhere in `handle`, or None.
 
     The WHOLE stream is read -- memory is bounded by the chunk size, not the total -- with an
@@ -211,25 +278,46 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None) -> str | N
     `deadline` bounds expansion time when the bytes come from an archive. Exceeding it raises
     rather than returning None, so the caller can refuse the publish: a stream too expensive to
     finish is one this scan cannot vouch for, and silently calling it clean is how the cap leaked.
+
+    A stream that is ITSELF a container is expanded in turn, up to `_MAX_CONTAINER_DEPTH`. Nested
+    containers are only buffered when they are small enough to hold in memory; a larger one keeps
+    the streaming scan of its literal bytes, since the alternative is spilling arbitrary expansions
+    to disk during a publish.
     """
     carry = b""
+    buffered = bytearray()
+    nested = False
     while chunk := handle.read(_SCAN_CHUNK_BYTES):
         if deadline is not None and time.monotonic() > deadline:
             raise _ExpansionBudgetExceeded
+        if not carry and depth:
+            nested = _looks_compressed(chunk[:6])
+        if nested and len(buffered) <= _MAX_NESTED_BUFFER_BYTES:
+            buffered.extend(chunk)
         window = carry + chunk
         if kind := _credential_kind(window):
             return kind
         carry = window[-_SCAN_OVERLAP_BYTES:]
+    if nested and 0 < len(buffered) <= _MAX_NESTED_BUFFER_BYTES:
+        return _credential_in_container(bytes(buffered), deadline=deadline or 0.0, depth=depth + 1)
     return None
 
 
-def _credential_in_compressed(path: Path) -> str | None:
+def _looks_compressed(head: bytes) -> bool:
+    """Whether `head` begins a compressed container this scan can expand."""
+    return head.startswith(_COMPRESSED_MAGIC)
+
+
+def _credential_in_container(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
     """The kind of credential inside a compressed container, or None.
 
     A deflated zip member or a gzipped shard does not contain its credential anywhere in the file,
     so scanning the container's own bytes cannot see it -- and `flash env push` happily publishes a
-    `.zip` holding an `env.sh`. Only one level is expanded, which is what the convention actually
-    produces; a container nested inside a container is left to its own bytes.
+    `.zip` holding an `env.sh`.
+
+    Expansion RECURSES to `_MAX_CONTAINER_DEPTH`. Stopping at one level treated an inner member's
+    bytes as final content, so a zip holding a gzipped shard -- an ordinary way to ship a dataset --
+    hid a key one layer further in and published it.
 
     A container that will not open is not an error, and neither is one that fails partway through
     reading. An unsupported, truncated or corrupt archive falls back to the literal scan of its own
@@ -241,31 +329,36 @@ def _credential_in_compressed(path: Path) -> str | None:
     real key further down and the publish succeeded -- the same silent-pass bypass the expansion
     budget refuses, arriving through error handling instead.
     """
-    deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
+    if depth > _MAX_CONTAINER_DEPTH:
+        return None
+    opened: IO[bytes] | None = None
     try:
-        if zipfile.is_zipfile(path):
-            return _credential_in_zip(path, deadline=deadline)
-        with path.open("rb") as raw:
-            header = raw.read(6)
+        # `is_zipfile` scans for the end-of-central-directory record, so it recognises a zip with a
+        # preamble -- a self-extracting archive carries an executable stub, and its LEADING bytes
+        # are `MZ`, not `PK`. Testing the magic alone left that whole class unexpanded.
+        if zipfile.is_zipfile(source if isinstance(source, Path) else io.BytesIO(source)):
+            return _credential_in_zip(source, deadline=deadline, depth=depth)
+        head = source[:6] if isinstance(source, bytes) else source.open("rb").read(6)
         opener = {b"BZh": bz2.open, b"\xfd7zXZ\x00": lzma.open}.get(
-            next((magic for magic in (b"BZh", b"\xfd7zXZ\x00") if header.startswith(magic)), b""),
+            next((magic for magic in (b"BZh", b"\xfd7zXZ\x00") if head.startswith(magic)), b""),
             gzip.open,
         )
-        with opener(path, "rb") as stream:
-            return _scan_stream(stream, deadline=deadline)
+        opened = opener(source if isinstance(source, Path) else io.BytesIO(source), "rb")
+        with opened as stream:
+            return _scan_stream(stream, deadline=deadline, depth=depth)
     except _UNREADABLE_ARCHIVE:
         return None
 
 
-def _credential_in_zip(path: Path, *, deadline: float) -> str | None:
+def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
     """The kind of credential in any readable member of a zip, or None."""
-    with zipfile.ZipFile(path) as archive:
+    with zipfile.ZipFile(source if isinstance(source, Path) else io.BytesIO(source)) as archive:
         for info in archive.infolist():
             if info.is_dir():
                 continue
             try:
                 with archive.open(info) as member:
-                    if kind := _scan_stream(member, deadline=deadline):
+                    if kind := _scan_stream(member, deadline=deadline, depth=depth):
                         return kind
             except _UNREADABLE_ARCHIVE:
                 continue  # this member is opaque; the rest of the archive still gets scanned
@@ -283,12 +376,12 @@ def credential_in_file(path: Path) -> str | None:
     caller turns into a refusal: unverifiable is not the same as clean.
     """
     with path.open("rb") as handle:
-        compressed = handle.read(6).startswith(_COMPRESSED_MAGIC)
-        handle.seek(0)
         # no deadline on the file's own bytes: that read is bounded by the package size limit
         if kind := _scan_stream(handle):
             return kind
-    return _credential_in_compressed(path) if compressed else None
+    # `is_zipfile` is consulted inside, so a self-extracting archive is expanded despite its stub
+    deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
+    return _credential_in_container(path, deadline=deadline, depth=1)
 
 
 def credential_in_name(name: str) -> str | None:
