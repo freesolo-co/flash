@@ -193,6 +193,41 @@ def _marked_inline_reasoning(content: object, marker: str) -> object:
     return marked
 
 
+def _marks_reasoning(message: dict) -> bool:
+    """Whether this turn gets a marker stamped into it.
+
+    One predicate for both the stamping and the listing below: a turn listed as marked but not
+    stamped reads as reasoning the template dropped, and a turn stamped but not listed cannot be
+    checked for survival. Either way the row is mis-reported, so the two never get their own copy.
+    """
+    return message.get("role") == "assistant" and bool(reasoned_assistant_turns([message]))
+
+
+def _turn_marker(prefix: str, index: int) -> str:
+    """The marker naming ONE turn.
+
+    Per-turn rather than a single shared stamp: survival is asked per turn, and a caller holding
+    only the shared prefix cannot tell WHICH turn a surviving marker belongs to -- one located
+    block would answer for every other block in the row.
+    """
+    return f"{prefix}{index} "
+
+
+def reasoning_markers(messages: list[dict], prefix: str) -> list[str]:
+    """The marker ``with_marked_reasoning`` stamps into each reasoning-authoring turn, in order.
+
+    Callers need the markers SEPARATELY to ask survival per turn. Searching a render for the shared
+    prefix instead answers only "did any reasoning survive", which is the wrong question for a row
+    whose turns can be answered differently: one turn the scan resolves would report the row
+    resolvable while another turn's block sits unlocated (see ``sft_workload._row_reasoning``).
+    """
+    return [
+        _turn_marker(prefix, index)
+        for index, message in enumerate(messages)
+        if _marks_reasoning(message)
+    ]
+
+
 def with_marked_reasoning(messages: list[dict], prefix: str) -> list[dict]:
     """The same messages with each reasoning-authoring assistant turn's reasoning stamped.
 
@@ -215,8 +250,8 @@ def with_marked_reasoning(messages: list[dict], prefix: str) -> list[dict]:
     marked: list[dict] = []
     for index, message in enumerate(messages):
         copied = dict(message)
-        if copied.get("role") == "assistant" and reasoned_assistant_turns([message]):
-            marker = f"{prefix}{index} "
+        if _marks_reasoning(message):
+            marker = _turn_marker(prefix, index)
             reasoning = copied.get("reasoning_content")
             if isinstance(reasoning, str) and reasoning.strip():
                 # the template reads this field in preference to an inline span, so it is the

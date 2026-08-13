@@ -16,6 +16,7 @@ from flash.engine.profiling.workload_profile import (
     count_rendered_reasoning_spans,
     reasoned_assistant_turns,
     reasoning_marker_prefix,
+    reasoning_markers,
     reasoning_span_texts,
     reasoning_spans,
     with_marked_reasoning,
@@ -372,6 +373,58 @@ def test_reasoning_the_scan_cannot_resolve_is_not_reported_as_a_template_drop(to
     # so whatever the scan resolves, it must not claim the block was dropped
     spans = reasoning_span_texts(full)
     assert spans == [] or any("then more" in span for span in spans)
+
+
+def test_one_unresolvable_block_beside_a_resolvable_one_keeps_its_marker(tokenizer) -> None:
+    """The real template's version of the row that makes a SHARED-prefix survival check wrong.
+
+    Two reasoning turns separated by a ``tool`` message, so the template's ``last_query_index`` rule
+    keeps BOTH: the first quotes a turn boundary verbatim and cannot be resolved, the second is
+    ordinary and resolves normally. Every fact the offline guard depends on is asserted here against
+    the shipped template rather than the fake, because the fake is the thing under suspicion:
+
+    * both markers reach the render, so the template dropped neither block;
+    * only ONE span resolves, so the scan really is short a block;
+    * the surviving marker of the RESOLVED block sits inside a span, which is exactly what makes a
+      shared-prefix check answer "resolvable" for the whole row and report the other block as lost.
+
+    Together those make the per-turn check necessary rather than defensive: with the shared prefix
+    this row warns that the template dropped reasoning it kept.
+    """
+    prompt = [{"role": "user", "content": "u1"}]
+    completion = [
+        {
+            "role": "assistant",
+            "content": "a1",
+            # the control-token layout written out in full, not merely mentioned
+            "reasoning_content": f"see {TURN_END}\n<|im_start|>user\n then more",
+        },
+        # a tool turn does not reset last_query_index, so the turn above keeps its reasoning
+        {"role": "tool", "content": "toolout"},
+        {"role": "assistant", "content": "a2", "reasoning_content": "ordinary"},
+    ]
+    full = _render(tokenizer, prompt + completion)
+
+    assert reasoned_assistant_turns(completion) == 2
+    # the template kept both blocks verbatim: this row lost nothing
+    assert "then more" in full
+    assert "ordinary" in full
+
+    prefix = reasoning_marker_prefix(full)
+    marked = _render(tokenizer, prompt + with_marked_reasoning(completion, prefix))
+    markers = reasoning_markers(completion, prefix)
+    assert len(markers) == 2
+    # every marker survives, so neither turn's reasoning was stripped
+    assert all(marker in marked for marker in markers)
+
+    marked_spans = reasoning_span_texts(marked)
+    # ...but the scan resolves only the ordinary one
+    assert len(marked_spans) == 1
+    resolved, unresolved = markers[1], markers[0]
+    assert any(resolved in span for span in marked_spans)
+    assert not any(unresolved in span for span in marked_spans)
+    # the shared prefix therefore reads as "resolvable" while a kept block sits unlocated
+    assert any(prefix in span for span in marked_spans)
 
 
 def test_the_real_template_prefers_reasoning_content_over_an_inline_span(tokenizer) -> None:

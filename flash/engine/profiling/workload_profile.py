@@ -14,6 +14,7 @@ from flash.engine.profiling.reasoning_render import (  # noqa: F401
     count_rendered_reasoning_spans,
     reasoned_assistant_turns,
     reasoning_marker_prefix,
+    reasoning_markers,
     reasoning_span_end_offsets,
     reasoning_span_texts,
     reasoning_spans,

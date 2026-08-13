@@ -1201,6 +1201,57 @@ def test_reasoning_the_scan_cannot_resolve_does_not_warn_about_a_drop(capsys) ->
     assert "dropped" not in capsys.readouterr().err
 
 
+def test_one_unresolvable_turn_beside_an_ordinary_one_does_not_warn_about_a_drop(capsys) -> None:
+    """Survival is asked PER TURN, so one resolvable block cannot answer for an unresolvable one.
+
+    The row pairs a block the scan cannot locate with an ordinary one it can, and a ``tool`` turn
+    between them keeps BOTH out of the template's ``last_query_index`` reset -- so the template
+    keeps both, and the row loses nothing.
+
+    A guard testing only the SHARED marker prefix reads the resolvable block's surviving marker as
+    proof the whole row resolved, leaving the other block counted as authored-but-not-rendered:
+    2 authored, 1 rendered, and a warning to split a transcript that lost nothing. The per-turn
+    markers separate them, because each names the one turn it rides in.
+    """
+
+    class PartlyUnresolvableEnvironment(ThinkingEnvironment):
+        def sft_completion(self, row):
+            return [
+                # the control-token layout written out in full: byte-identical to a turn boundary
+                {
+                    "role": "assistant",
+                    "reasoning_content": "before <|im_end|>\n<|im_start|>user\n after",
+                    "content": "a1",
+                },
+                # a tool turn does not reset last_query_index, so the turn above KEEPS its reasoning
+                {"role": "tool", "content": "toolout"},
+                {"role": "assistant", "reasoning_content": "ordinary", "content": "a2"},
+            ]
+
+    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
+    spec = replace(
+        spec,
+        thinking=True,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec,
+            tokenizer_revision=spec.model_revision,
+            producer_version="1.2.3",
+        ),
+    )
+    prepared = prepare_sft_workload(
+        spec,
+        PartlyUnresolvableEnvironment([], prompt="board"),
+        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda _model, _revision: ("pure-attention", True),
+    )
+
+    # unreported rather than misreported: neither a drop claim nor a phantom survivor
+    assert prepared.authored_reasoning_turns == 0
+    assert prepared.rendered_reasoning_spans == 0
+    assert "dropped" not in capsys.readouterr().err
+
+
 def test_a_tool_response_bounds_the_span_of_the_turn_before_it(capsys) -> None:
     """A block ends at its own turn even when no LATER turn opens reasoning of its own.
 
