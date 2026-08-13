@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import json
+import socket
 import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import pytest
 
 from flash.client import ApiClient, ApiError, ClientError, RequestTimeoutError
 from flash.client.http import _parse_chat_target, _prepare_chat_request
 from flash.client.specs import spec_payload
+from flash.client.streaming import _cap_socket_timeout, _read_capped_response
 from flash.schema import spec_from_dict
 
 _PROJECT_ID = "11111111-1111-4111-8111-111111111111"
@@ -1089,18 +1093,148 @@ def test_a_wall_clock_deadline_bounds_a_body_that_arrives_a_byte_at_a_time():
     runs: measured at 12s against a 2s deadline before this was fixed. Reading whatever has
     already arrived is what makes the deadline real, so this asserts the elapsed time rather than
     just the raised error -- the error alone was already raised while the bound was ineffective.
+
+    `ClientError` rather than the "stalled" message specifically: each read now re-caps the socket
+    to what is left of the deadline, so on a body still arriving the socket bound is by
+    construction always a shade tighter than the between-reads check, and a trickling peer ends as
+    `RequestTimeoutError` ("timed out") instead. Both are `ClientError`, both bound the time, and
+    which one wins is a race the caller should not be asserting on -- the bound is the contract.
     """
     body = b'{"state": "ready", "checkpoint_step": 100}'
     # every byte lands well inside the socket timeout, so nothing here is a socket-level stall.
     with _trickling_server(body, gap=0.3) as url:
         client = ApiClient(url, "fslo-user-test", timeout=60)
         start = time.monotonic()
-        with pytest.raises(ClientError, match="stalled"):
+        with pytest.raises(ClientError):
             client.deployed_checkpoint("flash-1", timeout=2.0, body_deadline=0.5)
         elapsed = time.monotonic() - start
 
     # generous against CI scheduling noise, and still far under the ~12s of the unbounded read.
     assert elapsed < 5.0, f"the deadline did not bound the read: {elapsed:.2f}s"
+
+
+@contextlib.contextmanager
+def _slow_header_then_stalling_server(header_delay: float, prefix: bytes, promised: int):
+    """Spend most of the deadline before the headers land, then stall mid-body.
+
+    The shape matters. `_capped_timeout` already opens the socket at `min(timeout, remaining)`, so
+    a socket timeout larger than the whole deadline is never actually installed and a server that
+    stalls immediately cannot overrun. The exposure needs the deadline to be partly consumed
+    *before* the body loop starts: the socket keeps the timeout it was opened with while the clock
+    runs down, so the read that follows can block for longer than the deadline has left.
+    """
+    ready = threading.Event()
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = sock.getsockname()[1]
+
+    def serve():
+        try:
+            conn, _ = sock.accept()
+        except OSError:
+            return
+        try:
+            conn.recv(65536)
+            time.sleep(header_delay)  # burn deadline while the socket timeout stays put
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(promised).encode() + b"\r\n\r\n"
+            )
+            conn.sendall(prefix)
+            ready.wait(30)  # hold the connection open, sending nothing more
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        ready.set()
+        with contextlib.suppress(OSError):
+            sock.close()
+        thread.join(5)
+
+
+@pytest.mark.wallclock
+def test_a_stalled_body_read_cannot_outlast_the_remaining_deadline():
+    """A read begun near the deadline must not block past it for the socket's original timeout.
+
+    The socket timeout is installed once, when the request opens. Time spent connecting and waiting
+    for headers is charged to the deadline but not to that timeout, so by the time the body loop
+    runs the socket is entitled to block for longer than the deadline has left -- measured at 3.51s
+    against a 2.0s deadline, and `flash env list` passes 230s as both bounds. Re-capping the socket
+    to the remaining budget before each read makes the two agree.
+
+    Asserts elapsed time, not the exception type: the same `RequestTimeoutError` is raised either
+    way, so only the clock distinguishes a bounded read from an unbounded one.
+    """
+    budget = 2.0
+    with _slow_header_then_stalling_server(1.5, b"{", promised=500) as url:
+        client = ApiClient(url, "fslo-user-test", timeout=60)
+        start = time.monotonic()
+        with pytest.raises(ClientError):
+            client.deployed_checkpoint("flash-1", timeout=5.0, body_deadline=budget)
+        elapsed = time.monotonic() - start
+
+    # without the re-cap this measured 3.51s. generous against CI noise, still well under that.
+    assert elapsed < budget + 0.75, f"the read outlasted the remaining deadline: {elapsed:.2f}s"
+
+
+def test_capping_the_socket_timeout_never_raises_it():
+    """Only ever lower it: raising it would grant more patience than the caller configured."""
+
+    class _Sock:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def gettimeout(self):
+            return self.timeout
+
+        def settimeout(self, value):
+            self.timeout = value
+
+    def _resp(sock):
+        raw = SimpleNamespace(_sock=sock)
+        return SimpleNamespace(fp=SimpleNamespace(raw=raw))
+
+    already_tighter = _Sock(2.0)
+    _cap_socket_timeout(_resp(already_tighter), 10.0)
+    assert already_tighter.timeout == 2.0
+
+    too_patient = _Sock(10.0)
+    _cap_socket_timeout(_resp(too_patient), 2.0)
+    assert too_patient.timeout == 2.0
+
+    blocking = _Sock(None)
+    _cap_socket_timeout(_resp(blocking), 3.0)
+    assert blocking.timeout == 3.0
+
+
+def test_a_reader_without_a_reachable_socket_still_reads():
+    """The socket sits behind private attributes, so an unexpected reader must degrade, not fail."""
+
+    class _Bare:
+        def __init__(self, data):
+            self._buf = io.BytesIO(data)
+
+        def read(self, size=-1):
+            return self._buf.read(size)
+
+        def read1(self, size=-1):
+            return self._buf.read(size)
+
+    body = b'{"state": "ready"}'
+    got = _read_capped_response(_Bare(body), 10_000, deadline=time.monotonic() + 5.0)
+    assert got == body
+    # and the cap itself must be inert on anything that does not expose a socket
+    _cap_socket_timeout(object(), 1.0)
 
 
 def test_a_complete_body_still_reads_whole_under_a_deadline():

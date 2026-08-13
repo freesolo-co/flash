@@ -52,6 +52,14 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   run, which bounds every stall shape. This affected `flash env list`, whose deadline exists to
   stop a slow environment hub hanging the command, as well as the new pre-deploy read.
 
+- A response deadline could still be overrun by a read that began near its end. The socket timeout
+  is installed once, when the request opens, and time spent connecting and waiting for headers is
+  charged to the deadline but not to that timeout, so a peer that delayed its headers and then
+  stalled mid-body held the call open past the deadline: 3.5s against a 2s budget. Each read now
+  re-caps the socket to the remaining budget, so the two bounds agree instead of stacking. On a
+  body still arriving this surfaces as a timeout rather than the "stalled" message; both bound the
+  call, and which one wins is a race not worth depending on.
+
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always
   `flash`. On a host where `runpod-flash` owns the `flash` script, the printed
