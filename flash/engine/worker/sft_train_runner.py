@@ -756,16 +756,17 @@ class _SftProgressCallbacks:
             "grad_norm": self.progress.values["grad_norm"],
             "learning_rate": self.progress.values["lr"],
         }
-        # this runs inside run_verl_training's stdout loop, so an upload that COMMITS defers the
-        # timestamp of the next step line into the following span. the return value distinguishes a
-        # commit from a throttled no-op: breaking on every step would leave no intervals at all.
-        committed = _w.heartbeat(
+        # this runs inside run_verl_training's stdout loop, so a heartbeat that blocks defers the
+        # timestamp of the next step line into the following span. time the call rather than read its
+        # result: an uncommitted heartbeat may have skipped instantly under the throttle or waited
+        # out the upload lock and failed, and only the second is a block.
+        started = time.time()
+        _w.heartbeat(
             "sft_step",
             **{key: value for key, value in payload.items() if value is not None},
             **self.step_timing_fields(),
         )
-        if committed:
-            self.progress.step_clock.note_blocking_work()
+        self.progress.step_clock.note_if_blocked(time.time() - started)
 
     def step_timing_fields(self) -> dict[str, float | bool]:
         """Steady-state step timing for one heartbeat; empty until a whole step has been measured."""

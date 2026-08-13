@@ -206,12 +206,11 @@ def test_a_span_containing_blocking_work_is_not_timed():
 
 
 def test_breaking_on_every_step_would_leave_nothing_measured():
-    """Why SFT and OPD break only on a heartbeat that COMMITTED, not on every step.
+    """Why SFT and OPD break on a MEASURED block, not on every step.
 
     Their ``on_step`` runs once per step inside the stdout loop. Declaring a block unconditionally
     splits the record at every line, so no segment ever holds two -- and a trainer that published a
-    pace would go silent. ``heartbeat()`` returns whether it actually uploaded, which is the signal
-    that separates a blocking commit from a throttled no-op.
+    pace would go silent.
     """
     every_step = step_timing.StepClock()
     for index in range(10):
@@ -220,14 +219,36 @@ def test_breaking_on_every_step_would_leave_nothing_measured():
     assert every_step.intervals() == []
     assert every_step.step_seconds() is None
 
-    # breaking only on the committed ones keeps the rest measurable.
-    throttled = step_timing.StepClock()
+    # breaking only on the one call that actually blocked keeps the rest measurable.
+    occasional = step_timing.StepClock()
     for index in range(10):
-        throttled.record(float(index) * 92.0, index)
-        if index == 4:  # the one upload that actually committed
-            throttled.note_blocking_work()
-    assert throttled.step_seconds() == 92.0
-    assert len(throttled.intervals()) == 8  # nine gaps, less the one that held the upload
+        occasional.record(float(index) * 92.0, index)
+        occasional.note_if_blocked(30.0 if index == 4 else 0.0002)
+    assert occasional.step_seconds() == 92.0
+    assert len(occasional.intervals()) == 8  # nine gaps, less the one that held the upload
+
+
+def test_a_blocked_call_is_detected_by_duration_not_by_its_result():
+    """``heartbeat()`` returning "not committed" does not mean it returned quickly.
+
+    A throttled skip returns in microseconds; a failed upload, or one that waited out the 30s upload
+    lock, blocks the reader and ALSO reports not-committed. Keying the break on the result would skip
+    it in exactly the case that distorts an interval, and a flaky HF path repeats that every step
+    until the inflated span is the median rather than an outlier the median drops.
+    """
+    clock = step_timing.StepClock()
+    # a throttled no-op must not split the segment...
+    clock.record(0.0, 1)
+    clock.note_if_blocked(0.0001)
+    clock.record(92.0, 2)
+    assert clock.intervals() == [92.0]
+
+    # ...while a failed upload that waited on the lock must, even though it committed nothing.
+    clock.note_if_blocked(30.0)
+    clock.record(214.0, 3)  # 92s of step plus the 30s wait
+    clock.record(306.0, 4)
+    assert clock.intervals() == [92.0, 92.0]
+    assert clock.step_seconds() == 92.0
 
 
 def test_the_projection_amortizes_saves_that_the_pace_excludes():

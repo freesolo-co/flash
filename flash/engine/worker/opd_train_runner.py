@@ -637,11 +637,12 @@ def _build_child_callbacks(
             payload["loss"] = progress["loss"]
         if progress["truncation_step"] == step and progress["truncation_rate"] is not None:
             payload["truncation_rate"] = progress["truncation_rate"]
-        # same as SFT: an upload that COMMITS blocks the stdout loop that timestamps the next step
-        # line, so that span is not a step. a throttled no-op returns immediately and must not break
-        # the segment, or a run whose heartbeats are all throttled would measure nothing.
-        if _opd_train._w.heartbeat("opd_step", **payload, **step_timing_fields()):
-            step_clock.note_blocking_work()
+        # same as SFT: a heartbeat that blocks the stdout loop defers the next step line's timestamp,
+        # so that span is not a step. measured, not inferred from the return value -- a failed upload
+        # and a 30s wait on the upload lock both block and both report "not committed".
+        started = time.time()
+        _opd_train._w.heartbeat("opd_step", **payload, **step_timing_fields())
+        step_clock.note_if_blocked(time.time() - started)
 
     def child_heartbeat() -> None:
         # see liveness_fields below: an upload replaces the published snapshot, so every ping that

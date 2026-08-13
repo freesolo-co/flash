@@ -39,6 +39,11 @@ from __future__ import annotations
 import itertools
 import statistics
 
+# how long a call inside the stdout loop must take before the span containing it stops being a step.
+# an uncommitted heartbeat returns in microseconds under the throttle, while the paths that actually
+# block -- a failed upload, or a 30s wait on the upload lock -- are orders of magnitude above this.
+_BLOCKING_CALL_THRESHOLD_S = 1.0
+
 
 def step_intervals(step_line_times: list[float]) -> list[float]:
     """Wall-clock length of each COMPLETED step, from the times its step lines arrived.
@@ -96,6 +101,21 @@ class StepClock:
         pays is not a step -- and it costs one interval on a run that has many.
         """
         self._break_after_last = True
+
+    def note_if_blocked(self, elapsed_s: float) -> None:
+        """Break the span when a call took long enough to have blocked the reader.
+
+        Measured rather than inferred from a success flag. A heartbeat that returns "not committed"
+        may have skipped instantly under the throttle OR waited out a 30s upload lock and failed, and
+        those are opposite cases: the first must not break the span, the second must. Timing the call
+        separates them without asking ``heartbeat()`` to report why it declined -- and it also covers
+        a slow upload that DID commit.
+
+        The threshold is deliberately well below a plausible step so that ordinary call overhead
+        never splits a segment; anything above it is long enough to distort an interval either way.
+        """
+        if elapsed_s >= _BLOCKING_CALL_THRESHOLD_S:
+            self._break_after_last = True
 
     def record(self, now: float, step: int | None = None) -> None:
         """Note that a step line for ``step`` arrived at ``now``.
