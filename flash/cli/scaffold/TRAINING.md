@@ -1226,6 +1226,10 @@ def step_episode(self, example, messages, assistant_response):
     ...
 ```
 
+That version takes each turn's text as the action verbatim, which only holds if your
+environment runs without `thinking` and your models emit nothing but the action. Two things
+break it, and both are ordinary.
+
 If your `start_episode` **does** seed an assistant message (a worked example, a demonstration
 turn), that message is sitting in `messages` looking exactly like a move, and the loop above
 would apply your own demo to the real state. The cleanest fix is to not seed one: put worked
@@ -1233,6 +1237,9 @@ examples in the user or system text of the prompt, where no replay loop can mist
 actions. Do not reach for a prompt length instead. Flash may prepend a system message carrying
 the training contract, so `len(self.start_episode(...))` can come out one short of the real
 prefix, and the offset then leaks the demo back in silently.
+
+And once `thinking` is on, a turn arrives as reasoning wrapped around the action rather than
+the action alone, so the text is no longer something `apply` can take as given.
 
 Parse the transcript instead, and parse it the same way on both paths:
 
