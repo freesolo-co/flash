@@ -548,6 +548,35 @@ def test_done_gate_waits_for_split_event_terminator(line_ending: bytes) -> None:
     assert b"".join(forwarded) == completion + terminator
 
 
+@pytest.mark.parametrize(
+    ("chunks", "terminated"),
+    [
+        ([b"data: [DONE]\n", b"\n"], True),
+        ([b"data: [DONE]\r\n", b"\r\n"], True),
+        ([b"data: [DONE]\r", b"\n\r\n"], True),
+        ([b"data: [DONE]\r", b"data: x\r", b"\r"], False),
+    ],
+    ids=["lf", "crlf", "split-crlf-at-cr", "bare-cr-multiline"],
+)
+def test_done_gate_resolves_an_ambiguous_trailing_cr_from_the_next_byte(
+    chunks: list[bytes], terminated: bool
+) -> None:
+    gate = trace_sse.SseDoneGate()
+
+    relayed = [part for chunk in chunks for part in gate.feed(chunk)]
+    relayed.extend(gate.finish())
+    parked = gate.done_event or b""
+
+    assert gate.terminated is terminated
+    assert len(b"".join(relayed)) + len(parked) == len(b"".join(chunks))
+    if terminated:
+        assert relayed == []
+        assert parked == b"".join(chunks)
+    else:
+        assert b"".join(relayed) == b"".join(chunks)
+        assert parked == b""
+
+
 def test_done_gate_accepts_bare_cr_and_preserves_split_crlf() -> None:
     bare_cr = b'data: {"choices":[]}\r\rdata: [DONE]\r\r'
     gate = trace_sse.SseDoneGate()
@@ -603,6 +632,27 @@ def test_done_gate_does_not_terminate_on_done_inside_multiline_data_event(
     assert gate.terminated is False
 
 
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [b'data: {"notice":1}', b"\ndata: [DONE]\n\n"],
+        [b'data: {"notice":1}\r', b"\ndata: [DONE]\r\n\r\n"],
+    ],
+    ids=["lf", "split-crlf"],
+)
+def test_done_gate_preserves_a_split_first_data_line_in_a_multiline_event(
+    chunks: list[bytes],
+) -> None:
+    gate = trace_sse.SseDoneGate()
+
+    forwarded = [part for chunk in chunks for part in gate.feed(chunk)]
+    forwarded.extend(gate.finish())
+
+    assert b"".join(forwarded) == b"".join(chunks)
+    assert gate.terminated is False
+    assert gate.done_event is None
+
+
 @pytest.mark.parametrize("line_ending", [b"\n", b"\r\n", b"\r"], ids=["lf", "crlf", "cr"])
 def test_done_gate_does_not_terminate_when_done_precedes_multiline_data(
     line_ending: bytes,
@@ -617,6 +667,48 @@ def test_done_gate_does_not_terminate_when_done_precedes_multiline_data(
 
     assert b"".join(forwarded) == first + later
     assert gate.terminated is False
+
+
+@pytest.mark.parametrize(
+    ("event", "terminated"),
+    [
+        (b"data: [DONE]   \n\n", False),
+        (b"data:  [DONE]\n\n", False),
+        (b"data: [DONE]\t\n\n", False),
+        (b"data: [DONE]\n\n", True),
+        (b"data:[DONE]\n\n", True),
+    ],
+    ids=["trailing-spaces", "two-leading-spaces", "trailing-tab", "space", "no-space"],
+)
+def test_done_gate_matches_only_the_exact_sse_done_value(event: bytes, terminated: bool) -> None:
+    line = event[: -len(b"\n\n")]
+    gate = trace_sse.SseDoneGate()
+
+    relayed = gate.feed(event)
+    relayed.extend(gate.finish())
+
+    assert gate.terminated is terminated
+    assert trace_sse._could_be_done_line(line) is terminated
+    if terminated:
+        assert relayed == []
+        assert gate.done_event == event
+    else:
+        assert b"".join(relayed) == event
+        assert gate.done_event is None
+
+
+def test_done_gate_relays_events_after_a_whitespace_suffixed_done_value() -> None:
+    stream = (
+        b'data: [DONE]   \n\ndata: {"choices":[{"delta":{"content":"REAL"}}]}\n\ndata: [DONE]\n\n'
+    )
+    gate = trace_sse.SseDoneGate()
+
+    relayed = gate.feed(stream)
+    relayed.extend(gate.finish())
+
+    assert b"".join(relayed) == stream[: -len(b"data: [DONE]\n\n")]
+    assert b"REAL" in b"".join(relayed)
+    assert gate.done_event == b"data: [DONE]\n\n"
 
 
 def test_done_gate_bounds_an_unterminated_done_candidate() -> None:
@@ -830,6 +922,92 @@ def test_tool_call_fragments_charge_only_retained_output_bytes() -> None:
         "x" * 30_000
     )
     assert accumulator._accumulated_bytes < 31_000
+
+
+def test_function_call_fragments_charge_only_retained_output_bytes() -> None:
+    accumulator = trace_sse.SseAccumulator(
+        max_accumulated_bytes=platform_traces.MAX_PAYLOAD_TOTAL_BYTES
+    )
+    event = b'data: {"choices":[{"index":0,"delta":{"function_call":{"arguments":"x"}}}]}\n\n'
+
+    for _ in range(20_000):
+        accumulator.feed(event)
+    accumulator.feed(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n')
+
+    output = accumulator.output()
+    assert accumulator.truncated is False
+    assert output["choices"][0]["message"]["function_call"]["arguments"] == "x" * 20_000
+    assert accumulator._accumulated_bytes < 21_000
+
+
+def test_large_function_call_still_truncates_at_a_small_stream_budget() -> None:
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=4_096)
+    event = json.dumps(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"function_call": {"arguments": "x" * 5_000}},
+                }
+            ]
+        }
+    ).encode()
+
+    accumulator.feed(b"data: " + event + b"\n\n")
+
+    assert accumulator.truncated is True
+
+
+def test_fragment_accounting_does_not_materialize_arguments_per_delta(monkeypatch) -> None:
+    text_calls = 0
+    original_text = trace_sse._StringFragments.text
+
+    def counted_text(fragments) -> str:
+        nonlocal text_calls
+        text_calls += 1
+        return original_text(fragments)
+
+    monkeypatch.setattr(trace_sse._StringFragments, "text", counted_text)
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=100_000)
+    event = (
+        b'data: {"choices":[{"index":0,"delta":{"tool_calls":'
+        b'[{"index":0,"function":{"arguments":"x"}}]}}]}\n\n'
+    )
+
+    for _ in range(8_000):
+        accumulator.feed(event)
+
+    assert text_calls == 0
+    assert (
+        accumulator.output()["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        == "x" * 8_000
+    )
+
+
+def test_tool_call_id_and_type_duplicate_suppression_is_preserved() -> None:
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=100_000)
+    event = json.dumps(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "id": "call_1", "type": "function"},
+                        ]
+                    },
+                }
+            ]
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    for _ in range(100):
+        accumulator.feed(b"data: " + event + b"\n\n")
+
+    tool_call = accumulator.output()["choices"][0]["message"]["tool_calls"][0]
+    assert tool_call["id"] == "call_1"
+    assert tool_call["type"] == "function"
 
 
 def test_tool_call_slots_count_toward_the_stream_budget() -> None:
@@ -3276,6 +3454,27 @@ def test_percent_encoded_secret_schema_refs_are_redacted(trace_api, monkeypatch,
     assert stored["$defs"]["Alpha"]["enum"] == ["[redacted]"]
 
 
+def test_document_id_schema_refs_redact_only_local_targets() -> None:
+    assert traces._is_secret_key("Widget") is False
+    expected = {
+        "#/$defs/Widget": "[redacted]",
+        "https://example/schema#/$defs/Widget": "[redacted]",
+        "schema#/$defs/Widget": "[redacted]",
+        "https://other/x#/$defs/Widget": "SECRET-DEFAULT",
+    }
+
+    for ref, expected_default in expected.items():
+        schema = {
+            "$id": "https://example/schema",
+            "properties": {"api_key": {"$ref": ref}},
+            "$defs": {"Widget": {"default": "SECRET-DEFAULT"}},
+        }
+
+        stored = traces._redact_secret_fields(schema)
+
+        assert stored["$defs"]["Widget"]["default"] == expected_default
+
+
 def test_percent_decoding_precedes_schema_pointer_unescaping() -> None:
     anchors: dict[str, frozenset[tuple[str, ...]]] = {}
 
@@ -3286,6 +3485,22 @@ def test_percent_decoding_precedes_schema_pointer_unescaping() -> None:
     assert traces._local_schema_pointer("#/a~1b", anchors) == frozenset({("a/b",)})
     assert traces._local_schema_pointer("#/x/%zz", anchors) == frozenset({("x", "%zz")})
     assert traces._local_schema_pointer("http://e/x#Alpha", anchors) == frozenset()
+
+
+def test_bare_root_schema_ref_redacts_only_through_the_ref_edge() -> None:
+    literal = "ROOT-LITERAL"
+    linked = {
+        "enum": [literal],
+        "properties": {"password": {"$ref": "#"}},
+    }
+    control = {
+        "enum": [literal],
+        "properties": {"password": {"$ref": "#/nonexistent"}},
+    }
+
+    assert traces._local_schema_pointer("#", {}) == frozenset({()})
+    assert traces._redact_secret_fields(linked)["enum"] == ["[redacted]"]
+    assert traces._redact_secret_fields(control)["enum"] == [literal]
 
 
 def test_root_schema_anchor_ref_redacts_only_through_the_ref_edge() -> None:

@@ -9,7 +9,7 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote, urldefrag, urljoin
 
 import anyio
 import httpx
@@ -224,11 +224,20 @@ def _redact_schema_literal(value: Any, *, depth: int) -> Any:
 
 
 def _local_schema_pointer(
-    ref: str, anchors: Mapping[str, frozenset[tuple[str, ...]]]
+    ref: str,
+    anchors: Mapping[str, frozenset[tuple[str, ...]]],
+    *,
+    base_uri: str = "",
 ) -> frozenset[tuple[str, ...]]:
     if not ref.startswith("#"):
-        return frozenset()
+        ref_base, fragment = urldefrag(urljoin(base_uri, ref))
+        document_base = urldefrag(base_uri)[0]
+        if not document_base or ref_base != document_base:
+            return frozenset()
+        ref = f"#{fragment}"
     ref = unquote(ref)
+    if ref == "#":
+        return frozenset({()})
     if ref.startswith("#/"):
         segments = tuple(
             segment.replace("~1", "/").replace("~0", "~") for segment in ref[2:].split("/")
@@ -266,6 +275,8 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
     if not isinstance(value, dict):
         return set()
     refs: set[tuple[str, ...]] = set()
+    document_id = value.get("$id")
+    base_uri = document_id if isinstance(document_id, str) else ""
     # `$dynamicAnchor` also declares an ordinary plain-name fragment, so a static `$ref` resolves
     # to it as well. one map serves both keywords: splitting them let `{"$ref": "#Name"}` miss a
     # `$dynamicAnchor: "Name"` target and persist its literals.
@@ -279,7 +290,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
             for keyword in ("$ref", "$dynamicRef"):
                 ref = node.get(keyword)
                 if isinstance(ref, str):
-                    found.update(_local_schema_pointer(ref, anchors))
+                    found.update(_local_schema_pointer(ref, anchors, base_uri=base_uri))
             for key, item in node.items():
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                     found.update(collect_refs(item, node_depth + 1))

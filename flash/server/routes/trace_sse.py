@@ -75,7 +75,7 @@ class SseDoneGate:
                 self._event_in_progress = False
                 continue
             if content.startswith(b"data:"):
-                data = content[len(b"data:") :].strip()
+                data = _sse_data_value(content)
                 if not self._event_in_progress and data == b"[DONE]":
                     self._holding_done_candidate = True
                 elif self._holding_done_candidate:
@@ -116,16 +116,26 @@ class SseDoneGate:
                 self._buffer = bytearray(retained)
             self._scan_start = _resume_scan_at(self._buffer)
         elif trailing.endswith(b"\r"):
-            if len(trailing) > 1:
-                forwarded.extend(trailing[:-1])
-                del self._buffer[:-1]
-            self._line_start = 0
-            self._scan_start = 0
+            partial_line = trailing[:-1]
+            if not self._event_in_progress and _could_be_done_line(partial_line):
+                self._scan_start = _resume_scan_at(self._buffer)
+            else:
+                if partial_line:
+                    forwarded.extend(partial_line)
+                    del self._buffer[: len(partial_line)]
+                    self._partial_line_in_progress = True
+                    self._event_in_progress = self._event_in_progress or partial_line.startswith(
+                        b"data:"
+                    )
+                self._line_start = 0
+                self._scan_start = 0
         else:
             forwarded.extend(self._buffer)
             self._buffer.clear()
             self._line_start = 0
             self._scan_start = 0
+            self._partial_line_in_progress = bool(trailing)
+            self._event_in_progress = self._event_in_progress or trailing.startswith(b"data:")
         return [bytes(forwarded)] if forwarded else []
 
     def finish(self) -> list[bytes]:
@@ -154,17 +164,18 @@ class SseDoneGate:
         self._holding_done_candidate = False
 
 
+def _sse_data_value(line: bytes) -> bytes:
+    data = line[len(b"data:") :]
+    return data[1:] if data.startswith(b" ") else data
+
+
 def _could_be_done_line(line: bytes) -> bool:
     prefix = b"data:"
     if len(line) < len(prefix):
         return prefix.startswith(line)
     if not line.startswith(prefix):
         return False
-    data = line[len(prefix) :].lstrip()
-    target = b"[DONE]"
-    return target.startswith(data) or (
-        data.startswith(target) and not data[len(target) :].strip(b" \t\r")
-    )
+    return b"[DONE]".startswith(_sse_data_value(line))
 
 
 class _StringFragments:
@@ -258,9 +269,10 @@ def _merge_fragment_dict(target: dict[str, Any], fragment: dict[str, Any]) -> No
                 target[key] = dict(value)
         elif isinstance(value, str):
             current = target.get(key)
-            current_text = current.text() if isinstance(current, _StringFragments) else current
-            if current_text == value and key in {"id", "type"}:
-                continue
+            if key in {"id", "type"}:
+                current_text = current.text() if isinstance(current, _StringFragments) else current
+                if current_text == value:
+                    continue
             if isinstance(current, _StringFragments):
                 current.append(value)
             elif isinstance(current, str):
@@ -406,9 +418,9 @@ class SseAccumulator:
             if isinstance(value, dict) and isinstance(current, dict):
                 size += self._tool_call_fragment_size(current, value)
                 continue
-            if isinstance(value, str):
+            if isinstance(value, str) and key in {"id", "type"}:
                 current_text = current.text() if isinstance(current, _StringFragments) else current
-                if current_text == value and key in {"id", "type"}:
+                if current_text == value:
                     continue
             size += self._value_size(value)
             if key not in target:
@@ -605,10 +617,9 @@ class SseAccumulator:
                 message[key] = value
         function_call = delta.get("function_call")
         if isinstance(function_call, dict):
-            if self._reserve(function_call):
-                target = message.setdefault("function_call", {})
-                if isinstance(target, dict):
-                    _merge_fragment_dict(target, function_call)
+            target = message.setdefault("function_call", {})
+            if isinstance(target, dict) and self._reserve_tool_call_fragment(target, function_call):
+                _merge_fragment_dict(target, function_call)
         elif function_call is not None:
             self._note_defect("stream function_call was not an object")
         tool_calls = delta.get("tool_calls")
