@@ -222,7 +222,7 @@ def _secret_schema_definition_refs(value: Any) -> set[tuple[str, str]]:
         return set()
     refs: set[tuple[str, str]] = set()
 
-    def collect(node: Any) -> None:
+    def collect_refs(node: Any) -> None:
         if isinstance(node, dict):
             ref = node.get("$ref")
             if isinstance(ref, str):
@@ -231,14 +231,25 @@ def _secret_schema_definition_refs(value: Any) -> set[tuple[str, str]]:
                     if name and "/" not in name:
                         refs.add((container, name))
             for item in node.values():
-                collect(item)
+                collect_refs(item)
         elif isinstance(node, list | tuple):
             for item in node:
-                collect(item)
+                collect_refs(item)
 
-    for key, schema in value["properties"].items():
-        if _is_secret_key(key) and _is_schema_definition(schema):
-            collect(schema)
+    def collect_secret_properties(node: Any) -> None:
+        if isinstance(node, dict):
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                for key, schema in properties.items():
+                    if _is_secret_key(key) and _is_schema_definition(schema):
+                        collect_refs(schema)
+            for item in node.values():
+                collect_secret_properties(item)
+        elif isinstance(node, list | tuple):
+            for item in node:
+                collect_secret_properties(item)
+
+    collect_secret_properties(value)
     return refs
 
 
@@ -371,6 +382,16 @@ def _decoded_payload(response: httpx.Response) -> Any:
         return response.text
 
 
+def _decode_response_bytes(response: httpx.Response, body: bytes) -> str:
+    encoding = response.encoding
+    if encoding:
+        try:
+            return body.decode(encoding, errors="replace")
+        except LookupError:
+            pass
+    return body.decode(errors="replace")
+
+
 def _is_error_status(status_code: int) -> bool:
     return not 200 <= status_code < 300
 
@@ -398,12 +419,16 @@ async def _record_trace(
     output_payload: Any,
     error: str | None,
     output_truncated: bool = False,
+    usage: Any = None,
 ) -> None:
     if not context.record_trace or context.project_id is None:
         return
     duration_ms = max(0, round((time.perf_counter() - context.started_at) * 1000))
     sanitized_output = _sanitize_for_trace(output_payload, context.secrets, response=True)
-    prompt_tokens, completion_tokens = _usage_tokens(sanitized_output)
+    sanitized_usage = _sanitize_for_trace(usage, context.secrets, response=True)
+    prompt_tokens, completion_tokens = _usage_tokens(
+        sanitized_output if sanitized_output is not None else {"usage": sanitized_usage}
+    )
     span = TraceSpan(
         name="chat.completions",
         provider=context.provider,
@@ -488,29 +513,29 @@ async def _stream_response(
     client_disconnected = False
     try:
         async for chunk in upstream_response.aiter_bytes():
-            if context.record_trace:
-                if raw_body:
-                    # bounded, but by which bound depends on what the body IS. an error body is
-                    # stored truncated anyway, so retaining an unbounded one only to discard most
-                    # of it lets one response grow the plane's memory without limit. a SUCCESSFUL
-                    # non-SSE body keeps exactly the aggregate bound persistence accepts, so a body
-                    # that could be stored whole is not pre-truncated into undecodable JSON.
-                    remaining = raw_output_limit - len(raw_output)
-                    if remaining > 0:
-                        raw_output.extend(chunk[:remaining])
-                    if len(chunk) > remaining:
-                        raw_output_truncated = True
-                else:
-                    accumulator.feed(chunk)
+            if context.record_trace and raw_body:
+                # bounded, but by which bound depends on what the body IS. an error body is
+                # stored truncated anyway, so retaining an unbounded one only to discard most
+                # of it lets one response grow the plane's memory without limit. a SUCCESSFUL
+                # non-SSE body keeps exactly the aggregate bound persistence accepts, so a body
+                # that could be stored whole is not pre-truncated into undecodable JSON.
+                remaining = raw_output_limit - len(raw_output)
+                if remaining > 0:
+                    raw_output.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    raw_output_truncated = True
             if done_gate is None:
                 yield chunk
             else:
-                for forwarded in done_gate.feed(chunk):
+                forwarded_chunks = done_gate.feed(chunk)
+                for forwarded in forwarded_chunks:
+                    accumulator.feed(forwarded)
                     yield forwarded
                 if done_gate.terminated:
                     break
         if done_gate is not None:
             for forwarded in done_gate.finish():
+                accumulator.feed(forwarded)
                 yield forwarded
     except (asyncio.CancelledError, GeneratorExit):
         client_disconnected = True
@@ -520,6 +545,7 @@ async def _stream_response(
         error = "upstream stream interrupted"
         if done_gate is not None:
             for forwarded in done_gate.finish():
+                accumulator.feed(forwarded)
                 yield forwarded
         raise
     finally:
@@ -535,8 +561,12 @@ async def _stream_response(
                         try:
                             output_payload: Any = json.loads(raw_output)
                         except (ValueError, UnicodeDecodeError):
-                            output_payload = bytes(raw_output).decode(errors="replace")
+                            output_payload = _decode_response_bytes(
+                                upstream_response, bytes(raw_output)
+                            )
                     else:
+                        if done_gate is not None and done_gate.done_event is not None:
+                            accumulator.feed(done_gate.done_event)
                         accumulator.finish()
                         # a stream that ended before any content arrived has NO output, which is
                         # not the same as an output with zero choices. keep an error-only envelope
@@ -561,6 +591,7 @@ async def _stream_response(
                         output_truncated=(
                             raw_output_truncated if raw_body else accumulator.truncated
                         ),
+                        usage=None if raw_body else accumulator.usage,
                     )
     if not client_disconnected and done_gate is not None:
         if context.record_failed:

@@ -6,6 +6,19 @@ import json
 from typing import Any
 
 _POST_DONE_SUFFIX_LIMIT = 1024
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _line_end(data: bytes, start: int = 0) -> tuple[int, int] | None:
+    for index in range(start, len(data)):
+        byte = data[index]
+        if byte == 0x0A:
+            return index, index + 1
+        if byte == 0x0D:
+            if index + 1 == len(data):
+                return None
+            return index, index + 2 if data[index + 1] == 0x0A else index + 1
+    return None
 
 
 class SseDoneGate:
@@ -27,23 +40,24 @@ class SseDoneGate:
             return []
 
         cursor = 0
-        while True:
-            newline = self._buffer.find(b"\n", cursor)
-            if newline < 0:
-                break
-            content = self._buffer[cursor:newline].rstrip(b"\r")
+        while (line_end := _line_end(self._buffer, cursor)) is not None:
+            line, next_cursor = line_end
+            content = self._buffer[cursor:line]
             if content.startswith(b"data:") and content[len(b"data:") :].strip() == b"[DONE]":
                 forwarded = self._buffer[:cursor]
-                self._done.extend(self._buffer[cursor : newline + 1])
-                self._buffer = self._buffer[newline + 1 :]
+                self._done.extend(self._buffer[cursor:next_cursor])
+                self._buffer = self._buffer[next_cursor:]
                 self._consume_done_suffix()
                 return [forwarded] if forwarded else []
-            cursor = newline + 1
+            cursor = next_cursor
 
         trailing = self._buffer[cursor:]
         if _could_be_done_line(trailing):
             forwarded = self._buffer[:cursor]
             self._buffer = trailing
+        elif trailing.endswith(b"\r"):
+            forwarded = self._buffer[:-1]
+            self._buffer = b"\r"
         else:
             forwarded = self._buffer
             self._buffer = b""
@@ -71,12 +85,13 @@ class SseDoneGate:
                 # terminator already is and stop retaining the rest.
                 self._settle_done()
                 return
-            newline = self._buffer.find(b"\n")
-            if newline < 0:
+            line_end = _line_end(self._buffer)
+            if line_end is None:
                 return
-            blank = not self._buffer[:newline].rstrip(b"\r")
-            self._done.extend(self._buffer[: newline + 1])
-            self._buffer = self._buffer[newline + 1 :]
+            line, next_cursor = line_end
+            blank = not self._buffer[:line]
+            self._done.extend(self._buffer[:next_cursor])
+            self._buffer = self._buffer[next_cursor:]
             if blank:
                 # the delimiter closed the event; anything past it is post-terminator data that
                 # this gate has already decided to stop at, so it must not be relayed later.
@@ -194,6 +209,7 @@ class SseAccumulator:
         self._max_accumulated_bytes = max_accumulated_bytes
         self._accumulated_bytes = 0
         self._overwriting_sizes: dict[str, int] = {}
+        self._at_stream_start = True
         self.truncated = False
         self.usage: Any = None
         # why this stream cannot be trusted as a complete reply, if anything went wrong in it. a
@@ -204,27 +220,35 @@ class SseAccumulator:
         self.defect: str | None = None
 
     def feed(self, chunk: bytes) -> None:
-        if self.truncated:
+        if self.truncated or self._done:
             return
-        cursor = 0
-        while cursor < len(chunk):
-            newline = chunk.find(b"\n", cursor)
-            end = len(chunk) if newline < 0 else newline
-            fragment = chunk[cursor:end]
-            if self._max_accumulated_bytes is not None and len(
-                fragment
-            ) > self._max_accumulated_bytes - len(self._buffer):
+        self._buffer += chunk
+        if self._at_stream_start:
+            if len(self._buffer) < len(_UTF8_BOM) and _UTF8_BOM.startswith(self._buffer):
+                return
+            self._at_stream_start = False
+            if self._buffer.startswith(_UTF8_BOM):
+                self._buffer = self._buffer[len(_UTF8_BOM) :]
+        while (line_end := _line_end(self._buffer)) is not None:
+            line, next_cursor = line_end
+            fragment = self._buffer[:line]
+            self._buffer = self._buffer[next_cursor:]
+            if (
+                self._max_accumulated_bytes is not None
+                and len(fragment) > self._max_accumulated_bytes
+            ):
                 self._buffer = b""
                 self.truncated = True
                 return
-            self._buffer += fragment
-            if newline < 0:
+            self._consume_line(fragment)
+            if self.truncated or self._done:
                 return
-            line, self._buffer = self._buffer, b""
-            self._consume_line(line.rstrip(b"\r"))
-            if self.truncated:
-                return
-            cursor = newline + 1
+        if (
+            self._max_accumulated_bytes is not None
+            and len(self._buffer) > self._max_accumulated_bytes
+        ):
+            self._buffer = b""
+            self.truncated = True
 
     def finish(self) -> None:
         if self._buffer:
@@ -414,8 +438,12 @@ class SseAccumulator:
             return
         message = state["message"]
         role = delta.get("role")
-        if isinstance(role, str) and role and self._reserve(role):
-            message["role"] = role
+        if role is not None:
+            if isinstance(role, str) and role:
+                if self._reserve(role):
+                    message["role"] = role
+            else:
+                self._note_defect("stream choice contained a non-string role")
         # every text-shaped delta field, not a fixed pair. providers stream their own alongside the
         # standard ones -- OpenRouter's `reasoning`, audio transcripts -- and an allowlist silently
         # dropped them, so a streamed trace held less than the identical non-streaming call.

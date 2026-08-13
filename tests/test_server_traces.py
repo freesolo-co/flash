@@ -488,6 +488,45 @@ def test_done_gate_waits_for_split_event_terminator(line_ending: bytes) -> None:
     assert b"".join(forwarded) == completion + terminator
 
 
+def test_done_gate_accepts_bare_cr_and_preserves_split_crlf() -> None:
+    bare_cr = b'data: {"choices":[]}\r\rdata: [DONE]\r\r'
+    gate = trace_sse.SseDoneGate()
+    forwarded = gate.feed(bare_cr + b": after-done")
+    if gate.done_event is not None:
+        forwarded.append(gate.done_event)
+
+    assert b"".join(forwarded) == bare_cr
+    assert gate.terminated is True
+
+    split_gate = trace_sse.SseDoneGate()
+    split_forwarded = split_gate.feed(b'data: {"choices":[]}\r')
+    split_forwarded.extend(split_gate.feed(b"\n\r"))
+    split_forwarded.extend(split_gate.feed(b"\n"))
+    split_forwarded.extend(split_gate.finish())
+    assert b"".join(split_forwarded) == b'data: {"choices":[]}\r\n\r\n'
+
+
+def test_sse_accumulator_accepts_bare_cr_and_preserves_split_crlf() -> None:
+    event = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}\r\r'
+    )
+    accumulator = trace_sse.SseAccumulator()
+    accumulator.feed(event + b": next-event")
+
+    assert accumulator.defect is None
+    assert accumulator.output()["choices"][0]["message"]["content"] == "world"
+    assert accumulator.terminal is True
+
+    split_accumulator = trace_sse.SseAccumulator()
+    split_accumulator.feed(b'data: {"choices":[{"index":0,"delta":{"content":"split"},')
+    split_accumulator.feed(b'"finish_reason":"stop"}]}\r')
+    assert split_accumulator.received is False
+    split_accumulator.feed(b"\n\r")
+    split_accumulator.feed(b"\n")
+    assert split_accumulator.defect is None
+    assert split_accumulator.output()["choices"][0]["message"]["content"] == "split"
+
+
 def test_done_gate_bounds_an_unterminated_post_done_suffix() -> None:
     gate = trace_sse.SseDoneGate()
 
@@ -660,6 +699,27 @@ def test_streaming_client_disconnect_before_any_event_records_no_output(
     ).json()
     assert records["records"] == []
     assert records["skipped"] == 1
+
+
+def test_streamed_trace_stops_accumulating_at_done(trace_api, monkeypatch) -> None:
+    event = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"real"},"finish_reason":"stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+        b'data: {"choices":[{"index":0,"delta":{"content":"LATE"}}]}\n\n'
+    )
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody([event])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    expected = event[: event.index(b'data: {"choices"', len(b"data:"))]
+    assert response.content == expected
+    stored = _raw(trace_api)["records"][0]["spans"][0]["output_payload"]
+    assert stored["choices"][0]["message"]["content"] == "real"
 
 
 def test_a_cleanly_truncated_stream_is_not_a_training_target(trace_api, monkeypatch) -> None:
@@ -1663,6 +1723,14 @@ def test_a_completion_without_a_finish_reason_still_exports(trace_api) -> None:
 
     assert export["records"] == [{"input": "hello", "output": "complete"}]
     assert export["skipped"] == 0
+
+
+@pytest.mark.parametrize("finish_reason", [[], {}, 1, True])
+def test_an_unhashable_or_non_string_finish_reason_is_skipped(finish_reason) -> None:
+    response = _reply_envelope("not a clean reply")
+    response["choices"][0]["finish_reason"] = finish_reason
+
+    assert platform_traces._chat_reply(response) is None
 
 
 def test_an_unknown_finish_reason_is_not_treated_as_a_clean_stop(trace_api) -> None:
@@ -2684,6 +2752,39 @@ def test_secret_named_schema_ref_literals_are_redacted(trace_api, monkeypatch) -
     }
 
 
+def test_deeply_nested_secret_named_schema_ref_reaches_root_definitions(
+    trace_api, monkeypatch
+) -> None:
+    secret = "third-party-secret-abc123"
+    schema = {
+        "type": "object",
+        "properties": {
+            "profile": {
+                "type": "object",
+                "properties": {"password": {"$ref": "#/$defs/Benign"}},
+            }
+        },
+        "$defs": {"Benign": {"type": "string", "default": secret}},
+    }
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions",
+        headers=_HEADERS,
+        json={
+            **_REQUEST,
+            "response_format": {"type": "json_schema", "json_schema": {"schema": schema}},
+        },
+    )
+
+    assert response.status_code == 200
+    stored_schema = _raw(trace_api)["records"][0]["spans"][0]["input_payload"]["response_format"][
+        "json_schema"
+    ]["schema"]
+    assert stored_schema["$defs"]["Benign"]["default"] == "[redacted]"
+
+
 def test_nested_secret_named_schema_ref_literals_are_redacted(trace_api, monkeypatch) -> None:
     secret = "third-party-secret-abc123"
     schema = {
@@ -2888,6 +2989,30 @@ def test_a_usage_only_stream_records_no_output(trace_api, monkeypatch) -> None:
 
     assert response.status_code == 200
     assert _raw(trace_api)["records"][0]["spans"][0]["output_payload"] is None
+
+
+def test_a_usage_only_stream_keeps_token_counters_without_output(trace_api, monkeypatch) -> None:
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody(
+        [
+            (
+                b'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":0}}\n\n'
+                b"data: [DONE]\n\n"
+            )
+        ]
+    )
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["output_payload"] is None
+    assert span["input_tokens"] == 11
+    assert span["output_tokens"] == 0
 
 
 def test_a_provider_specific_delta_field_is_accumulated(trace_api, monkeypatch) -> None:
@@ -3286,6 +3411,43 @@ def test_a_successful_non_sse_stream_keeps_its_body_and_content_type(
     assert span["output_payload"] == {"error": {"message": "upstream gateway: quota exhausted"}}
 
 
+def test_a_streamed_non_sse_body_uses_its_declared_charset(trace_api, monkeypatch) -> None:
+    body = "caf\N{LATIN SMALL LETTER E WITH ACUTE}".encode("iso-8859-1")
+
+    class _Latin1StreamingClient(_StreamingAsyncClient):
+        requests: ClassVar[list[dict]] = []
+
+        async def send(self, request, *, stream) -> httpx.Response:
+            assert stream is True
+            return httpx.Response(
+                500,
+                headers={"content-type": "text/plain; charset=iso-8859-1"},
+                stream=type(self).body,
+                request=request,
+            )
+
+    _Latin1StreamingClient.body = _StreamingBody([body])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _Latin1StreamingClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 500
+    assert response.content == body
+    assert (
+        _raw(trace_api)["records"][0]["spans"][0]["output_payload"]
+        == "caf\N{LATIN SMALL LETTER E WITH ACUTE}"
+    )
+
+    invalid = httpx.Response(
+        500,
+        headers={"content-type": "text/plain; charset=not-a-real-charset"},
+        content=b"caf\xe9",
+    )
+    assert traces._decode_response_bytes(invalid, invalid.content) == "caf\N{REPLACEMENT CHARACTER}"
+
+
 def test_the_export_budget_counts_encoded_bytes_not_characters() -> None:
     """`ensure_ascii=False` keeps non-ASCII text as itself, so one character can be up to four
     UTF-8 bytes on the wire. Counting characters let an emoji-heavy export ship several times the
@@ -3379,6 +3541,35 @@ def test_a_huge_integer_data_event_marks_the_stream_errored(trace_api, monkeypat
     assert span["error"] == "stream contained an unparseable data event"
 
 
+def test_a_leading_utf8_bom_is_stripped_only_at_stream_start(trace_api, monkeypatch) -> None:
+    first = b'\xef\xbb\xbfdata: {"choices":[{"index":0,"delta":{"content":"hello "}}]}\n\n'
+    second = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"world"},'
+        b'"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    )
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody([first, second])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "OK"
+    assert span["output_payload"]["choices"][0]["message"]["content"] == "hello world"
+
+    later_bom = trace_sse.SseAccumulator()
+    later_bom.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"kept"}}]}\n\n'
+        b'\xef\xbb\xbfdata: {"choices":[{"index":0,"delta":{"content":"dropped"}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+    )
+    assert later_bom.output()["choices"][0]["message"]["content"] == "kept"
+
+
 def test_a_malformed_data_event_marks_the_stream_errored(trace_api, monkeypatch) -> None:
     """A 200 SSE stream can still be broken. An unparseable `data:` event between valid deltas
     drops a fragment out of the MIDDLE of the reply, and the stream can still deliver a finish
@@ -3412,6 +3603,36 @@ def test_a_malformed_data_event_marks_the_stream_errored(trace_api, monkeypatch)
         limit=1000,
     )
     assert records["records"] == []
+
+
+@pytest.mark.parametrize("role", [[], {}, 1, True, ""])
+def test_a_present_malformed_stream_role_marks_the_stream_errored(
+    trace_api, monkeypatch, role
+) -> None:
+    event = json.dumps(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": role, "content": "hi"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+    ).encode()
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    _StreamingAsyncClient.body = _StreamingBody([b"data: " + event + b"\n\n", b"data: [DONE]\n\n"])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    span = _raw(trace_api)["records"][0]["spans"][0]
+    assert span["status_code"] == "ERROR"
+    assert span["error"] == "stream choice contained a non-string role"
 
 
 def test_a_non_object_delta_marks_the_stream_errored(trace_api, monkeypatch) -> None:

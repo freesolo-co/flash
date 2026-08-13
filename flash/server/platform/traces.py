@@ -478,7 +478,10 @@ def _chat_reply(payload: Any) -> str | None:
     choice = payload["choices"][0]
     if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
         return None
-    if choice.get("finish_reason") not in _ACCEPTED_FINISH_REASONS:
+    finish_reason = choice.get("finish_reason")
+    if finish_reason is not None and (
+        not isinstance(finish_reason, str) or finish_reason not in _ACCEPTED_FINISH_REASONS
+    ):
         return None
     message = choice["message"]
     # absent roles remain accepted for providers and older envelopes that omit them. an explicit
