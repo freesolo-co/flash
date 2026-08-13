@@ -2590,6 +2590,177 @@ def test_export_rejects_unwritable_namespace_before_control_plane(
     assert not any(call[0] == "export" for call in fake_client.calls)
 
 
+def test_export_allows_an_org_contributor_who_can_write_the_exact_repo(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """The exact-repo permission outranks the coarse org role, so it has to be asked first.
+
+    A `contributor` in `acme` is not `write`/`admin` org-wide, but auth_check says this token can
+    write this very repo. Consulting the role first would refuse an export the Hub allows.
+    """
+    import sys
+    import types
+
+    reached: dict[str, bool] = {"auth_check": False}
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "contributor"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        def auth_check(self, repo_id, *, repo_type=None, token=None, write=False):
+            reached["auth_check"] = True
+            return
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 0
+    )
+    assert reached["auth_check"], "the exact-repo check must run before the org role decides"
+    assert any(call[0] == "export" for call in fake_client.calls)
+    assert "hf_secret" not in capsys.readouterr().err
+
+
+def test_export_refuses_a_gated_destination_instead_of_treating_it_as_creatable(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """GatedRepoError subclasses RepositoryNotFoundError, so "gated" must be subtracted from "missing".
+
+    A gated repo exists and this token may not write it. Reading it as absent would hand it to the
+    create-permission paths, which are weaker.
+    """
+    import sys
+    import types
+
+    from huggingface_hub.utils import GatedRepoError
+
+    # a real GatedRepoError, because the point of this test is that the hub makes it a SUBCLASS of
+    # RepositoryNotFoundError. it needs a response carrying `request`/`headers` or its own
+    # constructor raises, and that AttributeError would block for the wrong reason -- passing the
+    # test while never exercising the gated branch at all.
+    response = type(
+        "R",
+        (),
+        {"status_code": 403, "headers": {}, "request": type("Q", (), {"headers": {}})()},
+    )()
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {"name": "alice", "orgs": [], "auth": {"accessToken": {"role": "write"}}}
+
+        def auth_check(self, repo_id, *, repo_type=None, token=None, write=False):
+            raise GatedRepoError("gated", response=response)
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "someone/gated-model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "cannot write" in err
+    assert "hf_secret" not in err
+    assert not any(call[0] == "export" for call in fake_client.calls)
+
+
+def test_export_proceeds_when_the_hub_cannot_be_reached(fake_client, monkeypatch, capsys) -> None:
+    """An unreachable Hub is not a verdict. The copy runs on the control plane, not on this host.
+
+    Blocking here would make a CLI host without Hub egress unable to export at all, while the same
+    command skips the check entirely when huggingface_hub is merely absent.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            raise OSError("[Errno -3] Temporary failure in name resolution")
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "alice/adapters",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 0
+    )
+    err = capsys.readouterr().err
+    assert "could not reach HuggingFace" in err
+    assert "hf_secret" not in err
+    assert any(call[0] == "export" for call in fake_client.calls)
+
+
+def test_export_still_refuses_a_token_the_hub_rejected(fake_client, monkeypatch, capsys) -> None:
+    """The other half of the same branch: a real answer from the Hub must still block."""
+    import sys
+    import types
+
+    class Rejected(Exception):
+        """A hub error shape carrying a real status: the Hub answered, and the answer was no."""
+
+        def __init__(self) -> None:
+            super().__init__("unauthorized")
+            self.response = type("R", (), {"status_code": 401, "headers": {}})()
+
+    class FakeHfApi:
+        def whoami(self, token):
+            raise Rejected
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "alice/adapters",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "rejected the token" in err
+    assert "hf_secret" not in err
+    assert not any(call[0] == "export" for call in fake_client.calls)
+
+
 def test_export_rejects_fine_grained_scope_for_a_different_namespace(
     fake_client, monkeypatch, capsys
 ) -> None:

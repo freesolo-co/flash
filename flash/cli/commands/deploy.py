@@ -319,6 +319,33 @@ def _hub_repo_missing_errors() -> tuple[type[BaseException], ...]:
     return ()
 
 
+def _hf_status_code(exc: BaseException) -> int | None:
+    """The HTTP status behind a hub error, or None when the request never got an answer.
+
+    None is the whole point: it separates "the Hub said no" from "the Hub was unreachable", which
+    the preflight must treat differently.
+    """
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hub_repo_gated_errors() -> tuple[type[BaseException], ...]:
+    """Gated-repo errors, which the hub models as a SUBCLASS of "repository not found".
+
+    So they match the missing-repo tuple and have to be subtracted from it. A gated destination
+    exists; it is simply not writable by this token, which is the opposite of creatable.
+    """
+    for module in ("huggingface_hub.errors", "huggingface_hub.utils"):
+        try:
+            return (__import__(module, fromlist=["GatedRepoError"]).GatedRepoError,)
+        except (ImportError, AttributeError):
+            continue
+    return ()
+
+
 def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
     """return the token account after verifying the destination namespace when hub is installed."""
     try:
@@ -334,9 +361,19 @@ def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
     try:
         identity = api.whoami(token=token)
     except Exception as exc:
+        # a rejected token is the Hub answering, so refuse. an unreachable Hub is not an answer: the
+        # copy runs on the control plane, not here, so a CLI host without Hub egress would otherwise
+        # be unable to export at all -- while the same command skips this check entirely when the
+        # package is simply absent. degrade to that behaviour rather than invent a new hard blocker.
+        if _hf_status_code(exc) is None:
+            print(
+                f"warning: could not reach HuggingFace to verify the export namespace ({exc}); "
+                "proceeding without the check",
+                file=sys.stderr,
+            )
+            return None
         raise ClientError(
-            "HuggingFace token preflight failed before export. Check HF_TOKEN or --api-key and "
-            "retry."
+            "HuggingFace rejected the token before export. Check HF_TOKEN or --api-key and retry."
         ) from exc
     account = str(identity.get("name") or identity.get("username") or "").strip()
     if not account:
@@ -347,39 +384,45 @@ def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
     print(f"HuggingFace token resolves to account {account}", file=sys.stderr)
 
     owner = repository.partition("/")[0].strip()
+
+    # the exact repo first: it is the only authoritative answer, and it is the one the export
+    # actually needs. asking the org role first would refuse a `contributor` who can write this
+    # very repo, because a role is a coarser fact than the permission being checked.
+    auth_check = getattr(api, "auth_check", None)
+    if callable(auth_check) and "write" in inspect.signature(auth_check).parameters:
+        try:
+            auth_check(repository, repo_type="model", token=token, write=True)
+            return account
+        except Exception as exc:
+            # a destination that is not there yet cannot be checked directly, so fall through to the
+            # creation rules below. GatedRepoError SUBCLASSES RepositoryNotFoundError, so it must be
+            # excluded first: a gated repo exists and this token may not write it, and reading it as
+            # "absent" would hand it to the weaker create-permission paths.
+            missing = _hub_repo_missing_errors()
+            absent = bool(missing) and isinstance(exc, missing)
+            if absent and isinstance(exc, _hub_repo_gated_errors()):
+                absent = False
+            if not absent:
+                raise ClientError(
+                    f"HuggingFace token resolves to account {account}, but it cannot write to "
+                    f"{repository}. Grant this token write access to that model repo or set HF_TOKEN "
+                    "to a token that can write there."
+                ) from exc
+
+    # only reached for a destination that does not exist yet, so the question is now whether this
+    # token may CREATE it in that namespace. that is what the org role legitimately answers.
     org_role = ""
     for org in identity.get("orgs") or ():
         if not isinstance(org, dict) or str(org.get("name") or "").casefold() != owner.casefold():
             continue
         org_role = str(org.get("role") or org.get("roleInOrg") or "").lower()
         break
-    namespace_writable = owner.casefold() == account.casefold() or org_role in {"write", "admin"}
-    if not namespace_writable:
+    if owner.casefold() != account.casefold() and org_role not in {"write", "admin"}:
         raise ClientError(
-            f"HuggingFace token resolves to account {account}, which has no verified write role in "
-            f"the requested namespace {owner}. Use --repository {account}/<repo>, choose an org where "
-            "this account has write access, or set HF_TOKEN to the intended account."
+            f"HuggingFace token resolves to account {account}, which cannot create "
+            f"{repository} in the namespace {owner}. Use --repository {account}/<repo>, choose an "
+            "org where this account has write access, or set HF_TOKEN to the intended account."
         )
-
-    auth_check = getattr(api, "auth_check", None)
-    supports_write_check = (
-        callable(auth_check) and "write" in inspect.signature(auth_check).parameters
-    )
-    if supports_write_check:
-        try:
-            auth_check(repository, repo_type="model", token=token, write=True)
-            return account
-        except Exception as exc:
-            # a missing destination cannot be checked directly. creation permission is instead
-            # established from the token scope and the user/org role below. match the class rather
-            # than its name so a hub subclass of "repo is not there" is not read as "cannot write",
-            # which would refuse an export into a repo the token is allowed to create.
-            if not isinstance(exc, _hub_repo_missing_errors()):
-                raise ClientError(
-                    f"HuggingFace token resolves to account {account}, but it cannot write to "
-                    f"{repository}. Grant this token write access to that model repo or set HF_TOKEN "
-                    "to a token that can write there."
-                ) from exc
 
     access_token = (identity.get("auth") or {}).get("accessToken") or {}
     token_role = str(access_token.get("role") or "").lower()
