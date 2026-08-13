@@ -1247,6 +1247,7 @@ Parse the transcript instead, and parse it the same way on both paths:
 import re
 
 ACTION = re.compile(r"<move>(.*?)</move>", re.DOTALL)  # your own action syntax
+FINAL_ACTION = re.compile(r"<move>(.*?)</move>\s*\Z", re.DOTALL)
 
 
 class MyEnv(EnvironmentMultiTurn):
@@ -1263,11 +1264,15 @@ class MyEnv(EnvironmentMultiTurn):
     def _action_of(self, content: str, state) -> Move | None:
         """The action in a turn, or None if it carries none this state can use.
 
-        A tag match is not a valid move: `<move>bad</move>` matches too, and a legal
-        square may already be occupied. Validate here so `apply` only ever sees actions
-        it can perform.
+        Exactly one action, and it has to be the last thing said: two tags is a model
+        talking itself out of a move, and a tag mid-sentence is a model still thinking.
+        A tag match is not a valid move either -- `<move>bad</move>` matches, and a
+        legal square may already be taken -- so validate before `apply` sees it.
         """
-        found = ACTION.search(self._answer_of(content))
+        answer = self._answer_of(content)
+        if len(ACTION.findall(answer)) != 1:
+            return None
+        found = FINAL_ACTION.search(answer)
         return self.parse_move(found.group(1), state) if found else None
 
     def step_episode(self, example, messages, assistant_response):
@@ -1306,14 +1311,19 @@ replayed as history on every later call.
 wins, and text before an unclosed `<think>` is still an answer, so a turn that acted and then
 ran out of budget mid-thought is treated the same way the scorer treats it.
 
-One case stays genuinely ambiguous. When the chat template pre-opens the reasoning block, the
-model never emits `<think>`, so a turn truncated before `</think>` carries no tag at all and
-reads as a plain answer. Flash resolves this with a flag it derives from the rendered template
-and sets on the adapter, which is not passed through to your hook, so your environment cannot
-see it. Do not hardcode a guess: the same environment needs a different answer under a different
-model. Rely instead on the action itself being present and valid, which is what
-`_action_of` already checks, and on your prompt asking for the action last so an action that
-appears at all is one the model committed to.
+One case stays genuinely ambiguous, and it is worth knowing rather than papering over. When the
+chat template pre-opens the reasoning block, the model never emits `<think>`, so a turn
+truncated before `</think>` carries no tag at all and reads as a plain answer. Flash resolves
+this with a flag it derives from the rendered template and sets on the adapter; that flag is not
+passed through to your hook, so your environment cannot see it. Do not hardcode a guess either,
+because the same environment needs a different answer under a different model.
+
+What the parser above does instead is require the action to be the **last** thing in the turn.
+That is why `FINAL_ACTION` is anchored: unfinished reasoning usually runs on past the move it
+was weighing, so `Maybe <move>left</move>, or maybe` fails the anchor and counts as no action.
+The residual case is a turn truncated exactly at a closing tag, which nothing available to an
+environment can tell from a committed answer. Ask for the action last in your prompt, and keep
+`max_completion_tokens` clear of your typical turn length so truncation stays rare.
 
 **Give `apply` one representation.** The replayed turns and `assistant_response` have to arrive
 in the same shape. Passing the unwrapped payload for replayed turns and the raw text for the
@@ -1340,6 +1350,15 @@ sampled outcome, a tool result, anything external), replay it too, matching it t
 match actions rather than branching on role alone: the user-role messages include the entire
 opening prompt from `start_episode`, and a loop that treats every user message as an
 observation will try to fold your task description into the state.
+
+**`apply` must be pure.** Replay calls it once per earlier action on **every** step, so anything
+it does to the outside world happens again on each turn: an HTTP call is re-issued, a charge is
+re-charged, a file is rewritten. That is not the double-application bug below, it is the cost of
+reconstructing state from a transcript, and it does not go away by getting the bounds right.
+Keep `apply` a pure reducer over recorded actions and replay the recorded results alongside
+them. When a turn genuinely has to touch a real service, do that once for the newest action
+only, outside the replay loop, and make the call idempotent (an idempotency key, a
+conditional write) so a retried episode cannot double it.
 
 Replaying all of `messages` and then applying `assistant_response` again applies the **newest**
 action twice on every call. Earlier actions still appear once; it is the turn you were handed
