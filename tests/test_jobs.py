@@ -873,9 +873,11 @@ def test_a_late_granted_worker_gets_a_full_setup_window_not_the_queues_leftovers
     grant_at = 3200.0
     res, ended_at = _queued_until_worker_granted(monkeypatch, gpu_count=4, grant_at=grant_at)
     assert res.failure == "stalled"
-    # measure from the GRANT, not from queue entry: the unfixed code also reports a large elapsed
-    # figure (~3280s), but nearly all of it was queue wait the worker never saw. What matters is
-    # how long the PLACED worker was actually given, which unfixed is ~0.
+    # Measure from the GRANT on the absolute clock, not from the failure's reported "no worker
+    # progress for Ns" figure. That figure is computed from whatever `last_progress` holds, so it
+    # reads ~3000s in BOTH the fixed and unfixed cases and cannot tell them apart -- a test
+    # asserting on it passes against the broken code. What distinguishes them is WHEN the run died:
+    # on the grant (~3200s) or a full cold start after it (~6200s).
     granted_for = ended_at - grant_at
     assert granted_for >= 3000.0, (
         f"the placed worker was torn down {granted_for:.0f}s after RunPod granted it (needs the "
@@ -884,11 +886,11 @@ def test_a_late_granted_worker_gets_a_full_setup_window_not_the_queues_leftovers
 
 
 def test_a_worker_that_stays_placed_does_not_renew_its_setup_budget_forever(monkeypatch):
-    # Guardrail on the SHAPE of the placement reset, not a regression of past behavior (it passes
-    # against the pre-fix code too, which never reset the baseline at all). It pins the reset to
-    # the TRANSITION into placement: resetting on every poll that still reports a worker -- the
-    # obvious wrong way to write `_note_worker_placement` -- would mean a wedged image pull never
-    # reaches the setup grace at all, holding a paid box until the run's wall deadline.
+    # Guardrail on the SHAPE of the re-anchoring, not a regression of past behavior (it passes
+    # against the pre-fix code too, which never rolled the baseline forward at all). It pins the
+    # roll-forward to the queued exemption: rolling `last_progress` on every poll that still
+    # reports a worker -- the obvious wrong way to write this -- would mean a wedged image pull
+    # never reaches the setup grace at all, holding a paid box until the run's wall deadline.
     res, ended_at = _queued_until_worker_granted(monkeypatch, gpu_count=4, grant_at=0.0)
     assert res.failure == "stalled"
     assert "limit 3000s" in res.detail, res.detail
@@ -911,58 +913,6 @@ def test_a_worker_that_is_coming_up_still_gets_the_unscaled_setup_grace(monkeypa
     )
     assert res.failure == "stalled"
     assert "limit 3000s" in res.detail, res.detail
-
-
-def test_a_late_worker_grant_starts_its_cold_start_budget_from_the_grant(monkeypatch):
-    # Deferring the stall timer while queued must not bank the queued wait against the cold start.
-    # `last_progress` anchors on the last status CHANGE, which for a job queued from the start is
-    # when it entered the queue -- so a worker granted late (after 3000s of queueing, but inside a
-    # 4-card shape's 3600s capacity grace) was already "overdue" the instant it arrived and was
-    # killed as `stalled` on its very first poll, having been given no time at all to boot.
-    #
-    # That is the same class of bug as the preemption above, just moved: the scaled grace buys a
-    # longer wait, and then the thing it was waiting FOR gets destroyed on arrival.
-    import itertools
-
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
-
-    seen = {"t": 0.0}
-    grant_at = 3200.0
-
-    def health(eid, _fp, **_kw):
-        # no worker until well past the 3000s setup grace, then one appears.
-        return {"workers": {"initializing": 1} if seen["t"] > grant_at else {}}
-
-    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
-    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
-    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
-    clock = itertools.count(start=0, step=20.0)
-
-    def tick():
-        seen["t"] = next(clock)
-        return seen["t"]
-
-    monkeypatch.setattr(jobs.time, "time", tick)
-
-    res = jobs.poll_job(
-        _runpod_handle(jobs),
-        interval_s=0,
-        heartbeat_reader=lambda: None,
-        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
-    )
-    # it still ends stalled -- the worker never boots in this scenario -- but only after being
-    # given a full cold start, not immediately on arrival.
-    #
-    # Assert on the ABSOLUTE clock, not the reported "no progress for Ns" figure: that figure is
-    # measured from whatever `last_progress` holds, so it reads ~3000s in BOTH the fixed and unfixed
-    # cases and cannot tell them apart. What distinguishes them is WHEN the run died -- at the grant
-    # (~3200s) or a full cold start after it (~6200s).
-    assert res.failure == "stalled", res.detail
-    assert seen["t"] >= grant_at + 3000.0, (
-        f"died at t={seen['t']:.0f}s, only {seen['t'] - grant_at:.0f}s after the worker was granted "
-        f"at {grant_at:.0f}s; it must get the full 3000s cold-start budget from the grant"
-    )
 
 
 def test_a_job_outside_the_queue_still_stalls_on_its_own_limit(monkeypatch):
