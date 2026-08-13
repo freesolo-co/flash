@@ -107,9 +107,11 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
 # assignment is required, and a `${VAR}` or `$(...)` indirection matches nothing because it is not
 # a key-shaped body.
 #
-# These skip `_is_high_entropy`, which exists to spare hand-written placeholders in a body that is
-# otherwise unmistakably a key. Here the variable name already carries that meaning, and a hex body
-# can legitimately be all-letters (`abcdef...`), which the placeholder heuristic would reject.
+# These take `_is_high_entropy` like every other pattern. Exempting them was tenable only while the
+# W&B body was pinned to 40 hex characters; once it widened,
+# `WANDB_API_KEY=your_wandb_api_key_here...` matched and a scaffolded environment became
+# unpublishable. The exemption existed for the all-hex legacy key, which that function now admits
+# directly.
 _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     (
         "a Weights & Biases API key",
@@ -138,6 +140,27 @@ _LITERAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
         re.compile(
             rb"-----BEGIN [A-Z ]*PRIVATE KEY-----[\r\n\s]*"
             rb"(?:[A-Za-z0-9+/=]{32,}|Proc-Type:|DEK-Info:)"
+        ),
+    ),
+    # The same key in DER: the binary encoding a PEM block base64-wraps. `openssl ... -outform DER`
+    # writes it, and it carries no text marker at all, so the PEM pattern above cannot see it.
+    #
+    # Anchored on the ASN.1 that distinguishes a private key from a public one rather than on the
+    # algorithm OID alone, which a certificate or public key carries too. In PKCS#8 that is the
+    # `INTEGER 0` version field preceding the AlgorithmIdentifier (a SubjectPublicKeyInfo has no
+    # version); in PKCS#1 it is the same version INTEGER before the modulus; in SEC1 it is
+    # `INTEGER 1` followed by the private scalar as an OCTET STRING of a curve-sized length.
+    (
+        "a private key",
+        re.compile(
+            # PKCS#8 PrivateKeyInfo, by algorithm: RSA, Ed25519/X25519, EC
+            rb"\x02\x01\x00\x30.\x06(?:\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
+            rb"|\x03\x2b\x65[\x6e\x70]|\x07\x2a\x86\x48\xce\x3d\x02\x01)"
+            # PKCS#1 RSAPrivateKey: version 0 then a long-form modulus INTEGER
+            rb"|\x30\x82..\x02\x01\x00\x02\x82"
+            # SEC1 ECPrivateKey: version 1, a curve-sized scalar, then the [0] curve parameters
+            rb"|\x02\x01\x01\x04(?:\x20.{32}|\x30.{48}|\x42.{66})\xa0",
+            re.DOTALL,
         ),
     ),
 )
@@ -175,6 +198,20 @@ _ZIP_TAIL_BYTES = (64 << 10) + 64
 # straddling the cut decoded into neither half -- so base64 of a whole `env.sh` published clean.
 # Length is instead bounded by `_decode_windows` below, which slides a window over the run.
 _BASE64_RUN = re.compile(rb"[A-Za-z0-9+/]{24,}={0,2}")
+
+# A fixed-width wrapped base64 block: two or more full-width lines, then a shorter final line. The
+# widths are the two conventions in use -- 76 for MIME (`base64.encodebytes`, mail, many
+# `kubectl -o yaml` outputs) and 64 for PEM bodies. Joining ONLY these leaves ordinary adjacent
+# lines alone, so no arbitrary pair of values is welded into a run that decodes to something
+# neither line contained.
+_WRAPPED_BLOCK = re.compile(
+    rb"(?:[A-Za-z0-9+/]{76}\n){2,}[A-Za-z0-9+/]{1,76}={0,2}"
+    rb"|(?:[A-Za-z0-9+/]{64}\n){2,}[A-Za-z0-9+/]{1,64}={0,2}"
+)
+# A necessary condition for the block above: a full-width line of base64 followed by a break. Cheap
+# to reject, and it fails on essentially every real file, so the expensive alternation only runs
+# where a wrapped block could actually be.
+_WRAPPED_HINT = re.compile(rb"[A-Za-z0-9+/]{64}\n")
 
 # How much of one base64 run to decode at a time, and how far the windows overlap. The overlap
 # exceeds the encoded length of the longest possible match (4/3 of `_MAX_BODY` plus its prefix), so
@@ -216,6 +253,10 @@ _MAX_DECOMPRESS_SECONDS = 60.0
 # archive as a single ordinary file, so this is the only place the inner count is bounded.
 _MAX_ARCHIVE_MEMBERS = 100_000
 
+# An all-hex body of key length. Recognised so `_is_high_entropy` admits a legacy 40-hex W&B key,
+# whose lowercase letters would otherwise read as the hand-written-placeholder convention.
+_HEX_BODY = re.compile(r"[0-9a-fA-F]{32,}")
+
 # Everything the standard library raises for an archive it cannot read. There is no single base
 # class to catch, and most of these are not OSError, so each omission crashed `flash env push` with
 # a traceback on an ordinary corrupt shard: an encrypted member raises RuntimeError, an
@@ -234,6 +275,11 @@ _UNREADABLE_ARCHIVE = (
     zipfile.BadZipFile,
     zlib.error,
     lzma.LZMAError,
+    # `TarError` inherits straight from `Exception`, so nothing else in this tuple covers it -- a
+    # truncated tar (`ReadError: unexpected end of data`) crashed the publish outright. A
+    # half-written shard in a dataset directory is ordinary, and crashing on it would be a worse
+    # bug than the hole being closed.
+    tarfile.TarError,
 )
 
 
@@ -258,19 +304,30 @@ def _is_high_entropy(body: bytes) -> bool:
     Mixed-case and digit-bearing bodies are still treated as issued, which keeps a real key whose
     body happens to read like a word. Erring that way is deliberate -- a false refusal is visible
     and recoverable, a missed credential is permanent in a shared repository's history.
+
+    Applied to the assignment-anchored patterns too. Exempting those was a false-positive
+    regression: once the W&B body widened past 40 hex characters,
+    `WANDB_API_KEY=your_wandb_api_key_here_replace_before_push` matched and a scaffolded
+    environment could not be published. The exemption existed for the all-hex legacy key
+    (`abcdef...` is all-lowercase-alpha, which reads as a placeholder), so that one case is
+    admitted explicitly below rather than by exempting the whole group.
     """
     text = body.decode("ascii", "ignore").replace("_", "").replace("-", "")
     if len(set(text)) <= 2:
         return False
+    if _HEX_BODY.fullmatch(text):
+        # a full-length hex body is a key or a hash, never a hand-written placeholder: the
+        # convention is words (`your_key_here`), and those are not confined to `[a-f]`.
+        return True
     return not (text.isalpha() and (text.isupper() or text.islower()))
 
 
 def _match(data: bytes) -> str | None:
     """The kind of credential the literal bytes `data` contain, or None."""
-    for kind, pattern in _LITERAL_PATTERNS + _ASSIGNED_PATTERNS:
+    for kind, pattern in _LITERAL_PATTERNS:
         if pattern.search(data):
             return kind
-    for kind, pattern in _TOKEN_PATTERNS:
+    for kind, pattern in _TOKEN_PATTERNS + _ASSIGNED_PATTERNS:
         for match in pattern.finditer(data):
             # the alternations above put the body in whichever group matched; the rest are None.
             body = next((group for group in match.groups() if group), b"")
@@ -299,7 +356,7 @@ def _match_base64(data: bytes) -> str | None:
     Measured against the false-positive risk before adopting it: 630,011 base64-shaped runs across
     8,769 real hub files decode to zero credential matches, so this costs no legitimate publish.
     """
-    for run in _BASE64_RUN.finditer(data):
+    for run in _BASE64_RUN.finditer(_unwrapped(data)):
         candidate = run.group(0)
         for window in _decode_windows(candidate):
             # base64 packs 3 bytes per 4 characters, so a run rarely starts on a boundary; all four
@@ -316,6 +373,31 @@ def _match_base64(data: bytes) -> str | None:
                 if kind := _match(decoded):
                     return kind
     return None
+
+
+def _unwrapped(data: bytes) -> bytes:
+    """`data` with the line breaks of a fixed-width base64 block removed, joining it into one run.
+
+    MIME base64 breaks every 76 characters (`base64.encodebytes`, mail attachments, many
+    `kubectl get -o yaml` outputs) and PEM bodies every 64. The run pattern stops at the newline,
+    so a wrapped blob arrived as a series of per-line runs and a credential straddling a break
+    decoded into neither -- measured at 20 of 60 possible key offsets missed, which is every key
+    that happens to cross a line.
+
+    Only FIXED-WIDTH sequences are joined, never any break between two base64 characters. That
+    distinction matters: `KEY=aGVsbG8\\nOTHER=d29ybGQ` is two unrelated values, and welding those
+    together would decode arbitrary line pairs and invent credentials that were never there.
+    Wrapping is what the width identifies, and a real wrapped blob always has it.
+
+    Guarded by a cheap substring test first. The joining pattern alternates over two widths and
+    retries at every offset, which cost most of the scan's throughput when it ran over every chunk
+    of every file; almost no file contains a wrapped block, and one that does always contains a
+    full-width run of base64 characters. Measured on ordinary source: 9 MB/s without the guard,
+    back to the pre-existing rate with it.
+    """
+    if b"\n" not in data or not _WRAPPED_HINT.search(data):
+        return data
+    return _WRAPPED_BLOCK.sub(lambda match: match.group(0).replace(b"\n", b""), data)
 
 
 def _decode_windows(run: bytes) -> Iterator[bytes]:
@@ -389,22 +471,25 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     carry = b""
     buffered = bytearray()
     tail = b""
-    compressed_head = False
+    container_head = False
     overflowed = False
     while chunk := handle.read(_SCAN_CHUNK_BYTES):
         if deadline is not None and time.monotonic() > deadline:
             raise _Unscannable("takes too long to decompress")
         if not carry and depth:
-            compressed_head = _looks_compressed(chunk[:6])
+            # tar as well as the compressed magics: a tar's own members are literal, but a
+            # COMPRESSED member inside one is not, so an oversized tar that went past the buffer
+            # cap is as unverifiable as an oversized gzip and must refuse rather than pass.
+            container_head = _looks_compressed(chunk[:6]) or _looks_like_tar(chunk)
         if depth and not overflowed:
             buffered.extend(chunk)
             if len(buffered) > _MAX_NESTED_BUFFER_BYTES:
-                if compressed_head:
-                    raise _Unscannable("contains a compressed member too large to inspect")
-                # Not a compressed container by its head, so the literal scan below is complete
-                # coverage and the buffer is only needed to REOPEN a container. Dropping it keeps
-                # memory bounded on an ordinary large member; `tail` still decides at the end
-                # whether what went past was a zip hiding behind a preamble.
+                if container_head:
+                    raise _Unscannable("contains an archive too large to inspect")
+                # Not a container by its head, so the literal scan below is complete coverage and
+                # the buffer is only needed to REOPEN a container. Dropping it keeps memory bounded
+                # on an ordinary large member; `tail` still decides at the end whether what went
+                # past was a zip hiding behind a preamble.
                 overflowed = True
                 buffered = bytearray()
         if depth:
@@ -457,8 +542,14 @@ def _looks_like_container(data: bytes) -> bool:
     Gating the recursion on this rather than recursing unconditionally keeps `_MAX_CONTAINER_DEPTH`
     honest: the depth cap raises, so calling it for an ordinary deeply-nested *file* would refuse a
     legitimate publish over nesting that never expanded anything.
+
+    Tar counts here too. A tar's own member bytes are literal, so a top-level one needed no special
+    handling for its plain members -- but nested it is a container like any other, and `tar.gz`
+    holding a tar of gzipped shards left the innermost key unreached.
     """
-    return _looks_compressed(data[:6]) or zipfile.is_zipfile(io.BytesIO(data))
+    return (
+        _looks_compressed(data[:6]) or _looks_like_tar(data) or zipfile.is_zipfile(io.BytesIO(data))
+    )
 
 
 def _credential_in_container(source: Path | bytes, *, deadline: float, depth: int) -> str | None:

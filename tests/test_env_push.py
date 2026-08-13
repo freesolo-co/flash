@@ -2286,21 +2286,30 @@ def test_a_credential_straddling_a_base64_window_is_still_decoded(tmp_path):
 
 
 def test_an_assigned_key_with_no_prefix_is_caught_by_its_variable_name(tmp_path):
-    """A W&B key is 40 hex characters and carries no prefix, so only the assignment identifies it.
+    """Some keys carry no issuer prefix, so only the assignment identifies them.
 
-    Every other pattern here keys off an issued prefix. This one cannot, which is why it is matched
-    through the variable it is assigned to rather than by shape -- 40 hex characters on their own
+    Every other pattern here keys off an issued prefix. These cannot, which is why they are matched
+    through the variable they are assigned to rather than by shape -- 40 hex characters on their own
     are just as likely to be a commit sha, and refusing those would block ordinary publishes.
     """
     from flash.env_secrets import _credential_kind, credential_in_file
 
-    key = b"3f" * 20
+    # a REAL legacy key's 40 hex characters, not a repeated pair: `3f` x 20 has two distinct
+    # characters and is correctly read as a masked value rather than a key, so using it here would
+    # have asserted the wrong behaviour.
+    key = b"d5c7bfe532fe1fe056b940909986e48aee4f5112"
     script = tmp_path / "run.sh"
     script.write_bytes(b"#!/bin/sh\nexport WANDB_API_KEY=" + key + b"\n")
     assert credential_in_file(script) == "a Weights & Biases API key"
 
     for form in (b'WANDB_API_KEY: "' + key + b'"', b"wandb_api_key = '" + key + b"'"):
         assert _credential_kind(form) == "a Weights & Biases API key", form
+
+    # an all-hex body reads as all-lowercase-alpha when it happens to avoid digits, which is the
+    # hand-written-placeholder shape. Hex of key length is admitted explicitly so this still counts.
+    assert _credential_kind(b"WANDB_API_KEY=" + b"abcdef" * 6 + b"abcd") == (
+        "a Weights & Biases API key"
+    )
 
     # W&B issued 40-hex keys historically and now issues much longer ones, and a new key does not
     # revoke an existing legacy one -- so both are live and both must be caught. Pinning the body
@@ -2324,8 +2333,31 @@ def test_an_assigned_key_with_no_prefix_is_caught_by_its_variable_name(tmp_path)
         b"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n",
         b"AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}\n",
         b"digest: " + aws,
+        b"WANDB_API_KEY=" + b"3f" * 20,  # a masked value, not a key
     ):
         assert _credential_kind(benign) is None, benign
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    [
+        b"WANDB_API_KEY=your_wandb_api_key_here_replace_before_push",
+        b"WANDB_API_KEY=REPLACE_ME_WITH_YOUR_WANDB_KEY_XXXXXXXX",
+        b"WANDB_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        b"AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key_here__",
+    ],
+)
+def test_an_assigned_placeholder_does_not_refuse_the_publish(placeholder):
+    """The assignment-anchored patterns take the placeholder test too.
+
+    Exempting them was safe only while the W&B body was pinned to 40 hex characters. Widening it to
+    catch currently-issued keys made `WANDB_API_KEY=your_wandb_api_key_here...` match, so a
+    scaffolded environment could not be published at all -- a false refusal, which is the failure
+    mode that gets a check switched off, and worse here than the hole it came from.
+    """
+    from flash.env_secrets import _credential_kind
+
+    assert _credential_kind(placeholder) is None
 
 
 def test_a_compressed_member_inside_a_plain_tar_is_expanded(tmp_path):
@@ -2479,6 +2511,163 @@ def test_a_refusal_never_echoes_a_credential_in_a_filename(tmp_path):
 
     # an ordinary path is returned untouched
     assert _redacted("src/environment.py") == "src/environment.py"
+
+
+def test_a_tar_nested_inside_another_container_is_expanded(tmp_path):
+    """Tar was recognised at top level only, so one layer in it became final content again.
+
+    `tar.gz` holding a tar of gzipped shards is an ordinary dataset layout, and the innermost key
+    was unreachable: the outer gzip expanded, and what came out was treated as bytes rather than as
+    the archive it is.
+    """
+    import gzip
+    import io
+    import tarfile
+    import zipfile
+
+    from flash.env_secrets import credential_in_file
+
+    secret = f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode()
+    inner = io.BytesIO()
+    with tarfile.open(fileobj=inner, mode="w") as archive:
+        payload = gzip.compress(secret)
+        info = tarfile.TarInfo("shard.jsonl.gz")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    plain = inner.getvalue()
+
+    wrapped = tmp_path / "dataset.tar.gz"
+    wrapped.write_bytes(gzip.compress(plain))
+    assert credential_in_file(wrapped) == "a Freesolo API key"
+
+    zipped = tmp_path / "dataset.zip"
+    with zipfile.ZipFile(zipped, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("inner.tar", plain)
+    assert credential_in_file(zipped) == "a Freesolo API key"
+
+
+def test_a_corrupt_tar_does_not_crash_the_publish(tmp_path):
+    """`TarError` inherits straight from `Exception`, so no other entry in the tuple covers it.
+
+    A truncated tar raised `ReadError: unexpected end of data` out of the publish as a traceback.
+    A half-written shard in a dataset directory is ordinary, so crashing on it would be a worse bug
+    than the hole being closed.
+    """
+    import io
+    import tarfile
+
+    from flash.env_secrets import credential_in_file
+
+    whole = io.BytesIO()
+    with tarfile.open(fileobj=whole, mode="w") as archive:
+        body = b"x" * 4096
+        info = tarfile.TarInfo("a.txt")
+        info.size = len(body)
+        archive.addfile(info, io.BytesIO(body))
+
+    truncated = tmp_path / "half.tar"
+    truncated.write_bytes(whole.getvalue()[:900])
+    assert credential_in_file(truncated) is None
+
+
+def test_an_oversized_tar_refuses_rather_than_passing(tmp_path, monkeypatch):
+    """The buffer-cap escape recognised only compressed magic, so a big tar took the pass branch.
+
+    A tar past the cap is exactly as unverifiable as a gzip past it -- its members can be
+    compressed, and those hold the credential nowhere the literal scan can see.
+    """
+    import gzip
+    import io
+    import os
+    import tarfile
+
+    from flash import env_secrets as secrets
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    monkeypatch.setattr(secrets, "_MAX_NESTED_BUFFER_BYTES", 1 << 20)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as archive:
+        for name, body in (
+            ("pad.bin", os.urandom(4 << 20)),
+            ("shard.gz", gzip.compress(f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode())),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(body))
+
+    oversized = tmp_path / "big.tar.gz"
+    oversized.write_bytes(gzip.compress(buf.getvalue()))
+    with pytest.raises(_Unscannable, match="too large to inspect"):
+        credential_in_file(oversized)
+
+
+def test_a_credential_in_line_wrapped_base64_is_decoded(tmp_path):
+    """MIME wraps base64 every 76 characters, and the run pattern stops at the newline.
+
+    A wrapped blob therefore arrived as a series of per-line runs, and a credential crossing a break
+    decoded into neither -- 20 of 60 possible key offsets, i.e. every key unlucky enough to straddle
+    a line.
+    """
+    import base64
+
+    from flash.env_secrets import _credential_kind
+
+    secret = f"fslo_{_FAKE_KEY_BODY}".encode()
+    # sweep the key across the 76-column boundary rather than testing one lucky placement
+    for pad in range(30, 56):
+        wrapped = base64.encodebytes(b"P" * pad + secret + b"Q" * 40)
+        assert wrapped.count(b"\n") > 1, "the fixture must actually wrap"
+        assert _credential_kind(wrapped) == "a Freesolo API key", pad
+
+    # unrelated adjacent values must NOT be welded into one run: joining arbitrary line pairs
+    # would decode bytes that neither line contained.
+    pair = (
+        b"KEY="
+        + base64.b64encode(b"hello there friend")
+        + b"\nOTHER="
+        + base64.b64encode(b"goodbye now everyone")
+    )
+    assert _credential_kind(pair) is None
+
+
+def test_a_binary_der_private_key_is_detected(tmp_path):
+    """A DER key is the same key a PEM block base64-wraps, with no text marker to match.
+
+    `openssl genpkey -outform DER` writes one, and the PEM pattern cannot see it, so a private key
+    published intact as long as it was not armoured.
+    """
+    import subprocess
+
+    from flash.env_secrets import credential_in_file
+
+    def _generate(*args: str, out: str):
+        path = tmp_path / out
+        subprocess.run(
+            ["openssl", "genpkey", *args, "-out", str(path)],
+            check=True,
+            capture_output=True,
+        )
+        return path
+
+    rsa = _generate(
+        "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-outform", "DER", out="rsa.der"
+    )
+    assert credential_in_file(rsa) == "a private key"
+    ed = _generate("-algorithm", "ED25519", "-outform", "DER", out="ed.der")
+    assert credential_in_file(ed) == "a private key"
+
+    # the armoured form still reports as the PEM block it is
+    pem = _generate("-algorithm", "ED25519", out="key.pem")
+    assert credential_in_file(pem) == "a private key block"
+
+    # a public key in DER carries the same algorithm OID but no version INTEGER, so it must pass
+    public = tmp_path / "pub.der"
+    subprocess.run(
+        ["openssl", "pkey", "-in", str(pem), "-pubout", "-outform", "DER", "-out", str(public)],
+        check=True,
+        capture_output=True,
+    )
+    assert credential_in_file(public) is None
 
 
 def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
