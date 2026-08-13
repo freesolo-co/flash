@@ -15,6 +15,7 @@ one implementation of it.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import re
@@ -69,6 +70,11 @@ PROVENANCE_FIELDS = ("record_type", "run_id", "checkpoint_step", "hf_revision")
 
 # Any nonempty value works: the contract is that whatever was sent comes back unchanged.
 CONFORMANCE_ORG_ID = "conformance-org"
+
+# The run the wrong-key probe posts under. FIXED rather than per-run unique, so that a run killed
+# between the probe and its cleanup leaves a single known name a later run reclaims, instead of one
+# more orphan per attempt.
+_UNAUTHORIZED_RUN_ID = "conformance-unauthorized"
 
 # One mutation per identity-bearing field CLASS, each changing something the client compares on
 # read-back. A backend that pins only the artifact path passes a subfolder-only check while still
@@ -1155,7 +1161,7 @@ def test_a_wrong_serving_key_is_rejected(serving_client_factory, internal_key, a
     if not internal_key:
         pytest.skip("no FREESOLO_INTERNAL_KEY configured; the backend is intentionally open")
 
-    revision = "conformance-unauthorized@final." + "0" * 40
+    revision = f"{_UNAUTHORIZED_RUN_ID}@final." + "0" * 40
     # Bodies are deliberately well-formed: a 422 would prove nothing about authentication, since
     # rejecting a malformed payload does not tell an anonymous caller apart from an authorized one.
     #
@@ -1172,7 +1178,7 @@ def test_a_wrong_serving_key_is_rejected(serving_client_factory, internal_key, a
     # removed, reintroduced one line later. The whole registration is therefore built from the
     # final-revision provenance, so the ONLY thing wrong with this request is the key.
     unauthorized_body = _registration(
-        "conformance-unauthorized", {**adapter_source, "hf_revision": "0" * 40}, step=None
+        _UNAUTHORIZED_RUN_ID, {**adapter_source, "hf_revision": "0" * 40}, step=None
     )
     assert unauthorized_body["adapter_id"] == revision, (
         "the unauthorized probe's body no longer describes the revision it posts to; a backend that "
@@ -1201,12 +1207,31 @@ def test_a_wrong_serving_key_is_rejected(serving_client_factory, internal_key, a
     # `_strip_key_off_origin` hook, so a redirect to another origin would have forwarded the
     # `internal_key + "-wrong"` header off-origin, from which the real key is trivially recovered.
     # Overriding just the header on the shipped shape keeps both properties.
-    with serving_client_factory() as client:
-        client.headers["X-Freesolo-Internal-Key"] = internal_key + "-wrong"
-        for name, method, path, body in probes:
-            response = client.request(method, path, json=body)
-            if response.status_code not in (401, 403):
-                unprotected.append(f"{name} ({method} {path}) -> {response.status_code}")
+    try:
+        with serving_client_factory() as client:
+            client.headers["X-Freesolo-Internal-Key"] = internal_key + "-wrong"
+            for name, method, path, body in probes:
+                response = client.request(method, path, json=body)
+                if response.status_code not in (401, 403):
+                    unprotected.append(f"{name} ({method} {path}) -> {response.status_code}")
+    finally:
+        # Undo whatever the probes managed to create, using the CORRECT key.
+        #
+        # A backend that fails this test is by definition one that accepted at least one of these
+        # calls, and the first probe is a full valid registration -- so a failing run downloads an
+        # adapter onto the operator's volume, writes a durable revision record, and creates a run
+        # alias, all under a name the suite never cleans up. That is a real mutation of somebody's
+        # backend performed by a read-only-looking conformance check, and it persists across runs.
+        #
+        # Deleted by RUN id, not by revision: that is the id flash's own `undeploy_adapter` uses,
+        # and it sweeps the alias and every member revision in one call, whereas deleting the
+        # revision alone would leave the alias the registration created behind.
+        #
+        # Failures here are swallowed on purpose. The interesting result is the assertion below,
+        # and a 404 (nothing was created, which is the conforming case) or an unreachable backend
+        # must not replace a precise "these routes are unprotected" report with a cleanup error.
+        with contextlib.suppress(Exception), serving_client_factory() as cleanup:
+            cleanup.delete(f"/adapters/{_UNAUTHORIZED_RUN_ID}")
 
     assert not unprotected, (
         f"these routes answered a WRONG serving key without rejecting it: {'; '.join(unprotected)}. "
