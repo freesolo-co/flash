@@ -1250,17 +1250,25 @@ def answer_of(content: str) -> str:
     return "" if "<think>" in content else content
 
 
-def action_of(content: str) -> str:
+def action_of(content: str) -> str | None:
+    """The action in a turn, or None if it carries none. A model is free to emit junk."""
     found = ACTION.search(answer_of(content))
-    if found is None:  # a generated turn carrying no action is a bug worth seeing
-        raise ValueError(f"no action in assistant turn: {content[:120]!r}")
-    return found.group(1)
+    return found.group(1) if found else None
 
 
 for message in messages[:-1]:
     if message["role"] == "assistant":
-        state = self.apply(state, action_of(message["content"]))
-state = self.apply(state, action_of(assistant_response))  # the newest action, exactly once
+        action = action_of(message["content"])
+        if action is not None:  # unparsable turns changed nothing then; keep it that way
+            state = self.apply(state, action)
+newest = action_of(assistant_response)
+if newest is None:
+    # no action to apply. reply with the error and let the reward do the teaching
+    return EnvironmentStepResult(
+        done=False,
+        messages=[{"role": "user", "content": "Reply with a single <move>(r,c)</move>."}],
+    )
+state = self.apply(state, newest)  # the newest action, exactly once
 ```
 
 **Parse the answer, not the raw turn.** With `thinking = true` the transcript keeps the turn
@@ -1287,10 +1295,17 @@ in the same shape. Passing the unwrapped payload for replayed turns and the raw 
 newest one gives a single action two meanings, so the transition it produces depends on which
 call is looking at it.
 
-Raising on an assistant turn that parses to nothing is the right default, and it is also why a
-seeded assistant demo is worth avoiding: no parser can tell a demo apart from a malformed
-generated turn. If you must seed one, skip rather than raise, and write the demo in a form your
-pattern cannot match. Prose is safe; your own action syntax is not.
+**Do not raise on a turn that parses to nothing.** A model emitting junk is ordinary, especially
+early in GRPO exploration, and it is the reward's job to teach otherwise. Nothing between your
+hook and the trainer catches the exception: `env_reply` calls `step_episode` without a guard, so
+a `ValueError` from your parser leaves the multi-turn bridge and can take the run down over one
+malformed sample. Return an error observation, or end the episode with a low score, but let the
+episode reach the reward.
+
+The same shape covers a seeded assistant demo: an unparsable turn is skipped on replay, which is
+exactly right, because a demo written in prose changed nothing when it was "played" either. That
+still leaves a demo written in your own action syntax indistinguishable from a move, so keep
+demos in prose or a visibly different form.
 
 Either shape rebuilds state from the actions alone, which is right when your observations are a
 deterministic function of them. If an observation carries information the actions do not (a
