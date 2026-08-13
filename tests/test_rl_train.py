@@ -910,6 +910,27 @@ def test_multimodal_overrides_hand_verl_the_images_column():
     assert "data.dataloader_num_workers=0" in o
 
 
+def test_rollout_overrides_disable_the_split_multimodal_processor_cache():
+    # vllm's mm processor cache is split across two processes: a sender that replaces an already-seen
+    # image with its hash, and a receiver that must still hold the item that hash names. verl sleeps
+    # the rollout replicas after every training batch, and sleep clears the RECEIVER only, so the
+    # sender then names items that are gone and the request dies on an assert. the assert kills the
+    # REQUEST, not the run: rollouts come back empty and the visible error is an IndexError off a
+    # zero-length reward tensor, nowhere near the cause. opd disables this; grpo is on the same
+    # lifecycle and must too.
+    o = rl_train.build_verl_overrides(_overrides_cfg(multimodal=True))
+    assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0" in o
+
+
+def test_rollout_cache_override_is_unconditional_like_the_opd_path():
+    # unconditional on purpose, exactly as the opd driver does it: with no mm items there is no cache
+    # to disable, so it is inert on a text job. gating it on cfg["multimodal"] would leave the cache
+    # live for any future path that carries images without setting that flag -- the failure mode this
+    # test exists to prevent is silence, so the safe default is off everywhere.
+    o = rl_train.build_verl_overrides(_overrides_cfg())
+    assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0" in o
+
+
 def test_text_overrides_omit_every_multimodal_key():
     # the control: these keys must be absent, not merely false. data.image_key=images on a text job
     # points verl at a column the parquet does not have.
