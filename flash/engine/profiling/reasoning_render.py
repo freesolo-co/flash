@@ -37,19 +37,28 @@ def reasoning_spans(text: str) -> list[tuple[int, int]]:
       depth instead lets an unmatched ``<think>`` in an EARLIER turn hold the depth permanently
       positive, so the template's own closer never completes a block and every later survivor reads
       as stripped -- a total-loss warning for a transcript that lost nothing.
-    * the END is the LAST newline-delimited closer within the turn. Taking the first one instead
-      ends the span early whenever the reasoning quotes the layout it is reasoning about, and a cap
-      landing between that quoted closer and the real one then scores a cut block as fully
-      retained -- overstating what reaches the loss, the direction that hides the problem.
+    * the END is the LAST newline-delimited closer before the turn's terminator. Taking the first
+      one instead ends the span early whenever the reasoning quotes the layout it is reasoning
+      about, and a cap landing between that quoted closer and the real one then scores a cut block
+      as fully retained -- overstating what reaches the loss, the direction that hides the problem.
 
-    Scanning to the last closer is safe because a turn ends at ``<|im_end|>`` and the template
-    strips reasoning from every turn but the kept one, so exactly one structural closer per turn
-    can follow the anchor: a later quoted closer belongs to the same block's body, never to another.
+    The turn's terminator is the LAST ``<|im_end|>`` at or before the next assistant header, not
+    the first one after the anchor: reasoning that mentions the token literally would otherwise end
+    the scan before the template's own closer, returning no span at all and reporting an intact
+    survivor as dropped.
+
+    Both endpoint rules read the rendered text alone, which cannot separate a closer quoted at the
+    END of the reasoning from one quoted at the START of the answer -- those two rows render
+    identically and want opposite answers. Callers that need that distinction pair these spans with
+    a marker stamped into the reasoning itself (see ``sft_workload._row_reasoning``); the residual
+    error here is bounded to a span end that runs into answer text, never to a missed block.
     """
     spans: list[tuple[int, int]] = []
     for match in _TEMPLATE_REASONING_START.finditer(text):
-        turn_end = text.find(_TURN_END, match.end())
-        limit = len(text) if turn_end < 0 else turn_end
+        next_turn = _TEMPLATE_REASONING_START.search(text, match.end())
+        horizon = len(text) if next_turn is None else next_turn.start()
+        turn_end = text.rfind(_TURN_END, match.end(), horizon)
+        limit = horizon if turn_end < 0 else turn_end
         close = text.rfind(_TEMPLATE_REASONING_END, match.end(), limit)
         if close < 0 or not text[match.end() : close].strip():
             continue
@@ -232,14 +241,22 @@ def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:
     Inline detection asks ``_reasoning_body_offset`` -- the same rule that places the marker -- so a
     shape counted as authored is always a shape that can be marked. Were the two to disagree, the
     turn would enter the denominator with no way to prove it survived, and report a false drop.
+
+    A ``reasoning_content`` that is a STRING is authoritative even when it is empty: the template
+    renders the field and leaves ``content`` whole as the answer, so an empty field means the turn
+    authored no reasoning however the answer is written. Falling back to inline detection there
+    reads a ``<think>`` the ANSWER quotes as this turn's reasoning, and since the marker then lands
+    outside the empty block the template owns, the turn reports as dropped -- a loss warning for a
+    row that authored nothing. Absent and ``None`` are different: the template parses the inline
+    span in both, so those do fall back.
     """
     turns = 0
     for message in messages:
         if message.get("role") != "assistant":
             continue
         reasoning = message.get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning.strip():
-            turns += 1
+        if isinstance(reasoning, str):
+            turns += 1 if reasoning.strip() else 0
             continue
         if _reasoning_body_offset(_message_text(message.get("content"))) is not None:
             turns += 1

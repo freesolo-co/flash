@@ -1116,6 +1116,51 @@ def test_a_closing_tag_quoted_inside_reasoning_does_not_end_the_block_early(
     assert "max_context_tokens cut 1 rendered reasoning" in capsys.readouterr().err
 
 
+def test_an_empty_reasoning_field_is_authoritative_over_a_tag_the_answer_quotes(capsys) -> None:
+    """A STRING ``reasoning_content`` decides the turn, even when it is empty.
+
+    The template renders the field and leaves ``content`` whole, so an empty field means the turn
+    authored no reasoning however the answer is written. Falling back to inline detection reads a
+    ``<think>`` the ANSWER quotes as this turn's reasoning; the marker then lands outside the empty
+    block the template owns, and the turn reports as dropped -- a loss warning for a row that
+    authored nothing at all.
+    """
+    completion = [
+        {
+            "role": "assistant",
+            "reasoning_content": "   ",
+            "content": "use <think>like this</think> in prompts",
+        }
+    ]
+    prepared = _thinking_prepared(completion)
+
+    assert prepared.authored_reasoning_turns == 0
+    assert prepared.rendered_reasoning_spans == 0
+    assert "reasoning" not in capsys.readouterr().err
+
+
+def test_reasoning_that_mentions_the_turn_terminator_is_still_found(capsys) -> None:
+    """A literal ``<|im_end|>`` inside reasoning is content, not the end of the turn.
+
+    Bounding the search at the FIRST terminator after the anchor stops the scan before the
+    template's own closer, so the block is never found and an intact survivor reports as dropped --
+    with a non-binding cap, a total-loss warning for a row that lost nothing.
+    """
+    completion = [
+        {
+            "role": "assistant",
+            "reasoning_content": "the turn ends with <|im_end|> always",
+            "content": "answer",
+        }
+    ]
+    prepared = _thinking_prepared(completion)
+
+    assert prepared.authored_reasoning_turns == 1
+    assert prepared.rendered_reasoning_spans == 1
+    assert prepared.truncated_reasoning_spans == 0
+    assert "the chat template dropped" not in capsys.readouterr().err
+
+
 def test_a_cap_landing_on_the_answer_separator_does_not_report_lost_reasoning(capsys) -> None:
     """Truncation is judged at the CLOSING TAG, not at the blank line that follows it.
 
