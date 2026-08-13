@@ -1523,7 +1523,8 @@ def _retry_block(log_text: str, attempt: int) -> str:
 def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monkeypatch):
     """LS-008/AT-013: a capacity failure on the LAST fitting class used to say the run was 'retrying
     on the next-best GPU' while the picker had nowhere to walk and re-selected that same class. The
-    log must describe the retry that actually happens."""
+    log must describe the retry that actually happens. A stalled failure now exercises the same
+    last-class retry message because ordinary exhausted capacity stops instead."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -1545,7 +1546,7 @@ def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monk
         gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt == 0:
-            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -1571,7 +1572,8 @@ def test_retry_message_admits_when_the_projected_provider_already_failed(orch, m
     True for all of them and the escape degrades to plain cheapest-first. The line then reads as
     recovery while the run loops on the substrate that is failing -- the shape of a 46-attempt
     profile loop that printed a failover target it never acted on. The operator's fix is another
-    provider, not more waiting, so the message has to say the pool is exhausted.
+    provider, not more waiting, so the message has to say the pool is exhausted. A stalled failure
+    keeps the retry-message path active while preserving the same provider topology.
     """
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
@@ -1641,7 +1643,7 @@ def test_retry_message_does_not_deny_a_provider_that_is_in_the_candidate_list(or
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt < 2:
-            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -1698,7 +1700,8 @@ def test_a_genuine_cross_provider_failover_is_not_labelled_exhausted(orch, monke
 def test_last_gpu_retry_message_names_the_clamped_back_class_not_the_current_one(orch, monkeypatch):
     """on_last_gpu means no UNTRIED class is left -- NOT that the current class is reused. With two
     fitting classes the walk is PCIe, SXM, then back to the cheaper PCIe, so the message printed on
-    the SXM failure must name the PCIe the picker actually selects, not the SXM it is leaving."""
+    the SXM failure must name the PCIe the picker actually selects, not the SXM it is leaving. Stalls
+    retain the full retry walk needed to exercise that clamp-back message."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -1722,7 +1725,7 @@ def test_last_gpu_retry_message_names_the_clamped_back_class_not_the_current_one
         gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt < 2:
-            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -1849,7 +1852,8 @@ def test_cache_drop_failure_detail_does_not_contradict_the_action_line(orch, mon
 def test_projected_retry_class_is_worded_as_a_projection_not_a_promise(orch, monkeypatch):
     """The projection reads the CURRENT candidate list, but the next attempt calls allocate() again.
     Providers that rebuild candidates from live capacity can drop the named class or surface a
-    cheaper one, so the log must not claim this is the class the retry will certainly use."""
+    cheaper one, so the log must not claim this is the class the retry will certainly use. A stalled
+    failure keeps this projection observable after exhausted capacity became terminal."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -1876,7 +1880,7 @@ def test_projected_retry_class_is_worded_as_a_projection_not_a_promise(orch, mon
         gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt == 0:
-            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -1945,7 +1949,8 @@ def test_sole_class_cache_drop_does_not_claim_the_class_is_exhausted(orch, monke
 def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
     """The complement of the cache-drop case: a plain infra retry DOES mark the class tried, so with
     one fitting class the clause is accurate and must survive. Guards against fixing the false
-    positive by deleting the clause outright."""
+    positive by deleting the clause outright. A stalled failure exercises this ordinary infra retry.
+    """
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -1963,7 +1968,7 @@ def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         if attempt == 0:
-            return PollResult(False, failure="no_capacity", detail="job stuck IN_QUEUE")
+            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
