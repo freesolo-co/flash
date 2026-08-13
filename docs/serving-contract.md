@@ -234,6 +234,19 @@ deploys of one run silently overwrite each other, which is precisely what
 The check and the write must be atomic. A read-then-write with a gap between them is not a
 compare-and-swap, no matter what `/healthz` says.
 
+**What the generated Modal app actually guarantees.** Its mutual exclusion is built on
+`modal.Dict`'s `put(skip_if_exists=True)`, an atomic insert-if-absent. That is enough to make the
+compare and the swap one step under normal operation, and enough to recover a lock whose holder died
+mid-update, via an expiry stamp. It is not a full compare-and-swap: reclaiming an expired lease uses
+a destructive `pop` plus a conditional restore, so between a misjudged removal and its restore the
+key is briefly empty and a third waiter can win it. Reaching that requires a holder to have already
+died mid-update AND two further operations on the SAME run to race through that window.
+
+If you operate a backend where concurrent deploys of one run are routine rather than exceptional,
+hold this state in a store with a real compare-and-delete (Redis `WATCH`/Lua, Postgres row locks,
+etcd) rather than reproducing the Dict-based lock. The endpoint contract above is unchanged; only
+the primitive behind it needs to be stronger.
+
 On success, return all five fields - the client validates every one and fails the deploy on any
 mismatch:
 
