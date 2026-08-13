@@ -2967,6 +2967,124 @@ def test_a_revision_revived_during_its_reclaim_keeps_the_pending_marker(client):
     )
 
 
+def test_a_reclaim_that_raises_keeps_its_pending_marker(client):
+    """Best effort must mean "does not fail the undeploy", not "forgets the directory".
+
+    The reclaim boots a container to reach the volume, so a timeout is its likely failure -- and
+    clearing the marker afterwards drops the only record that anything still needs collecting. The
+    files then sit on the volume with no revision left marked, which is the exact leak the marker
+    was added to prevent, reintroduced through the error path.
+    """
+    module = client.app.state.generated_module
+    module.runners.count = 0
+    revision = "run-reclaimfail@final." + "c" * 40
+    key = module._record_key(revision)
+    client.post(
+        "/adapters",
+        json={
+            **REGISTRATION,
+            "adapter_id": revision,
+            "repo_id": BAD_REPO,
+            "checkpoint": "run-reclaimfail",
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "run-reclaimfail",
+                "checkpoint_step": None,
+                "hf_revision": "c" * 40,
+            },
+        },
+    )
+    assert _lifecycle(client, revision) == "failed"
+
+    original = module.engine_methods["discard_cache"]
+
+    async def _reclaim_times_out(adapter_id):
+        if adapter_id == revision:
+            raise TimeoutError("the container never started")
+        return await original(adapter_id)
+
+    module.engine_methods["discard_cache"] = _reclaim_times_out
+    try:
+        response = client.delete("/adapters/run-reclaimfail")
+    finally:
+        module.engine_methods["discard_cache"] = original
+
+    # The undeploy still succeeds: a directory left on the volume is not a reason to tell the
+    # operator their run is still serving.
+    assert response.status_code == 200, f"a failed reclaim broke the undeploy ({response.text})"
+    settled = module.adapter_records[key]
+    assert (settled.get("metadata") or {}).get("cache_reclaim_pending") is True, (
+        "the marker was cleared even though the reclaim raised, so the download is orphaned on the "
+        "volume with nothing left to collect it"
+    )
+
+    # And because the marker survived, the retry actually happens.
+    module.discarded.clear()
+    again = client.delete("/adapters/run-reclaimfail")
+    assert again.status_code in (200, 404), f"retry undeploy returned {again.status_code}"
+    assert revision in module.discarded, (
+        "the retry did not re-attempt the reclaim, so a transient failure is permanent"
+    )
+
+
+def test_re_registering_a_failed_revision_drops_its_pending_reclaim(client):
+    """The marker means "these files are garbage"; re-registration makes that false.
+
+    A cold failed load leaves the revision marked for collection. Re-registering the same id is a
+    deliberate request to serve those exact files again, and `_discard_cached_adapter` re-checks the
+    record and refuses to delete them once it is no longer `disabled`. A marker that survives the
+    reset therefore collects nothing -- it only makes a later cold undeploy boot a GPU to run an
+    rmtree that will be declined.
+    """
+    module = client.app.state.generated_module
+    module.runners.count = 0
+    revision = "run-rereg@final." + "d" * 40
+    key = module._record_key(revision)
+    body = {
+        **REGISTRATION,
+        "adapter_id": revision,
+        "repo_id": BAD_REPO,
+        "checkpoint": "run-rereg",
+        "metadata": {
+            "record_type": "revision",
+            "run_id": "run-rereg",
+            "checkpoint_step": None,
+            "hf_revision": "d" * 40,
+        },
+    }
+    client.post("/adapters", json=body)
+    assert _lifecycle(client, revision) == "failed"
+    assert (module.adapter_records[key].get("metadata") or {}).get("cache_reclaim_pending") is True
+
+    # The re-registration has to be BYTE-IDENTICAL -- changing any identity-bearing field is a
+    # different revision and the immutability guard rejects it with 409. So the load is made to
+    # succeed at the engine instead, which is what a retry after a transient failure looks like.
+    module.runners.count = 1
+    module.discarded.clear()
+    original_register = module.engine_methods["register"]
+
+    async def _register_succeeds(record):
+        if record.get("adapter_id") == revision:
+            return {"ok": True}
+        return await original_register(record)
+
+    module.engine_methods["register"] = _register_succeeds
+    try:
+        again = client.post("/adapters", json=body)
+        # 202: the reset put the revision back to `registered` and re-drove its settle, which is
+        # accepted rather than complete. 200 would mean the `ready` no-op path, which this is not.
+        assert again.status_code == 202, f"re-registration returned {again.status_code}"
+        assert _lifecycle(client, revision) == "ready"
+    finally:
+        module.engine_methods["register"] = original_register
+    assert (module.adapter_records[key].get("metadata") or {}).get(
+        "cache_reclaim_pending"
+    ) is None, (
+        "a revision that was re-registered and loaded successfully still carries the deferred "
+        "reclaim from its earlier failure"
+    )
+
+
 def test_a_stale_resident_that_cannot_be_evicted_refuses_the_load(client, monkeypatch):
     """Suppressing a failed stale-resident eviction loses the adapter and loads over it anyway.
 

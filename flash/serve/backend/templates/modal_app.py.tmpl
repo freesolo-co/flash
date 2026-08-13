@@ -1254,6 +1254,12 @@ def api():
                     }}
                     # Drop a stale failure reason so a retried load does not report the old one.
                     existing["metadata"].pop("failure", None)
+                    # And the deferred reclaim it was paired with. The marker means "this
+                    # revision's download is garbage waiting to be collected", which stops being
+                    # true the moment the revision is registered again -- `_discard_cached_adapter`
+                    # would refuse to delete the files anyway, so a surviving marker only makes a
+                    # later cold undeploy boot a GPU to reclaim a directory that is still in use.
+                    existing["metadata"].pop("cache_reclaim_pending", None)
                     await _write(existing)
                 # Repaired on EVERY registration, including the `ready` no-op, not only on the
                 # first. Registration writes the revision and the alias as two operations, so a
@@ -1512,8 +1518,16 @@ def api():
         # revision whose load failed while scaled to zero -- and `discard_cache` deliberately does
         # not touch the GPU, so this cannot evict an id a colliding adapter has since taken.
         for revision_id in reclaimable:
-            with contextlib.suppress(Exception):  # reclaiming disk is best effort
+            try:
                 await Engine().discard_cache.remote.aio(revision_id)
+            except Exception:  # reclaiming disk is best effort, but the marker is not
+                # Left marked on purpose. Best effort means a failed reclaim must not fail the
+                # undeploy -- it does NOT mean forgetting the directory. This call boots a
+                # container to reach the volume, so a timeout is the likely failure here, and the
+                # marker is the only record that anything still needs collecting. Clearing it
+                # after a raise turns a retryable deferral into the permanent leak it was added
+                # to prevent; leaving it lets the next delete try again.
+                continue
             reclaimed = await _read(revision_id)
             if isinstance(reclaimed, dict):
                 metadata = reclaimed.get("metadata") or {{}}
