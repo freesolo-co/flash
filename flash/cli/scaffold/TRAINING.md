@@ -1159,17 +1159,20 @@ return RewardResult(
 )
 ```
 
-**The length is a hard contract, and it is checked nowhere.** The extractor validates only
-that the value is a non-string iterable of floats; it never compares the count to the
-rollout's turns. The trainer then walks `range(len(turn_rewards))` and indexes
-`spans[turn_index]` for each one, so the two mismatch directions fail differently and
-neither is a safe fallback:
+**The length is a hard contract.** The extractor validates only that the value is a
+non-string iterable of floats; it never compares the count to the rollout's turns. The
+layers behind it do, and both mismatch directions take the same exit: a vector that does not
+match the turns cannot be aligned to tokens, so it is discarded and the rollout falls back to
+episode-level credit. `scoring.py` is normally the one that catches it and warns `per-turn
+rewards unavailable (received N reward(s) for M assistant turn(s))`; the verl child
+(`per-turn rewards (N) do not match emitted turns (M)`) and the advantage shim sit behind it
+as backstops. Nothing raises, and no turn is ever paired with another turn's reward.
 
-- **Too many rewards** — `IndexError: tuple index out of range`, mid-training, after you have
-  already paid for the rollouts.
-- **Too few rewards** — no error at all. The unmatched turns keep the zero they were
-  initialized with, so those tokens train on **zero advantage**: that part of the episode
-  silently contributes no learning signal, and the run looks healthy throughout.
+That fallback is not scoped to the episode that caused it. Per-turn advantages are centred
+turn by turn against the rest of the group, so one row that cannot be aligned takes its whole
+group back to episode credit rather than leaving the others centred against a smaller sample.
+**One short vector costs the per-turn signal for every episode that shares its example**,
+which is why a mismatch is worth ruling out even though it never fails loudly.
 
 The easiest way to get this wrong is the hard turn cap. The rollout loop breaks out before
 the final `env_reply`, so the last assistant turn is generated and recorded **without** a
@@ -1179,11 +1182,8 @@ entries in `episode.turns`, not the number of steps you took and not the assista
 in `episode.messages` (those include any few-shot demo the prompt carried in). If your
 `step_episode` returns assistant-role observations, they land in `episode.turns` too and inflate
 this count, so tell them apart by something you control rather than by whether the turn parses.
-A malformed sampled turn still needs its own finite reward: drop it and the vector comes up
-short, `scoring.py` warns `per-turn rewards unavailable (received N reward(s) for M assistant
-turn(s))`, and the whole group falls back to episode-level credit. That is a louder failure than
-the unmatched-turn case above, but it costs you per-turn credit for every episode in the group,
-not just the malformed one.
+A malformed sampled turn is still a sampled turn: score it low, but score it, or you land in the
+same short-vector fallback by a different route.
 
 **Do not verify this by the absence of a warning** — a missing key produces no output at
 all. There are three distinct silent-fallback layers on this path, two of which emit
