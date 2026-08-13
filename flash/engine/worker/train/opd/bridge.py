@@ -38,7 +38,6 @@ from flash.engine.worker.train.opd.batching import (
 )
 from flash.engine.worker.train.opd.gkd import (
     _rollout_terminated,
-    _teacher_prompt_text,
     student_tokens_with_offsets,
 )
 from flash.engine.worker.train.opd.multiturn_validation import validated_multiturn_response
@@ -47,7 +46,7 @@ from flash.engine.worker.train.opd.prompts import (
     _validate_forced_mask,
     encode_shifted_group_metadata,
 )
-from flash.engine.worker.train.opd.scoring import score_rollout
+from flash.engine.worker.train.opd.scoring import score_multiturn_batch, score_rollout
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
 if TYPE_CHECKING:  # annotation-only: `opd_train` imports this module, so a runtime import
@@ -663,23 +662,19 @@ class _TeacherAlignmentBridge:
                 if not turn["truncated"] and not turn["skip_reason"] and turn["response_ids"]
             ]
             if scorable:
-                items = [
-                    (
-                        _teacher_prompt_text(
-                            turns[position]["context_messages"], self.thinking_prefill
-                        ),
-                        turns[position]["completion_text"],
-                    )
-                    for position in scorable
-                ]
-                # ONE call, not a chunk-and-drain loop. score_many already bounds itself to
-                # OPD_TEACHER_SCORING_CONCURRENCY workers, so slicing the items first did not lower
-                # the provider-facing rate -- it only added a BARRIER every 32 items, where the
-                # slowest request in a wave held back the whole next wave and the gpu idled behind
-                # it. handing the full list over keeps the same concurrency ceiling while letting a
-                # finished worker start the next item immediately. `executor.map` preserves input
-                # order, so the zip with `scorable` below is unchanged.
-                teacher_batches = self.teacher.score_many(items)
+                # ONE call, not a chunk-and-drain loop. the batch scorers already bound themselves
+                # to OPD_TEACHER_SCORING_CONCURRENCY workers, so slicing the items first did not
+                # lower the provider-facing rate -- it only added a BARRIER every 32 items, where
+                # the slowest request in a wave held back the whole next wave and the gpu idled
+                # behind it. handing the full list over keeps the same concurrency ceiling while
+                # letting a finished worker start the next item immediately. both routes preserve
+                # input order, so the zip with `scorable` below is unchanged.
+                teacher_batches = score_multiturn_batch(
+                    [turns[position] for position in scorable],
+                    self.prompts[session["index"]],
+                    teacher=self.teacher,
+                    thinking_prefill=self.thinking_prefill,
+                )
                 if len(teacher_batches) != len(scorable):
                     raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
                 with self._stats_lock:

@@ -4217,6 +4217,95 @@ def test_deterministic_empty_alignment_exhaustion_remains_permanent():
     assert bridge.empty_alignments == 3
 
 
+def test_multiturn_image_episode_scores_every_turn_through_the_multimodal_route(monkeypatch):
+    """An image-bearing multi-turn episode must reach the teacher's IMAGE route, not the text one.
+
+    The capability was always present -- `score_many_multimodal` is batched identically to
+    `score_many` and `_chat_messages` already walks an arbitrary multi-turn context. The multi-turn
+    scorer simply never called it, which is what the (now deleted) "not supported" guards encoded.
+    """
+    from flash.content.multimodal import IMAGE_TEACHER_PLACEHOLDER
+
+    class RecordingTeacher:
+        def __init__(self):
+            self.multimodal_calls = []
+
+        def score_many(self, items):
+            raise AssertionError(
+                "an image-bearing episode was scored over the TEXT route; the images are dropped "
+                "and the teacher silently scores a prompt that never showed them"
+            )
+
+        def score_many_multimodal(self, items):
+            self.multimodal_calls.append(items)
+            return [
+                _teacher_score([TeacherToken(text="AB", logprob=-1.0, start=0, end=2)])
+                for _item in items
+            ]
+
+    teacher = RecordingTeacher()
+    bridge = _text_bridge(teacher)
+    monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
+    # one image, declared on the frozen initial prompt exactly as the runner freezes it
+    bridge.prompts = [
+        _BridgePrompt(
+            student_messages=[{"role": "user", "content": [{"type": "image"}]}],
+            teacher_messages=[{"role": "user", "content": IMAGE_TEACHER_PLACEHOLDER}],
+            prompt_ids=(10, 11),
+            image_descriptors=("data:image/png;base64,AAAA",),
+            package_root=None,
+        )
+    ]
+    monkeypatch.setattr(
+        "flash.content.multimodal.image_descriptors_to_data_uris",
+        lambda descriptors, package_root: ["data:image/png;base64,AAAA"],
+    )
+
+    # turn 2's context still carries the image-bearing opening message: the episode history is
+    # cumulative, which is why one decoded URI list serves every turn.
+    first_turn_context = [{"role": "user", "content": [{"type": "image"}]}]
+    second_turn_context = [
+        {"role": "user", "content": [{"type": "image"}]},
+        {"role": "assistant", "content": "AB"},
+        {"role": "user", "content": [{"type": "text", "text": "again"}]},
+    ]
+    bridge._sessions["session-1"] = {
+        "index": 0,
+        "turns": [
+            {
+                "prompt_ids": [10, 11],
+                "response_ids": [65, 66],
+                "completion_text": "AB",
+                "context_messages": context,
+                "truncated": False,
+                "skip_reason": "",
+            }
+            for context in (first_turn_context, second_turn_context)
+        ],
+        "score_cache": None,
+        "score_lock": threading.Lock(),
+        "lease_deadline": time.monotonic() + 60,
+    }
+
+    result = bridge.score_multiturn("session-1")
+
+    assert len(result["turns"]) == 2
+    # ONE call carrying BOTH turns: the batch scorer bounds its own concurrency, so splitting the
+    # turns would only reintroduce a barrier.
+    assert len(teacher.multimodal_calls) == 1
+    scored = teacher.multimodal_calls[0]
+    assert len(scored) == 2
+    for messages, _completion, images, _continue_final in scored:
+        assert images == ["data:image/png;base64,AAAA"]
+        # the session stores STUDENT messages (raw image blocks); the teacher route needs the
+        # rendered placeholder form, one placeholder per supplied image data URI or the client
+        # rejects the request outright.
+        placeholders = sum(
+            str(message.get("content", "")).count(IMAGE_TEACHER_PLACEHOLDER) for message in messages
+        )
+        assert placeholders == len(images)
+
+
 def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch):
     class OrderedTeacher:
         def __init__(self):
@@ -4255,6 +4344,9 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
     bridge = _text_bridge(teacher)
     monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
     bridge._sessions["session-1"] = {
+        # the scorer reads the session's dataset row to decide the teacher route; `start` always
+        # records it (bridge.py) and a text-only prompt carries no image descriptors.
+        "index": 0,
         "turns": [
             {
                 "prompt_ids": [10, 11],

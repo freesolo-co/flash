@@ -219,13 +219,10 @@ class _OpdProgressState:
         return snapshot
 
 
-def _validate_multimodal_opd(request, spec, model_id: str) -> None:
+def _validate_multimodal_opd(spec, model_id: str) -> None:
     """Re-check an image-bearing OPD job now that the env class is loaded.
 
-    The submit-time preflight in multimodal.py reads `multi_turn` out of the dataset params, so a
-    multi-turn env that declares itself by CLASS reaches the worker unflagged; `request.multi_turn`
-    here comes from that class and is authoritative. Runs before the GPU probe and weight download
-    so a rejected job costs no paid setup.
+    Runs before the GPU probe and weight download so a rejected job costs no paid setup.
     """
     from flash.content.multimodal import validate_multimodal_training
 
@@ -234,8 +231,6 @@ def _validate_multimodal_opd(request, spec, model_id: str) -> None:
         "opd",
         getattr(spec.train, "teacher_model", None),
     )
-    if request.multi_turn:
-        raise ValueError("multi-turn image-bearing opd is not supported")
 
 
 def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[float, list]:
@@ -279,7 +274,7 @@ def run_opd_train(spec=None) -> None:
     request = _with_structured_validation(request, structured_validation)
     prompt_rows, multimodal = _render_prompt_rows(request)
     if multimodal:
-        _validate_multimodal_opd(request, spec, model_id)
+        _validate_multimodal_opd(spec, model_id)
     started_at = time.time()
     capability, control_panel_url = _validate_teacher_transport()
     _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))

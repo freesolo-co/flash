@@ -933,7 +933,7 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   shell is ignored. Arbitrary bring-your-own teacher models or keys are not supported (the allow-list
   is curated to teachers verified to score the student's tokens). Image-bearing opd requires
   `qwen3-vl-235b` or `qwen3.5-397b-a17b` (Qwen3.5 unifies text and vision in one checkpoint, so it
-  sees images despite the name carrying no `-vl`) and is single-turn only. The other teachers are
+  sees images despite the name carrying no `-vl`). The other teachers are
   text-only: they accept an image-bearing request and silently ignore the image rather than failing,
   which is why the allow-list is enforced. The key is never stored in the spec or needed at serving time;
   teacher token cost varies by model and is shown in the pre-flight estimate.

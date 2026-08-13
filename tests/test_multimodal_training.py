@@ -637,7 +637,10 @@ def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path
         mm.preflight_validate_image_opd(unsupported)
 
 
-def test_image_opd_preflight_rejects_multi_turn_with_a_vision_teacher():
+def test_image_opd_preflight_allows_multi_turn_with_a_vision_teacher():
+    # multi-turn image opd scores each turn through the same multimodal teacher route a single-turn
+    # rollout uses, so `multi_turn` is no longer a rejection signal -- only the teacher's vision
+    # capability is.
     spec = SimpleNamespace(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
@@ -661,7 +664,36 @@ def test_image_opd_preflight_rejects_multi_turn_with_a_vision_teacher():
         train=SimpleNamespace(teacher_model="qwen3-vl-235b"),
     )
 
-    with pytest.raises(ValueError, match="multi-turn image-bearing opd is not supported"):
+    mm.preflight_validate_image_opd(spec)
+
+
+def test_image_opd_preflight_still_rejects_multi_turn_with_a_text_only_teacher():
+    # the teacher allow-list is unchanged: a text-only teacher accepts an image-bearing request and
+    # silently ignores the image, which is exactly what this guard exists to prevent.
+    spec = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=SimpleNamespace(
+            id="local",
+            params={
+                "multi_turn": True,
+                "records": [
+                    {
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [{"type": "image"}],
+                            }
+                        ],
+                        "image": _data_uri(_png_bytes()),
+                    }
+                ],
+            },
+        ),
+        train=SimpleNamespace(teacher_model="kimi-k3"),
+    )
+
+    with pytest.raises(ValueError, match="cannot see images"):
         mm.preflight_validate_image_opd(spec)
 
 
