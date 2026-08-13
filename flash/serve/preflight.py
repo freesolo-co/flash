@@ -98,7 +98,7 @@ def _run_completion_budget(spec: JobSpec) -> int:
     return int(recipe.max_completion_len_thinking if spec.thinking else recipe.max_completion_len)
 
 
-def resolve_smoke_completion_tokens(spec: JobSpec) -> int:
+def resolve_smoke_completion_tokens(spec: JobSpec, *, constrained: bool = False) -> int:
     """Resolve the deployment smoke's completion budget for one generation.
 
     This sizes a single smoke request, not the run's training context, and the two are deliberately
@@ -106,10 +106,18 @@ def resolve_smoke_completion_tokens(spec: JobSpec) -> int:
     how many tokens answering it needs. Taking the run's number verbatim let a long training context
     spend the smoke's whole wall-clock budget generating, which is why the ceiling exists.
 
-    Kept below the run's own budget rather than above it, so the smoke can only ever ask for fewer
-    tokens than the run trained with -- never more than serving is prepared to produce.
+    A configured grammar is exempt. Deployment registers it as the adapter's serving default, so the
+    smoke generates under it too, and the shortest string it admits can exceed the ceiling -- a long
+    ``choice``, a fixed-repetition ``regex``, a schema with a large ``minLength``. Capping there
+    would truncate the only legal answer and reject an adapter that serves correctly. Deciding that
+    from the constraint needs the tokenizer and a minimum-length analysis of three grammar dialects,
+    so the run's own budget stands in for it: the run trains within that number, so it bounds the
+    grammar it was trained to satisfy.
     """
-    return min(_run_completion_budget(spec), SMOKE_COMPLETION_TOKEN_CEILING)
+    budget = _run_completion_budget(spec)
+    if constrained:
+        return budget
+    return min(budget, SMOKE_COMPLETION_TOKEN_CEILING)
 
 
 def resolve_effective_completion_tokens(spec: JobSpec) -> int | None:

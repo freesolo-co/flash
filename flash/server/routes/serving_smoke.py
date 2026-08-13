@@ -336,8 +336,12 @@ def _run_deployment_smoke(
     # block and reject a healthy deployment. the resolver widens it to what the run reasons within,
     # bounded by a smoke-specific ceiling -- this budget is spent from the same wall clock that must
     # also cold-start the base model and load the adapter, so it cannot track the training context.
+    # a grammar lifts that ceiling: it is the adapter's serving default, so the smoke generates under
+    # it, and the shortest string it admits may be longer than the ceiling allows.
     if spec.thinking:
-        max_tokens = max(256, resolve_smoke_completion_tokens(spec))
+        max_tokens = max(
+            256, resolve_smoke_completion_tokens(spec, constrained=constraint is not None)
+        )
         serving_capacity = serving_completion_token_capacity(
             spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
         )

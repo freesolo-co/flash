@@ -643,6 +643,29 @@ def test_run_deployment_smoke_uses_thinking_completion_budget(monkeypatch):
     assert calls[0]["max_tokens"] == 1536
 
 
+def test_run_deployment_smoke_does_not_cap_a_constrained_request(monkeypatch):
+    """End to end: a grammar reaches serving as the adapter default, so the request keeps the run's
+    explicit budget rather than the smoke ceiling. Capping it would truncate a long-but-legal
+    constrained answer and reject a working adapter."""
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response('<think>reasoning</think>{"answer":"4"}')
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    _run_smoke(
+        _smoke_spec(
+            thinking=True,
+            algorithm="grpo",
+            constraint={"json_object": True},
+            max_completion_tokens=8192,
+        )
+    )
+
+    assert calls[0]["max_tokens"] == 8192
+
+
 @pytest.mark.parametrize(
     "spec",
     [
@@ -917,6 +940,32 @@ def test_smoke_budget_is_capped_independently_of_the_training_context():
     assert RECIPE.sft.max_seq_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
     assert RECIPE.rl.max_completion_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
     assert RECIPE.opd.max_completion_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
+
+
+def test_a_configured_grammar_keeps_the_runs_own_budget():
+    """A grammar is the adapter's serving default, so the smoke generates under it too.
+
+    The shortest string a constraint admits can exceed the ceiling -- a long `choice`, a
+    fixed-repetition `regex`, a schema with a large `minLength`. Capping there truncates the only
+    legal answer, `finish_reason="length"` fails the truncation guard, and an adapter that serves
+    correctly becomes undeployable. That case passes today on an explicit budget, so the ceiling
+    must not reach it.
+    """
+    from flash.serve.preflight import (
+        SMOKE_COMPLETION_TOKEN_CEILING,
+        resolve_smoke_completion_tokens,
+    )
+
+    for algorithm in ("grpo", "opd"):
+        spec = _smoke_spec(
+            thinking=True,
+            algorithm=algorithm,
+            constraint={"choice": ["a" * 20000]},
+            max_completion_tokens=8192,
+        )
+        # unconstrained the same run is capped; the grammar is the only difference.
+        assert resolve_smoke_completion_tokens(spec) == SMOKE_COMPLETION_TOKEN_CEILING
+        assert resolve_smoke_completion_tokens(spec, constrained=True) == 8192
 
 
 def test_nonthinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default():
