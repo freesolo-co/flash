@@ -1554,6 +1554,57 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
     ]
 
 
+def test_dropping_the_weight_cache_gives_the_widened_search_its_own_capacity_looks(
+    orch, monkeypatch
+):
+    """A refusal heard while pinned to the cache volume must not count against the cacheless search.
+
+    The weight-cache volume pins the run to the one region holding those weights, so a refusal there
+    answers "any capacity for this class in that region?" -- a narrower question than the cacheless
+    retry asks. Carrying the tally across would let one region's shortage plus a single blip in the
+    unrestricted pool reach two and stop the run, having heard the wider market refuse only once."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    candidates = (Candidate("runpod", "H100", 0.49, 48),)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
+
+    seen = []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        vol = getattr(run_spec.gpu, "network_volume", None)
+        seen.append((run_spec.gpu.type, vol))
+        if on_handle:
+            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        # region-pinned refusal, then ONE blip in the widened pool, then the market comes back.
+        if len(seen) >= 3:
+            return PollResult(True, metrics={"train_tokens": 4096})
+        return PollResult(False, failure="no_capacity", detail="IN_QUEUE (no capacity)")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=3, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
+    _seed_status(orch, spec)
+    metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+
+    # the run survives to its third look. carrying the cache-pinned refusal would have made the
+    # cacheless blip the second strike and stopped here with the market never having been asked twice.
+    assert metrics["train_tokens"] == 4096
+    assert seen == [
+        ("H100", WEIGHT_CACHE_VOLUME_NAME),
+        ("H100", None),
+        ("H100", None),
+    ]
+
+
 def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     """Issue 5: a Lambda instance whose CUDA never inits fails job_preempted; the retry must move to
     a DIFFERENT provider (RunPod) instead of re-rolling another broken Lambda instance, and the sick

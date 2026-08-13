@@ -865,6 +865,13 @@ def _handle_failure(
         return _FailureDecision(None, False)
     if first_cache_drop:
         ctx.drop_weight_cache = True
+        # dropping the cache WIDENS the search: the weight-cache volume pins the run to the region
+        # holding those weights, so every refusal so far answered "any capacity for this class in
+        # that one region?" -- a narrower question than the cacheless retry is about to ask. Keeping
+        # the tally would let one region's shortage plus a single blip in the unrestricted pool
+        # reach two and stop the run, having heard the wider market refuse only once. Clear it so
+        # the widened search gets its own pair of looks.
+        ctx.capacity_refusals.clear()
         ctx.retry_budget.record_retry(result.failure, cache_drop=True)
     else:
         ctx.retry_budget.record_retry(result.failure, cache_drop=False)
