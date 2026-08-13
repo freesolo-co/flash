@@ -41,10 +41,11 @@ class _SubmitContext:
     # grow only when an attempt actually provisioned a class and lost it to infra.
     failed_providers: set[str] = field(default_factory=set)
     tried_classes: set[tuple[str, str, int]] = field(default_factory=set)
-    # shapes this run has seen refuse capacity, so a second refusal of the same one is a repeat
-    # rather than a first look. only capacity failures land here: a stall or a preemption says
-    # nothing about whether the class is rentable.
-    capacity_refused: set[tuple[str, str, int]] = field(default_factory=set)
+    # how many times each shape has refused capacity, so a second refusal of the SAME one is a
+    # repeat rather than a first look. counted per shape, not collected as a set of names: over
+    # several classes a set says "everything has refused" while one of them has been asked once.
+    # only capacity failures land here -- a stall or a preemption says nothing about rentability.
+    capacity_refusals: dict[tuple[str, str, int], int] = field(default_factory=dict)
     oom_vram_floor: float = 0.0
     last_detail: str | None = None
     # sticky: once dropped stays dropped so all remaining attempts run on the unrestricted all-dc pool.
@@ -831,10 +832,14 @@ def _handle_failure(
     )
     if capacity_exhausted:
         will_retry = False
-    # after the check, which asks whether this shape had refused BEFORE this attempt. recorded even
-    # when the run stops here, so an attach/recovery path reading this context sees the full picture.
+    # after the check, which asks whether this shape had refused BEFORE this attempt.
+    #
+    # in-memory and per-process on purpose: _build_context starts this empty every time, so a run
+    # resumed after a control-plane restart gets a fresh pair of looks at the market rather than
+    # inheriting a verdict from minutes ago. capacity is exactly the thing that changes in between.
     if result.failure == "no_capacity" and outcome.chosen is not None:
-        ctx.capacity_refused.add(_lifecycle._shape_key(outcome.chosen))
+        refused_key = _lifecycle._shape_key(outcome.chosen)
+        ctx.capacity_refusals[refused_key] = ctx.capacity_refusals.get(refused_key, 0) + 1
     retry_target = _retry_target(
         ctx,
         outcome,

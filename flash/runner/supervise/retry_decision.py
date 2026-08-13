@@ -38,6 +38,11 @@ def _every_shape_tried(
     return all(_lifecycle._shape_key(candidate) in retry_tried for candidate in outcome.candidates)
 
 
+# how many times one shape has to refuse capacity before the run believes it. one refusal is a
+# data point (a search flake, a momentary shortage); two is the market's answer.
+_REFUSALS_BEFORE_GIVING_UP = 2
+
+
 # what the log says INSTEAD of naming a retry target, when the run stops on exhausted capacity.
 # it names the things that actually change the outcome, because waiting is not one of them.
 _EXHAUSTED_CAPACITY_ACTION = (
@@ -63,7 +68,12 @@ def _capacity_exhausted(
     The bar is a SECOND refusal of the same shape, not the first. ``no_capacity`` covers a
     transient search flake and an exhausted provider pool as well as the 900s queue-grace expiry,
     and a market that was dry a minute ago routinely frees a card -- so one refusal is a data point,
-    while the same shape refusing twice in a row is the pattern that no amount of re-queueing fixes.
+    while the same shape refusing twice is the pattern that no amount of re-queueing fixes.
+
+    Counted PER SHAPE, which is the whole reason this is a tally and not a set of names. Over an
+    ordered pin of A and B, "A refused, B refused, A refused" puts both shapes on a membership list
+    while B has been asked exactly once -- ending the run on a class that never got its confirming
+    look, which is the transient-shortage failure this margin exists to prevent.
 
     Deliberately narrow beyond that. It fires only when every fitting shape is in that state and no
     cache-less retry is left to change the search: those retries are not repeats, because dropping
@@ -74,11 +84,14 @@ def _capacity_exhausted(
         return False
     if outcome.chosen is None:
         return False
-    # the shape that just refused counts as refused; the question is whether it had refused BEFORE.
-    if _lifecycle._shape_key(outcome.chosen) not in ctx.capacity_refused:
-        return False
+    # the tally as it will stand once this failure is recorded, so the shape that just refused is
+    # counted in its own verdict rather than judged on the state before it spoke.
+    refusals = dict(ctx.capacity_refusals)
+    chosen_key = _lifecycle._shape_key(outcome.chosen)
+    refusals[chosen_key] = refusals.get(chosen_key, 0) + 1
     return all(
-        _lifecycle._shape_key(candidate) in ctx.capacity_refused for candidate in outcome.candidates
+        refusals.get(_lifecycle._shape_key(candidate), 0) >= _REFUSALS_BEFORE_GIVING_UP
+        for candidate in outcome.candidates
     )
 
 

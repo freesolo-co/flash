@@ -1274,6 +1274,28 @@ def test_persisted_gpu_type_fallbacks_are_canonicalized_and_require_a_head() -> 
         _job_from_dict({"gpu": {"type_fallbacks": ["H100"]}})
 
 
+def test_persisted_ordered_gpu_pin_survives_a_status_reload() -> None:
+    """`to_dict()` writes the AUTHORED list, and the runner reloads that record through
+    `JobSpec.from_dict` on roughly twenty paths (status reads, attach, recovery, serving, billing).
+    So the internal parser has to accept the list spelling too: when it took only the split form,
+    every ordered-pin run parsed once and then died on its first status reload."""
+    spec = _job_from_dict({"gpu": {"type": "A100 PCIe", "type_fallbacks": ["A100 SXM"]}})
+
+    persisted = spec.to_dict()
+    assert persisted["gpu"]["type"] == ["A100 PCIe", "A100 SXM"]
+
+    reloaded = JobSpec.from_dict(persisted)
+    assert reloaded.gpu.acceptable_types == spec.gpu.acceptable_types
+    # and the reload is stable, because a record is re-read on every hop, not just the first.
+    assert JobSpec.from_dict(reloaded.to_dict()).gpu.acceptable_types == spec.gpu.acceptable_types
+
+    # the two spellings are alternatives, never combined: one of them has to be the authored order.
+    with pytest.raises(ValueError, match=r"cannot both be set"):
+        _job_from_dict({"gpu": {"type": ["H100", "B200"], "type_fallbacks": ["A100 SXM"]}})
+    with pytest.raises(ValueError, match=r"at least one gpu"):
+        _job_from_dict({"gpu": {"type": []}})
+
+
 def test_removed_gpu_pin_key_is_rejected_as_unknown() -> None:
     removed_key = "exact" + "_type"
     raw = _raw()

@@ -140,6 +140,37 @@ def _validated_gpu_type_fallbacks(value: Any, *, head: str) -> tuple[str, ...]:
     return tuple(fallbacks)
 
 
+def _parse_persisted_gpu_types(gpu: dict) -> tuple[str, tuple[str, ...]]:
+    """Read a persisted `[gpu]` mapping into the concrete head plus its ordered alternatives.
+
+    `type` arrives in EITHER spelling here, and both have to work. This is the reader of
+    ``to_dict()``, which re-folds an ordered pin back into the authored list so a resubmitted payload
+    round-trips; it is also the reader of a persisted ``status.spec``, which the runner reloads on
+    roughly twenty paths. Accepting only the split form would crash every ordered run on its first
+    status reload, and accepting only the list form would break the split.
+    """
+    gpu_type_raw = gpu.get("type", "")
+    extra_types: tuple = ()
+    if isinstance(gpu_type_raw, (list, tuple)):
+        authored = list(gpu_type_raw)
+        if not authored:
+            raise ValueError("gpu.type list must name at least one gpu")
+        gpu_type_raw, extra_types = authored[0], tuple(authored[1:])
+        if gpu.get("type_fallbacks"):
+            raise ValueError("gpu.type list and gpu.type_fallbacks cannot both be set")
+    if not isinstance(gpu_type_raw, str):
+        raise TypeError("gpu.type must be a string")
+    gpu_type = (
+        _validated_gpu_type(gpu_type_raw, field_name="gpu.type") if gpu_type_raw.strip() else ""
+    )
+    # every entry is canonicalized and validated exactly like the head: a persisted record is re-read
+    # here on every recovery hop, and an unvalidated fallback would only fail once allocation
+    # reached it.
+    return gpu_type, _validated_gpu_type_fallbacks(
+        extra_types or gpu.get("type_fallbacks", ()), head=gpu_type
+    )
+
+
 def _opt_int(value: Any) -> int | None:
     """Parse optional int; rejects bools (bool is int subclass — int(True)==1 is a footgun)."""
     if value is None:
@@ -670,19 +701,7 @@ class JobSpec:
         unknown_gpu = sorted(set(gpu) - {item.name for item in fields(GpuSpec)})
         if unknown_gpu:
             raise ValueError(f"gpu has unknown key(s): {', '.join(unknown_gpu)}")
-        gpu_type_raw = gpu.get("type", "")
-        if not isinstance(gpu_type_raw, str):
-            raise TypeError("gpu.type must be a string")
-        gpu_type = (
-            _validated_gpu_type(gpu_type_raw, field_name="gpu.type") if gpu_type_raw.strip() else ""
-        )
-        # an ordered `[gpu] type` list is split by the public parser into a concrete head plus these
-        # fallbacks, so this internal boundary still sees one class per field. every entry is
-        # canonicalized and validated exactly like the head: a persisted record is re-read here on
-        # every recovery hop, and an unvalidated fallback would only fail once allocation reached it.
-        gpu_type_fallbacks = _validated_gpu_type_fallbacks(
-            gpu.get("type_fallbacks", ()), head=gpu_type
-        )
+        gpu_type, gpu_type_fallbacks = _parse_persisted_gpu_types(gpu)
         provider = gpu.get("provider", "")
         if not isinstance(provider, str):
             raise TypeError("gpu.provider must be a string")

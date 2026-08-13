@@ -963,6 +963,109 @@ def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_clas
     assert 'type = ["A100 PCIe", "A100 SXM"]' in out
 
 
+def test_ordered_gpu_pin_walks_to_its_fallback_when_the_first_class_is_dry(orch, monkeypatch):
+    """The point of the ordered list, end to end: a pin that used to have nowhere to walk now does.
+
+    Same capacity shortage as the stop test above, but the author named an alternative, so the run
+    escalates to it and finishes instead of failing. This is the pairing that matters -- the stop
+    only bounds the damage, whereas the list is what actually gets the run onto a card."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    # what an ordered pin produces: both named classes offered, cheapest first.
+    candidates = (
+        Candidate("runpod", "A100 PCIe", 1.19, 80),
+        Candidate("runpod", "A100 SXM", 1.89, 80),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
+
+    submitted_gpus = []
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        if attempt == 0:
+            return PollResult(
+                False,
+                failure="no_capacity",
+                detail="never scheduled: job stuck IN_QUEUE for 903s",
+            )
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    # `_spec` goes through JobSpec.from_dict, the INTERNAL boundary, which sees the already-split
+    # head plus fallbacks -- the authored `type = [...]` list is the public schema's spelling and is
+    # split there (covered in test_spec_and_validation.py). Same spec either way, as asserted next.
+    spec = _spec(
+        run_id="flash-ordered-gpu-walk",
+        type="A100 PCIe",
+        type_fallbacks=("A100 SXM",),
+    )
+    assert spec.gpu.acceptable_types == ("A100 PCIe", "A100 SXM")
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert metrics["train_tokens"] == 4096
+    # the dry class is not re-asked; the named alternative is where the retry lands.
+    assert submitted_gpus == ["A100 PCIe", "A100 SXM"]
+    assert "every GPU class this run can use is out of capacity" not in log.getvalue()
+
+
+def test_every_named_class_gets_its_own_confirming_retry(orch, monkeypatch):
+    """The two-refusal margin is per CLASS, so no class is written off on a single refusal.
+
+    Walking an ordered pin of A then B, the sequence "A refused, B refused, A refused" leaves B
+    asked exactly once. Tracking mere membership ("has this shape ever refused?") would call that
+    exhaustion and end the run on a class that never got its confirming look -- reintroducing, for
+    multi-class pins, exactly the transient-shortage failure the margin exists to prevent."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("runpod", "A100 PCIe", 1.19, 80),
+        Candidate("runpod", "A100 SXM", 1.89, 80),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
+
+    submitted_gpus = []
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        # three refusals, then capacity returns. the third is PCIe's second, which under
+        # set-membership tracking would have read as "every class has refused" and ended the run.
+        if len(submitted_gpus) <= 3:
+            return PollResult(False, failure="no_capacity", detail="dry")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(
+        run_id="flash-per-class-margin",
+        type="A100 PCIe",
+        type_fallbacks=("A100 SXM",),
+        max_retries=5,
+    )
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert metrics["train_tokens"] == 4096
+    # PCIe, SXM, PCIe -- and then a FOURTH attempt, which membership tracking would have refused to
+    # make. Which class the picker returns to is its own cheapest-first business (SXM is dearer, so
+    # it clamps back to PCIe); what this pins down is that the run was still alive to make the call.
+    assert submitted_gpus == ["A100 PCIe", "A100 SXM", "A100 PCIe", "A100 PCIe"]
+    assert "every GPU class this run can use is out of capacity" not in log.getvalue()
+
+
 def test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up(orch, monkeypatch):
     """One `no_capacity` is a data point, not a verdict, so it must not end the run.
 
