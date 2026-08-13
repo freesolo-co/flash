@@ -707,6 +707,31 @@ def test_progress_age_distinguishes_real_heartbeat_from_liveness_bound(monkeypat
         assert "advances normally" not in out
 
 
+def test_fresh_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch):
+    from flash.cli.ui import heartbeat
+
+    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    obj = {
+        "state": "running",
+        "last_heartbeat": {
+            "stage": "rl_step",
+            "step": 14,
+            "ts": 1990.0,
+            "liveness": True,
+            "progress_age_s": 1800.0,
+        },
+    }
+
+    pairs = heartbeat._heartbeat_pairs(obj)
+    assert ("worker", "rl_step · step 14 · alive ping") in pairs
+    assert ("heartbeat", "10s ago") in pairs
+    progress = dict(pairs)["progress"]
+    assert "last known progress can be as old as 1810.0s" in progress
+    assert "upload throttling no longer explains the gap" in progress
+    assert heartbeat._QUIET_HEARTBEAT_HINT not in progress
+    assert len([label for label, _ in pairs if label == "progress"]) == 1
+
+
 def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
     from flash.cli.ui import heartbeat
 
@@ -728,6 +753,36 @@ def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch)
     old_hint = progress(old_worker)
     assert progress({**old_worker, "progress_age_s": 220.0}) == old_hint
     assert progress({**old_worker, "progress_age_s": 20.0, "liveness": True}) == old_hint
+
+
+@pytest.mark.parametrize("bad_progress_age", [10**400, float("inf"), float("nan"), True])
+def test_invalid_progress_age_falls_back_to_legacy_hint(monkeypatch, bad_progress_age):
+    from flash.cli.ui import heartbeat
+
+    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    base = {
+        "state": "running",
+        "remote": {"attempt": 2},
+    }
+    heartbeat_base = {
+        "stage": "rl_step",
+        "step": 14,
+        "attempt": 2,
+        "ts": 800.0,
+    }
+
+    legacy = dict(heartbeat._heartbeat_pairs({**base, "last_heartbeat": heartbeat_base}))[
+        "progress"
+    ]
+    invalid = dict(
+        heartbeat._heartbeat_pairs(
+            {
+                **base,
+                "last_heartbeat": {**heartbeat_base, "progress_age_s": bad_progress_age},
+            }
+        )
+    )["progress"]
+    assert invalid == legacy
 
 
 def test_missing_progress_age_preserves_legacy_stale_step_hint(monkeypatch):

@@ -13,6 +13,7 @@ CLI tests reach them.
 
 from __future__ import annotations
 
+import math
 import time
 
 from flash.cli.ui.render import _dim
@@ -115,8 +116,9 @@ _QUIET_HEARTBEAT_HINT = (
 # window, where a 900s gate would stay silent and leave only the dead-end quiet hint.
 _STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
 # progress_age_s is frozen at payload build time, so it is not a present-tense liveness reading by
-# itself. once the upload is older than the throttle, compare it with the worker-side reading without
-# claiming either health or a stall: newer progress may be uncommitted, or the worker may be silent.
+# itself. combine it with upload age when progress predates ts, and speak once that conservative bound
+# reaches the throttle without claiming either health or a stall: newer progress may be uncommitted,
+# or the worker may be silent.
 _UPLOAD_THROTTLE_S = 900.0
 # only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
 # post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older
@@ -259,8 +261,6 @@ def _stale_step_hint(
     # throttled progress hides that the replacement has published nothing.
     if not current_attempt:
         return None
-    if heartbeat_age_seconds <= _STALE_STEP_AFTER_S:
-        return None
     if str(heartbeat.get("stage") or "") not in _TRAINING_STEP_STAGES:
         return None
     # step 0 is the cold, still-running first step: no optimizer update has landed, so there is no
@@ -271,27 +271,32 @@ def _stale_step_hint(
     if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
         return None
     progress_age_s = heartbeat.get("progress_age_s")
-    if (
-        isinstance(progress_age_s, (int, float))
-        and not isinstance(progress_age_s, bool)
-        and progress_age_s >= 0
-    ):
-        # a liveness ping records no progress at ts, so its last known progress predates the payload by
-        # progress_age_s. a real heartbeat records progress at ts; there progress_age_s is the prior
-        # progress interval, useful as a step-period yardstick rather than as current silence. the
-        # caller already proved the upload is older than the quiet threshold, so this bound is too;
-        # no recent-progress reading is reachable here. past 900s use the conservative comparison;
-        # below it retain the existing throttle-lag reading.
+    progress_age: float | None = None
+    if not isinstance(progress_age_s, bool):
+        try:
+            candidate = float(progress_age_s)
+        except (OverflowError, TypeError, ValueError):
+            pass
+        else:
+            if candidate >= 0 and math.isfinite(candidate):
+                progress_age = candidate
+    if progress_age is not None:
+        # liveness and carried payloads both report progress anchored before ts. carried progress
+        # advances the provider stall clock, but the marker makes clear that no new progress happened
+        # at this upload. only an ordinary real heartbeat treats ts itself as the progress point.
+        progress_anchored_before_ts = bool(
+            heartbeat.get("liveness") or heartbeat.get("progress_carried") is True
+        )
         progress_age_bound_s = heartbeat_age_seconds
-        if heartbeat.get("liveness"):
-            progress_age_bound_s += float(progress_age_s)
+        if progress_anchored_before_ts:
+            progress_age_bound_s += progress_age
         if progress_age_bound_s >= _UPLOAD_THROTTLE_S:
-            if heartbeat.get("liveness"):
+            if progress_anchored_before_ts:
                 comparison = f"the last known progress can be as old as {progress_age_bound_s:.1f}s"
             else:
                 comparison = (
                     f"the upload is {heartbeat_age_seconds:.1f}s old versus the worker's prior "
-                    f"progress interval of {float(progress_age_s):.1f}s"
+                    f"progress interval of {progress_age:.1f}s"
                 )
             return (
                 "the step above is the last one UPLOADED; "
@@ -301,8 +306,11 @@ def _stale_step_hint(
             )
         # below the 900s hold, throttling still explains the visible lag. fall through to the exact
         # pre-existing reading so new workers never lose guidance in the incident's 300-900s band.
+    if heartbeat_age_seconds <= _STALE_STEP_AFTER_S:
+        return None
     # old workers do not publish progress_age_s. keep their existing throttle-only reading exactly so
-    # content-addressed in-flight runs do not change interpretation when the CLI upgrades.
+    # content-addressed in-flight runs do not change interpretation when the CLI upgrades. invalid
+    # progress ages use the same fallback because they provide no trustworthy worker-side reading.
     return (
         "the step above is the last one UPLOADED, not necessarily the one training is on; "
         "a throttled worker can hold it for many minutes while the trainer advances normally. "

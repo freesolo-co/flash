@@ -868,6 +868,17 @@ def test_progress_carry_upgrades_ping_after_throttled_real_heartbeat(monkeypatch
     assert uploads[-1]["progress_age_s"] == 901.0, (
         "carried progress keeps the age of the original real heartbeat; the upgrade is not new progress"
     )
+    assert uploads[-1]["progress_carried"] is True
+
+    # feed the real carried payload through the cli path. progress predates its ts, so ten seconds
+    # after upload the conservative age bound is 10 + 901, not the upload age alone.
+    now["t"] = 1911.0
+    from flash.cli.ui.heartbeat import _heartbeat_pairs
+
+    pairs = _heartbeat_pairs({"state": "running", "last_heartbeat": uploads[-1]})
+    progress = dict(pairs)["progress"]
+    assert "last known progress can be as old as 911.0s" in progress
+    assert "the upload is 10.0s old versus" not in progress
 
     uploads.clear()
     now["t"] = 2802.0  # next slot; no real heartbeat since the carried one
@@ -876,6 +887,7 @@ def test_progress_carry_upgrades_ping_after_throttled_real_heartbeat(monkeypatch
         "once carried progress is committed, later pings must stay liveness — a wedged worker "
         "pinging alive must not mask a stall"
     )
+    assert "progress_carried" not in uploads[-1]
 
 
 def test_progress_carry_survives_failed_upload(monkeypatch):

@@ -142,6 +142,7 @@ def heartbeat(
     stage: str, *, liveness: bool = False, force: bool = False, initial: bool = False, **kw
 ):
     global _HB_CLAIM_SEQ
+    progress_carried = False
     with _HB_LOCK:
         ts = time.time()
         previous_progress_ts = float(_w._HB_LAST_PROGRESS_TS or 0.0)
@@ -157,7 +158,10 @@ def heartbeat(
             # control plane's stall clock sees that progress instead of killing a healthy run.
             # carried progress is not new progress, so do not advance _HB_LAST_PROGRESS_TS: the
             # worker's own stall-dump timer and the published age keep the original reference point.
+            # mark the payload because clearing liveness advances the provider stall clock but does not
+            # mean progress happened at this payload's ts.
             liveness = False
+            progress_carried = True
         my_progress_seq = _w._HB_PROGRESS_SEQ
     # progress-carry may clear the liveness flag, but it only republishes progress already recorded at
     # previous_progress_ts. keep the age anchored there so carried progress does not look newly made.
@@ -170,6 +174,7 @@ def heartbeat(
         "attempt": _w.ATTEMPT,
         **({"liveness": True} if liveness else {}),
         **kw,
+        **({"progress_carried": True} if progress_carried else {}),
     }
     if previous_progress_ts:
         payload["progress_age_s"] = round(ts - previous_progress_ts, 1)
