@@ -96,12 +96,87 @@ def _is_secret_property_pattern(pattern: Any) -> bool:
 
     Anchors and redundant grouping are stripped -- both constrain WHERE or HOW the expression
     matches, not what it names, so `^(password)$` names the same field as `password`. Anything
-    else (alternation, character classes, quantifiers) is left in place, so a genuinely non-secret
-    pattern is still judged on its full spelling rather than guessed at.
+    else (character classes, quantifiers) is left in place, so a genuinely non-secret pattern is
+    still judged on its full spelling rather than guessed at.
+
+    An alternation names several fields at once. It is secret only when EVERY branch is, since one
+    non-secret branch means the pattern also matches an ordinary property whose literals must
+    survive: `^(password|api_key)$` is a credential either way, while `^(password|city)$` is not.
     """
     if not isinstance(pattern, str):
         return False
-    return _is_secret_key(_unwrap_pattern_groups(pattern))
+    unwrapped = _unwrap_pattern_groups(pattern)
+    branches = _alternation_branches(_peel_enclosing_group(unwrapped))
+    if branches is not None:
+        return all(_is_secret_key(_unwrap_pattern_groups(branch)) for branch in branches)
+    return _is_secret_key(unwrapped)
+
+
+def _peel_enclosing_group(pattern: str) -> str:
+    """Remove one group that wraps the WHOLE expression, keeping any alternation inside it.
+
+    `_unwrap_pattern_groups` deliberately refuses to unwrap a group containing `|`, because
+    `(password|city)` is not the single name `password`. The all-secret test needs to see those
+    branches, so this peels the wrapper for that inspection only -- what it returns is never used
+    as a field name.
+    """
+    if not (pattern.startswith("(") and pattern.endswith(")")):
+        return pattern
+    inner = pattern[1:-1].removeprefix("?:")
+    depth = 0
+    for character in inner:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                return pattern
+    return inner if depth == 0 else pattern
+
+
+def _alternation_branches(pattern: str) -> tuple[str, ...] | None:
+    """Split a top-level alternation into its branches, or None if there is no top-level `|`.
+
+    Only alternation bars OUTSIDE any group or character class separate branches: in `(a|b)c|d` the
+    first bar belongs to the group and splitting on it would invent branches the regex never has.
+    An escaped bar is a literal character, not a separator.
+    """
+    branches: list[str] = []
+    current: list[str] = []
+    depth = 0
+    in_class = False
+    escaped = False
+    for character in pattern:
+        if escaped:
+            current.append(character)
+            escaped = False
+            continue
+        if character == "\\":
+            current.append(character)
+            escaped = True
+            continue
+        if in_class:
+            current.append(character)
+            if character == "]":
+                in_class = False
+            continue
+        if character == "[":
+            in_class = True
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif character == "|" and depth == 0:
+            branches.append("".join(current))
+            current = []
+            continue
+        current.append(character)
+    if not branches or depth != 0 or in_class or escaped:
+        # an unbalanced or truncated expression is untrustworthy recorded input; judge it whole
+        # rather than acting on a split that may not reflect what it matches.
+        return None
+    branches.append("".join(current))
+    return tuple(branches)
 
 
 def _unwrap_pattern_groups(pattern: str) -> str:

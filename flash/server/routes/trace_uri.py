@@ -98,10 +98,14 @@ def _is_default_port(port: str, default_port: str | None) -> bool:
 
     `0443` and `443` are the same port: a string comparison kept the padded form, so the same
     resource reached under it was classified external and its secret schema literals survived.
+
+    The comparison is made on the zero-stripped TEXT rather than through `int`. A recorded URI is
+    untrusted input and may carry thousands of digits, which `int()` refuses to parse at all --
+    raising out of sanitization and dropping the whole paid request from storage.
     """
     if default_port is None or not port.isdigit():
         return False
-    return int(port) == int(default_port)
+    return _canonical_port(port) == _canonical_port(default_port)
 
 
 def _canonical_port(port: str) -> str:
@@ -111,10 +115,14 @@ def _canonical_port(port: str) -> str:
     keeping both spellings classified a local `$id` reached under one of them as external and left
     the local definition's secret literals in the raw export. A non-numeric port is untrustworthy
     recorded input and is left alone rather than reinterpreted.
+
+    Stripping is textual for the same reason as above: `int()` rejects an integer literal beyond
+    its digit limit, so a URI with a 5000-digit port made sanitization raise. Text handles any
+    length and gives the same answer for every port a real URI can carry.
     """
     if not port.isdigit():
         return port
-    return str(int(port))
+    return port.lstrip("0") or "0"
 
 
 def _canonical_registered_host(host: str) -> str:

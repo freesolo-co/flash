@@ -105,8 +105,12 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
                     is_dynamic = keyword in {"$dynamicRef", "$recursiveRef"}
                     resolved_base, fragment = _safe_urldefrag(_safe_urljoin(scope_uri, ref))
                     canonical_base = _canonical_resource_uri(resolved_base)
-                    resource_path = resources.get(canonical_base)
-                    if resource_path is not None:
+                    # a canonical id may be declared by several nodes. duplicates make the schema
+                    # ambiguous, so every declaring path is an equally valid resolution of this
+                    # reference and all of them are redacted; keeping one left the others' secret
+                    # literals in the raw export.
+                    resource_paths = resources.get(canonical_base)
+                    if resource_paths:
                         resource_ref = f"#{fragment}"
                         if keyword == "$recursiveRef" and resource_ref == "#":
                             # `$recursiveRef` resolves against the dynamic scope, so an ENCLOSING
@@ -120,7 +124,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
                                 if anchor_belongs_to_resource(pointer, canonical_base)
                                 or path[: len(pointer)] == pointer
                             )
-                            found.update(pointers or {resource_path})
+                            found.update(pointers or resource_paths)
                         elif is_dynamic and resource_ref != "#":
                             # union, not replacement: a plain-name fragment also names an ordinary
                             # `$anchor`, so dropping the static resolution would leave a same-named
@@ -134,7 +138,11 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
                         else:
                             pointers = _local_schema_pointer(resource_ref, anchors)
                             if resource_ref == "#" or resource_ref.startswith("#/"):
-                                found.update((*resource_path, *pointer) for pointer in pointers)
+                                found.update(
+                                    (*resource_path, *pointer)
+                                    for resource_path in resource_paths
+                                    for pointer in pointers
+                                )
                             else:
                                 found.update(
                                     pointer
@@ -298,8 +306,32 @@ def _declares_schema_response_format(item: dict[Any, Any]) -> bool:
 
     Both halves are required. `json_object` and `text` declare no schema at all, and a bare
     `json_schema` wrapper without the discriminator is not a request any provider accepts.
+
+    The wrapper must also CONTAIN the declaration it promises. Accepting any object let
+    `{"type": "json_schema", "json_schema": {"parameters": {...}}}` open the host, and the
+    unrelated `parameters` wrapper inside was then read as a declaration -- so a secret property's
+    unknown literal survived in a request the provider rejects.
     """
-    return item.get("type") == "json_schema" and isinstance(item.get("json_schema"), dict)
+    declaration = item.get("json_schema")
+    return (
+        item.get("type") == "json_schema"
+        and isinstance(declaration, dict)
+        and _has_schema_wrapper_evidence(declaration.get("schema"))
+    )
+
+
+_TOOL_RESULT_ROLES = frozenset({"tool", "function"})
+
+
+def _names_tool_role(role: Any) -> bool:
+    """Whether a message's `role` names a tool, allowing for case and surrounding whitespace.
+
+    A compatibility layer or a rejected request may spell the role `"Tool"` or `" tool "`, and an
+    exact membership test dropped the tool-result context for those. The message's serialized
+    output was then kept as ordinary prose, so a credential the tool returned reached the raw
+    export. Only the classification normalizes: the stored role keeps whatever spelling arrived.
+    """
+    return isinstance(role, str) and role.strip().casefold() in _TOOL_RESULT_ROLES
 
 
 def _carries_tool_result(container: dict[Any, Any], key: Any, *, inside_tool_result: bool) -> bool:
@@ -311,7 +343,7 @@ def _carries_tool_result(container: dict[Any, Any], key: Any, *, inside_tool_res
     or, in the parts form, as a part's `text`; the parts case is narrowed to that key so a part's
     `type` or `id` is not parsed as output.
     """
-    if key == "content" and container.get("role") in {"tool", "function"}:
+    if key == "content" and _names_tool_role(container.get("role")):
         return True
     # the enclosing message's role already established that this is tool output; the part's `type`
     # only narrows WHICH member carries it, and `text` is that member in every spelling. requiring
@@ -509,9 +541,13 @@ def _redact_secret_child(
         # and `json_schema` are spelled only INSIDE a host, so a top-level extension
         # of either name is ordinary data rather than a declaration.
         schema_host=schema_host or (payload_root and _opens_root_schema_host(key, item)),
-        # `tools`/`functions` hold tool DEFINITIONS; their entries must each qualify.
+        # `tools`/`functions` hold tool DEFINITIONS; their entries must each qualify. the
+        # container's NAME travels with the flag because the two spell their declarations
+        # differently, and an entry is only real in the array whose dialect it uses.
         tool_definition_list=(
-            payload_root and key in _ARRAY_SHAPED_ROOT_HOST_KEYS and isinstance(item, list)
+            str(key)
+            if payload_root and key in _ARRAY_SHAPED_ROOT_HOST_KEYS and isinstance(item, list)
+            else None
         ),
         schema_wrapper=schema_wrapper
         or wrapper_has_schema
@@ -546,7 +582,7 @@ def _redact_secret_fields(
     function_container: bool = False,
     schema_host: bool = False,
     schema_wrapper: bool = False,
-    tool_definition_list: bool = False,
+    tool_definition_list: str | None = None,
     tool_call_list: bool = False,
     tool_call: bool = False,
     secret_schema_refs: set[tuple[str, ...]] | None = None,
@@ -641,13 +677,19 @@ def _redact_secret_fields(
     )
 
 
-def _is_tool_definition(item: Any) -> bool:
+def _is_tool_definition(item: Any, *, container: str) -> bool:
     """Whether an entry of a `tools`/`functions` array is really a tool definition.
 
     The array shape alone is not the declaration: `{"tools": [{"parameters": {...}}]}` has the right
     container but an entry no provider would accept, and honouring it let the nested wrapper keep a
-    secret property's literal. A real entry either wraps its declaration in `function`, or names the
-    tool directly alongside its schema (Anthropic's `input_schema`, the legacy `functions` form).
+    secret property's literal.
+
+    The two containers are different dialects and each accepts only its own form. `tools` entries
+    wrap the declaration in `function` (or name the tool beside its schema, as Anthropic's
+    `input_schema` does); legacy `functions` entries are flat -- name and `parameters` at the entry
+    itself. Judging an entry without knowing its container accepted both spellings in both arrays,
+    so a payload the provider rejects still opened the schema exemption and preserved a secret
+    property's unknown literal in the raw export.
     """
     if not isinstance(item, dict):
         return False
@@ -656,6 +698,9 @@ def _is_tool_definition(item: Any) -> bool:
     # provider would accept open the schema exemption, so its nested wrapper kept a literal.
     function = item.get("function")
     if isinstance(function, dict):
+        # the legacy `functions` array has no wrapper form: its entries are flat.
+        if container != "tools":
+            return False
         # the wrapper is only a declaration under the tool type that DEFINES it. `{"type":
         # "custom", "function": {...}}` is an entry no provider accepts, yet a bare name check
         # honoured it and opened the schema exemption, so the nested wrapper kept a secret
@@ -667,11 +712,16 @@ def _is_tool_definition(item: Any) -> bool:
         name = function.get("name")
         return isinstance(name, str) and bool(name.strip())
     name = item.get("name")
-    return (
-        isinstance(name, str)
-        and bool(name.strip())
-        and any(isinstance(item.get(wrapper), dict) for wrapper in _JSON_SCHEMA_WRAPPER_KEYS)
+    if not (isinstance(name, str) and name.strip()):
+        return False
+    # `parameters` is the LEGACY spelling, valid only in `functions`. a modern `tools` entry that
+    # spells its schema that way without the `function` wrapper is a request providers reject.
+    wrappers = (
+        _JSON_SCHEMA_WRAPPER_KEYS
+        if container == "functions"
+        else _JSON_SCHEMA_WRAPPER_KEYS - {"parameters"}
     )
+    return any(isinstance(item.get(wrapper), dict) for wrapper in wrappers)
 
 
 def _redact_secret_sequence(
@@ -688,7 +738,7 @@ def _redact_secret_sequence(
     assistant_content: bool,
     tool_result_content: bool,
     schema_host: bool,
-    tool_definition_list: bool,
+    tool_definition_list: str | None,
     tool_call_list: bool,
     schema_wrapper: bool,
     secret_schema_refs: set[tuple[str, ...]] | None,
@@ -720,7 +770,11 @@ def _redact_secret_sequence(
             tool_result_content=tool_result_content,
             # inside a declaration array the host survives only for entries that really are tool
             # definitions; a fake entry beside a real one gets no exemption of its own.
-            schema_host=schema_host and (not tool_definition_list or _is_tool_definition(item)),
+            schema_host=schema_host
+            and (
+                tool_definition_list is None
+                or _is_tool_definition(item, container=tool_definition_list)
+            ),
             tool_call=tool_call_list,
             schema_wrapper=schema_wrapper,
             secret_schema_refs=secret_schema_refs,

@@ -9292,3 +9292,209 @@ def test_a_streamed_structured_reply_is_redacted_after_assembly() -> None:
     output = accumulator.output()
     assert output["choices"][0]["message"]["content"] == '{"password": "STREAMEDLEAK"}'
     assert "STREAMEDLEAK" not in json.dumps(traces._sanitize_for_trace(output, (), response=True))
+
+
+def test_every_duplicate_resource_target_is_redacted() -> None:
+    """Duplicate `$id`s make a schema ambiguous, but a recorded payload is untrusted input and may
+    carry them. Keeping only the first declaring path meant a `$ref` from a secret property marked
+    one definition and left the other -- an equally valid resolution -- with its credential."""
+
+    payload = _tool_hosted(
+        {
+            "type": "object",
+            "properties": {"password": {"$ref": "urn:cred"}},
+            "$defs": {
+                "First": {"$id": "urn:cred", "type": "string", "default": "DUPFIRSTLEAK"},
+                "Second": {"$id": "urn:cred", "type": "string", "default": "DUPSECONDLEAK"},
+            },
+        }
+    )
+
+    redacted = json.dumps(traces._sanitize_for_trace(payload, ()))
+    assert "DUPFIRSTLEAK" not in redacted
+    assert "DUPSECONDLEAK" not in redacted
+
+
+def test_duplicate_resource_targets_of_a_benign_property_survive() -> None:
+    """Redacting every duplicate must not become redacting every duplicate REGARDLESS of secrecy:
+    a non-secret property's targets are ordinary schema and keep their annotations."""
+
+    payload = _tool_hosted(
+        {
+            "type": "object",
+            "properties": {"city": {"$ref": "urn:place"}},
+            "$defs": {
+                "A": {"$id": "urn:place", "type": "string", "default": "PLACEKEEPA"},
+                "B": {"$id": "urn:place", "type": "string", "default": "PLACEKEEPB"},
+            },
+        }
+    )
+
+    redacted = json.dumps(traces._sanitize_for_trace(payload, ()))
+    assert "PLACEKEEPA" in redacted
+    assert "PLACEKEEPB" in redacted
+
+
+_DIALECT_SECRET_SCHEMA = {
+    "type": "object",
+    "properties": {"password": {"type": "string", "value": "DIALECTLEAK"}},
+}
+
+
+@pytest.mark.parametrize(
+    ("payload", "hosts"),
+    [
+        # `tools` entries wrap their declaration in `function`; `functions` entries are flat. an
+        # entry using the OTHER array's dialect is a request no provider accepts.
+        (
+            {
+                "functions": [
+                    {
+                        "type": "function",
+                        "function": {"name": "l", "parameters": _DIALECT_SECRET_SCHEMA},
+                    }
+                ]
+            },
+            False,
+        ),
+        ({"tools": [{"name": "l", "parameters": _DIALECT_SECRET_SCHEMA}]}, False),
+        (
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "l", "parameters": _DIALECT_SECRET_SCHEMA},
+                    }
+                ]
+            },
+            True,
+        ),
+        ({"functions": [{"name": "l", "parameters": _DIALECT_SECRET_SCHEMA}]}, True),
+        # anthropic spells its schema `input_schema` and needs no wrapper, so it stays valid.
+        ({"tools": [{"name": "l", "input_schema": _DIALECT_SECRET_SCHEMA}]}, True),
+    ],
+)
+def test_a_tool_entry_is_validated_against_its_container(payload: dict, hosts: bool) -> None:
+    """Judging an entry without knowing which array holds it accepted both dialects in both arrays,
+    so a payload the provider rejects still opened the schema exemption and preserved a secret
+    property's unknown literal in the raw export."""
+
+    redacted = json.dumps(traces._sanitize_for_trace(payload, ()))
+    assert ("DIALECTLEAK" in redacted) is hosts
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected_secret"),
+    [
+        # every branch names a credential, so the pattern matches only secret fields.
+        ("^(password|api_key)$", True),
+        ("^(client_secret|access_token)$", True),
+        # one benign branch means the pattern also matches an ordinary property.
+        ("^(password|city)$", False),
+        ("^(city|country)$", False),
+        # a single grouped name keeps working (round 45).
+        ("^(password)$", True),
+    ],
+)
+def test_an_alternation_is_secret_only_when_every_branch_is(
+    pattern: str, expected_secret: bool
+) -> None:
+    """`_unwrap_pattern_groups` leaves alternations intact, so `^(password|api_key)$` failed the
+    name test and credential literals beneath it stayed in the raw export -- while a mixed
+    alternation must keep its literals, since it also matches a non-secret field."""
+
+    payload = _tool_hosted(
+        {
+            "type": "object",
+            "patternProperties": {pattern: {"type": "string", "default": "ALTLEAK"}},
+        }
+    )
+
+    redacted = json.dumps(traces._sanitize_for_trace(payload, ()))
+    assert ("ALTLEAK" not in redacted) is expected_secret
+
+
+def test_an_unbounded_numeric_port_does_not_break_sanitization() -> None:
+    """`int(port)` refuses an integer literal beyond Python's digit limit, and it ran outside the
+    guarded `urlsplit`. A recorded URI with a 5000-digit port therefore raised out of
+    sanitization, so the paid request was dropped from storage entirely."""
+
+    huge_port = "1" * 5000
+    payload = _tool_hosted(
+        {
+            "$id": f"https://example.com:{huge_port}/schema",
+            "type": "object",
+            "properties": {"city": {"type": "string", "default": "PORTKEEP"}},
+        }
+    )
+
+    assert "PORTKEEP" in json.dumps(traces._sanitize_for_trace(payload, ()))
+    # the numeric equivalences the textual comparison replaced still hold.
+    assert trace_uri._canonical_resource_uri(
+        "https://example.com:0443/s"
+    ) == trace_uri._canonical_resource_uri("https://example.com/s")
+    assert trace_uri._canonical_resource_uri(
+        "https://example.com:0444/s"
+    ) == trace_uri._canonical_resource_uri("https://example.com:444/s")
+
+
+def test_a_response_format_needs_the_schema_member_itself() -> None:
+    """The discriminator and the `json_schema` nesting were checked, but any dict was accepted as
+    that wrapper -- so an unrelated `parameters` wrapper inside it was read as a declaration and a
+    secret property's unknown literal survived a request the provider rejects."""
+
+    invalid = {
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "parameters": {
+                    "type": "object",
+                    "properties": {"password": {"type": "string", "value": "RFPARAMLEAK"}},
+                }
+            },
+        }
+    }
+    assert "RFPARAMLEAK" not in json.dumps(traces._sanitize_for_trace(invalid, ()))
+
+    valid = {
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "reply",
+                "schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string", "default": "RFSCHEMAKEEP"}},
+                },
+            },
+        }
+    }
+    assert "RFSCHEMAKEEP" in json.dumps(traces._sanitize_for_trace(valid, ()))
+
+
+@pytest.mark.parametrize("role", ["Tool", "TOOL", " tool ", "Function", "tool"])
+def test_a_tool_role_is_recognized_despite_case_or_whitespace(role: str) -> None:
+    """A compatibility layer or a rejected request may spell the role `"Tool"`. An exact membership
+    check dropped the tool-result context, so the message's serialized output was kept as ordinary
+    prose and a credential the tool returned reached the raw export."""
+
+    payload = {"messages": [{"role": role, "content": json.dumps({"password": "ROLECASELEAK"})}]}
+
+    assert "ROLECASELEAK" not in json.dumps(traces._sanitize_for_trace(payload, ()))
+
+
+def test_normalizing_a_tool_role_does_not_rewrite_the_stored_value() -> None:
+    """Only the classification normalizes. The recorded role must still be what the caller sent,
+    and a non-tool role's JSON-looking content is not tool output and survives verbatim."""
+
+    sanitized = traces._sanitize_for_trace(
+        {
+            "messages": [
+                {"role": "Tool", "content": "plain text"},
+                {"role": "user", "content": '{"city": "USERKEEP"}'},
+            ]
+        },
+        (),
+    )
+
+    assert sanitized["messages"][0]["role"] == "Tool"
+    assert sanitized["messages"][1]["content"] == '{"city": "USERKEEP"}'

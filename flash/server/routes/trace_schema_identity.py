@@ -90,8 +90,17 @@ def _legacy_id_anchor_name(node: dict[Any, Any]) -> str | None:
     return fragment
 
 
-def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[str, ...]]:
-    resources: dict[str, tuple[str, ...]] = {}
+def _schema_resource_pointers(
+    value: Any, *, depth: int = 0
+) -> dict[str, frozenset[tuple[str, ...]]]:
+    """Every path declaring each canonical resource id.
+
+    Duplicate ids make a schema ambiguous, but a recorded payload is untrusted input and may carry
+    them anyway. Keeping only the first path meant a `$ref` to a secret target resolved to one of
+    them, and the OTHER definition -- an equally valid resolution of the same reference -- kept its
+    credential-bearing literals. Every declaring path is retained so all of them are redacted.
+    """
+    resources: dict[str, set[tuple[str, ...]]] = {}
 
     def collect(node: Any, path: tuple[str, ...], base_uri: str, depth: int) -> None:
         if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
@@ -100,7 +109,8 @@ def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[
             resource_id = _schema_resource_id(node)
             if isinstance(resource_id, str):
                 base_uri = _safe_urljoin(base_uri, resource_id)
-                resources.setdefault(_canonical_resource_uri(_safe_urldefrag(base_uri)[0]), path)
+                canonical = _canonical_resource_uri(_safe_urldefrag(base_uri)[0])
+                resources.setdefault(canonical, set()).add(path)
             for key, item in node.items():
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                     collect(item, (*path, str(key)), base_uri, depth + 1)
@@ -109,7 +119,7 @@ def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[
                 collect(item, (*path, str(index)), base_uri, depth + 1)
 
     collect(value, (), "", depth)
-    return resources
+    return {uri: frozenset(paths) for uri, paths in resources.items()}
 
 
 def _schema_anchor_pointers(value: Any, *, depth: int = 0) -> dict[str, frozenset[tuple[str, ...]]]:
@@ -185,7 +195,7 @@ class SchemaResourceScopes:
     """
 
     base_uri: str
-    resources: dict[str, tuple[str, ...]]
+    resources: dict[str, frozenset[tuple[str, ...]]]
     anchors: dict[str, frozenset[tuple[str, ...]]]
     dynamic_anchors: dict[str, frozenset[tuple[str, ...]]]
     _scopes: tuple[tuple[tuple[str, ...], str], ...]
@@ -195,7 +205,7 @@ class SchemaResourceScopes:
         document_id = _schema_resource_id(value) if isinstance(value, dict) else None
         base_uri = document_id if isinstance(document_id, str) else ""
         resources = _schema_resource_pointers(value, depth=depth)
-        resources.setdefault(_canonical_resource_uri(_safe_urldefrag(base_uri)[0]), ())
+        resources.setdefault(_canonical_resource_uri(_safe_urldefrag(base_uri)[0]), frozenset({()}))
         return cls(
             base_uri=base_uri,
             resources=resources,
@@ -206,7 +216,7 @@ class SchemaResourceScopes:
             dynamic_anchors=_schema_dynamic_anchor_pointers(value, depth=depth),
             _scopes=tuple(
                 sorted(
-                    ((path, uri) for uri, path in resources.items()),
+                    ((path, uri) for uri, paths in resources.items() for path in paths),
                     key=lambda item: len(item[0]),
                     reverse=True,
                 )
