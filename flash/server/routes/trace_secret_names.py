@@ -223,4 +223,64 @@ def _unwrap_pattern_groups(pattern: str) -> str:
                     break
         if depth == 0 and "|" not in inner:
             current = inner
-    return current
+    return _flatten_inner_groups(current)
+
+
+_QUANTIFIERS = frozenset({"?", "*", "+", "{"})
+
+
+def _flatten_inner_groups(pattern: str) -> str:
+    """Splice out groups that merely bracket part of a name, leaving the name itself.
+
+    Unwrapping only whole-expression groups left `pass(?:word)` intact, so the name test saw a
+    regex rather than `password` and the schema beneath the pattern kept its credential literals.
+    Tooling brackets name fragments routinely, and the grouping does not change what is matched.
+
+    Only groups that plainly consume their contents are spliced. A quantified group (`(?:word)?`)
+    matches with OR without the fragment, so it names two different fields and is left alone rather
+    than guessed at; a lookaround consumes nothing; alternation is a branch set handled separately.
+    Anything left unspliced simply fails the name test, which is the safe direction.
+    """
+    result: list[str] = []
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "\\" and index + 1 < len(pattern):
+            result.append(pattern[index : index + 2])
+            index += 2
+            continue
+        if character != "(":
+            result.append(character)
+            index += 1
+            continue
+        end = _group_end(pattern, index)
+        if end is None:
+            return pattern
+        inner = pattern[index + 1 : end]
+        quantified = end + 1 < len(pattern) and pattern[end + 1] in _QUANTIFIERS
+        if inner.startswith("?") and not inner.startswith("?:"):
+            return pattern
+        if quantified or "|" in inner:
+            return pattern
+        result.append(inner.removeprefix("?:"))
+        index = end + 1
+    return "".join(result)
+
+
+def _group_end(pattern: str, start: int) -> int | None:
+    """Index of the `)` closing the group opened at `start`, or None if it is never closed."""
+    depth = 0
+    index = start
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None

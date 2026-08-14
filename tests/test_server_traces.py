@@ -25,7 +25,13 @@ from flash.server.platform.traces import (
     sanitize_json_value,
     store_trace,
 )
-from flash.server.routes import trace_redaction, trace_sse, trace_uri, traces
+from flash.server.routes import (
+    trace_redaction,
+    trace_secret_names,
+    trace_sse,
+    trace_uri,
+    traces,
+)
 
 _PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 _OTHER_PROJECT_ID = "22222222-2222-4222-8222-222222222222"
@@ -304,9 +310,12 @@ def test_json_value_conversion_failure_relays_body_and_records_text(trace_api, m
     response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
 
     assert response.status_code == 200
+    # the caller's body is relayed byte for byte. only what we STORE is bounded: a body we could
+    # not parse cannot be inspected for credentials, so recording its text verbatim made a parse
+    # failure an exfiltration path.
     assert response.content == body
     span = _raw(trace_api)["records"][0]["spans"][0]
-    assert span["output_payload"] == body.decode()
+    assert span["output_payload"] == "[redacted]"
     assert span["status_code"] == "OK"
 
 
@@ -324,7 +333,9 @@ def test_recursive_json_response_relays_body_and_records_text(trace_api, monkeyp
     assert response.status_code == 200
     assert response.content == body
     span = _raw(trace_api)["records"][0]["spans"][0]
-    assert span["output_payload"] == body.decode()
+    # a body too deeply nested to parse is uninspectable for the same reason, so it is blanked
+    # rather than stored. the relay above is unaffected.
+    assert span["output_payload"] == "[redacted]"
     assert span["status_code"] == "OK"
 
 
@@ -404,7 +415,8 @@ def test_streamed_json_value_conversion_failure_records_text(trace_api, monkeypa
     assert response.status_code == 200
     assert response.content == body
     span = _raw(trace_api)["records"][0]["spans"][0]
-    assert span["output_payload"] == body.decode()
+    # same contract on the streamed path, which has its own unparseable-body fallback.
+    assert span["output_payload"] == "[redacted]"
     assert span["status_code"] == "OK"
 
 
@@ -9698,3 +9710,143 @@ def test_an_unrelated_vendor_extension_under_a_secret_property_survives() -> Non
 
     assert "NOTEKEEP" in stored
     assert "PARISKEEP" in stored
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"password":"THIRDPARTYLEAK","choices":[{"message":{"content":"hi"}}]',
+        '{"api_key":"THIRDPARTYLEAK","ok":true',
+        '[{"secret":"THIRDPARTYLEAK"},{"a":1}',
+    ],
+    ids=["truncated-object", "truncated-api-key", "truncated-array"],
+)
+def test_an_unparseable_upstream_body_is_not_stored_verbatim(body: str) -> None:
+    """When the upstream body will not parse, the proxy falls back to its raw TEXT.
+
+    As a bare string that text reaches none of the field branches, so field-name redaction never
+    ran over it and `{"password":"..."` was persisted intact and handed back through `format=raw`.
+    A parse failure must not be an exfiltration path.
+    """
+    assert "THIRDPARTYLEAK" not in json.dumps(traces._sanitize_for_trace(body, ()))
+
+
+def test_an_unparseable_body_is_blanked_whole_rather_than_salvaged() -> None:
+    """Partial JSON cannot be parsed, so a credential cannot be separated from the rest of it.
+
+    Salvaging the readable members would mean a tolerant parser guessing at a malformed document,
+    which is exactly the exfiltration path. An uninspectable body is not a usable trace anyway, so
+    it is blanked whole; the caller's response is still relayed byte for byte.
+    """
+    stored = json.dumps(traces._sanitize_for_trace('{"password":"LEAKED","city":"ALSOGONE"', ()))
+
+    assert "LEAKED" not in stored
+    assert "ALSOGONE" not in stored
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "the password reset email was sent to the user, KEEPTHIS",
+        "<html><body>502 Bad Gateway KEEPTHIS</body></html>",
+        "upstream timed out: KEEPTHIS",
+    ],
+    ids=["prose", "html", "plain-error"],
+)
+def test_an_unstructured_upstream_body_survives_verbatim(body: str) -> None:
+    """Only a body that OPENS as a JSON document is uninspectable structure.
+
+    Provider error pages and prose are the ordinary non-JSON case and are exactly what a trace of
+    a failed call needs to keep; blanking them would destroy the recorded reason for the failure.
+    """
+    assert "KEEPTHIS" in json.dumps(traces._sanitize_for_trace(body, ()))
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["^pass(?:word)$", "^api(?:_key)$", "^(?:api)_key$", "^secret(?:_token)$"],
+)
+def test_a_secret_pattern_with_an_inner_group_is_recognized(pattern: str) -> None:
+    """Unwrapping only whole-expression groups left `pass(?:word)` intact, so the name test saw a
+    regex rather than `password` and every schema beneath the pattern kept its credential-bearing
+    `default`/`const`/`enum` literals. Tooling brackets name fragments routinely."""
+
+    assert trace_secret_names._is_secret_property_pattern(pattern) is True
+
+    payload = _tool_hosted(
+        {
+            "type": "object",
+            "patternProperties": {pattern: {"type": "string", "default": "PATTERNLEAK"}},
+        }
+    )
+
+    assert "PATTERNLEAK" not in json.dumps(traces._sanitize_for_trace(payload, ()))
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "^wid(?:get)$",
+        "^cit(?:y)$",
+        "^(?:user)_name$",
+        "^pass(?:word)?$",
+        "^pass(?=word)$",
+        "^(?:password|city)$",
+    ],
+    ids=["widget", "city", "user-name", "quantified", "lookahead", "mixed-alternation"],
+)
+def test_a_pattern_that_does_not_name_a_secret_is_left_alone(pattern: str) -> None:
+    """The splice only applies to groups that plainly consume their contents.
+
+    A quantified group matches with OR without the fragment, so it names two different fields; a
+    lookaround consumes nothing; one benign branch disqualifies an alternation. Guessing at any of
+    them would blank the schema under an ordinary pattern.
+    """
+    assert trace_secret_names._is_secret_property_pattern(pattern) is False
+
+
+def test_a_benign_patterns_schema_literals_survive() -> None:
+    """The other direction, end to end: an ordinary pattern keeps its documented default."""
+    payload = _tool_hosted(
+        {
+            "type": "object",
+            "patternProperties": {"^cit(?:y)$": {"type": "string", "default": "PARISKEEP"}},
+        }
+    )
+
+    assert "PARISKEEP" in json.dumps(traces._sanitize_for_trace(payload, ()))
+
+
+def test_redaction_bounds_a_collection_before_copying_it() -> None:
+    """The wire limit bounds BYTES, not member count, so a payload well inside 8 MiB can carry
+    hundreds of thousands of shallow members. Redaction copied all of them, and `_redact_secret_
+    values` copied the result again, before the storage boundary applied the collection bound --
+    retaining hundreds of MB per concurrent call for members it was about to discard."""
+
+    flood = {"messages": [{"role": "user", "content": "x"} for _ in range(200_000)]}
+    assert len(json.dumps(flood)) < platform_traces.MAX_PAYLOAD_TOTAL_BYTES
+
+    sanitized = traces._sanitize_for_trace(flood, ())
+
+    assert len(sanitized["messages"]) <= platform_traces._MAX_PAYLOAD_COLLECTION
+
+
+def test_redaction_bounds_an_oversized_mapping() -> None:
+    """A dict floods the same way a list does."""
+    flood = {"attributes": {f"k{index}": "x" for index in range(200_000)}}
+
+    sanitized = traces._sanitize_for_trace(flood, ())
+
+    assert len(sanitized["attributes"]) <= platform_traces._MAX_PAYLOAD_COLLECTION
+
+
+def test_an_ordinary_conversation_is_not_bounded() -> None:
+    """The bound must not bite real traffic: a long agent trace is hundreds of messages, not
+    hundreds of thousands, and every one of them has to survive intact."""
+
+    conversation = {"messages": [{"role": "user", "content": f"m{i}"} for i in range(500)]}
+
+    sanitized = traces._sanitize_for_trace(conversation, ())
+
+    assert len(sanitized["messages"]) == 500
+    assert sanitized["messages"][499]["content"] == "m499"

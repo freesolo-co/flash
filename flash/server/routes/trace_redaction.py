@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sized
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any
 
 from flash.server.platform import traces as platform_traces
@@ -605,7 +606,7 @@ def _redact_secret_fields(
         )
         redact_schema_literals = secret_schema_definition or secret_schema_property
         redacted: dict[Any, Any] = {}
-        for key, item in value.items():
+        for key, item in _bounded_members(value.items(), flag=flag):
             schema_definition = schema_property_map and (
                 _is_schema_definition(item, allow_custom_vocabulary=schema_wrapper)
                 or (schema_property_dependencies and _is_property_name_list(item))
@@ -782,8 +783,30 @@ def _redact_secret_sequence(
             schema_definition_path=(*schema_definition_path, str(index)),
             flag=flag,
         )
-        for index, item in enumerate(value)
+        for index, item in enumerate(_bounded_members(value, flag=flag))
     ]
+
+
+def _bounded_members(value: Iterable[Any], *, flag: _SanitizationFlag | None) -> list[Any]:
+    """The leading members of a collection, bounded by the same limit storage will apply.
+
+    The wire limit bounds BYTES, not member count, so a payload well inside it can still carry
+    hundreds of thousands of shallow members. Redaction copied all of them -- and `_redact_secret_
+    values` copied the result again -- before `sanitize_json_value` applied the collection bound at
+    the storage boundary, retaining hundreds of MB per concurrent call for members it was about to
+    discard. Bounding here drops them before the copies rather than after.
+    """
+    members = list(islice(value, platform_traces._MAX_PAYLOAD_COLLECTION))
+    if flag is not None and _exceeds_collection_bound(value):
+        flag.hit = True
+    return members
+
+
+def _exceeds_collection_bound(value: Iterable[Any]) -> bool:
+    """Whether a collection has more members than the storage bound keeps."""
+    if isinstance(value, Sized):
+        return len(value) > platform_traces._MAX_PAYLOAD_COLLECTION
+    return False
 
 
 def _redact_secret_scalar(
@@ -835,10 +858,13 @@ def _redact_secret_values(
             (_redact_secret_string(key, secrets) if isinstance(key, str) else key): (
                 _redact_secret_values(item, secrets, depth=depth + 1, flag=flag)
             )
-            for key, item in value.items()
+            for key, item in _bounded_members(value.items(), flag=flag)
         }
     if isinstance(value, list | tuple):
-        return [_redact_secret_values(item, secrets, depth=depth + 1, flag=flag) for item in value]
+        return [
+            _redact_secret_values(item, secrets, depth=depth + 1, flag=flag)
+            for item in _bounded_members(value, flag=flag)
+        ]
     if isinstance(value, str):
         return _redact_secret_string(value, secrets)
     return value
@@ -851,6 +877,16 @@ def _sanitize_for_trace(
     response: bool = False,
     flag: _SanitizationFlag | None = None,
 ) -> Any:
+    if isinstance(value, str):
+        # the WHOLE payload is a string when the upstream body would not parse: the proxy falls
+        # back to the raw text. that text is usually a structured body that was truncated or
+        # malformed, and as a bare string it reaches none of the field branches below, so
+        # `{"password":"..."` was persisted verbatim and exported raw. parse failure must not be an
+        # exfiltration path, so a body that OPENS as a json document and cannot be inspected is
+        # blanked; prose and html error pages are not structured and survive.
+        value = _redact_json_text(
+            value, depth=0, flag=flag, on_unparseable=_opens_structured_document
+        )
     # `payload_root` opens the REQUEST's schema-host vocabulary (`tools`, `response_format`, ...).
     # a response declares no request schema, so honouring those names in one let an upstream error
     # body that echoes a submitted declaration claim the exemption -- and a nested secret property
