@@ -477,7 +477,12 @@ def _chat_reply(payload: Any) -> str | None:
         # a null error is the success shape of providers that always emit the key. any non-null value
         # is ambiguous training data and is skipped here; raw export still preserves the full envelope.
         return None
-    if not payload["choices"]:
+    if len(payload["choices"]) != 1:
+        # `n > 1` asks for several candidates, and there is no basis for calling the first one the
+        # target: they are alternatives, not a reply and its remainder. exporting `choices[0]`
+        # unconditionally also skipped every check on the others, so a candidate carrying a tool
+        # call or generated image -- which alone would disqualify the row -- was never looked at.
+        # a converted row is one completion, so a multi-candidate response has none.
         return None
     choice = payload["choices"][0]
     if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):

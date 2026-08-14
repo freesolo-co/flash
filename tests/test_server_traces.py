@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import anyio
 import httpx
@@ -10305,7 +10305,6 @@ def test_ordinary_terminator_gating_is_unchanged(
         ("^api.key$", False),
         ("^(api.key|password)$", False),
         ("^secret.*$", False),
-        (r"^api\.key$", False),
         ("^api_key$", True),
         ("^api-key$", True),
         ("^[Pp]assword$", True),
@@ -10317,7 +10316,6 @@ def test_ordinary_terminator_gating_is_unchanged(
         "wildcard",
         "wildcard-branch",
         "wildcard-star",
-        "escaped-dot",
         "underscore",
         "hyphen",
         "class",
@@ -10361,3 +10359,109 @@ def test_a_wildcard_pattern_keeps_its_schema_annotations() -> None:
 
     assert patterns["^api.key$"]["default"] == "KEEP"
     assert patterns["^api_key$"]["default"] == "[redacted]"
+
+
+@pytest.mark.parametrize(
+    ("pattern", "secret"),
+    [
+        (r"^api\.key$", True),
+        (r"^api\-key$", True),
+        (r"^api\/key$", True),
+        (r"^client\.secret$", True),
+        (r"^(api\.key|password)$", True),
+        (r"^city\.name$", False),
+        (r"^(api\.key|city)$", False),
+        (r"^api\dkey$", False),
+        (r"^api\wkey$", False),
+        (r"^api\skey$", False),
+        ("^api\\", False),
+    ],
+    ids=[
+        "escaped-dot",
+        "escaped-hyphen",
+        "escaped-slash",
+        "escaped-dot-compound",
+        "escaped-in-alternation",
+        "escaped-benign",
+        "escaped-benign-branch",
+        "digit-class",
+        "word-class",
+        "space-class",
+        "dangling-backslash",
+    ],
+)
+def test_an_escaped_separator_spells_the_one_name_it_denotes(pattern: str, secret: bool) -> None:
+    """A backslash before a metacharacter denotes that literal character, so `^api\\.key$` matches
+    exactly `api.key` -- a credential. Refusing every backslashed pattern left its `default`,
+    `const` and `enum` values visible in raw exports. A backslash that opens a character class
+    (`\\d`, `\\w`, `\\s`) still matches many names, so those stay unrecognized."""
+
+    assert trace_secret_names._is_secret_property_pattern(pattern) is secret
+
+
+def test_an_escaped_literal_credential_loses_its_schema_annotations() -> None:
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "patternProperties": {
+                            r"^api\.key$": {"type": "string", "default": "HUNTER2"},
+                            r"^city\.name$": {"type": "string", "default": "KEEP"},
+                        },
+                    },
+                },
+            }
+        ]
+    }
+
+    patterns = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"][
+        "patternProperties"
+    ]
+
+    assert patterns[r"^api\.key$"]["default"] == "[redacted]"
+    assert patterns[r"^city\.name$"]["default"] == "KEEP"
+
+
+def _candidates(count: int, last_extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    choices: list[dict[str, Any]] = []
+    for index in range(count):
+        message: dict[str, Any] = {"role": "assistant", "content": f"candidate {index}"}
+        if last_extra is not None and index == count - 1:
+            message.update(last_extra)
+        choices.append({"index": index, "message": message, "finish_reason": "stop"})
+    return {"choices": choices}
+
+
+@pytest.mark.parametrize(
+    "last_extra",
+    [None, {"tool_calls": [{"id": "c"}]}, {"images": [{"type": "image_url"}]}],
+    ids=["plain", "later-tool-call", "later-image"],
+)
+def test_a_multi_candidate_reply_is_not_exported_as_one_completion(
+    last_extra: dict[str, Any] | None,
+) -> None:
+    """`n: 2` returns alternatives, not a reply and its remainder, so no single choice is the
+    target. Taking `choices[0]` unconditionally also skipped every check on the others, so a
+    candidate carrying a tool call or a generated image -- either of which disqualifies the row --
+    was never inspected."""
+
+    assert platform_traces._chat_reply(_candidates(2, last_extra)) is None
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (_candidates(1), "candidate 0"),
+        ({"choices": []}, None),
+        (_candidates(1, {"tool_calls": [{"id": "c"}]}), None),
+    ],
+    ids=["single", "empty", "single-tool-call"],
+)
+def test_single_candidate_export_is_unchanged(
+    payload: dict[str, Any], expected: str | None
+) -> None:
+    assert platform_traces._chat_reply(payload) == expected

@@ -126,8 +126,8 @@ def _is_secret_property_pattern(pattern: Any) -> bool:
         return all(_is_secret_branch(_unwrap_pattern_groups(branch)) for branch in branches)
     names = _character_class_expansions(unwrapped)
     if names is None:
-        return _names_one_field(unwrapped) and _is_secret_key(unwrapped)
-    return all(_names_one_field(name) and _is_secret_key(name) for name in names)
+        return _is_secret_literal(unwrapped)
+    return all(_is_secret_literal(name) for name in names)
 
 
 # characters that make a pattern match more than the literal name it appears to spell. `.` is the
@@ -135,12 +135,48 @@ def _is_secret_property_pattern(pattern: Any) -> bool:
 # `^api.key$` was read as a credential -- but as a regex it also matches `apiXkey`, an ordinary
 # field whose schema annotations were then rewritten to "[redacted]", corrupting the stored schema.
 # the rest are refused for the same reason, and because a pattern carrying them is not a name.
-_PATTERN_METACHARACTERS = frozenset(".\\+*?()[]{}|^$")
+_PATTERN_METACHARACTERS = frozenset(".+*?()[]{}|^$")
+
+# what a backslash may legally escape and still denote one literal character. the metacharacters,
+# plus the separators tooling escapes out of caution: `\-` is a hyphen everywhere, and refusing it
+# left `^api\-key$` -- a perfectly ordinary spelling of a credential name -- unrecognized.
+_ESCAPABLE_LITERALS = _PATTERN_METACHARACTERS | frozenset("-/\\ ")
 
 
-def _names_one_field(pattern: str) -> bool:
-    """Whether a pattern is a plain literal, matching exactly the one field name it spells."""
-    return not any(character in _PATTERN_METACHARACTERS for character in pattern)
+def _literal_name(pattern: str) -> str | None:
+    """The single field name a pattern matches, or None if it matches more than that one name.
+
+    An ESCAPED metacharacter is the literal character, not the construct: `^api\\.key$` matches only
+    `api.key`, which is a credential by this module's rules. Refusing every backslash left that
+    valid `patternProperties` entry unrecognized, so the schema beneath it kept its credential
+    literals in the raw export -- the leak this test exists to close, arrived at from the other
+    side. Escapes are therefore decoded to the character they denote.
+
+    Only escapes of a metacharacter are decoded. `\\d`, `\\w` and `\\s` are classes that match many
+    names, and an unterminated trailing backslash is not a name at all; both return None, which
+    judges nothing secret and is the safe direction.
+    """
+    decoded: list[str] = []
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "\\":
+            if index + 1 >= len(pattern) or pattern[index + 1] not in _ESCAPABLE_LITERALS:
+                return None
+            decoded.append(pattern[index + 1])
+            index += 2
+            continue
+        if character in _PATTERN_METACHARACTERS:
+            return None
+        decoded.append(character)
+        index += 1
+    return "".join(decoded)
+
+
+def _is_secret_literal(pattern: str) -> bool:
+    """Whether a pattern spells exactly one field name, and that name is a credential."""
+    name = _literal_name(pattern)
+    return name is not None and _is_secret_key(name)
 
 
 def _is_secret_branch(branch: str) -> bool:
@@ -152,8 +188,8 @@ def _is_secret_branch(branch: str) -> bool:
     """
     names = _character_class_expansions(branch)
     if names is None:
-        return _names_one_field(branch) and _is_secret_key(branch)
-    return all(_names_one_field(name) and _is_secret_key(name) for name in names)
+        return _is_secret_literal(branch)
+    return all(_is_secret_literal(name) for name in names)
 
 
 # a class is only enumerated when the set stays small enough that expanding it is cheaper than the
