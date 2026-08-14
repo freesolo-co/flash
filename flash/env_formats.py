@@ -17,6 +17,8 @@ import zlib
 from collections.abc import Iterator
 from pathlib import Path
 
+from flash.env_deflate import _gzip_header_unfinished
+
 # The end-of-central-directory signature, and how much of a stream's tail to keep so it can be
 # found. A zip's end record is last in the file, within 64 KiB of the end (the comment field is
 # 16-bit), so this window always contains it.
@@ -73,6 +75,34 @@ _UNEXPANDABLE_MAGIC = (
     # and the archive published intact.
     (b"7z\xbc\xaf\x27\x1c", "7-zip"),
 )
+
+# Formats recognised ONLY at byte zero, kept apart from the list above rather than added to it.
+#
+# The unanchored search there admits any signature of `_SFX_MAGIC_BYTES` or more, which stands in
+# for "distinctive enough to mean something at an arbitrary offset" -- and that proxy holds only
+# for signatures carrying non-printable bytes. `Salted__` is eight printable characters and a word
+# documentation uses, so putting it in that list would refuse a file merely DESCRIBING the format,
+# the same false refusal the bare `Rar!` prefix caused. Length is the wrong test for it; position
+# is the right one, and the format defines these bytes as the start of the file.
+_ANCHORED_ONLY_MAGIC = (
+    # The OpenSSL salted envelope: `Salted__`, an 8-byte salt, then ciphertext. This is what
+    # `openssl enc -aes-256-cbc -pbkdf2 -salt` writes, and an encrypted credential file is an
+    # ordinary thing to keep beside an environment. The body is ciphertext, so neither a pattern
+    # nor a base64 decode can see the key inside -- verified with a real AES-256-CBC envelope
+    # around a Freesolo key, which scanned clean and decrypted back to the whole key.
+    #
+    # Refused rather than decrypted, for the same reason as an encrypted ZIP member and an OpenPGP
+    # message: the passphrase is not ours to have, and unverifiable is not clean. That the author
+    # encrypted it is not evidence the publish is safe, since the hub copy is readable by everyone
+    # the environment is and the passphrase travels beside the file about as often as not.
+    (b"Salted__", "OpenSSL-encrypted"),
+)
+
+# Which recognised-but-uninspectable formats are ENCRYPTED rather than merely unexpandable. The
+# refusal is the same either way; only the advice differs. Telling someone holding an `openssl enc`
+# envelope that it is "an archive this check cannot expand" sends them looking for a decompressor
+# that does not exist, when what they have to do is keep the ciphertext out of the package.
+ENCRYPTED_FORMATS = frozenset(fmt for _magic, fmt in _ANCHORED_ONLY_MAGIC)
 
 # Skippable frames: a standardized envelope both zstd and LZ4 allow before the real frame, used by
 # seekable and metadata-bearing streams. The magic is `0x184D2A5x` little-endian for any low nibble
@@ -298,6 +328,20 @@ def _decompresses(probe: bytes) -> bool:
     """
     try:
         if probe.startswith(b"\x1f\x8b\x08"):
+            # "No output" is only a rejection once the probe has actually REACHED the payload. A
+            # gzip header carries optional fields -- an extra field of up to 65,535 bytes, a name,
+            # a comment -- and a legal maximum-size FEXTRA runs past this 64 KiB probe on its own,
+            # so a valid stream produced no output because the deflate bits were never in view.
+            # Verified with a 65,535-byte extra field: the standalone stream was expanded, while
+            # the same bytes behind a stub were passed over and the credential published.
+            #
+            # Only for a FULL probe. A chance magic near the end of a file returns the few bytes
+            # that are left, and a header cannot outrun bytes that were never there to read -- with
+            # a short probe admitted, a random shard whose last bytes happened to look like a magic
+            # was refused once in 400 trials. A full probe means the remainder is genuinely out of
+            # view: measured 0 acceptances in 300 random 64 KiB probes behind a chance magic.
+            if len(probe) >= _OVERLAY_PROBE_BYTES and _gzip_header_unfinished(probe):
+                return True
             return bool(zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(probe, 4096))
         if probe.startswith(b"BZh"):
             decompressor = bz2.BZ2Decompressor()

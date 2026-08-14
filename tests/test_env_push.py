@@ -5671,3 +5671,219 @@ def test_an_aws_secret_with_escaped_slashes_is_matched(tmp_path):
     slashed = body.replace("/", "\\/")
     escaped.write_text(f'{{"SecretAccessKey": "{slashed}"}}')
     assert credential_in_file(escaped) == "an AWS secret access key"
+
+
+def test_an_openssl_salted_envelope_is_refused(tmp_path):
+    """`openssl enc` ciphertext is opaque, so approving it approves bytes nobody inspected.
+
+    An encrypted credential file is an ordinary thing to keep beside an environment, and the hub
+    copy is readable by everyone the environment is -- the passphrase travels beside the file about
+    as often as not. A real AES-256-CBC envelope around a Freesolo key scanned clean while
+    decryption recovered the whole key, which is the same unverifiable-content condition that
+    already refuses an encrypted zip member and an OpenPGP message.
+    """
+    import subprocess
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    plain = tmp_path / "key.txt"
+    plain.write_bytes(f"FSLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode())
+    envelope = tmp_path / "key.enc"
+    made = subprocess.run(
+        [
+            "openssl",
+            "enc",
+            "-aes-256-cbc",
+            "-pbkdf2",
+            "-salt",
+            "-in",
+            str(plain),
+            "-out",
+            str(envelope),
+            "-pass",
+            "pass:hunter2",
+        ],
+        capture_output=True,
+    )
+    if made.returncode:
+        pytest.skip("openssl unavailable")
+
+    blob = envelope.read_bytes()
+    assert blob.startswith(b"Salted__")
+    # the ciphertext really does hide the key from every pattern, which is why refusing is the
+    # only honest answer rather than a conservative one
+    assert b"fslo_" not in blob
+
+    with pytest.raises(_Unscannable, match="cannot read"):
+        credential_in_file(envelope)
+
+    # `Salted__` is eight PRINTABLE characters, so it is recognised only at byte zero. A file that
+    # merely mentions the format stays publishable, the same distinction the bare `Rar!` prefix
+    # needed.
+    prose = tmp_path / "README.md"
+    prose.write_text("The OpenSSL envelope header is Salted__ and we do not commit those here.\n")
+    assert credential_in_file(prose) is None
+
+
+def test_a_pdf_filter_chain_is_decoded_before_inflating(tmp_path):
+    """`/Filter [/ASCII85Decode /FlateDecode]` applies in order, so the stream is ASCII85 first.
+
+    Handing those bytes to zlib fails, and the stream was skipped as clean while the credential
+    inside decoded perfectly well one filter further in. `pdftk` and several writers emit this
+    chain, so it is an ordinary document rather than a crafted one.
+    """
+    import base64 as b64
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    inner = zlib.compress(b"BT (FSLO_API_KEY=" + key + b") Tj ET\n" * 4)
+    stream = b64.a85encode(inner) + b"~>"
+    chained = tmp_path / "chained.pdf"
+    chained.write_bytes(
+        b"%PDF-1.7\n1 0 obj\n<< /Filter [/ASCII85Decode /FlateDecode] /Length "
+        + str(len(stream)).encode()
+        + b" >>\nstream\n"
+        + stream
+        + b"\nendstream\nendobj\ntrailer\n%%EOF\n"
+    )
+    assert credential_in_file(chained) == "a Freesolo API key"
+
+    # a chain this cannot fully undo is REFUSED rather than skipped: bytes behind an unreadable
+    # filter are as unverified as an archive that would not expand
+    unknown = tmp_path / "unknown.pdf"
+    unknown.write_bytes(
+        b"%PDF-1.7\n1 0 obj\n<< /Filter [/JBIG2Decode /FlateDecode] /Length 10 >>\nstream\n"
+        + b"\x00" * 10
+        + b"\nendstream\nendobj\ntrailer\n%%EOF\n"
+    )
+    with pytest.raises(_Unscannable, match="filter"):
+        credential_in_file(unknown)
+
+    # the ordinary single-filter document still works
+    plain_stream = zlib.compress(b"BT (FSLO_API_KEY=" + key + b") Tj ET\n")
+    plain = tmp_path / "plain.pdf"
+    plain.write_bytes(
+        b"%PDF-1.7\n1 0 obj\n<< /Filter /FlateDecode /Length "
+        + str(len(plain_stream)).encode()
+        + b" >>\nstream\n"
+        + plain_stream
+        + b"\nendstream\nendobj\ntrailer\n%%EOF\n"
+    )
+    assert credential_in_file(plain) == "a Freesolo API key"
+
+
+def test_a_gzip_with_a_maximum_extra_field_is_probed_past_its_header(tmp_path):
+    """A legal 65,535-byte FEXTRA is longer than the 64 KiB probe, so no payload was in view.
+
+    The probe inflated nothing and the candidate was dismissed as "not a stream", even though the
+    stream is valid and gunzip reads it. Only the extra field can do this: it declares a LENGTH,
+    and it is the one part of a gzip header that can exceed the probe on its own.
+    """
+    import gzip
+    import random
+    import struct
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    body = b"export FSLO_API_KEY=" + key + b"\n"
+    raw = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    extra = b"\x00" * 65535
+    stream = (
+        b"\x1f\x8b\x08\x04"
+        + b"\x00" * 6
+        + struct.pack("<H", len(extra))
+        + extra
+        + raw.compress(body)
+        + raw.flush()
+        + struct.pack("<II", zlib.crc32(body), len(body))
+    )
+    # the fixture has to be a stream the stdlib really reads, or this proves nothing
+    assert gzip.decompress(stream) == body
+
+    behind_a_stub = tmp_path / "installer.sh"
+    behind_a_stub.write_bytes(b"#!/bin/sh\necho hello\nexit 0\n" + stream)
+    assert credential_in_file(behind_a_stub) == "a Freesolo API key"
+
+    # and the decoys stay decoys: three magic bytes plus noise are not a stream, so an ordinary
+    # binary carrying chance magics is still publishable
+    draws = random.Random(11)
+    decoys = b"".join(b"\x1f\x8b\x08" + draws.randbytes(29) for _ in range(400))
+    noise = tmp_path / "shard.bin"
+    noise.write_bytes(decoys)
+    assert credential_in_file(noise) is None
+
+
+def test_a_base64_container_cut_by_a_chunk_boundary_is_refused(tmp_path):
+    """A container does not survive being cut: only the first piece carries its header.
+
+    The scan reads a file in bounded chunks, so a long encoded blob arrives in pieces and the
+    windowed pass sees a prefix that stops before the tail. Measured: the credential in a gzip
+    whose base64 crossed the 1 MiB chunk boundary published clean, while the same blob one byte
+    shorter was caught. Unexpanded is not clean.
+    """
+    import gzip
+    import json
+    import random
+
+    from flash.env_secrets import _SCAN_CHUNK_BYTES, _Unscannable, credential_in_file
+
+    draws = random.Random(13)
+    words = [
+        bytes(draws.choice(b"abcdefghijklmnopqrstuvwxyz") for _ in range(8)) for _ in range(400)
+    ]
+    filler = bytearray()
+    while len(filler) < (6 << 20):
+        filler += draws.choice(words) + b" "
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    blob = gzip.compress(bytes(filler) + b"\nFSLO_API_KEY=" + key + b"\n", 1)
+    encoded = base64.b64encode(blob)
+    # semi-random filler on purpose: incompressible padding would leave the key stored VERBATIM in
+    # the gzip bytes, and fully repetitive padding never reaches a chunk boundary at all
+    assert b"fslo_" not in blob
+    assert len(encoded) > _SCAN_CHUNK_BYTES
+
+    cut = tmp_path / "secret.b64"
+    cut.write_bytes(b"DATA=" + encoded + b"\n")
+    with pytest.raises(_Unscannable, match="too long to expand"):
+        credential_in_file(cut)
+
+    # a long run that is NOT a container loses nothing by being cut, so it still publishes: the
+    # windowed pass reads a literal credential wherever it lands
+    padded = tmp_path / "rows.json"
+    padded.write_text(json.dumps({"note": "x" * (_SCAN_CHUNK_BYTES + 4096), "tail": "ok"}))
+    assert credential_in_file(padded) is None
+
+
+def test_raw_deflate_probing_does_not_read_the_whole_file(tmp_path):
+    """Every file reaching the handler is probed, so reading it whole doubled a publish's memory.
+
+    An extracted member may be as large as the uncompressed limit allows while the request body and
+    the decoded tar are both still live. Feeding the decompressor in bounded blocks keeps the probe
+    to one block plus whatever actually inflated.
+    """
+    import random
+    import time
+    import zlib
+
+    from flash.env_secrets import _blocks_of, _credential_in_raw_deflate
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    raw = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    body = b"export FSLO_API_KEY=" + key + b"\n"
+    sidecar = tmp_path / "payload.deflate"
+    sidecar.write_bytes(raw.compress(body) + raw.flush())
+    later = time.monotonic() + 120
+    assert _credential_in_raw_deflate(sidecar, deadline=later, depth=1) == "a Freesolo API key"
+
+    # the blocks really are bounded rather than one read of the whole file
+    big = tmp_path / "shard.bin"
+    big.write_bytes(random.Random(17).randbytes(3 << 20))
+    sizes = [len(block) for block in _blocks_of(big)]
+    assert len(sizes) > 1
+    assert max(sizes) <= (1 << 20)
+    # and a non-stream is still rejected rather than mistaken for deflate
+    assert _credential_in_raw_deflate(big, deadline=later, depth=1) is None

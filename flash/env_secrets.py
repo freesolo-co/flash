@@ -33,13 +33,17 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO, NoReturn
 
-from flash.env_base64 import _match_base64
-from flash.env_deflate import _pdf_stream_payloads, _raw_deflate_payload, _TooManyStreams
+from flash.env_base64 import _match_base64, _RunTooLongToExpand
+from flash.env_deflate import (
+    _pdf_stream_payloads,
+    _raw_deflate_from,
+    _TooManyStreams,
+    _UnreadableFilterChain,
+)
 from flash.env_formats import (
     _KEYSTORE_MAGIC,
     _MAX_ARCHIVE_MEMBERS,
     _MAX_OPENPGP_MARKERS,
-    _UNEXPANDABLE_MAGIC,
     _ZIP_TAIL_BYTES,
     OVERLAY_UNPROBED,
     _after_skippable_frames,
@@ -66,6 +70,7 @@ from flash.env_patterns import (
     SHORTEST_TOKEN_BYTES,
     _match,
 )
+from flash.env_policy import _unexpandable_format, _uninspectable_reason
 
 # Read in bounded chunks so a large dataset member is never held in memory whole. This costs no
 # more I/O than the publish already pays: `_tar_b64` reads every one of these bytes to gzip them.
@@ -99,14 +104,6 @@ _MAX_KEYSTORE_BYTES = 16 << 20
 # or an appended log writes a handful; the bound is what stops a file of many tiny records from
 # becoming an expansion cost of its own, and exceeding it refuses rather than passes.
 _MAX_ZLIB_RECORDS = 64
-
-# How long a signature must be to be searched for at an ARBITRARY offset rather than only at the
-# start of a stream. Six bytes is where the two real self-extracting formats sit (7-Zip at six, RAR
-# at seven and eight) and where a chance occurrence stops being plausible: measured 0 hits across
-# 256 MiB of random bytes for every signature, but a 4-byte magic is only 1 in 4 billion per
-# position, which a large enough model shard reaches. The short zstd and LZ4 magics stay decisive
-# at offset zero, where they mean what they say.
-_SFX_MAGIC_BYTES = 6
 
 
 # Marks NUL as 1 and everything else as 0, so an unbroken stretch of padding bytes becomes a run
@@ -194,7 +191,9 @@ _UNREADABLE_ARCHIVE = (
 )
 
 
-def _credential_kind(data: bytes, *, deadline: float | None = None, depth: int = 0) -> str | None:
+def _credential_kind(
+    data: bytes, *, deadline: float | None = None, depth: int = 0, truncated: bool = False
+) -> str | None:
     """The kind of credential `data` contains under any of its plausible text encodings.
 
     A wide encoding interleaves NUL bytes between ASCII characters, so a UTF-16 `env.ps1` holding
@@ -214,7 +213,7 @@ def _credential_kind(data: bytes, *, deadline: float | None = None, depth: int =
     character keeps its padding byte NUL, so requiring an unbroken NUL run alongside the candidate
     costs nothing on genuine UTF-16/32 and leaves machine code with nothing long enough to match.
     """
-    if kind := _decoded_kind(data, deadline=deadline, depth=depth):
+    if kind := _decoded_kind(data, deadline=deadline, depth=depth, truncated=truncated):
         return kind
     if b"\x00" not in data:
         return None
@@ -243,9 +242,13 @@ def _wide_runs(data: bytes, width: int, offset: int) -> Iterator[bytes]:
         yield narrow[match.start() : match.end()]
 
 
-def _decoded_kind(data: bytes, *, deadline: float | None = None, depth: int = 0) -> str | None:
+def _decoded_kind(
+    data: bytes, *, deadline: float | None = None, depth: int = 0, truncated: bool = False
+) -> str | None:
     """The kind of credential in `data` literally, or inside a base64 run within it."""
-    if kind := _match(data) or _match_base64(data, _decoded_container(deadline, depth)):
+    if kind := _match(data) or _match_base64(
+        data, _decoded_container(deadline, depth), truncated=truncated
+    ):
         return kind
     # A file can hold a credential in pieces that no contiguous run of its bytes contains: adjacent
     # string literals, which the language concatenates at parse time, and a backslash-newline
@@ -329,7 +332,12 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     seen: set[tuple[int, str]] = set()
     store_head = bytearray()
     walking_store = True
-    while chunk := handle.read(_SCAN_CHUNK_BYTES):
+    # Read one chunk AHEAD, so each pass knows whether bytes follow it. A base64 run reaching the
+    # end of a chunk that is not the last one was cut by the read rather than ended by the file,
+    # and a container encoded across that cut can no longer be expanded from either piece.
+    chunk = handle.read(_SCAN_CHUNK_BYTES)
+    while chunk:
+        upcoming = handle.read(_SCAN_CHUNK_BYTES)
         if deadline is not None and time.monotonic() > deadline:
             raise _Unscannable("takes too long to decompress")
         if walking_store:
@@ -356,7 +364,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
             # Anchored: every format is decisive about what a stream BEGINS with, including the
             # short zstd and LZ4 magics that are not searched for at arbitrary offsets below.
             if fmt := _unexpandable_format(head, anchored=True):
-                raise _Unscannable(f"contains a {fmt} archive this check cannot expand")
+                raise _Unscannable(_uninspectable_reason(fmt))
         if not carry and depth:
             # tar as well as the compressed magics: a tar's own members are literal, but a
             # COMPRESSED member inside one is not, so an oversized tar that went past the buffer
@@ -388,14 +396,19 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         # expected false-positive rate on arbitrary data is vanishing. Measured 0 hits across
         # 256 MiB of random bytes for all six.
         if fmt := _unexpandable_format(window, anchored=False):
-            raise _Unscannable(f"contains a {fmt} archive this check cannot expand")
+            raise _Unscannable(_uninspectable_reason(fmt))
         # Armored OpenPGP ciphertext, over the same window and for the same reason as the binary
         # form above: the body is opaque, so neither a pattern nor a base64 decode can see what is
         # inside, and treating it as ordinary text published the message intact.
         if _has_openpgp_message_armor(window):
             raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
-        if kind := _credential_kind(window, deadline=deadline, depth=depth):
-            return kind
+        try:
+            if kind := _credential_kind(
+                window, deadline=deadline, depth=depth, truncated=bool(upcoming)
+            ):
+                return kind
+        except _RunTooLongToExpand:
+            raise _Unscannable("contains a base64 run too long to expand") from None
         # A two-marker credential is paired across the WHOLE stream, not within one window. Those
         # detectors are order-independent and distance-free inside a single buffer, but a chunked
         # scan re-imposed a window between the halves at the chunk boundary. Remembering which
@@ -404,6 +417,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         if kind := _paired_markers_kind(window, seen):
             return kind
         carry = window[-_SCAN_OVERLAP_BYTES:]
+        chunk = upcoming
     if walking_store and store_head:
         # The stream ENDED with the walk still undecided, which more bytes can no longer settle --
         # either it ran off the end of the file or it exhausted the entry bound. Both mean the
@@ -459,33 +473,6 @@ def _openpgp_kind(chunk: bytes) -> str | None:
     if _is_openpgp_encrypted(chunk) is not False:
         raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
     return None
-
-
-def _unexpandable_format(data: bytes, *, anchored: bool) -> str | None:
-    """The name of an unexpandable archive format `data` carries, or None.
-
-    Two questions rather than one, because the two have different error costs.
-
-    `anchored` asks whether the stream BEGINS with such a signature. Every format is decisive
-    there: a file whose first bytes are a zstd frame is a zstd frame.
-
-    Unanchored asks whether one appears anywhere, which is what catches a self-extracting archive
-    -- an executable stub, then the signature, then the opaque compressed body, as `rar a -sfx` or
-    7-Zip's `-sfx` writes. Only the signatures of six bytes or more are searched that way. The
-    4-byte zstd and LZ4 magics are not distinctive enough to be decisive at an arbitrary offset:
-    embedded in a large model shard or high-entropy dataset they refuse a publishable file, and a
-    false refusal on ordinary content is worse than the narrow bypass of an SFX built from a
-    format that has no self-extracting form in the first place. RAR and 7-Zip, which do ship SFX
-    modules, carry 6-to-8-byte signatures and stay searched.
-    """
-    magics = (
-        _UNEXPANDABLE_MAGIC
-        if anchored
-        else [pair for pair in _UNEXPANDABLE_MAGIC if len(pair[0]) >= _SFX_MAGIC_BYTES]
-    )
-    if anchored:
-        return next((fmt for magic, fmt in magics if data.startswith(magic)), None)
-    return next((fmt for magic, fmt in magics if magic in data), None)
 
 
 def _paired_markers_kind(window: bytes, seen: set[tuple[int, str]]) -> str | None:
@@ -632,14 +619,35 @@ def _credential_in_raw_deflate(source: Path | bytes, *, deadline: float, depth: 
     Last by position in the handler list. With nothing to match on the decode IS the recognition,
     so it runs only once every magic-based handler has declined, and costs one inflate attempt that
     fails immediately on anything that is not a complete stream.
+
+    Fed in bounded blocks rather than read whole. Every file reaching here is probed, an ordinary
+    model shard included, so reading the source entire to answer "is this deflate" allocated a
+    second copy of a member that may be as large as the uncompressed limit allows -- while the
+    request body and the extracted tar are both still live.
     """
-    raw = source.read_bytes() if isinstance(source, Path) else source
-    plain = _raw_deflate_payload(raw, _MAX_NESTED_BUFFER_BYTES)
+    plain = _raw_deflate_from(_blocks_of(source), _MAX_NESTED_BUFFER_BYTES)
     if plain is None:
         raise _Unscannable("contains a compressed stream too large to inspect")
     if not plain:
         return None
     return _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth)
+
+
+def _blocks_of(source: Path | bytes) -> Iterator[bytes]:
+    """`source` in bounded blocks, so a probe never allocates a second copy of a whole file.
+
+    A path is read incrementally and bytes already in memory are yielded once: re-slicing those
+    would allocate the copy this exists to avoid.
+    """
+    if isinstance(source, bytes):
+        yield source
+        return
+    try:
+        with source.open("rb") as handle:
+            while block := handle.read(_SCAN_CHUNK_BYTES):
+                yield block
+    except OSError:
+        return
 
 
 def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
@@ -665,6 +673,10 @@ def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> 
                 return kind
     except _TooManyStreams:
         raise _Unscannable("contains more compressed streams than can be inspected") from None
+    except _UnreadableFilterChain:
+        raise _Unscannable(
+            "contains a compressed stream behind a filter this cannot undo"
+        ) from None
     return None
 
 

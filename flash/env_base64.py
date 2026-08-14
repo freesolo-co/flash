@@ -95,7 +95,29 @@ _BASE64_WINDOW_OVERLAP = 1024
 _MAX_WHOLE_RUN = 4 << 20
 
 
-def _match_base64(data: bytes, inspect: _Inspector | None = None) -> str | None:
+# What a container looks like in the first decoded bytes of a run, and how much of the run to
+# decode to find out. The magics are the compressed containers the scan can expand -- gzip, bzip2,
+# xz, zip and a zlib record -- and a header sits at the very start, so a short sniff settles it.
+_CONTAINER_MAGIC = (b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00", b"PK\x03\x04", b"PK\x05\x06", b"x\x9c")
+_CONTAINER_SNIFF_CHARS = 64
+
+
+class _RunTooLongToExpand(Exception):
+    """A base64 run is longer than `_MAX_WHOLE_RUN`, so the container inside it was never expanded.
+
+    Windowing finds a LITERAL credential in a run of any length, but a container does not survive
+    being cut: only the first window carries its header, and every later one starts mid-stream. So
+    past this bound the encoded bytes are unexpanded rather than clean, and reporting them clean
+    made "make it bigger" a bypass of the whole container path.
+
+    Defined here rather than reusing the scan's refusal so the dependency stays one way: this module
+    knows about base64, and the caller is what turns "not expanded" into a refusal.
+    """
+
+
+def _match_base64(
+    data: bytes, inspect: _Inspector | None = None, *, truncated: bool = False
+) -> str | None:
     """The kind of credential hidden in a base64 run, or None.
 
     A Kubernetes Secret stores every value base64-encoded, and that is an ordinary file to keep
@@ -115,6 +137,11 @@ def _match_base64(data: bytes, inspect: _Inspector | None = None) -> str | None:
     dependency stays one-way: this module knows nothing about containers, only that the caller may
     want a second look.
 
+    `truncated` says that `data` is a CHUNK with more bytes behind it, so a run reaching its end
+    was cut rather than ended. Such a run is refused instead of inspected: the windowed pass would
+    still find a literal credential in it, but a container inside it can no longer be expanded, and
+    reporting that clean made a large enough blob a bypass of the container path.
+
     A run is decoded in overlapping windows rather than whole, so memory stays bounded on a large
     encoded blob while a credential anywhere in it still lands whole inside some window. Slicing a
     long run into ADJACENT pieces was a bypass: a key straddling the cut decoded into neither half,
@@ -123,8 +150,22 @@ def _match_base64(data: bytes, inspect: _Inspector | None = None) -> str | None:
     Measured against the false-positive risk before adopting it: 630,011 base64-shaped runs across
     8,769 real hub files decode to zero credential matches, so this costs no legitimate publish.
     """
-    for run in _BASE64_RUN.finditer(_unwrapped(data)):
+    joined = _unwrapped(data)
+    for run in _BASE64_RUN.finditer(joined):
         candidate = run.group(0)
+        # A run touching the end of `data` may have been CUT there rather than ended there. The
+        # caller reads a file in bounded chunks, so a long encoded blob arrives in pieces, and a
+        # container needs to be seen entire to be expanded at all -- measured: the credential in a
+        # gzip whose base64 crossed the 1 MiB chunk boundary was published clean, while the same
+        # blob one byte shorter was caught. Only the tail run can be affected, and only when the
+        # caller says more bytes follow.
+        if (
+            truncated
+            and inspect is not None
+            and run.end() == len(joined)
+            and _decodes_to_container(candidate)
+        ):
+            raise _RunTooLongToExpand
         for window in _decode_windows(candidate):
             # base64 packs 3 bytes per 4 characters, so a run rarely starts on a boundary; all four
             # alignments are tried, each trimmed to a whole number of quartets.
@@ -156,6 +197,34 @@ def _match_base64(data: bytes, inspect: _Inspector | None = None) -> str | None:
     return None
 
 
+def _decodes_to_container(run: bytes) -> bool:
+    """Whether the START of `run` decodes to something carrying a compressed-container signature.
+
+    What makes a cut run unrecoverable is a CONTAINER inside it: the header lives in the first
+    window and every later piece starts mid-stream. A run that is merely long loses nothing by
+    being cut, since the windowed pass reads a literal credential wherever it lands -- so refusing
+    on length alone made an ordinary padded JSON value unpublishable the moment it crossed a chunk
+    boundary, which a real test caught.
+
+    Only the head is decoded, at each alignment, since a container declares itself in its first
+    bytes. Deliberately narrow: this decides whether to REFUSE, so it answers "is a container
+    visibly starting here", never "might these bytes hide one".
+    """
+    head = run[:_CONTAINER_SNIFF_CHARS]
+    for start in range(min(len(head), 4)):
+        aligned = head[start:]
+        aligned = aligned[: len(aligned) - len(aligned) % 4]
+        if len(aligned) < 4:
+            continue
+        try:
+            decoded = base64.b64decode(aligned.translate(_URL_SAFE_ALPHABET), validate=True)
+        except (ValueError, binascii.Error):
+            continue
+        if decoded.startswith(_CONTAINER_MAGIC):
+            return True
+    return False
+
+
 def _inspect_whole(run: bytes, inspect: _Inspector) -> str | None:
     """What `inspect` makes of the WHOLE run decoded, for a run too long to fit one window.
 
@@ -169,8 +238,13 @@ def _inspect_whole(run: bytes, inspect: _Inspector) -> str | None:
     would decode it a second time for the same answer. Bounded by `_MAX_WHOLE_RUN` so an enormous
     encoded blob cannot be turned into an unbounded buffer by asking for it in one piece.
     """
-    if len(run) <= _BASE64_WINDOW or len(run) > _MAX_WHOLE_RUN:
+    if len(run) <= _BASE64_WINDOW:
         return None
+    if len(run) > _MAX_WHOLE_RUN:
+        # Skipping here reported a container nobody could expand as clean. Measured across 8,944
+        # real hub files: the longest base64 run is 11,244 bytes, so no publishable file is near
+        # this bound and refusing costs nothing that a real environment does.
+        raise _RunTooLongToExpand
     whole = run[: len(run) - len(run) % 4]
     try:
         decoded = base64.b64decode(whole.translate(_URL_SAFE_ALPHABET), validate=True)
