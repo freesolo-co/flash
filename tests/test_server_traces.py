@@ -2350,7 +2350,6 @@ def test_record_false_proxies_without_project_or_storage(trace_api, monkeypatch)
     ("body", "expected_detail"),
     [
         ({"messages": []}, "model is required"),
-        ({"model": "  ", "messages": []}, "model is required"),
         ({**_REQUEST, "metadata": "not-an-object"}, "metadata must be an object"),
     ],
 )
@@ -2368,6 +2367,34 @@ def test_recording_validates_model_and_metadata(
     # rejected locally BEFORE the provider is billed: forwarding first and refusing afterwards
     # would spend the caller's quota (and disclose the payload) on a request we already know is bad
     assert _StaticAsyncClient.requests == []
+
+
+@pytest.mark.parametrize("model", [123, {"name": "gpt-test"}, ["gpt-test"]])
+def test_recording_rejects_non_string_models(trace_api, monkeypatch, model: object) -> None:
+    _StaticAsyncClient.requests.clear()
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "model": model}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "model must be a string"
+    assert _StaticAsyncClient.requests == []
+
+    for blank in ("", "  \t\n"):
+        blank_response = trace_api.post(
+            "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "model": blank}
+        )
+        assert blank_response.status_code == 400
+        assert blank_response.json()["detail"] == "model is required"
+        assert _StaticAsyncClient.requests == []
+
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    body = {**_REQUEST, "model": " gpt-test "}
+    valid_response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=body)
+    assert valid_response.status_code == 200
+    assert _StaticAsyncClient.requests[0]["json"] == body
 
 
 @pytest.mark.parametrize(
@@ -2784,6 +2811,24 @@ def test_tool_call_action_controls_remain_distinct(
     response["choices"][0]["message"]["tool_calls"] = tool_calls
 
     assert platform_traces._chat_reply(response) == expected
+
+
+@pytest.mark.parametrize("audio", [{"id": "audio-1"}, ""], ids=["object", "wrong-type"])
+def test_a_reply_with_audio_is_not_exported_as_text_only(audio: object) -> None:
+    response = _reply_envelope("spoken and written")
+    response["choices"][0]["finish_reason"] = "stop"
+    response["choices"][0]["message"]["audio"] = audio
+
+    assert platform_traces._chat_reply(response) is None
+
+    text = _reply_envelope("ok")
+    tool_call = _reply_envelope("partial")
+    tool_call["choices"][0]["message"]["tool_calls"] = [{"id": "call-1"}]
+    function_call = _reply_envelope("partial")
+    function_call["choices"][0]["message"]["function_call"] = {"name": "lookup"}
+    assert platform_traces._chat_reply(text) == "ok"
+    assert platform_traces._chat_reply(tool_call) is None
+    assert platform_traces._chat_reply(function_call) is None
 
 
 @pytest.mark.parametrize("tool_calls", [None, [], {}])
@@ -3990,6 +4035,35 @@ def test_an_empty_schema_under_a_secret_name_survives_redaction(trace_api, monke
     assert stored["tools"][0]["function"]["parameters"]["properties"]["password"] == {}
 
 
+def test_schema_map_keywords_preserve_subschemas_and_redact_their_literals() -> None:
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "dependentSchemas": {
+            "password": {
+                "type": "object",
+                "properties": {"token": {"type": "string", "default": "SECRET-DEPENDENT"}},
+            }
+        },
+        "patternProperties": {"^secret_": {"type": "string", "default": "SECRET-PATTERN"}},
+        "metadata": {"password": "SECRET-INSTANCE"},
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["dependentSchemas"]["password"] == {
+        "type": "object",
+        "properties": {
+            "token": {"type": "string", "default": "[redacted]"},
+        },
+    }
+    assert stored["patternProperties"]["^secret_"] == {
+        "type": "string",
+        "default": "[redacted]",
+    }
+    assert stored["metadata"]["password"] == "[redacted]"
+
+
 @pytest.mark.parametrize("container", ["properties", "$defs", "definitions"])
 def test_schema_container_names_do_not_exempt_instance_secrets(container: str) -> None:
     schema = {
@@ -4273,6 +4347,37 @@ def test_percent_encoded_unreserved_schema_resource_uri_matches() -> None:
     assert trace_redaction._canonical_resource_uri("https://example.com/%73chema/%7e") == (
         "https://example.com/schema/~"
     )
+
+
+def test_http_root_resource_ids_match_explicit_slash_refs() -> None:
+    schema = {
+        "$id": "https://example.com",
+        "type": "object",
+        "properties": {
+            "password": {"$ref": "https://example.com/#/$defs/Cred"},
+        },
+        "$defs": {"Cred": {"type": "string", "default": "SECRET"}},
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["$defs"]["Cred"]["default"] == "[redacted]"
+    assert trace_redaction._canonical_resource_uri("https://example.com") == (
+        "https://example.com/"
+    )
+    assert trace_redaction._canonical_resource_uri("https://other.example.com") != (
+        trace_redaction._canonical_resource_uri("https://example.com/")
+    )
+    assert trace_redaction._canonical_resource_uri("https://example.com/path") != (
+        trace_redaction._canonical_resource_uri("https://example.com/")
+    )
+    assert trace_redaction._canonical_resource_uri("https://example.com/%2F") != (
+        trace_redaction._canonical_resource_uri("https://example.com/")
+    )
+    assert trace_redaction._canonical_resource_uri("https://example.com/a/../b") == (
+        "https://example.com/b"
+    )
+    assert trace_redaction._canonical_resource_uri("urn:example:") == "urn:example:"
 
 
 def test_percent_encoded_reserved_schema_resource_uri_stays_distinct() -> None:
@@ -5333,20 +5438,48 @@ def test_json_encoded_function_arguments_are_redacted(message_field: str, action
     }
 
 
-def test_unparseable_function_arguments_are_unchanged() -> None:
-    arguments = '{"password":"unterminated"'
+def test_unparseable_function_arguments_are_redacted_as_a_string() -> None:
     payload = {
         "messages": [
             {
                 "role": "assistant",
-                "tool_calls": [{"function": {"name": "login", "arguments": arguments}}],
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "login",
+                            "arguments": '{"password":"HUNTER2"',
+                        }
+                    }
+                ],
             }
         ]
     }
 
     stored = traces._redact_secret_fields(payload)
+    arguments = stored["messages"][0]["tool_calls"][0]["function"]["arguments"]
 
-    assert stored["messages"][0]["tool_calls"][0]["function"]["arguments"] == arguments
+    assert arguments == "[redacted]"
+    assert isinstance(arguments, str)
+
+    valid = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "login",
+                            "arguments": '{"password":"HUNTER2","user":"amy"}',
+                        }
+                    }
+                ],
+            }
+        ]
+    }
+    valid_stored = traces._redact_secret_fields(valid)
+    valid_arguments = valid_stored["messages"][0]["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(valid_arguments, str)
+    assert json.loads(valid_arguments) == {"password": "[redacted]", "user": "amy"}
 
 
 def test_a_request_token_field_is_redacted(trace_api, monkeypatch) -> None:

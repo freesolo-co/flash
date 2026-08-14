@@ -105,7 +105,9 @@ _JSON_SCHEMA_KEYWORDS = _JSON_SCHEMA_STRUCTURAL_KEYWORDS | _JSON_SCHEMA_ANNOTATI
 _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS = frozenset(
     {"default", "const", "enum", "examples", "example"}
 )
-_JSON_SCHEMA_PROPERTY_MAP_KEYWORDS = frozenset({"properties", "$defs", "definitions"})
+_JSON_SCHEMA_PROPERTY_MAP_KEYWORDS = frozenset(
+    {"properties", "patternProperties", "dependentSchemas", "$defs", "definitions"}
+)
 _JSON_SCHEMA_VALUE_KEYWORDS = frozenset(
     {
         "items",
@@ -343,11 +345,14 @@ def _canonical_resource_uri(uri: str) -> str:
         else:
             hostport = f"{host.casefold()}:{port}" if port_separator else hostport.casefold()
     normalized_netloc = f"{userinfo}@{hostport}" if user_separator else hostport
+    normalized_path = _remove_dot_segments(_normalize_percent_encoding(path))
+    if normalized_scheme in {"http", "https"} and normalized_netloc and not normalized_path:
+        normalized_path = "/"
     return urlunsplit(
         (
             normalized_scheme,
             normalized_netloc,
-            _remove_dot_segments(_normalize_percent_encoding(path)),
+            normalized_path,
             _normalize_percent_encoding(query),
             _normalize_percent_encoding(fragment),
         )
@@ -643,7 +648,9 @@ def _redact_secret_fields(
         try:
             parsed = json.loads(value)
         except (ValueError, RecursionError):
-            return value
+            # malformed arguments cannot be inspected for nested credentials, so preserving their
+            # bytes would turn parse failure into a secret exfiltration path. keep the wire type only.
+            return "[redacted]"
         redacted = _redact_secret_fields(parsed, depth=depth + 1, flag=flag)
         return json.dumps(redacted, separators=(",", ":"))
     return value

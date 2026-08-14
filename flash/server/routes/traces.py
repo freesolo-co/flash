@@ -579,10 +579,12 @@ async def chat_completions(
     metadata = body.get("metadata")
     if metadata is not None and not isinstance(metadata, dict):
         raise HTTPException(status_code=400, detail="metadata must be an object")
-    model = str(body.get("model") or "").strip()
-    if not model:
+    raw_model = body.get("model")
+    if raw_model is not None and not isinstance(raw_model, str):
+        raise HTTPException(status_code=400, detail="model must be a string")
+    if raw_model is None or not raw_model.strip():
         raise HTTPException(status_code=400, detail="model is required")
-    body["model"] = model
+    model = raw_model
 
     provider = (request.headers.get(_PROVIDER_HEADER) or "").strip().casefold()
     if provider not in _PROVIDER_URLS:

@@ -496,6 +496,10 @@ def _chat_reply(payload: Any) -> str | None:
     tool_calls = message.get("tool_calls")
     if tool_calls is not None and (not isinstance(tool_calls, list) or tool_calls):
         return None
+    if message.get("audio") is not None:
+        # audio is part of the assistant action. exporting only its text sibling would train a target
+        # that differs from the multimodal response the caller received, including malformed payloads.
+        return None
     if message.get("function_call") is not None:
         # a training target must contain the whole assistant action. exporting only the accompanying
         # text would silently discard the invocation, so skipping the row is the only faithful choice.
