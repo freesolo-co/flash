@@ -6,6 +6,7 @@ import argparse
 import base64
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -4329,6 +4330,7 @@ def test_an_sfx_archive_is_refused_however_long_its_stub(tmp_path):
     the opaque compressed body behind it was scanned as ordinary content and published.
     """
     import os
+    import random
 
     from flash.env_secrets import _Unscannable, credential_in_file
 
@@ -4340,7 +4342,9 @@ def test_an_sfx_archive_is_refused_however_long_its_stub(tmp_path):
 
     # an ordinary large binary with no signature anywhere is still publishable
     plain = tmp_path / "weights.bin"
-    plain.write_bytes(os.urandom(256 << 10))
+    # seeded for the same reason as the raw-deflate control: a random block can legitimately
+    # satisfy a container header, and a check that reddens by luck gets switched off
+    plain.write_bytes(random.Random(1).randbytes(256 << 10))
     assert credential_in_file(plain) is None
 
 
@@ -5224,3 +5228,317 @@ def test_a_short_archive_magic_is_decisive_only_at_the_start(tmp_path):
                 credential_in_file(shard)
         else:
             assert credential_in_file(shard) is None, name
+
+
+def test_a_message_encrypted_to_two_recipients_is_refused(tmp_path):
+    """Every session-key packet is walked, not just the first.
+
+    `gpg --encrypt -r a -r b` writes one PKESK per recipient before the encrypted data packet, so
+    deciding the message from the first packet alone found another PKESK where a data packet was
+    expected and reported "not encrypted". GnuPG decrypts the file happily, and a credential inside
+    published intact -- while the same message to ONE recipient was refused.
+    """
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    if not shutil.which("gpg"):
+        pytest.skip("gpg is not installed")
+    home = tmp_path / "gnupg"
+    home.mkdir(mode=0o700)
+    for uid in ("alpha@example.test", "beta@example.test"):
+        subprocess.run(
+            [
+                "gpg",
+                "--homedir",
+                str(home),
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-generate-key",
+                uid,
+                "rsa2048",
+                "encr",
+                "never",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    plain = tmp_path / "plain.txt"
+    plain.write_text(f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n")
+
+    def encrypt(*recipients):
+        command = ["gpg", "--homedir", str(home), "--batch", "--yes", "--trust-model", "always"]
+        for recipient in recipients:
+            command += ["-r", recipient]
+        return subprocess.run(
+            [*command, "-o", "-", "--encrypt", str(plain)], check=True, capture_output=True
+        ).stdout
+
+    # the control: one recipient, which was already refused
+    single = tmp_path / "one.gpg"
+    single.write_bytes(encrypt("alpha@example.test"))
+    with pytest.raises(_Unscannable):
+        credential_in_file(single)
+
+    both = tmp_path / "two.gpg"
+    both.write_bytes(encrypt("alpha@example.test", "beta@example.test"))
+    with pytest.raises(_Unscannable):
+        credential_in_file(both)
+
+
+def test_an_appended_bzip2_whose_first_block_exceeds_the_probe_is_expanded(tmp_path):
+    """A bzip2 payload behind a stub is found even when the probe reads no output.
+
+    bzip2 emits nothing until it has a whole block of up to 900 KiB, so a stream compressing more
+    than the 64 KiB probe returns empty from a perfectly valid decode. Treating that as "not a
+    stream" dismissed the candidate, and a credential behind a self-extracting stub published --
+    while the identical stream standing alone was detected.
+    """
+    import bz2
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    payload = bz2.compress(os.urandom(200_000) + f"fslo_{_FAKE_KEY_BODY}".encode())
+    # the probe really does yield nothing, or this fixture would not exercise the bug
+    assert not bz2.BZ2Decompressor().decompress(payload[:65536], 4096)
+
+    standalone = tmp_path / "payload.bz2"
+    standalone.write_bytes(payload)
+    assert credential_in_file(standalone) == "a Freesolo API key"
+
+    appended = tmp_path / "installer.run"
+    appended.write_bytes(b"#!/bin/sh\nexit 0\n" + payload)
+    assert credential_in_file(appended) == "a Freesolo API key"
+
+
+def test_a_json_escaped_credential_name_is_still_matched(tmp_path):
+    """`"SecretAccess\\u004bey"` names the same field, so the same secret is caught.
+
+    JSON says the two spellings are one string and every parser agrees, so an AWS credential
+    document written with a single escaped character loaded identically while the literal-byte name
+    matched nothing. The escape carries the character's CODE POINT, so a case-insensitive literal
+    cannot supply it -- `\\u004b` is `K`, and folding `k` does not reach it.
+    """
+    import base64
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    body = base64.b64encode(os.urandom(30))[:40].decode()
+    for name, text in (
+        ("plain.json", f'{{"SecretAccessKey": "{body}"}}'),
+        ("escaped.json", f'{{"SecretAccess\\u004bey": "{body}"}}'),
+        ("escaped_lower.json", f'{{"secretaccess\\u006bey": "{body}"}}'),
+        ("escaped_env.json", f'{{"AWS_SECRET_ACCESS_\\u004bEY": "{body}"}}'),
+    ):
+        document = tmp_path / name
+        document.write_text(text)
+        assert credential_in_file(document) == "an AWS secret access key", name
+
+    # the same treatment for the other assignment-anchored name
+    wandb = tmp_path / "wandb.json"
+    wandb.write_text(f'{{"WANDB_API_\\u004bEY": "{os.urandom(20).hex()}"}}')
+    assert credential_in_file(wandb) == "a Weights & Biases API key"
+
+    # and prose about the field is still publishable
+    prose = tmp_path / "README.md"
+    prose.write_text("the SecretAccessKey field is documented above\n")
+    assert credential_in_file(prose) is None
+
+
+def test_a_headerless_deflate_stream_is_expanded(tmp_path):
+    """Raw DEFLATE has no magic, so the decode itself has to be the recognition.
+
+    `zlib.compressobj(wbits=-15)` writes RFC 1951 with no header at all, so the magic list never
+    matched it and the zlib header rule had no header to read. The compressed bytes were scanned as
+    content and the credential inside published, while the zlib-wrapped form of the same payload
+    was expanded.
+    """
+    import random
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    secret = f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode()
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+    raw = compressor.compress(secret) + compressor.flush()
+
+    stream = tmp_path / "payload.deflate"
+    stream.write_bytes(raw)
+    assert credential_in_file(stream) == "a Freesolo API key"
+
+    # completeness is what keeps this off ordinary binaries: a truncated stream is not one, and
+    # neither is arbitrary data
+    truncated = tmp_path / "partial.bin"
+    truncated.write_bytes(raw[:-4])
+    assert credential_in_file(truncated) is None
+    # SEEDED, not `os.urandom`: measured 13 refusals in 20,000 random 4 KiB blocks, which is a 1.3%
+    # chance of a red run per draw of twenty. Those refusals are correct -- a block that satisfies
+    # the zlib header and its FDICT bit really cannot be inspected -- so this control is asserting
+    # that raw deflate does not fire on arbitrary data, not that nothing else ever does.
+    draws = random.Random(0)
+    for index in range(20):
+        noise = tmp_path / f"noise{index}.bin"
+        noise.write_bytes(draws.randbytes(4096))
+        assert credential_in_file(noise) is None
+
+
+def test_a_base64_value_holding_a_container_is_expanded(tmp_path):
+    """A Kubernetes Secret stores a gzipped credential base64, and both layers have to come off.
+
+    The decode succeeded and the decoded bytes were then pattern-matched while still COMPRESSED, so
+    `b64encode(gzip.compress(secret))` published clean -- even though base64 of the plaintext and
+    the bare gzip were each detected on their own.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import credential_in_file
+
+    secret = f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode()
+    encoded = base64.b64encode(gzip.compress(secret))
+
+    value = tmp_path / "encoded.txt"
+    value.write_bytes(encoded)
+    assert credential_in_file(value) == "a Freesolo API key"
+
+    manifest = tmp_path / "secret.yaml"
+    manifest.write_bytes(b"apiVersion: v1\nkind: Secret\ndata:\n  env: " + encoded + b"\n")
+    assert credential_in_file(manifest) == "a Freesolo API key"
+
+    # an ordinary compressed document encoded the same way still publishes
+    innocent = tmp_path / "docs.txt"
+    innocent.write_bytes(base64.b64encode(gzip.compress(b"just some documentation " * 40)))
+    assert credential_in_file(innocent) is None
+
+
+def test_a_netrc_machine_password_is_refused(tmp_path):
+    """A `.netrc` password names no service, so nothing else here could anchor on it.
+
+    `wandb login` and `huggingface-cli login` persist their token this way, and the value is a bare
+    40-hex string: no issuer prefix for a token pattern, no assignment for the named-credential
+    patterns. The CLI's filename filter does not cover `.netrc` either, so the file reached the hub
+    through both the CLI and a direct upload with a live key in it.
+    """
+    import base64
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    token = os.urandom(20).hex()
+    for name, text in (
+        ("multiline", f"machine api.wandb.ai\n  login user\n  password {token}\n"),
+        ("oneline", f"machine api.wandb.ai login user password {token}\n"),
+        ("default", f"default login user password {token}\n"),
+        ("quoted", f'machine api.wandb.ai\npassword "{token}"\n'),
+        (
+            "b64",
+            "machine huggingface.co\npassword " + base64.b64encode(os.urandom(30)).decode() + "\n",
+        ),
+    ):
+        entry = tmp_path / f"{name}.netrc"
+        entry.write_text(text)
+        assert credential_in_file(entry) == "a machine password in a netrc file", name
+
+    # writing ABOUT a netrc, or a placeholder in one, is not a credential
+    for name, text in (
+        ("prose", "set the password field on the machine you use\n"),
+        ("placeholder", "machine example.com\nlogin me\npassword changeme\n"),
+        ("commented", "# machine api.example.com\n# password <your-token-here>\n"),
+        ("yaml", "machine: builder-01\npassword: null\n"),
+        ("sha", "the sha is " + "a1b2c3d4" * 5 + " on machine two\n"),
+    ):
+        innocent = tmp_path / f"{name}.txt"
+        innocent.write_text(text)
+        assert credential_in_file(innocent) is None, name
+
+
+def test_the_server_refuses_a_netrc_an_older_client_uploaded(tmp_path):
+    """The CLI is not the trust boundary, so the server has to catch what it never filtered.
+
+    A raw `POST /v1/envs` or an older client skips the CLI's exclusions entirely, and the server is
+    what writes to the shared hub, whose history is permanent.
+    """
+    import os
+
+    from flash.env_secrets import reject_credential_bearing_package
+
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / ".netrc").write_text(
+        f"machine api.wandb.ai\n  login user\n  password {os.urandom(20).hex()}\n"
+    )
+    with pytest.raises(ValueError, match="netrc"):
+        reject_credential_bearing_package(package, display={})
+
+
+def test_a_credential_in_a_pdf_stream_is_found(tmp_path):
+    """A PDF keeps its content in a zlib stream that does not start at byte zero.
+
+    The head-anchored zlib check never saw it and the appended-payload search covers only gzip,
+    bzip2 and xz, so a key inside a document published -- while the same zlib record standing alone
+    was expanded. Located by the PDF's own grammar rather than by searching for zlib headers, which
+    trip about once per 2 KiB of arbitrary data.
+    """
+    import random
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    record = zlib.compress(f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode())
+    document = tmp_path / "report.pdf"
+    document.write_bytes(
+        b"%PDF-1.4\n1 0 obj\n<< /Length "
+        + str(len(record)).encode()
+        + b" /Filter /FlateDecode >>\nstream\n"
+        + record
+        + b"\nendstream\nendobj\ntrailer\n%%EOF\n"
+    )
+    assert credential_in_file(document) == "a Freesolo API key"
+
+    # a PDF whose streams hold ordinary content still publishes, and so does a non-PDF that
+    # happens to carry the same bytes -- the signature is what gates the search
+    innocent = tmp_path / "clean.pdf"
+    innocent.write_bytes(
+        b"%PDF-1.4\n1 0 obj\n<< /Filter /FlateDecode >>\nstream\n"
+        + zlib.compress(b"ordinary page content " * 50)
+        + b"\nendstream\n%%EOF\n"
+    )
+    assert credential_in_file(innocent) is None
+    shard = tmp_path / "shard.bin"
+    # seeded: see the raw-deflate control
+    shard.write_bytes(random.Random(2).randbytes(1 << 20))
+    assert credential_in_file(shard) is None
+
+
+def test_a_credential_split_across_adjacent_literals_is_found(tmp_path):
+    """Adjacent string literals concatenate, so the file holds no contiguous copy of the key.
+
+    Python source is exempt from the filename filter by design -- helper modules have to ship or
+    the worker fails to import -- so a key split this way had nothing between it and the hub, while
+    the same key written as one literal was caught.
+    """
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}"
+    for name, source in (
+        ("adjacent.py", f'FREESOLO_API_KEY = "{key[:18]}" "{key[18:]}"\n'),
+        ("wrapped.py", f'FREESOLO_API_KEY = (\n    "{key[:18]}"\n    "{key[18:]}"\n)\n'),
+        ("three.py", f'KEY = "{key[:12]}" "{key[12:24]}" "{key[24:]}"\n'),
+    ):
+        helper = tmp_path / name
+        helper.write_text(source)
+        assert credential_in_file(helper) == "a Freesolo API key", name
+
+    # a comma between two literals is two values, not one string, so unrelated entries are never
+    # welded into a credential nobody wrote
+    for name, source in (
+        ("list.json", '["alpha_value_here", "beta_value_here"]\n'),
+        ("dict.json", '{"a": "xxxx", "b": "yyyy"}\n'),
+        ("prose.txt", 'he said "hello" "world" and left\n'),
+    ):
+        innocent = tmp_path / name
+        innocent.write_text(source)
+        assert credential_in_file(innocent) is None, name

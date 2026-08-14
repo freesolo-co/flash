@@ -29,11 +29,12 @@ import tarfile
 import time
 import zipfile
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO, NoReturn
 
 from flash.env_base64 import _match_base64
+from flash.env_deflate import _pdf_stream_payloads, _raw_deflate_payload
 from flash.env_formats import (
     _KEYSTORE_MAGIC,
     _MAX_ARCHIVE_MEMBERS,
@@ -97,6 +98,20 @@ _MAX_KEYSTORE_BYTES = 16 << 20
 # or an appended log writes a handful; the bound is what stops a file of many tiny records from
 # becoming an expansion cost of its own, and exceeding it refuses rather than passes.
 _MAX_ZLIB_RECORDS = 64
+
+# The seam between two adjacent string literals: a closing quote, whitespace that may cross one
+# line break, then an opening quote of the SAME kind. Removing it welds the pair into the single
+# string the language builds at runtime.
+#
+# Same quote character on both sides, and the closing one must not be escaped. A `", "` between two
+# JSON array elements has the same shape as a concatenation seam, so joining indiscriminately would
+# weld unrelated values into runs that decode to credentials nobody wrote. Requiring the quotes to
+# match and the separator to be whitespace ONLY is what distinguishes `"a" "b"` -- which is one
+# string -- from `"a", "b"`, which is two.
+#
+# At most one newline, so this joins a wrapped literal without welding two lines of a list that
+# happen to sit under each other. Applied only after the ordinary literal pass has found nothing.
+_ADJACENT_LITERALS = re.compile(rb"(?<!\\)([\"'])[ \t]*(?:\r?\n[ \t]*)?\1")
 
 # How long a signature must be to be searched for at an ARBITRARY offset rather than only at the
 # start of a stream. Six bytes is where the two real self-extracting formats sit (7-Zip at six, RAR
@@ -192,7 +207,7 @@ _UNREADABLE_ARCHIVE = (
 )
 
 
-def _credential_kind(data: bytes) -> str | None:
+def _credential_kind(data: bytes, *, deadline: float | None = None, depth: int = 0) -> str | None:
     """The kind of credential `data` contains under any of its plausible text encodings.
 
     A wide encoding interleaves NUL bytes between ASCII characters, so a UTF-16 `env.ps1` holding
@@ -212,7 +227,7 @@ def _credential_kind(data: bytes) -> str | None:
     character keeps its padding byte NUL, so requiring an unbroken NUL run alongside the candidate
     costs nothing on genuine UTF-16/32 and leaves machine code with nothing long enough to match.
     """
-    if kind := _decoded_kind(data):
+    if kind := _decoded_kind(data, deadline=deadline, depth=depth):
         return kind
     if b"\x00" not in data:
         return None
@@ -221,7 +236,7 @@ def _credential_kind(data: bytes) -> str | None:
             # take every `width`-th byte: for UTF-16 that is the ASCII half of each code unit, in
             # whichever of the two byte orders the file used.
             for run in _wide_runs(data, width, offset):
-                if kind := _decoded_kind(run):
+                if kind := _decoded_kind(run, deadline=deadline, depth=depth):
                     return kind
     return None
 
@@ -241,9 +256,55 @@ def _wide_runs(data: bytes, width: int, offset: int) -> Iterator[bytes]:
         yield narrow[match.start() : match.end()]
 
 
-def _decoded_kind(data: bytes) -> str | None:
+def _decoded_kind(data: bytes, *, deadline: float | None = None, depth: int = 0) -> str | None:
     """The kind of credential in `data` literally, or inside a base64 run within it."""
-    return _match(data) or _match_base64(data)
+    if kind := _match(data) or _match_base64(data, _decoded_container(deadline, depth)):
+        return kind
+    # Adjacent string literals concatenate in Python, C and several other languages, so
+    # `KEY = "fslo_AbCdEf01" "23456789AbCd"` builds the whole credential at runtime while no
+    # contiguous run of bytes in the file holds it. Python source is EXEMPT from the filename
+    # filter by design -- helper modules have to ship or the worker fails to import -- so a key
+    # split this way had nothing between it and the hub.
+    #
+    # Only tried when the literal pass found nothing, and only when a joinable pair is actually
+    # present, so the ordinary file pays one cheap search.
+    joined = _ADJACENT_LITERALS.sub(b"", data)
+    return _match(joined) if joined != data else None
+
+
+def _decoded_container(deadline: float | None, depth: int) -> Callable[[bytes], str | None] | None:
+    """What `_match_base64` should do with decoded bytes that match no pattern, or None to stop.
+
+    A base64 value routinely holds a whole CONTAINER: a Kubernetes Secret, a cloud-init document
+    and a `kubectl -o yaml` export all store their values encoded, so a gzipped credential inside
+    one decoded here and was then matched while still compressed and published clean.
+
+    Returns None once the depth cap is reached, which switches the second look off rather than
+    refusing. That is the same budget every other layer spends, so base64 of a container cannot buy
+    expansion the container alone would not get -- and the ordinary shallow case pays nothing.
+
+    A refusal from the second look is SWALLOWED, unlike every other unscannable path here, because
+    this decode is speculative: `_match_base64` tries four alignments of every base64-shaped run, so
+    the "container" handed over is a re-interpretation of bytes never claimed to be one, and an ELF
+    holds enough such runs to produce one by chance. Measured on `containerd`, `ctr` and `dockerd`:
+    each decoded to something tripping the dictionary-zlib refusal, making them unpublishable over
+    bytes nobody encoded. Refusing is honest only when the file really is the format it could not
+    read. A credential that IS present decodes and matches here, so this costs no detection.
+    """
+    if deadline is None or depth >= _MAX_CONTAINER_DEPTH:
+        return None
+
+    def inspect(decoded: bytes) -> str | None:
+        # Only bytes that actually look like a container are re-entered; anything else has already
+        # been through `_match` and would just be scanned a second time.
+        if not _looks_like_container(decoded):
+            return None
+        try:
+            return _credential_in_container(decoded, deadline=deadline, depth=depth + 1)
+        except (_Unscannable, *_UNREADABLE_ARCHIVE):
+            return None
+
+    return inspect
 
 
 class _Unscannable(Exception):
@@ -346,7 +407,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         # inside, and treating it as ordinary text published the message intact.
         if _has_openpgp_message_armor(window):
             raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
-        if kind := _credential_kind(window):
+        if kind := _credential_kind(window, deadline=deadline, depth=depth):
             return kind
         # A two-marker credential is paired across the WHOLE stream, not within one window. Those
         # detectors are order-independent and distance-free inside a single buffer, but a chunked
@@ -537,6 +598,8 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
         _credential_in_tar,
         _credential_in_compressed,
         _credential_in_overlay,
+        _credential_in_raw_deflate,
+        _credential_in_pdf,
     ):
         try:
             if kind := handler(source, deadline=deadline, depth=depth):
@@ -570,6 +633,49 @@ def _credential_in_overlay(source: Path | bytes, *, deadline: float, depth: int)
     if not payload:
         raise _Unscannable("contains an appended archive too large to inspect")
     return _credential_in_container(payload, deadline=deadline, depth=depth + 1)
+
+
+def _credential_in_raw_deflate(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
+    """The kind of credential inside a headerless DEFLATE stream (RFC 1951), or None.
+
+    Its own handler rather than a branch of the zlib one, because raw deflate has no header at all:
+    the zlib branch is reached by the two-byte RFC 1950 rule, which a headerless stream cannot
+    satisfy, so a `.deflate` sidecar was never expanded and its credential published intact.
+
+    Last by position in the handler list. With nothing to match on the decode IS the recognition,
+    so it runs only once every magic-based handler has declined, and costs one inflate attempt that
+    fails immediately on anything that is not a complete stream.
+    """
+    raw = source.read_bytes() if isinstance(source, Path) else source
+    plain = _raw_deflate_payload(raw, _MAX_NESTED_BUFFER_BYTES)
+    if plain is None:
+        raise _Unscannable("contains a compressed stream too large to inspect")
+    if not plain:
+        return None
+    return _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth)
+
+
+def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
+    """The kind of credential inside a PDF's compressed streams, or None.
+
+    A PDF keeps its content in `/FlateDecode` streams, whose zlib record starts after the object
+    header rather than at byte zero -- so the head-anchored zlib check never saw it, and the overlay
+    search covers only gzip, bzip2 and xz. A credential in a PDF published intact even though the
+    same zlib record standing alone is detected.
+
+    Anchored on the `%PDF-` signature and the object syntax around each stream, NOT by searching for
+    zlib headers. Searching is what makes this unaffordable: that rule is about eleven bits, so it
+    trips once per 2 KiB of arbitrary data -- measured 44,197 candidates across 310 MB of real
+    binaries, of which 15 inflated. Feeding those through the overlay machinery would exhaust its
+    bound and refuse every large binary. The grammar costs nothing on a non-PDF.
+    """
+    raw = source.read_bytes() if isinstance(source, Path) else source
+    for plain in _pdf_stream_payloads(raw, _MAX_NESTED_BUFFER_BYTES):
+        if plain is None:
+            raise _Unscannable("contains a compressed stream too large to inspect")
+        if kind := _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth):
+            return kind
+    return None
 
 
 def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: int) -> str | None:

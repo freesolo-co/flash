@@ -106,6 +106,18 @@ _KEYSTORE_MAGIC = (b"\xfe\xed\xfe\xed", b"\xce\xce\xce\xce")
 # bound only has to sit above any real store rather than above a handful.
 _MAX_JKS_ENTRIES = 4096
 
+# How many session-key packets a message may carry before the walk gives up. `gpg --encrypt -r a
+# -r b` writes one per recipient ahead of the encrypted data packet, so a message sent to a team
+# has as many as the team has members -- and deciding from the first packet alone reported "not
+# encrypted" for every multi-recipient message, publishing the ciphertext. Bounded like every other
+# walk here, and exhausting it refuses rather than passes.
+_MAX_PGP_RECIPIENTS = 256
+
+
+# "The packet runs past the bytes available", distinct from both an offset and from None. A packet
+# longer than what was read says nothing about what follows it, so the caller reports undecided.
+_PACKET_PAST_BUFFER = -1
+
 # The expandable compressed formats worth looking for BEHIND a stub, and how much of one is read to
 # prove it is really a stream rather than three bytes of coincidence. A self-extracting shell
 # archive -- what `makeself` writes, and what ships as a `.run` installer -- puts a script first and
@@ -269,12 +281,27 @@ def _decompresses(probe: bytes) -> bool:
     The magic alone is not proof: three fixed bytes occur by chance in any large binary. Attempting
     the decompression is what separates a payload from a coincidence, and it is decisive -- a
     stream that yields a byte is a stream.
+
+    For bzip2, "yielded no bytes yet" is NOT a rejection. bzip2 works in blocks of up to 900 KiB and
+    emits nothing until it has a whole one, so a stream compressing more than the probe reads --
+    200 KiB of incompressible data is enough -- returned empty from a perfectly valid decode and the
+    candidate was dismissed. What separates it from coincidence there is that the decompressor
+    consumed the entire probe and asked for more (`needs_input`) rather than raising: three bytes of
+    chance do not survive 64 KiB of block decoding. Measured 0 acceptances across 2,000 random
+    bodies behind a real `BZh` magic.
+
+    gzip and xz are deliberately NOT given the same treatment. Both emit output within the first
+    few bytes of any stream -- measured 4,096 bytes from the probe on gzip and xz payloads up to
+    2 MB, random or not -- so "no output yet" really is a rejection for them, and accepting
+    `needs_input` instead measured 97 false acceptances in 2,000 random gzip-magic bodies. That is
+    a bound-exhausting cost on any large binary, and this search has to stay cheap on model shards.
     """
     try:
         if probe.startswith(b"\x1f\x8b\x08"):
             return bool(zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(probe, 4096))
         if probe.startswith(b"BZh"):
-            return bool(bz2.BZ2Decompressor().decompress(probe, 4096))
+            decompressor = bz2.BZ2Decompressor()
+            return bool(decompressor.decompress(probe, 4096)) or decompressor.needs_input
         if probe.startswith(b"\xfd7zXZ\x00"):
             return bool(lzma.LZMADecompressor().decompress(probe, 4096))
     except (OSError, EOFError, ValueError, zlib.error, lzma.LZMAError):
@@ -444,8 +471,49 @@ def _encrypted_message_head(head: bytes) -> bool | None:
     the encrypted data forms.
     """
     session, encrypted = frozenset((1, 3)), frozenset((9, 18, 20))
+    at = 0
+    for _ in range(_MAX_PGP_RECIPIENTS):
+        following = _session_packet_end(head, at, session)
+        if following is None:
+            return False
+        if following == _PACKET_PAST_BUFFER:
+            return None
+        tag = _packet_tag(head[following])
+        if tag in encrypted:
+            return True
+        if tag not in session:
+            return False
+        # another recipient's session key, so the data packet is further on: keep walking. Each
+        # header is at least two bytes, so the offset always advances and the loop always ends.
+        at = following
+    # Bounded like every other walk here, and exhausting it is undecided rather than clean: a
+    # message addressed to more recipients than this is still an encrypted message.
+    return None
+
+
+def _packet_tag(first: int) -> int:
+    """The packet tag of an OpenPGP header byte, or 0 if it is not a packet header at all."""
+    if first & 0xC0 == 0xC0:
+        return first & 0x3F
+    return (first >> 2) & 0x0F if first & 0xC0 == 0x80 else 0
+
+
+def _session_packet_end(head: bytes, at: int, session: frozenset[int]) -> int | None:
+    """Where the session-key packet at `head[at:]` ends, so the caller can read what follows.
+
+    Three answers, each with one meaning: None is "not a valid session-key packet here", the
+    `_PACKET_PAST_BUFFER` sentinel is "the packet runs past the bytes available" -- undecided rather
+    than clean -- and any other value is the offset of the packet behind this one, guaranteed to be
+    a readable index.
+
+    Split out of `_encrypted_message_head` because that function now walks: `gpg --encrypt -r a -r b`
+    writes one of these per recipient before the encrypted data packet, so deciding a message from
+    the first packet alone reported "not encrypted" for every multi-recipient message and published
+    the ciphertext.
+    """
+    head = head[at:]
     if len(head) < 2:
-        return False
+        return None
     if head[0] & 0xC0 == 0xC0:  # new format: tag in the low six bits
         # The length is decoded here rather than through `_openpgp_body_length`, which keys on the
         # secret-key tag bytes: for a `0xC1`/`0xC3` header it falls through to a slice that is
@@ -455,44 +523,42 @@ def _encrypted_message_head(head: bytes) -> bool | None:
             length, header = first, 2
         elif first < 224:
             if len(head) < 3:
-                return False
+                return None
             length, header = ((first - 192) << 8) + head[2] + 192, 3
         elif first == 255:
             if len(head) < 6:
-                return False
+                return None
             length, header = int.from_bytes(head[2:6], "big"), 6
         else:
-            return False  # a partial-body length: the packet has no single stated length
+            return None  # a partial-body length: the packet has no single stated length
     elif head[0] & 0xC0 == 0x80:  # old format: tag in bits 5-2, length type in the low two
         tag, width = (head[0] >> 2) & 0x0F, (1, 2, 4, 0)[head[0] & 0x03]
         if not width:
-            return False
+            return None
         length, header = int.from_bytes(head[1 : 1 + width], "big"), 1 + width
     else:
-        return False
-    if tag not in session or length is None or len(head) < header + 1:
-        return False
+        return None
+    if tag not in session or len(head) < header + 1:
+        return None
     # RFC 4880/9580 packet versions: 3 for a public-key ESK, 4/5/6 for a symmetric-key ESK.
     if head[header] not in (3, 4, 5, 6):
-        return False
+        return None
     if tag == 3:
         # symmetric-key ESK: a cipher from the registry, then an S2K specifier of a defined type
         if len(head) < header + 3:
-            return False
+            return None
         if head[header + 1] not in (1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13):
-            return False
+            return None
         if head[header + 2] not in (0, 1, 3, 4):
-            return False
-    at = header + length
-    if at + 1 > len(head):
+            return None
+    end = header + length
+    if end + 1 > len(head):
         # The session packet is longer than the bytes available. A real PKESK for an RSA-2048 key
         # is a few hundred bytes, so a fixed head could not reach the data packet behind it and
         # reported "not encrypted" -- publishing the ciphertext. The caller passes the whole chunk
         # now; still running out means the packet is longer than a chunk, which is undecided.
-        return None
-    nxt = head[at]
-    following = nxt & 0x3F if nxt & 0xC0 == 0xC0 else (nxt >> 2) & 0x0F if nxt & 0xC0 == 0x80 else 0
-    return following in encrypted
+        return _PACKET_PAST_BUFFER
+    return at + end
 
 
 def _is_openpgp_secret_key(head: bytes) -> bool | None:

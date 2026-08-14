@@ -141,11 +141,43 @@ _OPEN_QUOTE = rb"(?:\"\"\"|'''|[\"'])?"
 # its key intact. They are small and legacy, but a 112-bit private key is still a private key, and
 # the point of reading the length rather than listing sizes is not to have a floor that guesses.
 _SEC1_SCALAR_BYTES = range(0x0E, 0x73)
+
+
+def _json_escapable(text: bytes, *, fold_case: bool = False) -> bytes:
+    """`text` as a pattern matching itself or any character written as its `\\u00XX` escape.
+
+    JSON says the two spellings are the same string, so a parser loads `"R\\u0053A"` as `RSA` and
+    a literal-byte pattern sees neither. Applied to member NAMES and to the `kty` VALUE: escaping
+    only the names left the key-type marker matchable by a one-character escape.
+
+    `fold_case` makes each position match the escape of EITHER case of the character, for a name
+    whose surrounding pattern is case-insensitive. Without it, wrapping the result in `(?i:...)`
+    covers only the literal half: the escape carries the character's code point, so `SecretAccessKey`
+    written `SecretAccess\\u004bey` needs the code point of `K` and a case-folded LITERAL cannot
+    supply it. An escaped AWS field name published its secret intact for exactly that reason.
+    """
+    codes = (
+        (lambda byte: (byte, byte ^ 0x20) if bytes([byte]).isalpha() else (byte,))
+        if fold_case
+        else (lambda byte: (byte,))
+    )
+    return b"".join(
+        rb"(?:%s|(?i:\\[uU]00(?:%s)))"
+        % (re.escape(bytes([byte])), b"|".join(b"%02x" % code for code in codes(byte)))
+        for byte in text
+    )
+
+
 _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     (
         "a Weights & Biases API key",
         re.compile(
-            rb"(?i:wandb_api_key)[\"']?\s*[:=]\s*"
+            # escapable per character for the same reason as the AWS name below: a `wandb` block in
+            # a JSON config is an ordinary place for this key to sit, and the escaped spelling
+            # loads identically.
+            rb"(?i:"
+            + _json_escapable(b"wandb_api_key", fold_case=True)
+            + rb")[\"']?\s*[:=]\s*"
             + _BLOCK_SCALAR
             + _NODE_PROPERTIES
             + _OPEN_QUOTE
@@ -160,7 +192,15 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
             # a saved session lands in on disk. Anchoring on the env-var name alone meant those
             # published intact. Word-boundary-free on the left so the `aws_` prefix stays optional
             # without admitting a longer unrelated identifier ending in the same characters.
-            rb"(?i:aws_secret_access_key|(?<![A-Za-z0-9_])secretaccesskey)[\"']?\s*[:=]\s*"
+            # Both spellings admit `\u00XX` escapes per character. A credential document is JSON
+            # more often than not, `"SecretAccessKey"` is the SAME field name to every parser,
+            # and a literal-byte name saw neither it nor an escaped `AWS_SECRET_ACCESS_KEY` -- so
+            # the identical 40-character secret published clean under a one-character escape.
+            rb"(?i:"
+            + _json_escapable(b"aws_secret_access_key", fold_case=True)
+            + rb"|(?<![A-Za-z0-9_])"
+            + _json_escapable(b"secretaccesskey", fold_case=True)
+            + rb")[\"']?\s*[:=]\s*"
             + _BLOCK_SCALAR
             + _NODE_PROPERTIES
             + _OPEN_QUOTE
@@ -185,14 +225,6 @@ class _Searchable(Protocol):
 #
 # Its name is escapable exactly like the private members below, and for the same reason: escaping
 # only the `kty` half left the pair unmatched even when the private member was spelled plainly.
-def _json_escapable(text: bytes) -> bytes:
-    """`text` as a pattern matching itself or any character written as its `\\u00XX` escape.
-
-    JSON says the two spellings are the same string, so a parser loads `"R\\u0053A"` as `RSA` and
-    a literal-byte pattern sees neither. Applied to member NAMES and to the `kty` VALUE: escaping
-    only the names left the key-type marker matchable by a one-character escape.
-    """
-    return b"".join(rb"(?:%s|(?i:\\[uU]00%02x))" % (re.escape(bytes([b])), b) for b in text)
 
 
 _JWK_KTY = re.compile(
@@ -277,6 +309,25 @@ _HEX_BODY = re.compile(r"[0-9a-fA-F]{32,}")
 # of starting with base64. It names those two headers exactly: a general `[A-Za-z-]+:` also accepts
 # `Warning:` or `Note:`, which is prose about a key rather than a key, and reopens the very false
 # positive the base64 requirement exists to close.
+# The two halves of a `.netrc` entry. `machine <host>` opens an entry and is the keyword that makes
+# the file a credential store; `password <token>` carries the secret.
+#
+# Netrc is TOKEN-separated rather than line-oriented: `curl` and several generators write a whole
+# entry on one line, and anchoring either half to a line start missed exactly that form. So each
+# half requires whitespace (or a boundary) before its keyword, which still keeps a sentence
+# mentioning either word out while matching the entry however it is laid out. `default` opens an
+# entry too, and is the fallback form. The password body must be key-length and goes through
+# `_is_high_entropy` like every other body, which is what keeps `password changeme` and a
+# documented placeholder out.
+#
+# The body stops at whitespace because netrc is token-separated. A quoted value is admitted too:
+# `password "..."` is what a generator writes when the token could contain a space.
+_NETRC_MACHINE = re.compile(rb"(?i)(?:^|\s)(?:machine[ \t]+\S+|default)(?:\s|$)")
+_NETRC_PASSWORD = re.compile(
+    rb"(?i)(?:^|\s)password[ \t]+[\"']?([A-Za-z0-9/+=_-]{32,%d})" % _MAX_BODY
+)
+
+
 _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
     #
     # `(?: BLOCK)?` because OpenPGP armours as `-----BEGIN PGP PRIVATE KEY BLOCK-----`. Without it
@@ -420,6 +471,26 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
         # each half is anchored on a literal that fails fast on ordinary JSON.
         _TwoMarkers(_JWK_KTY, _JWK_PRIVATE),
     ),
+    (
+        "a machine password in a netrc file",
+        # A `.netrc` is how `wandb login`, `huggingface-cli` and `curl` persist a credential, and
+        # its password line names no service: `password <40 hex>` has neither an issuer prefix nor
+        # an assignment for the patterns above to anchor on. The CLI's filename filter does not
+        # cover `.netrc` either, and the server accepts whatever is uploaded -- so a standard W&B
+        # netrc passed every check and committed a live key to the shared hub.
+        #
+        # Two markers rather than one span, for the same reason as the JWK above: the `machine`
+        # line and the `password` line are usually adjacent but need not be -- the format is
+        # whitespace-separated tokens, `login` may sit between them in either order, and a
+        # multi-host netrc puts whole entries in between. Requiring a window would miss those while
+        # a span would backtrack over every position between them.
+        #
+        # The `machine` half is what makes this a credential store rather than prose: the word
+        # `password` alone appears in documentation, in a config schema, and in any English text.
+        # Requiring the netrc keyword AND a key-length high-entropy body is what separates the file
+        # from writing about one.
+        _TwoMarkers(_NETRC_MACHINE, _NETRC_PASSWORD),
+    ),
 )
 
 
@@ -478,15 +549,71 @@ def _is_high_entropy(body: bytes, *, hex_is_issued: bool = False) -> bool:
     return not (text.isalpha() and (text.isupper() or text.islower()))
 
 
+# The keyword each expensive pattern is anchored on, in every spelling a substring test can see.
+# A buffer holding none of them cannot match that pattern, so the regex is skipped -- see
+# `_keyword_absent`. Keyed by the pattern's kind so a pattern without an entry is simply never
+# guarded, which is the safe default: a missing entry costs time, never a missed credential.
+#
+# Lowercase, because the guard tests against a lowercased copy. Only the patterns measured as
+# expensive are listed; the issuer-prefixed tokens are already cheap literal prefixes.
+_PATTERN_KEYWORDS: dict[str, tuple[bytes, ...]] = {
+    "an AWS secret access key": (b"secretaccesskey", b"secret_access_key"),
+    "a Weights & Biases API key": (b"wandb_api_key",),
+    "a machine password in a netrc file": (b"password",),
+}
+
+# A JSON `\u00XX` escape, which can spell any of the keywords above in a way no substring test
+# sees. Its presence disarms the guard so the full pattern runs -- the escaped spellings are
+# exactly what those patterns were widened to catch, and a guard that skipped them would close the
+# regex and reopen the bypass in the same change.
+_ESCAPE_HINT = re.compile(rb"\\[uU]00")
+
+# Below this size the lowercased copy costs more than the guards save, so they are not applied.
+# A small buffer runs every pattern as before.
+_GUARD_MIN_BYTES = 4096
+
+
+def _keyword_absent(data: bytes, lowered: bytes | None, kind: str) -> bool:
+    """Whether a keyword-anchored pattern cannot possibly match, tested by substring.
+
+    A necessary condition, never a sufficient one: every pattern below is anchored on a fixed
+    keyword, so a buffer containing none of that keyword's spellings cannot match it however the
+    rest of the pattern is written. The regex is then skipped entirely.
+
+    Worth doing because these patterns are the expensive ones. Admitting `\\u00XX` escapes per
+    character turned each name into a chain of alternations, which took the assignment group from
+    31 ms to 46 ms per MiB, and the netrc pair adds 15 ms more -- on a stream that expands to
+    hundreds of MiB, that is the difference between finishing inside the time budget and refusing a
+    legitimate publish over the scan's own cost. A lowercased copy plus a handful of `in` tests is
+    memchr-fast: 3 ms per MiB for all of them together, against roughly 50 ms of regex.
+
+    `lowered` is the caller's single lowercased copy, shared across the patterns so the cost is
+    paid once per buffer rather than once per pattern.
+    """
+    if lowered is None:
+        return False
+    if (keywords := _PATTERN_KEYWORDS.get(kind)) is None:
+        return False
+    # an escape anywhere means the keyword may be spelled in a way no substring test can see
+    return not any(keyword in lowered for keyword in keywords) and not _ESCAPE_HINT.search(lowered)
+
+
 def _match(data: bytes) -> str | None:
     """The kind of credential the literal bytes `data` contain, or None."""
+    # One lowercased copy for every keyword guard below, made only when the buffer is large enough
+    # for the guards to save more than the copy costs.
+    lowered = data.lower() if len(data) >= _GUARD_MIN_BYTES else None
     for kind, pattern in _LITERAL_PATTERNS:
+        if _keyword_absent(data, lowered, kind):
+            continue
         if pattern.search(data):
             return kind
     # only the assignment-anchored group admits an all-hex body: its W&B key is issued as hex,
     # while an issuer-prefixed token is base62, so an all-hex body there is the placeholder.
     for group, hex_is_issued in ((_TOKEN_PATTERNS, False), (_ASSIGNED_PATTERNS, True)):
         for kind, pattern in group:
+            if _keyword_absent(data, lowered, kind):
+                continue
             for match in pattern.finditer(data):
                 # the alternations put the body in whichever group matched; the rest are None.
                 body = next((found for found in match.groups() if found), b"")

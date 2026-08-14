@@ -13,9 +13,13 @@ from __future__ import annotations
 import base64
 import binascii
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from flash.env_patterns import SHORTEST_TOKEN_BYTES, _match
+
+# What a caller may offer for a second look at decoded bytes: given them, it names a credential or
+# returns None. Typed here rather than importing the scan, so the dependency stays one-way.
+_Inspector = Callable[[bytes], str | None]
 
 # A base64 run long enough to hold the shortest credential a pattern admits. The lower bound makes
 # the scan walk past ordinary prose rather than decoding every word it meets. There is deliberately
@@ -85,7 +89,7 @@ _BASE64_WINDOW = 8192
 _BASE64_WINDOW_OVERLAP = 1024
 
 
-def _match_base64(data: bytes) -> str | None:
+def _match_base64(data: bytes, inspect: _Inspector | None = None) -> str | None:
     """The kind of credential hidden in a base64 run, or None.
 
     A Kubernetes Secret stores every value base64-encoded, and that is an ordinary file to keep
@@ -96,6 +100,14 @@ def _match_base64(data: bytes) -> str | None:
     considered, so this walks past prose. The decoded bytes go through `_match` rather than the full
     `_credential_kind`, which keeps the recursion one level deep: base64 of base64 is not a
     convention worth chasing, and unbounded re-decoding is a denial-of-service surface.
+
+    `inspect`, when given, is offered the decoded bytes after `_match` declines. A Kubernetes
+    Secret, a cloud-init document and every `kubectl -o yaml` export store their values base64, and
+    a gzipped credential inside one decoded successfully here and was then pattern-matched while
+    still COMPRESSED -- so `b64encode(gzip.compress(secret))` published clean even though base64 of
+    the plaintext and the bare gzip are both caught. Passed in rather than imported so the
+    dependency stays one-way: this module knows nothing about containers, only that the caller may
+    want a second look.
 
     A run is decoded in overlapping windows rather than whole, so memory stays bounded on a large
     encoded blob while a credential anywhere in it still lands whole inside some window. Slicing a
@@ -130,6 +142,8 @@ def _match_base64(data: bytes) -> str | None:
                 except (ValueError, binascii.Error):
                     continue
                 if kind := _match(decoded):
+                    return kind
+                if inspect is not None and (kind := inspect(decoded)):
                     return kind
     return None
 
