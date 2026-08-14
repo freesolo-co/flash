@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import IO, NoReturn
 
 from flash.env_base64 import _match_base64
-from flash.env_deflate import _pdf_stream_payloads, _raw_deflate_payload
+from flash.env_deflate import _pdf_stream_payloads, _raw_deflate_payload, _TooManyStreams
 from flash.env_formats import (
     _KEYSTORE_MAGIC,
     _MAX_ARCHIVE_MEMBERS,
@@ -56,6 +56,7 @@ from flash.env_formats import (
     _overlay_payload,
     _zip_member_count,
 )
+from flash.env_joined import _rejoined
 from flash.env_patterns import (
     _ASSIGNED_PATTERNS,
     _LITERAL_PATTERNS,
@@ -98,20 +99,6 @@ _MAX_KEYSTORE_BYTES = 16 << 20
 # or an appended log writes a handful; the bound is what stops a file of many tiny records from
 # becoming an expansion cost of its own, and exceeding it refuses rather than passes.
 _MAX_ZLIB_RECORDS = 64
-
-# The seam between two adjacent string literals: a closing quote, whitespace that may cross one
-# line break, then an opening quote of the SAME kind. Removing it welds the pair into the single
-# string the language builds at runtime.
-#
-# Same quote character on both sides, and the closing one must not be escaped. A `", "` between two
-# JSON array elements has the same shape as a concatenation seam, so joining indiscriminately would
-# weld unrelated values into runs that decode to credentials nobody wrote. Requiring the quotes to
-# match and the separator to be whitespace ONLY is what distinguishes `"a" "b"` -- which is one
-# string -- from `"a", "b"`, which is two.
-#
-# At most one newline, so this joins a wrapped literal without welding two lines of a list that
-# happen to sit under each other. Applied only after the ordinary literal pass has found nothing.
-_ADJACENT_LITERALS = re.compile(rb"(?<!\\)([\"'])[ \t]*(?:\r?\n[ \t]*)?\1")
 
 # How long a signature must be to be searched for at an ARBITRARY offset rather than only at the
 # start of a stream. Six bytes is where the two real self-extracting formats sit (7-Zip at six, RAR
@@ -260,15 +247,15 @@ def _decoded_kind(data: bytes, *, deadline: float | None = None, depth: int = 0)
     """The kind of credential in `data` literally, or inside a base64 run within it."""
     if kind := _match(data) or _match_base64(data, _decoded_container(deadline, depth)):
         return kind
-    # Adjacent string literals concatenate in Python, C and several other languages, so
-    # `KEY = "fslo_AbCdEf01" "23456789AbCd"` builds the whole credential at runtime while no
-    # contiguous run of bytes in the file holds it. Python source is EXEMPT from the filename
-    # filter by design -- helper modules have to ship or the worker fails to import -- so a key
-    # split this way had nothing between it and the hub.
+    # A file can hold a credential in pieces that no contiguous run of its bytes contains: adjacent
+    # string literals, which the language concatenates at parse time, and a backslash-newline
+    # continuation, which the shell removes before the value is assigned. Python source is EXEMPT
+    # from the filename filter by design -- helper modules have to ship or the worker fails to
+    # import -- so a key split either way had nothing between it and the hub.
     #
-    # Only tried when the literal pass found nothing, and only when a joinable pair is actually
-    # present, so the ordinary file pays one cheap search.
-    joined = _ADJACENT_LITERALS.sub(b"", data)
+    # Only tried when the literal pass found nothing, and `_rejoined` returns the input unchanged
+    # when no seam is present, so the ordinary file pays two cheap searches and no rematch.
+    joined = _rejoined(data)
     return _match(joined) if joined != data else None
 
 
@@ -670,11 +657,14 @@ def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> 
     bound and refuse every large binary. The grammar costs nothing on a non-PDF.
     """
     raw = source.read_bytes() if isinstance(source, Path) else source
-    for plain in _pdf_stream_payloads(raw, _MAX_NESTED_BUFFER_BYTES):
-        if plain is None:
-            raise _Unscannable("contains a compressed stream too large to inspect")
-        if kind := _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth):
-            return kind
+    try:
+        for plain in _pdf_stream_payloads(raw, _MAX_NESTED_BUFFER_BYTES):
+            if plain is None:
+                raise _Unscannable("contains a compressed stream too large to inspect")
+            if kind := _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth):
+                return kind
+    except _TooManyStreams:
+        raise _Unscannable("contains more compressed streams than can be inspected") from None
     return None
 
 

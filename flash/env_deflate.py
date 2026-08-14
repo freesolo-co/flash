@@ -25,6 +25,16 @@ _PDF_STREAM = re.compile(rb"/FlateDecode\b[\s\S]{0,512}?\bstream\r?\n")
 _MAX_PDF_STREAMS = 4096
 
 
+class _TooManyStreams(Exception):
+    """A PDF carries more compressed streams than `_MAX_PDF_STREAMS`, so it was not fully read.
+
+    Defined here rather than reusing the scan's own refusal so the dependency stays one way: this
+    module knows about bytes and formats, and the caller is what turns "not fully read" into a
+    refusal. The distinction from the over-budget sentinel is what keeps the message honest --
+    the document is not too large to inflate, it has too many streams to walk.
+    """
+
+
 def _raw_deflate_payload(data: bytes, budget: int) -> bytes | None:
     """What ALL of `data` inflates to when it is one complete raw DEFLATE stream (RFC 1951).
 
@@ -78,10 +88,16 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     """
     if not data.startswith(b"%PDF-"):
         return
-    for found in itertools.islice(_PDF_STREAM.finditer(data), _MAX_PDF_STREAMS):
+    streams = _PDF_STREAM.finditer(data)
+    for found in itertools.islice(streams, _MAX_PDF_STREAMS):
         inflate = zlib.decompressobj()
         try:
             plain = inflate.decompress(data[found.end() :], budget)
         except zlib.error:
             continue
         yield None if inflate.unconsumed_tail else plain
+    # Stopping at the bound silently reported every later stream as clean, so a document with one
+    # more stream than the limit published the credential in it. Undecided is not clean, and every
+    # other bound here already refuses rather than truncating -- this one returned a verdict.
+    if next(streams, None) is not None:
+        raise _TooManyStreams

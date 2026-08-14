@@ -88,6 +88,12 @@ _WRAPPED_BREAK = re.compile(rb"\r?\n[ \t]*")
 _BASE64_WINDOW = 8192
 _BASE64_WINDOW_OVERLAP = 1024
 
+# How long a run may be before it is no longer decoded whole for container inspection. A container
+# has to be seen entire to be expanded at all, so this is a memory bound rather than a window: 4 MiB
+# of base64 decodes to 3 MiB, which the nested-buffer limit already allows a container to expand
+# into. Past it the windowed pass still runs, so a literal credential is still found.
+_MAX_WHOLE_RUN = 4 << 20
+
 
 def _match_base64(data: bytes, inspect: _Inspector | None = None) -> str | None:
     """The kind of credential hidden in a base64 run, or None.
@@ -145,7 +151,32 @@ def _match_base64(data: bytes, inspect: _Inspector | None = None) -> str | None:
                     return kind
                 if inspect is not None and (kind := inspect(decoded)):
                     return kind
+        if inspect is not None and (kind := _inspect_whole(candidate, inspect)):
+            return kind
     return None
+
+
+def _inspect_whole(run: bytes, inspect: _Inspector) -> str | None:
+    """What `inspect` makes of the WHOLE run decoded, for a run too long to fit one window.
+
+    Windowing is what bounds memory, but a container does not survive being cut: only the first
+    window decodes to anything with a header on it, and every later window starts mid-stream, so
+    the expansion sees a prefix and never reaches the tail. A 13 KB base64 of a gzip therefore
+    published clean while the same gzip standing alone was expanded -- the credential lived past
+    the first window, which is where a credential in a real encoded blob usually is.
+
+    Skipped when the run already fits one window, since window zero is then the whole run and this
+    would decode it a second time for the same answer. Bounded by `_MAX_WHOLE_RUN` so an enormous
+    encoded blob cannot be turned into an unbounded buffer by asking for it in one piece.
+    """
+    if len(run) <= _BASE64_WINDOW or len(run) > _MAX_WHOLE_RUN:
+        return None
+    whole = run[: len(run) - len(run) % 4]
+    try:
+        decoded = base64.b64decode(whole.translate(_URL_SAFE_ALPHABET), validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    return inspect(decoded)
 
 
 def _unwrapped(data: bytes) -> bytes:

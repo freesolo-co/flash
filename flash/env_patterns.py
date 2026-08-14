@@ -204,7 +204,12 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
             + _BLOCK_SCALAR
             + _NODE_PROPERTIES
             + _OPEN_QUOTE
-            + rb"([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])"
+            # `\/` is a legal JSON escape for `/`, and an AWS secret is base64 so it carries `/`
+            # about a third of the time. Encoders that escape it -- PHP's `json_encode` by default,
+            # and several SDK log formatters -- broke the run of 40 into two shorter runs, so the
+            # SAME key published clean purely because of how the document was serialized. Each
+            # position admits the escaped spelling; the count stays 40 DECODED characters.
+            + rb"((?:[A-Za-z0-9+=]|\\?/){40})(?![A-Za-z0-9/+=])"
         ),
     ),
 )

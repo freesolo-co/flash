@@ -5542,3 +5542,132 @@ def test_a_credential_split_across_adjacent_literals_is_found(tmp_path):
         innocent = tmp_path / name
         innocent.write_text(source)
         assert credential_in_file(innocent) is None, name
+
+
+def test_a_pdf_with_more_streams_than_the_limit_is_refused(tmp_path):
+    """The stream walk is bounded, and stopping at the bound reported the rest as clean.
+
+    `islice` truncated the search silently, so a document holding one more `/FlateDecode` stream
+    than the limit published the credential in it while the same document under the limit was
+    caught. Every other bound here refuses; this one returned a verdict it had not earned.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    def document(streams):
+        out = b"%PDF-1.4\n"
+        for index in range(streams):
+            body = (
+                f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode()
+                if index == streams - 1
+                else b"ordinary page content %d " % index * 3
+            )
+            out += b"%d 0 obj\n<< /Filter /FlateDecode >>\nstream\n" % index
+            out += zlib.compress(body) + b"\nendstream\nendobj\n"
+        return out + b"trailer\n%%EOF\n"
+
+    under = tmp_path / "small.pdf"
+    under.write_bytes(document(20))
+    assert credential_in_file(under) == "a Freesolo API key"
+
+    over = tmp_path / "huge.pdf"
+    over.write_bytes(document(4100))
+    with pytest.raises(_Unscannable):
+        credential_in_file(over)
+
+
+def test_a_base64_container_longer_than_one_window_is_expanded(tmp_path):
+    """A container has to be seen whole, and windowing cut it in half.
+
+    Only the first window decoded to anything carrying a gzip header; every later window started
+    mid-stream, so the expansion saw a prefix and never reached the tail. A 13 KB base64 of a
+    gzip published clean while the same gzip standing alone was expanded.
+    """
+    import base64
+    import gzip
+    import random
+
+    from flash.env_secrets import credential_in_file
+
+    # The filler has to be BOTH bulky when compressed and genuinely compressed. `os.urandom` is
+    # not: DEFLATE stores an incompressible tail verbatim, so the key survives literally in the
+    # gzip bytes and is found with no expansion at all -- the test would pass without the fix.
+    # Fully repetitive filler is not either: it compresses so far that the run never reaches one
+    # window. Semi-random words sit between the two.
+    draws = random.Random(7)
+    words = [
+        "".join(draws.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(8)) for _ in range(4000)
+    ]
+    filler = "\n".join(draws.choice(words) for _ in range(2000)).encode()
+    packed = gzip.compress(filler + b"\n" + f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode())
+    assert b"fslo_" not in packed, "filler must not leave the key stored literally"
+    encoded = base64.b64encode(packed)
+    assert len(encoded) > 8192, "the run must exceed one decode window"
+
+    bare = tmp_path / "shard.gz"
+    bare.write_bytes(packed)
+    assert credential_in_file(bare) == "a Freesolo API key"
+
+    value = tmp_path / "encoded.txt"
+    value.write_bytes(encoded)
+    assert credential_in_file(value) == "a Freesolo API key"
+
+
+def test_a_line_continuation_inside_a_credential_is_rejoined(tmp_path):
+    """The shell removes a backslash-newline before the value is ever assigned.
+
+    So `KEY="fslo_AbCd\\<newline>Ef01"` exports the whole credential while no contiguous run of
+    bytes in the file holds it. The literal-pair join added earlier covered only adjacent QUOTED
+    literals, which is not how a long line gets wrapped in a shell file.
+    """
+    from flash.env_secrets import credential_in_file
+
+    whole = tmp_path / "env.sh"
+    whole.write_bytes(f'FREESOLO_API_KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode())
+    assert credential_in_file(whole) == "a Freesolo API key"
+
+    split = tmp_path / "wrapped.sh"
+    split.write_bytes(
+        b'FREESOLO_API_KEY="fslo_'
+        + _FAKE_KEY_BODY[:10].encode()
+        + b"\\\n"
+        + _FAKE_KEY_BODY[10:].encode()
+        + b'"\n'
+    )
+    assert credential_in_file(split) == "a Freesolo API key"
+
+    # an ESCAPED backslash at end of line is not a continuation, so two unrelated lines must not
+    # be welded into a run that decodes to a credential nobody wrote
+    for name, source in (
+        ("paths.sh", 'ROOT="C:\\\\"\nNAME="ordinary"\n'),
+        ("makefile", "all:\n\tgcc -o out \\\n\t\tmain.c\n"),
+    ):
+        innocent = tmp_path / name
+        innocent.write_text(source)
+        assert credential_in_file(innocent) is None, name
+
+
+def test_an_aws_secret_with_escaped_slashes_is_matched(tmp_path):
+    """`\\/` is a legal JSON escape, and an AWS secret is base64 so it carries `/` routinely.
+
+    Encoders that escape it -- PHP's `json_encode` by default, several SDK log formatters -- broke
+    the run of 40 into two shorter runs, so the SAME key published clean purely because of how the
+    document happened to be serialized. The earlier fix covered escapes in the field NAME only.
+    """
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    body = base64.b64encode(os.urandom(30)).decode()[:40].replace("+", "/")
+    if "/" not in body:
+        body = body[:20] + "/" + body[21:]
+
+    plain = tmp_path / "creds.json"
+    plain.write_text(f'{{"SecretAccessKey": "{body}"}}')
+    assert credential_in_file(plain) == "an AWS secret access key"
+
+    escaped = tmp_path / "escaped.json"
+    slashed = body.replace("/", "\\/")
+    escaped.write_text(f'{{"SecretAccessKey": "{slashed}"}}')
+    assert credential_in_file(escaped) == "an AWS secret access key"
