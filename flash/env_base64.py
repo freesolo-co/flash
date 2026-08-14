@@ -13,13 +13,22 @@ from __future__ import annotations
 import base64
 import binascii
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
+from typing import Protocol
 
+from flash.env_formats import _looks_like_zlib
 from flash.env_patterns import SHORTEST_TOKEN_BYTES, _match
+
 
 # What a caller may offer for a second look at decoded bytes: given them, it names a credential or
 # returns None. Typed here rather than importing the scan, so the dependency stays one-way.
-_Inspector = Callable[[bytes], str | None]
+#
+# `whole` says the decode was an exact, aligned, complete one rather than one of the four
+# speculative alignments tried inside a window. The caller uses it to decide whether a refusal from
+# the decoded bytes is trustworthy enough to propagate.
+class _Inspector(Protocol):
+    def __call__(self, decoded: bytes, *, whole: bool = False) -> str | None: ...
+
 
 # A base64 run long enough to hold the shortest credential a pattern admits. The lower bound makes
 # the scan walk past ordinary prose rather than decoding every word it meets. There is deliberately
@@ -97,8 +106,13 @@ _MAX_WHOLE_RUN = 4 << 20
 
 # What a container looks like in the first decoded bytes of a run, and how much of the run to
 # decode to find out. The magics are the compressed containers the scan can expand -- gzip, bzip2,
-# xz, zip and a zlib record -- and a header sits at the very start, so a short sniff settles it.
-_CONTAINER_MAGIC = (b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00", b"PK\x03\x04", b"PK\x05\x06", b"x\x9c")
+# xz and zip -- and a header sits at the very start, so a short sniff settles it.
+#
+# zlib is NOT among them because it has no fixed magic: `x\x9c` is only the default level, and
+# `zlib.compress(data, 9)` writes `x\xda`. Listing the one literal meant a level-9 stream whose
+# base64 crossed a scan chunk was not recognised as a container and published clean, so the
+# structural predicate is applied alongside these instead of a byte of it being spelled out here.
+_CONTAINER_MAGIC = (b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00", b"PK\x03\x04", b"PK\x05\x06")
 _CONTAINER_SNIFF_CHARS = 64
 
 
@@ -177,8 +191,7 @@ def _match_base64(
                 # length, so unpadded base64url of a 20-character `pit_` key published clean.
                 # Unpadded output is what `b64encode(...).rstrip("=")`, a JWT segment, and most
                 # token-in-a-URL encodings emit, so this is the common case rather than the odd one.
-                if remainder := len(chunk) % 4:
-                    chunk = chunk + b"=" * (4 - remainder) if remainder > 1 else chunk[:-1]
+                chunk = _padded(chunk)
                 # The same derived floor as the run pattern, not a second hardcoded 24. Lowering
                 # only the pattern left this one rejecting exactly the encodings it had started
                 # admitting, so the fix would have looked applied while the bypass stayed open.
@@ -190,7 +203,29 @@ def _match_base64(
                     continue
                 if kind := _match(decoded):
                     return kind
-                if inspect is not None and (kind := inspect(decoded)):
+                # `whole` when the run is a DELIMITED VALUE that decodes entirely at its natural
+                # alignment: start 0, the whole run in one window, and a delimiter on both sides.
+                # Only then is a refusal from the decoded bytes trustworthy enough to propagate.
+                #
+                # "Decodes exactly" alone is not enough, and testing only that made two real hub
+                # datasets unpublishable. A 9.7 MB JSONL of issue text holds base64-shaped runs by
+                # chance, and a 196-byte one decoded to bytes beginning `x\x9c` with the FDICT bit
+                # set -- so the dictionary refusal fired on prose nobody encoded. Short runs are
+                # exactly where chance alignments live, and length cannot separate them: a real
+                # `zip -P` archive is 142 bytes, SMALLER than those accidents.
+                #
+                # Being ASSIGNED is what an encoded value has and a run inside prose does not:
+                # `KEY=<base64>`, a JSON or YAML scalar, or a whole `.b64` sidecar. Bounding
+                # characters are not enough -- prose is full of them, measured 8,430 such runs in
+                # one real dataset -- so a run in a sentence stays speculative and its refusal is
+                # swallowed as before.
+                exact = (
+                    start == 0
+                    and window is candidate
+                    and len(chunk) == len(_padded(candidate))
+                    and _is_assigned_value(joined, run.start(), run.end())
+                )
+                if inspect is not None and (kind := inspect(decoded, whole=exact)):
                     return kind
         if inspect is not None and (kind := _inspect_whole(candidate, inspect)):
             return kind
@@ -220,7 +255,7 @@ def _decodes_to_container(run: bytes) -> bool:
             decoded = base64.b64decode(aligned.translate(_URL_SAFE_ALPHABET), validate=True)
         except (ValueError, binascii.Error):
             continue
-        if decoded.startswith(_CONTAINER_MAGIC):
+        if decoded.startswith(_CONTAINER_MAGIC) or _looks_like_zlib(decoded):
             return True
     return False
 
@@ -245,12 +280,18 @@ def _inspect_whole(run: bytes, inspect: _Inspector) -> str | None:
         # real hub files: the longest base64 run is 11,244 bytes, so no publishable file is near
         # this bound and refusing costs nothing that a real environment does.
         raise _RunTooLongToExpand
-    whole = run[: len(run) - len(run) % 4]
+    # PADDED to the next multiple of four, not cut back to the previous one. An unpadded encoding
+    # is ordinary -- `base64 -w0 | tr -d '='`, a JWT segment, many YAML emitters -- and truncating
+    # discards the last one to three characters, which are real bytes at the END of the container:
+    # for a zip that is part of the end-of-central-directory record, so the whole-run inspection
+    # rejected an archive that decodes perfectly once padded. A remainder of one is not a length
+    # base64 can produce, so that case still drops the stray character.
+    whole = _padded(run)
     try:
         decoded = base64.b64decode(whole.translate(_URL_SAFE_ALPHABET), validate=True)
     except (ValueError, binascii.Error):
         return None
-    return inspect(decoded)
+    return inspect(decoded, whole=True)
 
 
 def _unwrapped(data: bytes) -> bytes:
@@ -276,6 +317,60 @@ def _unwrapped(data: bytes) -> bytes:
     if b"\n" not in data or not _WRAPPED_HINT.search(data):
         return data
     return _WRAPPED_BLOCK.sub(lambda match: _WRAPPED_BREAK.sub(b"", match.group(0)), data)
+
+
+# What marks a base64 run as an ASSIGNED value: the run is what something was set to, or the whole
+# of a quoted string, or the entire buffer. This is the test for whether a REFUSAL from the decoded
+# bytes is trustworthy, so it asks who PUT the bytes there rather than what sits beside them.
+#
+# Bounding characters alone cannot answer that, and using them made two real hub datasets
+# unpublishable. In English a word is bounded by spaces, and `(word)` and `{word}` are bounded too
+# -- measured 8,430 "delimited" runs in one 9.7 MB JSONL of issue text, one of which decoded to a
+# chance FDICT zlib header and was refused. Prose is full of delimiters; what it does not have is
+# an assignment.
+_ASSIGNED_VALUE = re.compile(rb"""[=:]\s*["'`]?\Z""")
+_QUOTE_CHARACTERS = b"\"'`"
+
+
+def _is_assigned_value(data: bytes, start: int, end: int) -> bool:
+    """Whether the run at `data[start:end]` was assigned or quoted rather than embedded in prose.
+
+    Three shapes count, and they are the ones an encoded container actually arrives in:
+
+      * assigned -- `KEY=<run>`, `data: <run>`, `"key": "<run>"`; the run follows `=` or `:` with
+        optional whitespace and an optional opening quote.
+      * fully quoted -- the run is the entire contents of a quoted string, which is how a JSON or
+        YAML scalar carries one.
+      * the whole buffer -- a `.b64` sidecar whose entire content is one encoded blob.
+
+    A run inside a sentence matches none of them, so its refusal stays swallowed as speculative.
+    """
+    before = data[max(0, start - 64) : start]
+    after = data[end : end + 1]
+    if not before and not after:
+        return True
+    if _ASSIGNED_VALUE.search(before):
+        return True
+    return bool(before[-1:] and before[-1:] in _QUOTE_CHARACTERS and before[-1:] == after)
+
+
+def _padded(run: bytes) -> bytes:
+    """`run` with its base64 padding restored, so a whole number of quartets can be decoded.
+
+    Restoring the padding rather than discarding the tail. Trimming to a whole quartet throws away
+    up to three encoded characters, which is up to two decoded bytes off the END of the value --
+    enough to take a token below its pattern's minimum length, and enough to cut a zip's
+    end-of-central-directory record so the archive no longer opens. Unpadded output is what
+    `b64encode(...).rstrip("=")`, a JWT segment, and most token-in-a-URL encodings emit, so this is
+    the common case rather than the odd one.
+
+    A remainder of ONE is not a length base64 can produce -- 4n+1 characters decode to no whole
+    byte count -- so that character is a neighbour rather than part of the value, and dropping it
+    is what leaves a decodable run behind.
+    """
+    if remainder := len(run) % 4:
+        return run + b"=" * (4 - remainder) if remainder > 1 else run[:-1]
+    return run
 
 
 def _decode_windows(run: bytes) -> Iterator[bytes]:

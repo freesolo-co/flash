@@ -270,9 +270,14 @@ _JWK_PRIVATE = re.compile(
     rb"\"(?:"
     + b"|".join(_JWK_ESCAPED[name] for name in (b"dp", b"dq", b"qi", b"d", b"k"))
     # longest first: `d` would otherwise win against `dp` and leave the `p` outside the quote
-    + rb")\"\s*:\s*\""
+    + rb")\"\s*:\s*\"("
+    # CAPTURED so the value goes through `_is_high_entropy` like every other pattern's body. An
+    # uncaptured value made the pair fire on any long string under a private member name, so a
+    # JSONL dataset with `{"d":"documentation-document"}` in one row and an ordinary public JWK in
+    # another was refused as a private key -- the halves pair across the whole stream, so unrelated
+    # rows combined. A real `d` is a base64url scalar and passes; an English word does not.
     + _JWK_VALUE_CHAR
-    + rb"{20,}={0,2}\""
+    + rb"{20,})={0,2}\""
 )
 
 
@@ -293,9 +298,31 @@ class _TwoMarkers:
         self.context = context
         self.payload = payload
 
+    def payload_match(self, data: bytes) -> re.Match[bytes] | None:
+        """The payload half's match in `data` whose captured body looks issued, or None.
+
+        The captured body goes through the same entropy test as every other pattern's. The comment
+        on the netrc pair says placeholders are filtered by it, but nothing applied it: this class
+        sits in `_LITERAL_PATTERNS`, whose loop returns on a match rather than inspecting groups,
+        so ordinary prose containing `Machine` and a masked `password XXXX...` was refused as a
+        credential, and a dataset row whose long `"d"` field is an English word was reported as a
+        private key.
+
+        A method rather than a filter inside `search`, because the CHUNKED scan does not call
+        `search`: it pairs the halves across the whole stream by calling `context` and `payload`
+        itself. Filtering in only one of the two left the streaming path -- which is every file
+        over a megabyte, and every file this check actually reads -- matching placeholders exactly
+        as before, so both paths ask this one question instead.
+        """
+        for payload in self.payload.finditer(data):
+            body = next((found for found in payload.groups() if found), b"")
+            if _is_high_entropy(body):
+                return payload
+        return None
+
     def search(self, data: bytes) -> re.Match[bytes] | None:
         """The payload's match when the context marker accompanies it anywhere in `data`."""
-        if not (payload := self.payload.search(data)):
+        if not (payload := self.payload_match(data)):
             return None
         return payload if self.context.search(data) else None
 
@@ -379,7 +406,9 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
         "a private key",
         _TwoMarkers(
             re.compile(rb"PuTTY-User-Key-File-\d+:[^\r\n]*[\r\n]"),
-            re.compile(rb"Private-Lines:\s*\d+[\r\n]+[A-Za-z0-9+/=]{32,}"),
+            # The body is CAPTURED so it goes through the same entropy test as every other
+            # pattern's, which is what keeps a documented placeholder out of the payload half.
+            re.compile(rb"Private-Lines:\s*\d+[\r\n]+([A-Za-z0-9+/=]{32,})"),
         ),
     ),
     # The same key in DER: the binary encoding a PEM block base64-wraps. `openssl ... -outform DER`
@@ -601,6 +630,26 @@ def _keyword_absent(data: bytes, lowered: bytes | None, kind: str) -> bool:
         return False
     # an escape anywhere means the keyword may be spelled in a way no substring test can see
     return not any(keyword in lowered for keyword in keywords) and not _ESCAPE_HINT.search(lowered)
+
+
+# A private-key armor that has opened and is STILL IN ITS HEADERS at the end of the buffer. RFC
+# 4880 puts no length limit on an armor header, so `Comment:` lines can push the base64 body into
+# the next scan chunk, leaving the BEGIN marker and the body in no single window.
+#
+# Anchored on the BEGIN line and matched to the END of the buffer, so it says "this armor is
+# unfinished HERE" rather than "an armor exists somewhere". A complete key -- header, blank line,
+# body -- fails it, because the body characters are not header lines. That is what keeps this from
+# refusing every armored key: it fires only when the window genuinely ends mid-header.
+_UNFINISHED_ARMOR = re.compile(
+    rb"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[ \t]*\r?\n"
+    rb"(?:[A-Za-z][A-Za-z-]*:[^\r\n]*\r?\n)*"
+    rb"(?:[A-Za-z][A-Za-z-]*:[^\r\n]*)?\Z"
+)
+
+
+def _unfinished_private_key_armor(window: bytes) -> bool:
+    """Whether `window` ends inside the headers of a private-key armor block."""
+    return _UNFINISHED_ARMOR.search(window) is not None
 
 
 def _match(data: bytes) -> str | None:

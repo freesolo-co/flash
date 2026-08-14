@@ -30,6 +30,10 @@ _MAX_PDF_STREAMS = 4096
 # emit -- and they apply in order, so the bytes after `stream` are ASCII85 text rather than the
 # zlib record `/FlateDecode` names. Handing those to zlib fails, and the stream was skipped as
 # clean while the credential inside it decoded perfectly well.
+# What a PDF begins with. Exported so the caller can decline a non-PDF from its first bytes rather
+# than reading a whole file to find out here.
+_PDF_SIGNATURE = b"%PDF-"
+
 _PDF_FILTERS = re.compile(rb"/Filter\s*(?:/(\w+)|\[([^\]]{0,256})\])")
 _PDF_FILTER_NAME = re.compile(rb"/(\w+)")
 
@@ -171,7 +175,7 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     after `stream` are ASCII85 text; zlib rejected them and the stream was passed over as clean
     while its credential decoded perfectly well one filter further in.
     """
-    if not data.startswith(b"%PDF-"):
+    if not data.startswith(_PDF_SIGNATURE):
         return
     streams = _PDF_STREAM.finditer(data)
     for found in itertools.islice(streams, _MAX_PDF_STREAMS):

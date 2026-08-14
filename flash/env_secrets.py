@@ -29,12 +29,19 @@ import tarfile
 import time
 import zipfile
 import zlib
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, NoReturn
 
-from flash.env_base64 import _match_base64, _RunTooLongToExpand
+from flash.env_base64 import _Inspector, _match_base64, _RunTooLongToExpand
+from flash.env_buffers import (
+    _SCAN_CHUNK_BYTES,
+    _blocks_of,
+    _looks_like_container,
+    _paired_markers_kind,
+)
 from flash.env_deflate import (
+    _PDF_SIGNATURE,
     _pdf_stream_payloads,
     _raw_deflate_from,
     _TooManyStreams,
@@ -43,14 +50,10 @@ from flash.env_deflate import (
 from flash.env_formats import (
     _KEYSTORE_MAGIC,
     _MAX_ARCHIVE_MEMBERS,
-    _MAX_OPENPGP_MARKERS,
     _ZIP_TAIL_BYTES,
     OVERLAY_UNPROBED,
     _after_skippable_frames,
-    _has_openpgp_message_armor,
     _has_zip_end_record,
-    _is_openpgp_encrypted,
-    _is_openpgp_secret_key,
     _jks_private_key_entries,
     _looks_compressed,
     _looks_like_tar,
@@ -61,20 +64,23 @@ from flash.env_formats import (
     _zip_member_count,
 )
 from flash.env_joined import _rejoined
+from flash.env_openpgp import (
+    _MAX_OPENPGP_MARKERS,
+    _has_openpgp_message_armor,
+    _is_openpgp_encrypted,
+    _openpgp_secret_key_in_sequence,
+)
 from flash.env_patterns import (
     _ASSIGNED_PATTERNS,
     _LITERAL_PATTERNS,
     _MAX_BODY,
-    _PAIRED_PATTERNS,
     _TOKEN_PATTERNS,
     SHORTEST_TOKEN_BYTES,
     _match,
+    _unfinished_private_key_armor,
 )
 from flash.env_policy import _unexpandable_format, _uninspectable_reason
 
-# Read in bounded chunks so a large dataset member is never held in memory whole. This costs no
-# more I/O than the publish already pays: `_tar_b64` reads every one of these bytes to gzip them.
-_SCAN_CHUNK_BYTES = 1 << 20
 # Carried between chunks so a credential straddling a chunk boundary is still matched. Derived from
 # `_MAX_BODY` rather than written as a bare number, so the two cannot drift apart: the overlap must
 # exceed the longest possible match (a body plus its prefix and quoting) or a credential landing on
@@ -262,36 +268,49 @@ def _decoded_kind(
     return _match(joined) if joined != data else None
 
 
-def _decoded_container(deadline: float | None, depth: int) -> Callable[[bytes], str | None] | None:
+def _decoded_container(deadline: float | None, depth: int) -> _Inspector | None:
     """What `_match_base64` should do with decoded bytes that match no pattern, or None to stop.
 
     A base64 value routinely holds a whole CONTAINER: a Kubernetes Secret, a cloud-init document
     and a `kubectl -o yaml` export all store their values encoded, so a gzipped credential inside
     one decoded here and was then matched while still compressed and published clean.
 
-    Returns None once the depth cap is reached, which switches the second look off rather than
-    refusing. That is the same budget every other layer spends, so base64 of a container cannot buy
-    expansion the container alone would not get -- and the ordinary shallow case pays nothing.
+    At the depth cap the container is REFUSED rather than skipped. Returning None there switched
+    the second look off and reported the member clean, so four nested zips around
+    `base64(gzip(secret))` published while the same gzip added as an ordinary fifth container
+    correctly raised -- the cap is a limit on what can be inspected, and every other limit in this
+    module raises rather than returning a verdict it did not reach. Only bytes that actually look
+    like a container are refused, so an ordinary deeply-nested file still publishes.
 
-    A refusal from the second look is SWALLOWED, unlike every other unscannable path here, because
-    this decode is speculative: `_match_base64` tries four alignments of every base64-shaped run, so
-    the "container" handed over is a re-interpretation of bytes never claimed to be one, and an ELF
-    holds enough such runs to produce one by chance. Measured on `containerd`, `ctr` and `dockerd`:
-    each decoded to something tripping the dictionary-zlib refusal, making them unpublishable over
-    bytes nobody encoded. Refusing is honest only when the file really is the format it could not
-    read. A credential that IS present decodes and matches here, so this costs no detection.
+    A refusal from the second look is swallowed only for a SPECULATIVE decode, unlike every other
+    unscannable path here, because `_match_base64` tries four alignments of every base64-shaped
+    run: the "container" handed over is then a re-interpretation of bytes never claimed to be one,
+    and an ELF holds enough such runs to produce one by chance. Measured on `containerd`, `ctr` and
+    `dockerd`: each decoded to something tripping the dictionary-zlib refusal, making them
+    unpublishable over bytes nobody encoded.
+
+    An exact WHOLE-RUN decode is not speculative -- the run is aligned, complete, and decodes to a
+    container in one piece -- so its refusal propagates. Swallowing that one turned a real
+    `zip -P` archive behind base64 into a clean result while the same archive scanned directly was
+    refused. `whole` carries that distinction down from `_match_base64`.
     """
-    if deadline is None or depth >= _MAX_CONTAINER_DEPTH:
+    if deadline is None:
         return None
 
-    def inspect(decoded: bytes) -> str | None:
+    def inspect(decoded: bytes, *, whole: bool = False) -> str | None:
         # Only bytes that actually look like a container are re-entered; anything else has already
         # been through `_match` and would just be scanned a second time.
         if not _looks_like_container(decoded):
             return None
+        if depth >= _MAX_CONTAINER_DEPTH:
+            raise _Unscannable("nests compressed containers too deeply to inspect")
         try:
             return _credential_in_container(decoded, deadline=deadline, depth=depth + 1)
-        except (_Unscannable, *_UNREADABLE_ARCHIVE):
+        except _Unscannable:
+            if whole:
+                raise
+            return None
+        except _UNREADABLE_ARCHIVE:
             return None
 
     return inspect
@@ -402,6 +421,15 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         # inside, and treating it as ordinary text published the message intact.
         if _has_openpgp_message_armor(window):
             raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
+        # A private-key armor whose HEADER runs past this window. The PEM pattern requires the
+        # BEGIN line and the start of the base64 body in one buffer, and RFC 4880 armor headers sit
+        # between them with no length limit -- so a 1.1 MB `Comment:` pushed the body into the next
+        # chunk, the two halves appeared in no single window, and a real `gpg --export-secret-keys
+        # --armor` key published. The body is what proves a key rather than prose about one, so it
+        # cannot simply be dropped from the pattern; an armor still in its headers at the end of a
+        # window is undecided instead, and undecided refuses.
+        if bool(upcoming) and _unfinished_private_key_armor(window):
+            raise _Unscannable("contains a private key armor header too long to read past")
         try:
             if kind := _credential_kind(
                 window, deadline=deadline, depth=depth, truncated=bool(upcoming)
@@ -464,8 +492,14 @@ def _openpgp_kind(chunk: bytes) -> str | None:
     walk allows, and an encrypted message whose body cannot be read at all. The WHOLE chunk goes to
     the encrypted test, since a public-key session packet carries the encrypted session key inline
     and runs to a few hundred bytes -- a fixed head could not reach the data packet behind it.
+
+    The whole chunk goes to the SEQUENCE walk too, rather than a fixed head. A keyring holding both
+    halves leads with the public block, which is thousands of bytes of key material, user IDs and
+    signatures, so any fixed prefix stops short of the secret packet behind it -- the walk needs to
+    reach whatever the earlier packets declare. It steps only between boundaries the packets
+    themselves state, so this stays anchored rather than becoming a search.
     """
-    secret_key = _is_openpgp_secret_key(chunk[:_OPENPGP_HEAD_BYTES])
+    secret_key = _openpgp_secret_key_in_sequence(chunk)
     if secret_key is None:
         raise _Unscannable("contains more OpenPGP marker packets than this check can walk")
     if secret_key:
@@ -473,58 +507,6 @@ def _openpgp_kind(chunk: bytes) -> str | None:
     if _is_openpgp_encrypted(chunk) is not False:
         raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
     return None
-
-
-def _paired_markers_kind(window: bytes, seen: set[tuple[int, str]]) -> str | None:
-    """The kind of two-marker credential whose halves have BOTH appeared by the end of `window`.
-
-    `seen` accumulates across the whole stream, so the halves are paired at any distance and in
-    either order. Tracking only one side was wrong for the reverse ordering that JSON permits: a
-    JWK written `{"d": ..., <1 MiB of metadata>, "kty": "RSA"}` had its private member leave the
-    window before the `kty` arrived, and the key published.
-
-    Marks halves by their index in `_PAIRED_PATTERNS` rather than by the pattern object, so two
-    detectors sharing a pattern cannot be confused for each other.
-    """
-    for index, (kind, detector) in enumerate(_PAIRED_PATTERNS):
-        for half, pattern in (("context", detector.context), ("payload", detector.payload)):
-            if (index, half) not in seen and pattern.search(window):
-                seen.add((index, half))
-        if {(index, "context"), (index, "payload")} <= seen:
-            return kind
-    return None
-
-
-def _looks_like_container(data: bytes) -> bool:
-    """Whether `data` is a container worth reopening, by magic OR by zip structure.
-
-    Nested members were tested on LEADING magic alone while top-level files got `is_zipfile`, so a
-    self-extracting zip one layer in -- whose first bytes are `MZ` -- was treated as final content
-    and the credential in its deflated payload published. `is_zipfile` scans for the end-of-central
-    -directory record, so it recognises a zip behind any preamble; applying it here makes a nested
-    member as well covered as the same bytes published directly.
-
-    Gating the recursion on this rather than recursing unconditionally keeps `_MAX_CONTAINER_DEPTH`
-    honest: the depth cap raises, so calling it for an ordinary deeply-nested *file* would refuse a
-    legitimate publish over nesting that never expanded anything.
-
-    Tar counts here too. A tar's own member bytes are literal, so a top-level one needed no special
-    handling for its plain members -- but nested it is a container like any other, and `tar.gz`
-    holding a tar of gzipped shards left the innermost key unreached.
-    """
-    return (
-        _looks_compressed(data[:6])
-        or _looks_like_tar(data)
-        or zipfile.is_zipfile(io.BytesIO(data))
-        # A self-extracting SHELL archive, whose stub is a script rather than an executable: none of
-        # the tests above sees past it, since each asks what the file BEGINS with and it begins with
-        # `#!/bin/sh`. `is_zipfile` covers the same shape for a zip payload; this covers the gzip,
-        # bzip2 and xz payloads that `makeself` and `.run` installers actually carry.
-        #
-        # `False` -- the search gave up with candidates unprobed -- counts as a container too, so
-        # the handler runs and turns it into a refusal rather than passing it off as ordinary bytes.
-        or _overlay_offset(data) is not None
-    )
 
 
 def _credential_in_container(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
@@ -633,23 +615,6 @@ def _credential_in_raw_deflate(source: Path | bytes, *, deadline: float, depth: 
     return _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth)
 
 
-def _blocks_of(source: Path | bytes) -> Iterator[bytes]:
-    """`source` in bounded blocks, so a probe never allocates a second copy of a whole file.
-
-    A path is read incrementally and bytes already in memory are yielded once: re-slicing those
-    would allocate the copy this exists to avoid.
-    """
-    if isinstance(source, bytes):
-        yield source
-        return
-    try:
-        with source.open("rb") as handle:
-            while block := handle.read(_SCAN_CHUNK_BYTES):
-                yield block
-    except OSError:
-        return
-
-
 def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
     """The kind of credential inside a PDF's compressed streams, or None.
 
@@ -664,6 +629,15 @@ def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> 
     binaries, of which 15 inflated. Feeding those through the overlay machinery would exhaust its
     bound and refuse every large binary. The grammar costs nothing on a non-PDF.
     """
+    # The signature is read before the file is. Every top-level file reaches this handler after the
+    # other probes decline, so an unconditional `read_bytes` allocated a second whole copy of every
+    # ordinary model shard in the package -- measured 216 MB of RSS for a 200 MiB non-PDF. `%PDF-`
+    # is head-anchored, which is the same rule `_pdf_stream_payloads` applies before it walks, so
+    # reading five bytes first decides it without materializing anything.
+    if isinstance(source, Path):
+        with source.open("rb") as handle:
+            if handle.read(len(_PDF_SIGNATURE)) != _PDF_SIGNATURE:
+                return None
     raw = source.read_bytes() if isinstance(source, Path) else source
     try:
         for plain in _pdf_stream_payloads(raw, _MAX_NESTED_BUFFER_BYTES):

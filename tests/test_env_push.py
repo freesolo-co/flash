@@ -6,10 +6,13 @@ import argparse
 import base64
 import io
 import os
+import random
 import shutil
 import subprocess
 import sys
 import tarfile
+import time
+from pathlib import Path
 
 import pytest
 
@@ -2895,7 +2898,7 @@ def test_the_openpgp_packet_header_does_not_fire_on_ordinary_binaries():
     """
     import random
 
-    from flash.env_secrets import _is_openpgp_secret_key
+    from flash.env_openpgp import _is_openpgp_secret_key
 
     # measured 1 in 4,400 on tag plus version alone, and 1 in 108,000 once the algorithm byte is
     # required too. 40,000 draws would fail essentially always at the former rate and pass at this
@@ -2974,7 +2977,7 @@ def test_every_openpgp_packet_length_encoding_is_parsed():
     every RSA secret key, and anything Sequoia, RNP or `--use-new-packet-format` writes -- so those
     returned false and published intact.
     """
-    from flash.env_secrets import _is_openpgp_secret_key
+    from flash.env_openpgp import _is_openpgp_secret_key
 
     def _packet(tag: int, body_length: int) -> bytes:
         if body_length < 192:
@@ -3495,7 +3498,8 @@ def test_an_openpgp_packet_shorter_than_its_fields_is_not_a_key(tmp_path):
     Ignoring it read those fields from BEYOND the packet, so `c5 01 04 00 00 00 00 01` -- an
     ordinary binary declaring a one-byte body -- was refused as a private key.
     """
-    from flash.env_secrets import _is_openpgp_secret_key, credential_in_file
+    from flash.env_openpgp import _is_openpgp_secret_key
+    from flash.env_secrets import credential_in_file
 
     assert not _is_openpgp_secret_key(bytes.fromhex("c501040000000001"))
     short = tmp_path / "short.bin"
@@ -5097,7 +5101,7 @@ def test_a_secret_key_behind_the_marker_bound_is_refused(tmp_path):
     secret-key test looking at a marker header, which is not a key -- and the file published. The
     bound has to fail closed: still sitting on a marker means what follows is unread, not absent.
     """
-    from flash.env_formats import _MAX_OPENPGP_MARKERS
+    from flash.env_openpgp import _MAX_OPENPGP_MARKERS
     from flash.env_secrets import _Unscannable, credential_in_file
 
     marker = b"\xca\x03PGP"
@@ -5887,3 +5891,296 @@ def test_raw_deflate_probing_does_not_read_the_whole_file(tmp_path):
     assert max(sizes) <= (1 << 20)
     # and a non-stream is still rejected rather than mistaken for deflate
     assert _credential_in_raw_deflate(big, deadline=later, depth=1) is None
+
+
+def test_a_zlib_stream_at_any_level_is_recognised_behind_base64(tmp_path):
+    """A cut base64 run holding a zlib stream is refused whatever level wrote it.
+
+    `_CONTAINER_MAGIC` listed `x\x9c`, which is only zlib's DEFAULT level. `zlib.compress(data, 9)`
+    writes `x\xda`, so a level-9 stream whose base64 crossed the 1 MiB scan chunk was not seen as a
+    container, the truncation refusal never fired, and the credential published clean.
+    """
+    import zlib
+
+    from flash.env_secrets import _SCAN_CHUNK_BYTES, _Unscannable, credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    for level in (1, 6, 9):
+        raw = zlib.compress(random.Random(level).randbytes(1 << 20) + key, level)
+        encoded = base64.b64encode(raw)
+        assert len(encoded) > _SCAN_CHUNK_BYTES, (level, len(encoded))
+        cut = tmp_path / f"cut{level}.txt"
+        cut.write_bytes(b"DATA=" + encoded + b"\n")
+        with pytest.raises(_Unscannable):
+            credential_in_file(cut, deadline=time.monotonic() + 120)
+
+
+def test_an_unpadded_base64_container_is_padded_rather_than_truncated(tmp_path):
+    """A whole run is padded up, not cut back, so the container's last bytes survive.
+
+    Trimming to the previous multiple of four discards up to three encoded characters, which for a
+    zip are bytes of the end-of-central-directory record: the archive then would not open, whole-run
+    inspection declined, and the credential inside published.
+    """
+    import zipfile
+
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("a.txt", random.Random(3).randbytes(20000).hex())
+        archive.writestr("env.sh", b"export FSLO_API_KEY=" + key + b"\n")
+        archive.writestr("b.txt", random.Random(4).randbytes(20000).hex())
+    encoded = base64.b64encode(buf.getvalue()).rstrip(b"=")
+    assert len(encoded) % 4, "fixture must be unpadded to exercise the padding"
+    unpadded = tmp_path / "unpadded.txt"
+    unpadded.write_bytes(b"DATA=" + encoded + b"\n")
+    assert credential_in_file(unpadded, deadline=time.monotonic() + 120) == "a Freesolo API key"
+
+
+def test_a_base64_container_at_the_depth_cap_is_refused(tmp_path):
+    """The nesting cap refuses a decoded container rather than reporting it clean.
+
+    Returning None at the cap switched the second look off, so four nested zips around
+    `base64(gzip(secret))` published while the same gzip as an ordinary fifth container refused --
+    making "encode the last layer" the way past the limit.
+    """
+    import gzip
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    inner = io.BytesIO()
+    with gzip.GzipFile(fileobj=inner, mode="wb") as handle:
+        handle.write(b"export FSLO_API_KEY=" + key + b"\n")
+
+    def nest(payload: bytes, name: str) -> bytes:
+        for layer in range(4):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(name, payload)
+            payload, name = buf.getvalue(), f"layer{layer}.zip"
+        return payload
+
+    encoded = tmp_path / "encoded.zip"
+    encoded.write_bytes(nest(base64.b64encode(inner.getvalue()), "inner.b64"))
+    with pytest.raises(_Unscannable):
+        credential_in_file(encoded, deadline=time.monotonic() + 120)
+
+    # an ordinary file nested just as deeply still publishes: the cap refuses CONTAINERS, not depth
+    plain = tmp_path / "plain.zip"
+    plain.write_bytes(nest(b"just some text\n", "inner.txt"))
+    assert credential_in_file(plain, deadline=time.monotonic() + 120) is None
+
+
+def test_a_refusal_from_a_whole_run_base64_container_propagates(tmp_path):
+    """An exact whole-run decode is not speculative, so its refusal is not swallowed.
+
+    Swallowing every refusal from the second look kept an ELF's chance base64 runs publishable, but
+    also turned a real encrypted zip behind base64 into a clean result while the same archive
+    scanned directly was refused.
+    """
+    import struct
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("env.sh", b"export FSLO_API_KEY=" + key + b"\n")
+    raw = bytearray(buf.getvalue())
+    for signature, offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        at = raw.find(signature)
+        flags = struct.unpack_from("<H", raw, at + offset)[0]
+        struct.pack_into("<H", raw, at + offset, flags | 0x1)
+
+    direct = tmp_path / "direct.zip"
+    direct.write_bytes(bytes(raw))
+    with pytest.raises(_Unscannable):
+        credential_in_file(direct, deadline=time.monotonic() + 120)
+
+    encoded = tmp_path / "encoded.txt"
+    encoded.write_bytes(b"DATA=" + base64.b64encode(bytes(raw)) + b"\n")
+    with pytest.raises(_Unscannable):
+        credential_in_file(encoded, deadline=time.monotonic() + 120)
+
+
+def test_a_private_key_armor_header_spanning_a_chunk_is_refused(tmp_path):
+    """An armor still in its headers at the end of a chunk is undecided, not clean.
+
+    The PEM pattern needs the BEGIN line and the start of the body in ONE buffer, and RFC 4880 puts
+    no length limit on an armor header -- so a 1.5 MB `Comment:` pushed the body into the next scan
+    chunk, the halves appeared in no single window, and a real armored secret key published.
+    """
+    from flash.env_secrets import _SCAN_CHUNK_BYTES, _Unscannable, credential_in_file
+
+    body = base64.encodebytes(random.Random(11).randbytes(2048)).decode()
+    # every eighth character is a dot, so no 32-character base64 run hides inside the header itself
+    line = "Comment: " + ".".join("abc" for _ in range(30)) + "\n"
+    header = line * 12000
+    assert len(header) > _SCAN_CHUNK_BYTES, len(header)
+    opening = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n"
+    closing = "-----END PGP PRIVATE KEY BLOCK-----\n"
+
+    spanning = tmp_path / "spanning.asc"
+    spanning.write_text(opening + header + "\n" + body + closing)
+    with pytest.raises(_Unscannable):
+        credential_in_file(spanning, deadline=time.monotonic() + 120)
+
+    # the ordinary armored key is still reported as the key it is, not refused
+    short = tmp_path / "short.asc"
+    short.write_text(opening + line + "\n" + body + closing)
+    assert credential_in_file(short, deadline=time.monotonic() + 120) == "a private key block"
+
+
+def test_a_secret_key_packet_after_a_public_one_is_found(tmp_path):
+    """An OpenPGP keyring is a SEQUENCE, so the secret packet need not lead it.
+
+    `gpg --export` followed by `gpg --export-secret-keys` -- what a "back up my keys" one-liner
+    writes -- leads with a public key block, so testing only the first packet passed the secret
+    material behind it, and it matched no textual or DER pattern.
+    """
+    from flash.env_secrets import credential_in_file
+
+    # laid out as gpg writes them: a public key packet (tag 6), a user id (tag 13), a signature
+    # (tag 2), then the secret key packet (tag 5) that the walk has to reach.
+    def packet(tag: int, body: bytes) -> bytes:
+        return bytes([0x80 | (tag << 2) | 0x01]) + len(body).to_bytes(2, "big") + body
+
+    key_body = b"\x04" + b"\x6a\x7e\x7e\x1e" + b"\x01" + b"\x00" * 16
+    public = packet(6, key_body)
+    user_id = packet(13, b"r16 test <r16@example.invalid>")
+    signature = packet(2, b"\x00" * 40)
+    secret = packet(5, key_body)
+
+    keyring = tmp_path / "keyring.gpg"
+    keyring.write_bytes(public + user_id + signature + secret)
+    assert credential_in_file(keyring, deadline=time.monotonic() + 120) == "a private key"
+
+    # a public-only keyring is exactly what is meant to be shared, and still publishes
+    public_only = tmp_path / "public.gpg"
+    public_only.write_bytes(public + user_id + signature)
+    assert credential_in_file(public_only, deadline=time.monotonic() + 120) is None
+
+
+def test_paired_marker_bodies_go_through_the_entropy_test(tmp_path):
+    """Both halves of a two-marker credential filter placeholders, in either scan path.
+
+    The netrc comment says placeholders are filtered, but nothing applied the entropy test to its
+    captured body, so prose containing `Machine` and a masked `password XXXX...` was refused. The
+    same gap paired a public JWK in one dataset row with an unrelated long `"d"` field in another.
+    """
+    from flash.env_secrets import _SCAN_CHUNK_BYTES, credential_in_file
+
+    later = time.monotonic() + 120
+    prose = tmp_path / "README.md"
+    prose.write_bytes(
+        b"Machine learning jobs use the cluster.\n" + b"password " + b"X" * 40 + b"\n"
+    )
+    assert credential_in_file(prose, deadline=later) is None
+
+    rows = tmp_path / "rows.jsonl"
+    rows.write_bytes(
+        b'{"kty":"RSA","n":"public-only","e":"AQAB"}\n{"d":"documentation-document"}\n'
+    )
+    assert credential_in_file(rows, deadline=later) is None
+
+    # both must still be found for real values, including past a chunk boundary where the
+    # streaming path -- not `_match` -- is what pairs the halves.
+    real_netrc = tmp_path / "netrc"
+    real_netrc.write_bytes(
+        b"machine api.example.com login bob password " + f"{_FAKE_KEY_BODY}".encode() + b"\n"
+    )
+    assert credential_in_file(real_netrc, deadline=later) == "a machine password in a netrc file"
+
+    spanning = tmp_path / "spanning.json"
+    scalar = base64.urlsafe_b64encode(random.Random(5).randbytes(32)).rstrip(b"=")
+    spanning.write_bytes(
+        b'{"kty":"RSA",' + b'"pad":"' + b"x" * _SCAN_CHUNK_BYTES + b'",' + b'"d":"' + scalar + b'"}'
+    )
+    assert credential_in_file(spanning, deadline=later) == "a private key"
+
+
+def test_a_non_pdf_is_declined_from_its_signature(tmp_path, monkeypatch):
+    """The PDF handler reads five bytes before it reads a file.
+
+    Every top-level file reaches this handler after the other probes decline, so an unconditional
+    `read_bytes` allocated a second whole copy of every ordinary model shard in the package.
+    """
+    from flash import env_secrets
+
+    shard = tmp_path / "model.bin"
+    shard.write_bytes(random.Random(9).randbytes(4 << 20))
+
+    read_whole = []
+    original = Path.read_bytes
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda self: (read_whole.append(self), original(self))[1],
+    )
+    assert env_secrets._credential_in_pdf(shard, deadline=time.monotonic() + 120, depth=0) is None
+    assert read_whole == [], f"read the whole non-PDF: {read_whole}"
+
+    # a real PDF still reaches the stream walk
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    import zlib
+
+    payload = zlib.compress(b"export FSLO_API_KEY=" + key + b"\n")
+    document = tmp_path / "doc.pdf"
+    document.write_bytes(
+        b"%PDF-1.4\n1 0 obj\n<< /Filter /FlateDecode /Length "
+        + str(len(payload)).encode()
+        + b" >>\nstream\n"
+        + payload
+        + b"\nendstream\nendobj\n"
+    )
+    found = env_secrets._credential_in_pdf(document, deadline=time.monotonic() + 120, depth=0)
+    assert found == "a Freesolo API key"
+
+
+def test_a_chance_container_in_prose_does_not_refuse(tmp_path):
+    """A base64-shaped run inside prose stays speculative, so its refusal is swallowed.
+
+    Propagating a refusal from any exactly-decoding run made two real hub datasets unpublishable: a
+    9.7 MB JSONL of issue text holds base64-shaped words by chance, and one decoded to bytes
+    beginning `x\\x9c` with the FDICT bit set, so the dictionary refusal fired on bytes nobody
+    encoded. Bounding characters cannot separate the two -- prose is full of them, and a real
+    `zip -P` archive is 142 bytes, SMALLER than the accidental runs -- so the test is whether the
+    run was ASSIGNED.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    # a REAL preset-dictionary stream. Setting the FDICT bit by hand does not work: the two header
+    # bytes must stay a multiple of 31, so flipping one breaks the check that identifies zlib at
+    # all and the refusal is never reached. zlib writes both the flag and a valid checksum here.
+    compressor = zlib.compressobj(
+        6,
+        zlib.DEFLATED,
+        zlib.MAX_WBITS,
+        zlib.DEF_MEM_LEVEL,
+        zlib.Z_DEFAULT_STRATEGY,
+        b"the quick brown fox",
+    )
+    stream = compressor.compress(b"the quick brown fox jumps over the lazy dog" * 4)
+    stream += compressor.flush()
+    assert stream[1] & 0x20, "fixture must carry the FDICT flag"
+    run = base64.b64encode(stream).decode().rstrip("=")
+
+    later = time.monotonic() + 120
+    prose = tmp_path / "issues.jsonl"
+    prose.write_text(
+        '{"title":"crash on startup","body":"the traceback mentions ' + run + ' in the log"}\n'
+    )
+    assert credential_in_file(prose, deadline=later) is None
+
+    # the same bytes ASSIGNED are a value someone encoded, and stay refused
+    assigned = tmp_path / "config.env"
+    assigned.write_text("PAYLOAD=" + run + "\n")
+    with pytest.raises(_Unscannable):
+        credential_in_file(assigned, deadline=later)
