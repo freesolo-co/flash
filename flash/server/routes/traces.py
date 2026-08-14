@@ -114,7 +114,17 @@ def _safe_provider_response_headers(
             or normalized.startswith(_SAFE_PROVIDER_RESPONSE_HEADER_PREFIXES)
             or (300 <= status_code < 400 and normalized == "location")
         ):
-            safe[name] = urljoin(upstream_url, value) if normalized == "location" else value
+            if normalized != "location":
+                safe[name] = value
+                continue
+            # a malformed authority (`http://[broken`) makes urljoin raise. this helper runs after
+            # the paid upstream call but before the trace is recorded, so letting it propagate cost
+            # the caller its trace AND, on the streaming path, skipped the generator that closes the
+            # upstream response. a location that cannot be resolved is relayed unresolved instead.
+            try:
+                safe[name] = urljoin(upstream_url, value)
+            except ValueError:
+                safe[name] = value
     return safe
 
 

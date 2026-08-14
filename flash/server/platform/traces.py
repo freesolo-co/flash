@@ -509,6 +509,14 @@ def _chat_reply(payload: Any) -> str | None:
         # rejects a response that CARRIES one while reporting `stop`, which is what a provider does
         # when the model both answered and invoked. wrong-typed present containers are malformed too.
         return None
+    refusal = message.get("refusal")
+    if refusal is not None:
+        # a refusal IS the assistant's complete reply, and skipping it silently drops every safety
+        # and policy row from `records`. it substitutes only when ordinary content is absent: a
+        # message carrying both is a malformed combination with no single faithful target.
+        if not isinstance(refusal, str) or message.get("content") is not None:
+            return None
+        return refusal
     return _message_text(message.get("content"))
 
 

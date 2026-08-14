@@ -14,7 +14,8 @@ from flash.server.platform import traces as platform_traces
 # secret corrupts unrelated training text, while real bearer credentials are comfortably longer.
 _MIN_SECRET_SUBSTRING_LENGTH = 16
 
-_SECRET_KEY_EXACT = frozenset({"authorization", "proxyauthorization"})
+# `auth` is exact-matched, never a suffix: `author` and `oauth` end in it but carry no credential.
+_SECRET_KEY_EXACT = frozenset({"authorization", "proxyauthorization", "auth", "xauth"})
 _SECRET_KEY_SUFFIXES = (
     "apikey",
     # conventional cloud credential fields end in these normalized forms. bare `key` is deliberately
@@ -165,6 +166,23 @@ def _is_schema_definition(value: Any, *, allow_custom_vocabulary: bool = False) 
     return bool(keys) and all(key in _JSON_SCHEMA_KEYWORDS for key in keys)
 
 
+def _is_schema_map_keyword(key: str, item: Any) -> bool:
+    """Whether `key` maps property names to SUBSCHEMAS rather than to instance data.
+
+    Draft-07 `dependencies` is polymorphic: a schema value states a conditional subschema, while an
+    array value lists required property names, which is ordinary instance data. Only the schema form
+    may be traversed as a schema, or a secret-named entry is replaced wholesale by `"[redacted]"` and
+    the stored JSON Schema stops being valid.
+    """
+    if key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS:
+        return True
+    return (
+        key == "dependencies"
+        and isinstance(item, dict)
+        and any(isinstance(entry, dict) for entry in item.values())
+    )
+
+
 def _has_schema_context(value: Any) -> bool:
     if not isinstance(value, dict):
         return False
@@ -218,12 +236,44 @@ def _is_unambiguous_schema_definition(value: Any) -> bool:
     )
 
 
+def _declares_applicators_its_type_forbids(value: Any) -> bool:
+    """Whether a declared scalar `type` contradicts the applicators declared beside it.
+
+    `properties` applies only to objects and `items` only to arrays, so a schema declaring exactly
+    `type: "string"` alongside either is self-contradictory. Real schemas do not do this; ordinary
+    metadata that merely happens to carry both keys does.
+    """
+    if not isinstance(value, dict):
+        return False
+    schema_type = value.get("type")
+    types = (
+        {schema_type}
+        if isinstance(schema_type, str)
+        else set(schema_type)
+        if isinstance(schema_type, list)
+        else set()
+    )
+    if not types or not types <= _JSON_SCHEMA_TYPES:
+        return False
+    object_only = any(
+        isinstance(value.get(key), dict) for key in ("properties", "patternProperties")
+    )
+    array_only = "items" in value or "prefixItems" in value
+    return (object_only and "object" not in types) or (array_only and "array" not in types)
+
+
 def _has_schema_wrapper_evidence(value: Any) -> bool:
     if _has_schema_context(value):
         return True
     if not isinstance(value, dict):
         return False
     schema_type = value.get("type")
+    if _declares_applicators_its_type_forbids(value):
+        # a schema is not merely a dict with a valid `type`: the type has to agree with the
+        # applicators alongside it. `{"type": "string", "properties": {...}}` describes a string
+        # that somehow has properties, which no real schema does, and treating it as one let
+        # ordinary metadata claim the exemption and keep its literals.
+        return False
     if isinstance(schema_type, str):
         return schema_type in _JSON_SCHEMA_TYPES
     return (
@@ -496,13 +546,16 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
                     if resource_path is not None:
                         resource_ref = f"#{fragment}"
                         if keyword == "$recursiveRef" and resource_ref == "#":
-                            # an embedded resource's `$recursiveAnchor` is not an ancestor of this
-                            # reference, so it is not in the dynamic scope: without an anchor on the
-                            # path the target is this resource's own root.
+                            # `$recursiveRef` resolves against the dynamic scope, so an ENCLOSING
+                            # resource that also declares `$recursiveAnchor` can be the target. a
+                            # sibling embedded resource cannot: it is not on this reference's
+                            # evaluation path, so its anchor is never in scope. with no anchor
+                            # reachable at all the target is this resource's own root.
                             pointers = frozenset(
                                 pointer
                                 for pointer in anchors.get("", frozenset())
                                 if anchor_belongs_to_resource(pointer, canonical_base)
+                                or path[: len(pointer)] == pointer
                             )
                             found.update(pointers or {resource_path})
                         elif is_dynamic and resource_ref != "#":
@@ -636,7 +689,7 @@ def _redact_secret_fields(
                 redacted[key] = "[redacted]"
             else:
                 child_schema_context = schema_context and (
-                    key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS
+                    _is_schema_map_keyword(key, item)
                     or key in _JSON_SCHEMA_VALUE_KEYWORDS
                     or schema_property_map
                     or key in _JSON_SCHEMA_KEYWORDS
@@ -649,11 +702,7 @@ def _redact_secret_fields(
                 redacted[key] = _redact_secret_fields(
                     item,
                     depth=depth + 1,
-                    schema_property_map=(
-                        schema_context
-                        and key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS
-                        and isinstance(item, dict)
-                    ),
+                    schema_property_map=(schema_context and _is_schema_map_keyword(key, item)),
                     schema_context=child_schema_context,
                     secret_schema_definition=secret_schema_definition
                     or referenced_secret_definition,
@@ -671,7 +720,7 @@ def _redact_secret_fields(
                     ),
                     schema_wrapper=schema_wrapper
                     or wrapper_has_schema
-                    or (schema_context and key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS),
+                    or (schema_context and _is_schema_map_keyword(key, item)),
                     tool_call_list=key == "tool_calls" and isinstance(item, list),
                     secret_schema_refs=active_secret_schema_refs,
                     schema_definition_path=current_schema_path,

@@ -595,6 +595,11 @@ class SseAccumulator:
             if choices is not None:
                 self._note_defect("stream contained non-list choices")
             return
+        # one event carries at most one delta per choice. a repeated index within a SINGLE event
+        # would merge two providers' entries into one reply, so the accumulated text would be a
+        # completion the provider never sent as one choice. the same index across SUCCESSIVE events
+        # is ordinary streaming, so this set is per-event.
+        event_indices: set[int] = set()
         for position, choice in enumerate(choices):
             if not isinstance(choice, dict):
                 self._note_defect("stream choices contained a non-object entry")
@@ -607,6 +612,10 @@ class SseAccumulator:
                 continue
             else:
                 index = raw_index
+            if index in event_indices:
+                self._note_defect("stream event repeated a choice index")
+                continue
+            event_indices.add(index)
             choice_entry_bytes = max(64, self._value_size(index) + 12)
             if index not in self._choices and not self._reserve(b"x" * choice_entry_bytes):
                 continue

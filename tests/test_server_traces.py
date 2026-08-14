@@ -4118,6 +4118,173 @@ def test_schema_wrapper_names_require_real_schema_evidence(wrapper: str) -> None
     }
 
 
+def test_wrapper_key_with_type_contradicting_its_applicators_is_instance_data() -> None:
+    """`{"type": "string", "properties": {...}}` is not a schema: a string has no properties.
+
+    A wrapper-named key plus a syntactically valid `type` was enough to claim the schema exemption,
+    so ordinary metadata shaped this way kept its literals verbatim in raw exports.
+    """
+    payload = {
+        "parameters": {
+            "type": "string",
+            "properties": {"password": {"type": "string", "value": "SECRET"}},
+        }
+    }
+
+    stored = traces._redact_secret_fields(payload)
+
+    assert "SECRET" not in json.dumps(stored)
+    assert stored["parameters"]["properties"]["password"] == "[redacted]"
+
+
+def test_wrapper_key_with_coherent_type_keeps_schema_shape() -> None:
+    """Control for the check above: `type: "object"` agrees with `properties`, so it is a schema."""
+    payload = {
+        "parameters": {
+            "type": "object",
+            "properties": {"password": {"type": "string", "default": "SECRET"}},
+        }
+    }
+
+    stored = traces._redact_secret_fields(payload)
+
+    assert stored["parameters"]["properties"]["password"] == {
+        "type": "string",
+        "default": "[redacted]",
+    }
+
+
+def test_legacy_dependencies_map_preserves_subschema_entries() -> None:
+    """Draft-07 `dependencies` is polymorphic: a schema value is a subschema, an array is not.
+
+    Replacing a secret-named schema entry with the string "[redacted]" made the stored JSON Schema
+    invalid, the same defect already fixed for `dependentSchemas`.
+    """
+    schema = {
+        "type": "object",
+        "dependencies": {"password": {"type": "object", "default": "SECRET-DEPENDENCY"}},
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["dependencies"]["password"] == {"type": "object", "default": "[redacted]"}
+    # the ARRAY form lists required property names: instance data, redacted as before
+    array_form = traces._redact_secret_fields(
+        {"type": "object", "dependencies": {"password": ["a", "b"]}}
+    )
+    assert array_form["dependencies"]["password"] == "[redacted]"
+
+
+def test_recursive_ref_reaches_an_outer_recursive_anchor() -> None:
+    """`$recursiveRef` resolves against the dynamic scope, so an ENCLOSING anchor can be the target.
+
+    A sibling embedded resource is different: it is not on the reference's evaluation path, so its
+    anchor is never in scope and its literals must survive.
+    """
+    nested = {
+        "$id": "https://example.com/root",
+        "$recursiveAnchor": True,
+        "default": "SECRET-OUTER",
+        "$defs": {
+            "Inner": {
+                "$id": "https://example.com/inner",
+                "$recursiveAnchor": True,
+                "default": "SECRET-INNER",
+                "properties": {"password": {"$recursiveRef": "#"}},
+            }
+        },
+    }
+
+    stored = traces._redact_secret_fields(nested)
+
+    assert stored["default"] == "[redacted]"
+    assert stored["$defs"]["Inner"]["default"] == "[redacted]"
+
+
+def test_scalar_auth_key_is_redacted() -> None:
+    """A bare `auth` key carries third-party credentials but matched neither exact nor suffix set."""
+    stored = traces._redact_secret_fields(
+        {"auth": "Bearer third-party-secret-value", "author": "amy"}
+    )
+
+    assert stored["auth"] == "[redacted]"
+    # `author` ends in "auth" backwards but is an ordinary word: exact-matched, never a suffix
+    assert stored["author"] == "amy"
+
+
+def test_malformed_redirect_location_does_not_abandon_the_trace() -> None:
+    """`urljoin` raises on a malformed IPv6 authority, and this helper runs after the paid call.
+
+    Letting it propagate cost the caller its trace and, on the streaming path, skipped the generator
+    that closes the upstream response and client.
+    """
+    safe = traces._safe_provider_response_headers(
+        {"location": "http://[broken"},
+        status_code=302,
+        upstream_url="https://api.openai.com/v1/chat/completions",
+    )
+
+    assert safe["location"] == "http://[broken"
+    resolved = traces._safe_provider_response_headers(
+        {"location": "/v2/chat"},
+        status_code=302,
+        upstream_url="https://api.openai.com/v1/chat/completions",
+    )
+    assert resolved["location"] == "https://api.openai.com/v2/chat"
+
+
+def test_duplicate_choice_index_within_one_event_is_malformed() -> None:
+    """Two entries sharing an index in ONE event would merge into a reply the provider never sent.
+
+    The same index across SUCCESSIVE events is ordinary streaming and must keep concatenating.
+    """
+    duplicated = trace_sse.SseAccumulator()
+    duplicated.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"A"}},'
+        b'{"index":0,"delta":{"content":"B"}}]}\n\ndata: [DONE]\n\n'
+    )
+    duplicated.finish()
+
+    assert duplicated.defect == "stream event repeated a choice index"
+
+    successive = trace_sse.SseAccumulator()
+    successive.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"A"}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{"content":"B"}}]}\n\ndata: [DONE]\n\n'
+    )
+    successive.finish()
+
+    assert successive.defect is None
+    assert successive.output()["choices"][0]["message"]["content"] == "AB"
+
+
+def test_refusal_only_reply_is_exported() -> None:
+    """A refusal IS the assistant's complete reply; skipping it drops every safety row silently."""
+    refusal_only = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": None, "refusal": "I cannot help"},
+            }
+        ]
+    }
+
+    assert platform_traces._chat_reply(refusal_only) == "I cannot help"
+    # both present is a malformed combination with no single faithful target
+    both = {
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": "hi", "refusal": "no"}}
+        ]
+    }
+    assert platform_traces._chat_reply(both) is None
+    non_string = {
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": None, "refusal": {"x": 1}}}
+        ]
+    }
+    assert platform_traces._chat_reply(non_string) is None
+
+
 def test_an_empty_schema_under_a_secret_name_survives_redaction(trace_api, monkeypatch) -> None:
     """`{}` is the permissive JSON Schema, so `{"password": {}}` is a declaration, not a secret.
     Replacing it with the string "[redacted]" turns a valid schema into an invalid one."""
