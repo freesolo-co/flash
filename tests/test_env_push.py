@@ -2659,11 +2659,16 @@ def test_a_corrupt_tar_does_not_crash_the_publish(tmp_path):
     A truncated tar raised `ReadError: unexpected end of data` out of the publish as a traceback.
     A half-written shard in a dataset directory is ordinary, so crashing on it would be a worse bug
     than the hole being closed.
+
+    It refuses rather than returning None, which is the same distinction the unreadable zip member
+    draws: the member's declared bytes are not in the file, so nothing read them, and a clean
+    verdict would be one nobody checked. Not crashing is what this test is about, and a refusal is
+    a decision rather than a traceback.
     """
     import io
     import tarfile
 
-    from flash.env_secrets import credential_in_file
+    from flash.env_secrets import _Unscannable, credential_in_file
 
     whole = io.BytesIO()
     with tarfile.open(fileobj=whole, mode="w") as archive:
@@ -2674,7 +2679,56 @@ def test_a_corrupt_tar_does_not_crash_the_publish(tmp_path):
 
     truncated = tmp_path / "half.tar"
     truncated.write_bytes(whole.getvalue()[:900])
-    assert credential_in_file(truncated) is None
+    with pytest.raises(_Unscannable, match="cannot read"):
+        credential_in_file(truncated)
+
+
+def test_a_truncated_tar_member_is_refused_rather_than_skipped(tmp_path):
+    """A member declaring more bytes than the file holds was scanned by nobody and passed.
+
+    The read fails AND the iterator fails again walking to the next header, and that second failure
+    escapes any per-member guard into the dispatch loop -- which reads it as "not a tar" and
+    published the file on its literal bytes. A zlib-compressed key inside such a member returned
+    clean, while the same member on its own reported the key: the outer raw scan does not look for
+    a compressed record at an arbitrary offset, so nothing else would have caught it.
+    """
+    import io
+    import tarfile
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    inner = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
+
+    # the control: the same member, honestly sized, is read and its credential found
+    honest = io.BytesIO()
+    with tarfile.open(fileobj=honest, mode="w") as archive:
+        info = tarfile.TarInfo("payload.z")
+        info.size = len(inner)
+        archive.addfile(info, io.BytesIO(inner))
+    intact = tmp_path / "intact.tar"
+    intact.write_bytes(honest.getvalue())
+    assert credential_in_file(intact) == "a Freesolo API key"
+
+    lying = io.BytesIO()
+    with tarfile.open(fileobj=lying, mode="w") as archive:
+        info = tarfile.TarInfo("payload.z")
+        info.size = 1 << 20
+        archive.addfile(info, io.BytesIO(inner + b"\0" * ((1 << 20) - len(inner))))
+    cut = tmp_path / "lying.tar"
+    cut.write_bytes(lying.getvalue()[: 512 + len(inner)])
+    with pytest.raises(_Unscannable, match="cannot read"):
+        credential_in_file(cut)
+
+    # a file that is not a tar raises the SAME exception from the same place, and must still be
+    # scanned on its own bytes rather than refused -- that is most of any real package
+    for name, data in (
+        ("notes.txt", b"# ordinary\nDEBUG=1\n"),
+        ("blob.bin", bytes(range(256)) * 8),
+    ):
+        ordinary = tmp_path / name
+        ordinary.write_bytes(data)
+        assert credential_in_file(ordinary) is None, name
 
 
 def test_an_oversized_tar_refuses_rather_than_passing(tmp_path, monkeypatch):
