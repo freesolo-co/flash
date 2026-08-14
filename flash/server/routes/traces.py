@@ -38,9 +38,11 @@ from flash.server.routes.trace_redaction import (  # noqa: F401
     _redact_secret_values,
     _SanitizationFlag,
     _sanitize_for_trace,
+    _secret_schema_definition_refs,
+)
+from flash.server.routes.trace_schema_identity import (  # noqa: F401
     _schema_anchor_pointers,
     _schema_resource_pointers,
-    _secret_schema_definition_refs,
 )
 from flash.server.routes.trace_sse import SseAccumulator, SseDoneGate
 

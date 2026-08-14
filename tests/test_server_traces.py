@@ -25,7 +25,7 @@ from flash.server.platform.traces import (
     sanitize_json_value,
     store_trace,
 )
-from flash.server.routes import trace_redaction, trace_sse, traces
+from flash.server.routes import trace_redaction, trace_sse, trace_uri, traces
 
 _PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 _OTHER_PROJECT_ID = "22222222-2222-4222-8222-222222222222"
@@ -8581,3 +8581,222 @@ def test_a_truncated_stream_keeps_its_partial_line_intact(trace_api, monkeypatch
     assert response.status_code == 200
     assert partial + b": freesolo-record-failed" not in response.content
     assert response.content == completion + partial + b"\n: freesolo-record-failed\n\n"
+
+
+def test_an_anchored_secret_pattern_is_still_secret() -> None:
+    """`patternProperties` keys are REGEXES, so the raw spelling is the wrong thing to match on:
+    `^password$` names exactly the field `password` but ends in `$`, failing the suffix rule. Its
+    schema was never marked secret and its literals stayed in the raw export."""
+
+    def payload(pattern: str, schema: dict) -> dict:
+        return {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "patternProperties": {pattern: schema},
+                            "$defs": {"Cred": {"type": "string", "default": "ANCHORREFLEAK"}},
+                        },
+                    },
+                }
+            ]
+        }
+
+    anchored = payload("^password$", {"type": "string", "default": "ANCHORLEAK"})
+    referenced = payload("^secret_token$", {"$ref": "#/$defs/Cred"})
+
+    assert "ANCHORLEAK" not in json.dumps(traces._redact_secret_fields(anchored))
+    assert "ANCHORREFLEAK" not in json.dumps(traces._redact_secret_fields(referenced))
+
+    # a non-secret anchored pattern is judged on its full spelling and keeps its declaration
+    ordinary = traces._redact_secret_fields(
+        payload("^item_$", {"type": "string", "default": "widget"})
+    )
+    parameters = ordinary["tools"][0]["function"]["parameters"]
+    assert parameters["patternProperties"]["^item_$"]["default"] == "widget"
+
+
+def test_an_unnamed_function_entry_is_not_a_tool_definition() -> None:
+    """A tool definition NAMES the tool -- that is what `tool_choice` selects and what the provider
+    calls back with. Accepting a bare `{"function": {...}}` wrapper let an entry no provider would
+    accept open the schema exemption, so its nested wrapper preserved an unknown literal."""
+    anonymous = {
+        "tools": [
+            {
+                "function": {
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"password": {"type": "string", "value": "ANONLEAK"}},
+                    }
+                }
+            }
+        ]
+    }
+
+    assert "ANONLEAK" not in json.dumps(traces._redact_secret_fields(anonymous))
+
+    # a named nested function still hosts its declaration
+    named = traces._redact_secret_fields(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"password": {"type": "string", "description": "pw"}},
+                        },
+                    },
+                }
+            ]
+        }
+    )
+    assert named["tools"][0]["function"]["parameters"]["properties"]["password"] == {
+        "type": "string",
+        "description": "pw",
+    }
+
+
+@pytest.mark.parametrize(
+    ("part", "marker"),
+    [
+        ({"text": '{"password":"NOTYPELEAK"}'}, "NOTYPELEAK"),
+        ({"type": "output", "text": '{"password":"UNKNOWNLEAK"}'}, "UNKNOWNLEAK"),
+        ({"type": "text", "text": '{"password":"KNOWNLEAK"}'}, "KNOWNLEAK"),
+    ],
+    ids=["absent-type", "unknown-type", "known-type"],
+)
+def test_a_tool_result_part_is_redacted_whatever_its_type(part: dict, marker: str) -> None:
+    """The enclosing message's role already establishes that a part carries tool output; its `type`
+    only narrows WHICH member holds it. Requiring a recognized type meant an absent or
+    vendor-specific one dropped the context and preserved a serialized credential verbatim."""
+    stored = traces._redact_secret_fields({"messages": [{"role": "tool", "content": [part]}]})
+
+    assert marker not in json.dumps(stored)
+
+
+def test_ordinary_assistant_prose_is_not_treated_as_tool_output() -> None:
+    """The widened part handling must not reach ordinary assistant content, which is prose."""
+    stored = traces._redact_secret_fields(
+        {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "hello world"}]}]}
+    )
+
+    assert stored["messages"][0]["content"][0]["text"] == "hello world"
+
+
+def test_a_trailing_root_dot_names_the_same_host() -> None:
+    """`example.com.` and `example.com` are the same authority. Keeping both spellings classified a
+    local `$id` reached under one of them as external, so the local target's secret literals were
+    never redacted out of the raw export."""
+    assert trace_uri._canonical_resource_uri(
+        "https://example.com./schema"
+    ) == trace_uri._canonical_resource_uri("https://example.com/schema")
+    assert trace_uri._canonical_resource_uri(
+        "https://example.com.:8443/s"
+    ) == trace_uri._canonical_resource_uri("https://example.com:8443/s")
+
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "$id": "https://example.com./tool.json",
+                        "type": "object",
+                        "properties": {
+                            "api_key": {"$ref": "https://example.com/tool.json#/$defs/Cred"}
+                        },
+                        "$defs": {"Cred": {"type": "string", "default": "ROOTDOTLEAK"}},
+                    },
+                },
+            }
+        ]
+    }
+
+    assert "ROOTDOTLEAK" not in json.dumps(traces._redact_secret_fields(payload))
+
+    # distinct hosts stay distinct, and a bare dot is not a hostname to rewrite
+    assert trace_uri._canonical_resource_uri(
+        "https://a.example.com/s"
+    ) != trace_uri._canonical_resource_uri("https://b.example.com/s")
+
+
+def test_empty_data_lines_cannot_retain_an_object_each() -> None:
+    """Every `data:` line cost a retained object, but an EMPTY one charged only the joining newline
+    and the first charged nothing. Millions of `data:\\n` lines then sat under the byte budget while
+    retaining an object each, so one pathological event could exhaust memory per stream."""
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=4096)
+    peak_objects = 0
+    for _ in range(12_000):
+        accumulator.feed(b"data:\n")
+        held = accumulator._event_data
+        # a list holds one object per line; the joined buffer holds one no matter how many arrive.
+        peak_objects = max(peak_objects, len(held) if isinstance(held, list) else 1)
+        if accumulator.truncated:
+            break
+
+    assert peak_objects == 1
+    assert accumulator.truncated is True
+
+    # the ordinary multi-line event still joins with newlines exactly as before
+    joined = trace_sse.SseAccumulator()
+    joined.feed(b'data: {"choices":[{"index":0,\ndata: "delta":{"content":"hi"}}]}\n\n')
+    joined.feed(b"data: [DONE]\n\n")
+    joined.finish()
+
+    assert joined.output()["choices"][0]["message"]["content"] == "hi"
+
+
+def test_property_names_declares_names_not_credential_values() -> None:
+    """`propertyNames` constrains the NAMES a member may have, so its `enum` lists allowed property
+    names. Propagating the secret flag into it rewrote that list to `["[redacted]"]`, silently
+    changing the stored schema's contract while protecting nothing."""
+    stored = traces._redact_secret_fields(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "credentials": {
+                                    "type": "object",
+                                    "propertyNames": {"enum": ["alpha", "beta"]},
+                                }
+                            },
+                        },
+                    },
+                }
+            ]
+        }
+    )
+    declared = stored["tools"][0]["function"]["parameters"]["properties"]["credentials"]
+
+    assert declared["propertyNames"]["enum"] == ["alpha", "beta"]
+
+    # a secret property's OWN enum is instance data and is still redacted
+    own = traces._redact_secret_fields(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"password": {"type": "string", "enum": ["ENUMLEAK"]}},
+                        },
+                    },
+                }
+            ]
+        }
+    )
+
+    assert "ENUMLEAK" not in json.dumps(own)

@@ -8,11 +8,9 @@ from typing import Any
 
 from flash.server.platform import traces as platform_traces
 from flash.server.routes.trace_schema_identity import (
+    SchemaResourceScopes,
     _local_schema_pointer,
-    _schema_anchor_pointers,
-    _schema_dynamic_anchor_pointers,
     _schema_resource_id,
-    _schema_resource_pointers,
 )
 from flash.server.routes.trace_uri import (
     _canonical_resource_uri,
@@ -182,6 +180,22 @@ def _is_secret_key(key: Any, *, allow_token: bool = False) -> bool:
     )
 
 
+def _is_secret_property_pattern(pattern: Any) -> bool:
+    """Whether a `patternProperties` key matches property names this module treats as secret.
+
+    The key is a REGEX, not a name, so the raw spelling is the wrong thing to test: `^password$`
+    names exactly the field `password`, but it ends in `$` and failed the suffix rule, so the
+    pattern's schema was never marked secret and its literals stayed in the raw export.
+
+    Only the anchors are stripped -- they constrain WHERE the expression matches, not what it
+    names. Anything else (alternation, character classes, quantifiers) is left in place, so a
+    genuinely non-secret pattern is still judged on its full spelling rather than guessed at.
+    """
+    if not isinstance(pattern, str):
+        return False
+    return _is_secret_key(pattern.removeprefix("^").removesuffix("$"))
+
+
 def _is_schema_definition(value: Any, *, allow_custom_vocabulary: bool = False) -> bool:
     if isinstance(value, bool):
         return True
@@ -346,29 +360,12 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
     if not isinstance(value, dict):
         return set()
     refs: set[tuple[str, ...]] = set()
-    document_id = _schema_resource_id(value) if isinstance(value, dict) else None
-    base_uri = document_id if isinstance(document_id, str) else ""
-    resources = _schema_resource_pointers(value, depth=depth)
-    resources.setdefault(_canonical_resource_uri(_safe_urldefrag(base_uri)[0]), ())
-    resource_scopes = sorted(
-        ((path, uri) for uri, path in resources.items()),
-        key=lambda item: len(item[0]),
-        reverse=True,
-    )
-    # `$dynamicAnchor` also declares an ordinary plain-name fragment, so a static `$ref` resolves
-    # to it as well. one map serves both keywords: splitting them let `{"$ref": "#Name"}` miss a
-    # `$dynamicAnchor: "Name"` target and persist its literals.
-    anchors = _schema_anchor_pointers(value, depth=depth)
-    dynamic_anchors = _schema_dynamic_anchor_pointers(value, depth=depth)
-
-    def scope_for(path: tuple[str, ...]) -> str:
-        return next(
-            (uri for prefix, uri in resource_scopes if path[: len(prefix)] == prefix), base_uri
-        )
-
-    def anchor_belongs_to_resource(pointer: tuple[str, ...], resource_uri: str) -> bool:
-        owner_uri = _canonical_resource_uri(_safe_urldefrag(scope_for(pointer))[0])
-        return owner_uri == _canonical_resource_uri(resource_uri)
+    scopes = SchemaResourceScopes.build(value, depth=depth)
+    base_uri = scopes.base_uri
+    resources = scopes.resources
+    anchors = scopes.anchors
+    dynamic_anchors = scopes.dynamic_anchors
+    anchor_belongs_to_resource = scopes.anchor_belongs_to_resource
 
     def collect_refs(
         node: Any, node_depth: int, path: tuple[str, ...], scope_uri: str
@@ -454,7 +451,12 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
                     continue
                 for key, schema in property_map.items():
                     schema_path = (*path, map_keyword, str(key))
-                    if _is_secret_key(key) and _is_schema_definition(schema):
+                    secret_declaration = (
+                        _is_secret_property_pattern(key)
+                        if map_keyword == "patternProperties"
+                        else _is_secret_key(key)
+                    )
+                    if secret_declaration and _is_schema_definition(schema):
                         refs.update(collect_refs(schema, 0, schema_path, scope_uri))
                     collect_secret_properties(schema, node_depth + 1, schema_path, scope_uri)
             for key, item in node.items():
@@ -483,7 +485,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
     while pending:
         target_path = pending.pop()
         target = resolve(target_path)
-        for pointer in collect_refs(target, 0, target_path, scope_for(target_path)):
+        for pointer in collect_refs(target, 0, target_path, scopes.scope_for(target_path)):
             if pointer not in refs:
                 refs.add(pointer)
                 pending.append(pointer)
@@ -543,9 +545,15 @@ def _carries_tool_result(container: dict[Any, Any], key: Any, *, inside_tool_res
     """
     if key == "content" and container.get("role") in {"tool", "function"}:
         return True
-    return (
-        inside_tool_result and key == "text" and container.get("type") in _TEXT_CONTENT_PART_TYPES
-    )
+    if not (inside_tool_result and key == "text"):
+        return False
+    # the enclosing message's role already established that this is tool output; the part's `type`
+    # only narrows WHICH member carries it, and `text` is that member in every spelling. requiring
+    # a recognized `type` meant an absent or vendor-specific one dropped the context, and a
+    # serialized credential in that part was preserved verbatim. an unrecognized type is unknown
+    # input, so it is handled conservatively rather than trusted to be something other than output.
+    part_type = container.get("type")
+    return part_type is None or isinstance(part_type, str)
 
 
 def _resolve_secret_schema_refs(
@@ -572,11 +580,175 @@ def _resolve_secret_schema_refs(
     return active, secret_schema_definition or referenced
 
 
+def _child_response_shape_flags(
+    key: Any,
+    item: Any,
+    *,
+    response_root: bool,
+    choice_list: bool,
+    choice: bool,
+    logprobs: bool,
+    logprob_entries: bool,
+) -> dict[str, bool]:
+    """The response-envelope flags a child inherits: where it sits in `choices` and `logprobs`.
+
+    These travel together because they describe one thing -- position inside a reply envelope --
+    and `logprob_entries` in particular must stay sticky so a token whose text happens to look like
+    a secret key is not redacted out of a logprob table.
+    """
+    return {
+        "choice_list": response_root and key == "choices" and isinstance(item, list),
+        "choice": choice_list,
+        "logprobs": choice and key == "logprobs" and isinstance(item, dict),
+        "logprob_entries": logprob_entries
+        or (logprobs and key in {"content", "refusal", "top_logprobs"}),
+    }
+
+
+def _child_secret_schema_flags(
+    key: Any,
+    *,
+    schema_definition: bool,
+    schema_property_pattern_map: bool,
+    secret_schema_definition: bool,
+    secret_schema_property: bool,
+    referenced_secret_definition: bool,
+) -> tuple[bool, bool]:
+    """The two secret-schema flags a child node inherits: definition-level and property-level.
+
+    `propertyNames` constrains the NAMES a member may have, never its value, so its `enum` lists
+    allowed property names. Propagating either flag into it rewrote that list to `["[redacted]"]`
+    and silently changed the stored schema's contract while protecting nothing -- no credential is
+    ever spelled there. Both flags therefore stop at that keyword.
+
+    Under `patternProperties` the key is a REGEX rather than a name, so the secrecy test strips its
+    anchors: `^password$` names exactly the field `password`.
+    """
+    if key == "propertyNames":
+        return False, False
+    declares_secret_property = schema_definition and (
+        _is_secret_property_pattern(key) if schema_property_pattern_map else _is_secret_key(key)
+    )
+    return (
+        secret_schema_definition or referenced_secret_definition,
+        secret_schema_property or declares_secret_property,
+    )
+
+
+def _redact_secret_child(
+    value: dict[Any, Any],
+    key: Any,
+    item: Any,
+    *,
+    depth: int,
+    schema_property_map: bool,
+    schema_property_pattern_map: bool,
+    schema_property_dependencies: bool,
+    schema_context: bool,
+    schema_definition: bool,
+    secret_schema_definition: bool,
+    secret_schema_property: bool,
+    referenced_secret_definition: bool,
+    response_root: bool,
+    choice_list: bool,
+    choice: bool,
+    logprobs: bool,
+    logprob_entries: bool,
+    function_container: bool,
+    tool_result_content: bool,
+    schema_host: bool,
+    schema_wrapper: bool,
+    tool_call: bool,
+    payload_root: bool,
+    active_secret_schema_refs: set[tuple[str, ...]],
+    current_schema_path: tuple[str, ...],
+    flag: _SanitizationFlag | None,
+) -> Any:
+    """Redact one member of a mapping, deciding what context the child inherits.
+
+    This is the whole of the non-secret, non-literal case: everything about WHERE the child sits --
+    schema context, host and wrapper exemptions, response-envelope position, tool-call framing --
+    is decided here so the mapping walk itself stays readable.
+    """
+    child_schema_context = schema_context and (
+        _is_schema_map_keyword(key, item)
+        or key in _JSON_SCHEMA_VALUE_KEYWORDS
+        or schema_property_map
+        or key in _JSON_SCHEMA_KEYWORDS
+    )
+    # a wrapper key only grants the schema exemption inside a container that actually
+    # declares schemas. `{"parameters": {"type": "object", "properties": {...}}}` is a
+    # perfectly ordinary metadata shape, and honouring the wrapper anywhere let it claim
+    # the exemption: its secret-named property kept an unknown `value` verbatim, so a
+    # third-party credential that is not in `context.secrets` reached the raw export.
+    wrapper_has_schema = (
+        schema_host and key in _JSON_SCHEMA_WRAPPER_KEYS and _has_schema_wrapper_evidence(item)
+    )
+    if wrapper_has_schema:
+        child_schema_context = True
+    child_secret_definition, child_secret_property = _child_secret_schema_flags(
+        key,
+        schema_definition=schema_definition,
+        schema_property_pattern_map=schema_property_pattern_map,
+        secret_schema_definition=secret_schema_definition,
+        secret_schema_property=secret_schema_property,
+        referenced_secret_definition=referenced_secret_definition,
+    )
+    return _redact_secret_fields(
+        item,
+        depth=depth + 1,
+        schema_property_map=(schema_context and _is_schema_map_keyword(key, item)),
+        schema_property_pattern_map=(key == "patternProperties"),
+        schema_property_dependencies=(
+            key == "dependencies" or key in _JSON_SCHEMA_PROPERTY_NAME_MAP_KEYWORDS
+        ),
+        schema_context=child_schema_context,
+        secret_schema_definition=child_secret_definition,
+        secret_schema_property=child_secret_property,
+        payload_root=False,
+        response_root=False,
+        **_child_response_shape_flags(
+            key,
+            item,
+            response_root=response_root,
+            choice_list=choice_list,
+            choice=choice,
+            logprobs=logprobs,
+            logprob_entries=logprob_entries,
+        ),
+        function_arguments=function_container and key == "arguments",
+        tool_result_content=_carries_tool_result(
+            value, key, inside_tool_result=tool_result_content
+        ),
+        function_container=(key == "function_call" or (tool_call and key == "function")),
+        # only the request's OWN declaration keys open a schema host, and only at the
+        # payload root. recognizing the names anywhere let ordinary nested metadata --
+        # `{"metadata": {"tools": {...}}}` -- open one for its whole subtree and keep a
+        # secret-named property's literal verbatim. inside a host the flag stays set,
+        # since a real declaration nests (`tools[].function.parameters`). `function`
+        # and `json_schema` are spelled only INSIDE a host, so a top-level extension
+        # of either name is ordinary data rather than a declaration.
+        schema_host=schema_host or (payload_root and _opens_root_schema_host(key, item)),
+        # `tools`/`functions` hold tool DEFINITIONS; their entries must each qualify.
+        tool_definition_list=(
+            payload_root and key in _ARRAY_SHAPED_ROOT_HOST_KEYS and isinstance(item, list)
+        ),
+        schema_wrapper=schema_wrapper
+        or wrapper_has_schema
+        or (schema_context and _is_schema_map_keyword(key, item)),
+        tool_call_list=key == "tool_calls" and isinstance(item, list),
+        secret_schema_refs=active_secret_schema_refs,
+        schema_definition_path=current_schema_path,
+        flag=flag,
+    )
+
+
 def _redact_secret_fields(
     value: Any,
     *,
     depth: int = 0,
     schema_property_map: bool = False,
+    schema_property_pattern_map: bool = False,
     schema_property_dependencies: bool = False,
     schema_context: bool = False,
     secret_schema_definition: bool = False,
@@ -627,71 +799,32 @@ def _redact_secret_fields(
             elif _is_secret_key(key, allow_token=logprob_entries) and not schema_definition:
                 redacted[key] = "[redacted]"
             else:
-                child_schema_context = schema_context and (
-                    _is_schema_map_keyword(key, item)
-                    or key in _JSON_SCHEMA_VALUE_KEYWORDS
-                    or schema_property_map
-                    or key in _JSON_SCHEMA_KEYWORDS
-                )
-                # a wrapper key only grants the schema exemption inside a container that actually
-                # declares schemas. `{"parameters": {"type": "object", "properties": {...}}}` is a
-                # perfectly ordinary metadata shape, and honouring the wrapper anywhere let it claim
-                # the exemption: its secret-named property kept an unknown `value` verbatim, so a
-                # third-party credential that is not in `context.secrets` reached the raw export.
-                wrapper_has_schema = (
-                    schema_host
-                    and key in _JSON_SCHEMA_WRAPPER_KEYS
-                    and _has_schema_wrapper_evidence(item)
-                )
-                if wrapper_has_schema:
-                    child_schema_context = True
-                redacted[key] = _redact_secret_fields(
+                redacted[key] = _redact_secret_child(
+                    value,
+                    key,
                     item,
-                    depth=depth + 1,
-                    schema_property_map=(schema_context and _is_schema_map_keyword(key, item)),
-                    schema_property_dependencies=(
-                        key == "dependencies" or key in _JSON_SCHEMA_PROPERTY_NAME_MAP_KEYWORDS
-                    ),
-                    schema_context=child_schema_context,
-                    secret_schema_definition=secret_schema_definition
-                    or referenced_secret_definition,
-                    secret_schema_property=secret_schema_property
-                    or (schema_definition and _is_secret_key(key)),
-                    payload_root=False,
-                    response_root=False,
-                    choice_list=response_root and key == "choices" and isinstance(item, list),
-                    choice=choice_list,
-                    logprobs=choice and key == "logprobs" and isinstance(item, dict),
-                    logprob_entries=logprob_entries
-                    or (logprobs and key in {"content", "refusal", "top_logprobs"}),
-                    function_arguments=function_container and key == "arguments",
-                    tool_result_content=_carries_tool_result(
-                        value, key, inside_tool_result=tool_result_content
-                    ),
-                    function_container=(
-                        key == "function_call" or (tool_call and key == "function")
-                    ),
-                    # only the request's OWN declaration keys open a schema host, and only at the
-                    # payload root. recognizing the names anywhere let ordinary nested metadata --
-                    # `{"metadata": {"tools": {...}}}` -- open one for its whole subtree and keep a
-                    # secret-named property's literal verbatim. inside a host the flag stays set,
-                    # since a real declaration nests (`tools[].function.parameters`). `function`
-                    # and `json_schema` are spelled only INSIDE a host, so a top-level extension
-                    # of either name is ordinary data rather than a declaration.
-                    schema_host=schema_host
-                    or (payload_root and _opens_root_schema_host(key, item)),
-                    # `tools`/`functions` hold tool DEFINITIONS; their entries must each qualify.
-                    tool_definition_list=(
-                        payload_root
-                        and key in _ARRAY_SHAPED_ROOT_HOST_KEYS
-                        and isinstance(item, list)
-                    ),
-                    schema_wrapper=schema_wrapper
-                    or wrapper_has_schema
-                    or (schema_context and _is_schema_map_keyword(key, item)),
-                    tool_call_list=key == "tool_calls" and isinstance(item, list),
-                    secret_schema_refs=active_secret_schema_refs,
-                    schema_definition_path=current_schema_path,
+                    depth=depth,
+                    schema_property_map=schema_property_map,
+                    schema_property_pattern_map=schema_property_pattern_map,
+                    schema_property_dependencies=schema_property_dependencies,
+                    schema_context=schema_context,
+                    schema_definition=schema_definition,
+                    secret_schema_definition=secret_schema_definition,
+                    secret_schema_property=secret_schema_property,
+                    referenced_secret_definition=referenced_secret_definition,
+                    response_root=response_root,
+                    choice_list=choice_list,
+                    choice=choice,
+                    logprobs=logprobs,
+                    logprob_entries=logprob_entries,
+                    function_container=function_container,
+                    tool_result_content=tool_result_content,
+                    schema_host=schema_host,
+                    schema_wrapper=schema_wrapper,
+                    tool_call=tool_call,
+                    payload_root=payload_root,
+                    active_secret_schema_refs=active_secret_schema_refs,
+                    current_schema_path=current_schema_path,
                     flag=flag,
                 )
         return redacted
@@ -734,8 +867,12 @@ def _is_tool_definition(item: Any) -> bool:
     """
     if not isinstance(item, dict):
         return False
-    if isinstance(item.get("function"), dict):
-        return True
+    # a definition NAMES the tool it declares -- that is what a later `tool_choice` selects and what
+    # the provider calls back with. accepting a bare `{"function": {...}}` wrapper let an entry no
+    # provider would accept open the schema exemption, so its nested wrapper kept a literal.
+    function = item.get("function")
+    if isinstance(function, dict):
+        return isinstance(function.get("name"), str)
     return isinstance(item.get("name"), str) and any(
         isinstance(item.get(wrapper), dict) for wrapper in _JSON_SCHEMA_WRAPPER_KEYS
     )

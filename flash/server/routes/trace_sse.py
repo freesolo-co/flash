@@ -384,7 +384,11 @@ def _merge_fragment_dict(
 class SseAccumulator:
     def __init__(self, *, max_accumulated_bytes: int | None = None) -> None:
         self._buffer = bytearray()
-        self._event_data: list[bytes] = []
+        # the pieces are joined AS THEY ARRIVE rather than held one entry per `data:` line. an
+        # event split across millions of lines is the same bytes either way, but the list form
+        # retained an object per line, which a byte budget alone could not bound.
+        self._event_data = bytearray()
+        self._event_data_seen = False
         self._event_data_bytes = 0
         self._choices: dict[int, dict[str, Any]] = {}
         self._envelope: dict[str, Any] = {}
@@ -448,8 +452,9 @@ class SseAccumulator:
             self._note_defect("stream ended with an unterminated data event")
         self._buffer.clear()
         self._scan_start = 0
-        if self._event_data:
+        if self._event_data_seen:
             self._event_data.clear()
+            self._event_data_seen = False
             self._event_data_bytes = 0
             self._note_defect("stream ended with an unterminated data event")
 
@@ -610,22 +615,33 @@ class SseAccumulator:
         if not _is_data_field(line):
             return
         data = _sse_data_value(line)
-        added_bytes = len(data) + (1 if self._event_data else 0)
+        # every `data:` line costs a list entry whether or not it carries bytes, but an EMPTY one
+        # charged only the joining newline -- and the first charged nothing at all. Millions of
+        # `data:\n` lines then sat under the byte budget while retaining an entry each, so a single
+        # pathological event could exhaust memory per concurrent stream. Charging a minimum of one
+        # byte per line ties the entry count to the budget, and holding the pieces already joined
+        # keeps that count at one regardless of how the event was split across lines.
+        added_bytes = max(len(data) + (1 if self._event_data_seen else 0), 1)
         if self._max_accumulated_bytes is not None and added_bytes > (
             self._max_accumulated_bytes - self._event_data_bytes
         ):
             self._event_data.clear()
+            self._event_data_seen = False
             self._event_data_bytes = 0
             self.truncated = True
             return
-        self._event_data.append(data)
+        if self._event_data_seen:
+            self._event_data.extend(b"\n")
+        self._event_data.extend(data)
+        self._event_data_seen = True
         self._event_data_bytes += added_bytes
 
     def _consume_event(self) -> None:
-        if not self._event_data:
+        if not self._event_data_seen:
             return
-        data = b"\n".join(self._event_data)
+        data = bytes(self._event_data)
         self._event_data.clear()
+        self._event_data_seen = False
         self._event_data_bytes = 0
         if not data:
             return

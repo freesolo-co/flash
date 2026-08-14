@@ -8,6 +8,7 @@ and is separable from deciding which literals are secret.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote
 
@@ -172,3 +173,51 @@ def _schema_dynamic_anchor_pointers(
 
     collect(value, (), depth)
     return {name: frozenset(paths) for name, paths in anchors.items()}
+
+
+@dataclass(frozen=True)
+class SchemaResourceScopes:
+    """Which resource each node in a payload belongs to, and the anchors each resource declares.
+
+    Resolving a `$ref` needs three facts that are all about identity: the base URI in effect at the
+    reference, which resource a candidate target sits in, and what anchors exist. Bundling them
+    keeps the reference walker from threading four maps through every recursive call.
+    """
+
+    base_uri: str
+    resources: dict[str, tuple[str, ...]]
+    anchors: dict[str, frozenset[tuple[str, ...]]]
+    dynamic_anchors: dict[str, frozenset[tuple[str, ...]]]
+    _scopes: tuple[tuple[tuple[str, ...], str], ...]
+
+    @classmethod
+    def build(cls, value: Any, *, depth: int = 0) -> SchemaResourceScopes:
+        document_id = _schema_resource_id(value) if isinstance(value, dict) else None
+        base_uri = document_id if isinstance(document_id, str) else ""
+        resources = _schema_resource_pointers(value, depth=depth)
+        resources.setdefault(_canonical_resource_uri(_safe_urldefrag(base_uri)[0]), ())
+        return cls(
+            base_uri=base_uri,
+            resources=resources,
+            # `$dynamicAnchor` also declares an ordinary plain-name fragment, so a static `$ref`
+            # resolves to it as well. one map serves both keywords: splitting them let
+            # `{"$ref": "#Name"}` miss a `$dynamicAnchor: "Name"` target and persist its literals.
+            anchors=_schema_anchor_pointers(value, depth=depth),
+            dynamic_anchors=_schema_dynamic_anchor_pointers(value, depth=depth),
+            _scopes=tuple(
+                sorted(
+                    ((path, uri) for uri, path in resources.items()),
+                    key=lambda item: len(item[0]),
+                    reverse=True,
+                )
+            ),
+        )
+
+    def scope_for(self, path: tuple[str, ...]) -> str:
+        return next(
+            (uri for prefix, uri in self._scopes if path[: len(prefix)] == prefix), self.base_uri
+        )
+
+    def anchor_belongs_to_resource(self, pointer: tuple[str, ...], resource_uri: str) -> bool:
+        owner_uri = _canonical_resource_uri(_safe_urldefrag(self.scope_for(pointer))[0])
+        return owner_uri == _canonical_resource_uri(resource_uri)

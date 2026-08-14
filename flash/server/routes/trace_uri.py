@@ -117,6 +117,19 @@ def _canonical_port(port: str) -> str:
     return str(int(port))
 
 
+def _canonical_registered_host(host: str) -> str:
+    """Drop a registered name's trailing DNS root label, which names the same host.
+
+    `example.com.` and `example.com` are the same authority, so keeping both spellings classified a
+    local `$id` reached under one of them as external and left the local target's secret literals in
+    the raw export. Only ONE trailing dot is removed and only from a name that has other content: a
+    bare `"."` or `".."` is not a hostname, and rewriting it would merge unrelated authorities.
+    """
+    if len(host) > 1 and host.endswith(".") and not host.endswith(".."):
+        return host[:-1]
+    return host
+
+
 def _canonical_ipv6_host(host: str) -> str:
     """Collapse an IPv6 literal to its canonical compressed form, or return it unchanged.
 
@@ -157,11 +170,11 @@ def _canonical_resource_uri(uri: str) -> str:
     else:
         host, port_separator, port = hostport.rpartition(":")
         if port_separator and (not port or _is_default_port(port, default_port)):
-            hostport = host.casefold()
+            hostport = _canonical_registered_host(host.casefold())
         elif port_separator:
-            hostport = f"{host.casefold()}:{_canonical_port(port)}"
+            hostport = f"{_canonical_registered_host(host.casefold())}:{_canonical_port(port)}"
         else:
-            hostport = hostport.casefold()
+            hostport = _canonical_registered_host(hostport.casefold())
     # the host is case-insensitive, so a character an escape DECODES to must fold too: `%4A` and a
     # plain `j` are the same host. the casefold above cannot do it (the escape is still encoded) and
     # folding the whole string afterwards would lowercase the hex digits rfc 3986 6.2.2.1 wants
