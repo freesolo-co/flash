@@ -729,7 +729,26 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
         else:
             raise _Unscannable("contains more compressed records than this check can inspect")
     with opener(source if isinstance(source, Path) else io.BytesIO(source), "rb") as stream:
-        return _scan_stream(stream, deadline=deadline, depth=depth)
+        try:
+            return _scan_stream(stream, deadline=deadline, depth=depth)
+        except gzip.BadGzipFile:
+            # A COMPLETE member followed by bytes that are not a valid next one: the reader finishes
+            # the member, looks for another where the trailer ends, and raises -- without yielding
+            # one byte of the plaintext it already inflated. `BadGzipFile` is an `OSError`, so the
+            # dispatch loop read that as "never this format", every remaining handler declined, and
+            # the file published on its literal bytes. `gzip.compress(key) + b"x"` is that file, and
+            # `gzip -dc` prints the key from it: recoverable by the ordinary tool, unseen by the
+            # publish. Any non-null trailing byte does it, so concatenation reaches this too.
+            #
+            # The magic check is not redundant: `gzip.open` is the fallback opener here, so ordinary
+            # text raises this SAME exception on its first header read. Only `zlib.error` -- damage
+            # INSIDE a member, genuinely unreadable rather than merely unread -- keeps falling
+            # through, which is what lets a corrupt shard publish instead of failing.
+            if head.startswith(b"\x1f\x8b"):
+                raise _Unscannable(
+                    "contains a compressed stream this check cannot finish reading"
+                ) from None
+            raise
 
 
 def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> str | None:

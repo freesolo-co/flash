@@ -2097,6 +2097,58 @@ def test_every_member_unreadable_is_not_an_error(tmp_path):
         credential_in_file(path)
 
 
+def test_a_gzip_with_trailing_bytes_is_not_published_as_unreadable(tmp_path):
+    """A complete member plus one stray byte hid the key it had already inflated.
+
+    Python's reader finishes the member, looks for another where the trailer ends, finds the stray
+    byte and raises `BadGzipFile` -- WITHOUT yielding any of the plaintext. That is an `OSError`,
+    so the handler tuple swallowed it, the dispatch loop concluded "not this format", every
+    remaining handler declined, and the file published on its literal bytes alone.
+
+    The key is genuinely recoverable, not merely present: `gzip -dc` on this exact file prints it
+    to stdout and exits 1. Any non-null trailing byte reaches it -- a newline, a stray `PK\\x03\\x04`
+    -- so an accidental concatenation leaks as readily as a crafted file. Trailing NULs are the one
+    shape that already worked, being skipped as padding rather than read as a member.
+
+    The two shapes that must NOT change are pinned alongside it: ordinary text still publishes
+    (`gzip.open` is the fallback opener, so it raises this same exception on its first header read
+    and only the magic separates the cases), and damage INSIDE a member still falls through to the
+    literal scan rather than failing a publish over a corrupt dataset shard.
+    """
+    import gzip
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    body = f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode()
+    member = gzip.compress(body)
+
+    for name, trailer in (("byte.gz", b"x"), ("nl.gz", b"\n"), ("zip.gz", b"PK\x03\x04")):
+        path = tmp_path / name
+        path.write_bytes(member + trailer)
+        with pytest.raises(_Unscannable, match="cannot finish reading"):
+            credential_in_file(path)
+
+    clean = tmp_path / "clean.gz"
+    clean.write_bytes(member)
+    assert credential_in_file(clean) == "a Freesolo API key"
+
+    padded = tmp_path / "padded.gz"
+    padded.write_bytes(member + b"\x00" * 64)
+    assert credential_in_file(padded) == "a Freesolo API key"
+
+    # never a gzip: the same exception, and it must still fall through to the other formats
+    text = tmp_path / "plain.txt"
+    text.write_bytes(b"# ordinary configuration\nDEBUG=1\n")
+    assert credential_in_file(text) is None
+
+    # damage inside the member raises zlib.error, which stays a fall-through, not a refusal
+    broken = bytearray(gzip.compress(body * 40))
+    broken[len(broken) // 2] ^= 0xFF
+    shard = tmp_path / "shard.gz"
+    shard.write_bytes(bytes(broken))
+    assert credential_in_file(shard) is None
+
+
 def test_a_corrupt_xz_does_not_crash_the_publish(tmp_path):
     """`lzma.LZMAError` inherits straight from Exception, so it needs naming explicitly.
 
@@ -6331,6 +6383,47 @@ def test_a_secret_key_packet_past_the_first_chunk_is_not_reported_clean(tmp_path
     truncated = tmp_path / "truncated.pgp"
     truncated.write_bytes(public + b"\xb2" + (4096).to_bytes(4, "big") + b"\x00" * 32)
     assert credential_in_file(truncated) is None
+
+
+def test_ordinary_binary_is_not_refused_as_an_unfinishable_openpgp_sequence():
+    """Random bytes must not be walked as a packet sequence and then refused for outrunning it.
+
+    The walk entered on bit 7 of the first byte alone -- set on HALF of all random bytes -- and the
+    next four bytes were then read as a body length, averaging two gigabytes. That declared body
+    ran past the buffer, which the caller reports as "cannot walk to the end" and refuses. Measured
+    at 18.8% of random 4 KiB blocks: roughly one upload in five blocked over nothing, and the shape
+    is ordinary (a model shard, a random-padded archive member), not crafted.
+
+    Two things were missing and BOTH are needed. The tag must name a packet type the format
+    defines, which removes the new-format half. That is not sufficient on its own: an old-format
+    tag is four bits, so a random byte names a real type most of the time -- the payload that
+    actually failed CI was `0x92`, a legal one-pass signature header -- so a body larger than the
+    scan could ever hold is also required to end the walk rather than report it undecided.
+
+    Asserted at the chunk size the scan really reads. A 4 KiB probe still shows a residual from the
+    two-byte length form, which can only claim 64 KB and so cannot outrun a megabyte chunk.
+    """
+    import os
+
+    from flash.env_buffers import _SCAN_CHUNK_BYTES
+    from flash.env_openpgp import _openpgp_secret_key_in_sequence
+
+    refused = sum(
+        1
+        for _ in range(64)
+        if _openpgp_secret_key_in_sequence(os.urandom(_SCAN_CHUNK_BYTES), truncated=True) is None
+    )
+    assert refused == 0, f"{refused}/64 random chunks refused as an unfinishable sequence"
+
+    # the shape that failed CI, pinned exactly: an old-format one-pass signature tag whose 4-byte
+    # length declares a body no scan holds. Undecided here is what refused the publish.
+    implausible = b"\x92" + (1 << 31).to_bytes(4, "big") + os.urandom(4096)
+    assert _openpgp_secret_key_in_sequence(implausible, truncated=True) is False
+
+    # and a body that IS plausible still reports undecided, which is the property being preserved:
+    # the fix must not turn "a real packet I could not finish reading" into a confident clean.
+    spanning = b"\x92" + (1 << 20).to_bytes(4, "big") + os.urandom(4096)
+    assert _openpgp_secret_key_in_sequence(spanning, truncated=True) is None
 
 
 def test_an_openssl_envelope_written_in_base64_is_refused(tmp_path):
