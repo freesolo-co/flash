@@ -6650,3 +6650,131 @@ def test_an_overlay_search_does_not_reprobe_identical_candidates(tmp_path):
     started = time.monotonic()
     assert _overlay_offset(spam) == OVERLAY_UNPROBED
     assert time.monotonic() - started < 10
+
+
+def _flate_pdf(dictionary: bytes, body: bytes, eol: bytes = b"\r\n") -> bytes:
+    """A one-object PDF whose stream carries `body`, for the filter-chain tests below."""
+    return (
+        b"%PDF-1.7\n1 0 obj\n<< "
+        + dictionary
+        + b" /Length "
+        + str(len(body)).encode()
+        + b" >>\nstream"
+        + eol
+        + body
+        + b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+    )
+
+
+def test_a_pdf_stream_is_found_after_every_legal_line_ending(tmp_path):
+    """PDF allows CRLF, LF or a bare CR after the `stream` keyword.
+
+    Matching only the first two left a CR-wrapped document's stream unrecognised, so its deflated
+    bytes were scanned as opaque content and the credential inside published. All three are legal
+    and generators emit all three.
+    """
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    body = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
+    for name, eol in (("cr.pdf", b"\r"), ("lf.pdf", b"\n"), ("crlf.pdf", b"\r\n")):
+        published = tmp_path / name
+        published.write_bytes(_flate_pdf(b"/Filter /FlateDecode", body, eol=eol))
+        assert credential_in_file(published) == "a Freesolo API key", name
+
+
+def test_a_pdf_predictor_refuses_rather_than_reading_differences(tmp_path):
+    """A predictor is applied to the INFLATED bytes, so zlib's output is not the content.
+
+    The stream inflates successfully and holds none of its own literal bytes -- they are horizontal
+    or PNG differences -- so scanning what came out of zlib found nothing and the key published.
+    Undoing it needs the colour and column parameters, so the honest answer is undecided.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    body = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
+    predicted = tmp_path / "predicted.pdf"
+    predicted.write_bytes(
+        _flate_pdf(b"/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 4 >>", body)
+    )
+    with pytest.raises(_Unscannable):
+        credential_in_file(predicted)
+
+    # `/Predictor 1` is the identity, so it must NOT refuse -- a document that names it is
+    # ordinary, and refusing on the parameter's presence would fail a legitimate publish.
+    identity = tmp_path / "identity.pdf"
+    identity.write_bytes(_flate_pdf(b"/Filter /FlateDecode /DecodeParms << /Predictor 1 >>", body))
+    assert credential_in_file(identity) == "a Freesolo API key"
+
+
+def test_an_indirect_pdf_filter_reference_refuses(tmp_path):
+    """`/Filter 2 0 R` names its filter through another object.
+
+    A pattern matching the filter NAME directly never associated the stream with flate, so its
+    deflated bytes were scanned as opaque content and the credential published. Resolving the
+    reference means parsing the xref table; refusing is the bounded answer.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    body = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
+    indirect = tmp_path / "indirect.pdf"
+    indirect.write_bytes(_flate_pdf(b"/Filter 2 0 R", body))
+    with pytest.raises(_Unscannable):
+        credential_in_file(indirect)
+
+
+def test_an_encrypted_pdf_refuses_rather_than_skipping_its_streams(tmp_path):
+    """An encrypted PDF reverses stream encryption BEFORE the declared filters.
+
+    What follows `stream` is ciphertext, so zlib rejects it -- which the skip treated as "not
+    really a stream" and the document passed as clean. That made an encrypted PDF the one container
+    shape this let through, while encrypted zip, OpenSSL and OpenPGP payloads are all refused.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    body = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
+    encrypted = tmp_path / "encrypted.pdf"
+    encrypted.write_bytes(
+        b"%PDF-1.7\ntrailer\n<< /Encrypt 5 0 R /Root 1 0 R >>\n"
+        + _flate_pdf(b"/Filter /FlateDecode", body)
+    )
+    with pytest.raises(_Unscannable):
+        credential_in_file(encrypted)
+
+
+def test_narrowed_wide_text_keeps_the_truncation_state_of_its_chunk(tmp_path):
+    """A UTF-16 file must reach the same verdict as the same bytes written narrow.
+
+    Dropping `truncated` on the way into the narrowed run told the base64 path that every run
+    ended where the file did, so an encoded container crossing a chunk boundary had its first
+    fragment treated as a complete value while later fragments began mid-stream and could be
+    expanded from neither side -- the wide form returned clean where the narrow form refused.
+    """
+    import base64
+    import gzip
+    import os
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    # incompressible padding, so the ENCODED form really does exceed one read chunk
+    blob = base64.b64encode(
+        gzip.compress(os.urandom(900_000) + b'export KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
+    )
+    assert len(blob) > (1 << 20)
+
+    verdicts = []
+    for name, data in (("narrow.txt", blob), ("wide.txt", blob.decode().encode("utf-16-le"))):
+        published = tmp_path / name
+        published.write_bytes(data)
+        try:
+            verdicts.append(credential_in_file(published))
+        except _Unscannable as refusal:
+            verdicts.append(str(refusal))
+    assert verdicts[0] == verdicts[1], verdicts
