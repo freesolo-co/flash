@@ -124,7 +124,61 @@ def _is_secret_property_pattern(pattern: Any) -> bool:
     branches = _alternation_branches(_peel_enclosing_group(unwrapped))
     if branches is not None:
         return all(_is_secret_key(_unwrap_pattern_groups(branch)) for branch in branches)
-    return _is_secret_key(unwrapped)
+    names = _character_class_expansions(unwrapped)
+    if names is None:
+        return _is_secret_key(unwrapped)
+    return all(_is_secret_key(name) for name in names)
+
+
+# a class is only enumerated when the set stays small enough that expanding it is cheaper than the
+# leak it prevents. names are compared case-folded, so the fully spelled `[Pp][Aa]...` form of one
+# word collapses to a single name and stays well inside the cap; a genuinely wide class does not.
+_MAX_CLASS_EXPANSIONS = 64
+
+
+def _character_class_expansions(pattern: str) -> tuple[str, ...] | None:
+    """Every name a pattern of literals and simple classes matches, or None if it is not one.
+
+    Tooling writes a case-insensitive property as `^[Pp]assword$`, and both names it matches are
+    credentials by this module's own rules -- but the pattern is neither a literal nor an
+    alternation, so the name test saw a regex and every schema beneath it kept its literals.
+
+    Only CLOSED classes of plain characters are expanded. A range (`[a-z]`), a negation (`[^x]`) or
+    any class carrying an escape is left unexpanded, because `pass[a-z]ord` also matches `passzord`
+    and treating it as a credential name would blank an ordinary property's schema. Returning None
+    falls back to judging the pattern whole, which is the safe direction.
+    """
+    if not any(character in pattern for character in "[]"):
+        return None
+    names: set[str] = {""}
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "\\" or character == "]":
+            return None
+        if character != "[":
+            names = {name + character for name in names}
+            index += 1
+            continue
+        end = pattern.find("]", index + 1)
+        if end == -1:
+            return None
+        members = pattern[index + 1 : end]
+        if not members or "-" in members or members.startswith("^") or "\\" in members:
+            return None
+        # names are deduplicated case-insensitively as they grow, because the comparison that
+        # judges them is case-folded too. spelling one word as `[Pp][Aa][Ss][Ss]...` would
+        # otherwise multiply out to hundreds of variants of a single name and blow the cap.
+        names = {_dedupe_name(name + member) for name in names for member in members}
+        if len(names) > _MAX_CLASS_EXPANSIONS:
+            return None
+        index = end + 1
+    return tuple(names)
+
+
+def _dedupe_name(name: str) -> str:
+    """One spelling of a name, so case variants of the same word count once."""
+    return name.casefold()
 
 
 def _peel_enclosing_group(pattern: str) -> str:

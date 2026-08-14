@@ -69,10 +69,16 @@ def _redact_schema_literal(value: Any, *, depth: int, flag: _SanitizationFlag | 
             "[redacted]" if _is_secret_key(key) else key: _redact_schema_literal(
                 item, depth=depth + 1, flag=flag
             )
-            for key, item in value.items()
+            # a secret schema's `default` or `enum` is instance data like any other collection, and
+            # this pass runs BEFORE the bounded traversal. copying it whole meant the parsed
+            # payload, this copy and the bounded copy all coexisted at peak.
+            for key, item in _bounded_members(value.items(), flag=flag)
         }
     if isinstance(value, list | tuple):
-        return [_redact_schema_literal(item, depth=depth + 1, flag=flag) for item in value]
+        return [
+            _redact_schema_literal(item, depth=depth + 1, flag=flag)
+            for item in _bounded_members(value, flag=flag)
+        ]
     return "[redacted]"
 
 

@@ -9850,3 +9850,114 @@ def test_an_ordinary_conversation_is_not_bounded() -> None:
 
     assert len(sanitized["messages"]) == 500
     assert sanitized["messages"][499]["content"] == "m499"
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "^[Pp]assword$",
+        "^[Aa]pi_key$",
+        "^[Ss]ecret$",
+        "^[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]$",
+        "^[Ss]ecret[Kk]ey$",
+    ],
+    ids=["password", "api-key", "secret", "fully-spelled", "two-classes"],
+)
+def test_a_pattern_whose_every_expansion_is_secret_is_recognized(pattern: str) -> None:
+    """Tooling writes a case-insensitive property as `^[Pp]assword$`, and BOTH names it matches are
+    credentials by this module's own case-folded rules. The pattern is neither a literal nor an
+    alternation, so the name test saw a regex and every schema beneath it kept its literals."""
+
+    assert trace_secret_names._is_secret_property_pattern(pattern) is True
+
+    payload = _tool_hosted(
+        {
+            "type": "object",
+            "patternProperties": {pattern: {"type": "string", "default": "CLASSLEAK"}},
+        }
+    )
+
+    assert "CLASSLEAK" not in json.dumps(traces._sanitize_for_trace(payload, ()))
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "^[Cc]ity$",
+        "^[Cc][Ii][Tt][Yy]$",
+        "^[pc]assword$",
+        "^pass[a-z]ord$",
+        "^[^x]assword$",
+        "^password[0-9]$",
+        "^[abcdefgh][ijklmnop]assword$",
+    ],
+    ids=["city", "fully-spelled", "mixed", "range", "negated", "digit", "wide"],
+)
+def test_a_pattern_that_can_match_a_benign_name_is_not_secret(pattern: str) -> None:
+    """Only CLOSED classes of plain characters are expanded, and every expansion must be secret.
+
+    A range, a negation or a digit class cannot be enumerated -- `pass[a-z]ord` also matches
+    `passzord` -- and one benign expansion means the pattern matches an ordinary property whose
+    literals must survive. A genuinely wide class is refused rather than expanded.
+    """
+    assert trace_secret_names._is_secret_property_pattern(pattern) is False
+
+
+def test_a_benign_class_patterns_schema_literals_survive() -> None:
+    """The other direction, end to end: an ordinary class pattern keeps its documented default."""
+    payload = _tool_hosted(
+        {
+            "type": "object",
+            "patternProperties": {"^[Cc]ity$": {"type": "string", "default": "PARISKEEP"}},
+        }
+    )
+
+    assert "PARISKEEP" in json.dumps(traces._sanitize_for_trace(payload, ()))
+
+
+def test_schema_literal_redaction_bounds_its_collections() -> None:
+    """A secret schema's `default` or `enum` is instance data like any other collection, and this
+    pass runs BEFORE the bounded traversal -- so the parsed payload, this copy and the bounded copy
+    all coexisted at peak for a flood that fits inside the wire limit."""
+
+    flood = [f"v{index}" for index in range(300_000)]
+
+    bounded = trace_redaction._redact_schema_literal(flood, depth=0)
+
+    assert len(bounded) <= platform_traces._MAX_PAYLOAD_COLLECTION
+
+
+def test_schema_literal_redaction_bounds_an_oversized_mapping() -> None:
+    """A mapping annotation floods the same way a list does."""
+    flood = {f"k{index}": "v" for index in range(300_000)}
+
+    bounded = trace_redaction._redact_schema_literal(flood, depth=0)
+
+    assert len(bounded) <= platform_traces._MAX_PAYLOAD_COLLECTION
+
+
+def test_bounding_a_schema_literal_is_reported() -> None:
+    """Dropping recorded content must be visible, not silent: the flag is what marks the payload
+    truncated so a reader knows the annotation is incomplete rather than genuinely short."""
+
+    flag = trace_redaction._SanitizationFlag()
+
+    trace_redaction._redact_schema_literal(
+        [f"v{index}" for index in range(300_000)], depth=0, flag=flag
+    )
+
+    assert flag.hit is True
+
+
+def test_an_ordinary_schema_literal_is_neither_truncated_nor_flagged() -> None:
+    """A real `enum` is a handful of values. Truncating or flagging one would destroy the
+    declaration the trace exists to record, and the values themselves are still redacted."""
+
+    flag = trace_redaction._SanitizationFlag()
+    literal = {"type": "string", "enum": ["a", "b", "c"], "default": "SECRETVALUE"}
+
+    bounded = trace_redaction._redact_schema_literal(literal, depth=0, flag=flag)
+
+    assert len(bounded["enum"]) == 3
+    assert flag.hit is False
+    assert "SECRETVALUE" not in json.dumps(bounded)
