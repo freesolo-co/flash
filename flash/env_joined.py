@@ -1,10 +1,11 @@
 """Rejoining a credential that the file itself stores in pieces.
 
-Two ways a source file holds a key that no contiguous run of its bytes contains: adjacent string
-literals, which the language concatenates at parse time, and a backslash-newline continuation,
-which the shell removes before the value is ever assigned. Either one splits a token across a seam
-that is invisible to a pattern but absent by the time anything reads the value, so a key written
-that way published intact while the same key on one line was refused.
+Three ways a source file holds a key that no contiguous run of its bytes contains: adjacent string
+literals, which the language concatenates at parse time; a backslash-newline continuation, which
+the shell removes before the value is ever assigned; and a JSON `\\uXXXX` escape, which the parser
+resolves to the character it names. Each one splits a token across a seam that is invisible to a
+pattern but absent by the time anything reads the value, so a key written that way published intact
+while the same key on one line was refused.
 
 Split out to keep `flash.env_secrets` under the file-size limit. The dependency runs one way: this
 knows about bytes, nothing about files, packages or the scan.
@@ -38,6 +39,17 @@ _CONTINUED_LINE = re.compile(rb"(?<!\\)((?:\\\\)*)\\\r?\n")
 # What a continuation looks like as a plain substring, for the guard below.
 _CONTINUATIONS = (b"\\\n", b"\\\r\n")
 
+# A JSON `\uXXXX` escape naming a character the credential patterns would otherwise match. The
+# parser resolves it, so `{"key":"fslo_AbCdEf..."}` carries the SAME key as the plain spelling
+# and `json.loads` returns it verbatim -- while the raw bytes the patterns read are split by the
+# escape and match nothing. Any single character of a key body can be written this way.
+#
+# Restricted to the ASCII range these credentials are built from. A general `\uXXXX` would have to
+# decide an encoding for characters above 0x7F and would rewrite ordinary prose containing escaped
+# accents, which no pattern here can match anyway -- so the narrow form does the whole job and
+# cannot invent text. The surrogate range cannot appear alone in valid JSON and is excluded with it.
+_JSON_ESCAPE = re.compile(rb"\\u00([0-7][0-9A-Fa-f])")
+
 
 def _rejoined(data: bytes) -> bytes:
     """`data` with both kinds of seam closed, or `data` itself when it holds neither.
@@ -55,4 +67,9 @@ def _rejoined(data: bytes) -> bytes:
     joined = _ADJACENT_LITERALS.sub(b"", data)
     if any(marker in data for marker in _CONTINUATIONS):
         joined = _CONTINUED_LINE.sub(rb"\1", joined)
+    # Guarded by the same substring test as the continuation, for the same reason: `\u` is absent
+    # from almost every file, and settling that at memchr speed keeps the ordinary scan free of a
+    # substitution pass over every byte.
+    if b"\\u" in joined:
+        joined = _JSON_ESCAPE.sub(lambda point: bytes.fromhex(point.group(1).decode()), joined)
     return joined

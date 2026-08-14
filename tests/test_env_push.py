@@ -5738,6 +5738,44 @@ def test_an_aws_secret_with_escaped_slashes_is_matched(tmp_path):
     assert credential_in_file(escaped) == "an AWS secret access key"
 
 
+def test_a_json_unicode_escape_inside_a_credential_is_resolved(tmp_path):
+    """`\\u0045` IS `E` to every JSON parser, so the escape spells the key without spelling it.
+
+    `json.loads` returns the identical credential either way -- the reader of the file gets the
+    working key -- but the raw bytes the patterns read carry a six-character escape where one
+    character belongs, so the run breaks and the file published clean. One escaped character
+    anywhere in the body is enough, and encoders that emit `\\u` for ASCII (Python's
+    `ensure_ascii`, several log formatters) can produce it without anyone choosing to.
+    """
+    import json
+
+    from flash.env_secrets import credential_in_file
+
+    def escaped(text: str) -> str:
+        return "".join(f"\\u00{ord(letter):02x}" for letter in text)
+
+    for name, key in (
+        ("one.json", f"fslo_{_FAKE_KEY_BODY[:4]}{escaped(_FAKE_KEY_BODY[4])}{_FAKE_KEY_BODY[5:]}"),
+        ("all.json", f"fslo_{escaped(_FAKE_KEY_BODY)}"),
+        ("prefix.json", f"{escaped('f')}slo_{_FAKE_KEY_BODY}"),
+    ):
+        published = tmp_path / name
+        published.write_text(f'{{"FREESOLO_API_KEY": "{key}"}}')
+        # the escape is not a near-miss spelling: the parser hands the caller the real key
+        assert json.loads(published.read_text())["FREESOLO_API_KEY"] == f"fslo_{_FAKE_KEY_BODY}"
+        assert credential_in_file(published) == "a Freesolo API key", name
+
+    # resolving escapes must not invent a credential in a document that holds none, and an escaped
+    # non-ASCII character stays untouched rather than being folded into some encoding
+    for name, source in (
+        ("prose.json", '{"note": "caf\\u00e9 \\u0041BC", "count": 1}'),
+        ("newline.json", '{"text": "line\\u000aline"}'),
+    ):
+        innocent = tmp_path / name
+        innocent.write_text(source)
+        assert credential_in_file(innocent) is None, name
+
+
 def test_an_openssl_salted_envelope_is_refused(tmp_path):
     """`openssl enc` ciphertext is opaque, so approving it approves bytes nobody inspected.
 
@@ -6783,6 +6821,48 @@ def test_a_pdf_stream_is_found_after_every_legal_line_ending(tmp_path):
         published = tmp_path / name
         published.write_bytes(_flate_pdf(b"/Filter /FlateDecode", body, eol=eol))
         assert credential_in_file(published) == "a Freesolo API key", name
+
+
+def test_a_pdf_filter_name_written_with_hex_escapes_is_still_flate(tmp_path):
+    """`/Flate#44ecode` IS `/FlateDecode`: `#44` is the PDF escape for `D` in a name.
+
+    The rule applies to every character of every name, so one filter has 4096 legal spellings and a
+    reader resolves all of them identically. Matching the literal characters recognised exactly one,
+    which left the stream unrecognised, scanned as opaque bytes, and published with its credential
+    inside -- and a document is trivially rewritten into a spelling nobody matches.
+    """
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    body = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
+    for name, spelling in (
+        ("named.pdf", b"/Flate#44ecode"),
+        ("first.pdf", b"/#46lateDecode"),
+        ("last.pdf", b"/FlateDecod#65"),
+        ("upper.pdf", b"/F#6CateDecode"),
+        # hex digits are case-insensitive in a name escape, so the lowercase form is the same name
+        ("lower.pdf", b"/F#6cateDecode"),
+        ("every.pdf", b"/" + b"".join(b"#%02X" % c for c in b"FlateDecode")),
+        ("chain.pdf", b"[/ASCII85Decode /Flate#44ecode]"),
+    ):
+        published = tmp_path / name
+        stream = base64.a85encode(body) if spelling.startswith(b"[") else body
+        published.write_bytes(_flate_pdf(b"/Filter " + spelling, stream))
+        assert credential_in_file(published) == "a Freesolo API key", name
+
+    # resolving escapes must not turn a DIFFERENT filter into Flate, and a name that merely starts
+    # with the same characters is still a different name
+    for name, spelling in (
+        ("dct.pdf", b"/DCTDecode"),
+        ("lzw.pdf", b"/LZWDecode"),
+        ("longer.pdf", b"/FlateDecodeX"),
+        ("shorter.pdf", b"/Flate"),
+        ("case.pdf", b"/flatedecode"),
+    ):
+        other = tmp_path / name
+        other.write_bytes(_flate_pdf(b"/Filter " + spelling, body))
+        assert credential_in_file(other) != "a Freesolo API key", name
 
 
 def test_a_pdf_predictor_refuses_rather_than_reading_differences(tmp_path):
