@@ -137,8 +137,14 @@ def _raw_deflate_from(blocks: Iterator[bytes], budget: int) -> bytes | None:
     plain, seen = b"", 0
     for block in blocks:
         seen += len(block)
+        # Checked BEFORE the call, because `max_length=0` means unlimited to `decompress` rather
+        # than "no output". A block boundary landing exactly on the exhausted budget therefore
+        # inflated the next block whole: measured 11,024 bytes returned under a 1,024-byte budget,
+        # which is the buffer cap this bound exists to enforce.
+        if len(plain) >= budget:
+            return None
         try:
-            plain += inflate.decompress(block, max(0, budget - len(plain)))
+            plain += inflate.decompress(block, budget - len(plain))
         except zlib.error:
             return b""
         if inflate.unconsumed_tail:
@@ -170,22 +176,24 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     A stream that will not inflate is skipped rather than refused: `/FlateDecode` may name an
     encoding this cannot read, and the `stream` keyword appears in ordinary PDF text too.
 
-    A stream piped through EARLIER filters is decoded through them first where that is possible and
-    refused where it is not. `/Filter [/ASCII85Decode /FlateDecode]` applies in order, so the bytes
-    after `stream` are ASCII85 text; zlib rejected them and the stream was passed over as clean
-    while its credential decoded perfectly well one filter further in.
+    A stream piped through filters on EITHER side of the flate stage is decoded through them where
+    that is possible and refused where it is not. Both orders occur: `/Filter [/ASCII85Decode
+    /FlateDecode]` leaves the bytes after `stream` as ASCII85 text, which zlib rejected outright,
+    and `/Filter [/FlateDecode /ASCII85Decode]` inflates TO ASCII85 text, which scanned as
+    printable noise. Either way the credential decoded perfectly well one filter further in.
     """
     if not data.startswith(_PDF_SIGNATURE):
         return
     streams = _PDF_STREAM.finditer(data)
     for found in itertools.islice(streams, _MAX_PDF_STREAMS):
-        body = _after_pre_filters(data, found.start(), data[found.end() :])
+        before, after = _filter_stages(data, found.start())
+        body = _undo_ascii85(data[found.end() :], before)
         inflate = zlib.decompressobj()
         try:
             plain = inflate.decompress(body, budget)
         except zlib.error:
             continue
-        yield None if inflate.unconsumed_tail else plain
+        yield None if inflate.unconsumed_tail else _undo_ascii85(plain, after)
     # Stopping at the bound silently reported every later stream as clean, so a document with one
     # more stream than the limit published the credential in it. Undecided is not clean, and every
     # other bound here already refuses rather than truncating -- this one returned a verdict.
@@ -193,18 +201,12 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
         raise _TooManyStreams
 
 
-def _after_pre_filters(data: bytes, at: int, body: bytes) -> bytes:
-    """`body` with any filters applied BEFORE `/FlateDecode` undone, ready for zlib.
+def _filter_stages(data: bytes, at: int) -> tuple[list[bytes], list[bytes]]:
+    """The filters the object at `at` applies before and after its flate stage, in order.
 
     The filter list belongs to the object the stream sits in, so it is read backwards from the
     match rather than forwards: `/Filter` precedes `stream` in the dictionary. Only the entry
     closest behind the match is considered, which is that object's own.
-
-    ASCII85 is undone; anything else before the flate stage raises, because a stream that cannot be
-    put back into the shape `/FlateDecode` names is one this never inspected, and skipping it is
-    the fail-open the surrounding walk exists to close. Filters AFTER the flate stage are not this
-    function's business -- the inflated bytes are still scanned, and a credential in them is found
-    whatever encoding is layered on top.
     """
     # Searched from well BEFORE the match, not from it. `_PDF_STREAM` anchors on the filter NAME,
     # so on a chain the match begins in the middle of the array -- at `/FlateDecode]` -- and a slice
@@ -217,14 +219,33 @@ def _after_pre_filters(data: bytes, at: int, body: bytes) -> bytes:
         if candidate.start() <= min(at, 512):
             names = candidate
     if not names:
-        return body
+        return [], []
     chain = _PDF_FILTER_NAME.findall(names.group(2) or b"/" + (names.group(1) or b""))
-    before = chain[: chain.index(_FLATE_FILTER)] if _FLATE_FILTER in chain else []
-    if not before:
-        return body
-    if before != [_ASCII85_FILTER]:
+    if _FLATE_FILTER not in chain:
+        return [], []
+    flate = chain.index(_FLATE_FILTER)
+    return chain[:flate], chain[flate + 1 :]
+
+
+def _undo_ascii85(payload: bytes, filters: list[bytes]) -> bytes:
+    """`payload` with `filters` undone, refusing any chain this cannot read.
+
+    ASCII85 is undone; anything else raises, because a stream that cannot be put into the shape the
+    next stage names is one this never inspected, and skipping it is the fail-open the surrounding
+    walk exists to close.
+
+    Applied on BOTH sides of the flate stage. Filters after it were originally left alone, on the
+    reasoning that the inflated bytes are scanned anyway and a credential is found whatever encoding
+    sits on top. That holds for a layer this scans through, and ASCII85 is not one: under
+    `/Filter [/FlateDecode /ASCII85Decode]` the inflated bytes are ASCII85 text, so the key's own
+    bytes are re-encoded and the scan reads printable noise. Measured: that chain published a key
+    that plain `/FlateDecode` caught.
+    """
+    if not filters:
+        return payload
+    if filters != [_ASCII85_FILTER]:
         raise _UnreadableFilterChain
     try:
-        return base64.a85decode(body.split(b"~>")[0], adobe=False, ignorechars=b" \t\r\n\v\f")
+        return base64.a85decode(payload.split(b"~>")[0], adobe=False, ignorechars=b" \t\r\n\v\f")
     except ValueError as exc:
         raise _UnreadableFilterChain from exc

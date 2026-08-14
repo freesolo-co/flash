@@ -6184,3 +6184,107 @@ def test_a_chance_container_in_prose_does_not_refuse(tmp_path):
     assigned.write_text("PAYLOAD=" + run + "\n")
     with pytest.raises(_Unscannable):
         credential_in_file(assigned, deadline=later)
+
+
+def test_raw_deflate_stops_when_its_output_budget_reaches_zero():
+    """A block boundary landing exactly on the budget must not inflate the next block whole.
+
+    `max_length=0` means UNLIMITED to `zlib.decompressobj().decompress`, not "no output", so a
+    budget computed as `max(0, budget - produced)` handed the decompressor a blank cheque exactly
+    when it was out of room. Measured 11,024 bytes returned under a 1,024-byte budget, which is the
+    buffer cap the bound exists to enforce.
+    """
+    import zlib
+
+    from flash.env_deflate import _raw_deflate_from
+
+    budget = 1024
+    compressor = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
+    # the first block ends, flushed, at exactly the budget; the second is the over-budget payload
+    first = compressor.compress(b"A" * budget) + compressor.flush(zlib.Z_SYNC_FLUSH)
+    second = compressor.compress(b"B" * 10000) + compressor.flush()
+
+    assert _raw_deflate_from(iter((first, second)), budget) is None
+
+    # the bound still lets a stream that FITS through, so the fix is not "refuse everything"
+    small = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
+    fits = small.compress(b"hello world" * 10) + small.flush()
+    assert _raw_deflate_from(iter((fits,)), budget) == b"hello world" * 10
+
+
+def test_a_filter_applied_after_flatedecode_is_undone(tmp_path):
+    """`/Filter [/FlateDecode /ASCII85Decode]` inflates TO ASCII85 text, not to the key.
+
+    Filters after the flate stage were left alone on the reasoning that the inflated bytes are
+    scanned anyway. That holds for a layer this scans through; ASCII85 re-encodes the key's own
+    bytes, so the scan read printable noise and the credential published.
+    """
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    key = "fslo_" + _FAKE_KEY_BODY
+    encoded = base64.a85encode(key.encode(), adobe=False) + b"~>"
+    stream = zlib.compress(encoded)
+    document = (
+        b"%PDF-1.4\n1 0 obj\n<< /Length "
+        + str(len(stream)).encode()
+        + b" /Filter [/FlateDecode /ASCII85Decode] >>\nstream\n"
+        + stream
+        + b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+    )
+    chained = tmp_path / "chained.pdf"
+    chained.write_bytes(document)
+    assert credential_in_file(chained, deadline=time.monotonic() + 120) == "a Freesolo API key"
+
+    # an ordinary flate-only document is still clean, so the walk did not become indiscriminate
+    plain = zlib.compress(b"just the ordinary text of a document")
+    innocent = tmp_path / "innocent.pdf"
+    innocent.write_bytes(
+        b"%PDF-1.4\n1 0 obj\n<< /Length "
+        + str(len(plain)).encode()
+        + b" /Filter /FlateDecode >>\nstream\n"
+        + plain
+        + b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+    )
+    assert credential_in_file(innocent, deadline=time.monotonic() + 120) is None
+
+
+def test_a_chance_zlib_header_is_not_read_whole(tmp_path, monkeypatch):
+    """Bytes that merely satisfy the zlib header rule must not be copied entire to disprove it.
+
+    The rule is about eleven bits, so roughly one file in 2,000 trips it by chance, and a member may
+    be 256 MiB with the request body and staged file already live. A bounded prefix decides it.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    later = time.monotonic() + 120
+    accidental = tmp_path / "shard.bin"
+    accidental.write_bytes(b"\x78\x9c" + b"ordinary binary content, not deflate at all " * 500)
+
+    reads: list[str] = []
+    original = Path.read_bytes
+    monkeypatch.setattr(
+        Path, "read_bytes", lambda self: (reads.append(self.name), original(self))[1]
+    )
+    assert credential_in_file(accidental, deadline=later) is None
+    assert "shard.bin" not in reads, "the whole member was read to disprove a chance header"
+
+    # a REAL stream is still expanded and its credential found
+    real = tmp_path / "real.z"
+    real.write_bytes(zlib.compress(("fslo_" + _FAKE_KEY_BODY).encode()))
+    assert credential_in_file(real, deadline=later) == "a Freesolo API key"
+
+    # and the dictionary refusal, which cannot inflate at all, still fires
+    compressor = zlib.compressobj(
+        6, zlib.DEFLATED, zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, zlib.Z_DEFAULT_STRATEGY, b"fox"
+    )
+    stream = compressor.compress(b"the quick brown fox jumps over the lazy dog" * 4)
+    stream += compressor.flush()
+    assert stream[1] & 0x20, "fixture must carry the FDICT flag"
+    dictionary = tmp_path / "dict.z"
+    dictionary.write_bytes(stream)
+    with pytest.raises(_Unscannable):
+        credential_in_file(dictionary, deadline=later)

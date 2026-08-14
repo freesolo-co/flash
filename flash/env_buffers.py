@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import zipfile
+import zlib
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -19,6 +20,31 @@ from flash.env_patterns import _PAIRED_PATTERNS
 # Read in bounded chunks so a large dataset member is never held in memory whole. This costs no
 # more I/O than the publish already pays: `_tar_b64` reads every one of these bytes to gzip them.
 _SCAN_CHUNK_BYTES = 1 << 20
+
+# How much of a member is inflated to decide whether its zlib header is real before the whole thing
+# is held in memory. Large enough that a genuine stream produces symbols to fail on, small enough
+# that the chance case costs a page rather than a second copy of a 256 MiB shard.
+_ZLIB_PROBE_BYTES = 1 << 16
+
+
+def _zlib_prefix_inflates(source: Path | bytes) -> bool:
+    """Whether the first `_ZLIB_PROBE_BYTES` of `source` inflate as a zlib stream.
+
+    Deliberately weaker than "is a zlib stream": a truncated prefix of a real stream ends mid-symbol
+    rather than at a record end, so the test is that `decompress` does not RAISE, not that it
+    completes. That is enough to separate a genuine stream from the roughly one file in 2,000 whose
+    first two bytes satisfy the header rule by chance, which is all this decides.
+    """
+    if isinstance(source, bytes):
+        prefix = source[:_ZLIB_PROBE_BYTES]
+    else:
+        with source.open("rb") as handle:
+            prefix = handle.read(_ZLIB_PROBE_BYTES)
+    try:
+        zlib.decompressobj().decompress(prefix, _ZLIB_PROBE_BYTES)
+    except zlib.error:
+        return False
+    return True
 
 
 def _paired_markers_kind(window: bytes, seen: set[tuple[int, str]]) -> str | None:

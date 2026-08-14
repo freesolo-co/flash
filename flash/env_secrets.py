@@ -39,6 +39,7 @@ from flash.env_buffers import (
     _blocks_of,
     _looks_like_container,
     _paired_markers_kind,
+    _zlib_prefix_inflates,
 )
 from flash.env_deflate import (
     _PDF_SIGNATURE,
@@ -664,7 +665,23 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
     # A raw zlib stream (RFC 1950) is deflate with a 2-byte header instead of gzip's 10, so none of
     # the openers above read it. `decompressobj` with the zlib window size does, and it is the same
     # deflate underneath -- which is why the stream can be expanded rather than merely refused.
-    if opener is gzip.open and not head.startswith(b"\x1f\x8b") and _looks_like_zlib(head):
+    # Probed on a bounded prefix before the whole member is held. The header rule is about eleven
+    # bits, so roughly one arbitrary file in 2,000 trips it, and an extracted member may be 256 MiB
+    # with the request body and the staged file already live -- so an ordinary model shard that
+    # merely starts with the right two bytes was charged a second full copy to establish it was
+    # never zlib at all. A real stream inflates its prefix; only bytes that are not deflate raise,
+    # which is exactly the accidental case. Failing the probe skips this branch and falls through
+    # to the openers below, the same path the first record's `zlib.error` already took.
+    #
+    # FDICT is exempt because it CANNOT inflate: the dictionary is not in the file, so `decompress`
+    # raises for a genuine stream just as it does for an accident. That branch stays decided by the
+    # textual gate below, on the whole member as before.
+    if (
+        opener is gzip.open
+        and not head.startswith(b"\x1f\x8b")
+        and _looks_like_zlib(head)
+        and (head[1] & 0x20 or _zlib_prefix_inflates(source))
+    ):
         raw = source.read_bytes() if isinstance(source, Path) else source
         # FDICT (bit 5 of the flag byte) means the stream was compressed against a preset
         # dictionary that is not carried in the file. Without it `decompress` raises, and treating
