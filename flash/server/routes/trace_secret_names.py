@@ -123,11 +123,37 @@ def _is_secret_property_pattern(pattern: Any) -> bool:
     unwrapped = _unwrap_pattern_groups(pattern)
     branches = _alternation_branches(_peel_enclosing_group(unwrapped))
     if branches is not None:
-        return all(_is_secret_key(_unwrap_pattern_groups(branch)) for branch in branches)
+        return all(_is_secret_branch(_unwrap_pattern_groups(branch)) for branch in branches)
     names = _character_class_expansions(unwrapped)
     if names is None:
-        return _is_secret_key(unwrapped)
-    return all(_is_secret_key(name) for name in names)
+        return _names_one_field(unwrapped) and _is_secret_key(unwrapped)
+    return all(_names_one_field(name) and _is_secret_key(name) for name in names)
+
+
+# characters that make a pattern match more than the literal name it appears to spell. `.` is the
+# one that mattered: the name test strips it as a word separator (`api.key` -> `apikey`), so
+# `^api.key$` was read as a credential -- but as a regex it also matches `apiXkey`, an ordinary
+# field whose schema annotations were then rewritten to "[redacted]", corrupting the stored schema.
+# the rest are refused for the same reason, and because a pattern carrying them is not a name.
+_PATTERN_METACHARACTERS = frozenset(".\\+*?()[]{}|^$")
+
+
+def _names_one_field(pattern: str) -> bool:
+    """Whether a pattern is a plain literal, matching exactly the one field name it spells."""
+    return not any(character in _PATTERN_METACHARACTERS for character in pattern)
+
+
+def _is_secret_branch(branch: str) -> bool:
+    """Whether one branch of an alternation names a credential, by literal or by simple class.
+
+    A branch is judged exactly as a whole pattern is, because it IS one: `^(api.key|password)$`
+    otherwise passed its wildcard branch straight to the name test, which is the same corruption
+    the whole-pattern case had.
+    """
+    names = _character_class_expansions(branch)
+    if names is None:
+        return _names_one_field(branch) and _is_secret_key(branch)
+    return all(_names_one_field(name) and _is_secret_key(name) for name in names)
 
 
 # a class is only enumerated when the set stays small enough that expanding it is cheaper than the

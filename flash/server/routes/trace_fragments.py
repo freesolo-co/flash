@@ -230,6 +230,14 @@ def _trim_to_bound(value: Any, *, depth: int = 0) -> tuple[Any, bool]:
     smuggle width past the bound.
     """
     if depth >= _MAX_TRIM_DEPTH:
+        # the walk stops here, but returning the subtree whole reopened the same leak one level
+        # further out: a mapping nested past this guard was retained at full width. nothing here is
+        # recoverable anyway -- it sits hundreds of levels below the payload depth bound, so storage
+        # replaces it with "[redacted]" -- and the structure ABOVE it is left intact, which is what
+        # the merge reads to report a too-deeply-nested fragment. so the contents are dropped and
+        # the drop is reported, rather than handed back for the stream to hold.
+        if isinstance(value, dict | list) and value:
+            return type(value)(), True
         return value, False
     if isinstance(value, dict):
         bounded = len(value) > platform_traces._MAX_PAYLOAD_COLLECTION

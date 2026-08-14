@@ -172,7 +172,18 @@ class SseDoneGate:
             if self._leading_bom and trailing.startswith(_UTF8_BOM)
             else trailing
         )
-        if not self._event_in_progress and _could_be_done_line(parsed_trailing):
+        # a buffered CONTINUATION is not the start of a line. when a prefix of this line has
+        # already been relayed, the bytes still held are its tail, and reading them as a fresh line
+        # let an ignored field split as `meta` + `dat` + `a: x` classify its own `dat` suffix as a
+        # data field: the real `data: [DONE]` that followed was folded into that event and relayed
+        # ungated, so the terminator was never detected -- `_stream_response` did not break, and the
+        # record-failed marker was emitted after a terminator the client had already seen.
+        continuing_line = self._partial_line_in_progress
+        if (
+            not continuing_line
+            and not self._event_in_progress
+            and _could_be_done_line(parsed_trailing)
+        ):
             if len(trailing) > _POST_DONE_SUFFIX_LIMIT:
                 retained = trailing[-_POST_DONE_SUFFIX_LIMIT:]
                 forwarded.extend(trailing[: -len(retained)])
@@ -181,15 +192,21 @@ class SseDoneGate:
         elif trailing.endswith(b"\r"):
             partial_line = trailing[:-1]
             parsed_partial_line = parsed_trailing[:-1]
-            if not self._event_in_progress and _could_be_done_line(parsed_partial_line):
+            if (
+                not continuing_line
+                and not self._event_in_progress
+                and _could_be_done_line(parsed_partial_line)
+            ):
                 self._scan_start = _resume_scan_at(self._buffer)
             else:
                 if partial_line:
                     forwarded.extend(partial_line)
                     del self._buffer[: len(partial_line)]
                     self._partial_line_in_progress = True
-                    self._event_in_progress = (
-                        self._event_in_progress or parsed_partial_line.startswith(b"data:")
+                    # only the line's OWN opening bytes name its field; a continuation carries the
+                    # tail of a field already classified when its prefix was relayed.
+                    self._event_in_progress = self._event_in_progress or (
+                        not continuing_line and parsed_partial_line.startswith(b"data:")
                     )
                 self._line_start = 0
                 self._scan_start = 0
@@ -198,9 +215,9 @@ class SseDoneGate:
             self._buffer.clear()
             self._line_start = 0
             self._scan_start = 0
-            self._partial_line_in_progress = bool(trailing)
-            self._event_in_progress = self._event_in_progress or parsed_trailing.startswith(
-                b"data:"
+            self._partial_line_in_progress = continuing_line or bool(trailing)
+            self._event_in_progress = self._event_in_progress or (
+                not continuing_line and parsed_trailing.startswith(b"data:")
             )
             self._leading_bom = False
         return self._emit(bytes(forwarded))

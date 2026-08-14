@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
+import sys
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import ClassVar
 
 import anyio
@@ -10215,3 +10217,147 @@ def test_a_scalar_at_the_depth_cutoff_is_untouched_and_unreported() -> None:
 
     assert retained == "plain"
     assert bounded is False
+
+
+def test_a_wide_collection_past_the_trim_guard_is_not_retained() -> None:
+    """The width trim has its own recursion guard, and returning the subtree whole there reopened
+    the same leak one level further out: a mapping nested past it was retained at full width.
+    Nothing below that guard is recoverable -- it sits hundreds of levels past the payload depth
+    bound, so storage replaces it with "[redacted]" -- while the structure ABOVE it, which the
+    merge reads to report a too-deeply-nested fragment, is left intact."""
+
+    node: object = {
+        f"k{index}": 1 for index in range(platform_traces._MAX_PAYLOAD_COLLECTION + 20_000)
+    }
+    for _ in range(trace_fragments._MAX_TRIM_DEPTH + 24):
+        node = {"n": node}
+
+    with _raised_recursion_limit():
+        trimmed, bounded = trace_fragments._bound_collections(node)
+
+    walked = trimmed
+    while isinstance(walked, dict) and len(walked) == 1 and "n" in walked:
+        walked = walked["n"]
+    assert len(walked) <= platform_traces._MAX_PAYLOAD_COLLECTION
+    assert bounded is True
+
+
+@contextlib.contextmanager
+def _raised_recursion_limit() -> Iterator[None]:
+    previous = sys.getrecursionlimit()
+    sys.setrecursionlimit(50_000)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(previous)
+
+
+def _gate_stream(chunks: list[bytes]) -> tuple[bytes, bytes | None, bool]:
+    gate = trace_sse.SseDoneGate()
+    relayed: list[bytes] = []
+    for chunk in chunks:
+        relayed.extend(gate.feed(chunk))
+    relayed.extend(gate.finish())
+    return b"".join(relayed), gate.done_event, gate.terminated
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_a_terminator_after_a_split_ignored_field_is_still_gated(newline: bytes) -> None:
+    """A buffered CONTINUATION is not the start of a line. Reading it as one let an ignored field
+    split as `meta` + `dat` + `a: x` classify its own `dat` suffix as a data field, so the real
+    `data: [DONE]` was folded into that event and relayed ungated: the terminator was never
+    detected, `_stream_response` did not break, and the record-failed marker was emitted after a
+    terminator the client had already seen."""
+
+    relayed, done_event, terminated = _gate_stream(
+        [b"meta", b"dat", b"a: x", newline, b"data: [DONE]\n\n"]
+    )
+
+    assert b"[DONE]" not in relayed
+    assert relayed == b"metadata: x" + newline
+    assert done_event == b"data: [DONE]\n\n"
+    assert terminated is True
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected_relayed"),
+    [
+        ([b"data: [DONE]\n\n"], b""),
+        ([b"data: [DO", b"NE]\n\n"], b""),
+        ([b'data: {"a":1}\n\n', b"data: [DONE]\n\n"], b'data: {"a":1}\n\n'),
+        ([b'data: {"a":1}\n\ndata: [DONE]\n\n'], b'data: {"a":1}\n\n'),
+    ],
+    ids=["plain", "split-terminator", "after-event", "single-chunk"],
+)
+def test_ordinary_terminator_gating_is_unchanged(
+    chunks: list[bytes], expected_relayed: bytes
+) -> None:
+    relayed, done_event, terminated = _gate_stream(chunks)
+
+    assert relayed == expected_relayed
+    assert done_event == b"data: [DONE]\n\n"
+    assert terminated is True
+
+
+@pytest.mark.parametrize(
+    ("pattern", "secret"),
+    [
+        ("^api.key$", False),
+        ("^(api.key|password)$", False),
+        ("^secret.*$", False),
+        (r"^api\.key$", False),
+        ("^api_key$", True),
+        ("^api-key$", True),
+        ("^[Pp]assword$", True),
+        ("^(password|api_key)$", True),
+        ("^([Pp]assword|api_key)$", True),
+        ("^(password|city)$", False),
+    ],
+    ids=[
+        "wildcard",
+        "wildcard-branch",
+        "wildcard-star",
+        "escaped-dot",
+        "underscore",
+        "hyphen",
+        "class",
+        "alternation",
+        "alternation-class",
+        "alternation-benign",
+    ],
+)
+def test_a_regex_wildcard_is_not_a_field_name_separator(pattern: str, secret: bool) -> None:
+    """`.` is stripped by the name normalizer as a word separator (`api.key` -> `apikey`), so
+    `^api.key$` was read as a credential name -- but as a regex it also matches `apiXkey`, an
+    ordinary field. Its schema annotations were then rewritten to "[redacted]", corrupting the
+    stored raw schema. Only a pattern that matches exactly the one literal name it spells reaches
+    the name test; alternation branches are judged the same way, since a branch IS a pattern."""
+
+    assert trace_secret_names._is_secret_property_pattern(pattern) is secret
+
+
+def test_a_wildcard_pattern_keeps_its_schema_annotations() -> None:
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "patternProperties": {
+                            "^api.key$": {"type": "string", "default": "KEEP"},
+                            "^api_key$": {"type": "string", "default": "HUNTER2"},
+                        },
+                    },
+                },
+            }
+        ]
+    }
+
+    patterns = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"][
+        "patternProperties"
+    ]
+
+    assert patterns["^api.key$"]["default"] == "KEEP"
+    assert patterns["^api_key$"]["default"] == "[redacted]"
