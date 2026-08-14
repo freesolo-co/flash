@@ -238,6 +238,12 @@ def _sse_data_value(line: bytes) -> bytes:
     return data[1:] if data.startswith(b" ") else data
 
 
+# how many pieces a `_StringFragments` holds before compacting them into one. 256 keeps retention
+# to a few hundred objects for any reply length while copying each byte about twice on average, so
+# neither the memory nor the ingestion cost grows with the number of deltas.
+_FRAGMENT_COMPACT_THRESHOLD = 256
+
+
 def _is_padded_done_value(data: bytes) -> bool:
     return data != b"[DONE]" and data.strip(b" \t") == b"[DONE]"
 
@@ -252,12 +258,39 @@ def _could_be_done_line(line: bytes) -> bool:
 
 
 class _StringFragments:
+    """Streamed text held as pieces, so the reply is assembled once rather than on every delta.
+
+    Joining on each append is quadratic in the reply length, so the pieces are retained. But
+    retaining one object per delta has its own cost the byte budget cannot see: a one-character
+    token is a few bytes of text carried by roughly fifty bytes of interpreter overhead plus a list
+    slot, so a reply streamed token by token held an order of magnitude more memory than the budget
+    that admitted it.
+
+    Pieces are therefore compacted in two levels. At most `_FRAGMENT_COMPACT_THRESHOLD` pieces are
+    pending at a time; when that many have arrived they become one block, and the block list is
+    compacted the same way. Retention stays bounded at roughly twice the threshold while each byte
+    is copied a constant number of times on average, so ingestion is still linear.
+    """
+
     def __init__(self, value: str) -> None:
-        self.parts = [value] if value else []
+        self._blocks: list[str] = []
+        self._pending: list[str] = [value] if value else []
+
+    @property
+    def parts(self) -> list[str]:
+        """The retained pieces, in order. Their concatenation is the accumulated text."""
+        return [*self._blocks, *self._pending]
 
     def append(self, value: str) -> None:
-        if value:
-            self.parts.append(value)
+        if not value:
+            return
+        self._pending.append(value)
+        if len(self._pending) < _FRAGMENT_COMPACT_THRESHOLD:
+            return
+        self._blocks.append("".join(self._pending))
+        self._pending.clear()
+        if len(self._blocks) >= _FRAGMENT_COMPACT_THRESHOLD:
+            self._blocks = ["".join(self._blocks)]
 
     def text(self) -> str:
         return "".join(self.parts)

@@ -6329,8 +6329,11 @@ def test_a_list_delta_keeps_every_streamed_fragment(trace_api, monkeypatch) -> N
 
 def test_many_stream_fragments_stay_unjoined_until_output() -> None:
     """Each streamed fragment runs on the async response iterator. Rebuilding the whole reply per
-    chunk makes total work quadratic, while retaining one part per chunk keeps ingestion linear
-    regardless of scheduler timing."""
+    chunk makes total work quadratic, so pieces are retained rather than joined on every delta.
+
+    They are not retained one-per-delta either: object overhead the byte budget cannot see then
+    scales with the number of tokens. Compaction bounds the retained pieces while still copying
+    each byte a constant number of times, so both costs stay linear."""
     accumulator = trace_sse.SseAccumulator()
     fragment = "x" * 40
 
@@ -6341,7 +6344,8 @@ def test_many_stream_fragments_stay_unjoined_until_output() -> None:
 
     content = accumulator._choices[0]["message"]["content"]
     assert isinstance(content, trace_sse._StringFragments)
-    assert content.parts == [fragment] * 32_000
+    assert len(content.parts) <= 2 * trace_sse._FRAGMENT_COMPACT_THRESHOLD
+    assert "".join(content.parts) == fragment * 32_000
     assert accumulator.output()["choices"][0]["message"]["content"] == fragment * 32_000
 
 
@@ -9132,3 +9136,139 @@ def test_stacked_qualifiers_cannot_hide_a_secret_name(field: str, expected_secre
 
     redacted = json.dumps(traces._sanitize_for_trace(payload, ()))
     assert ("STACKEDLEAK" not in redacted) is expected_secret
+
+
+def _tool_hosted(parameters: dict) -> dict:
+    """A valid function-tool declaration hosting `parameters`, as the provider spells it."""
+    return {
+        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": parameters}}]
+    }
+
+
+@pytest.mark.parametrize("identifier", ["$id", "id"])
+def test_an_embedded_resource_does_not_inherit_the_secret_target(identifier: str) -> None:
+    """A `$id`/`id` starts a new resource scope, so a schema embedded inside a secret property's
+    target is a separate resource and keeps its annotations. Checking only the modern `$id` spelling
+    meant a draft-04 resource stayed inside the enclosing scope and was blanked with it."""
+
+    payload = _tool_hosted(
+        {
+            "type": "object",
+            "properties": {"password": {"$ref": "#/definitions/Cred"}},
+            "definitions": {
+                "Cred": {
+                    "type": "string",
+                    "default": "EMBEDDEDCREDLEAK",
+                    "definitions": {"Other": {identifier: "other", "default": "EMBEDDEDKEEP"}},
+                }
+            },
+        }
+    )
+
+    redacted = json.dumps(traces._sanitize_for_trace(payload, ()))
+    assert "EMBEDDEDCREDLEAK" not in redacted
+    assert "EMBEDDEDKEEP" in redacted
+
+
+@pytest.mark.parametrize("host", ["tools", "response_format"])
+def test_a_response_payload_does_not_open_a_request_schema_host(host: str) -> None:
+    """`tools` and `response_format` name what the REQUEST declares. An upstream error body that
+    echoes the submitted declaration is a response, and honouring the names there let the echo claim
+    the schema exemption, so a secret property's unknown literal was exported verbatim."""
+
+    declaration = {
+        "type": "object",
+        "properties": {"api_key": {"type": "string", "value": "ECHOEDLEAK"}},
+    }
+    payload = (
+        {"tools": [{"type": "function", "function": {"name": "lookup", "parameters": declaration}}]}
+        if host == "tools"
+        else {"response_format": {"type": "json_schema", "json_schema": {"schema": declaration}}}
+    )
+
+    assert "ECHOEDLEAK" not in json.dumps(traces._sanitize_for_trace(payload, (), response=True))
+    # the same payload as a REQUEST is a real declaration and keeps its schema.
+    assert "ECHOEDLEAK" in json.dumps(traces._sanitize_for_trace(payload, ()))
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_secret"),
+    [
+        ('{"password": "ASSISTANTLEAK"}', True),
+        ('  [{"api_key": "ASSISTANTLEAK"}]  ', True),
+        # prose is the reply itself and must survive byte for byte, even when it quotes json.
+        ('The config uses "password": "ASSISTANTLEAK" as its key.', False),
+        ('{"city": "ASSISTANTLEAK"}', False),
+    ],
+)
+def test_structured_output_returned_as_assistant_content_is_redacted(
+    content: str, expected_secret: bool
+) -> None:
+    """A structured-output completion returns its json in the ordinary string `content` of a
+    choice's message. Only tool results and function arguments were parsed, so the string form kept
+    its credential while the equivalent structured OBJECT was redacted."""
+
+    payload = {"choices": [{"message": {"role": "assistant", "content": content}}]}
+
+    redacted = json.dumps(traces._sanitize_for_trace(payload, (), response=True))
+    assert ("ASSISTANTLEAK" not in redacted) is expected_secret
+
+
+def test_truncated_structured_assistant_content_is_blanked() -> None:
+    """Structured output that ran out of tokens cannot be parsed, so its nested credentials cannot
+    be inspected. Keeping the bytes would make truncation an exfiltration path, while a logprob
+    table's token text -- which is not the reply -- must still survive."""
+
+    truncated = {
+        "choices": [{"message": {"role": "assistant", "content": '{"password":"CUTLEAK"'}}]
+    }
+    assert "CUTLEAK" not in json.dumps(traces._sanitize_for_trace(truncated, (), response=True))
+
+    tokens = {"choices": [{"logprobs": {"content": [{"token": "TOKENKEEP"}]}}]}
+    assert "TOKENKEEP" in json.dumps(traces._sanitize_for_trace(tokens, (), response=True))
+
+
+@pytest.mark.parametrize(
+    ("keyword", "definitions"),
+    [("dependentSchemas", "$defs"), ("dependencies", "definitions")],
+)
+def test_a_reference_from_a_secret_dependency_schema_is_followed(
+    keyword: str, definitions: str
+) -> None:
+    """`dependentSchemas` (and its draft-07 `dependencies` spelling) is keyed by property name, so a
+    secret-named key declares a secret member. Only `properties` and `patternProperties` were
+    collected, so a reference out of one of these reached a definition that kept its literal."""
+
+    payload = _tool_hosted(
+        {
+            "type": "object",
+            keyword: {
+                "password": {"$ref": f"#/{definitions}/Cred"},
+                "city": {"$ref": f"#/{definitions}/Place"},
+            },
+            definitions: {
+                "Cred": {"type": "string", "default": "DEPENDENCYLEAK"},
+                "Place": {"type": "string", "default": "DEPENDENCYKEEP"},
+            },
+        }
+    )
+
+    redacted = json.dumps(traces._sanitize_for_trace(payload, ()))
+    assert "DEPENDENCYLEAK" not in redacted
+    assert "DEPENDENCYKEEP" in redacted
+
+
+def test_retained_stream_fragments_are_bounded_by_compaction() -> None:
+    """A reply streamed token by token produced one retained object per delta. The byte budget
+    cannot see interpreter overhead, so a few bytes of text arrived carrying roughly fifty bytes of
+    object each and the accumulator held far more memory than the budget that admitted it."""
+
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=1 << 20)
+    for _ in range(20_000):
+        accumulator.feed(b'data: {"choices":[{"index":0,"delta":{"content":"x"}}]}\n\n')
+    accumulator.finish()
+
+    content = accumulator._choices[0]["message"]["content"]
+    assert len(content.parts) <= 2 * trace_sse._FRAGMENT_COMPACT_THRESHOLD
+    assert accumulator.output()["choices"][0]["message"]["content"] == "x" * 20_000
+    assert accumulator.defect is None

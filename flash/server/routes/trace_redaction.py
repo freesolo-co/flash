@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +12,28 @@ from flash.server.routes.trace_schema_identity import (
     SchemaResourceScopes,
     _local_schema_pointer,
     _schema_resource_id,
+)
+from flash.server.routes.trace_schema_shape import (  # noqa: F401
+    _ARRAY_SHAPED_ROOT_HOST_KEYS,
+    _JSON_SCHEMA_KEYWORDS,
+    _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS,
+    _JSON_SCHEMA_PROPERTY_NAME_MAP_KEYWORDS,
+    _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS,
+    _JSON_SCHEMA_STRUCTURAL_KEYWORDS,
+    _JSON_SCHEMA_TYPES,
+    _JSON_SCHEMA_VALUE_KEYWORDS,
+    _JSON_SCHEMA_WRAPPER_KEYS,
+    _NESTED_SCHEMA_HOST_KEYS,
+    _ROOT_SCHEMA_HOST_KEYS,
+    _SCHEMA_DECLARING_FORMAT_KEYS,
+    _SCHEMA_HOST_KEYS,
+    _SECRET_DECLARING_PROPERTY_MAPS,
+    _TEXT_CONTENT_PART_TYPES,
+    _has_schema_context,
+    _has_schema_wrapper_evidence,
+    _is_property_name_list,
+    _is_schema_definition,
+    _is_schema_map_keyword,
 )
 from flash.server.routes.trace_secret_names import (  # noqa: F401
     _is_secret_key,
@@ -28,285 +51,10 @@ from flash.server.routes.trace_uri import (
 # secret corrupts unrelated training text, while real bearer credentials are comfortably longer.
 _MIN_SECRET_SUBSTRING_LENGTH = 16
 
-_JSON_SCHEMA_STRUCTURAL_KEYWORDS = frozenset(
-    {
-        "type",
-        "properties",
-        "items",
-        "prefixItems",
-        "additionalItems",
-        "contains",
-        "enum",
-        "const",
-        "$ref",
-        "$id",
-        "$schema",
-        "$anchor",
-        "$dynamicRef",
-        "$dynamicAnchor",
-        "$recursiveRef",
-        "$recursiveAnchor",
-        "anyOf",
-        "allOf",
-        "oneOf",
-        "not",
-        "format",
-        "additionalProperties",
-        "patternProperties",
-        "propertyNames",
-        "unevaluatedProperties",
-        "unevaluatedItems",
-        "dependentRequired",
-        "dependentSchemas",
-        "discriminator",
-        "required",
-        "$defs",
-        "definitions",
-        "if",
-        "then",
-        "else",
-        "contentSchema",
-    }
-)
-_JSON_SCHEMA_ANNOTATION_KEYWORDS = frozenset(
-    {
-        "description",
-        "title",
-        "default",
-        "examples",
-        "deprecated",
-        "readOnly",
-        "writeOnly",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "multipleOf",
-        "minLength",
-        "maxLength",
-        "pattern",
-        "minItems",
-        "maxItems",
-        "uniqueItems",
-        "minProperties",
-        "maxProperties",
-        "minContains",
-        "maxContains",
-        "contentEncoding",
-        "contentMediaType",
-        "nullable",
-        "example",
-        "$comment",
-    }
-)
-_JSON_SCHEMA_KEYWORDS = _JSON_SCHEMA_STRUCTURAL_KEYWORDS | _JSON_SCHEMA_ANNOTATION_KEYWORDS
-_JSON_SCHEMA_SECRET_LITERAL_KEYWORDS = frozenset(
-    {"default", "const", "enum", "examples", "example"}
-)
-_JSON_SCHEMA_PROPERTY_MAP_KEYWORDS = frozenset(
-    {"properties", "patternProperties", "dependentSchemas", "$defs", "definitions"}
-)
-# keyed by property name like the maps above, but its VALUES are arrays of declared property names
-# rather than subschemas. both halves are declarations: `{"password": ["username"]}` names two
-# fields, so redacting either corrupts the stored schema instead of protecting a credential.
-_JSON_SCHEMA_PROPERTY_NAME_MAP_KEYWORDS = frozenset({"dependentRequired"})
-# tool output can arrive as content PARTS instead of one string. a part's `text` is still the tool's
-# output, so it needs the same parsed-or-conservative handling the scalar form gets.
-_TEXT_CONTENT_PART_TYPES = frozenset({"text", "output_text", "input_text"})
-_JSON_SCHEMA_VALUE_KEYWORDS = frozenset(
-    {
-        "items",
-        "additionalItems",
-        "contains",
-        "not",
-        "additionalProperties",
-        "propertyNames",
-        "unevaluatedProperties",
-        "unevaluatedItems",
-        "if",
-        "then",
-        "else",
-        "contentSchema",
-        "prefixItems",
-        "anyOf",
-        "allOf",
-        "oneOf",
-    }
-)
-_JSON_SCHEMA_WRAPPER_KEYS = frozenset({"schema", "parameters", "input_schema", "output_schema"})
-# containers that genuinely declare schemas. a wrapper key is honoured only beneath one of these,
-# so ordinary request metadata that happens to be shaped like a schema cannot claim the exemption.
-# only these names are a request's OWN top-level declaration. the rest of the host vocabulary is
-# spelled only INSIDE one of them, so accepting those at the root let an unrelated top-level
-# extension named `function` or `json_schema` open a host for its whole subtree.
-# `tool_choice` and a root `function_call` SELECT an already-declared function by name; neither
-# carries a schema. Listing them here let `{"tool_choice": {"function": {"parameters": ...}}}` open
-# a host, and the nested wrapper then read `password` as a schema property and kept its unknown
-# `value` verbatim -- a credential in a selector, which the tool declaration itself never contains.
-_ROOT_SCHEMA_HOST_KEYS = frozenset({"tools", "functions", "response_format", "text_format"})
-# a declaration is its NAME and its SHAPE. `tools` and `functions` are arrays of tool definitions;
-# the rest are single objects. accepting the name alone let `{"tools": {"parameters": {...}}}` --
-# which no provider would accept -- open a host whose nested wrapper then kept a secret property's
-# literal, so an upstream-rejected request still persisted a third-party credential.
-_ARRAY_SHAPED_ROOT_HOST_KEYS = frozenset({"tools", "functions"})
-# these two name the SAME declaration in the chat-completions and responses spellings, and both
-# state a discriminator: a response format only declares a schema as `{"type": "json_schema",
-# "json_schema": {...}}`. accepting any object under the name let a direct `schema` wrapper the
-# provider rejects open the exemption and keep an unknown keyword's credential literal.
-_SCHEMA_DECLARING_FORMAT_KEYS = frozenset({"response_format", "text_format"})
-_NESTED_SCHEMA_HOST_KEYS = frozenset({"function", "json_schema"})
-_SCHEMA_HOST_KEYS = _ROOT_SCHEMA_HOST_KEYS | _NESTED_SCHEMA_HOST_KEYS
-_JSON_SCHEMA_TYPES = frozenset(
-    {"null", "boolean", "object", "array", "number", "string", "integer"}
-)
-
 
 @dataclass
 class _SanitizationFlag:
     hit: bool = False
-
-
-def _is_schema_definition(value: Any, *, allow_custom_vocabulary: bool = False) -> bool:
-    if isinstance(value, bool):
-        return True
-    if not isinstance(value, dict):
-        return False
-    if not value:
-        # `{}` is the permissive JSON Schema ("any value"), so under a `properties` map it is a
-        # declaration, not a secret. Treating it as one rewrote `{"password": {}}` into the string
-        # "[redacted]" and turned a valid schema into an invalid one.
-        return True
-    keys = [key for key in value if not (isinstance(key, str) and key.startswith("x-"))]
-    if allow_custom_vocabulary and any(key in _JSON_SCHEMA_KEYWORDS for key in keys):
-        return True
-    if any(key in _JSON_SCHEMA_STRUCTURAL_KEYWORDS for key in keys):
-        return True
-    return bool(keys) and all(key in _JSON_SCHEMA_KEYWORDS for key in keys)
-
-
-def _is_property_name_list(value: Any) -> bool:
-    """Whether `value` is a draft-07 `dependencies` array: a list of declared property names.
-
-    These are schema declarations, not instance data, so a secret-looking entry is a property name
-    and replacing the list with `"[redacted]"` corrupts the stored schema.
-    """
-    return isinstance(value, list) and all(isinstance(entry, str) for entry in value)
-
-
-def _is_schema_map_keyword(key: str, item: Any) -> bool:
-    """Whether `key`'s entries are keyed by PROPERTY NAME rather than being instance data.
-
-    Under such a keyword a secret-looking key is a declared property name, not a credential, so
-    replacing the entry with `"[redacted]"` corrupts the stored schema instead of protecting
-    anything. Draft-07 `dependencies` qualifies in both of its forms: a schema value states a
-    conditional subschema and an array value lists required property names, and neither is a secret.
-    Only its entry VALUES differ, which the ordinary schema traversal already distinguishes.
-    """
-    return (
-        key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS
-        or key in _JSON_SCHEMA_PROPERTY_NAME_MAP_KEYWORDS
-        or (key == "dependencies" and isinstance(item, dict))
-    )
-
-
-def _has_schema_context(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
-    if isinstance(value.get("$schema"), str) or isinstance(value.get("$id"), str):
-        return True
-    property_maps = [
-        value[keyword]
-        for keyword in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS
-        if isinstance(value.get(keyword), dict)
-    ]
-    property_maps_are_schemas = all(
-        all(_is_unambiguous_schema_definition(item) for item in property_map.values())
-        for property_map in property_maps
-    )
-    schema_type = value.get("type")
-    if (
-        isinstance(schema_type, str)
-        and schema_type in _JSON_SCHEMA_TYPES
-        and property_maps_are_schemas
-    ):
-        return True
-    if (
-        isinstance(schema_type, list)
-        and schema_type
-        and all(isinstance(item, str) and item in _JSON_SCHEMA_TYPES for item in schema_type)
-        and property_maps_are_schemas
-    ):
-        return True
-    return bool(property_maps) and property_maps_are_schemas
-
-
-def _is_unambiguous_schema_definition(value: Any) -> bool:
-    if isinstance(value, bool):
-        return True
-    if not isinstance(value, dict):
-        return False
-    keys = [key for key in value if not (isinstance(key, str) and key.startswith("x-"))]
-    if not keys:
-        return True
-    if any(key not in _JSON_SCHEMA_KEYWORDS for key in keys):
-        return False
-    schema_type = value.get("type")
-    if schema_type is None:
-        return True
-    if isinstance(schema_type, str):
-        return schema_type in _JSON_SCHEMA_TYPES
-    return (
-        isinstance(schema_type, list)
-        and bool(schema_type)
-        and all(isinstance(item, str) and item in _JSON_SCHEMA_TYPES for item in schema_type)
-    )
-
-
-def _declares_applicators_its_type_forbids(value: Any) -> bool:
-    """Whether a declared scalar `type` contradicts the applicators declared beside it.
-
-    `properties` applies only to objects and `items` only to arrays, so a schema declaring exactly
-    `type: "string"` alongside either is self-contradictory. Real schemas do not do this; ordinary
-    metadata that merely happens to carry both keys does.
-    """
-    if not isinstance(value, dict):
-        return False
-    schema_type = value.get("type")
-    types = (
-        {schema_type}
-        if isinstance(schema_type, str)
-        else set(schema_type)
-        if isinstance(schema_type, list)
-        else set()
-    )
-    if not types or not types <= _JSON_SCHEMA_TYPES:
-        return False
-    object_only = any(
-        isinstance(value.get(key), dict) for key in ("properties", "patternProperties")
-    )
-    array_only = "items" in value or "prefixItems" in value
-    return (object_only and "object" not in types) or (array_only and "array" not in types)
-
-
-def _has_schema_wrapper_evidence(value: Any) -> bool:
-    if _has_schema_context(value):
-        return True
-    if not isinstance(value, dict):
-        return False
-    schema_type = value.get("type")
-    if _declares_applicators_its_type_forbids(value):
-        # a schema is not merely a dict with a valid `type`: the type has to agree with the
-        # applicators alongside it. `{"type": "string", "properties": {...}}` describes a string
-        # that somehow has properties, which no real schema does, and treating it as one let
-        # ordinary metadata claim the exemption and keep its literals.
-        return False
-    if isinstance(schema_type, str):
-        return schema_type in _JSON_SCHEMA_TYPES
-    return (
-        isinstance(schema_type, list)
-        and bool(schema_type)
-        and all(isinstance(item, str) and item in _JSON_SCHEMA_TYPES for item in schema_type)
-    )
 
 
 def _redact_schema_literal(value: Any, *, depth: int, flag: _SanitizationFlag | None = None) -> Any:
@@ -415,7 +163,11 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
             # `patternProperties` declares secret-looking members too: `{"^secret_": {...}}` marks
             # every matching property secret. scanning only `properties` left a reference from such
             # an entry uncollected, so its target definition kept its credential-bearing literal.
-            for map_keyword in ("properties", "patternProperties"):
+            # `dependentSchemas` (and its draft-07 `dependencies` spelling) is keyed by property
+            # name too, so `{"password": {"$ref": ...}}` declares a secret member exactly like
+            # `properties` does. scanning only the two property maps left that reference
+            # uncollected, and the target definition kept its credential-bearing literal.
+            for map_keyword in _SECRET_DECLARING_PROPERTY_MAPS:
                 property_map = node.get(map_keyword)
                 if not isinstance(property_map, dict):
                     continue
@@ -430,7 +182,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
                         refs.update(collect_refs(schema, 0, schema_path, scope_uri))
                     collect_secret_properties(schema, node_depth + 1, schema_path, scope_uri)
             for key, item in node.items():
-                if key not in {"properties", "patternProperties"}:
+                if key not in _SECRET_DECLARING_PROPERTY_MAPS:
                     collect_secret_properties(item, node_depth + 1, (*path, str(key)), scope_uri)
         elif isinstance(node, list | tuple):
             for index, item in enumerate(node):
@@ -476,14 +228,42 @@ def _looks_structured(value: str) -> bool:
 
 def _redact_tool_result_content(value: str, *, depth: int, flag: _SanitizationFlag | None) -> str:
     """Redact a tool message's `content`, which carries the tool's output rather than prose."""
+    # a tool result is not required to be json -- prose is the ordinary case -- so unparseable text
+    # is kept. but truncated or malformed structured output is common too, and its credentials
+    # cannot be inspected, so anything that LOOKS structured is blanked instead: keeping
+    # `{"password":"HUNTER2"` verbatim made a parse failure an exfiltration path.
+    return _redact_json_text(value, depth=depth, flag=flag, on_unparseable=_looks_structured)
+
+
+def _opens_structured_document(value: str) -> bool:
+    """Whether a string was EMITTED as a JSON document, rather than merely quoting one.
+
+    The assistant's `content` is the reply itself, so the containment test used for tool output is
+    too eager here: prose that quotes `"name": "value"` mid-sentence is still prose, and blanking it
+    would destroy the recorded reply. A structured-output completion that ran out of tokens opens
+    with its brace, which is the case that actually hides an uninspectable credential.
+    """
+    return value.strip().startswith(("{", "["))
+
+
+def _redact_json_text(
+    value: str,
+    *,
+    depth: int,
+    flag: _SanitizationFlag | None,
+    on_unparseable: Callable[[str], bool],
+) -> str:
+    """Redact a string field that may carry a serialized JSON payload.
+
+    Three fields carry model- or tool-authored JSON as a string: a tool result's `content`, a
+    function call's `arguments`, and a structured-output reply's `content`. Each needs the same
+    parse-and-redact treatment; they differ only in whether text that fails to parse is a credential
+    risk worth blanking, which `on_unparseable` decides.
+    """
     try:
         parsed = json.loads(value)
     except (ValueError, RecursionError):
-        # a tool result is not required to be json -- prose is the ordinary case -- so unparseable
-        # text is kept. but truncated or malformed structured output is common too, and its
-        # credentials cannot be inspected, so anything that LOOKS structured is blanked instead:
-        # keeping `{"password":"HUNTER2"` verbatim made a parse failure an exfiltration path.
-        return "[redacted]" if _looks_structured(value) else value
+        return "[redacted]" if on_unparseable(value) else value
     if not isinstance(parsed, dict | list):
         return value
     redacted = _redact_secret_fields(parsed, depth=depth + 1, flag=flag)
@@ -562,7 +342,11 @@ def _resolve_secret_schema_refs(
         for pointer in _secret_schema_definition_refs(value, depth=depth)
     }
     referenced = schema_definition_path in active
-    if schema_definition_path and isinstance(value.get("$id"), str):
+    # draft-04 spells the resource identifier `id`, and checking only `$id` meant an embedded
+    # legacy resource did not start its own scope here -- so an unrelated sibling definition
+    # inherited the enclosing target's secrecy and its annotation was rewritten to "[redacted]".
+    # `_schema_resource_id` is the same legacy-aware detection the reference collectors use.
+    if schema_definition_path and isinstance(_schema_resource_id(value), str):
         return active, referenced
     return active, secret_schema_definition or referenced
 
@@ -576,6 +360,7 @@ def _child_response_shape_flags(
     choice: bool,
     logprobs: bool,
     logprob_entries: bool,
+    assistant_content: bool,
 ) -> dict[str, bool]:
     """The response-envelope flags a child inherits: where it sits in `choices` and `logprobs`.
 
@@ -589,6 +374,12 @@ def _child_response_shape_flags(
         "logprobs": choice and key == "logprobs" and isinstance(item, dict),
         "logprob_entries": logprob_entries
         or (logprobs and key in {"content", "refusal", "top_logprobs"}),
+        # a structured-output completion returns its json in the ordinary string `content` of a
+        # choice's message. that path parsed only tool results and function arguments, so
+        # `{"password": "HUNTER2"}` came back unchanged while the equivalent structured OBJECT was
+        # name-redacted. `logprobs` is excluded: its `content` is a token table, not the reply.
+        "assistant_content": assistant_content
+        or (choice and key == "message" and isinstance(item, dict)),
     }
 
 
@@ -641,6 +432,7 @@ def _redact_secret_child(
     choice: bool,
     logprobs: bool,
     logprob_entries: bool,
+    assistant_content: bool,
     function_container: bool,
     tool_result_content: bool,
     schema_host: bool,
@@ -702,6 +494,7 @@ def _redact_secret_child(
             choice=choice,
             logprobs=logprobs,
             logprob_entries=logprob_entries,
+            assistant_content=assistant_content,
         ),
         function_arguments=function_container and key == "arguments",
         tool_result_content=_carries_tool_result(
@@ -747,6 +540,7 @@ def _redact_secret_fields(
     choice: bool = False,
     logprobs: bool = False,
     logprob_entries: bool = False,
+    assistant_content: bool = False,
     function_arguments: bool = False,
     tool_result_content: bool = False,
     function_container: bool = False,
@@ -804,6 +598,7 @@ def _redact_secret_fields(
                     choice=choice,
                     logprobs=logprobs,
                     logprob_entries=logprob_entries,
+                    assistant_content=assistant_content,
                     function_container=function_container,
                     tool_result_content=tool_result_content,
                     schema_host=schema_host,
@@ -826,6 +621,7 @@ def _redact_secret_fields(
             choice_list=choice_list,
             logprobs=logprobs,
             logprob_entries=logprob_entries,
+            assistant_content=assistant_content,
             tool_result_content=tool_result_content,
             schema_host=schema_host,
             tool_definition_list=tool_definition_list,
@@ -840,6 +636,7 @@ def _redact_secret_fields(
         depth=depth,
         tool_result_content=tool_result_content,
         function_arguments=function_arguments,
+        assistant_content=assistant_content,
         flag=flag,
     )
 
@@ -888,6 +685,7 @@ def _redact_secret_sequence(
     choice_list: bool,
     logprobs: bool,
     logprob_entries: bool,
+    assistant_content: bool,
     tool_result_content: bool,
     schema_host: bool,
     tool_definition_list: bool,
@@ -912,6 +710,9 @@ def _redact_secret_sequence(
             choice=choice_list,
             logprobs=logprobs,
             logprob_entries=logprob_entries,
+            # a message's `content` may be a list of parts; the reply text then sits in each
+            # part's `text`, so the flag has to survive the list hop like `tool_result_content`.
+            assistant_content=assistant_content,
             payload_root=False,
             # a tool message's `content` may be a list of parts rather than one string, and the
             # tool's output then sits in each part's `text`. dropping the flag at the list hop
@@ -936,20 +737,20 @@ def _redact_secret_scalar(
     depth: int,
     tool_result_content: bool,
     function_arguments: bool,
+    assistant_content: bool,
     flag: _SanitizationFlag | None,
 ) -> Any:
     """Redact a leaf value, whose handling depends on the field that carries it."""
     if tool_result_content and isinstance(value, str):
         return _redact_tool_result_content(value, depth=depth, flag=flag)
     if function_arguments and isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except (ValueError, RecursionError):
-            # malformed arguments cannot be inspected for nested credentials, so preserving their
-            # bytes would turn parse failure into a secret exfiltration path. keep the wire type only.
-            return "[redacted]"
-        redacted = _redact_secret_fields(parsed, depth=depth + 1, flag=flag)
-        return json.dumps(redacted, separators=(",", ":"))
+        # malformed arguments cannot be inspected for nested credentials, so preserving their bytes
+        # would turn parse failure into a secret exfiltration path. keep the wire type only.
+        return _redact_json_text(value, depth=depth, flag=flag, on_unparseable=lambda _: True)
+    if assistant_content and isinstance(value, str):
+        return _redact_json_text(
+            value, depth=depth, flag=flag, on_unparseable=_opens_structured_document
+        )
     return value
 
 
@@ -995,5 +796,11 @@ def _sanitize_for_trace(
     response: bool = False,
     flag: _SanitizationFlag | None = None,
 ) -> Any:
-    redacted = _redact_secret_fields(value, payload_root=True, response_root=response, flag=flag)
+    # `payload_root` opens the REQUEST's schema-host vocabulary (`tools`, `response_format`, ...).
+    # a response declares no request schema, so honouring those names in one let an upstream error
+    # body that echoes a submitted declaration claim the exemption -- and a nested secret property
+    # then kept its unknown literal, exporting a credential the caller had sent us.
+    redacted = _redact_secret_fields(
+        value, payload_root=not response, response_root=response, flag=flag
+    )
     return _redact_secret_values(redacted, secrets, flag=flag)
