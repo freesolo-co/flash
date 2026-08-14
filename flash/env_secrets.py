@@ -38,11 +38,13 @@ from flash.env_buffers import (
     _blocks_of,
     _looks_like_container,
     _paired_markers_kind,
+    _paired_state,
     _wide_runs,
     _zlib_prefix_inflates,
 )
 from flash.env_deflate import (
     _PDF_SIGNATURE,
+    _EncryptedDocument,
     _pdf_stream_payloads,
     _raw_deflate_from,
     _TooManyStreams,
@@ -207,7 +209,12 @@ def _credential_kind(
             # take every `width`-th byte: for UTF-16 that is the ASCII half of each code unit, in
             # whichever of the two byte orders the file used.
             for run in _wide_runs(data, width, offset):
-                if kind := _decoded_kind(run, deadline=deadline, depth=depth):
+                # `truncated` is carried through. Dropping it told the base64 path that every
+                # narrowed run ended where the file did, so an encoded container crossing a chunk
+                # boundary had its first fragment treated as a complete value while later fragments
+                # began mid-stream and could not be expanded from either side. Measured: the same
+                # base64 gzip refused as narrow text returned clean in UTF-16LE.
+                if kind := _decoded_kind(run, deadline=deadline, depth=depth, truncated=truncated):
                     return kind
     return None
 
@@ -328,7 +335,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     tail = b""
     container_head = False
     overflowed = False
-    seen: set[tuple[int, str]] = set()
+    seen = _paired_state()
     store_head = bytearray()
     walking_store = True
     # Read one chunk AHEAD, so each pass knows whether bytes follow it. A base64 run reaching the
@@ -630,6 +637,8 @@ def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> 
                 raise _Unscannable("contains a compressed stream too large to inspect")
             if kind := _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth):
                 return kind
+    except _EncryptedDocument:
+        raise _Unscannable("contains an encrypted document this check cannot read") from None
     except _TooManyStreams:
         raise _Unscannable("contains more compressed streams than can be inspected") from None
     except _UnreachedStream:

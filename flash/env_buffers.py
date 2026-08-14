@@ -16,7 +16,12 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from flash.env_formats import _looks_compressed, _looks_like_tar, _overlay_offset
-from flash.env_patterns import _PAIRED_PATTERNS, SHORTEST_TOKEN_BYTES
+from flash.env_patterns import (
+    _PAIRED_PATTERNS,
+    SHORTEST_TOKEN_BYTES,
+    _RecordHalves,
+    _RecordSplitter,
+)
 
 # Read in bounded chunks so a large dataset member is never held in memory whole. This costs no
 # more I/O than the publish already pays: `_tar_b64` reads every one of these bytes to gzip them.
@@ -48,27 +53,45 @@ def _zlib_prefix_inflates(source: Path | bytes) -> bool:
     return True
 
 
-def _paired_markers_kind(window: bytes, seen: set[tuple[int, str]]) -> str | None:
-    """The kind of two-marker credential whose halves have BOTH appeared by the end of `window`.
+def _paired_state() -> tuple[_RecordSplitter, tuple[_RecordHalves, ...]]:
+    """The record boundary tracker and one pairing state per two-marker detector.
 
-    `seen` accumulates across the whole stream, so the halves are paired at any distance and in
-    either order. Tracking only one side was wrong for the reverse ordering that JSON permits: a
-    JWK written `{"d": ..., <1 MiB of metadata>, "kty": "RSA"}` had its private member leave the
-    window before the `kty` arrived, and the key published.
-
-    Marks halves by their index in `_PAIRED_PATTERNS` rather than by the pattern object, so two
-    detectors sharing a pattern cannot be confused for each other.
+    One splitter shared by every detector, because where a record ends is a property of the STREAM
+    rather than of what is being looked for. Giving each detector its own repeated the tokenizing
+    per detector, which cost more than the pairing it fed.
     """
-    for index, (kind, detector) in enumerate(_PAIRED_PATTERNS):
-        # `payload_match` rather than the raw pattern, so the captured body goes through the same
+    return (
+        _RecordSplitter(),
+        tuple(_RecordHalves(detector) for _, detector in _PAIRED_PATTERNS),
+    )
+
+
+def _paired_markers_kind(
+    window: bytes, seen: tuple[_RecordSplitter, tuple[_RecordHalves, ...]]
+) -> str | None:
+    """The kind of two-marker credential whose halves share a RECORD, by the end of `window`.
+
+    `seen` carries each detector's pairing state across the whole stream, so halves pair at any
+    distance within one record and in either order. Tracking only one side was wrong for the
+    reverse ordering that JSON permits: a JWK written `{"d": ..., <1 MiB of metadata>, "kty":
+    "RSA"}` had its private member leave the window before the `kty` arrived, and the key
+    published. Carrying the state is what keeps that key caught however far apart its halves sit.
+
+    Pairing is per RECORD rather than per stream. Accumulating over the whole file combined
+    unrelated JSONL rows -- a public JWK in one and a high-entropy build id under a private member
+    name in another -- into a private key that no row held, refusing a legitimate publish.
+
+    One state per detector, positionally, so two detectors sharing a pattern cannot be confused
+    for each other.
+    """
+    splitter, states = seen
+    ends = splitter.ends(window)
+    for (kind, _), halves in zip(_PAIRED_PATTERNS, states, strict=True):
+        # `_RecordHalves` applies `payload_match`, so the captured body goes through the same
         # entropy test the single-buffer path applies. Calling `detector.payload` directly here
         # meant the streaming scan -- which is every file over one chunk -- paired placeholders and
         # prose that `_match` had already rejected.
-        halves = (("context", detector.context.search), ("payload", detector.payload_match))
-        for half, find in halves:
-            if (index, half) not in seen and find(window):
-                seen.add((index, half))
-        if {(index, "context"), (index, "payload")} <= seen:
+        if halves.paired(window, ends):
             return kind
     return None
 

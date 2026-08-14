@@ -32,9 +32,15 @@ from collections.abc import Iterator
 # -- and a stream found that way is refused rather than reported clean. Anchoring the second look
 # on `>>` is what separates an over-long dictionary from prose: a document that merely mentions the
 # word `/FlateDecode` has no dictionary to close, so it never reaches a `>> stream` of its own.
+#
+# The keyword's line ending is CRLF, LF, or a bare CR. The spec names the first two, but real
+# producers emit the third and conforming readers accept it -- and matching only `\r?\n` meant a
+# `stream\r` document was never enumerated at all, so a key in it published while byte-identical
+# LF and CRLF versions were caught.
 _PDF_GAP = 512
-_PDF_STREAM = re.compile(rb"/FlateDecode\b[\s\S]{0,%d}?\bstream\r?\n" % _PDF_GAP)
-_PDF_LONG_DICTIONARY = re.compile(rb"/FlateDecode\b[^<>]{0,%d}?>>\s*stream\r?\n" % (1 << 16))
+_PDF_EOL = rb"(?:\r\n|\n|\r)"
+_PDF_STREAM = re.compile(rb"/FlateDecode\b[\s\S]{0,%d}?\bstream%s" % (_PDF_GAP, _PDF_EOL))
+_PDF_LONG_DICTIONARY = re.compile(rb"/FlateDecode\b[^<>]{0,%d}?>>\s*stream%s" % (1 << 16, _PDF_EOL))
 _MAX_PDF_STREAMS = 4096
 
 # The filter list of the object the matched stream belongs to. A PDF may pipe a stream through
@@ -56,6 +62,22 @@ _PDF_FILTER_NAME = re.compile(rb"/(\w+)")
 _ASCII85_FILTER = b"ASCII85Decode"
 _FLATE_FILTER = b"FlateDecode"
 
+# The document's encryption dictionary. Present exactly when stream bodies are ciphertext, and
+# named in the trailer rather than in any stream's own dictionary, so it is searched document-wide.
+_PDF_ENCRYPT = re.compile(rb"/Encrypt\s")
+
+# A `/Filter` whose value is an indirect reference (`2 0 R`) rather than a name or an array of
+# names. Resolving it means following the xref table into another object.
+_PDF_INDIRECT_FILTER = re.compile(rb"/Filter\s+\d+\s+\d+\s+R\b")
+
+# A predictor declared in `/DecodeParms`. Predictor 1 is the identity and needs no undoing; any
+# higher value means the inflated bytes are differences rather than content.
+_PDF_PREDICTOR = re.compile(rb"/Predictor\s*(\d+)")
+
+# How far back from the `stream` keyword the owning object's dictionary is read. The same 512-byte
+# reach `_filter_stages` uses, for the same reason: the dictionary precedes the keyword.
+_PDF_DICTIONARY_REACH = 512
+
 
 class _UnreadableFilterChain(Exception):
     """A stream is piped through a filter chain this cannot fully undo, so it was never inspected.
@@ -72,6 +94,16 @@ class _UnreachedStream(Exception):
     Distinct from `_UnreadableFilterChain` so the message stays honest: the filters here are
     perfectly readable, the stream was simply never located. A dictionary may legally carry any
     amount of metadata, and 600 bytes of it put the keyword out of the pattern's reach.
+    """
+
+
+class _EncryptedDocument(Exception):
+    """A PDF declares an `/Encrypt` dictionary, so its stream bodies are ciphertext.
+
+    Distinct from `_UnreadableFilterChain` because the filters are not the problem: they would be
+    perfectly readable if the bytes underneath them were. Encryption is reversed before any filter
+    runs, so zlib sees ciphertext and rejects it, and the skip for "not really a stream" turned an
+    encrypted document into a clean result.
     """
 
 
@@ -205,15 +237,35 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     """
     if not data.startswith(_PDF_SIGNATURE):
         return
+    # An encrypted document reverses stream encryption BEFORE the declared filters, so what follows
+    # `stream` is ciphertext and zlib rejects it -- which the skip below treats as "not really a
+    # stream" and the document passes as clean. That made an encrypted PDF the one container shape
+    # this let through, while encrypted zip, OpenSSL and OpenPGP payloads are all refused. The
+    # passphrase is not ours to have, so the only honest answer is undecided.
+    if _PDF_ENCRYPT.search(data):
+        raise _EncryptedDocument
     # A dictionary too long for the gap is undecided, not clean. Raised before the walk so a
     # document carrying one such object refuses whatever its other streams inflate to. Compared
     # against the gap-bounded pattern rather than searched alone: every stream `_PDF_STREAM` pairs
     # is also found here, so only a SURPLUS means one sits beyond the bound.
     if len(_PDF_LONG_DICTIONARY.findall(data)) > len(_PDF_STREAM.findall(data)):
         raise _UnreachedStream
+    # A filter named through an INDIRECT reference -- `/Filter 2 0 R`, resolved from another object
+    # -- cannot be read by a pattern that matches the name directly, so the stream it belongs to was
+    # never associated with flate and its credential published. Resolving object references means
+    # parsing the xref table; refusing is the bounded answer, and these are rare in practice.
+    if _PDF_INDIRECT_FILTER.search(data):
+        raise _UnreadableFilterChain
     streams = _PDF_STREAM.finditer(data)
     for found in itertools.islice(streams, _MAX_PDF_STREAMS):
         before, after = _filter_stages(data, found.start())
+        # A predictor is applied to the INFLATED bytes, so what comes out of zlib is horizontal or
+        # PNG differences rather than the stream's contents: a key encoded that way inflates
+        # successfully while containing none of its own literal bytes. Undoing it needs the colour
+        # and column parameters, so the stream is refused rather than reconstructed and guessed at.
+        predictor = _PDF_PREDICTOR.search(_object_dictionary(data, found.start()))
+        if predictor and int(predictor.group(1)) > 1:
+            raise _UnreadableFilterChain
         body = _undo_ascii85(data[found.end() :], before)
         inflate = zlib.decompressobj()
         try:
@@ -226,6 +278,16 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     # other bound here already refuses rather than truncating -- this one returned a verdict.
     if next(streams, None) is not None:
         raise _TooManyStreams
+
+
+def _object_dictionary(data: bytes, at: int) -> bytes:
+    """The bytes of the dictionary belonging to the stream whose filter name sits at `at`.
+
+    Read backwards from the match for the same reason `_filter_stages` does: the dictionary
+    precedes the `stream` keyword, and a slice starting at the filter name would miss the
+    `/DecodeParms` entry when that entry is written before `/Filter`.
+    """
+    return data[max(0, at - _PDF_DICTIONARY_REACH) : at + _PDF_DICTIONARY_REACH]
 
 
 def _filter_stages(data: bytes, at: int) -> tuple[list[bytes], list[bytes]]:

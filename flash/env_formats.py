@@ -147,6 +147,12 @@ _OVERLAY_PROBE_BYTES = 1 << 16
 # chance occurrences of the gzip magic across 400 MiB of random bytes, of which 0 inflated.
 _MAX_OVERLAY_CANDIDATES = 4096
 
+# How much of a candidate's probe identifies it for the repeat check above. Long enough that two
+# different streams do not collide -- a gzip header alone is 10 bytes and a real payload's deflate
+# bits follow immediately -- and short enough that the key costs a slice rather than a hash of the
+# whole 64 KiB probe.
+_OVERLAY_PROBE_KEY_BYTES = 64
+
 # The "gave up with candidates unprobed" answer, distinct from both an offset and from None. A
 # plain sentinel rather than a bool so no caller can confuse it with a falsy offset.
 OVERLAY_UNPROBED = -1
@@ -353,9 +359,32 @@ def _overlay_offset(source: Path | bytes) -> int | None:
     inflates ends the search, an attacker chooses how many decoys sit in front of the real one.
 
     Every candidate in a window is probed before the bound is consulted, so the limit bites on the
-    number of WINDOWS walked rather than on a decoy count an attacker sets. A probe is a
-    decompressor rejecting a few bytes -- measured 20 chance gzip magics across 400 MiB of random
-    data, none of which inflated -- so probing them all is cheap and a real payload is still found.
+    number of WINDOWS walked rather than on a decoy count an attacker sets. Cutting a window's list
+    short instead would hand back the bypass the third answer exists to close: the file chooses how
+    many failing magics precede the real stream, so a cap applied mid-window is a cap the file
+    positions its payload behind.
+
+    What the file cannot be allowed to choose is the COST of that walk. Two things made it
+    expensive, and both are the same bytes being handled repeatedly rather than a real search:
+
+      * every probe reopened the file and re-read `_OVERLAY_PROBE_BYTES`. On a 1 MiB file of
+        adjacent gzip magics that was 349,522 opens re-reading 21 GB. The probe now comes from the
+        window already in hand, and only a candidate whose stream runs past the window's end falls
+        back to a read.
+      * every probe then ran a decompressor over 64 KiB, at 56 microseconds each -- 18 seconds for
+        one megabyte of upload. Overlapping magics produce the SAME probe bytes over and over, so
+        the decode is repeated rather than distinguishing anything: those 349,522 candidates are 22
+        distinct probes. Deduplicating on the probe's head collapses them to 22 decodes.
+
+    Deduplication cannot hide a payload, which is why it is safe where a cap is not: two candidates
+    with identical leading bytes decode identically, so skipping the second skips a repeat of an
+    answer already obtained. A file of 4,146 DISTINCT decoys in front of a real payload -- the
+    shape an attacker actually needs, since a repeat buys nothing -- stays 4,147 separate probes and
+    the payload is still found.
+
+    A probe is a decompressor rejecting a few bytes -- measured 20 chance gzip magics across
+    400 MiB of random data, none of which inflated -- so the cap is far above what any real file
+    reaches and a genuine payload is still found.
 
     Offset 0 is excluded deliberately: a stream that begins the file is not an overlay and the
     ordinary openers already read it.
@@ -365,13 +394,33 @@ def _overlay_offset(source: Path | bytes) -> int | None:
         found = sorted(
             at for magic in _OVERLAY_MAGIC for at in _offsets_of(window, magic) if base + at > 0
         )
+        seen: set[bytes] = set()
         for at in found:
-            if _decompresses(_read_at(source, base + at, _OVERLAY_PROBE_BYTES) or b""):
+            probe = _probe_bytes(source, window, base, at)
+            # Keyed on the head rather than the whole probe, so the key costs a slice instead of a
+            # 64 KiB hash. Two streams agreeing over this much and diverging later would both have
+            # to be real streams, and the first is returned in that case anyway.
+            if (key := probe[:_OVERLAY_PROBE_KEY_BYTES]) in seen:
+                continue
+            seen.add(key)
+            if _decompresses(probe):
                 return base + at
         probed += len(found)
         if probed > _MAX_OVERLAY_CANDIDATES:
             return OVERLAY_UNPROBED
     return None
+
+
+def _probe_bytes(source: Path | bytes, window: bytes, base: int, at: int) -> bytes:
+    """The bytes at `at` used to decide whether a candidate really is a compressed stream.
+
+    Served from the window already read whenever it holds the whole probe. Re-reading the file per
+    candidate is what made a window of adjacent magics expensive, and the window is the same bytes:
+    the read only happens where the probe would run off its end.
+    """
+    if len(window) - at >= _OVERLAY_PROBE_BYTES:
+        return window[at : at + _OVERLAY_PROBE_BYTES]
+    return _read_at(source, base + at, _OVERLAY_PROBE_BYTES) or b""
 
 
 def _overlay_payload(source: Path | bytes, at: int, cap: int) -> bytes | None:

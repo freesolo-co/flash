@@ -6529,3 +6529,124 @@ def test_a_new_format_packet_length_is_decoded_for_every_tag(tmp_path):
     literal = tmp_path / "literal.gpg"
     literal.write_bytes(bytes([0xCB, 0xFF]) + len(filler).to_bytes(4, "big") + filler + secret)
     assert credential_in_file(literal) == "a private key"
+
+
+def test_jwk_markers_pair_within_one_record_not_across_a_dataset(tmp_path):
+    """Two harmless JSONL rows are not one private key.
+
+    The halves were paired across the whole stream, so a dataset holding a PUBLIC JWK in one row
+    and an ordinary high-entropy string under a private member name in another -- a build id, a
+    timestamped artifact name -- had both markers present and neither row held a key. The publish
+    was refused over a file with no credential in it, and the entropy test cannot separate the two
+    because a build id scores exactly as random as a key body does.
+    """
+    from flash.env_secrets import credential_in_file
+
+    unrelated = tmp_path / "shard.jsonl"
+    unrelated.write_bytes(
+        b'{"kty":"RSA","n":"public-only","e":"AQAB"}\n{"d":"2026-08-14T12-34-56Z-build-123456"}\n'
+    )
+    assert credential_in_file(unrelated) is None
+
+    # the same two markers in ONE object is a real key and still refuses
+    together = tmp_path / "key.jwk"
+    together.write_bytes(b'{"kty":"RSA","n":"public-only","d":"%s"}' % _FAKE_KEY_BODY.encode())
+    assert credential_in_file(together) == "a private key"
+
+
+def test_a_jwk_pairs_across_any_distance_inside_one_object(tmp_path):
+    """Record scoping must not reintroduce the window it replaced.
+
+    JWK members may sit any distance apart with arbitrary extension members between them, so a real
+    key with megabytes of metadata between `kty` and `d` -- either way round, and spanning several
+    read chunks -- has to pair. A boundary that split on distance rather than on the enclosing
+    object would publish exactly that key.
+    """
+    from flash.env_secrets import credential_in_file
+
+    padding = b'"pad":"' + b"m" * (3 << 20) + b'"'
+    for name, body in (
+        ("forward.jwk", b'{"kty":"RSA",' + padding + b',"d":"%s"}' % _FAKE_KEY_BODY.encode()),
+        ("reverse.jwk", b'{"d":"%s",' % _FAKE_KEY_BODY.encode() + padding + b',"kty":"RSA"}'),
+        # nested members must not close the record: only a brace back to depth zero ends it
+        ("nested.jwk", b'{"kty":"RSA","x":{"y":{"z":1}},"d":"%s"}' % _FAKE_KEY_BODY.encode()),
+        # a brace inside a STRING is not a boundary, or a crafted value splits a real key
+        ("quoted.jwk", b'{"kty":"RSA","c":"} {","d":"%s"}' % _FAKE_KEY_BODY.encode()),
+        # a format with no braces at all is one record, which is what a netrc relies on
+        ("bare.jwk", b'"kty":"RSA"\n"d":"%s"\n' % _FAKE_KEY_BODY.encode()),
+    ):
+        published = tmp_path / name
+        published.write_bytes(body)
+        assert credential_in_file(published) == "a private key", name
+
+
+def test_a_netrc_entry_spanning_lines_is_still_one_record(tmp_path):
+    """A `.netrc` writes one entry over several lines, and both halves are in it.
+
+    Splitting records at the newline read like the separator of a line-delimited file, but a netrc
+    entry is `machine`, `login` and `password` on three separate lines -- so it put the two halves
+    in different records and published the key.
+    """
+    from flash.env_secrets import credential_in_file
+
+    entry = b"machine api.wandb.ai\n  login user\n  password %s\n" % _FAKE_KEY_BODY.encode()
+    for name, body in (
+        (".netrc", entry),
+        # a brace ANYWHERE in the file is what makes the boundary scan run at all, so the
+        # line-spanning entry has to survive it too -- a comment naming `${HOME}` is enough, and
+        # so is an unrelated JSON line in the same file.
+        ("commented.netrc", b"# see ${HOME}/.netrc\n" + entry),
+        ("mixed.netrc", b'{"note":"creds below"}\n' + entry),
+    ):
+        published = tmp_path / name
+        published.write_bytes(body)
+        assert credential_in_file(published) == "a machine password in a netrc file", name
+
+
+def test_the_wrapped_block_guard_is_linear_in_the_run_it_rejects(tmp_path):
+    """The cheap guard in front of the joining pattern must not be quadratic.
+
+    Widening it to accept narrower columns as an open-ended run made it take the longest match at
+    every start position and backtrack it away one character at a time when no break followed:
+    53 seconds on 100 KB of one long non-matching run, and hours on the megabyte chunks the scan
+    actually reads. A single unbroken run of base64 characters is an ordinary thing for a file to
+    contain, so this is reached without anyone crafting it.
+    """
+    import time
+
+    from flash.env_base64 import _WRAPPED_HINT
+
+    # one long run with no break after it: the shape that has no match to find
+    haystack = b'{"pad":"' + b"z" * (1 << 20) + b'"}\n'
+    started = time.monotonic()
+    assert _WRAPPED_HINT.search(haystack) is None
+    assert time.monotonic() - started < 5
+
+    # and it still recognises the blocks it was widened for, at every column in the range
+    for width in (32, 64, 76, 128):
+        wrapped = (b"a" * width + b"\n") * 2
+        assert _WRAPPED_HINT.search(wrapped), width
+    assert _WRAPPED_HINT.search(b"a" * 31 + b"\n") is None
+
+
+def test_an_overlay_search_does_not_reprobe_identical_candidates(tmp_path):
+    """Overlapping magics are the same probe repeated, not a search.
+
+    A file of adjacent gzip magics presents one candidate every three bytes, and each used to reopen
+    the file, re-read 64 KiB and run a decompressor over it: 349,522 probes and 21 GB of reads for
+    one megabyte of upload, which one authenticated publish could spend a worker's time on. Those
+    candidates are 22 DISTINCT probes.
+
+    Deduplicating cannot hide a payload -- two candidates with identical leading bytes decode
+    identically -- which is why the cap itself stays where it was, applied per window rather than
+    inside one.
+    """
+    import time
+
+    from flash.env_formats import OVERLAY_UNPROBED, _overlay_offset
+
+    spam = tmp_path / "spam.run"
+    spam.write_bytes(b"#!/bin/sh\n" + b"\x1f\x8b\x08" * 350_000)
+    started = time.monotonic()
+    assert _overlay_offset(spam) == OVERLAY_UNPROBED
+    assert time.monotonic() - started < 10

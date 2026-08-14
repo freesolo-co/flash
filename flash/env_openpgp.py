@@ -28,6 +28,11 @@ _MAX_OPENPGP_PACKETS = 64
 # `False` otherwise. Never a real packet: no OpenPGP packet has a first byte with bit 7 clear.
 _TRUNCATED_PACKET = b"\x00"
 
+# Yielded when the packet-count bound is reached with bytes still unwalked. Separate from
+# `_TRUNCATED_PACKET` because it is undecided unconditionally: the unexamined bytes are in hand,
+# not beyond the buffer, so no statement about what follows the chunk can make them absent.
+_UNWALKED_REMAINDER = b"\x01"
+
 # What a Java KeyStore and a JCEKS store begin with. Named so the scan can tell in four bytes
 
 _MAX_PGP_RECIPIENTS = 256
@@ -274,6 +279,11 @@ def _openpgp_packet_starts(head: bytes) -> Iterator[bytes]:
     Bounded by `_MAX_OPENPGP_PACKETS`. A real key block is a handful of packets; a file claiming
     more than this is either not a keyring or is one no publish needs, and an unbounded walk over
     attacker-chosen lengths is a denial-of-service surface.
+
+    Reaching that bound with bytes still unwalked yields `_TRUNCATED_PACKET`, exactly as running
+    past the buffer does. Ending the generator normally made the cap its own bypass: 64 valid
+    literal-data packets in front of a secret key returned `False` -- a confident "no key here"
+    about a remainder never examined -- while 63 of them reported the key correctly.
     """
     for _ in range(_MAX_OPENPGP_PACKETS):
         if not head:
@@ -306,6 +316,13 @@ def _openpgp_packet_starts(head: bytes) -> Iterator[bytes]:
             yield _TRUNCATED_PACKET
             return
         head = head[offset + body :]
+    # The loop bound, reached with bytes still in hand: the remainder is unwalked, not absent.
+    # A distinct sentinel from `_TRUNCATED_PACKET`, because the two are undecided for different
+    # reasons. Running past the buffer is only undecided when more bytes follow -- at end of file
+    # it is an ordinary corrupt keyring. Exhausting the cap leaves bytes unexamined that are RIGHT
+    # HERE, so it is undecided whatever the caller says about what follows.
+    if head:
+        yield _UNWALKED_REMAINDER
 
 
 def _openpgp_secret_key_in_sequence(head: bytes, *, truncated: bool = False) -> bool | None:
@@ -329,6 +346,8 @@ def _openpgp_secret_key_in_sequence(head: bytes, *, truncated: bool = False) -> 
     if leading is not False:
         return leading
     for packet in _openpgp_packet_starts(head):
+        if packet is _UNWALKED_REMAINDER:
+            return None
         if packet is _TRUNCATED_PACKET:
             return None if truncated else False
         if _is_openpgp_secret_key(packet):

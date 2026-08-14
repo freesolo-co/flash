@@ -55,10 +55,10 @@ _BASE64_RUN = re.compile(rb"[A-Za-z0-9+/\-_]{%d,}={0,2}" % _MIN_BASE64_RUN)
 _URL_SAFE_ALPHABET = bytes.maketrans(b"-_", b"+/")
 
 # A fixed-width wrapped base64 block: one or more full-width lines, then a final line of any
-# length. The widths are the two conventions in use -- 76 for MIME (`base64.encodebytes`, mail,
-# many `kubectl -o yaml` outputs) and 64 for PEM bodies. Joining ONLY these leaves ordinary
-# adjacent lines alone, so no arbitrary pair of values is welded into a run that decodes to
-# something neither line contained.
+# length. Every line but the last shares one width, which is what leaves ordinary adjacent lines
+# alone -- no arbitrary pair of values is welded into a run that decodes to something neither line
+# contained. 76 (MIME: `base64.encodebytes`, mail, many `kubectl -o yaml` outputs) and 64 (PEM
+# bodies) are the common conventions, but they are not the only ones in use.
 #
 # ONE full line is enough to qualify, not two. Requiring two meant the commonest shape of all --
 # a blob just over the width, so one full line plus a short tail -- never joined, and a key
@@ -77,15 +77,44 @@ _URL_SAFE_ALPHABET = bytes.maketrans(b"-_", b"+/")
 # meant a url-safe blob was never recognised as wrapped. Its lines were then left unjoined and a
 # credential straddling a break decoded into neither side -- the exact bypass joining exists to
 # close, reachable by encoding with the other alphabet.
+#
+# Any consistent width is joined, not just 76 and 64. Naming those two covered MIME and PEM and
+# nothing else, so a blob wrapped at another column -- `base64 -w 72`, an editor reflow, a generator
+# with its own convention -- arrived as independent per-line runs and a credential crossing a break
+# decoded into neither side. That is the same bypass joining exists to close, reachable by choosing
+# a different column.
+# The range of line widths a wrapped base64 block may use. The floor keeps ordinary prose and short
+# adjacent values from being welded together -- real wrapping is never narrow -- and the ceiling is
+# the widest column any encoder emits before switching to a single unbroken line.
+_MIN_WRAP_WIDTH = 32
+_MAX_WRAP_WIDTH = 128
+
+#
+# Built as an alternation over widths rather than written out, because a regex cannot back-reference
+# a LENGTH: `(\w{64})\n\1` would compare the characters, not the column. Enumerating every width in
+# the range keeps each alternative exactly as strict as the two hardcoded ones were -- within one
+# alternative all lines but the last are the same fixed width -- while covering the columns real
+# encoders actually use. Widest first so the longest valid join wins.
+_WRAP_WIDTHS = range(_MIN_WRAP_WIDTH, _MAX_WRAP_WIDTH + 1)
 _WRAPPED_BLOCK = re.compile(
-    rb"(?:[A-Za-z0-9+/\-_]{76}\r?\n[ \t]*)+[A-Za-z0-9+/\-_]{1,76}={0,2}"
-    rb"|(?:[A-Za-z0-9+/\-_]{64}\r?\n[ \t]*)+[A-Za-z0-9+/\-_]{1,64}={0,2}"
+    b"|".join(
+        rb"(?:[A-Za-z0-9+/\-_]{%d}\r?\n[ \t]*)+[A-Za-z0-9+/\-_]{1,%d}={0,2}" % (width, width)
+        for width in reversed(_WRAP_WIDTHS)
+    )
 )
 # A necessary condition for the block above: a full-width line of base64 followed by a break. Cheap
 # to reject, and it fails on essentially every real file, so the expensive alternation only runs
-# where a wrapped block could actually be. Same alphabet as the block, or the guard rejects
-# precisely the url-safe blobs the block was widened to join.
-_WRAPPED_HINT = re.compile(rb"[A-Za-z0-9+/\-_]{64}\r?\n")
+# where a wrapped block could actually be. Same alphabet AND same minimum width as the block, or
+# the guard rejects precisely the blobs the block was widened to join -- it hardcoded 64 while
+# the block accepted narrower columns, which made the widening inert for every one of them.
+#
+# A fixed-width LOOKBEHIND on the break rather than an open-ended run before it. `{32,}` reads the
+# same but is quadratic: the engine takes the longest run at every start position and backtracks it
+# away one character at a time when no break follows, which is 53 seconds on 100 KB of one long
+# non-matching run and hours on the megabyte chunks this actually runs over. The lookbehind asks
+# the same question -- are the 32 characters before this break all base64 -- at each break only,
+# which is linear and measured within noise of the single fixed-width test it replaced.
+_WRAPPED_HINT = re.compile(rb"(?<=[A-Za-z0-9+/\-_]{%d})\r?\n" % _MIN_WRAP_WIDTH)
 # The break itself, removed when a block is joined -- with any indent that follows it, or the
 # joined run would still carry spaces outside the base64 alphabet. Both endings, so a CRLF blob
 # joins into a continuous run rather than one still carrying stray `\r` bytes.

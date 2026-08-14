@@ -9,6 +9,7 @@ about files, archives or the publish.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from typing import Protocol
 
 # Bodies are bounded rather than open-ended so a match has a maximum length, which is what lets
@@ -320,6 +321,110 @@ class _NotCertificateOnlyPkcs12:
         return found
 
 
+# Where one record of a multi-record file ends: a top-level `}` closing back to depth zero. Below
+# the top level a `}` closes a nested member and does NOT end the record, which is what keeps a
+# real JWK carrying nested extension objects -- or one wrapped in an enclosing document -- whole.
+#
+# Only the brace, never a newline. A newline reads like the separator of a line-delimited file, but
+# it is redundant for JSONL, whose rows already close their own brace, and WRONG for the formats
+# whose records legitimately span lines: a `.netrc` entry is `machine`, `login` and `password` on
+# three separate lines, and splitting at the newline put its two halves in different records and
+# published the key. Braces alone leave a brace-free format as one record, which is the behaviour
+# those detectors already had.
+#
+# Strings are skipped whole so a brace INSIDE a quoted value cannot split a record --
+# `{"note":"} ", "kty":"RSA", "d":"..."}` is one object, and treating its quoted `}` as the end
+# would separate the halves of a genuine key and publish it. The escape alternative is what makes
+# `"\\"` end the string and `"\""` not.
+#
+# The `*+` is possessive: without it an unterminated string backtracks over every position in the
+# rest of the file, which on a megabyte chunk is the same quadratic cost the span between markers
+# was removed for. Possessive quantifiers are available from Python 3.11, which is the floor this
+# package already declares.
+_JSON_RECORD_SPLIT = re.compile(rb'"(?:[^"\\]|\\.)*+"?|(\{)|(\})')
+
+
+class _RecordSplitter:
+    """Where the top-level records of a stream end, tracked across the chunks it arrives in.
+
+    Separate from the pairing so the tokenizing runs ONCE per window rather than once per detector.
+    Each detector asking for its own boundaries cost 18 ms per megabyte per detector, which on the
+    300 MiB expansion the padding test scans was 16 seconds of duplicated work and pushed that scan
+    past its budget -- the scan then refused a file it had previously read to the end.
+    """
+
+    def __init__(self) -> None:
+        # Depth is carried between windows so a record split across chunks is not read as two. It
+        # starts at zero, which is also the depth of a brace-free format such as a `.netrc`: those
+        # produce no boundaries at all and are one record, as they were before this existed.
+        self.depth = 0
+
+    def ends(self, data: bytes) -> list[int]:
+        """The offsets in `data` just past each top-level record boundary.
+
+        Skipped entirely when the window holds no brace at all. `bytes.find` is a memchr scan and
+        the tokenizer is not, so this keeps the cost off the padding, the binary members and the
+        prose that make up almost every byte actually scanned.
+        """
+        if b"{" not in data and b"}" not in data:
+            return []
+        found = []
+        for token in _JSON_RECORD_SPLIT.finditer(data):
+            if token.group(1):
+                self.depth += 1
+            elif token.group(2):
+                # Never below zero: a stray `}` in prose would otherwise leave the depth negative
+                # and every later `{` would close a record early, splitting a real key in two.
+                self.depth = max(0, self.depth - 1)
+                if not self.depth:
+                    found.append(token.end())
+        return found
+
+
+class _RecordHalves:
+    """Pairs one detector's halves within a single record rather than across a whole file.
+
+    A stream-wide pairing combined unrelated records: a JSONL dataset holding a PUBLIC JWK in one
+    row and an ordinary high-entropy string under a private member name in another -- a build id,
+    a timestamped artifact name -- has both halves present in the file and neither row holds a key.
+    That refused a legitimate publish, and the entropy test cannot separate the two because a build
+    id scores exactly as random as a key body does.
+
+    Scoped by RECORD rather than by distance. A window would reintroduce the bug the stream-wide
+    pairing exists to fix: JWK members may sit any distance apart, so a real key with a megabyte of
+    metadata between `kty` and `d` must still pair, and it does here because that metadata is
+    inside the same object. Only a top-level record boundary separates halves.
+
+    State is carried between calls so the chunked scan can hand over one window at a time. A record
+    straddling a chunk boundary keeps its seen halves; a record that ENDS inside the window clears
+    them, which is what stops the next record inheriting the last one's markers.
+    """
+
+    def __init__(self, detector: _TwoMarkers) -> None:
+        self.detector = detector
+        self.context = False
+        self.payload: re.Match[bytes] | None = None
+
+    def paired(self, data: bytes, ends: list[int]) -> re.Match[bytes] | None:
+        """The payload match of the first record in `data` holding BOTH halves, or None."""
+        start = 0
+        for boundary in ends:
+            if found := self._absorb(data[start:boundary]):
+                return found
+            self.context = False
+            self.payload = None
+            start = boundary
+        return self._absorb(data[start:])
+
+    def _absorb(self, record: bytes) -> re.Match[bytes] | None:
+        """Fold one record fragment into the halves seen so far, returning a completed pair."""
+        if not record:
+            return None
+        self.context = self.context or bool(self.detector.context.search(record))
+        self.payload = self.payload or self.detector.payload_match(record)
+        return self.payload if self.context and self.payload else None
+
+
 class _TwoMarkers:
     """A credential identified by two markers that may sit any distance apart, in either order.
 
@@ -337,8 +442,8 @@ class _TwoMarkers:
         self.context = context
         self.payload = payload
 
-    def payload_match(self, data: bytes) -> re.Match[bytes] | None:
-        """The payload half's match in `data` whose captured body looks issued, or None.
+    def payload_matches(self, data: bytes) -> Iterator[re.Match[bytes]]:
+        """Every payload-half match in `data` whose captured body looks issued.
 
         The captured body goes through the same entropy test as every other pattern's. The comment
         on the netrc pair says placeholders are filtered by it, but nothing applied it: this class
@@ -347,23 +452,22 @@ class _TwoMarkers:
         credential, and a dataset row whose long `"d"` field is an English word was reported as a
         private key.
 
-        A method rather than a filter inside `search`, because the CHUNKED scan does not call
-        `search`: it pairs the halves across the whole stream by calling `context` and `payload`
-        itself. Filtering in only one of the two left the streaming path -- which is every file
-        over a megabyte, and every file this check actually reads -- matching placeholders exactly
-        as before, so both paths ask this one question instead.
+        Every match rather than the first, because the halves are paired per RECORD: the first
+        high-entropy body in a file may sit in a record with no context marker while a later one
+        sits beside its own. Stopping at the first would decide the whole file on that record.
         """
         for payload in self.payload.finditer(data):
             body = next((found for found in payload.groups() if found), b"")
             if _is_high_entropy(body):
-                return payload
-        return None
+                yield payload
+
+    def payload_match(self, data: bytes) -> re.Match[bytes] | None:
+        """The first payload-half match in `data` whose captured body looks issued, or None."""
+        return next(self.payload_matches(data), None)
 
     def search(self, data: bytes) -> re.Match[bytes] | None:
-        """The payload's match when the context marker accompanies it anywhere in `data`."""
-        if not (payload := self.payload_match(data)):
-            return None
-        return payload if self.context.search(data) else None
+        """The payload's match when the context marker shares a RECORD with it in `data`."""
+        return _RecordHalves(self).paired(data, _RecordSplitter().ends(data))
 
 
 # An all-hex body of key length. Recognised so `_is_high_entropy` admits a legacy 40-hex W&B key,
