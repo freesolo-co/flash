@@ -9272,3 +9272,23 @@ def test_retained_stream_fragments_are_bounded_by_compaction() -> None:
     assert len(content.parts) <= 2 * trace_sse._FRAGMENT_COMPACT_THRESHOLD
     assert accumulator.output()["choices"][0]["message"]["content"] == "x" * 20_000
     assert accumulator.defect is None
+
+
+def test_a_streamed_structured_reply_is_redacted_after_assembly() -> None:
+    """A structured reply arrives split across deltas, so the credential exists only once the
+    accumulator has joined them. The assembled reply lands in the same `choices[].message.content`
+    the non-streamed form uses, so it must be redacted on the same rule rather than by chance."""
+
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=1 << 20)
+    for piece in ['{"passw', 'ord": "', 'STREAMEDLEAK"}']:
+        accumulator.feed(
+            b'data: {"choices":[{"index":0,"delta":{"content":'
+            + json.dumps(piece).encode()
+            + b"}}]}\n\n"
+        )
+    accumulator.feed(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n')
+    accumulator.finish()
+
+    output = accumulator.output()
+    assert output["choices"][0]["message"]["content"] == '{"password": "STREAMEDLEAK"}'
+    assert "STREAMEDLEAK" not in json.dumps(traces._sanitize_for_trace(output, (), response=True))
