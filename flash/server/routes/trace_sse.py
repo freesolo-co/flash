@@ -552,6 +552,12 @@ class SseAccumulator:
                 "logprobs": {},
                 "extensions": {},
                 "finish_reason": None,
+                # `message` and `delta` are alternative representations of the same reply, so a
+                # choice that switches between them across events is not assembling one response.
+                "mode": None,
+                # the seeded role is a default, not something the provider stated. tracking the
+                # first EXPLICIT role separately keeps a later conflicting one from replacing it.
+                "explicit_role": None,
             },
         )
 
@@ -646,6 +652,8 @@ class SseAccumulator:
                 continue
             if message is not None:
                 if isinstance(message, dict):
+                    if self._switches_mode(state, "message"):
+                        continue
                     self._consume_delta(state, message)
                 else:
                     self._note_defect("stream choice contained a non-object message")
@@ -657,7 +665,8 @@ class SseAccumulator:
             if "delta" in choice:
                 delta = choice["delta"]
                 if isinstance(delta, dict):
-                    self._consume_delta(state, delta)
+                    if not self._switches_mode(state, "delta"):
+                        self._consume_delta(state, delta)
                 elif delta is not None:
                     self._note_defect("stream choice contained a non-object delta")
             if "logprobs" in choice:
@@ -681,6 +690,16 @@ class SseAccumulator:
                     # reply, so `records` exported truncated text as a completed training target.
                     self._note_defect("stream choice reported conflicting finish reasons")
 
+    def _switches_mode(self, state: dict[str, Any], mode: str) -> bool:
+        """Whether this choice already streamed the OTHER representation; records a defect if so."""
+        if state["mode"] is None:
+            state["mode"] = mode
+            return False
+        if state["mode"] == mode:
+            return False
+        self._note_defect("stream choice switched between message and delta")
+        return True
+
     def _consume_delta(self, state: dict[str, Any], delta: dict[str, Any]) -> None:
         if self.truncated:
             return
@@ -688,8 +707,15 @@ class SseAccumulator:
         role = delta.get("role")
         if role is not None:
             if isinstance(role, str) and role:
-                if self._reserve(role):
-                    message["role"] = role
+                if state["explicit_role"] is None:
+                    if self._reserve(role):
+                        state["explicit_role"] = role
+                        message["role"] = role
+                elif state["explicit_role"] != role:
+                    # a later role does not reclassify text already emitted under the first one.
+                    # overwriting it recorded content streamed as `tool` as an assistant reply,
+                    # which `records` would then export as a training target.
+                    self._note_defect("stream choice reported conflicting roles")
             else:
                 self._note_defect("stream choice contained a non-string role")
         # every text-shaped delta field, not a fixed pair. providers stream their own alongside the

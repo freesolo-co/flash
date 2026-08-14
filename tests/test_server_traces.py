@@ -4258,6 +4258,148 @@ def test_deeply_nested_fragment_is_bounded_instead_of_recursing() -> None:
     assert trace_sse._merge_fragment_dict({}, json.loads(deep_json(3))) is True
 
 
+def test_unparseable_structured_tool_result_is_redacted() -> None:
+    """A truncated tool result cannot be inspected, so keeping it verbatim leaks its credentials.
+
+    Prose is still the ordinary case for tool output and must survive: only text that LOOKS
+    structured is blanked.
+    """
+    payload = {
+        "messages": [
+            {"role": "tool", "content": '{"password":"HUNTER2"'},
+            {"role": "tool", "content": "the weather in paris is sunny"},
+            {"role": "user", "content": '{"password":"HUNTER2"'},
+        ]
+    }
+
+    redacted = traces._redact_secret_fields(payload)["messages"]
+
+    assert redacted[0]["content"] == "[redacted]"
+    assert redacted[1]["content"] == "the weather in paris is sunny"
+    # a user turn is the caller's own text, not tool output, and is never reinterpreted
+    assert redacted[2]["content"] == '{"password":"HUNTER2"'
+
+
+def test_schema_host_names_only_count_at_the_payload_root() -> None:
+    """`tools` names a schema host only as the request's own declaration.
+
+    Recognizing the name anywhere let ordinary nested metadata open a host for its whole subtree
+    and keep a secret-named property's literal verbatim.
+    """
+    nested = {
+        "metadata": {
+            "tools": {
+                "parameters": {
+                    "type": "object",
+                    "properties": {"password": {"type": "string", "value": "SECRET"}},
+                }
+            }
+        }
+    }
+    declared = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "login",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"password": {"type": "string", "default": "SECRET"}},
+                    },
+                },
+            }
+        ]
+    }
+
+    assert "SECRET" not in json.dumps(traces._redact_secret_fields(nested))
+    declared_function = traces._redact_secret_fields(declared)["tools"][0]["function"]
+    assert declared_function["parameters"]["properties"]["password"] == {
+        "type": "string",
+        "default": "[redacted]",
+    }
+
+
+def test_zero_padded_default_port_resolves_to_the_local_resource() -> None:
+    """`0443` and `443` are the same port, so a padded reference is still local.
+
+    A textual comparison kept the padding, classified the reference external, and left the local
+    target's secret schema literals visible.
+    """
+    canonical = trace_redaction._canonical_resource_uri
+
+    assert canonical("https://example.com:0443/schema") == canonical("https://example.com/schema")
+    assert canonical("http://example.com:080/s") == canonical("http://example.com/s")
+    # a genuinely different port still identifies a different resource
+    assert canonical("https://example.com:8443/s") != canonical("https://example.com/s")
+
+
+def test_malformed_resource_uri_does_not_abandon_the_trace() -> None:
+    """An unparseable `$id` is untrusted payload input, not a bug here.
+
+    Letting `ValueError` escape abandoned the whole trace after the upstream call had already been
+    paid for, so not even the provider's rejection could be exported.
+    """
+    malformed = {"$id": "http://[broken", "type": "string", "default": "SECRET"}
+    well_formed = {"$id": "http://ok.example/s", "type": "string", "default": "SECRET"}
+
+    # sanitization completes, and an unparseable identifier behaves exactly like a parseable one
+    # that nothing references: unresolvable, so it grants no exemption of its own.
+    assert traces._redact_secret_fields(malformed) == traces._redact_secret_fields(well_formed) | {
+        "$id": "http://[broken"
+    }
+    assert trace_redaction._canonical_resource_uri("http://[broken") == "http://[broken"
+
+
+def test_choice_switching_between_message_and_delta_is_malformed() -> None:
+    """`message` and `delta` are alternatives, so switching across events is not one response."""
+    switched = trace_sse.SseAccumulator()
+    switched.feed(
+        b'data: {"choices":[{"index":0,"message":{"content":"FULL"}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{"content":"DELTA"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    switched.finish()
+
+    assert switched.defect == "stream choice switched between message and delta"
+    assert switched.output()["choices"][0]["message"]["content"] == "FULL"
+
+    streamed = trace_sse.SseAccumulator()
+    streamed.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"A"}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{"content":"B"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    streamed.finish()
+
+    assert streamed.defect is None
+    assert streamed.output()["choices"][0]["message"]["content"] == "AB"
+
+
+def test_conflicting_roles_across_deltas_are_malformed() -> None:
+    """A later role does not reclassify text already emitted under the first one."""
+    conflicting = trace_sse.SseAccumulator()
+    conflicting.feed(
+        b'data: {"choices":[{"index":0,"delta":{"role":"tool","content":"A"}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"B"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    conflicting.finish()
+
+    assert conflicting.defect == "stream choice reported conflicting roles"
+    assert conflicting.output()["choices"][0]["message"]["role"] == "tool"
+
+    repeated = trace_sse.SseAccumulator()
+    repeated.feed(
+        b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"A"}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"B"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    repeated.finish()
+
+    assert repeated.defect is None
+    assert repeated.output()["choices"][0]["message"]["content"] == "AB"
+
+
 def test_first_terminal_finish_reason_survives_a_later_one() -> None:
     """The FIRST terminal reason is the true one.
 

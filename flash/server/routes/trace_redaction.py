@@ -327,8 +327,8 @@ def _local_schema_pointer(
     base_uri: str = "",
 ) -> frozenset[tuple[str, ...]]:
     if not ref.startswith("#"):
-        ref_base, fragment = urldefrag(urljoin(base_uri, ref))
-        document_base = urldefrag(base_uri)[0]
+        ref_base, fragment = _safe_urldefrag(_safe_urljoin(base_uri, ref))
+        document_base = _safe_urldefrag(base_uri)[0]
         if not document_base or ref_base != document_base:
             return frozenset()
         ref = f"#{fragment}"
@@ -407,19 +407,58 @@ def _remove_dot_segments(path: str) -> str:
     return "".join(output)
 
 
+def _safe_urljoin(base: str, ref: str) -> str:
+    """Resolve `ref` against `base`, treating an unparseable URI as unresolvable.
+
+    Both arguments come from the recorded payload, so a malformed `$id` or `$ref` is untrusted
+    input rather than a bug. Letting `ValueError` escape abandoned the ENTIRE trace after the
+    upstream call had already completed -- not even the provider's rejection could be exported.
+    """
+    try:
+        return urljoin(base, ref)
+    except ValueError:
+        return ref
+
+
+def _safe_urldefrag(uri: str) -> tuple[str, str]:
+    try:
+        base, fragment = urldefrag(uri)
+    except ValueError:
+        return uri, ""
+    return base, fragment
+
+
+def _is_default_port(port: str, default_port: str | None) -> bool:
+    """Whether `port` denotes the scheme's default, compared numerically rather than textually.
+
+    `0443` and `443` are the same port: a string comparison kept the padded form, so the same
+    resource reached under it was classified external and its secret schema literals survived.
+    """
+    if default_port is None or not port.isdigit():
+        return False
+    return int(port) == int(default_port)
+
+
 def _canonical_resource_uri(uri: str) -> str:
-    scheme, netloc, path, query, fragment = urlsplit(uri)
+    try:
+        scheme, netloc, path, query, fragment = urlsplit(uri)
+    except ValueError:
+        # a malformed `$id` (an unterminated IPv6 literal, say) is untrustworthy input from the
+        # recorded payload, not a bug here. raising abandoned the WHOLE trace after the upstream
+        # call had already been paid for, so the identifier is treated as unresolvable instead and
+        # redaction continues conservatively: an unmatched reference redacts rather than exempts.
+        return uri
     normalized_scheme = scheme.casefold()
     default_port = {"http": "80", "https": "443"}.get(normalized_scheme)
     userinfo, user_separator, hostport = netloc.rpartition("@")
     if hostport.startswith("[") and (host_end := hostport.find("]")) >= 0:
         suffix = hostport[host_end + 1 :]
-        if suffix == ":" or (default_port is not None and suffix == f":{default_port}"):
+        if suffix == ":" or (suffix.startswith(":") and _is_default_port(suffix[1:], default_port)):
             suffix = ""
         hostport = f"[{hostport[1:host_end].casefold()}]{suffix}"
     else:
         host, port_separator, port = hostport.rpartition(":")
-        if port_separator and (not port or port == default_port):
+        if port_separator and (not port or _is_default_port(port, default_port)):
             hostport = host.casefold()
         else:
             hostport = f"{host.casefold()}:{port}" if port_separator else hostport.casefold()
@@ -458,8 +497,8 @@ def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[
         if isinstance(node, dict):
             resource_id = node.get("$id")
             if isinstance(resource_id, str):
-                base_uri = urljoin(base_uri, resource_id)
-                resources.setdefault(_canonical_resource_uri(urldefrag(base_uri)[0]), path)
+                base_uri = _safe_urljoin(base_uri, resource_id)
+                resources.setdefault(_canonical_resource_uri(_safe_urldefrag(base_uri)[0]), path)
             for key, item in node.items():
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                     collect(item, (*path, str(key)), base_uri, depth + 1)
@@ -535,7 +574,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
     document_id = value.get("$id")
     base_uri = document_id if isinstance(document_id, str) else ""
     resources = _schema_resource_pointers(value, depth=depth)
-    resources.setdefault(_canonical_resource_uri(urldefrag(base_uri)[0]), ())
+    resources.setdefault(_canonical_resource_uri(_safe_urldefrag(base_uri)[0]), ())
     resource_scopes = sorted(
         ((path, uri) for uri, path in resources.items()),
         key=lambda item: len(item[0]),
@@ -553,7 +592,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
         )
 
     def anchor_belongs_to_resource(pointer: tuple[str, ...], resource_uri: str) -> bool:
-        owner_uri = _canonical_resource_uri(urldefrag(scope_for(pointer))[0])
+        owner_uri = _canonical_resource_uri(_safe_urldefrag(scope_for(pointer))[0])
         return owner_uri == _canonical_resource_uri(resource_uri)
 
     def collect_refs(
@@ -565,7 +604,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
         if isinstance(node, dict):
             resource_id = node.get("$id")
             if isinstance(resource_id, str):
-                scope_uri = urljoin(scope_uri, resource_id)
+                scope_uri = _safe_urljoin(scope_uri, resource_id)
             for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
                 ref = node.get(keyword)
                 if isinstance(ref, str):
@@ -574,7 +613,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
                     # entry point. restricting it to the reference's resource kept literals on the
                     # outer target exposed, so dynamic keywords consider every same-named anchor.
                     is_dynamic = keyword in {"$dynamicRef", "$recursiveRef"}
-                    resolved_base, fragment = urldefrag(urljoin(scope_uri, ref))
+                    resolved_base, fragment = _safe_urldefrag(_safe_urljoin(scope_uri, ref))
                     canonical_base = _canonical_resource_uri(resolved_base)
                     resource_path = resources.get(canonical_base)
                     if resource_path is not None:
@@ -630,7 +669,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
         if isinstance(node, dict):
             resource_id = node.get("$id")
             if isinstance(resource_id, str):
-                scope_uri = urljoin(scope_uri, resource_id)
+                scope_uri = _safe_urljoin(scope_uri, resource_id)
             properties = node.get("properties")
             if isinstance(properties, dict):
                 for key, schema in properties.items():
@@ -671,15 +710,28 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
     return refs
 
 
+def _looks_structured(value: str) -> bool:
+    """Whether a string appears to carry JSON, whether or not it parses.
+
+    Used to tell truncated structured output -- whose nested credentials cannot be inspected --
+    from ordinary prose, which must survive verbatim.
+    """
+    stripped = value.strip()
+    if stripped.startswith(("{", "[")):
+        return True
+    return '":' in stripped or '": ' in stripped
+
+
 def _redact_tool_result_content(value: str, *, depth: int, flag: _SanitizationFlag | None) -> str:
     """Redact a tool message's `content`, which carries the tool's output rather than prose."""
     try:
         parsed = json.loads(value)
     except (ValueError, RecursionError):
-        # unlike function arguments, a tool result is not required to be json: prose is the
-        # ordinary case. a parse failure here means "this was never structured", so the text is
-        # kept as-is rather than blanked -- blanking would destroy legitimate tool output.
-        return value
+        # a tool result is not required to be json -- prose is the ordinary case -- so unparseable
+        # text is kept. but truncated or malformed structured output is common too, and its
+        # credentials cannot be inspected, so anything that LOOKS structured is blanked instead:
+        # keeping `{"password":"HUNTER2"` verbatim made a parse failure an exfiltration path.
+        return "[redacted]" if _looks_structured(value) else value
     if not isinstance(parsed, dict | list):
         return value
     redacted = _redact_secret_fields(parsed, depth=depth + 1, flag=flag)
@@ -695,6 +747,8 @@ def _redact_secret_fields(
     schema_context: bool = False,
     secret_schema_definition: bool = False,
     secret_schema_property: bool = False,
+    # the value handed to this function IS the payload root; recursion passes False explicitly.
+    payload_root: bool = True,
     response_root: bool = False,
     choice_list: bool = False,
     choice: bool = False,
@@ -702,7 +756,6 @@ def _redact_secret_fields(
     logprob_entries: bool = False,
     function_arguments: bool = False,
     tool_result_content: bool = False,
-    message_list: bool = False,
     function_container: bool = False,
     schema_host: bool = False,
     schema_wrapper: bool = False,
@@ -770,6 +823,7 @@ def _redact_secret_fields(
                     or referenced_secret_definition,
                     secret_schema_property=secret_schema_property
                     or (schema_definition and _is_secret_key(key)),
+                    payload_root=False,
                     response_root=False,
                     choice_list=response_root and key == "choices" and isinstance(item, list),
                     choice=choice_list,
@@ -784,11 +838,15 @@ def _redact_secret_fields(
                     tool_result_content=(
                         key == "content" and value.get("role") in {"tool", "function"}
                     ),
-                    message_list=key == "messages" and isinstance(item, list),
                     function_container=(
                         key == "function_call" or (tool_call and key == "function")
                     ),
-                    schema_host=schema_host or key in _SCHEMA_HOST_KEYS,
+                    # only the request's OWN declaration keys open a schema host, and only at the
+                    # payload root. recognizing the names anywhere let ordinary nested metadata --
+                    # `{"metadata": {"tools": {...}}}` -- open one for its whole subtree and keep a
+                    # secret-named property's literal verbatim. inside a host the flag stays set,
+                    # since a real declaration nests (`tools[].function.parameters`).
+                    schema_host=schema_host or (payload_root and key in _SCHEMA_HOST_KEYS),
                     schema_wrapper=schema_wrapper
                     or wrapper_has_schema
                     or (schema_context and _is_schema_map_keyword(key, item)),
@@ -813,6 +871,7 @@ def _redact_secret_fields(
                 choice=choice_list,
                 logprobs=logprobs,
                 logprob_entries=logprob_entries,
+                payload_root=False,
                 schema_host=schema_host,
                 tool_call=tool_call_list,
                 schema_wrapper=schema_wrapper,
@@ -822,6 +881,24 @@ def _redact_secret_fields(
             )
             for index, item in enumerate(value)
         ]
+    return _redact_secret_scalar(
+        value,
+        depth=depth,
+        tool_result_content=tool_result_content,
+        function_arguments=function_arguments,
+        flag=flag,
+    )
+
+
+def _redact_secret_scalar(
+    value: Any,
+    *,
+    depth: int,
+    tool_result_content: bool,
+    function_arguments: bool,
+    flag: _SanitizationFlag | None,
+) -> Any:
+    """Redact a leaf value, whose handling depends on the field that carries it."""
     if tool_result_content and isinstance(value, str):
         return _redact_tool_result_content(value, depth=depth, flag=flag)
     if function_arguments and isinstance(value, str):
@@ -878,5 +955,5 @@ def _sanitize_for_trace(
     response: bool = False,
     flag: _SanitizationFlag | None = None,
 ) -> Any:
-    redacted = _redact_secret_fields(value, response_root=response, flag=flag)
+    redacted = _redact_secret_fields(value, payload_root=True, response_root=response, flag=flag)
     return _redact_secret_values(redacted, secrets, flag=flag)
