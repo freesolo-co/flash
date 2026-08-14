@@ -96,19 +96,28 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
 # published. A `secrets.yaml` or a Helm values file is an ordinary thing to keep beside an
 # environment, and both write keys this way.
 _BLOCK_SCALAR = rb"(?:[|>][+-]?[0-9]?\s*)?"
+# The opening quote, if any. A single optional quote character consumed only ONE of the three in a
+# triple-quote delimiter, leaving a quote sitting where the body had to begin, so an ordinary
+# Python or TOML multiline assignment matched nothing and published. Whole delimiters are named,
+# longest first, so all three forms are consumed together.
+_OPEN_QUOTE = rb"(?:\"\"\"|'''|[\"'])?"
 _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     (
         "a Weights & Biases API key",
         re.compile(
-            rb"(?i:wandb_api_key)[\"']?\s*[:=]\s*" + _BLOCK_SCALAR + rb"[\"']?"
-            rb"([A-Za-z0-9_-]{40,%d})" % _MAX_BODY
+            rb"(?i:wandb_api_key)[\"']?\s*[:=]\s*"
+            + _BLOCK_SCALAR
+            + _OPEN_QUOTE
+            + rb"([A-Za-z0-9_-]{40,%d})" % _MAX_BODY
         ),
     ),
     (
         "an AWS secret access key",
         re.compile(
-            rb"(?i:aws_secret_access_key)[\"']?\s*[:=]\s*" + _BLOCK_SCALAR + rb"[\"']?"
-            rb"([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])"
+            rb"(?i:aws_secret_access_key)[\"']?\s*[:=]\s*"
+            + _BLOCK_SCALAR
+            + _OPEN_QUOTE
+            + rb"([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])"
         ),
     ),
 )
@@ -135,21 +144,28 @@ _JWK_KTY = re.compile(rb"\"kty\"\s*:\s*\"(?:RSA|EC|OKP|oct)\"")
 _JWK_PRIVATE = re.compile(rb"\"(?:d|dp|dq|qi|k)\"\s*:\s*\"[A-Za-z0-9+/\-_]{20,}={0,2}\"")
 
 
-class _JwkPrivateKey:
-    """A private JSON Web Key: a `kty` naming a key type, plus at least one private member.
+class _TwoMarkers:
+    """A credential identified by two markers that may sit any distance apart, in either order.
 
     Presented as a pattern object because `_match` iterates `(kind, pattern)` pairs and calls
-    `.search`; the two markers cannot be one regex without reintroducing the span between them.
+    `.search`. The pair cannot be one regex: a span between them (`[\\s\\S]{0,N}?`) is wrong in
+    both directions -- it misses a real key whose halves sit further apart than N, and it
+    backtracks over every position in between, which cost 4.2 seconds per MiB on near-matching
+    input. Searching for each independently is exact at any distance and linear.
+
+    `context` is the half that identifies the FORMAT and `payload` the half that carries the
+    secret; the payload's match is returned so a caller can report where it is.
     """
 
-    _KTY = _JWK_KTY
-    _PRIVATE = _JWK_PRIVATE
+    def __init__(self, context: re.Pattern[bytes], payload: re.Pattern[bytes]) -> None:
+        self.context = context
+        self.payload = payload
 
     def search(self, data: bytes) -> re.Match[bytes] | None:
-        """The private member's match when a `kty` accompanies it anywhere in `data`, else None."""
-        if not (private := self._PRIVATE.search(data)):
+        """The payload's match when the context marker accompanies it anywhere in `data`."""
+        if not (payload := self.payload.search(data)):
             return None
-        return private if self._KTY.search(data) else None
+        return payload if self.context.search(data) else None
 
 
 # An all-hex body of key length. Recognised so `_is_high_entropy` admits a legacy 40-hex W&B key,
@@ -195,11 +211,17 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
     # Anchored on the header together with the `Private-Lines` body, for the same reason the PEM
     # pattern requires base64 after its header: the header alone appears in documentation and in
     # the PUBLIC half that PuTTYgen also exports, and refusing on it would block prose about keys.
+    #
+    # Two independent markers rather than one pattern spanning both, for the same reason the JWK
+    # detector is built that way. A `[\s\S]{0,512}?` span between them was wrong twice over: an
+    # RSA-4096 public section base64-encodes to ~716 characters, so `Private-Lines` necessarily
+    # fell outside the cap and a complete `.ppk` published (its payload is SSH mpints, not DER, so
+    # nothing downstream caught it); and the lazy span backtracks over every position in between.
     (
         "a private key",
-        re.compile(
-            rb"PuTTY-User-Key-File-\d+:[^\r\n]*[\r\n][\s\S]{0,512}?"
-            rb"Private-Lines:\s*\d+[\r\n]+[A-Za-z0-9+/=]{32,}"
+        _TwoMarkers(
+            re.compile(rb"PuTTY-User-Key-File-\d+:[^\r\n]*[\r\n]"),
+            re.compile(rb"Private-Lines:\s*\d+[\r\n]+[A-Za-z0-9+/=]{32,}"),
         ),
     ),
     # The same key in DER: the binary encoding a PEM block base64-wraps. `openssl ... -outform DER`
@@ -236,7 +258,11 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
             # and a short-form `02 41` for a 512-bit one, so both published intact. `0x81` and
             # `0x82` introduce a 1- and 2-byte length; a short form below 0x80 IS the length, and
             # is bounded from 0x40 up so an ordinary `02 01 00 02 xx` byte sequence does not match.
-            rb"|\x30\x82..\x02\x01\x00\x02(?:\x82..|\x81.|[\x40-\x7f])\x00"
+            #
+            # Version `1` as well as `0`: RFC 8017 defines `two-prime(0)` and `multi(1)`, and a
+            # real three-prime key from `openssl genrsa -primes 3` (which `openssl rsa -check`
+            # accepts) begins `02 01 01` instead. Its private factors published intact.
+            rb"|\x30\x82..\x02\x01[\x00\x01]\x02(?:\x82..|\x81.|[\x40-\x7f])\x00"
             # SEC1 ECPrivateKey: version 1, a curve-sized scalar, then the [0] curve parameters
             rb"|\x02\x01\x01\x04(?:\x20.{32}|\x30.{48}|\x42.{66})\xa0"
             # EncryptedPrivateKeyInfo: `openssl pkcs8 -topk8 -passout` in DER. The plaintext key is
@@ -279,8 +305,17 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
         #
         # Order-independent and window-free, so it is exact on a real key either way round, and
         # each half is anchored on a literal that fails fast on ordinary JSON.
-        _JwkPrivateKey(),
+        _TwoMarkers(_JWK_KTY, _JWK_PRIVATE),
     ),
+)
+
+
+# The two-marker detectors, exposed so the chunked scan can pair their halves across chunk
+# boundaries. Derived from `_LITERAL_PATTERNS` rather than listed again, so a detector added there
+# is covered by the cross-chunk pairing automatically instead of silently regressing to
+# within-one-window matching.
+_PAIRED_PATTERNS: tuple[tuple[str, _TwoMarkers], ...] = tuple(
+    (kind, pattern) for kind, pattern in _LITERAL_PATTERNS if isinstance(pattern, _TwoMarkers)
 )
 
 

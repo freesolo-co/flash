@@ -4107,3 +4107,156 @@ def test_a_member_count_cannot_be_forged_behind_a_stub_on_a_zip64_archive(tmp_pa
         writing.writestr("a.txt", b"hello")
         writing.writestr("b.txt", b"world")
     assert _zip_member_count(small, 100) == 2
+
+
+def test_a_jwk_is_found_with_its_markers_in_either_order_across_chunks(tmp_path):
+    """JSON permits any member order, so the private member may precede the `kty`.
+
+    Tracking only whether a `kty` had gone past was one-directional: a JWK written
+    `{"d": ..., <over a chunk of metadata>, "kty": "RSA"}` had its private member leave the window
+    before the `kty` arrived, and a real RSA key published. Both halves are remembered now.
+    """
+    import json
+
+    from flash.env_secrets import _SCAN_CHUNK_BYTES, credential_in_file
+
+    filler = "x" * (_SCAN_CHUNK_BYTES + 4096)
+    body = "a1B2c3D4" * 8
+    reversed_order = tmp_path / "reversed.jwk"
+    reversed_order.write_text(json.dumps({"d": body, "extension": filler, "kty": "RSA"}))
+    assert credential_in_file(reversed_order) == "a private key"
+
+    forward = tmp_path / "forward.jwk"
+    forward.write_text(json.dumps({"kty": "RSA", "extension": filler, "d": body}))
+    assert credential_in_file(forward) == "a private key"
+
+    # neither half alone is a key, however far the file extends
+    lone = tmp_path / "lone.json"
+    lone.write_text(json.dumps({"note": filler, "d": body}))
+    assert credential_in_file(lone) is None
+
+
+def test_a_putty_key_is_found_however_large_its_public_section(tmp_path):
+    """An RSA-4096 public blob base64-encodes to ~716 characters.
+
+    A fixed proximity cap between the header and `Private-Lines` therefore excluded exactly the
+    larger keys: the private payload is SSH mpints rather than DER, so nothing downstream caught
+    it either and the complete `.ppk` published.
+    """
+    import base64
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    public = base64.b64encode(os.urandom(535)).decode()
+    lines = "\n".join(public[at : at + 64] for at in range(0, len(public), 64))
+    key = tmp_path / "rsa4096.ppk"
+    key.write_text(
+        "PuTTY-User-Key-File-3: ssh-rsa\nEncryption: none\nComment: rsa-key\n"
+        f"Public-Lines: {len(public) // 64 + 1}\n{lines}\n"
+        f"Private-Lines: 1\n{base64.b64encode(os.urandom(48)).decode()}\nPrivate-MAC: 00\n"
+    )
+    assert len(public) > 512, "fixture no longer exceeds the removed cap"
+    assert credential_in_file(key) == "a private key"
+
+    # both markers are still required: either alone is not a key
+    header_only = tmp_path / "header.md"
+    header_only.write_text("PuTTY-User-Key-File-3: is the header.\n" + "prose\n" * 200)
+    assert credential_in_file(header_only) is None
+    body_only = tmp_path / "body.txt"
+    body_only.write_text(f"Private-Lines: 1\n{base64.b64encode(os.urandom(48)).decode()}\n")
+    assert credential_in_file(body_only) is None
+
+
+def test_a_multi_prime_rsa_private_key_is_detected(tmp_path):
+    """RFC 8017 defines `two-prime(0)` and `multi(1)`, and only version 0 was accepted.
+
+    A real three-prime key from `openssl genrsa -primes 3` begins `02 01 01`, passes
+    `openssl rsa -check`, and published its private factors intact.
+    """
+    import subprocess
+
+    from flash.env_secrets import credential_in_file
+
+    plain = tmp_path / "multi.pem"
+    generated = subprocess.run(
+        ["openssl", "genrsa", "-primes", "3", "-out", str(plain), "1024"], capture_output=True
+    )
+    if generated.returncode != 0:
+        pytest.skip("this openssl build cannot generate multi-prime keys")
+    der = tmp_path / "multi.der"
+    subprocess.run(
+        ["openssl", "rsa", "-in", str(plain), "-outform", "DER", "-traditional", "-out", str(der)],
+        capture_output=True,
+    )
+    assert der.read_bytes()[4:7] == b"\x02\x01\x01", "fixture is not the multi-prime version"
+    assert credential_in_file(der) == "a private key"
+
+
+def test_unpadded_base64_is_padded_rather_than_truncated(tmp_path):
+    """Trimming a run to a whole quartet discarded up to two decoded bytes off the END.
+
+    That is enough to take a token below its pattern's minimum length, so unpadded base64url of a
+    20-character `pit_` key or a 23-character `hf_` token decoded to something matching nothing.
+    Unpadded output is what `rstrip("=")`, a JWT segment and most token-in-a-URL encodings emit.
+    """
+    import base64
+
+    from flash.env_secrets import credential_in_file
+
+    for name, token in (("pit", "pit_AbCdEf0123456789"), ("hf", "hf_AbCdEf0123456789AbCd")):
+        encoded = base64.urlsafe_b64encode(token.encode()).decode()
+        assert encoded.endswith("="), "fixture no longer exercises omitted padding"
+        written = tmp_path / f"{name}.txt"
+        written.write_text(encoded.rstrip("="))
+        assert credential_in_file(written) is not None, name
+
+
+def test_a_zlib_stream_needing_a_preset_dictionary_is_refused(tmp_path):
+    """FDICT means the stream was compressed against a dictionary the file does not carry.
+
+    Decompression then raises, and treating that as "not zlib after all" let the opaque bytes fall
+    through to the literal scan and publish. Refusing is the honest answer: from here the content
+    cannot be inspected at all.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    dictionary = b"FREESOLO_API_KEY="
+    compressor = zlib.compressobj(zdict=dictionary)
+    blob = compressor.compress(b"FREESOLO_API_KEY=fslo_AbCdEf0123456789AbCdEf\n")
+    blob += compressor.flush()
+    assert blob[1] & 0x20, "fixture does not set FDICT"
+    stream = tmp_path / "dict.zz"
+    stream.write_bytes(blob)
+    with pytest.raises(_Unscannable):
+        credential_in_file(stream)
+
+    # an ordinary dictionary-free stream is still expanded and scanned rather than refused
+    plain = tmp_path / "plain.zz"
+    plain.write_bytes(zlib.compress(b"ordinary rows, nothing issued\n" * 50))
+    assert credential_in_file(plain) is None
+
+
+def test_a_triple_quoted_assignment_is_read_as_an_assignment(tmp_path):
+    """A single optional quote consumed only one of the three in `\"\"\"` or `'''`.
+
+    That left a quote sitting where the body had to begin, so an ordinary Python or TOML multiline
+    assignment matched nothing while its single-quoted equivalent was caught.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    for name, text in (
+        ("double", f'AWS_SECRET_ACCESS_KEY = """{body}"""'),
+        ("single", f"AWS_SECRET_ACCESS_KEY = '''{body}'''"),
+        ("plain", f'AWS_SECRET_ACCESS_KEY = "{body}"'),
+    ):
+        written = tmp_path / f"{name}.py"
+        written.write_text(text)
+        assert credential_in_file(written) == "an AWS secret access key", name
+
+    wandb = tmp_path / "conf.py"
+    wandb.write_text('WANDB_API_KEY = """' + "a1b2c3d4e5" * 4 + '"""')
+    assert credential_in_file(wandb) == "a Weights & Biases API key"

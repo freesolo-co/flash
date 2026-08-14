@@ -49,10 +49,9 @@ from flash.env_formats import (
 )
 from flash.env_patterns import (
     _ASSIGNED_PATTERNS,
-    _JWK_KTY,
-    _JWK_PRIVATE,
     _LITERAL_PATTERNS,
     _MAX_BODY,
+    _PAIRED_PATTERNS,
     _TOKEN_PATTERNS,
     _match,
 )
@@ -236,7 +235,14 @@ def _match_base64(data: bytes) -> str | None:
             # alignments are tried, each trimmed to a whole number of quartets.
             for start in range(min(len(window), 4)):
                 chunk = window[start:]
-                chunk = chunk[: len(chunk) - len(chunk) % 4]
+                # Restore the padding rather than discarding the tail. Trimming to a whole quartet
+                # threw away up to three encoded characters, which is up to two decoded bytes off
+                # the END of the value -- enough to take a token below its pattern's minimum
+                # length, so unpadded base64url of a 20-character `pit_` key published clean.
+                # Unpadded output is what `b64encode(...).rstrip("=")`, a JWT segment, and most
+                # token-in-a-URL encodings emit, so this is the common case rather than the odd one.
+                if remainder := len(chunk) % 4:
+                    chunk = chunk + b"=" * (4 - remainder) if remainder > 1 else chunk[:-1]
                 if len(chunk) < 24:
                     continue
                 try:
@@ -369,7 +375,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     tail = b""
     container_head = False
     overflowed = False
-    seen_kty = False
+    seen: set[tuple[int, str]] = set()
     while chunk := handle.read(_SCAN_CHUNK_BYTES):
         if deadline is not None and time.monotonic() > deadline:
             raise _Unscannable("takes too long to decompress")
@@ -417,20 +423,38 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         window = carry + chunk
         if kind := _credential_kind(window):
             return kind
-        # A `kty` seen in ANY window keeps counting for the rest of the stream. The two JWK markers
-        # are order-independent and window-free within one buffer, but a chunked scan re-imposed a
-        # window between them at the chunk boundary: a 1 MiB JWK whose `kty` fell in the first
-        # chunk and whose `d` fell in the second matched neither half and published a real RSA key.
-        # Carrying the marker rather than widening the overlap keeps memory bounded whatever the
-        # distance, which is unbounded -- JWK members may sit any amount of metadata apart.
-        seen_kty = seen_kty or bool(_JWK_KTY.search(window))
-        if seen_kty and _JWK_PRIVATE.search(window):
-            return "a private key"
+        # A two-marker credential is paired across the WHOLE stream, not within one window. Those
+        # detectors are order-independent and distance-free inside a single buffer, but a chunked
+        # scan re-imposed a window between the halves at the chunk boundary. Remembering which
+        # halves have gone past keeps memory bounded whatever the distance -- which is unbounded,
+        # since JWK members and PuTTY sections may sit behind any amount of intervening data.
+        if kind := _paired_markers_kind(window, seen):
+            return kind
         carry = window[-_SCAN_OVERLAP_BYTES:]
     if overflowed and _has_zip_end_record(tail):
         raise _Unscannable("contains an archive too large to inspect")
     if buffered and _looks_like_container(bytes(buffered)):
         return _credential_in_container(bytes(buffered), deadline=deadline or 0.0, depth=depth + 1)
+    return None
+
+
+def _paired_markers_kind(window: bytes, seen: set[tuple[int, str]]) -> str | None:
+    """The kind of two-marker credential whose halves have BOTH appeared by the end of `window`.
+
+    `seen` accumulates across the whole stream, so the halves are paired at any distance and in
+    either order. Tracking only one side was wrong for the reverse ordering that JSON permits: a
+    JWK written `{"d": ..., <1 MiB of metadata>, "kty": "RSA"}` had its private member leave the
+    window before the `kty` arrived, and the key published.
+
+    Marks halves by their index in `_PAIRED_PATTERNS` rather than by the pattern object, so two
+    detectors sharing a pattern cannot be confused for each other.
+    """
+    for index, (kind, detector) in enumerate(_PAIRED_PATTERNS):
+        for half, pattern in (("context", detector.context), ("payload", detector.payload)):
+            if (index, half) not in seen and pattern.search(window):
+                seen.add((index, half))
+        if {(index, "context"), (index, "payload")} <= seen:
+            return kind
     return None
 
 
@@ -521,6 +545,12 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
     # deflate underneath -- which is why the stream can be expanded rather than merely refused.
     if opener is gzip.open and not head.startswith(b"\x1f\x8b") and _looks_like_zlib(head):
         raw = source.read_bytes() if isinstance(source, Path) else source
+        # FDICT (bit 5 of the flag byte) means the stream was compressed against a preset
+        # dictionary that is not carried in the file. Without it `decompress` raises, and treating
+        # that as "not zlib after all" let the opaque bytes fall through to the literal scan and
+        # publish. Refusing is the honest answer: the content cannot be inspected from here.
+        if head[1] & 0x20:
+            raise _Unscannable("contains a compressed stream needing a dictionary to inspect")
         inflate = zlib.decompressobj()
         try:
             plain = inflate.decompress(raw, _MAX_NESTED_BUFFER_BYTES)
