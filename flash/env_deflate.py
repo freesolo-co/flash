@@ -39,8 +39,18 @@ from collections.abc import Iterator
 # LF and CRLF versions were caught.
 _PDF_GAP = 512
 _PDF_EOL = rb"(?:\r\n|\n|\r)"
-_PDF_STREAM = re.compile(rb"/FlateDecode\b[\s\S]{0,%d}?\bstream%s" % (_PDF_GAP, _PDF_EOL))
-_PDF_LONG_DICTIONARY = re.compile(rb"/FlateDecode\b[^<>]{0,%d}?>>\s*stream%s" % (1 << 16, _PDF_EOL))
+# EVERY character of a PDF name may be written as a `#XX` escape, and readers resolve the escaped
+# and plain spellings identically -- so the name is matched character by character, each accepting
+# either form, rather than as the one literal string. Enumerating spellings does not work: there are
+# 4,096 of them for this name alone, and hardcoding the `#44` that a report happened to cite still
+# published a key under `/#46lateDecode`, `/FlateDecod#65` and `/#46#6cate#44ecode`.
+_FLATE_NAME = b"".join(
+    rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for letter in b"FlateDecode"
+)
+_PDF_STREAM = re.compile(rb"/%s\b[\s\S]{0,%d}?\bstream%s" % (_FLATE_NAME, _PDF_GAP, _PDF_EOL))
+_PDF_LONG_DICTIONARY = re.compile(
+    rb"/%s\b[^<>]{0,%d}?>>\s*stream%s" % (_FLATE_NAME, 1 << 16, _PDF_EOL)
+)
 _MAX_PDF_STREAMS = 4096
 
 # The filter list of the object the matched stream belongs to. A PDF may pipe a stream through
@@ -52,8 +62,20 @@ _MAX_PDF_STREAMS = 4096
 # than reading a whole file to find out here.
 _PDF_SIGNATURE = b"%PDF-"
 
-_PDF_FILTERS = re.compile(rb"/Filter\s*(?:/(\w+)|\[([^\]]{0,256})\])")
-_PDF_FILTER_NAME = re.compile(rb"/(\w+)")
+_PDF_FILTERS = re.compile(rb"/Filter\s*(?:/([\w#]+)|\[([^\]]{0,256})\])")
+_PDF_FILTER_NAME = re.compile(rb"/([\w#]+)")
+
+# `#` followed by two hex digits inside a PDF name stands for that byte, so `/Flate#44ecode` and
+# `/FlateDecode` are the SAME name to every reader -- the escape is spelling, not content. Matching
+# the literal bytes meant the escaped spelling named no filter this recognised, the stream was left
+# uninflated, and a key inside it published while the plain spelling was caught.
+_PDF_NAME_ESCAPE = re.compile(rb"#([0-9A-Fa-f]{2})")
+
+
+def _pdf_name(raw: bytes) -> bytes:
+    """`raw` with its `#XX` escapes resolved, so a name compares by what it MEANS."""
+    return _PDF_NAME_ESCAPE.sub(lambda hexed: bytes.fromhex(hexed.group(1).decode()), raw)
+
 
 # The one pre-filter this can undo. ASCII85 is the common companion to FlateDecode and is pure
 # syntax, so decoding it needs no parameters. Every other filter is left undone deliberately: a
@@ -309,7 +331,10 @@ def _filter_stages(data: bytes, at: int) -> tuple[list[bytes], list[bytes]]:
             names = candidate
     if not names:
         return [], []
-    chain = _PDF_FILTER_NAME.findall(names.group(2) or b"/" + (names.group(1) or b""))
+    chain = [
+        _pdf_name(raw)
+        for raw in _PDF_FILTER_NAME.findall(names.group(2) or b"/" + (names.group(1) or b""))
+    ]
     if _FLATE_FILTER not in chain:
         return [], []
     flate = chain.index(_FLATE_FILTER)
