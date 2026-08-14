@@ -344,7 +344,13 @@ def _canonical_resource_uri(uri: str) -> str:
             hostport = host.casefold()
         else:
             hostport = f"{host.casefold()}:{port}" if port_separator else hostport.casefold()
-    normalized_netloc = f"{userinfo}@{hostport}" if user_separator else hostport
+    # after casefolding, never before: casefold would lowercase the escape's hex digits, and
+    # `_normalize_percent_encoding` is what restores the uppercase form rfc 3986 6.2.2.1 wants.
+    # decoding is delimiter-safe in either order because no unreserved character is a delimiter,
+    # so `@`, `:` and the brackets stay encoded and the split above still describes the authority.
+    normalized_netloc = _normalize_percent_encoding(
+        f"{userinfo}@{hostport}" if user_separator else hostport
+    )
     normalized_path = _remove_dot_segments(_normalize_percent_encoding(path))
     if normalized_scheme in {"http", "https"} and normalized_netloc and not normalized_path:
         normalized_path = "/"
@@ -406,6 +412,38 @@ def _schema_anchor_pointers(value: Any, *, depth: int = 0) -> dict[str, frozense
     return {name: frozenset(paths) for name, paths in anchors.items()}
 
 
+def _schema_dynamic_anchor_pointers(
+    value: Any, *, depth: int = 0
+) -> dict[str, frozenset[tuple[str, ...]]]:
+    """Pointers a dynamic reference can reach, keyed by anchor name (`""` for `$recursiveAnchor`).
+
+    `$dynamicRef` and `$recursiveRef` resolve against the dynamic scope, so the target is chosen by
+    the outermost resource that declares the anchor rather than by the reference's own resource.
+    Which resource that is depends on the evaluation entry point, which a redactor recording a
+    payload cannot know, so every same-named dynamic anchor counts as a possible target.
+    """
+    anchors: dict[str, set[tuple[str, ...]]] = {}
+
+    def collect(node: Any, path: tuple[str, ...], depth: int) -> None:
+        if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
+            return
+        if isinstance(node, dict):
+            anchor = node.get("$dynamicAnchor")
+            if isinstance(anchor, str):
+                anchors.setdefault(anchor, set()).add(path)
+            if node.get("$recursiveAnchor") is True:
+                anchors.setdefault("", set()).add(path)
+            for key, item in node.items():
+                if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
+                    collect(item, (*path, str(key)), depth + 1)
+        elif isinstance(node, list | tuple):
+            for index, item in enumerate(node):
+                collect(item, (*path, str(index)), depth + 1)
+
+    collect(value, (), depth)
+    return {name: frozenset(paths) for name, paths in anchors.items()}
+
+
 def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[str, ...]]:
     if not isinstance(value, dict):
         return set()
@@ -423,6 +461,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
     # to it as well. one map serves both keywords: splitting them let `{"$ref": "#Name"}` miss a
     # `$dynamicAnchor: "Name"` target and persist its literals.
     anchors = _schema_anchor_pointers(value, depth=depth)
+    dynamic_anchors = _schema_dynamic_anchor_pointers(value, depth=depth)
 
     def scope_for(path: tuple[str, ...]) -> str:
         return next(
@@ -446,18 +485,36 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
             for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
                 ref = node.get(keyword)
                 if isinstance(ref, str):
+                    # a dynamic reference leaves its own resource by design: the target is the
+                    # outermost dynamic scope declaring the anchor, which depends on the evaluation
+                    # entry point. restricting it to the reference's resource kept literals on the
+                    # outer target exposed, so dynamic keywords consider every same-named anchor.
+                    is_dynamic = keyword in {"$dynamicRef", "$recursiveRef"}
                     resolved_base, fragment = urldefrag(urljoin(scope_uri, ref))
                     canonical_base = _canonical_resource_uri(resolved_base)
                     resource_path = resources.get(canonical_base)
                     if resource_path is not None:
                         resource_ref = f"#{fragment}"
                         if keyword == "$recursiveRef" and resource_ref == "#":
+                            # an embedded resource's `$recursiveAnchor` is not an ancestor of this
+                            # reference, so it is not in the dynamic scope: without an anchor on the
+                            # path the target is this resource's own root.
                             pointers = frozenset(
                                 pointer
                                 for pointer in anchors.get("", frozenset())
                                 if anchor_belongs_to_resource(pointer, canonical_base)
                             )
                             found.update(pointers or {resource_path})
+                        elif is_dynamic and resource_ref != "#":
+                            # union, not replacement: a plain-name fragment also names an ordinary
+                            # `$anchor`, so dropping the static resolution would leave a same-named
+                            # `$anchor` target unredacted.
+                            found.update(_local_schema_pointer(resource_ref, dynamic_anchors))
+                            found.update(
+                                pointer
+                                for pointer in _local_schema_pointer(resource_ref, anchors)
+                                if anchor_belongs_to_resource(pointer, canonical_base)
+                            )
                         else:
                             pointers = _local_schema_pointer(resource_ref, anchors)
                             if resource_ref == "#" or resource_ref.startswith("#/"):

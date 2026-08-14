@@ -343,13 +343,15 @@ async def _stream_response(
             else:
                 forwarded_chunks = done_gate.feed(chunk)
                 for forwarded in forwarded_chunks:
-                    accumulator.feed(forwarded)
+                    if context.record_trace:
+                        accumulator.feed(forwarded)
                     yield forwarded
                 if done_gate.terminated:
                     break
         if done_gate is not None:
             for forwarded in done_gate.finish():
-                accumulator.feed(forwarded)
+                if context.record_trace:
+                    accumulator.feed(forwarded)
                 yield forwarded
     except (asyncio.CancelledError, GeneratorExit):
         client_disconnected = True
@@ -359,7 +361,8 @@ async def _stream_response(
         error = "upstream stream interrupted"
         if done_gate is not None:
             for forwarded in done_gate.finish():
-                accumulator.feed(forwarded)
+                if context.record_trace:
+                    accumulator.feed(forwarded)
                 yield forwarded
         raise
     finally:

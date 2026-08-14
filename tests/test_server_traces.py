@@ -1906,6 +1906,114 @@ async def test_unrecorded_stream_stops_reading_after_done_event() -> None:
 
 
 @pytest.mark.anyio
+async def test_unrecorded_stream_does_not_accumulate_events(monkeypatch) -> None:
+    """Recording off must not pay to parse events into a span that is then discarded.
+
+    The stored row cannot detect this: nothing is stored either way. Only the work done is
+    observable, so this counts `SseAccumulator.feed` calls. The done gate still has to run,
+    because it decides stream termination, not recording.
+    """
+    context = traces._UpstreamRequestContext(
+        url="https://api.openai.com/v1/chat/completions",
+        headers={},
+        body={**_REQUEST, "stream": True},
+        provider="openai",
+        model="gpt-test",
+        key_id=1,
+        project_id=None,
+        metadata=None,
+        secrets=(),
+        started_at=traces.time.perf_counter(),
+        record_trace=False,
+    )
+    events = (
+        b"".join(
+            b'data: {"choices":[{"index":0,"delta":{"content":"tok"}}]}\n\n' for _ in range(50)
+        )
+        + b"data: [DONE]\n\n"
+    )
+    fed: list[bytes] = []
+    original_feed = trace_sse.SseAccumulator.feed
+
+    def counting_feed(self, chunk: bytes) -> None:
+        fed.append(chunk)
+        original_feed(self, chunk)
+
+    monkeypatch.setattr(trace_sse.SseAccumulator, "feed", counting_feed)
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=events,
+        request=httpx.Request("POST", context.url),
+    )
+    client = _StaticAsyncClient()
+
+    chunks = [
+        chunk
+        async for chunk in traces._stream_response(
+            client=client, upstream_response=response, context=context
+        )
+    ]
+
+    assert fed == []
+    # the caller still receives the provider's bytes verbatim, terminator included
+    assert b"".join(chunks) == events
+    assert client.closed is True
+
+
+@pytest.mark.anyio
+async def test_recorded_stream_still_accumulates_events(tmp_path, monkeypatch) -> None:
+    """Control for the gate above: with recording ON the same stream is still accumulated."""
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+    owner = db.ensure_internal_key(_KEY)
+    context = traces._UpstreamRequestContext(
+        url="https://api.openai.com/v1/chat/completions",
+        headers={},
+        body={**_REQUEST, "stream": True},
+        provider="openai",
+        model="gpt-test",
+        key_id=owner["id"],
+        project_id=_PROJECT_ID,
+        metadata=None,
+        secrets=(_KEY, _PROVIDER_KEY),
+        started_at=traces.time.perf_counter(),
+        record_trace=True,
+    )
+    events = b'data: {"choices":[{"index":0,"delta":{"content":"kept"}}]}\n\ndata: [DONE]\n\n'
+    fed: list[bytes] = []
+    original_feed = trace_sse.SseAccumulator.feed
+
+    def counting_feed(self, chunk: bytes) -> None:
+        fed.append(chunk)
+        original_feed(self, chunk)
+
+    monkeypatch.setattr(trace_sse.SseAccumulator, "feed", counting_feed)
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=events,
+        request=httpx.Request("POST", context.url),
+    )
+
+    chunks = [
+        chunk
+        async for chunk in traces._stream_response(
+            client=_StaticAsyncClient(), upstream_response=response, context=context
+        )
+    ]
+
+    assert fed != []
+    assert b"".join(chunks) == events
+    exported = export_traces(
+        key_id=owner["id"], project_id=_PROJECT_ID, export_format="raw", limit=1000
+    )
+    assert (
+        exported["records"][0]["spans"][0]["output_payload"]["choices"][0]["message"]["content"]
+        == "kept"
+    )
+
+
+@pytest.mark.anyio
 async def test_stream_stops_reading_after_done_event(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
     owner = db.ensure_internal_key(_KEY)
@@ -4844,6 +4952,79 @@ def test_secret_schema_dynamic_ref_literals_are_redacted(trace_api, monkeypatch)
     assert definitions["Dynamic"]["default"] == "[redacted]"
     assert definitions["Static"]["default"] == "[redacted]"
     assert definitions["Ordinary"]["default"] == "KEEP"
+
+
+def test_percent_encoded_unreserved_authority_matches_schema_resource() -> None:
+    """`%65xample.com` and `example.com` are the same host, so the `$ref` reaches the local target.
+
+    Normalizing only the path left an authority escape looking like an external resource, and an
+    unresolved reference means the target's literals are never reached and stay in the stored copy.
+    """
+    schema = {
+        "$id": "https://example.com/a/schema",
+        "type": "object",
+        "properties": {"api_key": {"$ref": "https://%65xample.com/a/schema#/$defs/Cred"}},
+        "$defs": {"Cred": {"default": "SECRET", "const": "SECRET-C", "enum": ["SECRET-E"]}},
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["$defs"]["Cred"]["default"] == "[redacted]"
+    assert stored["$defs"]["Cred"]["const"] == "[redacted]"
+    assert stored["$defs"]["Cred"]["enum"] == ["[redacted]"]
+    # a reserved escape is NOT a decoded delimiter, so a genuinely different host stays distinct
+    assert trace_redaction._canonical_resource_uri("https://exa%2Fmple.com/s") != (
+        trace_redaction._canonical_resource_uri("https://exa/mple.com/s")
+    )
+
+
+def test_dynamic_ref_redacts_outer_dynamic_anchor_target() -> None:
+    """`$dynamicRef` resolves against the dynamic scope, so it can leave its own resource.
+
+    Which resource wins depends on the evaluation entry point, which a redactor recording a payload
+    cannot know. Restricting the lookup to the reference's own resource left the outer target's
+    literals exposed, so every same-named `$dynamicAnchor` counts as a possible target.
+    """
+    schema = {
+        "$id": "https://example.com/root",
+        "type": "object",
+        "$defs": {
+            "Outer": {"$dynamicAnchor": "T", "default": "SECRET-OUTER"},
+            "Inner": {
+                "$id": "https://example.com/inner",
+                "type": "object",
+                "properties": {"password": {"$dynamicRef": "#T"}},
+                "$defs": {"Local": {"$dynamicAnchor": "T", "default": "SECRET-INNER"}},
+            },
+            "Ordinary": {"default": "KEEP"},
+        },
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["$defs"]["Outer"]["default"] == "[redacted]"
+    assert stored["$defs"]["Inner"]["$defs"]["Local"]["default"] == "[redacted]"
+    assert stored["$defs"]["Ordinary"]["default"] == "KEEP"
+
+
+def test_static_ref_does_not_cross_into_an_outer_resource() -> None:
+    """Control for the dynamic widening above: a plain `$ref` stays inside its own resource."""
+    schema = {
+        "$id": "https://example.com/root",
+        "$defs": {
+            "Outer": {"$anchor": "S", "default": "OUTER-PUBLIC"},
+            "Inner": {
+                "$id": "https://example.com/inner",
+                "properties": {"password": {"$ref": "#S"}},
+                "$defs": {"Local": {"$anchor": "S", "default": "SECRET-INNER"}},
+            },
+        },
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["$defs"]["Inner"]["$defs"]["Local"]["default"] == "[redacted]"
+    assert stored["$defs"]["Outer"]["default"] == "OUTER-PUBLIC"
 
 
 def test_static_ref_resolves_a_dynamic_anchor(trace_api, monkeypatch) -> None:
