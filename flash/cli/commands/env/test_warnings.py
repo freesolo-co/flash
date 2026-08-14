@@ -156,53 +156,67 @@ def _warn_on_repeated_rendered_roles(
     Reported for every algorithm, not just sft: one published environment serves all three, so a
     single-turn env shaped this way is broken for sft whichever algorithm this invocation named.
 
-    Only the RENDERED sequence is checked, never either list alone -- a prompt may legitimately end
-    on an assistant prefill, and the fault is adjacency after concatenation.
+    Only repeats INSIDE the completion are reported, and the prompt is read solely to know what the
+    completion's first turn follows. The other two regions have healthy forms this cannot tell from
+    broken ones, and neither is something `sft_completion` authorship can fix:
+
+    - inside `prompt_messages`: a retrieved document in its own user message, or a task and its
+      reply-format instruction as separate user turns, are ordinary prompt shapes that every chat
+      template renders as separate delimited blocks. Flagging them accused a correct prompt and
+      pointed at a completion that restates nothing.
+    - at the seam, ONLY when the doubled role is `assistant`: a prompt ending on an assistant
+      prefill CONTINUED by the completion is the one adjacency meant to merge -- that is what a
+      prefill is -- and the remedy this warning prints would destroy it. A doubled `user` or
+      `system` turn at the same boundary has no such form: it is the completion restating a turn the
+      prompt already contains, the off-by-one trajectory capture, and it stays reported.
+
+    A false alarm on a healthy environment is what teaches people to ignore this warning on the
+    broken one, so the check is kept to the repeats whose evidence is unambiguous.
     """
     if multi_turn or not prompt or not completion:
         return
-    repeated = _repeated_roles([*prompt, *completion])
+    # the prompt's last turn is passed as context so a completion whose FIRST turn doubles it is
+    # still seen. index 0 is that prompt turn, index 1 is the seam.
+    repeated = [
+        (index, role)
+        for index, role in _repeated_roles([prompt[-1], *completion])
+        # a repeat strictly inside the completion always counts; at the seam only a non-assistant
+        # role does, since an assistant seam is a legitimate prefill continuation.
+        if index > 1 or role != "assistant"
+    ]
     if not repeated:
         return
-    _emit(_repeated_roles_message(repeated, len(prompt)))
+    # rebased from the [prompt[-1], *completion] window onto the concatenation `_repeated_roles_message`
+    # expects, where the completion begins at `len(prompt)`.
+    rebased = [(index - 1 + len(prompt), role) for index, role in repeated]
+    _emit(_repeated_roles_message(rebased, len(prompt)))
     print(f"  rendered roles: {_rendered_roles(prompt, completion)}", file=sys.stderr)
 
 
 def _repeated_roles_message(repeated: list[tuple[int, str]], boundary: int) -> str:
-    """Name each collapsing turn in the region that owns it, with that region's own index.
+    """Name each collapsing turn with `sft_completion`'s own index.
 
-    Three regions, three different edits, so all three are named rather than folded into one: a
-    repeat inside the prompt is a `prompt_messages`/`start_episode` fault, one at the seam means the
-    prompt ends on a prefill the completion continues, and one inside the completion means the gold
-    answer needs the env's follow-up user turns interleaved. Reporting a prompt-internal or seam
-    collision as "inside sft_completion" sends the author to a file that is correct.
+    Two shapes reach here, and both are the completion's to fix: a repeat strictly inside it, and a
+    non-assistant turn at the seam that restates the prompt's last turn. The caller drops the
+    prompt's interior (not `sft_completion`'s to fix) and an assistant seam (a legitimate prefill).
 
-    Indices are rebased onto the region they belong to. A raw offset into the concatenation is not a
-    position the author can look up: with a system prompt prepended, turn 0 of a three-message
-    completion is reported as message 3, which does not exist in the file they open.
+    Indices are rebased onto `sft_completion`, which is what the author can look up: a raw offset
+    into the concatenation would report turn 0 of a three-message completion as message 3 when a
+    system prompt is prepended, a position that does not exist in the file they open. The seam is
+    the completion's message 0.
     """
-    inside_prompt = [(index, role) for index, role in repeated if index < boundary]
     at_seam = [(index, role) for index, role in repeated if index == boundary]
-    inside_completion = [(index, role) for index, role in repeated if index > boundary]
-    parts: list[str] = []
-    if inside_prompt:
-        where = ", ".join(f"message {index} ({role})" for index, role in inside_prompt)
-        parts.append(f"inside prompt_messages ({where})")
+    where = ", ".join(f"message {index - boundary} ({role})" for index, role in repeated)
     if at_seam:
         role = at_seam[0][1]
-        parts.append(
-            f"at the prompt/completion boundary (its first turn is another {role} turn, "
-            "continuing the prompt's last)"
+        where = (
+            f"{where}; message 0 repeats the prompt's last turn, which is also a {role} turn"
+            if len(repeated) > 1
+            else f"message 0 ({role}), which repeats the prompt's last turn"
         )
-    if inside_completion:
-        # rebased onto sft_completion's own indexing, which is what the author can actually look up.
-        where = ", ".join(
-            f"message {index - boundary} ({role})" for index, role in inside_completion
-        )
-        parts.append(f"inside sft_completion ({where})")
-    # the remedy depends on which role doubled, not just where. two assistant turns need the env's
-    # user turns interleaved; a doubled user turn is the opposite fault -- the completion restating
-    # a question the prompt already asked, which is an off-by-one in how the trajectory was captured.
+    # the remedy depends on which role doubled. two assistant turns need the env's user turns
+    # interleaved; a doubled user turn is the opposite fault -- the completion restating a question
+    # the prompt already asked, which is an off-by-one in how the trajectory was captured.
     doubled = {role for _index, role in repeated}
     if doubled == {"assistant"}:
         remedy = (
@@ -215,11 +229,11 @@ def _repeated_roles_message(repeated: list[tuple[int, str]], boundary: int) -> s
             "early, so the completion restates a turn the prompt already contains"
         )
     else:
-        remedy = "each region must alternate roles once concatenated"
+        remedy = "sft_completion must alternate roles once concatenated"
     return (
-        f"sft would train on consecutive same-role turns {' and '.join(parts)}. sft renders one "
-        f"string from prompt_messages + sft_completion, so these turns merge into a single reply -- "
-        f"{remedy}"
+        f"sft would train on consecutive same-role turns inside sft_completion ({where}). sft "
+        f"renders one string from prompt_messages + sft_completion, so these turns merge into a "
+        f"single reply -- {remedy}"
     )
 
 

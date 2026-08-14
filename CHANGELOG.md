@@ -35,8 +35,15 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   no longer passes without a word about what it found:
 
   - **Every episode scored 0.0.** The existing blocking gate is GRPO-only and abstains for a
-    reasoning-markup reference, a replay that ran out mid-episode, and a junk probe that raised, so
-    an all-zero run routinely printed `PASS` and nothing else. A constant reward is never a
+    non-GRPO algorithm and for a junk probe that raised, so an all-zero run routinely printed `PASS`
+    and nothing else. The warning is independent of those abstentions - but not of the two that are
+    about this command's own fidelity rather than the environment's health. A reference written in
+    reasoning markup is replayed verbatim here (there is no run config, so `thinking` defaults off)
+    and scores zero against a correct strict grader that would have seen the span stripped; a replay
+    that ran out mid-episode is graded part reference and part junk. Neither zero is evidence about
+    the environment, so both are excluded from the warning exactly as they are from the gate.
+    Counting them said "this run measured nothing" about a working reasoning environment - the very
+    conclusion the gate deliberately withholds. A constant reward that IS interpretable is never a
     measurement, and for GRPO it carries the risk of being actively silent: rewards are mean-centred
     within each group, so if sampled rollouts score alike the advantage and gradient are zero -
     training completes, the loss curve looks unremarkable, W&B looks healthy, and the adapter comes
@@ -50,8 +57,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     content, a native tool-call turn). It stays silent when the grader was proven to separate - a
     centered scale paying gold 0.0 and junk -1.0, or a per-turn vector that separates while the
     scalar is only a placeholder - since both have a real gradient and calling them unmeasured
-    would be false. The junk probe behind that judgement runs at most once per run, shared with the
-    blocking gate rather than driven twice, so a paid judge is not billed twice.
+    would be false. Both probes behind that judgement are spent only where their answer can change
+    what the command prints, and neither is free: the junk probe drives a whole extra episode, and
+    the per-turn probe runs the environment's own `score_episodes`, which may be a paid judge. A
+    healthy environment reaches neither, so it is billed exactly what it was before this change.
   - **A gold replay that never terminates.** An environment applying every move twice can solve no
     board, yet gold scored 0.60-0.65, beat a junk answer, and burned the full turn cap - clearing
     every existing check. What exposed it in the field was reading `turns=12` on a board with a
@@ -67,6 +76,14 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     _effective_ one: a row setting `max_episode_turns` below the dataset-wide `max_turns` is stopped
     by its own budget, which `rollout_done` gives precedence, so measuring exhaustion against
     `max_turns` alone silenced this warning for exactly the rows whose budget is tightest.
+
+    Measuring against the effective cap also made an existing hole reachable: for an episode
+    stopped at the ceiling, the final `env_reply` is issued by a deferred call after the loop, and
+    that call never checked its envelope. An environment whose last reply is malformed - scalar
+    `content`, which breaks the chat template on the paid run - therefore reached `overall: PASS`.
+    It is now validated exactly like the in-loop replies, with an empty reply still allowed, since
+    an environment with nothing further to observe legitimately returns none.
+
   - **A gold completion whose rendered role sequence collapses.** SFT does not replay a completion
     turn by turn; it renders one training string from `prompt_messages + sft_completion`, and
     nothing validated that concatenation. On a single-turn environment a gold answer returned as
@@ -81,10 +98,14 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     the dataset. `tool` is exempt, since parallel tool calls are answered by one `tool` message per
     call and chat templates render each as its own block; `user` and `system` are not, because a
     doubled user turn is how an off-by-one trajectory capture shows up and it duplicates that text
-    in the trained string just as a doubled assistant turn does. Each collapsing turn is attributed
-    to the region that owns it - `prompt_messages`, the seam, or `sft_completion` - with that
-    region's own indices and the role that doubled, and all applicable regions are named rather
-    than only the first, since they are different edits.
+    in the trained string just as a doubled assistant turn does. Only repeats the completion owns
+    are reported, with `sft_completion`'s own indices: a repeat wholly inside `prompt_messages` is
+    an ordinary prompt shape (a retrieved document in its own user message, a task and its
+    reply-format instruction as separate turns) that no edit to the completion could change, and an
+    `assistant` turn at the prompt/completion seam is a prefill the completion continues, the one
+    adjacency meant to merge. A doubled `user` or `system` turn at that same seam has no such
+    innocent form and is still reported, since it is the completion restating a turn the prompt
+    already contains.
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always

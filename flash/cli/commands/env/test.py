@@ -332,7 +332,18 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     # env that replied with nothing, a natural finish) -- stepping again there would be a spurious
     # extra move. rollout_done covers the env having declared the episode over.
     if env_step_pending and not env.rollout_done(state, hard_cap):
-        env.env_reply(state["messages"], state)
+        # validated exactly like the in-loop replies above: a malformed reply breaks the chat
+        # template on the paid run whether it was the last one or not. this call is the ONLY
+        # env_reply for an episode stopped at the ceiling, and a per-example `max_episode_turns`
+        # makes that the common case rather than a rare one -- leaving it unchecked let an env whose
+        # final reply is malformed reach `overall: PASS`.
+        #
+        # an EMPTY reply is allowed first, exactly as the in-loop path does (`if not env_msgs:
+        # break` precedes its own `_check_messages`): an env with nothing further to observe
+        # legitimately returns nothing, and `_check_messages` rejects an empty list.
+        final_msgs = env.env_reply(state["messages"], state)
+        if final_msgs:
+            _check_messages(final_msgs, "env_reply")
     if gold_finished is None:
         # the gold answer never ran out inside the loop -- it covered the whole episode, so the
         # break came first and the mid-loop sample never fired. NOW is its moment: the deferred
@@ -472,20 +483,14 @@ class _Tally:
 
     One value rather than five loose locals because the gates disagree about which episodes count,
     and the distinction is the whole subtlety: `replayed`/`replayed_zero` are the BLOCKING gate's
-    evidence and deliberately exclude a thinking-markup or incomplete replay, while `scored_rewards`
-    and `scored_episode` are the advisory warning's and include every policy.
+    evidence and count only what it can hold responsible, while `interpretable_rewards` and
+    `scored_episode` are the advisory warning's and span every algorithm and policy.
     """
 
     # only replay episodes carry a gold answer to score. an echo episode has none, so its reward
     # says nothing about the grader and is counted in neither total.
     replayed: int = 0
     replayed_zero: list[tuple[dict, dict | None]] = field(default_factory=list)
-    # every finite reward this run scored, whatever the policy or algorithm. the blocking gate
-    # counts only the replay episodes it can hold responsible, and abstains for thinking markup, an
-    # incomplete replay, a non-grpo algorithm, or a junk probe that raised -- so a run where nothing
-    # scored anything reached `overall: PASS` with no line saying so. this list is what makes the
-    # uniformly-zero warning independent of every one of those abstentions.
-    scored_rewards: list[float] = field(default_factory=list)
     # whether any episode replayed a gold answer at all, including the ones the blocking gate
     # excludes (reasoning markup, an incomplete replay). an all-echo run scored only deliberate
     # junk, for which zero is the CORRECT answer, so the warning must not read that as a broken
@@ -494,32 +499,46 @@ class _Tally:
     # the first episode that produced a finite reward, whatever its policy. used only as the subject
     # of the advisory warning's separation probe.
     scored_episode: tuple[dict, dict | None] | None = None
+    # every finite reward whose value says something about the ENVIRONMENT, across all policies and
+    # algorithms. the blocking gate counts only the replay episodes it can hold responsible and
+    # abstains for a non-grpo algorithm or a junk probe that raised, so a run where nothing scored
+    # anything reached `overall: PASS` with no line saying so; this list is what makes the
+    # uniformly-zero warning independent of those abstentions. it is NOT independent of the two
+    # abstentions that are about this command's own fidelity -- see `observe`.
+    interpretable_rewards: list[float] = field(default_factory=list)
 
     def observe(self, example: dict, record: dict) -> None:
         """Record one episode that passed its contract checks."""
         reward = record["reward"]
         if reward is None:
             return
-        # recorded for every passing episode, echo included: an echo run whose scores are all zero
-        # is equally unmeasured, and is exactly the shape a replay-only counter misses.
-        self.scored_rewards.append(reward)
         if self.scored_episode is None:
             # a probe subject for the advisory warning, kept independently of `replayed_zero`. that
             # list is the BLOCKING gate's evidence and deliberately excludes a thinking-markup or
             # incomplete replay -- but a per-turn vector on such an episode still proves the grader
             # separates, so the warning needs a subject the gate skips.
             self.scored_episode = (example, record["state"])
+        # an ECHO episode's reward IS interpretable: zero is the correct score for deliberate junk,
+        # and the warning has separate, weaker wording for a run that scored only junk. recorded
+        # here because the replay-only bookkeeping below does not apply to it.
         if record["policy"] != "replay":
+            self.interpretable_rewards.append(reward)
             return
         self.replayed_any = True
         # a reference written in reasoning markup cannot be replayed faithfully from here (see
         # `_carries_thinking_markup`), so its score is not evidence about the grader and is kept out
         # of the blocking gate's totals. neither is a multi-turn episode whose gold answer ran out
         # before the rollout did: the graded trajectory is then part reference and part junk, and a
-        # zero says nothing about the reference the gate never ran. the advisory warning still fires
-        # for both: a low reward is worth surfacing either way, it just cannot be the reason to fail.
+        # zero says nothing about the reference the gate never ran.
+        #
+        # excluded from the ADVISORY warning's evidence too, not only the gate's. both zeros are
+        # artifacts of replaying from HERE rather than statements about the environment, so counting
+        # them made the warning say "this run measured nothing" about a working reasoning env -- the
+        # very conclusion the gate abstains from. the per-episode low-reward warning still prints
+        # the number, which is the part that is true.
         if record["thinking_markup"] or record["replay_incomplete"]:
             return
+        self.interpretable_rewards.append(reward)
         self.replayed += 1
         # an exact zero is what a scorer that recognized nothing returns, so it stays the signature
         # this gate looks for. it is confirmed against a wrong answer once every episode has run,
@@ -544,8 +563,12 @@ def _check_grader(env, algorithm: str, tally: _Tally) -> bool:
     all_accountable_gold_scored_zero = bool(tally.replayed) and (
         len(tally.replayed_zero) == tally.replayed
     )
-    uniformly_zero = bool(tally.scored_rewards) and all(
-        reward == 0.0 for reward in tally.scored_rewards
+    # read from `interpretable_rewards`, not every score: a run whose only rewards came from replays
+    # this command cannot reproduce faithfully has not shown that the environment measures nothing,
+    # only that THIS COMMAND could not measure it. saying so anyway reported a working reasoning
+    # environment as unmeasured on every run.
+    uniformly_zero = bool(tally.interpretable_rewards) and all(
+        reward == 0.0 for reward in tally.interpretable_rewards
     )
     # the probe's subject: the blocking gate's own episode when it has one, otherwise any episode
     # that scored. the fallback matters -- a gold answer in reasoning markup keeps `replayed_zero`
@@ -606,7 +629,7 @@ def _check_grader(env, algorithm: str, tally: _Tally) -> bool:
     # below the gold zero. a probe that failed leaves `junk_reward` None, which proves nothing and so
     # does not excuse the run.
     _warn_on_uniformly_zero_rewards(
-        tally.scored_rewards,
+        tally.interpretable_rewards,
         algorithm=algorithm,
         replayed_any=tally.replayed_any,
         separates=separates_on_turns or (junk_reward is not None and junk_reward < 0.0),

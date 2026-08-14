@@ -793,9 +793,14 @@ def test_env_test_reports_the_text_the_scorer_actually_received(monkeypatch, tmp
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
     # the scorer really did receive the override, so that is the only honest thing to print. every
-    # call sees it, the real episode and the junk probe alike -- the env replaces the graded text
+    # call sees it, the real episode and the probes alike -- the env replaces the graded text
     # whatever was replayed, which is the whole point of the override.
-    assert set(graded) == {"ENV_OVERRODE"}
+    #
+    # the COUNT is pinned, not just the values. this env scores 0.0 on every row, so the run is one
+    # the warning fires on and both probes are legitimately spent: the episode itself, the per-turn
+    # separation probe, and the junk probe. asserting only `set(graded)` would accept any number of
+    # grader calls, and for an env graded by a paid judge the number is the billing.
+    assert graded == ["ENV_OVERRODE", "ENV_OVERRODE", "ENV_OVERRODE"]
     assert "scored text: 'ENV_OVERRODE'" in captured.err
     assert "scored text: 'RAW_TURN'" not in captured.err
 
@@ -850,9 +855,10 @@ def test_env_test_reports_an_empty_override_as_the_scored_text(monkeypatch, tmp_
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    # the grader really did receive the empty override, so that is what must be reported. asserted
-    # as a set: the junk probe scores this env too, and it also sees the override.
-    assert set(graded) == {""}
+    # the grader really did receive the empty override, so that is what must be reported. the count
+    # is pinned for the same reason as the test above: this env scores 0.0 everywhere, so the
+    # episode plus both probes is the expected spend, and a set assertion would hide a fourth call.
+    assert graded == ["", "", ""]
     assert "scored text: ''" in captured.err
     # the replayed turn was never scored; naming it would send the reader to the wrong place.
     assert "scored text: 'RAW_TURN'" not in captured.err
@@ -1898,13 +1904,16 @@ def test_env_test_does_not_warn_on_parallel_tool_result_turns(monkeypatch, tmp_p
     assert "overall: PASS" in captured.out
 
 
-def test_env_test_blames_the_prompt_for_a_repeat_inside_the_prompt(monkeypatch, tmp_path, capsys):
-    """A repeat wholly inside `prompt_messages` must not be reported against `sft_completion`.
+def test_env_test_stays_quiet_for_a_repeat_wholly_inside_the_prompt(monkeypatch, tmp_path, capsys):
+    """A repeat wholly inside `prompt_messages` is not this warning's to report.
 
     `with_system_prompt` prepends the contract system message without merging an existing one, so a
-    two-system prompt is a shape the adapter itself can produce. Naming `sft_completion` there sends
-    the author to a file that is correct -- here, a single well-formed assistant turn that cannot
-    contain a repeat at all.
+    two-system prompt is a shape the adapter itself produces, and an ordinary RAG prompt puts the
+    retrieved document in its own user message. Both render as separate delimited blocks and are
+    correct. There is no edit to `sft_completion` -- here a single well-formed assistant turn that
+    cannot contain a repeat at all -- that would change them, so naming it accused a correct file,
+    and firing on every episode of a healthy env is what teaches people to ignore the warning where
+    it is real.
     """
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv()
@@ -1921,18 +1930,46 @@ def test_env_test_blames_the_prompt_for_a_repeat_inside_the_prompt(monkeypatch, 
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    assert "inside prompt_messages (message 1 (assistant))" in captured.err
-    assert "inside sft_completion" not in captured.err
+    assert "consecutive same-role turns" not in captured.err
 
 
-def test_env_test_names_both_regions_when_a_completion_collides_and_collapses(
+def test_env_test_stays_quiet_for_an_assistant_prefill_the_completion_continues(
     monkeypatch, tmp_path, capsys
 ):
-    """A seam collision and an internal collapse are different edits, so both must be named.
+    """A prompt ending on an assistant prefill is the one seam that is MEANT to merge.
 
-    Reporting only the seam sends the author to remove the prefill; they re-run and the completion
-    is still collapsing turns, which is the exact confusion naming the regions separately exists to
-    prevent.
+    The completion finishes an utterance the prompt began, so the two assistant turns rendering as
+    one reply is the point. The remedy this warning would print -- interleave the user turn being
+    answered -- destroys the prefill, which is why the assistant seam is exempt while a doubled
+    `user` turn at the same boundary (a trajectory captured one turn early) still reports.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _SingleTurnEnv(rows=[{"input": "who wrote Dune?", "output": "Frank Herbert"}])
+    monkeypatch.setattr(
+        env,
+        "prompt_messages",
+        lambda example: [
+            {"role": "user", "content": example["input"]},
+            {"role": "assistant", "content": "The author is"},
+        ],
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    assert "consecutive same-role turns" not in captured.err
+
+
+def test_env_test_reports_an_internal_collapse_behind_a_legitimate_prefill(
+    monkeypatch, tmp_path, capsys
+):
+    """A prefill seam is exempt, but it must not mask a real collapse further into the completion.
+
+    This env has both: the prompt ends on an assistant prefill the completion continues (healthy,
+    and the reason the seam is skipped), and the completion then runs two assistant turns together
+    (the ISSUE-015 defect). Suppressing the whole episode because its first adjacency was excusable
+    would lose the finding that matters, so the interior is still scanned and reported on its own
+    index.
     """
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv()
@@ -1956,34 +1993,9 @@ def test_env_test_names_both_regions_when_a_completion_collides_and_collapses(
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    assert "at the prompt/completion boundary" in captured.err
     assert "inside sft_completion (message 1 (assistant))" in captured.err
-
-
-def test_env_test_warns_on_a_same_role_seam_at_the_prompt_boundary(monkeypatch, tmp_path, capsys):
-    """A completion whose first turn collides with the prompt's last is a different edit.
-
-    Two assistant turns inside the completion means "interleave the user turns"; a collision at the
-    seam means "stop prefilling the prompt". Naming the wrong one sends the reader to the wrong
-    file, so the two are reported distinctly.
-    """
-    env_dir = _environment_dir(tmp_path)
-    env = _SingleTurnEnv(rows=[{"input": "finish it", "output": "done"}])
-    # a prompt that ends on an assistant prefill, which is legal on its own.
-    monkeypatch.setattr(
-        env,
-        "prompt_messages",
-        lambda example: [
-            {"role": "user", "content": example["input"]},
-            {"role": "assistant", "content": "the answer is"},
-        ],
-    )
-    _patch_loader(monkeypatch, env)
-
-    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
-    captured = capsys.readouterr()
-    assert "consecutive same-role turns at the prompt/completion boundary" in captured.err
-    assert "rendered roles: user assistant | assistant" in captured.err
+    # the prefill itself is not blamed: the remedy for it would break a working prompt.
+    assert "prompt/completion boundary" not in captured.err
 
 
 def test_env_test_does_not_warn_when_the_gold_completion_interleaves_user_turns(
@@ -2213,13 +2225,18 @@ def test_env_test_warns_when_every_episode_scores_zero_under_sft(monkeypatch, tm
     assert "measured nothing" in captured.err
 
 
-def test_env_test_zero_reward_warning_survives_a_reasoning_markup_reference(
-    monkeypatch, tmp_path, capsys
-):
-    """A `<think>` reference is excluded from the blocking gate, and took the diagnosis with it.
+def test_env_test_does_not_call_a_reasoning_markup_run_unmeasured(monkeypatch, tmp_path, capsys):
+    """A `<think>` reference scoring zero here says nothing about the environment.
 
-    Abstaining from the blocking verdict is right -- this command cannot replay reasoning markup
-    faithfully -- but abstaining from SAYING the run scored nothing is not.
+    This command has no run config, so `thinking` defaults off and it replays the tagged reference
+    verbatim -- while a real run grades what `_scored_turn_text` leaves after stripping the span. A
+    correct strict answer-only grader therefore scores 0.0 here on a WORKING environment, which is
+    why `_carries_thinking_markup` keeps these episodes out of the blocking gate.
+
+    The advisory warning has to abstain for the same reason: "this run measured nothing" is the very
+    conclusion the gate withholds, and asserting it in a warning restates it with the blocking
+    removed rather than the claim. The per-episode low-reward warning still prints the number, which
+    is the part that is true.
     """
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(
@@ -2230,10 +2247,12 @@ def test_env_test_zero_reward_warning_survives_a_reasoning_markup_reference(
 
     assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
     captured = capsys.readouterr()
-    # the blocking gate stayed out of it, exactly as designed...
+    # the blocking gate stays out of it, exactly as designed...
     assert "cannot recognize its own reference answers" not in captured.err
-    # ...but the run no longer passes without a word about having measured nothing.
-    assert "all 1 scored episode(s) returned reward 0.000000" in captured.err
+    # ...and so does the advisory warning, which would otherwise assert the same thing.
+    assert "measured nothing" not in captured.err
+    # the observation that IS supported is still made.
+    assert "replay gold answer scored low" in captured.err
 
 
 def test_env_test_does_not_warn_when_one_episode_scores_nonzero(monkeypatch, tmp_path, capsys):
@@ -2565,6 +2584,72 @@ def test_env_test_does_not_warn_when_an_episode_finishes_on_its_per_example_cap(
     assert "never finished" not in captured.err
 
 
+class _MalformedFinalReplyEnv(_PerExampleCapDeadEnv):
+    """An env whose LAST `env_reply` is malformed, reached only at the ceiling.
+
+    Scalar `content` breaks the chat template in a real rollout, which is why every in-loop reply is
+    envelope-checked. This one is issued by the deferred call after the loop, and a per-example
+    budget makes that the common path rather than a rare one.
+    """
+
+    def env_reply(self, messages, state):
+        state["turn"] += 1
+        reply = (
+            {"role": "user", "content": 123}
+            if state["turn"] >= 3
+            else {"role": "user", "content": "keep going"}
+        )
+        messages.append(reply)
+        return [reply]
+
+
+def test_env_test_validates_the_deferred_final_env_reply(monkeypatch, tmp_path, capsys):
+    """The last `env_reply` of a capped episode must be checked like every other one.
+
+    An episode stopped at the ceiling has its final reply issued by the deferred call after the
+    loop, so that call is the ONLY `env_reply` an author sees validated for such an episode. It was
+    unchecked, and an environment whose final reply is malformed reached `overall: PASS` -- then
+    broke tokenization on the paid run, which is precisely what the in-loop check exists to prevent.
+    """
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _MalformedFinalReplyEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "env_reply is not well-formed" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+class _NoFinalReplyEnv(_PerExampleCapDeadEnv):
+    """A healthy env with nothing left to observe on its final turn."""
+
+    def env_reply(self, messages, state):
+        state["turn"] += 1
+        if state["turn"] >= 3:
+            # legitimate: no further observation to make.
+            return []
+        reply = {"role": "user", "content": "keep going"}
+        messages.append(reply)
+        return [reply]
+
+
+def test_env_test_allows_an_empty_deferred_final_env_reply(monkeypatch, tmp_path, capsys):
+    """Returning no final observation is legal, and must not be read as a malformed reply.
+
+    The paired negative for the test above. `_check_messages` rejects an empty list, so validating
+    the deferred reply without checking for emptiness first would fail every environment that simply
+    has nothing more to say -- the in-loop path breaks on that case before validating, and this one
+    has to agree.
+    """
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _NoFinalReplyEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "env_reply is not well-formed" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
 def test_env_test_warns_when_the_completion_repeats_the_prompts_last_user_turn(
     monkeypatch, tmp_path, capsys
 ):
@@ -2588,7 +2673,9 @@ def test_env_test_warns_when_the_completion_repeats_the_prompts_last_user_turn(
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    assert "at the prompt/completion boundary (its first turn is another user turn" in captured.err
+    # reported even though it sits AT the seam: only an assistant seam is a legitimate prefill, and
+    # a doubled user turn there has no such form -- it is the completion restating the question.
+    assert "message 0 (user), which repeats the prompt's last turn" in captured.err
     # the remedy names the real fault rather than telling them to interleave user turns.
     assert "captured one turn early" in captured.err
 
