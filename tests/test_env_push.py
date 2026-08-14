@@ -5432,6 +5432,52 @@ def test_an_appended_bzip2_whose_first_block_exceeds_the_probe_is_expanded(tmp_p
     assert credential_in_file(appended) == "a Freesolo API key"
 
 
+def test_an_appended_gzip_whose_name_field_exceeds_the_probe_is_expanded(tmp_path):
+    """A gzip name is NUL-terminated and unbounded, so a legal one outruns the 64 KiB probe.
+
+    The deflate bits then sit past everything the overlay search reads, the candidate inflates to
+    nothing, and it was dismissed as "not a stream" -- so the credential behind the stub published
+    while `gzip.decompress` recovered it from the very same bytes. Only the extra field was treated
+    as a reason a header might be unfinished, and the name and comment fields have exactly the same
+    shape.
+    """
+    import gzip
+    import io
+
+    from flash.env_secrets import credential_in_file
+
+    body = f'export FREESOLO_API_KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode()
+    buffered = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffered, mode="wb", filename="") as writer:
+        writer.write(body)
+    raw = bytearray(buffered.getvalue())
+    # set FNAME and splice in a name longer than the probe, which is legal and ordinary for a
+    # stream produced from a long path
+    named = (
+        bytes(raw[:3])
+        + bytes([raw[3] | 0x08])
+        + bytes(raw[4:10])
+        + b"n" * (80 << 10)
+        + b"\x00"
+        + bytes(raw[10:])
+    )
+    # the stream is real: an ordinary reader recovers the whole credential from it
+    assert body in gzip.decompress(named)
+
+    standalone = tmp_path / "payload.gz"
+    standalone.write_bytes(named)
+    assert credential_in_file(standalone) == "a Freesolo API key"
+
+    appended = tmp_path / "installer.run"
+    appended.write_bytes(b"#!/bin/sh\nexit 0\n" + named)
+    assert credential_in_file(appended) == "a Freesolo API key"
+
+    # widening the header test must not make ordinary content look like an unfinished stream
+    ordinary = tmp_path / "notes.txt"
+    ordinary.write_bytes(b"# ordinary configuration\nDEBUG=1\n" * 4000)
+    assert credential_in_file(ordinary) is None
+
+
 def test_a_json_escaped_credential_name_is_still_matched(tmp_path):
     """`"SecretAccess\\u004bey"` names the same field, so the same secret is caught.
 
@@ -6982,6 +7028,59 @@ def test_an_encrypted_pdf_refuses_rather_than_skipping_its_streams(tmp_path):
     )
     with pytest.raises(_Unscannable):
         credential_in_file(encrypted)
+
+
+def test_an_encrypt_key_ends_at_any_legal_separator(tmp_path):
+    """A PDF name ends at whitespace, at a delimiter, or at the `%` that opens a comment.
+
+    Requiring whitespace meant `/Encrypt%c\\n2 0 R` named no encryption dictionary, so the document
+    was treated as unencrypted: its ciphertext streams went to the declared filters, failed to
+    inflate, and were skipped as "not really a stream" -- publishing clean while being, by
+    construction, unreadable to this check. Every character may also be written `#XX`, so the name
+    has to be recognised by what it MEANS rather than by one spelling.
+    """
+    import os
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    # really ciphertext: if the key were findable in these bytes, a refusal would prove nothing
+    cipher = bytes(
+        stream ^ pad
+        for stream, pad in zip(
+            zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode()),
+            os.urandom(4096) * 8,
+            strict=False,
+        )
+    )
+    assert b"fslo_" not in cipher
+
+    for name, entry in (
+        ("comment.pdf", b"/Encrypt%c\n2 0 R"),
+        ("escaped.pdf", b"/Encryp#74 2 0 R"),
+        ("both.pdf", b"/#45ncrypt%x\n2 0 R"),
+        ("dict.pdf", b"/Encrypt<</O 1>>"),
+        ("array.pdf", b"/Encrypt[1 0 R]"),
+    ):
+        published = tmp_path / name
+        published.write_bytes(
+            b"%PDF-1.7\ntrailer\n<< "
+            + entry
+            + b" /Root 1 0 R >>\n"
+            + _flate_pdf(b"/Filter /FlateDecode", cipher)
+        )
+        with pytest.raises(_Unscannable, match="encrypted document"):
+            credential_in_file(published)
+
+    # a LONGER name merely starting with those characters is a different name, and its document is
+    # not encrypted -- refusing there would refuse ordinary documents on a substring
+    plain = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
+    other = tmp_path / "other.pdf"
+    other.write_bytes(
+        b"%PDF-1.7\ntrailer\n<< /Encryptionless 1 /Root 1 0 R >>\n"
+        + _flate_pdf(b"/Filter /FlateDecode", plain)
+    )
+    assert credential_in_file(other) == "a Freesolo API key"
 
 
 def test_narrowed_wide_text_keeps_the_truncation_state_of_its_chunk(tmp_path):

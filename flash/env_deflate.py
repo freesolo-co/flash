@@ -86,7 +86,19 @@ _FLATE_FILTER = b"FlateDecode"
 
 # The document's encryption dictionary. Present exactly when stream bodies are ciphertext, and
 # named in the trailer rather than in any stream's own dictionary, so it is searched document-wide.
-_PDF_ENCRYPT = re.compile(rb"/Encrypt\s")
+#
+# A name ENDS at whitespace, at a delimiter, or at the `%` that opens a comment -- all three are
+# legal separators, and a reader that sees any of them has read the name `Encrypt`. Requiring
+# whitespace alone meant `/Encrypt%c\n2 0 R` named no encryption dictionary here, so the ciphertext
+# went to the declared filters, failed to inflate, and was skipped as "not really a stream": the
+# document published clean while its streams were, by construction, unreadable to this check.
+#
+# Written character by character like `_FLATE_NAME` above, and for the same reason -- every one of
+# them may be spelled `#XX`, so `/Encryp#74` is the same name to every reader. Matching the escaped
+# forms here rather than resolving them across the document keeps stream bytes untouched: a `#` in
+# a compressed body means nothing, and rewriting it could invent a name that is not there.
+_ENCRYPT_NAME = b"".join(rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for letter in b"Encrypt")
+_PDF_ENCRYPT = re.compile(rb"/%s(?:[\s/<>\[\]()%%]|$)" % _ENCRYPT_NAME)
 
 # A `/Filter` whose value is an indirect reference (`2 0 R`) rather than a name or an array of
 # names. Resolving it means following the xref table into another object.
@@ -139,6 +151,11 @@ class _TooManyStreams(Exception):
     """
 
 
+# What a byte of a gzip name or comment may be. RFC 1952 makes both ISO 8859-1 text, so the C1
+# control range is excluded along with the C0 one -- a name is something a person could have typed.
+_LATIN1_TEXT = frozenset(range(0x20, 0x7F)) | frozenset(range(0xA0, 0x100))
+
+
 def _gzip_header_unfinished(probe: bytes) -> bool:
     """Whether a gzip header declares OPTIONAL FIELDS that run past all of `probe`.
 
@@ -162,17 +179,38 @@ def _gzip_header_unfinished(probe: bytes) -> bool:
     if len(probe) < 12 or not probe.startswith(b"\x1f\x8b\x08"):
         return False
     flags = probe[3]
-    # Only FEXTRA, and only when the two reserved flag bits are clear. A name or comment is
-    # NUL-terminated, so "no terminator in view" is satisfied by any run of random bytes, and
-    # accepting that admitted 2 of 500 decoy magics as real streams -- the decoy stream in the
-    # overlay test is nothing but gzip magics, so one landing near the end of a probe has a
-    # header that genuinely runs past it. An extra field is different: it declares a LENGTH, and
-    # the field is the only part of a gzip header that can exceed a 64 KiB probe on its own.
-    if flags & 0b11100000 or not flags & 0b100:
+    # The two reserved bits must be clear: no real header sets them, and requiring that is most of
+    # what keeps a chance magic from looking like a header at all.
+    if flags & 0b11100000:
         return False
-    # The declared field must actually outrun the probe. A chance length is small and lands well
-    # inside it, which is not the condition this exists for.
-    return 12 + int.from_bytes(probe[10:12], "little") > len(probe)
+    at = 10
+    # The extra field declares a LENGTH, so it is decided by arithmetic. A chance length is small
+    # and lands well inside the probe, which is not the condition this exists for.
+    if flags & 0b100:
+        at = 12 + int.from_bytes(probe[10:12], "little")
+        if at > len(probe):
+            return True
+    # FNAME and FCOMMENT are NUL-terminated and unbounded, so a legal one longer than the probe
+    # reaches the end with no terminator -- the same "payload not reached yet" the extra field
+    # reports by arithmetic. Excluding them meant a valid stream with an 80 KiB name inflated to
+    # nothing, was read as "not a stream", and published, while `gzip -dc` recovered the credential
+    # from those same bytes.
+    #
+    # "No terminator in view" alone is not enough, which is why they were excluded before: any run
+    # of bytes satisfies it, and a file of adjacent gzip magics is nothing but such runs. RFC 1952
+    # makes both fields Latin-1 TEXT, so the unterminated remainder must READ like a name -- which
+    # a stream of `1f 8b 08` control bytes does not. Measured over full probes: 0 of 4,000 random
+    # bodies behind a chance magic, and the adjacent-magic decoy rejected, while the real long-name
+    # stream is caught. Padding with printable bytes defeats the test, but that only buys an
+    # expansion attempt which then judges the candidate on what it actually inflates to.
+    for present in (0b1000, 0b10000):
+        if flags & present:
+            end = probe.find(b"\0", at)
+            if end < 0:
+                unterminated = probe[at:]
+                return bool(unterminated) and all(byte in _LATIN1_TEXT for byte in unterminated)
+            at = end + 1
+    return False
 
 
 def _raw_deflate_payload(data: bytes, budget: int) -> bytes | None:
