@@ -37,6 +37,7 @@ from typing import IO, NoReturn
 
 from flash.env_formats import (
     _MAX_ARCHIVE_MEMBERS,
+    _MAX_OPENPGP_MARKERS,
     _UNEXPANDABLE_MAGIC,
     _ZIP_TAIL_BYTES,
     _after_skippable_frames,
@@ -44,6 +45,7 @@ from flash.env_formats import (
     _is_openpgp_secret_key,
     _looks_compressed,
     _looks_like_tar,
+    _looks_like_textual,
     _looks_like_zlib,
     _zip_member_count,
 )
@@ -53,6 +55,7 @@ from flash.env_patterns import (
     _MAX_BODY,
     _PAIRED_PATTERNS,
     _TOKEN_PATTERNS,
+    SHORTEST_TOKEN_BYTES,
     _match,
 )
 
@@ -69,6 +72,10 @@ _SCAN_OVERLAP_BYTES = _MAX_BODY * 4
 # seekable stream carries, and bounded so a chain of crafted frame headers cannot make this walk a
 # cost of its own.
 _SKIPPABLE_SCAN_BYTES = 64 << 10
+# How much of a member's head the OpenPGP secret-key test reads. The test itself needs about a
+# dozen bytes, but a legal marker packet may precede the real one and each consumes five, so a
+# fixed 24 left too few behind four markers to reach the version and algorithm fields.
+_OPENPGP_HEAD_BYTES = 24 + 5 * _MAX_OPENPGP_MARKERS
 
 # A base64 run long enough to hold the shortest credential a pattern admits. The lower bound makes
 # the scan walk past ordinary prose rather than decoding every word it meets. There is deliberately
@@ -81,7 +88,14 @@ _SKIPPABLE_SCAN_BYTES = 64 << 10
 # `+/` split such a value at its first `-` so the fragments decoded to neither the whole token nor
 # anything matching. The two alphabets are disjoint apart from the shared 62 characters, so one
 # pattern covers both and the decode below translates whichever pair is present.
-_BASE64_RUN = re.compile(rb"[A-Za-z0-9+/\-_]{24,}={0,2}")
+#
+# The floor is DERIVED from the shortest credential the patterns admit, not chosen. At a fixed 24
+# it sat above the encoding of the shortest Slack token: `xoxb-` plus its 10-character body is 15
+# bytes, which encodes to 20 characters, so `eG94Yi1BYkNkRWYwMTIz` in a Kubernetes Secret or any
+# other base64 config was never decoded even though the same token in plaintext was caught. Any
+# future lowering of a body minimum moves this with it.
+_MIN_BASE64_RUN = -(-SHORTEST_TOKEN_BYTES * 4 // 3)  # ceil, unpadded base64 length
+_BASE64_RUN = re.compile(rb"[A-Za-z0-9+/\-_]{%d,}={0,2}" % _MIN_BASE64_RUN)
 
 # Maps the URL-safe alphabet onto the standard one so a single decoder handles both. A run mixing
 # the two is not valid base64 either way, and translating it simply fails to decode as before.
@@ -243,7 +257,10 @@ def _match_base64(data: bytes) -> str | None:
                 # token-in-a-URL encodings emit, so this is the common case rather than the odd one.
                 if remainder := len(chunk) % 4:
                     chunk = chunk + b"=" * (4 - remainder) if remainder > 1 else chunk[:-1]
-                if len(chunk) < 24:
+                # The same derived floor as the run pattern, not a second hardcoded 24. Lowering
+                # only the pattern left this one rejecting exactly the encodings it had started
+                # admitting, so the fix would have looked applied while the bypass stayed open.
+                if len(chunk) < _MIN_BASE64_RUN:
                     continue
                 try:
                     decoded = base64.b64decode(chunk.translate(_URL_SAFE_ALPHABET), validate=True)
@@ -379,29 +396,19 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     while chunk := handle.read(_SCAN_CHUNK_BYTES):
         if deadline is not None and time.monotonic() > deadline:
             raise _Unscannable("takes too long to decompress")
-        if not carry and _is_openpgp_secret_key(chunk[:24]):
+        if not carry and _is_openpgp_secret_key(chunk[:_OPENPGP_HEAD_BYTES]):
             # only ever at offset 0, and `carry` is empty only on the first chunk. Every file and
             # every archive member reaches this, so the binary export is covered wherever it sits.
             return "a private key"
         if not carry:
-            # Past any skippable frames first: zstd and LZ4 both allow a metadata envelope before
-            # the real frame, and a head-only check saw that envelope's magic, matched neither
-            # list, and passed the compressed frame behind it through as ordinary content.
-            head, truncated = _after_skippable_frames(chunk[:_SKIPPABLE_SCAN_BYTES])
+            # zstd and LZ4 both allow a metadata envelope before the real frame. What matters here
+            # is only whether that prelude could be READ to its end: a frame declaring a payload
+            # longer than the bytes available leaves the format undecided, and undecided is not
+            # clean. The signature search itself runs below over the whole window, so the walked
+            # bytes are not needed -- only the verdict on whether the walk ran out.
+            _, truncated = _after_skippable_frames(chunk[:_SKIPPABLE_SCAN_BYTES])
             if truncated:
                 raise _Unscannable("begins with a frame prelude too long to read past")
-            for magic, fmt in _UNEXPANDABLE_MAGIC:
-                # `find`, not `startswith`. RAR and 7-Zip both ship self-extracting archives: an
-                # executable stub, then the signature, then the opaque compressed body. A
-                # head-anchored test saw the stub, matched nothing, and scanned the compressed
-                # bytes as if they were content -- the same bypass the zip stub handling closes,
-                # reachable with `rar a -sfx` or 7-Zip's `-sfx` switch.
-                #
-                # Bounded to the head already read rather than the whole stream: the signature of a
-                # real SFX sits within the stub, and searching every chunk would make these six
-                # patterns a per-byte cost on every file scanned.
-                if head.find(magic) >= 0:
-                    raise _Unscannable(f"contains a {fmt} archive this check cannot expand")
         if not carry and depth:
             # tar as well as the compressed magics: a tar's own members are literal, but a
             # COMPRESSED member inside one is not, so an oversized tar that went past the buffer
@@ -421,6 +428,19 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         if depth:
             tail = (tail + chunk)[-_ZIP_TAIL_BYTES:]
         window = carry + chunk
+        # The signature of a self-extracting archive is searched over the WHOLE stream, not just
+        # the head. Bounding it to the first 64 KiB only moved the bypass: a stub of at least that
+        # size -- which is every real SFX module, since the smallest 7-Zip one is about 150 KiB --
+        # put the signature past the window, and the opaque compressed body behind it was scanned
+        # as ordinary content and published. There is no upper bound on where a stub ends, so any
+        # fixed prefix is a number an attacker picks their padding to exceed.
+        #
+        # Affordable because these signatures are 4 to 8 bytes of fixed content: `bytes.find` is a
+        # memchr-driven scan, and the expected false-positive rate on arbitrary data is a quarter
+        # of a hit per GiB for the shortest of them and vanishing for the rest. Measured 0 hits
+        # across 256 MiB of random bytes for all six.
+        if fmt := _unexpandable_format(window):
+            raise _Unscannable(f"contains a {fmt} archive this check cannot expand")
         if kind := _credential_kind(window):
             return kind
         # A two-marker credential is paired across the WHOLE stream, not within one window. Those
@@ -436,6 +456,17 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     if buffered and _looks_like_container(bytes(buffered)):
         return _credential_in_container(bytes(buffered), deadline=deadline or 0.0, depth=depth + 1)
     return None
+
+
+def _unexpandable_format(data: bytes) -> str | None:
+    """The name of an unexpandable archive format whose signature appears in `data`, or None.
+
+    `find` rather than `startswith`. RAR and 7-Zip both ship self-extracting archives -- an
+    executable stub, then the signature, then the opaque compressed body -- so a head-anchored test
+    saw the stub, matched nothing, and scanned the compressed bytes as if they were content. That
+    is the same bypass the zip stub handling closes, reachable with `rar a -sfx` or 7-Zip's `-sfx`.
+    """
+    return next((fmt for magic, fmt in _UNEXPANDABLE_MAGIC if magic in data), None)
 
 
 def _paired_markers_kind(window: bytes, seen: set[tuple[int, str]]) -> str | None:
@@ -549,7 +580,15 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
         # dictionary that is not carried in the file. Without it `decompress` raises, and treating
         # that as "not zlib after all" let the opaque bytes fall through to the literal scan and
         # publish. Refusing is the honest answer: the content cannot be inspected from here.
-        if head[1] & 0x20:
+        #
+        # Gated on the bytes not reading as text first. The zlib header rule is about eleven bits
+        # of signal, and `x ` satisfies all of it -- so an ordinary `x = 1` sidecar was refused as
+        # a dictionary-compressed stream and could not be published at all. A refusal needs more
+        # than a heuristic behind it, and a deflate payload is not printable ASCII: measured over
+        # 20 real dictionary-compressed streams none read as text, and over every innocent shape
+        # that trips the header none read as compressed. Decompression cannot make this call --
+        # `zlib.error` is identical for a real FDICT stream and for `x = 1`.
+        if head[1] & 0x20 and not _looks_like_textual(raw):
             raise _Unscannable("contains a compressed stream needing a dictionary to inspect")
         inflate = zlib.decompressobj()
         try:

@@ -4260,3 +4260,188 @@ def test_a_triple_quoted_assignment_is_read_as_an_assignment(tmp_path):
     wandb = tmp_path / "conf.py"
     wandb.write_text('WANDB_API_KEY = """' + "a1b2c3d4e5" * 4 + '"""')
     assert credential_in_file(wandb) == "a Weights & Biases API key"
+
+
+def test_a_yaml_block_header_is_read_in_either_indicator_order(tmp_path):
+    """YAML 1.2 lets a block header carry its indentation and chomping indicators in either order.
+
+    `|2-` and `|-2` are the same scalar, but the header pattern admitted only sign-then-digit, so
+    the `|` was left unconsumed, the body failed to match, and the key published. A writer that
+    emits an explicit indentation indicator -- ruamel, several Helm chart generators -- naturally
+    puts the digit first.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    for header in ("|", "|-", "|+", ">-", "|2-", ">2+", "|-2", "|2"):
+        written = tmp_path / "secrets.yaml"
+        written.write_text(f"AWS_SECRET_ACCESS_KEY: {header}\n  {body}\n")
+        assert credential_in_file(written) == "an AWS secret access key", header
+
+
+def test_a_jwk_member_name_is_matched_through_its_json_escape(tmp_path):
+    """JSON says `"\\u0064"` and `"d"` are the same string, and every parser agrees.
+
+    A JWK whose private member is spelled with escapes loads and exports identically, so it is the
+    same key -- but a literal-byte pattern saw no `d` at all and published it. Both halves are
+    escapable, so the `kty` that identifies the format is covered too.
+    """
+    import base64
+    import json
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    secret = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+    # `k` is `k`, `d` is `d`. The hex digits are case-insensitive per RFC 8259, so the
+    # capital form is the same name and must be caught too.
+    escape_d, escape_kty, escape_dp = "\\u0064", "\\u006bty", "\\u0064p"
+    escape_kty_upper = "\\u006Bty"
+    for name, text in (
+        ("plain", '{"kty":"OKP","crv":"Ed25519","x":"abc","d":"' + secret + '"}'),
+        (
+            "escaped-d",
+            '{"kty":"OKP","crv":"Ed25519","x":"abc","' + escape_d + '":"' + secret + '"}',
+        ),
+        ("escaped-kty", '{"' + escape_kty + '":"OKP","x":"abc","d":"' + secret + '"}'),
+        (
+            "escaped-both",
+            '{"' + escape_kty_upper + '":"RSA","' + escape_dp + '":"' + secret + '"}',
+        ),
+    ):
+        written = tmp_path / f"{name}.json"
+        written.write_text(text)
+        assert json.loads(text), name  # the fixture must be legal JSON, or it proves nothing
+        assert credential_in_file(written) == "a private key", name
+
+    # a PUBLIC jwk written the same way is still publishable
+    public = tmp_path / "public.json"
+    public.write_text('{"' + escape_kty + '":"OKP","crv":"Ed25519","x":"' + secret + '"}')
+    assert credential_in_file(public) is None
+
+
+def test_an_sfx_archive_is_refused_however_long_its_stub(tmp_path):
+    """The signature of a self-extracting archive sits past any amount of stub.
+
+    Bounding the search to the first 64 KiB only moved the bypass: every real SFX module is larger
+    than that -- 7-Zip's smallest is about 150 KiB -- so the signature landed past the window and
+    the opaque compressed body behind it was scanned as ordinary content and published.
+    """
+    import os
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    for stub_kb in (1, 63, 64, 65, 256):
+        packed = tmp_path / f"sfx{stub_kb}.exe"
+        packed.write_bytes(os.urandom(stub_kb << 10) + b"7z\xbc\xaf\x27\x1c" + os.urandom(4096))
+        with pytest.raises(_Unscannable):
+            credential_in_file(packed)
+
+    # an ordinary large binary with no signature anywhere is still publishable
+    plain = tmp_path / "weights.bin"
+    plain.write_bytes(os.urandom(256 << 10))
+    assert credential_in_file(plain) is None
+
+
+def test_an_lz4_legacy_frame_is_refused_like_the_modern_one(tmp_path):
+    """The LZ4 legacy frame carries its own magic rather than a variant of the modern one.
+
+    `lz4 -l` writes it, and its body is opaque exactly like the modern frame -- so naming only
+    `04 22 4d 18` meant a legacy frame was scanned as raw bytes and published intact.
+    """
+    import os
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    for name, magic in (("legacy", b"\x02\x21\x4c\x18"), ("modern", b"\x04\x22\x4d\x18")):
+        packed = tmp_path / f"{name}.lz4"
+        packed.write_bytes(magic + os.urandom(4096))
+        with pytest.raises(_Unscannable):
+            credential_in_file(packed)
+
+
+def test_an_openpgp_secret_key_is_found_behind_a_marker_packet(tmp_path):
+    """A marker packet is a legal no-op RFC 9580 requires implementations to skip.
+
+    GnuPG parses `<marker><secret key>` as the secret key it is, but an offset-zero-only test saw
+    the marker, matched nothing, and the remaining binary key material matched no textual or DER
+    pattern -- so five prepended bytes published a private key intact.
+    """
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    def packet(body_bytes: int) -> bytes:
+        body = bytes([4]) + b"\x66\x00\x00\x00" + bytes([1]) + os.urandom(body_bytes)
+        if len(body) < 192:
+            return bytes([0xC5, len(body)]) + body
+        over = len(body) - 192
+        return bytes([0xC5, 192 + (over >> 8), over & 0xFF]) + body
+
+    marker = b"\xca\x03PGP"
+    for body_bytes in (100, 180, 400):
+        for name, data in (
+            ("bare", packet(body_bytes)),
+            ("marker", marker + packet(body_bytes)),
+            ("two-markers", marker * 2 + packet(body_bytes)),
+        ):
+            written = tmp_path / f"{name}{body_bytes}.gpg"
+            written.write_bytes(data)
+            assert credential_in_file(written) == "a private key", f"{name}/{body_bytes}"
+
+    # a marker in front of ordinary bytes is not a key
+    innocent = tmp_path / "notes.bin"
+    innocent.write_bytes(marker + b"just some text about PGP\n" * 20)
+    assert credential_in_file(innocent) is None
+
+
+def test_ordinary_text_is_not_refused_as_a_dictionary_compressed_stream(tmp_path):
+    """The zlib header rule is about eleven bits of signal, and `x ` satisfies all of it.
+
+    Turning that heuristic into a terminal refusal meant an ordinary `x = 1` sidecar could not be
+    published at all. Decompression cannot make the call -- `zlib.error` is identical for a real
+    dictionary-compressed stream and for the text -- so the discriminator is whether the bytes read
+    as text at all.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    for name, text in (("a", "x = 1\n"), ("b", "x  = 1\n"), ("c", "x = 1\nimport os\n" * 40)):
+        written = tmp_path / f"{name}.py"
+        written.write_text(text)
+        assert credential_in_file(written) is None, name
+
+    # a real dictionary-compressed stream is still refused: its content cannot be inspected
+    compressor = zlib.compressobj(zdict=b"AWS_SECRET_ACCESS_KEY=")
+    blob = compressor.compress(b"AWS_SECRET_ACCESS_KEY=" + b"A" * 40 + b"\n") + compressor.flush()
+    assert blob[1] & 0x20, "fixture must actually set FDICT"
+    packed = tmp_path / "state.zz"
+    packed.write_bytes(blob)
+    with pytest.raises(_Unscannable):
+        credential_in_file(packed)
+
+
+def test_the_base64_floor_admits_the_shortest_token_the_patterns_match(tmp_path):
+    """The encoded floor is derived from the shortest credential, not chosen.
+
+    `xoxb-` plus its 10-character body is 15 bytes, which encodes to 20 characters -- below a fixed
+    24 -- so a minimum-length Slack token in a Kubernetes Secret was never decoded even though the
+    same token in plaintext was caught.
+    """
+    import base64
+
+    from flash.env_patterns import SHORTEST_TOKEN_BYTES
+    from flash.env_secrets import _MIN_BASE64_RUN, credential_in_file
+
+    token = b"xoxb-AbCdEf0123"
+    assert len(token) == SHORTEST_TOKEN_BYTES
+    encoded = base64.b64encode(token).decode()
+    assert len(encoded) == _MIN_BASE64_RUN
+
+    written = tmp_path / "secret.yaml"
+    written.write_text(f"data:\n  token: {encoded}\n")
+    assert credential_in_file(written) == "a Slack token"
+
+    # the floor tracks the patterns rather than being written twice
+    assert _MIN_BASE64_RUN == -(-SHORTEST_TOKEN_BYTES * 4 // 3)

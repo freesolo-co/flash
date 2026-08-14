@@ -54,6 +54,11 @@ _COMPRESSED_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7z
 _UNEXPANDABLE_MAGIC = (
     (b"\x28\xb5\x2f\xfd", "zstd"),
     (b"\x04\x22\x4d\x18", "lz4"),
+    # The LZ4 LEGACY frame, a different magic rather than a variant of the one above. It is what
+    # `lz4 -l` writes and what the Linux kernel build and several dataset tools still emit, and its
+    # body is opaque exactly like the modern frame -- so naming only `04 22 4d 18` meant a legacy
+    # frame was scanned as ordinary bytes and published with its credential intact.
+    (b"\x02\x21\x4c\x18", "lz4"),
     # The full RAR 4 and RAR 5 signatures, not the bare `Rar!` prefix. Four printable characters
     # are ordinary prose -- a README opening "Rar! archives are not supported" was refused as an
     # archive -- and a real signature always carries the version bytes that follow.
@@ -75,6 +80,17 @@ _SKIPPABLE_FRAME_HEADER = 8
 # How many skippable frames are walked before the stream is given up on. A real stream carries a
 # handful; an unbounded walk over crafted headers would be a scan cost of its own.
 _MAX_SKIPPABLE_FRAMES = 16
+
+# How many OpenPGP marker packets are walked before the secret-key test. One is what an
+# implementation emits; the bound is what keeps a file of nothing but repeated markers from being
+# a scan cost, and it is checked against the 24-byte head so it can never walk past that anyway.
+_MAX_OPENPGP_MARKERS = 4
+
+# How much of a stream `_looks_like_textual` reads. A multi-byte UTF-8 character straddling the cut
+# would decode-fail on the truncation rather than on the content, so the sample is taken at a
+# 4 KiB boundary and the decode error is tolerated as "not text" -- which is the safe direction:
+# it only ever costs a refusal that the heuristic already justified.
+_TEXT_SAMPLE_BYTES = 4096
 
 
 def _after_skippable_frames(head: bytes) -> tuple[bytes, bool]:
@@ -103,6 +119,25 @@ def _after_skippable_frames(head: bytes) -> tuple[bytes, bool]:
 def _looks_compressed(head: bytes) -> bool:
     """Whether `head` begins a compressed container this scan can expand."""
     return head.startswith(_COMPRESSED_MAGIC) or _looks_like_zlib(head)
+
+
+def _looks_like_textual(data: bytes) -> bool:
+    """Whether `data` reads as text rather than as a compressed stream.
+
+    Used only to keep a heuristic from becoming a refusal: the zlib header rule is satisfied by
+    ordinary text such as `x = 1`, and refusing that file outright is worse than the bypass the
+    rule exists to close. A deflate payload is high-entropy bytes -- it holds NUL and 0x80-0xff
+    almost immediately -- so requiring the sample to be printable UTF-8 separates the two cleanly.
+
+    Deliberately not the inverse of "looks compressed". This answers a narrower question, on a
+    bounded sample, and is only ever consulted where the alternative is a false refusal.
+    """
+    sample = data[:_TEXT_SAMPLE_BYTES]
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return all(32 <= byte < 127 or byte in (9, 10, 13) for byte in sample)
 
 
 def _looks_like_zlib(head: bytes) -> bool:
@@ -155,6 +190,9 @@ def _is_openpgp_secret_key(head: bytes) -> bool:
     # RFC 4880 and 9580 public-key algorithms: RSA, Elgamal, DSA, ECDH/ECDSA/EdDSA, and the RFC
     # 9580 curve IDs. A byte outside this registry is not a key packet.
     algorithms = frozenset((1, 2, 3, 16, 17, 18, 19, 22, 25, 26, 27, 28))
+    head = _after_openpgp_markers(head)
+    if not head:
+        return False
     tag_old, tag_new = head[0] & 0xFC, head[0]
     if tag_old not in (0x94, 0x9C) and tag_new not in (0xC5, 0xC7):
         return False
@@ -182,6 +220,28 @@ def _is_openpgp_secret_key(head: bytes) -> bool:
         return False
     # then a four-byte creation timestamp, then the algorithm
     return len(head) > offset + 5 and head[offset + 5] in algorithms
+
+
+def _after_openpgp_markers(head: bytes) -> bytes:
+    """`head` past any leading OpenPGP marker packets.
+
+    A marker packet (tag 10, body `PGP`) is a legal no-op that RFC 9580 requires implementations to
+    skip, and GnuPG parses `<marker><secret key>` as the secret key it is. Anchoring the secret-key
+    test at offset 0 meant prepending five bytes -- `ca 03 50 47 50` -- moved the real packet out
+    from under the check, and the remaining key material matched no textual or DER pattern, so a
+    binary secret key published intact.
+
+    Only markers are skipped, not arbitrary packets. Walking any packet header would let a crafted
+    prefix of ordinary binary lead the scan to a false secret-key match deep inside a model shard;
+    the marker is a fixed five bytes with a body that must be exactly `PGP`, so recognising it
+    costs no signal. Both packet formats are accepted because either may carry tag 10.
+    """
+    for _ in range(_MAX_OPENPGP_MARKERS):
+        if head[:2] in (b"\xca\x03", b"\xa8\x03") and head[2:5] == b"PGP":
+            head = head[5:]
+        else:
+            break
+    return head
 
 
 def _openpgp_body_length(head: bytes, offset: int) -> int | None:

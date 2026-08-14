@@ -63,6 +63,16 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     ("a Slack token", re.compile(rb"(?:xox[baprs]|xapp)-([A-Za-z0-9-]{10,%d})" % _MAX_BODY)),
 )
 
+# The shortest plaintext any pattern above admits: `xoxb-` plus a 10-character body. Stated here,
+# beside the patterns that determine it, so lowering a body minimum cannot silently leave the
+# base64 floor derived from it too high.
+#
+# Kept as a plain constant rather than computed from the compiled patterns. Deriving it means
+# parsing regex source to find each alternative's prefix and repetition minimum, which is more
+# machinery than the number is worth and gets the count wrong in exactly the quiet direction --
+# too HIGH, which reopens the bypass this exists to close.
+SHORTEST_TOKEN_BYTES = 15
+
 # Credentials with no issuer prefix, anchored on the ASSIGNMENT that names them instead. Both are
 # names this repository already treats as runtime secrets (`WANDB_API_KEY` is the default in
 # `flash/client/runtime_secrets.py`, and `AWS_SECRET_ACCESS_KEY` is its documented example), so a
@@ -95,7 +105,14 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
 # are not whitespace -- so a key written in the commonest multi-line YAML form matched nothing and
 # published. A `secrets.yaml` or a Helm values file is an ordinary thing to keep beside an
 # environment, and both write keys this way.
-_BLOCK_SCALAR = rb"(?:[|>][+-]?[0-9]?\s*)?"
+#
+# The two indicators may appear in EITHER order. YAML 1.2 defines the block header as an
+# indentation indicator and a chomping indicator in any order (`|2-` and `|-2` are the same
+# scalar), and admitting only sign-then-digit meant `|2-` and `>2+` left the `|` unconsumed, the
+# body then failed to match, and the key published. Both orders are named because a writer that
+# emits an explicit indentation indicator -- which is what ruamel and several Helm chart
+# generators do when the first body line is itself indented -- naturally puts the digit first.
+_BLOCK_SCALAR = rb"(?:[|>](?:[+-][0-9]?|[0-9][+-]?)?\s*)?"
 # The opening quote, if any. A single optional quote character consumed only ONE of the three in a
 # triple-quote delimiter, leaving a quote sitting where the body had to begin, so an ordinary
 # Python or TOML multiline assignment matched nothing and published. Whole delimiters are named,
@@ -135,13 +152,38 @@ class _Searchable(Protocol):
 # The `kty` half of a JWK, named at module level because `_scan_stream` needs it too: the two
 # markers may sit further apart than one read chunk, and a chunked scan that only ever sees a
 # window cannot pair them without remembering that the `kty` went past.
-_JWK_KTY = re.compile(rb"\"kty\"\s*:\s*\"(?:RSA|EC|OKP|oct)\"")
+#
+# Its name is escapable exactly like the private members below, and for the same reason: escaping
+# only the `kty` half left the pair unmatched even when the private member was spelled plainly.
+_JWK_KTY = re.compile(
+    rb"\"(?:k|(?i:\\[uU]006b))(?:t|(?i:\\[uU]0074))(?:y|(?i:\\[uU]0079))\""
+    rb"\s*:\s*\"(?:RSA|EC|OKP|oct)\""
+)
 # `d` is the private exponent or scalar in every key type; for RSA the CRT parameters accompany it.
 # `k` is the symmetric case: an `oct` JWK holds its whole secret there and has no `d` at all, so
 # naming `oct` above without it accepted the one key type where the secret IS the file -- what an
 # HMAC signing key or an `A256GCM` content key exports as. A public JWK carries none of these,
 # which is exactly what separates the two.
-_JWK_PRIVATE = re.compile(rb"\"(?:d|dp|dq|qi|k)\"\s*:\s*\"[A-Za-z0-9+/\-_]{20,}={0,2}\"")
+#
+# Each name character is written as itself OR as its `\u00XX` escape, because JSON says the two
+# are the same string and every parser agrees: `"\u0064"` IS `"d"`, so a key whose private member
+# is spelled that way loads identically and exports identically, while a literal-byte pattern saw
+# no `d` at all and published it. Escaping is per-character rather than whole-name so a mixed
+# spelling (`"d\u0070"` for `dp`) is covered too.
+#
+# The hex digits are matched case-insensitively per RFC 8259, and so is the `u`: `\u0064` and
+# `\U0064` name the same character. Every one of these names is ASCII, so two hex digits after
+# `00` are always enough.
+_JWK_ESCAPED = {
+    name: b"".join(rb"(?:%c|(?i:\\[uU]00%02x))" % (byte, byte) for byte in name)
+    for name in (b"d", b"dp", b"dq", b"qi", b"k")
+}
+_JWK_PRIVATE = re.compile(
+    rb"\"(?:"
+    + b"|".join(_JWK_ESCAPED[name] for name in (b"dp", b"dq", b"qi", b"d", b"k"))
+    # longest first: `d` would otherwise win against `dp` and leave the `p` outside the quote
+    + rb")\"\s*:\s*\"[A-Za-z0-9+/\-_]{20,}={0,2}\""
+)
 
 
 class _TwoMarkers:
