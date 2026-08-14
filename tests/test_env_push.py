@@ -1902,6 +1902,41 @@ def test_push_refuses_a_credential_used_as_a_directory_name(monkeypatch, tmp_pat
     assert credential_in_name("src/hf_hub_download_helper.py") is None
 
 
+def test_a_container_encoded_into_a_member_name_is_expanded():
+    """A name gets the same container inspection a file's contents get.
+
+    The name scan passed no deadline, and that is exactly what switches `_decoded_container` off --
+    so an encoded container in a name was only ever matched in its still-compressed form. A
+    66-character filename holding `base64(gzip(key))` published clean, while decoding and inflating
+    the published path recovers the whole key: the name is in the repo tree forever, so this leaks
+    through the listing even with an empty file under it.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import credential_in_name
+
+    encoded = (
+        base64.urlsafe_b64encode(gzip.compress(f"fslo_{_FAKE_KEY_BODY}".encode()))
+        .decode()
+        .rstrip("=")
+    )
+    # the name really does carry the key, recoverable by ordinary tools
+    assert f"fslo_{_FAKE_KEY_BODY}".encode() in gzip.decompress(
+        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    )
+    assert credential_in_name(encoded) == "a Freesolo API key"
+
+    # ordinary names must not become refusals or false matches -- base64-SHAPED names are common
+    for ordinary in (
+        "model-00001-of-00002.safetensors",
+        "data/shard_0001.tar.gz",
+        "aGVsbG8gd29ybGQK",
+        "checkpoint-1000/optimizer.pt",
+    ):
+        assert credential_in_name(ordinary) is None, ordinary
+
+
 def test_a_pem_header_without_a_key_body_is_prose_not_a_credential(tmp_path):
     """Documentation that mentions a PEM header must still publish.
 

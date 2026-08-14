@@ -826,8 +826,19 @@ def credential_in_name(name: str) -> str | None:
     holding a lone surrogate raised `UnicodeEncodeError` out of a security check. Reached from the
     publish route that check turned a 400 into an uncaught 500, and reached from a tar member name
     it crashed the scan of an archive rather than reporting what was in it.
+
+    A name gets a deadline of its own, which is what enables the container inspection that file
+    contents already get: without one `_decoded_container` returns None, so an encoded container in
+    a name was matched only in its still-compressed form. A 66-character filename holding
+    `base64(gzip(key))` published clean while decoding and inflating the published path recovered
+    the whole key. The budget is a fresh one rather than the package's, because a name is bounded
+    by the filesystem at a few hundred bytes -- there is no expansion here for a caller to multiply,
+    and sharing the package budget would let a long member list exhaust it on names alone.
     """
-    return _credential_kind(name.encode("utf-8", "surrogatepass"))
+    return _credential_kind(
+        name.encode("utf-8", "surrogatepass"),
+        deadline=time.monotonic() + _MAX_DECOMPRESS_SECONDS,
+    )
 
 
 def _redacted(name: str) -> str:
