@@ -364,9 +364,16 @@ def _after_openpgp_markers(head: bytes) -> tuple[bytes, bool]:
 
 
 def _openpgp_body_length(head: bytes, offset: int) -> int | None:
-    """The body length an OpenPGP packet header declares, or None if it is not stated."""
-    if head[0] in (0xC5, 0xC7):
-        first = head[1]
+    """The body length an OpenPGP packet header declares, or None if it is not stated.
+
+    Which ENCODING applies is decided by bit 6 of the tag byte, not by the tag itself. Naming the
+    two secret-key tags meant every other new-format packet fell through to the old-format branch,
+    which reads `head[1:offset]` as a big-endian integer -- so a two- or five-byte length was read
+    as though its first byte were the whole length, and the five-byte form returned a nonsense
+    trillion-byte body built from four bytes of the packet's own payload.
+    """
+    if head[0] & 0xC0 == 0xC0:
+        first = head[1] if len(head) > 1 else 0
         if first < 192:
             return first
         if first < 224:

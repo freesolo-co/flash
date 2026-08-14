@@ -6488,3 +6488,44 @@ def test_a_certificate_only_pkcs12_is_not_reported_as_a_private_key(tmp_path):
     certificates_only = tmp_path / "chain.p12"
     certificates_only.write_bytes(preamble + pbes2 + body)
     assert credential_in_file(certificates_only) is None
+
+
+def test_a_new_format_packet_length_is_decoded_for_every_tag(tmp_path):
+    """Which length ENCODING applies is decided by bit 6 of the tag byte, not by the tag.
+
+    Naming only the two new-format secret-key tags meant every other new-format packet fell to the
+    old-format branch, which reads the length as one big-endian integer. That coincidentally agreed
+    for the one-byte form and was wrong for the other two: a five-byte length returned a nonsense
+    trillion-byte body assembled from four bytes of the packet's own payload, so the walk stopped
+    and a secret key behind a modern public-key or literal packet was reported clean.
+    """
+    from flash.env_openpgp import _openpgp_body_length
+    from flash.env_secrets import credential_in_file
+
+    # a new-format PUBLIC key packet (tag 6), which is what Sequoia, RNP and
+    # `--use-new-packet-format` write, across all three length encodings RFC 4880 defines
+    for length_bytes, declared in (
+        (bytes([30]), 30),
+        (bytes([193, 52]), 500),
+        (b"\xff" + (70000).to_bytes(4, "big"), 70000),
+    ):
+        head = bytes([0xC6]) + length_bytes + b"\x00" * 16
+        first = head[1]
+        offset = 2 if first < 192 else (3 if first < 224 else (6 if first == 0xFF else 0))
+        assert _openpgp_body_length(head, offset) == declared, length_bytes
+
+    secret = b"\x95\x03\x98\x04" + b"\x6a\x7e\x7e\x1e" + b"\x01" + b"\x00" * 16
+
+    # a keyring whose leading packet uses the new format: the secret key behind it is still found.
+    # The declared length must equal the bytes actually carried, or the walk lands mid-packet.
+    body = b"\x04" + b"\x6a\x7e\x7e\x1e" + b"\x01" + b"\x00" * 25
+    modern = tmp_path / "modern.gpg"
+    modern.write_bytes(bytes([0xC6, len(body)]) + body + secret)
+    assert credential_in_file(modern) == "a private key"
+
+    # the same through a new-format LITERAL packet using the five-byte length form, which is the
+    # encoding the old branch got most wrong
+    filler = b"\x00" * 16
+    literal = tmp_path / "literal.gpg"
+    literal.write_bytes(bytes([0xCB, 0xFF]) + len(filler).to_bytes(4, "big") + filler + secret)
+    assert credential_in_file(literal) == "a private key"
