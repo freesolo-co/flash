@@ -42,6 +42,7 @@ from flash.env_formats import (
     _ZIP_TAIL_BYTES,
     _after_skippable_frames,
     _has_zip_end_record,
+    _is_openpgp_encrypted,
     _is_openpgp_secret_key,
     _jks_private_key_entries,
     _looks_compressed,
@@ -410,15 +411,32 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     while chunk := handle.read(_SCAN_CHUNK_BYTES):
         if deadline is not None and time.monotonic() > deadline:
             raise _Unscannable("takes too long to decompress")
-        if not carry and _jks_private_key_entries(chunk[:16]):
-            # A Java KeyStore holding a private-key entry, recognised structurally. Head-anchored
-            # like the OpenPGP test and for the same reason: `feedfeed` plus a plausible version
-            # and count is only decisive at offset 0.
-            return "a private key"
-        if not carry and _is_openpgp_secret_key(chunk[:_OPENPGP_HEAD_BYTES]):
+        if not carry and (store := _jks_private_key_entries(chunk)) is not False:
+            if store is None:
+                raise _Unscannable(
+                    "contains a key store with more entries than this check can walk"
+                )
+            # A Java KeyStore or JCEKS holding a key entry, recognised structurally. Head-anchored
+            # like the OpenPGP test and for the same reason: the magic plus a plausible version and
+            # count is only decisive at offset 0. The WHOLE first chunk is passed, not the 16-byte
+            # header: the walk has to reach entries past the first, and a store larger than one
+            # chunk is bounded by `_MAX_JKS_ENTRIES` rather than by the read.
+            #
+            # Named for the STORE rather than for the entry inside it. The walk stops at the first
+            # key entry, which may be a private key or a JCEKS symmetric key, and the author has to
+            # rotate the store either way -- calling a `-genseckey` AES key "a private key" would
+            # send them looking for the wrong thing.
+            return "a key store"
+        if not carry:
             # only ever at offset 0, and `carry` is empty only on the first chunk. Every file and
             # every archive member reaches this, so the binary export is covered wherever it sits.
-            return "a private key"
+            secret_key = _is_openpgp_secret_key(chunk[:_OPENPGP_HEAD_BYTES])
+            if secret_key is None:
+                raise _Unscannable("contains more OpenPGP marker packets than this check can walk")
+            if secret_key:
+                return "a private key"
+            if _is_openpgp_encrypted(chunk[:_OPENPGP_HEAD_BYTES]):
+                raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
         if not carry:
             # zstd and LZ4 both allow a metadata envelope before the real frame. What matters here
             # is only whether that prelude could be READ to its end: a frame declaring a payload

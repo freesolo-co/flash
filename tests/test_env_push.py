@@ -4649,20 +4649,171 @@ def test_a_java_keystore_holding_a_private_key_is_detected(tmp_path):
 
     from flash.env_secrets import credential_in_file
 
-    def keystore(tag: int) -> bytes:
-        alias = b"mykey"
-        entry = struct.pack(">I", tag) + struct.pack(">H", len(alias)) + alias
-        entry += struct.pack(">Q", 1700000000000)
-        entry += struct.pack(">I", 1200) + os.urandom(1200)
-        return b"\xfe\xed\xfe\xed" + struct.pack(">II", 2, 1) + entry
+    def keystore(*tags: int, magic: bytes = b"\xfe\xed\xfe\xed") -> bytes:
+        """A store whose entries carry `tags`, laid out as the format actually declares them."""
+        body = b""
+        for tag in tags:
+            alias = b"a%d" % tag
+            body += struct.pack(">I", tag) + struct.pack(">H", len(alias)) + alias
+            body += struct.pack(">Q", 1700000000000)
+            if tag == 1:  # key bytes, then a one-certificate chain
+                body += struct.pack(">I", 1200) + os.urandom(1200)
+                body += struct.pack(">I", 1)
+                body += struct.pack(">H", 5) + b"X.509" + struct.pack(">I", 64) + os.urandom(64)
+            else:  # a trusted certificate: type then der
+                body += struct.pack(">H", 5) + b"X.509" + struct.pack(">I", 64) + os.urandom(64)
+        return magic + struct.pack(">II", 2, len(tags)) + body + os.urandom(20)
 
     private = tmp_path / "keystore.jks"
     private.write_bytes(keystore(1))
-    assert credential_in_file(private) == "a private key"
+    assert credential_in_file(private) == "a key store"
 
     trusted = tmp_path / "truststore.jks"
     trusted.write_bytes(keystore(2))
     assert credential_in_file(trusted) is None
+
+    # A trusted certificate BEFORE the private key, which is what `-importcert` then `-genkeypair`
+    # writes. Reading only the first tag published this store's key intact.
+    ordered = tmp_path / "ordered.jks"
+    ordered.write_bytes(keystore(2, 1))
+    assert credential_in_file(ordered) == "a key store"
+
+    # several certificates then the key, so the walk has to stay on entry boundaries to find it
+    deep = tmp_path / "deep.jks"
+    deep.write_bytes(keystore(2, 2, 2, 1))
+    assert credential_in_file(deep) == "a key store"
+
+    # JCEKS is the same layout under a different magic, and was a separate bypass
+    jceks = tmp_path / "keystore.jceks"
+    jceks.write_bytes(keystore(2, 1, magic=b"\xce\xce\xce\xce"))
+    assert credential_in_file(jceks) == "a key store"
+
+    certs_only = tmp_path / "certs.jceks"
+    certs_only.write_bytes(keystore(2, 2, magic=b"\xce\xce\xce\xce"))
+    assert credential_in_file(certs_only) is None
+
+    # Tag 3 is the JCEKS `SecretKeyEntry` that `keytool -genseckey` writes. Its payload is a
+    # symmetric key, which is as much a credential as an asymmetric one -- treating an unknown tag
+    # as "not this format" published a real AES store intact.
+    secret = tmp_path / "secret.jceks"
+    secret.write_bytes(keystore(3, magic=b"\xce\xce\xce\xce"))
+    assert credential_in_file(secret) == "a key store"
+
+    # A key past the entry bound is UNREAD, not absent -- the same fail-open the OpenPGP marker
+    # bound had. The walk is bounded so a forged count cannot be a scan cost, and exhausting it
+    # refuses rather than reporting the store clean.
+    from flash.env_formats import _MAX_JKS_ENTRIES
+    from flash.env_secrets import _Unscannable
+
+    within = tmp_path / "within.jks"
+    within.write_bytes(keystore(*([2] * (_MAX_JKS_ENTRIES - 1)), 1))
+    assert credential_in_file(within) == "a key store"
+
+    beyond = tmp_path / "beyond.jks"
+    beyond.write_bytes(keystore(*([2] * _MAX_JKS_ENTRIES), 1))
+    with pytest.raises(_Unscannable, match="more entries"):
+        credential_in_file(beyond)
+
+
+def test_a_secret_key_behind_the_marker_bound_is_refused(tmp_path):
+    """Bounding the marker walk turned the bound itself into the bypass.
+
+    A marker packet is a legal no-op, so a key behind more of them than the walk allows left the
+    secret-key test looking at a marker header, which is not a key -- and the file published. The
+    bound has to fail closed: still sitting on a marker means what follows is unread, not absent.
+    """
+    from flash.env_formats import _MAX_OPENPGP_MARKERS
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    marker = b"\xca\x03PGP"
+    # a secret-key packet laid out as `gpg --export-secret-keys` writes one: tag 5 old-format with
+    # length-type 1, so a TWO-byte length, then version 4, a 4-byte timestamp and the algorithm.
+    key = b"\x95\x03\x98\x04" + b"\x6a\x7e\x7e\x1e" + b"\x01" + b"\x00" * 16
+
+    within = tmp_path / "within.pgp"
+    within.write_bytes(marker * (_MAX_OPENPGP_MARKERS - 1) + key)
+    assert credential_in_file(within) == "a private key"
+
+    beyond = tmp_path / "beyond.pgp"
+    beyond.write_bytes(marker * (_MAX_OPENPGP_MARKERS + 1) + key)
+    with pytest.raises(_Unscannable, match="marker packets"):
+        credential_in_file(beyond)
+
+    # markers in front of nothing in particular are still not a credential
+    bare = tmp_path / "bare.pgp"
+    bare.write_bytes(marker + b"ordinary file contents\n")
+    assert credential_in_file(bare) is None
+
+
+def test_an_encrypted_openpgp_message_is_refused(tmp_path):
+    """`gpg --symmetric` around a credential is opaque, and opaque is not clean.
+
+    The ciphertext carries no secret-key tag and matches no textual or DER check, so it read as
+    ordinary bytes and published -- while an encrypted ZIP member, the same situation, is refused.
+    """
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    # symmetric-key ESK exactly as `gpg --symmetric` writes it: tag 3 old-format, a 13-byte body,
+    # version 4, cipher 9 (AES-256), S2K type 3. The body length puts the next packet at offset 15.
+    esk = b"\x8c\x0d\x04\x09\x03" + b"\x00" * 10
+    assert len(esk) == 15, "the data packet must land exactly where the length says"
+    encrypted = tmp_path / "secrets.gpg"
+    encrypted.write_bytes(esk + b"\xd2" + b"\x40" + b"\x00" * 64)  # then a tag-18 data packet
+    with pytest.raises(_Unscannable, match="encrypted OpenPGP"):
+        credential_in_file(encrypted)
+
+    # a session-key packet with no encrypted data behind it is not this structure
+    lone = tmp_path / "lone.bin"
+    lone.write_bytes(esk + b"ordinary trailing content\n")
+    assert credential_in_file(lone) is None
+
+    # and an ordinary binary must not be refused: the fields are what make this specific
+    plain = tmp_path / "plain.bin"
+    plain.write_bytes(b"\x8c\x0d\xff\xff\xff" + b"\x00" * 64)
+    assert credential_in_file(plain) is None
+
+
+def test_a_sec1_key_is_found_on_every_supported_curve(tmp_path):
+    """Hardcoding the P-256/384/521 scalar sizes missed every smaller curve.
+
+    `openssl ecparam -list_curves` spans 20 to 114 bytes, so real `prime192v1` (24) and
+    `secp224r1` (28) keys published intact while the otherwise-identical P-256 form was caught.
+    """
+    import subprocess
+
+    from flash.env_secrets import credential_in_file
+
+    # `secp112r1` is the smallest curve OpenSSL carries, at a 14-byte scalar. A first pass at this
+    # floored the range at 20 and left twelve curve families below it publishing intact.
+    for curve in ("secp112r1", "secp128r1", "prime192v1", "secp224r1", "prime256v1", "secp384r1"):
+        der = tmp_path / f"{curve}.der"
+        result = subprocess.run(
+            ["openssl", "ecparam", "-name", curve, "-genkey", "-noout", "-outform", "DER"],
+            capture_output=True,
+        )
+        if result.returncode:  # a curve this build does not carry
+            continue
+        der.write_bytes(result.stdout)
+        assert credential_in_file(der) == "a private key", curve
+
+
+def test_an_aws_secret_is_found_under_its_json_field_name(tmp_path):
+    """`SecretAccessKey` is the name the SDKs and `sts assume-role` write, not the env-var form.
+
+    Anchoring only on `AWS_SECRET_ACCESS_KEY` meant a saved session credential -- which is exactly
+    what lands beside an environment config -- published intact.
+    """
+    from flash.env_secrets import _credential_kind
+
+    body = b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert _credential_kind(b'{"SecretAccessKey":"' + body + b'"}') == "an AWS secret access key"
+    assert _credential_kind(b"AWS_SECRET_ACCESS_KEY=" + body) == "an AWS secret access key"
+    assert _credential_kind(b'"secretAccessKey": "' + body + b'"') == "an AWS secret access key"
+
+    # a longer identifier merely ENDING in the field name is not an assignment of one
+    assert _credential_kind(b'"NotSecretAccessKey":"' + body + b'"') is None
+    # and a placeholder body is still not a credential
+    assert _credential_kind(b'"SecretAccessKey":"${AWS_SECRET_ACCESS_KEY}"') is None
 
 
 def test_a_short_archive_magic_is_decisive_only_at_the_start(tmp_path):

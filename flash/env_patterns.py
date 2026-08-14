@@ -123,6 +123,15 @@ _BLOCK_SCALAR = rb"(?:[|>](?:[+-][0-9]?|[0-9][+-]?)?[ \t]*(?:\#[^\r\n]*)?\s*)?"
 # Python or TOML multiline assignment matched nothing and published. Whole delimiters are named,
 # longest first, so all three forms are consumed together.
 _OPEN_QUOTE = rb"(?:\"\"\"|'''|[\"'])?"
+# Every private-scalar length `openssl ecparam -list_curves` produces: 25 distinct values from 14
+# bytes (`secp112r1`) to 114 (`sect571r1`). Used to tie a SEC1 key's stated OCTET STRING length to
+# the scalar that follows it.
+#
+# The floor is 14, not the 20 a first pass at this used. Twelve curve families sit below 20 --
+# secp112, sect113, secp128, sect131 and their WAP/WTLS aliases -- and every one of them published
+# its key intact. They are small and legacy, but a 112-bit private key is still a private key, and
+# the point of reading the length rather than listing sizes is not to have a floor that guesses.
+_SEC1_SCALAR_BYTES = range(0x0E, 0x73)
 _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     (
         "a Weights & Biases API key",
@@ -136,7 +145,12 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     (
         "an AWS secret access key",
         re.compile(
-            rb"(?i:aws_secret_access_key)[\"']?\s*[:=]\s*"
+            # `SecretAccessKey` as well as the environment-variable name: that is the field the
+            # SDKs, `sts assume-role` and a credential-process document write, and it is the shape
+            # a saved session lands in on disk. Anchoring on the env-var name alone meant those
+            # published intact. Word-boundary-free on the left so the `aws_` prefix stays optional
+            # without admitting a longer unrelated identifier ending in the same characters.
+            rb"(?i:aws_secret_access_key|(?<![A-Za-z0-9_])secretaccesskey)[\"']?\s*[:=]\s*"
             + _BLOCK_SCALAR
             + _OPEN_QUOTE
             + rb"([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])"
@@ -327,8 +341,19 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
             # real three-prime key from `openssl genrsa -primes 3` (which `openssl rsa -check`
             # accepts) begins `02 01 01` instead. Its private factors published intact.
             rb"|\x30\x82..\x02\x01[\x00\x01]\x02(?:\x82..|\x81.|[\x40-\x7f])\x00"
-            # SEC1 ECPrivateKey: version 1, a curve-sized scalar, then the [0] curve parameters
-            rb"|\x02\x01\x01\x04(?:\x20.{32}|\x30.{48}|\x42.{66})\xa0"
+            # SEC1 ECPrivateKey: version 1, the private scalar as an OCTET STRING, then the [0]
+            # curve parameters. Naming only 32, 48 and 66 covered P-256/384/521 and missed every
+            # other supported curve, so real `prime192v1` (24) and `secp224r1` (28) keys published
+            # intact. `openssl ecparam -list_curves` spans 20 to 114 bytes, so the length byte is
+            # enumerated across that range with the scalar width tied to it -- a DER length cannot
+            # be back-referenced as a repeat count, so the alternation is built rather than
+            # written out. The `\xa0` landing exactly where the stated length ends is what keeps
+            # this specific: an arbitrary `02 01 01 04` run does not satisfy it.
+            rb"|\x02\x01\x01\x04(?:"
+            # `re.escape` on the length byte: emitting it raw turns a length such as 0x2a into a
+            # literal `*`, which is a repeat operator with nothing to repeat and fails to compile.
+            + b"|".join(re.escape(bytes([size])) + rb".{%d}" % size for size in _SEC1_SCALAR_BYTES)
+            + rb")\xa0"
             # EncryptedPrivateKeyInfo: `openssl pkcs8 -topk8 -passout` in DER. The plaintext key is
             # inside an OCTET STRING, so none of the structures above appear anywhere in the file
             # and it published intact -- the ARMOURED form of the same key was caught by its

@@ -82,9 +82,16 @@ _SKIPPABLE_FRAME_HEADER = 8
 _MAX_SKIPPABLE_FRAMES = 16
 
 # How many OpenPGP marker packets are walked before the secret-key test. One is what an
-# implementation emits; the bound is what keeps a file of nothing but repeated markers from being
-# a scan cost, and it is checked against the 24-byte head so it can never walk past that anyway.
-_MAX_OPENPGP_MARKERS = 4
+# implementation emits; the bound keeps a file of nothing but repeated markers from being a scan
+# cost. Exhausting it is NOT a pass: `_after_openpgp_markers` reports that it stopped early and
+# the caller refuses, because a stream still sitting on a marker at the bound is undecided rather
+# than clean. Returning the remainder silently let five markers hide a secret key.
+_MAX_OPENPGP_MARKERS = 8
+
+# How many keystore entries are walked looking for a private key. A real store holds a handful;
+# the bound stops a forged count from being a scan cost. Reaching it means the walk never settled
+# the question, which the caller treats as unscannable rather than clean.
+_MAX_JKS_ENTRIES = 64
 
 # How much of a stream `_looks_like_textual` reads. A multi-byte UTF-8 character straddling the cut
 # would decode-fail on the truncation rather than on the content, so the sample is taken at a
@@ -121,26 +128,73 @@ def _looks_compressed(head: bytes) -> bool:
     return head.startswith(_COMPRESSED_MAGIC) or _looks_like_zlib(head)
 
 
-def _jks_private_key_entries(head: bytes) -> bool:
-    """Whether `head` begins a Java KeyStore holding a private-key entry.
+def _jks_private_key_entries(store: bytes) -> bool | None:
+    """Whether `store` is a Java KeyStore holding a private-key entry.
 
-    `keytool -genkeypair -storetype JKS` writes a format no other check here understands: not PEM,
-    not DER, not a container -- so a store holding a complete private key returned None, and `.jks`
-    is not in the filename exclusions either. The key inside is password-encrypted, but the store
-    is the credential: possession plus a guessable or shared store password is the whole secret,
-    and it is exactly what gets committed beside a service config.
+    `keytool -genkeypair` writes a format no other check here understands: not PEM, not DER, not a
+    container -- so a store holding a complete private key returned None, and neither `.jks` nor
+    `.jceks` is in the filename exclusions. The key inside is password-encrypted, but the store is
+    the credential: possession plus a guessable or shared store password is the whole secret, and
+    it is exactly what gets committed beside a service config.
 
-    Structural: the `feedfeed` magic, a version of 1 or 2, an entry count, then each entry's tag.
-    Tag 1 is a `PrivateKeyEntry` and tag 2 a `TrustedCertificateEntry` -- a store holding only
-    trusted certs carries no secret and stays publishable, which is what separates the two. Only
-    the FIRST entry's tag is read, since the fields after it are variable-length and walking them
-    would mean parsing the whole store to answer a question the first entry usually settles.
+    Structural: the magic, a version of 1 or 2, an entry count, then every entry in turn. Tag 1 is
+    a `PrivateKeyEntry` and tag 2 a `TrustedCertificateEntry` -- a store holding only trusted certs
+    carries no secret and stays publishable, which is what separates the two.
+
+    EVERY entry is walked, not just the first. Reading one tag was wrong about ordering rather than
+    about rare stores: `keytool -importcert` followed by `-genkeypair` writes the trusted cert
+    first, so a real two-entry store led with tag 2 and its private key published intact. The
+    fields are variable-length but fully determined, so the walk is exact; anything that does not
+    stay on an entry boundary means this is not the format it claims and the caller falls through
+    to the other checks.
+
+    JCEKS (`cececece`) is the same layout under a different magic and is walked identically. It was
+    a distinct bypass: `keytool -storetype JCEKS` produced a store whose encrypted key matched no
+    textual or DER check.
     """
-    if len(head) < 16 or head[:4] != b"\xfe\xed\xfe\xed":
+    if len(store) < 16 or store[:4] not in (b"\xfe\xed\xfe\xed", b"\xce\xce\xce\xce"):
         return False
-    version = int.from_bytes(head[4:8], "big")
-    count = int.from_bytes(head[8:12], "big")
-    return version in (1, 2) and count > 0 and int.from_bytes(head[12:16], "big") == 1
+    if int.from_bytes(store[4:8], "big") not in (1, 2):
+        return False
+    count, at = int.from_bytes(store[8:12], "big"), 12
+
+    def read(width: int) -> int | None:
+        """The next `width`-byte big-endian field, or None once the walk runs off the end."""
+        nonlocal at
+        if at < 0 or at + width > len(store):
+            return None
+        value = int.from_bytes(store[at : at + width], "big")
+        at += width
+        return value
+
+    def skip(length: int | None) -> bool:
+        """Advance over a variable-length field, refusing a length that leaves the buffer."""
+        nonlocal at
+        if length is None or length < 0 or at + length > len(store):
+            return False
+        at += length
+        return True
+
+    for walked in range(count):
+        if walked >= _MAX_JKS_ENTRIES:
+            # More entries than the walk inspects, and the ones behind it are unread. Reporting
+            # False here was the same fail-open as the OpenPGP marker bound: a store whose key sat
+            # past the limit published intact. Undecided is not clean, so the caller refuses.
+            return None
+        tag = read(4)
+        if tag in (1, 3):
+            # 1 is a `PrivateKeyEntry`; 3 is the JCEKS `SecretKeyEntry` that `keytool -genseckey`
+            # writes, whose payload is a symmetric key -- as much a credential as an asymmetric
+            # one, and it published intact while the store around it was recognised.
+            return True
+        if tag != 2:
+            # not an entry tag this format defines: the walk is off the rails, so this is not the
+            # structure it claimed and the other checks get their turn
+            return False
+        # the alias, then an 8-byte creation timestamp, then the certificate's type and its DER
+        if not skip(read(2)) or not skip(8) or not skip(read(2)) or not skip(read(4)):
+            return False
+    return False
 
 
 def _looks_like_textual(data: bytes) -> bool:
@@ -184,7 +238,72 @@ def _looks_like_zlib(head: bytes) -> bool:
     )
 
 
-def _is_openpgp_secret_key(head: bytes) -> bool:
+def _is_openpgp_encrypted(head: bytes) -> bool:
+    """Whether `head` begins an encrypted OpenPGP message.
+
+    `gpg --symmetric` and `gpg --encrypt` write a session-key packet followed by an encrypted data
+    packet. None of the secret-key tags appear, and the ciphertext matches no textual or DER check,
+    so a credential wrapped this way read as ordinary bytes and published intact -- while an
+    encrypted ZIP member, which is the same situation, is refused as unverifiable. Treating the two
+    differently was the inconsistency; both are opaque, and opaque is not clean.
+
+    Two packets are required, not one, AND the session-key packet's own fields must be valid. A
+    lone tag byte is a single common value; even the two-packet shape alone fired on 1 in 4,000
+    random 64-byte heads, which is a refusal rate an ordinary model shard would hit. Requiring the
+    version and, for a symmetric-key packet, the cipher and S2K specifier to come from their
+    registries takes that to 0 across 20,000 -- the structure is then one ordinary data does not
+    fall into. Tags 1 and 3 are the public-key and symmetric-key session keys, tags 9, 18 and 20
+    the encrypted data forms.
+    """
+    session, encrypted = frozenset((1, 3)), frozenset((9, 18, 20))
+    if len(head) < 2:
+        return False
+    if head[0] & 0xC0 == 0xC0:  # new format: tag in the low six bits
+        # The length is decoded here rather than through `_openpgp_body_length`, which keys on the
+        # secret-key tag bytes: for a `0xC1`/`0xC3` header it falls through to a slice that is
+        # empty and returns 0, so a wrong length would read as a stated one.
+        tag, first = head[0] & 0x3F, head[1]
+        if first < 192:
+            length, header = first, 2
+        elif first < 224:
+            if len(head) < 3:
+                return False
+            length, header = ((first - 192) << 8) + head[2] + 192, 3
+        elif first == 255:
+            if len(head) < 6:
+                return False
+            length, header = int.from_bytes(head[2:6], "big"), 6
+        else:
+            return False  # a partial-body length: the packet has no single stated length
+    elif head[0] & 0xC0 == 0x80:  # old format: tag in bits 5-2, length type in the low two
+        tag, width = (head[0] >> 2) & 0x0F, (1, 2, 4, 0)[head[0] & 0x03]
+        if not width:
+            return False
+        length, header = int.from_bytes(head[1 : 1 + width], "big"), 1 + width
+    else:
+        return False
+    if tag not in session or length is None or len(head) < header + 1:
+        return False
+    # RFC 4880/9580 packet versions: 3 for a public-key ESK, 4/5/6 for a symmetric-key ESK.
+    if head[header] not in (3, 4, 5, 6):
+        return False
+    if tag == 3:
+        # symmetric-key ESK: a cipher from the registry, then an S2K specifier of a defined type
+        if len(head) < header + 3:
+            return False
+        if head[header + 1] not in (1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13):
+            return False
+        if head[header + 2] not in (0, 1, 3, 4):
+            return False
+    at = header + length
+    if at + 1 > len(head):
+        return False
+    nxt = head[at]
+    following = nxt & 0x3F if nxt & 0xC0 == 0xC0 else (nxt >> 2) & 0x0F if nxt & 0xC0 == 0x80 else 0
+    return following in encrypted
+
+
+def _is_openpgp_secret_key(head: bytes) -> bool | None:
     """Whether `head` begins an unarmoured OpenPGP secret key packet.
 
     `gpg --export-secret-keys` without `--armor` writes raw packets: no text header for the PEM
@@ -212,7 +331,12 @@ def _is_openpgp_secret_key(head: bytes) -> bool:
     # RFC 4880 and 9580 public-key algorithms: RSA, Elgamal, DSA, ECDH/ECDSA/EdDSA, and the RFC
     # 9580 curve IDs. A byte outside this registry is not a key packet.
     algorithms = frozenset((1, 2, 3, 16, 17, 18, 19, 22, 25, 26, 27, 28))
-    head = _after_openpgp_markers(head)
+    head, stopped_on_marker = _after_openpgp_markers(head)
+    if stopped_on_marker:
+        # Still on a marker at the bound: what follows is unread, not absent. This module holds no
+        # exception type of its own -- it is imported BY the scanner, never the reverse -- so the
+        # undecided case is reported and `_scan_stream` turns it into the refusal.
+        return None
     if not head:
         return False
     tag_old, tag_new = head[0] & 0xFC, head[0]
@@ -244,7 +368,7 @@ def _is_openpgp_secret_key(head: bytes) -> bool:
     return len(head) > offset + 5 and head[offset + 5] in algorithms
 
 
-def _after_openpgp_markers(head: bytes) -> bytes:
+def _after_openpgp_markers(head: bytes) -> tuple[bytes, bool]:
     """`head` past any leading OpenPGP marker packets.
 
     A marker packet (tag 10, body `PGP`) is a legal no-op that RFC 9580 requires implementations to
@@ -257,13 +381,18 @@ def _after_openpgp_markers(head: bytes) -> bytes:
     prefix of ordinary binary lead the scan to a false secret-key match deep inside a model shard;
     the marker is a fixed five bytes with a body that must be exactly `PGP`, so recognising it
     costs no signal. Both packet formats are accepted because either may carry tag 10.
+
+    Returns the remainder and whether the walk STOPPED on a marker. Reporting only the remainder
+    made the bound its own bypass: a key behind five markers left the walk sitting on the fifth,
+    the secret-key test ran against a marker header and said no, and the file published. A stream
+    still on a marker at the bound is undecided, and the caller refuses it.
     """
     for _ in range(_MAX_OPENPGP_MARKERS):
         if head[:2] in (b"\xca\x03", b"\xa8\x03") and head[2:5] == b"PGP":
             head = head[5:]
         else:
-            break
-    return head
+            return head, False
+    return head, head[:2] in (b"\xca\x03", b"\xa8\x03") and head[2:5] == b"PGP"
 
 
 def _openpgp_body_length(head: bytes, offset: int) -> int | None:
