@@ -18,6 +18,7 @@ from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
 from flash.engine.profiling.workload_profile import (
+    reasoning_warning_rows,
     rendered_reasoning_loss_warning,
     unpacked_batch_warning,
 )
@@ -209,7 +210,6 @@ def _print_reasoning_loss_warning(status: object) -> None:
         return
     if isinstance(rendered, bool) or not isinstance(rendered, int):
         return
-    rows = profile.get("retained_examples")
     truncated = profile.get("truncated_reasoning_spans")
     message = rendered_reasoning_loss_warning(
         authored_turns=authored,
@@ -219,7 +219,10 @@ def _print_reasoning_loss_warning(status: object) -> None:
         truncated_spans=truncated
         if isinstance(truncated, int) and not isinstance(truncated, bool)
         else 0,
-        rows=rows if isinstance(rows, int) and not isinstance(rows, bool) else 0,
+        # the counts above cover the rows the update horizon reaches, so the denominator has to
+        # cover the same rows. `retained_examples` is the whole retained dataset -- it sizes the
+        # allocation -- and pairing it with bounded counts would understate the survival rate.
+        rows=reasoning_warning_rows(profile),
     )
     if not message:
         return

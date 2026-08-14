@@ -609,6 +609,74 @@ def test_sft_cost_warns_the_client_that_the_template_dropped_reasoning(
     assert "K single-turn rows" in err
 
 
+def test_the_client_warning_counts_rows_over_the_same_horizon_as_the_counts(
+    tmp_path, monkeypatch, capsys
+):
+    """The percentage has to describe ONE population, and the profile carries two row figures.
+
+    The reasoning counts on the profile cover the rows the update horizon reaches. Pairing them
+    with ``retained_examples`` -- the whole retained dataset, which sizes the allocation -- would
+    divide a bounded numerator by an unbounded denominator and understate the survival rate in the
+    line the user reads. Here 2 updates at 2 rows each reach 4 of the 8 retained rows.
+    """
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "estimated_cost_usd": 1.25,
+                "workload_profile": {
+                    **EXACT_PROFILE,
+                    "authoritative_steps": 2,
+                    "examples_per_update": 2,
+                    "authored_reasoning_turns": 4,
+                    "rendered_reasoning_spans": 1,
+                },
+            }
+        ),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "dropped 3 of 4 authored reasoning blocks" in err
+    # the horizon reaches 4 rows, not the 8 that were retained
+    assert "across 4 SFT rows" in err
+    assert "across 8 SFT rows" not in err
+
+
+def test_the_client_warning_falls_back_to_retained_rows_without_horizon_fields(
+    tmp_path, monkeypatch, capsys
+):
+    """A profile from a producer that predates the horizon fields is still reported correctly.
+
+    Those counts were measured over every retained row, so the matching denominator is the retained
+    count. Defaulting the missing horizon to zero instead would divide by zero rows and report a
+    loss against a population the profile never described.
+    """
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "estimated_cost_usd": 1.25,
+                "workload_profile": {
+                    # EXACT_PROFILE carries no examples_per_update, which is the old-producer shape
+                    **EXACT_PROFILE,
+                    "authored_reasoning_turns": 4,
+                    "rendered_reasoning_spans": 1,
+                },
+            }
+        ),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "dropped 3 of 4 authored reasoning blocks" in err
+    assert "across 8 SFT rows" in err
+
+
 def test_a_real_sft_submit_warns_about_dropped_reasoning_before_the_run_starts(
     tmp_path, monkeypatch, capsys
 ):

@@ -15,11 +15,13 @@ from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
 from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
+    horizon_row_count,
     reasoned_assistant_turns,
     reasoning_marker_prefix,
     reasoning_markers,
     reasoning_span_end_offsets,
     reasoning_span_texts,
+    reasoning_warning_rows,
     rendered_reasoning_loss_warning,
     sft_sample_policy,
     unpacked_batch_warning,
@@ -745,39 +747,39 @@ def _build_sft_profile(
         authoritative_steps=horizon.authoritative_steps,
         packing_efficiency=measurements.real_tokens / measurements.padded_compute_tokens,
         sample_policy=sft_sample_policy(max_examples),
-        authored_reasoning_turns=retained.authored_reasoning_turns,
-        rendered_reasoning_spans=retained.rendered_reasoning_spans,
-        truncated_reasoning_spans=retained.truncated_reasoning_spans,
+        # bounded to the rows the horizon reaches, not the whole retained dataset. these three
+        # fields exist only to carry the reasoning-loss warning, and the warning is rendered TWICE:
+        # here on the worker's stderr, and again by the CLI off the serialized profile, because
+        # control-plane profiling runs server-side where its stderr never reaches the submitter.
+        # bounding them at the source is what keeps those two renderings from disagreeing.
+        #
+        # `retained_examples` deliberately stays whole-dataset: it sizes the GPU allocation and
+        # carries the profile invariant retained + dropped == selected.
+        **_horizon_reasoning_fields(retained, horizon),
     )
 
 
-def _horizon_row_count(rows: list, profile: SftWorkloadProfile) -> int:
-    """How many of ``rows`` the resolved update horizon reaches, in retained order.
+def _horizon_reasoning_fields(
+    retained: _RetainedSftRows, horizon: _SftStepHorizon
+) -> dict[str, int]:
+    """The three reasoning counts, totalled over just the rows the optimizer consumes.
 
-    Mirrors ``_authoritative_token_total``: updates consume ``examples_per_update`` rows each, in
-    the retained order, wrapping at the end of an epoch. A horizon at or past one full pass reaches
-    every row, so the answer saturates at ``len(rows)`` rather than reporting a row twice.
+    ``retained.row_reasoning`` is index-aligned with the retained rows, so the horizon's row count
+    is also its prefix length. An empty prefix -- a horizon of zero updates -- totals zero and
+    stays silent, which is correct: a run that performs no update cannot lose reasoning to one.
     """
-    per_update = max(int(profile.examples_per_update), 1)
-    reached = int(profile.authoritative_steps) * per_update
-    return min(len(rows), max(reached, 0))
-
-
-def _horizon_row_reasoning(
-    per_row: list[_RowReasoning], profile: SftWorkloadProfile
-) -> _RowReasoning:
-    """The reasoning totals over just the rows the optimizer consumes.
-
-    ``per_row`` is index-aligned with the retained rows, so the horizon's row count is also its
-    prefix length. An empty prefix -- a horizon of zero updates -- totals zero and stays silent,
-    which is correct: a run that performs no update cannot lose reasoning to one.
-    """
-    consumed = per_row[: _horizon_row_count(per_row, profile)]
-    return _RowReasoning(
-        sum(row.authored_turns for row in consumed),
-        sum(row.rendered_spans for row in consumed),
-        sum(row.truncated_spans for row in consumed),
-    )
+    consumed = retained.row_reasoning[
+        : horizon_row_count(
+            len(retained.row_reasoning),
+            examples_per_update=horizon.examples_per_update,
+            updates=horizon.authoritative_steps,
+        )
+    ]
+    return {
+        "authored_reasoning_turns": sum(row.authored_turns for row in consumed),
+        "rendered_reasoning_spans": sum(row.rendered_spans for row in consumed),
+        "truncated_reasoning_spans": sum(row.truncated_spans for row in consumed),
+    }
 
 
 def _print_workload_warnings(
@@ -804,20 +806,15 @@ def _print_workload_warnings(
     )
     if warning:
         print(f"warning: [train] {warning}", file=sys.stderr)
-    # every row the optimizer reaches is counted rather than sampled, so a cheap row cannot hide an
-    # expensive one, and dropped rows are excluded so the figures describe what the run trains on.
-    #
-    # bounded to the horizon rather than the whole retained dataset, the way authoritative token
-    # accounting already is: `max_steps` can stop a run before it traverses every row, and the rows
-    # past that point are never trained on. counting them either invents a loss the run cannot
-    # suffer -- a warning naming a remedy for reasoning that never reaches the optimizer -- or
-    # dilutes a real one behind rows that never load.
-    consumed = _horizon_row_reasoning(retained.row_reasoning, profile)
+    # read straight off the profile, which already carries the horizon-bounded counts. this line is
+    # rendered twice -- here, and again by the CLI off the serialized profile -- and recomputing it
+    # from `retained` would let the worker's stderr and the submitter's warning disagree about the
+    # same run. one source, one answer.
     reasoning_warning = rendered_reasoning_loss_warning(
-        authored_turns=consumed.authored_turns,
-        rendered_spans=consumed.rendered_spans,
-        truncated_spans=consumed.truncated_spans,
-        rows=_horizon_row_count(retained.rows, profile),
+        authored_turns=profile.authored_reasoning_turns,
+        rendered_spans=profile.rendered_reasoning_spans,
+        truncated_spans=profile.truncated_reasoning_spans,
+        rows=reasoning_warning_rows(profile),
     )
     if reasoning_warning:
         print(f"warning: [train] {reasoning_warning}", file=sys.stderr)

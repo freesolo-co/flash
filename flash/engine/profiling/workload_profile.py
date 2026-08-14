@@ -12,12 +12,14 @@ from typing import Any
 # but the profile's callers import these from here.
 from flash.engine.profiling.reasoning_render import (  # noqa: F401
     count_rendered_reasoning_spans,
+    horizon_row_count,
     reasoned_assistant_turns,
     reasoning_marker_prefix,
     reasoning_markers,
     reasoning_span_end_offsets,
     reasoning_span_texts,
     reasoning_spans,
+    reasoning_warning_rows,
     rendered_reasoning_loss_warning,
     with_marked_reasoning,
 )
