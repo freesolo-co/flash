@@ -150,6 +150,11 @@ _JSON_SCHEMA_WRAPPER_KEYS = frozenset({"schema", "parameters", "input_schema", "
 _ROOT_SCHEMA_HOST_KEYS = frozenset(
     {"tools", "functions", "tool_choice", "function_call", "response_format", "text_format"}
 )
+# a declaration is its NAME and its SHAPE. `tools` and `functions` are arrays of tool definitions;
+# the rest are single objects. accepting the name alone let `{"tools": {"parameters": {...}}}` --
+# which no provider would accept -- open a host whose nested wrapper then kept a secret property's
+# literal, so an upstream-rejected request still persisted a third-party credential.
+_ARRAY_SHAPED_ROOT_HOST_KEYS = frozenset({"tools", "functions"})
 _NESTED_SCHEMA_HOST_KEYS = frozenset({"function", "json_schema"})
 _SCHEMA_HOST_KEYS = _ROOT_SCHEMA_HOST_KEYS | _NESTED_SCHEMA_HOST_KEYS
 _JSON_SCHEMA_TYPES = frozenset(
@@ -605,6 +610,20 @@ def _redact_tool_result_content(value: str, *, depth: int, flag: _SanitizationFl
     return json.dumps(redacted, separators=(",", ":"))
 
 
+def _opens_root_schema_host(key: Any, item: Any) -> bool:
+    """Whether a root-level `key` is a real declaration container, by NAME and by SHAPE.
+
+    `tools` and `functions` are arrays of tool definitions and the other host keys are single
+    objects, so a value of the wrong shape is not the declaration its name claims -- no provider
+    would accept it -- and must not open the schema exemption for its subtree.
+    """
+    if key not in _ROOT_SCHEMA_HOST_KEYS:
+        return False
+    if key in _ARRAY_SHAPED_ROOT_HOST_KEYS:
+        return isinstance(item, list)
+    return isinstance(item, dict)
+
+
 def _carries_tool_result(container: dict[Any, Any], key: Any, *, inside_tool_result: bool) -> bool:
     """Whether `key`'s value is a tool's OUTPUT rather than ordinary prose.
 
@@ -750,7 +769,8 @@ def _redact_secret_fields(
                     # since a real declaration nests (`tools[].function.parameters`). `function`
                     # and `json_schema` are spelled only INSIDE a host, so a top-level extension
                     # of either name is ordinary data rather than a declaration.
-                    schema_host=schema_host or (payload_root and key in _ROOT_SCHEMA_HOST_KEYS),
+                    schema_host=schema_host
+                    or (payload_root and _opens_root_schema_host(key, item)),
                     schema_wrapper=schema_wrapper
                     or wrapper_has_schema
                     or (schema_context and _is_schema_map_keyword(key, item)),

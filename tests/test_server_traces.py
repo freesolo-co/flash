@@ -8112,3 +8112,160 @@ def test_the_caller_s_original_request_bytes_reach_the_provider(trace_api, monke
 
     assert response.status_code == 200
     assert _StaticAsyncClient.requests[0]["content"] == body
+
+
+def test_a_root_host_name_needs_the_right_shape_too() -> None:
+    """`tools` and `functions` are arrays of tool definitions; the other host keys are single
+    objects. Accepting the NAME alone let `{"tools": {"parameters": {...}}}` -- which no provider
+    would accept -- open the schema exemption, so an upstream-rejected request still persisted a
+    third-party credential into raw exports."""
+    object_shaped = {
+        "tools": {
+            "parameters": {
+                "type": "object",
+                "properties": {"password": {"type": "string", "value": "SECRET"}},
+            }
+        }
+    }
+    array_shaped = {
+        "response_format": [
+            {
+                "json_schema": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"token": {"type": "string", "value": "ARRLEAK"}},
+                    }
+                }
+            }
+        ]
+    }
+
+    assert "SECRET" not in json.dumps(traces._redact_secret_fields(object_shaped))
+    assert "ARRLEAK" not in json.dumps(traces._redact_secret_fields(array_shaped))
+
+    # the correct shapes still open a host and keep their declarations
+    tools = traces._redact_secret_fields(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"password": {"type": "string", "description": "pw"}},
+                        },
+                    },
+                }
+            ]
+        }
+    )
+    assert tools["tools"][0]["function"]["parameters"]["properties"]["password"] == {
+        "type": "string",
+        "description": "pw",
+    }
+    # a string `tool_choice` is the ordinary "auto"/"none" spelling and is untouched
+    assert traces._redact_secret_fields({"tool_choice": "auto"}) == {"tool_choice": "auto"}
+
+
+def test_zero_padded_ports_canonicalize_at_every_port() -> None:
+    """Removing the scheme default was not enough: `:0444` and `:444` are the same non-default
+    port, so keeping both spellings classified a local `$id` reached under one of them as external
+    and left the local definition's secret literals in the raw export."""
+    canonical = trace_redaction._canonical_resource_uri
+
+    assert canonical("https://example.com:444/schema") == canonical(
+        "https://example.com:00444/schema"
+    )
+    assert canonical("https://[2001:db8::1]:444/s") == canonical("https://[2001:db8::1]:0444/s")
+    # distinct ports stay distinct, and a non-numeric port is not reinterpreted
+    assert canonical("https://example.com:445/s") != canonical("https://example.com:444/s")
+    assert canonical("https://example.com:abc/s") != canonical("https://example.com:444/s")
+    # the default port is still removed entirely, padded or not
+    assert canonical("https://example.com:0443/s") == canonical("https://example.com/s")
+
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "auth",
+                    "parameters": {
+                        "$id": "https://example.com:444/schema",
+                        "type": "object",
+                        "properties": {
+                            "password": {"$ref": "https://example.com:0444/schema#/$defs/Cred"}
+                        },
+                        "$defs": {"Cred": {"type": "string", "default": "PORTSECRET"}},
+                    },
+                },
+            }
+        ]
+    }
+
+    assert "PORTSECRET" not in json.dumps(traces._redact_secret_fields(payload))
+
+
+def test_conflicting_streamed_tool_call_identity_is_malformed() -> None:
+    """`id` and `type` name WHICH call this is, so successive values are alternatives rather than
+    halves. Concatenating them stored the nonexistent call `call_Acall_B` with no defect, which
+    converted export would carry as a real invocation."""
+    conflicting = trace_sse.SseAccumulator()
+    conflicting.feed(
+        b'data: {"choices":[{"index":0,"delta":{"tool_calls":'
+        b'[{"index":0,"id":"call_A","function":{"name":"get","arguments":""}}]}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{"tool_calls":'
+        b'[{"index":0,"id":"call_B","function":{"arguments":"{}"}}]}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    conflicting.finish()
+
+    assert conflicting.defect == "stream tool_call reported a conflicting identity"
+    output = json.dumps(conflicting.output())
+    assert "call_Acall_B" not in output
+    # the FIRST identity is the true one
+    assert conflicting.output()["choices"][0]["message"]["tool_calls"][0]["id"] == "call_A"
+
+    # repeating the same id across events is how streaming assembles one call
+    streaming = trace_sse.SseAccumulator()
+    streaming.feed(
+        b'data: {"choices":[{"index":0,"delta":{"tool_calls":'
+        b'[{"index":0,"id":"call_A","function":{"arguments":"{\\"a\\""}}]}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{"tool_calls":'
+        b'[{"index":0,"id":"call_A","function":{"arguments":":1}"}}]}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    streaming.finish()
+
+    assert streaming.defect is None
+    call = streaming.output()["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["arguments"] == '{"a":1}'
+
+
+def test_a_repeated_complete_message_is_not_a_fragment() -> None:
+    """A `message` is the WHOLE reply, so a provider sending several emits successive snapshots.
+    Feeding each to the fragment merger concatenated them -- `"A"` then `"AB"` stored as `"AAB"` --
+    and with a clean `stop` alongside, `records` exported that fabricated text as a target."""
+    repeated = trace_sse.SseAccumulator()
+    repeated.feed(
+        b'data: {"choices":[{"index":0,"message":{"role":"assistant","content":"A"}}]}\n\n'
+        b'data: {"choices":[{"index":0,"message":{"role":"assistant","content":"AB"},'
+        b'"finish_reason":"stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    repeated.finish()
+
+    assert repeated.defect == "stream choice repeated a complete message"
+    assert repeated.output()["choices"][0]["message"]["content"] != "AAB"
+
+    # a single message event is the ordinary non-streaming-shaped reply
+    single = trace_sse.SseAccumulator()
+    single.feed(
+        b'data: {"choices":[{"index":0,"message":{"role":"assistant","content":"hello"},'
+        b'"finish_reason":"stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    single.finish()
+
+    assert single.defect is None
+    assert single.output()["choices"][0]["message"]["content"] == "hello"

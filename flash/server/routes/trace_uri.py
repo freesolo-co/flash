@@ -104,6 +104,19 @@ def _is_default_port(port: str, default_port: str | None) -> bool:
     return int(port) == int(default_port)
 
 
+def _canonical_port(port: str) -> str:
+    """Strip leading zeros from a numeric port, which are not part of its value.
+
+    Default-port removal alone was not enough: `:0444` and `:444` are the same non-default port, so
+    keeping both spellings classified a local `$id` reached under one of them as external and left
+    the local definition's secret literals in the raw export. A non-numeric port is untrustworthy
+    recorded input and is left alone rather than reinterpreted.
+    """
+    if not port.isdigit():
+        return port
+    return str(int(port))
+
+
 def _canonical_ipv6_host(host: str) -> str:
     """Collapse an IPv6 literal to its canonical compressed form, or return it unchanged.
 
@@ -138,13 +151,17 @@ def _canonical_resource_uri(uri: str) -> str:
         suffix = hostport[host_end + 1 :]
         if suffix == ":" or (suffix.startswith(":") and _is_default_port(suffix[1:], default_port)):
             suffix = ""
+        elif suffix.startswith(":"):
+            suffix = f":{_canonical_port(suffix[1:])}"
         hostport = f"[{_canonical_ipv6_host(hostport[1:host_end].casefold())}]{suffix}"
     else:
         host, port_separator, port = hostport.rpartition(":")
         if port_separator and (not port or _is_default_port(port, default_port)):
             hostport = host.casefold()
+        elif port_separator:
+            hostport = f"{host.casefold()}:{_canonical_port(port)}"
         else:
-            hostport = f"{host.casefold()}:{port}" if port_separator else hostport.casefold()
+            hostport = hostport.casefold()
     # the host is case-insensitive, so a character an escape DECODES to must fold too: `%4A` and a
     # plain `j` are the same host. the casefold above cannot do it (the escape is still encoded) and
     # folding the whole string afterwards would lowercase the hex digits rfc 3986 6.2.2.1 wants

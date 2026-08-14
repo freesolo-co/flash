@@ -313,7 +313,11 @@ _TOO_DEEP_DEFECT = "stream fragment exceeded the payload depth bound"
 
 
 def _merge_fragment_dict(
-    target: dict[str, Any], fragment: dict[str, Any], *, depth: int = 0
+    target: dict[str, Any],
+    fragment: dict[str, Any],
+    *,
+    depth: int = 0,
+    on_identity_conflict: Callable[[], None] | None = None,
 ) -> bool:
     """Merge a streamed fragment into `target`. Returns False if the depth bound truncated it.
 
@@ -328,14 +332,22 @@ def _merge_fragment_dict(
         if isinstance(value, dict):
             nested = target.setdefault(key, {})
             if isinstance(nested, dict):
-                bounded &= _merge_fragment_dict(nested, value, depth=depth + 1)
+                bounded &= _merge_fragment_dict(
+                    nested, value, depth=depth + 1, on_identity_conflict=on_identity_conflict
+                )
             else:
                 target[key] = dict(value)
         elif isinstance(value, str):
             current = target.get(key)
             if key in {"id", "type"}:
+                # identity, not text: `id` and `type` name WHICH call this is, so successive values
+                # are alternatives rather than halves. concatenating them stored the nonexistent
+                # call `call_Acall_B` with no defect, exportable as a real invocation. the first
+                # value wins and a conflicting later one is reported.
                 current_text = current.text() if isinstance(current, _StringFragments) else current
-                if current_text == value:
+                if current_text is not None:
+                    if current_text != value and on_identity_conflict is not None:
+                        on_identity_conflict()
                     continue
             if isinstance(current, _StringFragments):
                 current.append(value)
@@ -567,6 +579,9 @@ class SseAccumulator:
                 # the seeded role is a default, not something the provider stated. tracking the
                 # first EXPLICIT role separately keeps a later conflicting one from replacing it.
                 "explicit_role": None,
+                # a `message` is a complete reply, so a second one is a new snapshot rather than a
+                # fragment of the first and must not be merged into it.
+                "received_message": False,
             },
         )
 
@@ -661,8 +676,10 @@ class SseAccumulator:
                 continue
             if message is not None:
                 if isinstance(message, dict):
-                    if self._arrives_after_finish(state, message) or self._switches_mode(
-                        state, "message"
+                    if (
+                        self._arrives_after_finish(state, message)
+                        or self._switches_mode(state, "message")
+                        or self._repeats_complete_message(state, message)
                     ):
                         continue
                     self._consume_delta(state, message)
@@ -702,6 +719,20 @@ class SseAccumulator:
                     # reported `length` with partial content and then `stop` into a clean stopped
                     # reply, so `records` exported truncated text as a completed training target.
                     self._note_defect("stream choice reported conflicting finish reasons")
+
+    def _repeats_complete_message(self, state: dict[str, Any], message: dict[str, Any]) -> bool:
+        """Whether this choice already received a complete `message`; records a defect if so.
+
+        A `message` is the WHOLE reply, so a provider that sends several emits successive snapshots
+        rather than fragments. Feeding each to the fragment merger concatenated them: snapshots
+        `"A"` then `"AB"` stored as `"AAB"`, and with a clean `stop` alongside, `records` exported
+        that fabricated text as a training target.
+        """
+        if not state["received_message"]:
+            state["received_message"] = True
+            return False
+        self._note_defect("stream choice repeated a complete message")
+        return True
 
     def _arrives_after_finish(self, state: dict[str, Any], fragment: dict[str, Any]) -> bool:
         """Whether a response-bearing fragment arrived after this choice already finished.
@@ -812,5 +843,11 @@ class SseAccumulator:
             target = accumulated_calls.setdefault(index, {})
             if not self._reserve_tool_call_fragment(target, fragment):
                 return
-            if not _merge_fragment_dict(target, fragment):
+            if not _merge_fragment_dict(
+                target,
+                fragment,
+                on_identity_conflict=lambda: self._note_defect(
+                    "stream tool_call reported a conflicting identity"
+                ),
+            ):
                 self._note_defect(_TOO_DEEP_DEFECT)
