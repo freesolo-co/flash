@@ -344,10 +344,15 @@ def _is_assigned_value(data: bytes, start: int, end: int) -> bool:
       * the whole buffer -- a `.b64` sidecar whose entire content is one encoded blob.
 
     A run inside a sentence matches none of them, so its refusal stays swallowed as speculative.
+
+    The whole-buffer case ignores a TRAILING NEWLINE, which every text file has and `openssl enc
+    -a` writes: requiring nothing at all after the run meant a real encrypted sidecar was treated as
+    prose, and the envelope it decoded to published clean while the same bytes inside a YAML value
+    were refused. A newline after the final run is the file ending, not a neighbouring token.
     """
     before = data[max(0, start - 64) : start]
     after = data[end : end + 1]
-    if not before and not after:
+    if not before and after in (b"", b"\n", b"\r"):
         return True
     if _ASSIGNED_VALUE.search(before):
         return True

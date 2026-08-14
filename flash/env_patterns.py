@@ -281,6 +281,45 @@ _JWK_PRIVATE = re.compile(
 )
 
 
+# A PKCS#12 file (`.p12`, `.pfx`) opens as `SEQUENCE { INTEGER 3` -- the PFX version -- and carries
+# its private material in a keyBag or a pkcs8ShroudedKeyBag. Both OIDs are named, because a keyBag
+# holds the key in the clear and a shrouded one holds it encrypted; either means the file has a key.
+_PFX_VERSION = re.compile(rb"\A\x30[\x80-\x8f].{0,8}?\x02\x01\x03", re.DOTALL)
+_PFX_KEY_BAGS = (
+    b"\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x0a\x01\x01",  # 1.2.840.113549.1.12.10.1.1 keyBag
+    b"\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x0a\x01\x02",  # ...10.1.2 pkcs8ShroudedKeyBag
+)
+
+
+class _NotCertificateOnlyPkcs12:
+    """`pattern`, except that a PKCS#12 carrying no key bag does not count as a private key.
+
+    A `.p12` holding only certificates -- a truststore or a CA bundle, what
+    `openssl pkcs12 -export -nokeys` writes -- still encrypts its certificate SafeContents, and
+    PBES2 is the ordinary choice. The DER key pattern is anchored on that encryption OID, so the
+    truststore matched it and could not be published even though OpenSSL reports nothing but a
+    `Certificate bag` in it.
+
+    The OID alone cannot separate the two: both files carry PBES2. What differs is the BAG: a file
+    with a key names keyBag or pkcs8ShroudedKeyBag, and a certificate-only file names neither.
+    (The certBag OID is not a counter-test -- it sits inside the encrypted SafeContents and is not
+    visible in the file at all.)
+
+    Scoped to files that actually open as a PFX, so an ordinary DER key -- which is what this
+    pattern is for -- is unaffected by any of it.
+    """
+
+    def __init__(self, pattern: re.Pattern[bytes]) -> None:
+        self.pattern = pattern
+
+    def search(self, data: bytes, /) -> re.Match[bytes] | None:
+        if not (found := self.pattern.search(data)):
+            return None
+        if _PFX_VERSION.match(data) and not any(bag in data for bag in _PFX_KEY_BAGS):
+            return None
+        return found
+
+
 class _TwoMarkers:
     """A credential identified by two markers that may sit any distance apart, in either order.
 
@@ -371,9 +410,22 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
     # armour carrying `Version:` or `Comment:` -- what most implementations emit, and what a
     # hand-annotated backup carries -- went undetected again.
     #
-    # Those five keys are named exactly, for the same reason `Proc-Type:`/`DEK-Info:` are below. A
-    # general `[A-Za-z-]+:` would also skip `Warning:` and `Note:`, which is prose about a key
-    # rather than a key, and reopens the false positive the base64 requirement exists to close.
+    # Header NAMES are not enumerated. Naming five of them (`Version`, `Comment`, `MessageID`,
+    # `Hash`, `Charset`) rejected the armor headers RFC 4880 explicitly permits implementations to
+    # invent: a real `gpg --export-secret-keys --armor` file with `Foo: bar` inserted before its
+    # body matched nothing here and published, while gpg imported the same file and installed the
+    # secret key. An allowlist of names cannot be right when the format's own rule is "any name".
+    #
+    # What keeps this off prose is the BLANK LINE and the body after it, not the header names. RFC
+    # 4880 armor separates its headers from its body with an empty line, and every header line is
+    # `Name: value` -- so `Warning: never commit one of these` followed by more prose matches
+    # nothing, because no base64 body follows the separator. That test does not care what the
+    # header is called, which is what lets the names be general.
+    #
+    # The separator is why the END marker is NOT required: a key truncated by a chunk boundary, or
+    # sitting at the end of a file, has a body and no closing line, and requiring one made those
+    # publish. `Proc-Type:` and `DEK-Info:` keep their own alternative because an encrypted PEM
+    # writes them where the armor headers would go and its body follows directly.
     #
     # The 32 body characters are counted ACROSS line breaks, not within one line. PEM does not fix
     # a wrap width -- RFC 7468 recommends 64 but permits any -- and `openssl pkey -check` accepts a
@@ -384,9 +436,9 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
     (
         "a private key block",
         re.compile(
-            rb"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\r\n\s]*"
-            rb"(?:(?:Version|Comment|MessageID|Hash|Charset):[^\r\n]*[\r\n\s]*)*"
-            rb"(?:(?:[A-Za-z0-9+/=][ \t]*\r?\n?[ \t]*){32,}|Proc-Type:|DEK-Info:)"
+            rb"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[ \t]*\r?\n"
+            rb"(?:(?:[A-Za-z][A-Za-z0-9-]*:[^\r\n]*\r?\n)+[ \t]*\r?\n)?"
+            rb"(?:\s*(?:[A-Za-z0-9+/=][ \t]*\r?\n?[ \t]*){32,}|Proc-Type:|DEK-Info:)"
         ),
     ),
     # PuTTY's own key format, which PuTTYgen writes and `pageant`/`plink` read. It is neither PEM
@@ -421,66 +473,70 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
     # `INTEGER 1` followed by the private scalar as an OCTET STRING of a curve-sized length.
     (
         "a private key",
-        re.compile(
-            # PKCS#8 PrivateKeyInfo, by algorithm: RSA, the RFC 8410 curves, EC.
-            #
-            # The RFC 8410 OIDs are `1.3.101.{110,111,112,113}` = X25519, X448, Ed25519, Ed448,
-            # whose final byte is 0x6e, 0x6f, 0x70, 0x71. Naming only the 25519 pair let a real
-            # Ed448 or X448 key publish intact; the four are one contiguous range.
-            # DSA is `1.2.840.10040.4.1` (`2a 86 48 ce 38 04 01`). Its AlgorithmIdentifier is a
-            # SEQUENCE rather than the 1-byte length the others use, so the `\x30.` above does not
-            # cover it: `openssl pkcs8 -topk8 -nocrypt -outform DER` on a real 1024-bit DSA key
-            # produced a file every branch here passed as clean.
-            rb"\x02\x01\x00\x30.\x06(?:\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
-            rb"|\x03\x2b\x65[\x6e-\x71]|\x07\x2a\x86\x48\xce\x3d\x02\x01)"
-            # DSA `1.2.840.10040.4.1` and DH `1.2.840.113549.1.3.1`, each across the three
-            # AlgorithmIdentifier length forms. DH is `dhKeyAgreement`: `openssl genpkey
-            # -paramfile` writes it, `openssl pkey -check` accepts it, and every branch above
-            # passed the resulting DER as clean.
-            rb"|\x02\x01\x00\x30(?:\x82..|\x81.|[\x00-\x7f])\x06"
-            rb"(?:\x07\x2a\x86\x48\xce\x38\x04\x01|\x09\x2a\x86\x48\x86\xf7\x0d\x01\x03\x01)"
-            # PKCS#1 RSAPrivateKey: version 0 then the modulus INTEGER, whose length may be stated
-            # in any of DER's three forms. Requiring `\x02\x82` recognised only 2048-bit and larger
-            # keys: `openssl rsa -outform DER -traditional` writes `02 81 81` for a 1024-bit key
-            # and a short-form `02 41` for a 512-bit one, so both published intact. `0x81` and
-            # `0x82` introduce a 1- and 2-byte length; a short form below 0x80 IS the length, and
-            # is bounded from 0x40 up so an ordinary `02 01 00 02 xx` byte sequence does not match.
-            #
-            # Version `1` as well as `0`: RFC 8017 defines `two-prime(0)` and `multi(1)`, and a
-            # real three-prime key from `openssl genrsa -primes 3` (which `openssl rsa -check`
-            # accepts) begins `02 01 01` instead. Its private factors published intact.
-            rb"|\x30\x82..\x02\x01[\x00\x01]\x02(?:\x82..|\x81.|[\x40-\x7f])\x00"
-            # SEC1 ECPrivateKey: version 1, the private scalar as an OCTET STRING, then the [0]
-            # curve parameters. Naming only 32, 48 and 66 covered P-256/384/521 and missed every
-            # other supported curve, so real `prime192v1` (24) and `secp224r1` (28) keys published
-            # intact. `openssl ecparam -list_curves` spans 20 to 114 bytes, so the length byte is
-            # enumerated across that range with the scalar width tied to it -- a DER length cannot
-            # be back-referenced as a repeat count, so the alternation is built rather than
-            # written out. The `\xa0` landing exactly where the stated length ends is what keeps
-            # this specific: an arbitrary `02 01 01 04` run does not satisfy it.
-            rb"|\x02\x01\x01\x04(?:"
-            # `re.escape` on the length byte: emitting it raw turns a length such as 0x2a into a
-            # literal `*`, which is a repeat operator with nothing to repeat and fails to compile.
-            + b"|".join(re.escape(bytes([size])) + rb".{%d}" % size for size in _SEC1_SCALAR_BYTES)
-            + rb")\xa0"
-            # EncryptedPrivateKeyInfo: `openssl pkcs8 -topk8 -passout` in DER. The plaintext key is
-            # inside an OCTET STRING, so none of the structures above appear anywhere in the file
-            # and it published intact -- the ARMOURED form of the same key was caught by its
-            # `-----BEGIN ENCRYPTED PRIVATE KEY-----` header, which made DER the way past.
-            #
-            # Anchored on the encryption-algorithm OID in the AlgorithmIdentifier: PBES2
-            # (1.2.840.113549.1.5.13) or a pkcs-12 PBE (1.2.840.113549.1.12.1.x). A passphrase is
-            # not much protection for a key in a public repository, and the OIDs appear only in a
-            # key that is actually encrypted.
-            #
-            # `\x05.` rather than `\x05\x0d` covers PBES1 alongside PBES2: the whole
-            # `1.2.840.113549.1.5.x` arc is password-based encryption, and only `13` was named. A
-            # key written by `openssl pkcs8 -topk8 -v1 PBE-SHA1-DES` (or `-v1 PBE-MD5-DES`, or
-            # `-v1 PBE-SHA1-RC2-64`) carries `05 03`, `05 0a` or `05 0b` and passed as clean. The
-            # arc holds nothing but PBE algorithms, so widening it admits no other structure.
-            rb"|\x30.{1,4}?\x30.\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x05."
-            rb"|\x30.{1,4}?\x30.\x06\x0a\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x01.",
-            re.DOTALL,
+        _NotCertificateOnlyPkcs12(
+            re.compile(
+                # PKCS#8 PrivateKeyInfo, by algorithm: RSA, the RFC 8410 curves, EC.
+                #
+                # The RFC 8410 OIDs are `1.3.101.{110,111,112,113}` = X25519, X448, Ed25519, Ed448,
+                # whose final byte is 0x6e, 0x6f, 0x70, 0x71. Naming only the 25519 pair let a real
+                # Ed448 or X448 key publish intact; the four are one contiguous range.
+                # DSA is `1.2.840.10040.4.1` (`2a 86 48 ce 38 04 01`). Its AlgorithmIdentifier is a
+                # SEQUENCE rather than the 1-byte length the others use, so the `\x30.` above does not
+                # cover it: `openssl pkcs8 -topk8 -nocrypt -outform DER` on a real 1024-bit DSA key
+                # produced a file every branch here passed as clean.
+                rb"\x02\x01\x00\x30.\x06(?:\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
+                rb"|\x03\x2b\x65[\x6e-\x71]|\x07\x2a\x86\x48\xce\x3d\x02\x01)"
+                # DSA `1.2.840.10040.4.1` and DH `1.2.840.113549.1.3.1`, each across the three
+                # AlgorithmIdentifier length forms. DH is `dhKeyAgreement`: `openssl genpkey
+                # -paramfile` writes it, `openssl pkey -check` accepts it, and every branch above
+                # passed the resulting DER as clean.
+                rb"|\x02\x01\x00\x30(?:\x82..|\x81.|[\x00-\x7f])\x06"
+                rb"(?:\x07\x2a\x86\x48\xce\x38\x04\x01|\x09\x2a\x86\x48\x86\xf7\x0d\x01\x03\x01)"
+                # PKCS#1 RSAPrivateKey: version 0 then the modulus INTEGER, whose length may be stated
+                # in any of DER's three forms. Requiring `\x02\x82` recognised only 2048-bit and larger
+                # keys: `openssl rsa -outform DER -traditional` writes `02 81 81` for a 1024-bit key
+                # and a short-form `02 41` for a 512-bit one, so both published intact. `0x81` and
+                # `0x82` introduce a 1- and 2-byte length; a short form below 0x80 IS the length, and
+                # is bounded from 0x40 up so an ordinary `02 01 00 02 xx` byte sequence does not match.
+                #
+                # Version `1` as well as `0`: RFC 8017 defines `two-prime(0)` and `multi(1)`, and a
+                # real three-prime key from `openssl genrsa -primes 3` (which `openssl rsa -check`
+                # accepts) begins `02 01 01` instead. Its private factors published intact.
+                rb"|\x30\x82..\x02\x01[\x00\x01]\x02(?:\x82..|\x81.|[\x40-\x7f])\x00"
+                # SEC1 ECPrivateKey: version 1, the private scalar as an OCTET STRING, then the [0]
+                # curve parameters. Naming only 32, 48 and 66 covered P-256/384/521 and missed every
+                # other supported curve, so real `prime192v1` (24) and `secp224r1` (28) keys published
+                # intact. `openssl ecparam -list_curves` spans 20 to 114 bytes, so the length byte is
+                # enumerated across that range with the scalar width tied to it -- a DER length cannot
+                # be back-referenced as a repeat count, so the alternation is built rather than
+                # written out. The `\xa0` landing exactly where the stated length ends is what keeps
+                # this specific: an arbitrary `02 01 01 04` run does not satisfy it.
+                rb"|\x02\x01\x01\x04(?:"
+                # `re.escape` on the length byte: emitting it raw turns a length such as 0x2a into a
+                # literal `*`, which is a repeat operator with nothing to repeat and fails to compile.
+                + b"|".join(
+                    re.escape(bytes([size])) + rb".{%d}" % size for size in _SEC1_SCALAR_BYTES
+                )
+                + rb")\xa0"
+                # EncryptedPrivateKeyInfo: `openssl pkcs8 -topk8 -passout` in DER. The plaintext key is
+                # inside an OCTET STRING, so none of the structures above appear anywhere in the file
+                # and it published intact -- the ARMOURED form of the same key was caught by its
+                # `-----BEGIN ENCRYPTED PRIVATE KEY-----` header, which made DER the way past.
+                #
+                # Anchored on the encryption-algorithm OID in the AlgorithmIdentifier: PBES2
+                # (1.2.840.113549.1.5.13) or a pkcs-12 PBE (1.2.840.113549.1.12.1.x). A passphrase is
+                # not much protection for a key in a public repository, and the OIDs appear only in a
+                # key that is actually encrypted.
+                #
+                # `\x05.` rather than `\x05\x0d` covers PBES1 alongside PBES2: the whole
+                # `1.2.840.113549.1.5.x` arc is password-based encryption, and only `13` was named. A
+                # key written by `openssl pkcs8 -topk8 -v1 PBE-SHA1-DES` (or `-v1 PBE-MD5-DES`, or
+                # `-v1 PBE-SHA1-RC2-64`) carries `05 03`, `05 0a` or `05 0b` and passed as clean. The
+                # arc holds nothing but PBE algorithms, so widening it admits no other structure.
+                rb"|\x30.{1,4}?\x30.\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x05."
+                rb"|\x30.{1,4}?\x30.\x06\x0a\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x01.",
+                re.DOTALL,
+            )
         ),
     ),
     # The same key as a JSON Web Key. Node's `privateKey.export({format: "jwk"})` and every JOSE

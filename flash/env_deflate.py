@@ -19,10 +19,22 @@ from collections.abc import Iterator
 
 # Where a PDF keeps its compressed content, and how many of those streams are expanded. The
 # `/FlateDecode` filter names the encoding, and the `stream` keyword with its mandatory newline
-# marks where the zlib record begins. The gap between them is bounded because a real object
-# dictionary is short -- a `/Length`, sometimes a `/DecodeParms`, little else -- and unbounded the
-# pattern would pair a filter name with a `stream` keyword arbitrarily far away in a document.
-_PDF_STREAM = re.compile(rb"/FlateDecode\b[\s\S]{0,512}?\bstream\r?\n")
+# marks where the zlib record begins.
+#
+# The gap between them is bounded so the pattern cannot pair a filter name with a `stream` keyword
+# arbitrarily far away in a document. The bound was 512 on the reasoning that a real object
+# dictionary is short -- a `/Length`, sometimes a `/DecodeParms`, little else. That is a
+# convention, not a rule: a dictionary may legally carry any amount of metadata, and 600 bytes of
+# it hid the stream entirely while the compact form of the same document was caught.
+#
+# Distance is now measured but never treated as proof of absence. A filter name the bound does not
+# pair is checked again against the dictionary's OWN end -- `>>` then the keyword, at any distance
+# -- and a stream found that way is refused rather than reported clean. Anchoring the second look
+# on `>>` is what separates an over-long dictionary from prose: a document that merely mentions the
+# word `/FlateDecode` has no dictionary to close, so it never reaches a `>> stream` of its own.
+_PDF_GAP = 512
+_PDF_STREAM = re.compile(rb"/FlateDecode\b[\s\S]{0,%d}?\bstream\r?\n" % _PDF_GAP)
+_PDF_LONG_DICTIONARY = re.compile(rb"/FlateDecode\b[^<>]{0,%d}?>>\s*stream\r?\n" % (1 << 16))
 _MAX_PDF_STREAMS = 4096
 
 # The filter list of the object the matched stream belongs to. A PDF may pipe a stream through
@@ -51,6 +63,15 @@ class _UnreadableFilterChain(Exception):
     Raised rather than skipped for the same reason every other bound here refuses: the bytes behind
     an unreadable filter are exactly as unverified as an archive that would not expand, and calling
     them clean is the fail-open this scan exists to close.
+    """
+
+
+class _UnreachedStream(Exception):
+    """A PDF object declares `/FlateDecode` but its `stream` sits beyond the dictionary gap.
+
+    Distinct from `_UnreadableFilterChain` so the message stays honest: the filters here are
+    perfectly readable, the stream was simply never located. A dictionary may legally carry any
+    amount of metadata, and 600 bytes of it put the keyword out of the pattern's reach.
     """
 
 
@@ -184,6 +205,12 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     """
     if not data.startswith(_PDF_SIGNATURE):
         return
+    # A dictionary too long for the gap is undecided, not clean. Raised before the walk so a
+    # document carrying one such object refuses whatever its other streams inflate to. Compared
+    # against the gap-bounded pattern rather than searched alone: every stream `_PDF_STREAM` pairs
+    # is also found here, so only a SURPLUS means one sits beyond the bound.
+    if len(_PDF_LONG_DICTIONARY.findall(data)) > len(_PDF_STREAM.findall(data)):
+        raise _UnreachedStream
     streams = _PDF_STREAM.finditer(data)
     for found in itertools.islice(streams, _MAX_PDF_STREAMS):
         before, after = _filter_stages(data, found.start())

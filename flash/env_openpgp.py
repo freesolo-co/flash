@@ -22,6 +22,12 @@ _MAX_OPENPGP_MARKERS = 8
 # already parsed as OpenPGP.
 _MAX_OPENPGP_PACKETS = 64
 
+# Yielded by the packet walk in place of a boundary when a packet's declared body runs past the
+# bytes in hand. A distinct object rather than a flag so the sequence test can tell "no secret key
+# in this sequence" from "the sequence continues somewhere this never read", which are the same
+# `False` otherwise. Never a real packet: no OpenPGP packet has a first byte with bit 7 clear.
+_TRUNCATED_PACKET = b"\x00"
+
 # What a Java KeyStore and a JCEKS store begin with. Named so the scan can tell in four bytes
 
 _MAX_PGP_RECIPIENTS = 256
@@ -284,12 +290,25 @@ def _openpgp_packet_starts(head: bytes) -> Iterator[bytes]:
         if offset == 0 or len(head) < offset:
             return
         body = _openpgp_body_length(head, offset)
-        if body is None or body <= 0 or offset + body > len(head):
+        if body is None or body <= 0:
+            return
+        if offset + body > len(head):
+            # The packet declares more body than is here. On a whole file that means a truncated or
+            # malformed keyring and the walk simply ends -- but this runs on the FIRST CHUNK of a
+            # streamed scan, so it is equally what a well-formed sequence looks like when a large
+            # early packet crosses the chunk boundary. Measured: `gpg --export` followed by
+            # `--export-secret-keys`, with a packet padding the public block past 1 MiB, imported
+            # its secret key while the scan reported clean, because the walk stopped here and the
+            # sequence test only ever sees chunk one.
+            #
+            # Yielding the remainder before stopping is what makes the difference visible to the
+            # caller: a packet that outruns the buffer is undecided, not absent.
+            yield _TRUNCATED_PACKET
             return
         head = head[offset + body :]
 
 
-def _openpgp_secret_key_in_sequence(head: bytes) -> bool | None:
+def _openpgp_secret_key_in_sequence(head: bytes, *, truncated: bool = False) -> bool | None:
     """Whether any packet in the OpenPGP sequence `head` begins with is a secret key.
 
     The FIRST packet decides the undecided case, and it is evaluated before the walk. The marker
@@ -298,11 +317,23 @@ def _openpgp_secret_key_in_sequence(head: bytes) -> bool | None:
     on a marker at the bound" into a confident answer from a position further along -- which is
     exactly the refusal `_after_openpgp_markers` exists to raise. So the leading packet is asked
     once, and only a decided `False` continues into the sequence.
+
+    A packet that outruns the buffer is undecided ONLY when more bytes follow, which is what
+    `truncated` states. On a streamed scan the walk runs on the first chunk alone, so a large public
+    block padded past that boundary left the secret packet behind it unread and the file published
+    -- while `gpg --import` installed the key from those same bytes. At true end of file the same
+    shape is an ordinary corrupt or partial keyring with nothing unread behind it, and refusing
+    those would fail a publish over a file that demonstrably holds no key.
     """
     leading = _is_openpgp_secret_key(head)
     if leading is not False:
         return leading
-    return any(_is_openpgp_secret_key(packet) for packet in _openpgp_packet_starts(head))
+    for packet in _openpgp_packet_starts(head):
+        if packet is _TRUNCATED_PACKET:
+            return None if truncated else False
+        if _is_openpgp_secret_key(packet):
+            return True
+    return False
 
 
 def _after_openpgp_markers(head: bytes) -> tuple[bytes, bool]:

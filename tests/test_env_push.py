@@ -5072,8 +5072,9 @@ def test_the_wide_text_floor_admits_the_shortest_token(tmp_path):
     body is 15 bytes, so its UTF-16 form carries 15 NUL columns -- under a hardcoded 20, and the
     token that was detected as ASCII was missed in the encoding this narrowing exists to cover.
     """
+    from flash.env_buffers import _WIDE_RUN
     from flash.env_patterns import SHORTEST_TOKEN_BYTES
-    from flash.env_secrets import _WIDE_RUN, _credential_kind
+    from flash.env_secrets import _credential_kind
 
     token = b"xoxb-AbCdEf0123"
     assert len(token) == SHORTEST_TOKEN_BYTES
@@ -5115,7 +5116,7 @@ def test_a_secret_key_behind_the_marker_bound_is_refused(tmp_path):
 
     beyond = tmp_path / "beyond.pgp"
     beyond.write_bytes(marker * (_MAX_OPENPGP_MARKERS + 1) + key)
-    with pytest.raises(_Unscannable, match="marker packets"):
+    with pytest.raises(_Unscannable, match="cannot walk to the end"):
         credential_in_file(beyond)
 
     # markers in front of nothing in particular are still not a credential
@@ -6288,3 +6289,202 @@ def test_a_chance_zlib_header_is_not_read_whole(tmp_path, monkeypatch):
     dictionary.write_bytes(stream)
     with pytest.raises(_Unscannable):
         credential_in_file(dictionary, deadline=later)
+
+
+def test_a_secret_key_packet_past_the_first_chunk_is_not_reported_clean(tmp_path):
+    """A keyring whose secret packet sits beyond the scan chunk must not publish.
+
+    The sequence walk runs on the FIRST chunk alone, and it stopped as soon as a packet declared
+    more body than was in hand -- which is exactly what a well-formed keyring looks like when a
+    large early packet crosses the boundary. Measured with a real GnuPG export: `gpg --import`
+    installed the secret key from bytes this reported clean.
+    """
+    from flash.env_buffers import _SCAN_CHUNK_BYTES
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    # a public key packet, then filler, then the secret key: the order `gpg --export` followed by
+    # `gpg --export-secret-keys` writes, which is what a "back up my keys" one-liner produces.
+    public = b"\x99\x00\x10" + b"\x04" + b"\x6a\x7e\x7e\x1e" + b"\x01" + b"\x00" * 10
+    secret = b"\x95\x03\x98\x04" + b"\x6a\x7e\x7e\x1e" + b"\x01" + b"\x00" * 16
+    # old-format tag 12, four-byte length: legal, parsed, and long enough to span the chunk.
+    filler = lambda size: b"\xb2" + size.to_bytes(4, "big") + b"\x00" * size  # noqa: E731
+
+    compact = tmp_path / "compact.pgp"
+    compact.write_bytes(public + filler(16) + secret)
+    assert credential_in_file(compact) == "a private key"
+
+    spanning = tmp_path / "spanning.pgp"
+    spanning.write_bytes(public + filler(_SCAN_CHUNK_BYTES + 4096) + secret)
+    with pytest.raises(_Unscannable, match="cannot walk to the end"):
+        credential_in_file(spanning)
+
+    # a keyring cut short at TRUE end of file has nothing unread behind it, so refusing it would
+    # fail a publish over bytes that demonstrably hold no key.
+    truncated = tmp_path / "truncated.pgp"
+    truncated.write_bytes(public + b"\xb2" + (4096).to_bytes(4, "big") + b"\x00" * 32)
+    assert credential_in_file(truncated) is None
+
+
+def test_an_openssl_envelope_written_in_base64_is_refused(tmp_path):
+    """`openssl enc -a` is the same ciphertext as `openssl enc`, and just as unreadable.
+
+    The binary form was refused at the anchored format check, but the base64 form reached the
+    decoded-bytes hook, which asked only whether the decode looked like a CONTAINER. An encrypted
+    envelope is not a container, so it returned None and a whole Freesolo key published.
+    """
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    # `Salted__`, an 8-byte salt, then ciphertext: the layout `openssl enc -salt` writes.
+    envelope = b"Salted__" + bytes(range(8)) + bytes(range(256)) * 2
+
+    binary = tmp_path / "enc.bin"
+    binary.write_bytes(envelope)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(binary)
+
+    # the sidecar form: one encoded blob and the trailing newline every text file carries
+    sidecar = tmp_path / "enc.b64"
+    sidecar.write_bytes(base64.b64encode(envelope) + b"\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(sidecar)
+
+    # and as an assigned value, which is how a Kubernetes Secret carries one
+    assigned = tmp_path / "secret.yaml"
+    assigned.write_bytes(b"data:\n  creds: " + base64.b64encode(envelope) + b"\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(assigned)
+
+    # prose ABOUT the format is not an envelope, and an ordinary encoded file is still publishable
+    prose = tmp_path / "notes.md"
+    prose.write_text("the `Salted__` header precedes the salt.\n" * 20)
+    assert credential_in_file(prose) is None
+    harmless = tmp_path / "config.b64"
+    harmless.write_bytes(base64.b64encode(b"ordinary configuration text\n" * 8) + b"\n")
+    assert credential_in_file(harmless) is None
+
+
+def test_a_pdf_stream_beyond_the_dictionary_gap_is_refused(tmp_path):
+    """A PDF object may carry any amount of metadata before its `stream` keyword.
+
+    The filter name and the keyword were paired within a fixed gap, on the convention that a stream
+    dictionary is short. Padding one past that bound hid the stream entirely, and the credential in
+    it published while the compact form of the same document was caught.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    body = zlib.compress(f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode())
+
+    def document(dictionary: bytes) -> bytes:
+        return (
+            b"%PDF-1.4\n1 0 obj\n<< /Filter /FlateDecode "
+            + dictionary
+            + b" /Length "
+            + str(len(body)).encode()
+            + b" >>\nstream\n"
+            + body
+            + b"\nendstream\nendobj\n%%EOF\n"
+        )
+
+    compact = tmp_path / "compact.pdf"
+    compact.write_bytes(document(b""))
+    assert credential_in_file(compact) == "a Freesolo API key"
+
+    padded = tmp_path / "padded.pdf"
+    padded.write_bytes(document(b"/Meta (" + b"z" * 600 + b")"))
+    with pytest.raises(_Unscannable, match="could not locate"):
+        credential_in_file(padded)
+
+    # a document that merely MENTIONS the filter -- and happens to contain the word `stream` later
+    # -- has no dictionary to close, so it must stay publishable at any distance.
+    prose = tmp_path / "prose.pdf"
+    prose.write_bytes(
+        b"%PDF-1.4\n% the /FlateDecode filter is the usual one.\n"
+        + b"x" * 4000
+        + b"\nstream\nnot an object\n%%EOF\n"
+    )
+    assert credential_in_file(prose) is None
+
+    # an ordinary PDF whose streams all pair normally is not refused over the surplus test
+    harmless = zlib.compress(b"BT /F1 12 Tf (hello) Tj ET\n" * 40)
+    ordinary = tmp_path / "ordinary.pdf"
+    ordinary.write_bytes(
+        b"%PDF-1.4\n1 0 obj\n<< /Filter /FlateDecode /Length "
+        + str(len(harmless)).encode()
+        + b" >>\nstream\n"
+        + harmless
+        + b"\nendstream\nendobj\n%%EOF\n"
+    )
+    assert credential_in_file(ordinary) is None
+
+
+def test_a_private_key_armor_with_extension_headers_is_found(tmp_path):
+    """RFC 4880 permits ANY header name in an armored block, so a name list cannot gate the body.
+
+    The armor pattern reached the base64 body directly, which a real `gpg --export-secret-keys
+    --armor` block does not: it writes headers, and the blank line after them is what separates the
+    two. Requiring a known header NAME instead was the same mistake one layer in -- the standard
+    puts no limit on which names appear, so an unrecognised one hid the key.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = "\n".join([_FAKE_KEY_BODY] * 6)
+
+    def armored(headers: str) -> bytes:
+        return f"-----BEGIN PGP PRIVATE KEY BLOCK-----\n{headers}\n{body}\n".encode()
+
+    # the shape GnuPG writes: a recognised header, then a blank line, then the body
+    known = tmp_path / "known.asc"
+    known.write_bytes(armored("Version: GnuPG v2\n"))
+    assert credential_in_file(known) == "a private key block"
+
+    # an extension header nobody has an allowlist entry for is still an armored private key
+    extended = tmp_path / "extended.asc"
+    extended.write_bytes(armored("X-Custom-Exporter: acme-backup/3\nComment: nightly\n"))
+    assert credential_in_file(extended) == "a private key block"
+
+    # a headerless block puts the body on the line straight after BEGIN, with no blank line at all
+    headerless = tmp_path / "bare.asc"
+    headerless.write_bytes(f"-----BEGIN PRIVATE KEY-----\n{body}\n".encode())
+    assert credential_in_file(headerless) == "a private key block"
+
+    # prose naming the marker, with no body behind it, is not a key
+    mention = tmp_path / "notes.md"
+    mention.write_text("paste the -----BEGIN PGP PRIVATE KEY BLOCK----- line here.\n")
+    assert credential_in_file(mention) is None
+
+
+def test_a_certificate_only_pkcs12_is_not_reported_as_a_private_key(tmp_path):
+    """A `.p12` holding only certificates carries no key, and refusing it fails a real publish.
+
+    Both shapes are PBES2-encrypted, so the encryption OID cannot tell them apart. The key bag OID
+    can: `pkcs8ShroudedKeyBag` is present exactly when a key is, and the certificate bag OID sits
+    INSIDE the encrypted SafeContents where nothing can see it.
+    """
+    from flash.env_secrets import credential_in_file
+
+    # The DER body both files share: a PKCS#8 RSA PrivateKeyInfo, which is what the private-key
+    # pattern matches on. Built rather than asserted about, so the test exercises the PFX wrapper
+    # around a body already known to match rather than a hand-guessed byte string.
+    body = b"\x02\x01\x00\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01" + bytes(range(200))
+    # the PFX preamble openssl writes: SEQUENCE, a two-byte long-form length, then the version 3
+    # INTEGER PKCS#12 requires
+    preamble = b"\x30\x82\x09\xdf" + b"\x02\x01\x03"
+    shrouded_key_bag = b"\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x0a\x01\x02"
+    pbes2 = b"\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0d"
+
+    # the body alone, with no PFX wrapper, is a private key and stays one
+    plain_der = tmp_path / "key.der"
+    plain_der.write_bytes(body)
+    assert credential_in_file(plain_der) == "a private key"
+
+    with_key = tmp_path / "bundle.p12"
+    with_key.write_bytes(preamble + pbes2 + shrouded_key_bag + body)
+    assert credential_in_file(with_key) == "a private key"
+
+    # the same envelope with no key bag: a certificate chain, which is public material. Both files
+    # carry PBES2, so the encryption OID cannot be what decides.
+    certificates_only = tmp_path / "chain.p12"
+    certificates_only.write_bytes(preamble + pbes2 + body)
+    assert credential_in_file(certificates_only) is None

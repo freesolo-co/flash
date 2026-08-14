@@ -29,7 +29,6 @@ import tarfile
 import time
 import zipfile
 import zlib
-from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, NoReturn
 
@@ -39,6 +38,7 @@ from flash.env_buffers import (
     _blocks_of,
     _looks_like_container,
     _paired_markers_kind,
+    _wide_runs,
     _zlib_prefix_inflates,
 )
 from flash.env_deflate import (
@@ -46,6 +46,7 @@ from flash.env_deflate import (
     _pdf_stream_payloads,
     _raw_deflate_from,
     _TooManyStreams,
+    _UnreachedStream,
     _UnreadableFilterChain,
 )
 from flash.env_formats import (
@@ -76,7 +77,6 @@ from flash.env_patterns import (
     _LITERAL_PATTERNS,
     _MAX_BODY,
     _TOKEN_PATTERNS,
-    SHORTEST_TOKEN_BYTES,
     _match,
     _unfinished_private_key_armor,
 )
@@ -111,28 +111,6 @@ _MAX_KEYSTORE_BYTES = 16 << 20
 # or an appended log writes a handful; the bound is what stops a file of many tiny records from
 # becoming an expansion cost of its own, and exceeding it refuses rather than passes.
 _MAX_ZLIB_RECORDS = 64
-
-
-# Marks NUL as 1 and everything else as 0, so an unbroken stretch of padding bytes becomes a run
-# `_WIDE_RUN` can find. The length floor is the shortest credential worth decoding; below it a
-# chance alignment of NULs cannot carry one anyway.
-#
-# The floor is the SHORTEST credential any pattern admits, not a round number. At 24 it sat above
-# three of them -- `pit_` matches from 20 characters, `fslo_` from 21, `hf_` from 23 -- so a real
-# key of any of those lengths was detected as ASCII and missed in its UTF-16 form, which is the
-# encoding this narrowing exists to cover. A run must hold the whole credential to decode it.
-#
-# DERIVED from the shortest token, not written as a number. Lowering the base64 floor for Slack
-# left this one at a hardcoded 20, so `xoxb-` plus its 10-character body -- 15 bytes, 15 NUL columns
-# in UTF-16 -- was detected as ASCII and missed in the encoding this narrowing exists to cover. The
-# two floors answer the same question about the same patterns, so they move together or one of them
-# silently stops matching what the other admits.
-#
-# The NUL-column gate is what keeps an ELF from narrowing into a token, and a shorter run is a
-# weaker gate, so the floor is re-measured whenever it moves: at 15 over 500 system binaries, still
-# zero false positives.
-_NUL_MARKER = bytes(1 if byte == 0 else 0 for byte in range(256))
-_WIDE_RUN = re.compile(rb"\x01{%d,}" % SHORTEST_TOKEN_BYTES)
 
 
 # How many container layers deep to expand. A zip holding a gzipped shard is an ordinary way to
@@ -234,21 +212,6 @@ def _credential_kind(
     return None
 
 
-def _wide_runs(data: bytes, width: int, offset: int) -> Iterator[bytes]:
-    """The stretches of `data[offset::width]` whose discarded padding byte is NUL throughout.
-
-    Wide text pads every character with NULs, so the padding column is what separates a genuine
-    UTF-16/32 region from bytes that merely narrow into something readable. Only runs long enough
-    to hold a credential are yielded, which is why an ELF -- whose NULs are scattered rather than
-    columnar -- produces none while a wide file produces one run covering the whole of it.
-    """
-    pad = offset + 1 if offset + 1 < width else offset - 1
-    narrow = data[offset::width]
-    columns = data[pad::width].translate(_NUL_MARKER)
-    for match in _WIDE_RUN.finditer(columns, 0, min(len(narrow), len(columns))):
-        yield narrow[match.start() : match.end()]
-
-
 def _decoded_kind(
     data: bytes, *, deadline: float | None = None, depth: int = 0, truncated: bool = False
 ) -> str | None:
@@ -294,11 +257,27 @@ def _decoded_container(deadline: float | None, depth: int) -> _Inspector | None:
     container in one piece -- so its refusal propagates. Swallowing that one turned a real
     `zip -P` archive behind base64 into a clean result while the same archive scanned directly was
     refused. `whole` carries that distinction down from `_match_base64`.
+
+    An exact decode is also checked for a format that cannot be inspected at ALL, which is not the
+    same question as whether it is a container. `openssl enc -a` writes its salted envelope in
+    base64 by design, and that form published a key the binary form of the same ciphertext refused.
     """
     if deadline is None:
         return None
 
     def inspect(decoded: bytes, *, whole: bool = False) -> str | None:
+        # A format that is recognised but cannot be inspected at all -- an `openssl enc` envelope,
+        # chiefly -- is refused here rather than expanded, because there is nothing to expand. The
+        # container test below cannot stand in for this: an encrypted envelope is not a container,
+        # so it returned None and `openssl enc -aes-256-cbc -a` published a whole Freesolo key
+        # while the SAME ciphertext without `-a` was refused at the anchored check. Encoding the
+        # bytes is not what makes them readable.
+        #
+        # Only for an exact whole-run decode, on the same reasoning that governs the refusal below:
+        # `Salted__` is eight printable characters, and a speculative alignment of a base64-shaped
+        # run inside prose can produce them by chance.
+        if whole and (fmt := _unexpandable_format(decoded, anchored=True)):
+            raise _Unscannable(_uninspectable_reason(fmt))
         # Only bytes that actually look like a container are re-entered; anything else has already
         # been through `_match` and would just be scanned a second time.
         if not _looks_like_container(decoded):
@@ -370,7 +349,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
                 return "a key store"
             if not walking_store:
                 store_head = bytearray()
-        if not carry and (kind := _openpgp_kind(chunk)):
+        if not carry and (kind := _openpgp_kind(chunk, truncated=bool(upcoming))):
             return kind
         if not carry:
             # zstd and LZ4 both allow a metadata envelope before the real frame. What matters here
@@ -483,16 +462,17 @@ def _keystore_undecided(head: bytes) -> bool | None:
     return None if store else False
 
 
-def _openpgp_kind(chunk: bytes) -> str | None:
+def _openpgp_kind(chunk: bytes, *, truncated: bool) -> str | None:
     """The kind of OpenPGP key a stream BEGINS with, or None if it holds no key.
 
     Anchored at offset 0, where every packet format is decisive. Every file and every archive
     member reaches this, so a binary export is covered wherever it sits.
 
-    Raises rather than returning None for the two undecided cases: more marker packets than the
-    walk allows, and an encrypted message whose body cannot be read at all. The WHOLE chunk goes to
-    the encrypted test, since a public-key session packet carries the encrypted session key inline
-    and runs to a few hundred bytes -- a fixed head could not reach the data packet behind it.
+    Raises rather than returning None for the undecided cases: more marker packets than the walk
+    allows, a packet whose body runs past this chunk while `truncated` says more follows, and an
+    encrypted message whose body cannot be read at all. The WHOLE chunk goes to the encrypted test,
+    since a public-key session packet carries the encrypted session key inline and runs to a few
+    hundred bytes -- a fixed head could not reach the data packet behind it.
 
     The whole chunk goes to the SEQUENCE walk too, rather than a fixed head. A keyring holding both
     halves leads with the public block, which is thousands of bytes of key material, user IDs and
@@ -500,9 +480,13 @@ def _openpgp_kind(chunk: bytes) -> str | None:
     reach whatever the earlier packets declare. It steps only between boundaries the packets
     themselves state, so this stays anchored rather than becoming a search.
     """
-    secret_key = _openpgp_secret_key_in_sequence(chunk)
+    secret_key = _openpgp_secret_key_in_sequence(chunk, truncated=truncated)
     if secret_key is None:
-        raise _Unscannable("contains more OpenPGP marker packets than this check can walk")
+        # Two undecided shapes share this verdict: a sequence still on a marker packet at the walk
+        # bound, and one whose packet declares a body running past the bytes in hand. The message
+        # names the sequence rather than either cause, because the author's remedy is the same and
+        # claiming the wrong one is worse than naming neither.
+        raise _Unscannable("contains an OpenPGP packet sequence this check cannot walk to the end")
     if secret_key:
         return "a private key"
     if _is_openpgp_encrypted(chunk) is not False:
@@ -648,6 +632,8 @@ def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> 
                 return kind
     except _TooManyStreams:
         raise _Unscannable("contains more compressed streams than can be inspected") from None
+    except _UnreachedStream:
+        raise _Unscannable("contains a compressed stream this could not locate") from None
     except _UnreadableFilterChain:
         raise _Unscannable(
             "contains a compressed stream behind a filter this cannot undo"

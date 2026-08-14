@@ -9,13 +9,14 @@ on literal bytes with no archive, no deadline and no recursion.
 from __future__ import annotations
 
 import io
+import re
 import zipfile
 import zlib
 from collections.abc import Iterator
 from pathlib import Path
 
 from flash.env_formats import _looks_compressed, _looks_like_tar, _overlay_offset
-from flash.env_patterns import _PAIRED_PATTERNS
+from flash.env_patterns import _PAIRED_PATTERNS, SHORTEST_TOKEN_BYTES
 
 # Read in bounded chunks so a large dataset member is never held in memory whole. This costs no
 # more I/O than the publish already pays: `_tar_b64` reads every one of these bytes to gzip them.
@@ -119,3 +120,40 @@ def _blocks_of(source: Path | bytes) -> Iterator[bytes]:
                 yield block
     except OSError:
         return
+
+
+# Marks NUL as 1 and everything else as 0, so an unbroken stretch of padding bytes becomes a run
+# `_WIDE_RUN` can find. The length floor is the shortest credential worth decoding; below it a
+# chance alignment of NULs cannot carry one anyway.
+#
+# The floor is the SHORTEST credential any pattern admits, not a round number. At 24 it sat above
+# three of them -- `pit_` matches from 20 characters, `fslo_` from 21, `hf_` from 23 -- so a real
+# key of any of those lengths was detected as ASCII and missed in its UTF-16 form, which is the
+# encoding this narrowing exists to cover. A run must hold the whole credential to decode it.
+#
+# DERIVED from the shortest token, not written as a number. Lowering the base64 floor for Slack
+# left this one at a hardcoded 20, so `xoxb-` plus its 10-character body -- 15 bytes, 15 NUL columns
+# in UTF-16 -- was detected as ASCII and missed in the encoding this narrowing exists to cover. The
+# two floors answer the same question about the same patterns, so they move together or one of them
+# silently stops matching what the other admits.
+#
+# The NUL-column gate is what keeps an ELF from narrowing into a token, and a shorter run is a
+# weaker gate, so the floor is re-measured whenever it moves: at 15 over 500 system binaries, still
+# zero false positives.
+_NUL_MARKER = bytes(1 if byte == 0 else 0 for byte in range(256))
+_WIDE_RUN = re.compile(rb"\x01{%d,}" % SHORTEST_TOKEN_BYTES)
+
+
+def _wide_runs(data: bytes, width: int, offset: int) -> Iterator[bytes]:
+    """The stretches of `data[offset::width]` whose discarded padding byte is NUL throughout.
+
+    Wide text pads every character with NULs, so the padding column is what separates a genuine
+    UTF-16/32 region from bytes that merely narrow into something readable. Only runs long enough
+    to hold a credential are yielded, which is why an ELF -- whose NULs are scattered rather than
+    columnar -- produces none while a wide file produces one run covering the whole of it.
+    """
+    pad = offset + 1 if offset + 1 < width else offset - 1
+    narrow = data[offset::width]
+    columns = data[pad::width].translate(_NUL_MARKER)
+    for match in _WIDE_RUN.finditer(columns, 0, min(len(narrow), len(columns))):
+        yield narrow[match.start() : match.end()]
