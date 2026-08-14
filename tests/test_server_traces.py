@@ -9498,3 +9498,203 @@ def test_normalizing_a_tool_role_does_not_rewrite_the_stored_value() -> None:
 
     assert sanitized["messages"][0]["role"] == "Tool"
     assert sanitized["messages"][1]["content"] == '{"city": "USERKEEP"}'
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["API Key", "Private Key", "Secret Key", "AWS Access Key", "api\tkey", "api.key", "api/key"],
+)
+def test_a_secret_field_name_is_recognized_whatever_separates_its_words(key: str) -> None:
+    """Normalization stripped `_` and `-` but not the separators a human-written label uses.
+
+    `{"API Key": ...}` is how a config dump, a header table or a hand-written tool result spells
+    the same field, and none of them matched a suffix -- so the credential reached the raw export.
+    """
+    assert traces._is_secret_key(key) is True
+
+    payload = {"messages": [{"role": "tool", "content": json.dumps({key: "SPACEDKEYLEAK"})}]}
+
+    assert "SPACEDKEYLEAK" not in json.dumps(traces._sanitize_for_trace(payload, ()))
+
+
+def test_a_benign_spaced_label_is_not_treated_as_secret() -> None:
+    """Joining the words must not make an ordinary label look like a credential."""
+    assert traces._is_secret_key("Token Count") is False
+
+    payload = {"messages": [{"role": "tool", "content": json.dumps({"Token Count": "COUNTKEEP"})}]}
+
+    assert "COUNTKEEP" in json.dumps(traces._sanitize_for_trace(payload, ()))
+
+
+def test_conflicting_streamed_tool_call_names_do_not_concatenate() -> None:
+    """Two deltas each restating the call header describe two calls, not halves of one name.
+
+    Merging them as text stored the invented function `lookupdelete` with no defect, exportable as
+    a real invocation -- the `id`/`type` fix did not cover the name the model actually called.
+    """
+    conflicting = trace_sse.SseAccumulator()
+    for name in ("lookup", "delete"):
+        conflicting.feed(
+            b'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+            b'"type":"function","function":{"name":"' + name.encode() + b'"}}]}}]}\n\n'
+        )
+    conflicting.finish()
+
+    call = conflicting.output()["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "lookup"
+    assert conflicting.defect == "stream tool_call reported a conflicting identity"
+
+
+def test_conflicting_streamed_legacy_function_call_names_do_not_concatenate() -> None:
+    """The legacy dialect sends its name whole and streams only `arguments` afterwards."""
+    conflicting = trace_sse.SseAccumulator()
+    for name in ("lookup", "delete"):
+        conflicting.feed(
+            b'data: {"choices":[{"index":0,"delta":{"function_call":{"name":"'
+            + name.encode()
+            + b'"}}}]}\n\n'
+        )
+    conflicting.finish()
+
+    message = conflicting.output()["choices"][0]["message"]
+    assert message["function_call"]["name"] == "lookup"
+    assert conflicting.defect == "stream function_call reported a conflicting name"
+
+
+def test_a_function_name_split_across_deltas_still_assembles() -> None:
+    """Providers split one name across deltas, which is why `name` was ever merged as text.
+
+    A continuing fragment carries the name alone; only a delta restating the call header is
+    claiming an identity. Reading every repeated name as a conflict would truncate real calls.
+    """
+    streamed = trace_sse.SseAccumulator()
+    for piece in ("loo", "kup"):
+        streamed.feed(
+            b'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":'
+            b'{"name":"' + piece.encode() + b'"}}]}}]}\n\n'
+        )
+    streamed.finish()
+
+    call = streamed.output()["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "lookup"
+    assert streamed.defect is None
+
+
+def test_a_repeated_header_around_a_fragmented_name_fails_toward_a_defect() -> None:
+    """A provider that restates the call header on EVERY delta while also splitting the name is
+    indistinguishable from two conflicting calls: same id, same type, different name text.
+
+    The ambiguity is resolved toward flagging. Recording an invented function is silent corruption
+    that `records` would export as a real invocation; keeping the first fragment marks the trace
+    untrustworthy instead, which is the failure a reader can see.
+    """
+    streamed = trace_sse.SseAccumulator()
+    for piece in ("loo", "kup"):
+        streamed.feed(
+            b'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+            b'"type":"function","function":{"name":"' + piece.encode() + b'"}}]}}]}\n\n'
+        )
+    streamed.finish()
+
+    assert streamed.output()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "loo"
+    assert streamed.defect == "stream tool_call reported a conflicting identity"
+
+
+def test_the_number_of_retained_choice_slots_is_bounded() -> None:
+    """Each new index allocates a nest of dicts, but only the index's own bytes were charged.
+
+    100k `{"index":N,"delta":{}}` entries retain ~70 MB of state and all fit under an 8 MiB
+    budget, so one pathological event could exhaust memory per concurrent stream.
+    """
+    flooded = trace_sse.SseAccumulator(max_accumulated_bytes=8 * 1024 * 1024)
+    flooded.feed(
+        b'data: {"choices":['
+        + b",".join(b'{"index":' + str(i).encode() + b',"delta":{}}' for i in range(100_000))
+        + b"]}\n\n"
+    )
+    flooded.finish()
+
+    assert len(flooded._choices) <= trace_sse._MAX_ENTRY_SLOTS
+    assert flooded.defect == "stream exceeded the choice slot bound"
+
+
+def test_the_number_of_retained_tool_call_slots_is_bounded() -> None:
+    """A tool-call index allocates the same per-slot state as a choice does."""
+    flooded = trace_sse.SseAccumulator(max_accumulated_bytes=8 * 1024 * 1024)
+    flooded.feed(
+        b'data: {"choices":[{"index":0,"delta":{"tool_calls":['
+        + b",".join(
+            b'{"index":' + str(i).encode() + b',"function":{"arguments":"x"}}'
+            for i in range(100_000)
+        )
+        + b"]}}]}\n\n"
+    )
+    flooded.finish()
+
+    calls = flooded.output()["choices"][0]["message"]["tool_calls"]
+    assert len(calls) <= trace_sse._MAX_ENTRY_SLOTS
+    assert flooded.defect == "stream exceeded the tool call slot bound"
+
+
+def test_a_small_byte_budget_still_records_its_first_choice() -> None:
+    """Slots are bounded by COUNT, not charged against the byte budget.
+
+    That budget is also what a small deployment lowers to cap how much text it retains; charging
+    per-slot structure against it made even the first choice of a 256-byte stream unrecordable.
+    """
+    accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=256)
+    accumulator.feed(b'data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n')
+    accumulator.finish()
+
+    assert accumulator.output()["choices"][0]["message"]["content"] == "hi"
+
+
+def test_an_ordinary_multi_choice_reply_is_unaffected_by_the_state_charge() -> None:
+    """`n=8` is a normal request and must record every choice without a defect."""
+    reply = trace_sse.SseAccumulator()
+    reply.feed(
+        b'data: {"choices":['
+        + b",".join(
+            b'{"index":' + str(i).encode() + b',"delta":{"content":"hi"}}' for i in range(8)
+        )
+        + b"]}\n\n"
+    )
+    reply.finish()
+
+    choices = reply.output()["choices"]
+    assert len(choices) == 8
+    assert reply.defect is None
+    assert all(choice["message"]["content"] == "hi" for choice in choices)
+
+
+@pytest.mark.parametrize("keyword", ["x-example", "x-examples", "X-example"])
+def test_a_vendor_prefixed_example_under_a_secret_property_is_redacted(keyword: str) -> None:
+    """OpenAPI-derived schemas carry vendor extensions, and tooling emits `x-example` alongside the
+    standard `example`. Only the exact keyword set was recognized, so a credential written into the
+    vendor spelling of the SAME annotation survived into the raw export."""
+
+    payload = _tool_hosted(
+        {"type": "object", "properties": {"password": {"type": "string", keyword: "XEXAMPLELEAK"}}}
+    )
+
+    assert "XEXAMPLELEAK" not in json.dumps(traces._sanitize_for_trace(payload, ()))
+
+
+def test_an_unrelated_vendor_extension_under_a_secret_property_survives() -> None:
+    """Only the example/default family is a literal. Unknown keywords inside a declared schema are
+    preserved, and a benign property's vendor example is not a credential."""
+
+    documented = _tool_hosted(
+        {
+            "type": "object",
+            "properties": {
+                "password": {"type": "string", "x-internal-note": "NOTEKEEP"},
+                "city": {"type": "string", "x-example": "PARISKEEP"},
+            },
+        }
+    )
+
+    stored = json.dumps(traces._sanitize_for_trace(documented, ()))
+
+    assert "NOTEKEEP" in stored
+    assert "PARISKEEP" in stored

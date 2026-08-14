@@ -376,6 +376,26 @@ def _append_fragment(target: dict[str, Any], key: str, value: Any) -> None:
 
 _TOO_DEEP_DEFECT = "stream fragment exceeded the payload depth bound"
 
+_IDENTITY_KEYS = frozenset({"id", "type"})
+
+# a choice or tool-call slot retains a nest of dicts (message, tool_calls, logprobs, extensions)
+# whose ~700 bytes are the structure itself, not the index that named it. the byte budget charged
+# only the index, so 100k empty `{"index":N,"delta":{}}` entries -- ~70 MB of retained state -- sat
+# inside an 8 MiB budget. slots are bounded by COUNT rather than folded into the byte budget: the
+# budget is also what a small deployment lowers to cap recorded text, and charging structure
+# against it made the first choice of a 256-byte stream unrecordable. a provider's `n` and its
+# parallel tool calls are small; this is the runaway bound, not a working limit.
+_MAX_ENTRY_SLOTS = 4096
+
+
+def _restates_call_identity(fragment: dict[str, Any]) -> bool:
+    """Whether a tool-call delta re-announces WHICH call it is, rather than continuing one.
+
+    A provider streaming a long function name sends the name alone; a delta that repeats the call
+    header is describing a call in full, so a second such header is a different call.
+    """
+    return any(key in fragment for key in _IDENTITY_KEYS)
+
 
 def _merge_fragment_dict(
     target: dict[str, Any],
@@ -383,6 +403,7 @@ def _merge_fragment_dict(
     *,
     depth: int = 0,
     on_identity_conflict: Callable[[], None] | None = None,
+    restates_identity: bool = False,
 ) -> bool:
     """Merge a streamed fragment into `target`. Returns False if the depth bound truncated it.
 
@@ -398,17 +419,26 @@ def _merge_fragment_dict(
             nested = target.setdefault(key, {})
             if isinstance(nested, dict):
                 bounded &= _merge_fragment_dict(
-                    nested, value, depth=depth + 1, on_identity_conflict=on_identity_conflict
+                    nested,
+                    value,
+                    depth=depth + 1,
+                    on_identity_conflict=on_identity_conflict,
+                    restates_identity=restates_identity,
                 )
             else:
                 target[key] = dict(value)
         elif isinstance(value, str):
             current = target.get(key)
-            if key in {"id", "type"}:
+            if key in _IDENTITY_KEYS or (key == "name" and restates_identity):
                 # identity, not text: `id` and `type` name WHICH call this is, so successive values
                 # are alternatives rather than halves. concatenating them stored the nonexistent
                 # call `call_Acall_B` with no defect, exportable as a real invocation. the first
                 # value wins and a conflicting later one is reported.
+                #
+                # `name` is BOTH: providers split one function name across deltas, so it can only be
+                # read as identity when the delta restates the call header -- a fragment continuing
+                # a name carries the name alone. without that distinction two complete headers named
+                # `lookup` then `delete` merged into the invented call `lookupdelete`.
                 current_text = current.text() if isinstance(current, _StringFragments) else current
                 if current_text is not None:
                     if current_text != value and on_identity_conflict is not None:
@@ -754,8 +784,12 @@ class SseAccumulator:
                 continue
             event_indices.add(index)
             choice_entry_bytes = max(64, self._value_size(index) + 12)
-            if index not in self._choices and not self._reserve(b"x" * choice_entry_bytes):
-                continue
+            if index not in self._choices:
+                if len(self._choices) >= _MAX_ENTRY_SLOTS:
+                    self._note_defect("stream exceeded the choice slot bound")
+                    continue
+                if not self._reserve(b"x" * choice_entry_bytes):
+                    continue
             state = self._choice_state(index)
             message = choice.get("message")
             if message is not None and choice.get("delta") is not None:
@@ -895,7 +929,17 @@ class SseAccumulator:
             if (
                 isinstance(target, dict)
                 and self._reserve_tool_call_fragment(target, function_call)
-                and not _merge_fragment_dict(target, function_call)
+                and not _merge_fragment_dict(
+                    target,
+                    function_call,
+                    on_identity_conflict=lambda: self._note_defect(
+                        "stream function_call reported a conflicting name"
+                    ),
+                    # the legacy dialect carries at most one call per reply and sends its name whole
+                    # in the opening delta, streaming only `arguments` afterwards. so a second name
+                    # here is a different function rather than the tail of this one.
+                    restates_identity=True,
+                )
             ):
                 self._note_defect(_TOO_DEEP_DEFECT)
         elif function_call is not None:
@@ -929,8 +973,12 @@ class SseAccumulator:
                 continue
             seen_indices.add(index)
             tool_call_entry_bytes = max(64, self._value_size(index) + 12)
-            if index not in accumulated_calls and not self._reserve(b"x" * tool_call_entry_bytes):
-                return
+            if index not in accumulated_calls:
+                if len(accumulated_calls) >= _MAX_ENTRY_SLOTS:
+                    self._note_defect("stream exceeded the tool call slot bound")
+                    continue
+                if not self._reserve(b"x" * tool_call_entry_bytes):
+                    return
             fragment = {key: value for key, value in tool_call.items() if key != "index"}
             target = accumulated_calls.setdefault(index, {})
             if not self._reserve_tool_call_fragment(target, fragment):
@@ -941,5 +989,6 @@ class SseAccumulator:
                 on_identity_conflict=lambda: self._note_defect(
                     "stream tool_call reported a conflicting identity"
                 ),
+                restates_identity=_restates_call_identity(fragment),
             ):
                 self._note_defect(_TOO_DEEP_DEFECT)

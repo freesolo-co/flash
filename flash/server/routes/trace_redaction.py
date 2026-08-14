@@ -34,6 +34,7 @@ from flash.server.routes.trace_schema_shape import (  # noqa: F401
     _is_property_name_list,
     _is_schema_definition,
     _is_schema_map_keyword,
+    _is_secret_literal_keyword,
 )
 from flash.server.routes.trace_secret_names import (  # noqa: F401
     _is_secret_key,
@@ -611,7 +612,7 @@ def _redact_secret_fields(
             )
             current_schema_path = (*schema_definition_path, str(key))
             referenced_secret_definition = current_schema_path in active_secret_schema_refs
-            if redact_schema_literals and key in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
+            if redact_schema_literals and _is_secret_literal_keyword(key):
                 redacted[key] = _redact_schema_literal(item, depth=depth + 1, flag=flag)
             elif _is_secret_key(key, allow_token=logprob_entries) and not schema_definition:
                 redacted[key] = "[redacted]"

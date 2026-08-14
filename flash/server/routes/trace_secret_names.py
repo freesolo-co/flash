@@ -48,8 +48,23 @@ _SECRET_KEY_QUALIFIERS = (
 )
 
 
+# separators that join the WORDS of a field name without changing what it names. a JSON key uses
+# `_` or `-`, but a human-readable label written into a request, an assistant reply or a tool result
+# spells the same field `"API Key"` -- and leaving the space in place meant no `apikey` suffix
+# matched, so that credential was persisted unchanged.
+_SECRET_KEY_SEPARATORS = ("_", "-", " ", "\t", "\n", ".", "/")
+
+
+def _normalize_secret_key(key: Any) -> str:
+    """A field name reduced to its letters, so every spelling of one name compares equal."""
+    normalized = str(key).casefold()
+    for separator in _SECRET_KEY_SEPARATORS:
+        normalized = normalized.replace(separator, "")
+    return normalized
+
+
 def _is_secret_key(key: Any, *, allow_token: bool = False) -> bool:
-    normalized = str(key).casefold().replace("_", "").replace("-", "")
+    normalized = _normalize_secret_key(key)
     if normalized in _SECRET_KEY_EXACT:
         return True
     for candidate in _secret_key_candidates(normalized):

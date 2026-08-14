@@ -89,6 +89,28 @@ _JSON_SCHEMA_KEYWORDS = _JSON_SCHEMA_STRUCTURAL_KEYWORDS | _JSON_SCHEMA_ANNOTATI
 _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS = frozenset(
     {"default", "const", "enum", "examples", "example"}
 )
+
+
+def _is_secret_literal_keyword(key: Any) -> bool:
+    """Whether `key` carries INSTANCE DATA that a secret schema must not keep.
+
+    The standard names above are the usual spelling, but tooling writes the same thing as an
+    OpenAPI-style vendor extension: `{"password": {"type": "string", "x-example": "..."}}` states a
+    sample credential exactly as `example` does. Recognizing only the standard set meant the
+    extension form survived storage and raw export while the plain one was redacted.
+
+    Only an extension OF a literal keyword qualifies. `x-internal-note` is an unknown keyword inside
+    a declared schema, which the traversal deliberately preserves, and widening this to every `x-`
+    key would delete legitimate schema content.
+    """
+    if not isinstance(key, str):
+        return False
+    if key in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
+        return True
+    extension = key.removeprefix("x-").removeprefix("X-")
+    return extension != key and extension in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS
+
+
 _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS = frozenset(
     {"properties", "patternProperties", "dependentSchemas", "$defs", "definitions"}
 )
