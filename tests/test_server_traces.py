@@ -8800,3 +8800,205 @@ def test_property_names_declares_names_not_credential_values() -> None:
     )
 
     assert "ENUMLEAK" not in json.dumps(own)
+
+
+def test_an_escaped_trailing_root_dot_names_the_same_host() -> None:
+    """The root-dot cleanup ran on the ENCODED spelling, but `.` is unreserved so `%2E` only
+    becomes a dot during percent normalization -- after the cleanup had already passed. The
+    reference canonicalized to `example.com.`, was classified external, and the local target's
+    secret literals stayed in the raw export."""
+
+    assert trace_uri._canonical_resource_uri("https://example.com%2E/schema") == (
+        trace_uri._canonical_resource_uri("https://example.com/schema")
+    )
+    assert trace_uri._canonical_resource_uri("https://EXAMPLE%2Ecom%2E/s") == (
+        trace_uri._canonical_resource_uri("https://example.com/s")
+    )
+    # a MIDDLE escaped dot is an ordinary label separator and must survive.
+    assert trace_uri._canonical_resource_uri("https://api%2Eexample.com/s") == (
+        trace_uri._canonical_resource_uri("https://api.example.com/s")
+    )
+    # `..` is not a root label; rewriting it would merge unrelated authorities.
+    assert trace_uri._canonical_resource_uri("https://example.com%2E%2E/s") != (
+        trace_uri._canonical_resource_uri("https://api.example.com/s")
+    )
+    # the port is unaffected by the decoded-host cleanup.
+    assert trace_uri._canonical_resource_uri("https://example.com%2E:8443/s") == (
+        trace_uri._canonical_resource_uri("https://example.com:8443/s")
+    )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected_secret"),
+    [
+        ("^(password)$", True),
+        ("^((api_key))$", True),
+        ("(secret)", True),
+        ("^(?:access_token)$", True),
+        # alternation names more than one field, so the group is NOT redundant and stays.
+        ("^(password|city)$", False),
+        # a non-secret grouped pattern keeps its schema meaning.
+        ("^(city)$", False),
+    ],
+)
+def test_a_grouped_secret_pattern_is_still_secret(pattern: str, expected_secret: bool) -> None:
+    """`patternProperties` keys are regexes. Stripping only the anchors left `(password)`, which
+    the name test did not recognize, so the pattern's schema was never marked secret and its
+    credential literals stayed in the raw export."""
+
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "patternProperties": {pattern: {"type": "string", "default": "GROUPLEAK"}},
+                    },
+                },
+            }
+        ]
+    }
+
+    redacted = json.dumps(traces._redact_secret_fields(payload))
+    assert ("GROUPLEAK" not in redacted) is expected_secret
+
+
+@pytest.mark.parametrize("part_type", [1, False, ["x"], {"a": 1}])
+def test_a_malformed_tool_result_type_is_still_tool_output(part_type: object) -> None:
+    """A malformed non-string discriminator is no more trustworthy than a missing one, but it made
+    the tool-result condition false, so the serialized result was treated as ordinary text and a
+    third-party credential stayed visible in the raw export."""
+
+    payload = {
+        "messages": [
+            {
+                "role": "tool",
+                "content": [{"type": part_type, "text": '{"password": "MALFORMEDLEAK"}'}],
+            }
+        ]
+    }
+
+    assert "MALFORMEDLEAK" not in json.dumps(traces._sanitize_for_trace(payload, ()))
+
+
+def test_a_function_wrapper_needs_the_function_tool_type() -> None:
+    """A `function` wrapper is a declaration only under the tool type that defines it. Accepting
+    `{"type": "custom", "function": {...}}` -- an entry no provider accepts -- opened the schema
+    exemption, so the nested wrapper preserved an unknown keyword's credential literal."""
+
+    def payload(entry: dict) -> dict:
+        return {"tools": [entry]}
+
+    schema = {
+        "type": "object",
+        "properties": {"password": {"type": "string", "value": "DISCRIMLEAK"}},
+    }
+    mismatched = payload({"type": "custom", "function": {"name": "lookup", "parameters": schema}})
+    blank = payload({"type": "function", "function": {"name": "   ", "parameters": schema}})
+    empty = payload({"type": "function", "function": {"name": "", "parameters": schema}})
+
+    for invalid in (mismatched, blank, empty):
+        assert "DISCRIMLEAK" not in json.dumps(traces._sanitize_for_trace(invalid, ()))
+
+    # a real declaration still hosts its schema: that exemption is the point of the check.
+    valid = payload(
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string", "default": "PARISKEEP"}},
+                },
+            },
+        }
+    )
+    assert "PARISKEEP" in json.dumps(traces._sanitize_for_trace(valid, ()))
+    # the pre-`type` spelling has no discriminator to disagree with and stays valid.
+    legacy = {
+        "functions": [
+            {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string", "default": "LEGACYKEEP"}},
+                },
+            }
+        ]
+    }
+    assert "LEGACYKEEP" in json.dumps(traces._sanitize_for_trace(legacy, ()))
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_secret"),
+    [
+        ("password_confirmation", True),
+        ("client_secret_value", True),
+        ("access_token_value", True),
+        ("api_key_value", True),
+        ("new_password", True),
+        # these qualifiers CHANGE what the field names, so their content is legitimate.
+        ("password_policy_url", False),
+        ("token_count", False),
+        ("secretary_name", False),
+    ],
+)
+def test_a_secret_field_with_a_trailing_qualifier_is_still_secret(
+    field: str, expected_secret: bool
+) -> None:
+    """The suffix rule required the sensitive term to END the key, so `password_confirmation` and
+    `client_secret_value` fell through and their credentials were persisted unchanged -- and a
+    third-party credential is never in `context.secrets` to be caught by value."""
+
+    payload = {"messages": [{"role": "tool", "content": json.dumps({field: "QUALIFIERLEAK"})}]}
+
+    redacted = json.dumps(traces._sanitize_for_trace(payload, ()))
+    assert ("QUALIFIERLEAK" not in redacted) is expected_secret
+
+
+def test_content_after_an_abandoned_done_candidate_is_not_silently_dropped() -> None:
+    """The gate withholds `[DONE]` until its event closes and relays it only when it ABANDONS the
+    candidate, past its comment-suffix bound. The accumulator then marked itself done, so content
+    still being relayed to the caller was omitted from the recording -- and with no defect and an
+    absent finish reason, `records` would export the earlier partial text as a complete target."""
+
+    gate = trace_sse.SseDoneGate()
+    accumulator = trace_sse.SseAccumulator()
+    relayed = bytearray()
+    comments = b"".join(b": comment-%04d\n" % index for index in range(120))
+    assert len(comments) > trace_sse._POST_DONE_SUFFIX_LIMIT
+    for chunk in (
+        b'data: {"choices":[{"delta":{"content":"EARLY"}}]}\n\n',
+        b"data: [DONE]\n",
+        comments,
+        b"\n",
+        b'data: {"choices":[{"delta":{"content":"LATE"}}]}\n\n',
+    ):
+        for forwarded in gate.feed(chunk):
+            relayed.extend(forwarded)
+            accumulator.feed(forwarded)
+    for forwarded in gate.finish():
+        relayed.extend(forwarded)
+        accumulator.feed(forwarded)
+    accumulator.finish()
+
+    assert b"LATE" in relayed
+    recorded = json.dumps(accumulator.output(), default=str)
+    assert "LATE" in recorded or accumulator.defect is not None
+
+    # an ordinary stream keeps its clean recording: no spurious defect from trailing whitespace.
+    clean_gate = trace_sse.SseDoneGate()
+    clean = trace_sse.SseAccumulator()
+    for chunk in (
+        b'data: {"choices":[{"delta":{"content":"HELLO"}}]}\n\n',
+        b"data: [DONE]\n: small\n\n",
+    ):
+        for forwarded in clean_gate.feed(chunk):
+            clean.feed(forwarded)
+    for forwarded in clean_gate.finish():
+        clean.feed(forwarded)
+    clean.finish()
+    assert clean.defect is None
+    assert "HELLO" in json.dumps(clean.output(), default=str)

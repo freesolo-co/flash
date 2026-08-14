@@ -12,6 +12,12 @@ from flash.server.routes.trace_schema_identity import (
     _local_schema_pointer,
     _schema_resource_id,
 )
+from flash.server.routes.trace_secret_names import (  # noqa: F401
+    _is_secret_key,
+    _is_secret_property_pattern,
+    _secret_key_candidates,
+    _unwrap_pattern_groups,
+)
 from flash.server.routes.trace_uri import (
     _canonical_resource_uri,
     _safe_urldefrag,
@@ -22,23 +28,6 @@ from flash.server.routes.trace_uri import (
 # secret corrupts unrelated training text, while real bearer credentials are comfortably longer.
 _MIN_SECRET_SUBSTRING_LENGTH = 16
 
-# `auth` is exact-matched, never a suffix: `author` and `oauth` end in it but carry no credential.
-_SECRET_KEY_EXACT = frozenset({"authorization", "proxyauthorization", "auth", "xauth"})
-_SECRET_KEY_SUFFIXES = (
-    "apikey",
-    # conventional cloud credential fields end in these normalized forms. bare `key` is deliberately
-    # excluded because JSON schemas and tool arguments use it pervasively for harmless data.
-    "accesskeyid",
-    "secretkey",
-    "accesskey",
-    "secret",
-    "token",
-    "password",
-    "passwd",
-    "credential",
-    "credentials",
-    "privatekey",
-)
 _JSON_SCHEMA_STRUCTURAL_KEYWORDS = frozenset(
     {
         "type",
@@ -170,30 +159,6 @@ _JSON_SCHEMA_TYPES = frozenset(
 @dataclass
 class _SanitizationFlag:
     hit: bool = False
-
-
-def _is_secret_key(key: Any, *, allow_token: bool = False) -> bool:
-    normalized = str(key).casefold().replace("_", "").replace("-", "")
-    return normalized in _SECRET_KEY_EXACT or (
-        not (allow_token and normalized == "token")
-        and any(normalized.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES)
-    )
-
-
-def _is_secret_property_pattern(pattern: Any) -> bool:
-    """Whether a `patternProperties` key matches property names this module treats as secret.
-
-    The key is a REGEX, not a name, so the raw spelling is the wrong thing to test: `^password$`
-    names exactly the field `password`, but it ends in `$` and failed the suffix rule, so the
-    pattern's schema was never marked secret and its literals stayed in the raw export.
-
-    Only the anchors are stripped -- they constrain WHERE the expression matches, not what it
-    names. Anything else (alternation, character classes, quantifiers) is left in place, so a
-    genuinely non-secret pattern is still judged on its full spelling rather than guessed at.
-    """
-    if not isinstance(pattern, str):
-        return False
-    return _is_secret_key(pattern.removeprefix("^").removesuffix("$"))
 
 
 def _is_schema_definition(value: Any, *, allow_custom_vocabulary: bool = False) -> bool:
@@ -545,15 +510,14 @@ def _carries_tool_result(container: dict[Any, Any], key: Any, *, inside_tool_res
     """
     if key == "content" and container.get("role") in {"tool", "function"}:
         return True
-    if not (inside_tool_result and key == "text"):
-        return False
     # the enclosing message's role already established that this is tool output; the part's `type`
     # only narrows WHICH member carries it, and `text` is that member in every spelling. requiring
     # a recognized `type` meant an absent or vendor-specific one dropped the context, and a
-    # serialized credential in that part was preserved verbatim. an unrecognized type is unknown
-    # input, so it is handled conservatively rather than trusted to be something other than output.
-    part_type = container.get("type")
-    return part_type is None or isinstance(part_type, str)
+    # serialized credential in that part was preserved verbatim. a MALFORMED discriminator (an int,
+    # a list) is no more trustworthy than a missing one -- treating it as "not a tool result" let
+    # `{"type": 1, "text": "{\"password\": ...}"}` through -- so the `type` is not consulted at all.
+    # the role is what decides; `type` cannot revoke it.
+    return inside_tool_result and key == "text"
 
 
 def _resolve_secret_schema_refs(
@@ -872,9 +836,21 @@ def _is_tool_definition(item: Any) -> bool:
     # provider would accept open the schema exemption, so its nested wrapper kept a literal.
     function = item.get("function")
     if isinstance(function, dict):
-        return isinstance(function.get("name"), str)
-    return isinstance(item.get("name"), str) and any(
-        isinstance(item.get(wrapper), dict) for wrapper in _JSON_SCHEMA_WRAPPER_KEYS
+        # the wrapper is only a declaration under the tool type that DEFINES it. `{"type":
+        # "custom", "function": {...}}` is an entry no provider accepts, yet a bare name check
+        # honoured it and opened the schema exemption, so the nested wrapper kept a secret
+        # literal. an absent type is the pre-`type` spelling and stays valid; a present one has
+        # to agree. a blank name names nothing, so it cannot be the tool a `tool_choice` selects.
+        declared_type = item.get("type")
+        if declared_type is not None and declared_type != "function":
+            return False
+        name = function.get("name")
+        return isinstance(name, str) and bool(name.strip())
+    name = item.get("name")
+    return (
+        isinstance(name, str)
+        and bool(name.strip())
+        and any(isinstance(item.get(wrapper), dict) for wrapper in _JSON_SCHEMA_WRAPPER_KEYS)
     )
 
 

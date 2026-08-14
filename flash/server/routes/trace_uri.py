@@ -181,11 +181,23 @@ def _canonical_resource_uri(uri: str) -> str:
     # uppercase, so the fold is applied to decoded characters only. the userinfo is case-sensitive
     # and keeps the plain normalization. decoding is delimiter-safe here because no unreserved
     # character is a delimiter: `@`, `:` and the brackets stay encoded and the split above holds.
+    # the root-dot cleanup above ran on the ENCODED spelling, but `.` is unreserved, so `%2E`
+    # only becomes a dot here. `https://example.com%2E/s` therefore came back out as
+    # `example.com.` and was classified as a different authority than `example.com`, which put the
+    # local `$id` out of reach and left its secret literals in the raw export. the cleanup is
+    # idempotent, so re-applying it to the decoded host is enough; the port was already handled.
+    normalized_hostport = _normalize_percent_encoding(hostport, fold_decoded=True)
+    if not normalized_hostport.startswith("["):
+        host, port_separator, port = normalized_hostport.rpartition(":")
+        normalized_hostport = (
+            f"{_canonical_registered_host(host)}:{port}"
+            if port_separator
+            else _canonical_registered_host(normalized_hostport)
+        )
     normalized_netloc = (
-        f"{_normalize_percent_encoding(userinfo)}@"
-        f"{_normalize_percent_encoding(hostport, fold_decoded=True)}"
+        f"{_normalize_percent_encoding(userinfo)}@{normalized_hostport}"
         if user_separator
-        else _normalize_percent_encoding(hostport, fold_decoded=True)
+        else normalized_hostport
     )
     normalized_path = _remove_dot_segments(_normalize_percent_encoding(path))
     if normalized_scheme in {"http", "https"} and normalized_netloc and not normalized_path:

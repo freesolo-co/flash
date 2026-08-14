@@ -409,7 +409,18 @@ class SseAccumulator:
         self.defect: str | None = None
 
     def feed(self, chunk: bytes) -> None:
-        if self.truncated or self._done:
+        if self.truncated:
+            return
+        if self._done:
+            # bytes after the terminator are not part of the reply, but they are not nothing
+            # either. the gate withholds `[DONE]` until the event closes, and relays it only when
+            # it ABANDONS the candidate -- past its comment-suffix bound, say. so content arriving
+            # here was relayed to the caller while this recording had already closed, and
+            # `records` would export the earlier partial text as if it were the complete target.
+            # the reply cannot be repaired at this point, so it is marked instead of silently
+            # kept: a defective span is excluded from training data, an incomplete one is not.
+            if chunk.strip():
+                self._note_defect("stream continued after its terminator")
             return
         self._buffer.extend(chunk)
         if self._at_stream_start:
