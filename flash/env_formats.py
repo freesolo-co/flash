@@ -121,6 +121,28 @@ def _looks_compressed(head: bytes) -> bool:
     return head.startswith(_COMPRESSED_MAGIC) or _looks_like_zlib(head)
 
 
+def _jks_private_key_entries(head: bytes) -> bool:
+    """Whether `head` begins a Java KeyStore holding a private-key entry.
+
+    `keytool -genkeypair -storetype JKS` writes a format no other check here understands: not PEM,
+    not DER, not a container -- so a store holding a complete private key returned None, and `.jks`
+    is not in the filename exclusions either. The key inside is password-encrypted, but the store
+    is the credential: possession plus a guessable or shared store password is the whole secret,
+    and it is exactly what gets committed beside a service config.
+
+    Structural: the `feedfeed` magic, a version of 1 or 2, an entry count, then each entry's tag.
+    Tag 1 is a `PrivateKeyEntry` and tag 2 a `TrustedCertificateEntry` -- a store holding only
+    trusted certs carries no secret and stays publishable, which is what separates the two. Only
+    the FIRST entry's tag is read, since the fields after it are variable-length and walking them
+    would mean parsing the whole store to answer a question the first entry usually settles.
+    """
+    if len(head) < 16 or head[:4] != b"\xfe\xed\xfe\xed":
+        return False
+    version = int.from_bytes(head[4:8], "big")
+    count = int.from_bytes(head[8:12], "big")
+    return version in (1, 2) and count > 0 and int.from_bytes(head[12:16], "big") == 1
+
+
 def _looks_like_textual(data: bytes) -> bool:
     """Whether `data` reads as text rather than as a compressed stream.
 
@@ -414,11 +436,30 @@ def _zip_directory_entries(
     # offset is short) and the zip64 record and locator between its directory and the classic end
     # record (so the computed shift overshoots by their combined length). Neither of the first two
     # candidates lands on the directory, and the walk fell back to the forged count.
-    for candidate in dict.fromkeys((start, start + shift, start + shift - _ZIP64_END_BYTES)):
-        directory = _read_at(source, candidate, size)
-        if directory is not None and directory[:4] == b"PK\x01\x02":
-            break
-    else:
+    # Every candidate is WALKED, not merely sniffed, and the largest count any of them yields wins.
+    # Selecting on the leading four bytes and committing to that choice was a bypass: a decoy
+    # `PK\x01\x02` planted in the stub at the unshifted offset won the sniff, its walk then failed
+    # on the second record, and the failure was reported as "cannot be walked" -- which makes the
+    # caller fall back to the forged count in the end record. A stub decoy plus a count patched to
+    # 1 made a real 500-entry archive report one member while `ZipFile` still materialized all 500.
+    #
+    # Taking the maximum rather than the first success is what makes a decoy useless: it can add a
+    # candidate that walks to a small number, but it cannot lower what the real directory walks to.
+    counts = [
+        walked
+        for candidate in dict.fromkeys((start, start + shift, start + shift - _ZIP64_END_BYTES))
+        if (walked := _walk_directory(_read_at(source, candidate, size), limit)) is not None
+    ]
+    return max(counts) if counts else None
+
+
+def _walk_directory(directory: bytes | None, limit: int) -> int | None:
+    """How many central-directory records `directory` holds, or None if it is not one.
+
+    Stops one past `limit`: the caller only needs to know the bound is exceeded, and walking an
+    unbounded directory would make this counter the very cost it exists to prevent.
+    """
+    if directory is None or directory[:4] != b"PK\x01\x02":
         return None
     count, cursor = 0, 0
     while cursor + _ZIP_CENTRAL_HEADER_BYTES <= len(directory):

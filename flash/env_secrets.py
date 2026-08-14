@@ -43,6 +43,7 @@ from flash.env_formats import (
     _after_skippable_frames,
     _has_zip_end_record,
     _is_openpgp_secret_key,
+    _jks_private_key_entries,
     _looks_compressed,
     _looks_like_tar,
     _looks_like_textual,
@@ -76,6 +77,19 @@ _SKIPPABLE_SCAN_BYTES = 64 << 10
 # dozen bytes, but a legal marker packet may precede the real one and each consumes five, so a
 # fixed 24 left too few behind four markers to reach the version and algorithm fields.
 _OPENPGP_HEAD_BYTES = 24 + 5 * _MAX_OPENPGP_MARKERS
+
+# How many concatenated zlib records are inflated before the stream is refused. A per-record cache
+# or an appended log writes a handful; the bound is what stops a file of many tiny records from
+# becoming an expansion cost of its own, and exceeding it refuses rather than passes.
+_MAX_ZLIB_RECORDS = 64
+
+# How long a signature must be to be searched for at an ARBITRARY offset rather than only at the
+# start of a stream. Six bytes is where the two real self-extracting formats sit (7-Zip at six, RAR
+# at seven and eight) and where a chance occurrence stops being plausible: measured 0 hits across
+# 256 MiB of random bytes for every signature, but a 4-byte magic is only 1 in 4 billion per
+# position, which a large enough model shard reaches. The short zstd and LZ4 magics stay decisive
+# at offset zero, where they mean what they say.
+_SFX_MAGIC_BYTES = 6
 
 # A base64 run long enough to hold the shortest credential a pattern admits. The lower bound makes
 # the scan walk past ordinary prose rather than decoding every word it meets. There is deliberately
@@ -396,6 +410,11 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     while chunk := handle.read(_SCAN_CHUNK_BYTES):
         if deadline is not None and time.monotonic() > deadline:
             raise _Unscannable("takes too long to decompress")
+        if not carry and _jks_private_key_entries(chunk[:16]):
+            # A Java KeyStore holding a private-key entry, recognised structurally. Head-anchored
+            # like the OpenPGP test and for the same reason: `feedfeed` plus a plausible version
+            # and count is only decisive at offset 0.
+            return "a private key"
         if not carry and _is_openpgp_secret_key(chunk[:_OPENPGP_HEAD_BYTES]):
             # only ever at offset 0, and `carry` is empty only on the first chunk. Every file and
             # every archive member reaches this, so the binary export is covered wherever it sits.
@@ -406,9 +425,13 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
             # longer than the bytes available leaves the format undecided, and undecided is not
             # clean. The signature search itself runs below over the whole window, so the walked
             # bytes are not needed -- only the verdict on whether the walk ran out.
-            _, truncated = _after_skippable_frames(chunk[:_SKIPPABLE_SCAN_BYTES])
+            head, truncated = _after_skippable_frames(chunk[:_SKIPPABLE_SCAN_BYTES])
             if truncated:
                 raise _Unscannable("begins with a frame prelude too long to read past")
+            # Anchored: every format is decisive about what a stream BEGINS with, including the
+            # short zstd and LZ4 magics that are not searched for at arbitrary offsets below.
+            if fmt := _unexpandable_format(head, anchored=True):
+                raise _Unscannable(f"contains a {fmt} archive this check cannot expand")
         if not carry and depth:
             # tar as well as the compressed magics: a tar's own members are literal, but a
             # COMPRESSED member inside one is not, so an oversized tar that went past the buffer
@@ -436,10 +459,10 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         # fixed prefix is a number an attacker picks their padding to exceed.
         #
         # Affordable because these signatures are 4 to 8 bytes of fixed content: `bytes.find` is a
-        # memchr-driven scan, and the expected false-positive rate on arbitrary data is a quarter
-        # of a hit per GiB for the shortest of them and vanishing for the rest. Measured 0 hits
-        # across 256 MiB of random bytes for all six.
-        if fmt := _unexpandable_format(window):
+        # memchr-driven scan, and only the 6-to-8-byte signatures are searched this way, whose
+        # expected false-positive rate on arbitrary data is vanishing. Measured 0 hits across
+        # 256 MiB of random bytes for all six.
+        if fmt := _unexpandable_format(window, anchored=False):
             raise _Unscannable(f"contains a {fmt} archive this check cannot expand")
         if kind := _credential_kind(window):
             return kind
@@ -458,15 +481,31 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     return None
 
 
-def _unexpandable_format(data: bytes) -> str | None:
-    """The name of an unexpandable archive format whose signature appears in `data`, or None.
+def _unexpandable_format(data: bytes, *, anchored: bool) -> str | None:
+    """The name of an unexpandable archive format `data` carries, or None.
 
-    `find` rather than `startswith`. RAR and 7-Zip both ship self-extracting archives -- an
-    executable stub, then the signature, then the opaque compressed body -- so a head-anchored test
-    saw the stub, matched nothing, and scanned the compressed bytes as if they were content. That
-    is the same bypass the zip stub handling closes, reachable with `rar a -sfx` or 7-Zip's `-sfx`.
+    Two questions rather than one, because the two have different error costs.
+
+    `anchored` asks whether the stream BEGINS with such a signature. Every format is decisive
+    there: a file whose first bytes are a zstd frame is a zstd frame.
+
+    Unanchored asks whether one appears anywhere, which is what catches a self-extracting archive
+    -- an executable stub, then the signature, then the opaque compressed body, as `rar a -sfx` or
+    7-Zip's `-sfx` writes. Only the signatures of six bytes or more are searched that way. The
+    4-byte zstd and LZ4 magics are not distinctive enough to be decisive at an arbitrary offset:
+    embedded in a large model shard or high-entropy dataset they refuse a publishable file, and a
+    false refusal on ordinary content is worse than the narrow bypass of an SFX built from a
+    format that has no self-extracting form in the first place. RAR and 7-Zip, which do ship SFX
+    modules, carry 6-to-8-byte signatures and stay searched.
     """
-    return next((fmt for magic, fmt in _UNEXPANDABLE_MAGIC if magic in data), None)
+    magics = (
+        _UNEXPANDABLE_MAGIC
+        if anchored
+        else [pair for pair in _UNEXPANDABLE_MAGIC if len(pair[0]) >= _SFX_MAGIC_BYTES]
+    )
+    if anchored:
+        return next((fmt for magic, fmt in magics if data.startswith(magic)), None)
+    return next((fmt for magic, fmt in magics if magic in data), None)
 
 
 def _paired_markers_kind(window: bytes, seen: set[tuple[int, str]]) -> str | None:
@@ -590,17 +629,42 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
         # `zlib.error` is identical for a real FDICT stream and for `x = 1`.
         if head[1] & 0x20 and not _looks_like_textual(raw):
             raise _Unscannable("contains a compressed stream needing a dictionary to inspect")
-        inflate = zlib.decompressobj()
-        try:
-            plain = inflate.decompress(raw, _MAX_NESTED_BUFFER_BYTES)
-        except zlib.error:
-            plain = None  # not zlib after all; the openers below still get their turn
-        if plain is not None:
+        # EVERY concatenated stream is inflated, not just the first. `decompressobj` stops at the
+        # end of one zlib record and hands the rest back as `unused_data`; scanning only the first
+        # plaintext meant `zlib.compress(benign) + zlib.compress(secret)` published clean, since
+        # the credential lived entirely in the discarded remainder. Concatenated records are what a
+        # per-record cache or an appended log writes, so this is an ordinary shape as well as a
+        # reachable bypass.
+        remaining, budget = raw, _MAX_NESTED_BUFFER_BYTES
+        for record in range(_MAX_ZLIB_RECORDS):
+            inflate = zlib.decompressobj()
+            try:
+                plain = inflate.decompress(remaining, budget)
+            except zlib.error:
+                if record:
+                    # Records inflated and then one did not: the trailing bytes are a compressed
+                    # stream this cannot read, and undecided is not clean. Only the FIRST record
+                    # failing means "not zlib after all", which the openers below still handle.
+                    raise _Unscannable(
+                        "contains trailing compressed data this check cannot inspect"
+                    ) from None
+                break
             # `max_length` TRUNCATES rather than raising, so a credential past the cap would read
             # as a clean scan. `unconsumed_tail` is non-empty exactly when that happened.
             if inflate.unconsumed_tail:
                 raise _Unscannable("contains a compressed stream too large to inspect")
-            return _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth)
+            if kind := _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth):
+                return kind
+            # The budget is shared across the records so a chain of them cannot buy more expansion
+            # than one stream of the same total size.
+            budget -= len(plain)
+            remaining = inflate.unused_data
+            if not remaining:
+                return None
+            if budget <= 0:
+                raise _Unscannable("contains a compressed stream too large to inspect")
+        else:
+            raise _Unscannable("contains more compressed records than this check can inspect")
     with opener(source if isinstance(source, Path) else io.BytesIO(source), "rb") as stream:
         return _scan_stream(stream, deadline=deadline, depth=depth)
 
@@ -651,7 +715,14 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
                     "an archive member compressed in a way this check cannot read"
                 )
             except _UNREADABLE_ARCHIVE:
-                continue  # this member is opaque; the rest of the archive still gets scanned
+                # Recorded like the two above rather than skipped silently. A member of a SPLIT
+                # archive (`zip -s`) has its directory entry in the final volume and its bytes in
+                # an earlier one, so opening it here raises and the member read as clean -- both
+                # published parts returned None while joining the volumes recovered the key. The
+                # bytes are not in this file, which is exactly the "unverifiable" case, and every
+                # other unreadable member reaches the same conclusion for the same reason.
+                unreadable = unreadable or "an archive member this check cannot read"
+                continue  # the rest of the archive still gets scanned
     if unreadable:
         raise _Unscannable(f"contains {unreadable}")
     return None

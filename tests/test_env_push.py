@@ -4445,3 +4445,260 @@ def test_the_base64_floor_admits_the_shortest_token_the_patterns_match(tmp_path)
 
     # the floor tracks the patterns rather than being written twice
     assert _MIN_BASE64_RUN == -(-SHORTEST_TOKEN_BYTES * 4 // 3)
+
+
+def test_a_yaml_block_header_may_carry_a_comment(tmp_path):
+    """YAML permits `KEY: | # generated`, which is how templating tools annotate injected values.
+
+    The header pattern stopped at the `#`, so the indented body never matched and the key
+    published.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    for header in ("|", "| # injected value", ">- # generated", "|2- # note"):
+        written = tmp_path / "values.yaml"
+        written.write_text(f"AWS_SECRET_ACCESS_KEY: {header}\n  {body}\n")
+        assert credential_in_file(written) == "an AWS secret access key", header
+
+
+def test_a_jwk_private_value_is_matched_through_its_json_escapes(tmp_path):
+    """A base64url scalar is all ASCII, so any character in it may legally be written `\\u00XX`.
+
+    A Node-exported JWK whose `d` begins `"\\u0078..."` is the same key to `JSON.parse` and
+    `createPrivateKey`, but a run of plain base64 characters matched nothing and the whole private
+    key published.
+    """
+    import base64
+    import json
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    raw = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+    value = "x" + raw[1:]
+    escape_x = "\\u0078"
+    for name, text in (
+        ("plain", '{"kty":"OKP","crv":"Ed25519","d":"' + value + '"}'),
+        ("escaped", '{"kty":"OKP","crv":"Ed25519","d":"' + escape_x + value[1:] + '"}'),
+    ):
+        written = tmp_path / f"{name}.json"
+        written.write_text(text)
+        assert json.loads(text)["d"] == value, name  # both spellings ARE the same key
+        assert credential_in_file(written) == "a private key", name
+
+
+def test_a_pem_body_is_found_at_any_wrap_width(tmp_path):
+    """PEM does not fix a wrap width -- RFC 7468 recommends 64 but permits any.
+
+    Requiring 32 contiguous base64 characters meant a key rewrapped at 16 columns matched neither
+    this pattern nor the 64/76-column joining, while `openssl pkey -check` still accepts it.
+    """
+    from flash.env_secrets import credential_in_file
+
+    header = "-----BEGIN PRIVATE KEY-----"
+    footer = "-----END PRIVATE KEY-----"
+    body = "MC4CAQAwBQYDK2VwBCIEIH" + "AbCdEf0123456789" * 3
+    for width in (8, 16, 32, 64):
+        wrapped = "\n".join(body[i : i + width] for i in range(0, len(body), width))
+        written = tmp_path / f"key{width}.pem"
+        written.write_text(f"{header}\n{wrapped}\n{footer}\n")
+        assert credential_in_file(written) == "a private key block", width
+
+    # prose that merely NAMES a header is still publishable
+    prose = tmp_path / "README.md"
+    prose.write_text("If you see -----BEGIN PRIVATE KEY----- in a log, redact it.\n")
+    assert credential_in_file(prose) is None
+
+
+def test_every_concatenated_zlib_record_is_scanned(tmp_path):
+    """`decompressobj` stops at the end of one zlib record and hands the rest back as unused data.
+
+    Scanning only the first plaintext meant `zlib.compress(benign) + zlib.compress(secret)`
+    published clean, with the credential entirely inside the discarded remainder. Concatenated
+    records are what a per-record cache or an appended log writes.
+    """
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    secret = zlib.compress(b"FREESOLO_API_KEY=fslo_A1b2C3d4E5f6G7h8\n")
+    benign = zlib.compress(b"just some ordinary configuration text\n" * 20)
+    for name, data in (
+        ("first", secret + benign),
+        ("second", benign + secret),
+        ("third", benign + benign + secret),
+    ):
+        written = tmp_path / f"{name}.zz"
+        written.write_bytes(data)
+        assert credential_in_file(written) == "a Freesolo API key", name
+
+    # a stream of only benign records is still publishable
+    clean = tmp_path / "clean.zz"
+    clean.write_bytes(benign + benign)
+    assert credential_in_file(clean) is None
+
+
+def test_a_record_chain_that_exhausts_the_budget_is_refused(tmp_path):
+    """The expansion budget is shared across concatenated records, and running out of it says
+    nothing about the records that were never read.
+
+    Returning None there let a chain of two large benign records hide a credential in a third:
+    the budget hit zero, the loop reported clean, and the key published. Exhausting a limit is
+    unverifiable, and unverifiable is not clean. A chain whose end is a stream this cannot decode
+    is the same case -- only a FIRST record that fails means "not zlib after all".
+    """
+    import zlib
+
+    from flash.env_secrets import _MAX_NESTED_BUFFER_BYTES, _Unscannable, credential_in_file
+
+    secret = zlib.compress(b"FREESOLO_API_KEY=fslo_A1b2C3d4E5f6G7h8\n")
+    # exactly the budget, so this record inflates whole -- an OVER-budget record is a different
+    # case, caught earlier by `unconsumed_tail` with the same message, and would not prove this
+    # branch runs at all.
+    exact = zlib.compress(b"x" * _MAX_NESTED_BUFFER_BYTES)
+
+    starved = tmp_path / "starved.zz"
+    starved.write_bytes(exact + secret)
+    with pytest.raises(_Unscannable, match="too large to inspect"):
+        credential_in_file(starved)
+
+    # records inflate, then the tail is a compressed stream this cannot read
+    undecodable = tmp_path / "undecodable.zz"
+    undecodable.write_bytes(zlib.compress(b"ordinary text\n") + b"\x78\x9c" + b"\xff" * 64)
+    with pytest.raises(_Unscannable, match="trailing compressed data"):
+        credential_in_file(undecodable)
+
+    # a file that was never zlib is still ordinary content, not a broken chain
+    plain = tmp_path / "plain.txt"
+    plain.write_bytes(b"just some ordinary configuration text\n")
+    assert credential_in_file(plain) is None
+
+
+def test_a_decoy_directory_header_cannot_defeat_the_member_count(tmp_path):
+    """Selecting a directory candidate on its first four bytes made a stub decoy decisive.
+
+    The decoy's walk failed on its second record, the failure was reported as "cannot be walked",
+    and the caller fell back to the count in the end record -- so a decoy plus a count patched to 1
+    made a real 500-entry archive report one member while `ZipFile` still materialized all 500.
+    """
+    import io
+    import os
+    import struct
+    import zipfile
+
+    from flash.env_formats import _zip_member_count
+
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as archive:
+        for index in range(500):
+            archive.writestr(f"m{index}.txt", "x" * 10)
+    body = inner.getvalue()
+    end = body.rfind(b"PK\x05\x06")
+    start = struct.unpack("<I", body[end + 16 : end + 20])[0]
+
+    packed = bytearray(os.urandom(start + 4096) + body)
+    decoy = bytearray(b"PK\x01\x02" + os.urandom(42))
+    struct.pack_into("<HHH", decoy, 28, 8, 0, 0)
+    decoy += b"FILENAME" + os.urandom(64)
+    packed[start : start + len(decoy)] = decoy
+    forged = packed.rfind(b"PK\x05\x06")
+    struct.pack_into("<H", packed, forged + 8, 1)
+    struct.pack_into("<H", packed, forged + 10, 1)
+
+    data = bytes(packed)
+    assert _zip_member_count(data) == len(zipfile.ZipFile(io.BytesIO(data)).infolist()) == 500
+
+
+def test_a_member_whose_bytes_live_in_another_volume_is_refused(tmp_path):
+    """A split archive's final volume holds the directory while the bytes sit in an earlier one.
+
+    Opening such a member raises, and the bare `continue` treated it as clean -- so both published
+    parts returned None while joining the volumes recovered the key.
+    """
+    import io
+    import struct
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_LZMA) as archive:
+        archive.writestr("secret.txt", "FREESOLO_API_KEY=fslo_A1b2C3d4E5f6G7h8\n")
+    raw = buffer.getvalue()
+    final = bytearray(raw[raw.find(b"PK\x01\x02") :])
+    struct.pack_into("<I", final, final.find(b"PK\x05\x06") + 16, 0)
+
+    written = tmp_path / "a.zip"
+    written.write_bytes(bytes(final))
+    # the directory still names the member, so this is not an empty archive
+    assert zipfile.ZipFile(io.BytesIO(bytes(final))).namelist() == ["secret.txt"]
+    with pytest.raises(_Unscannable):
+        credential_in_file(written)
+
+
+def test_a_java_keystore_holding_a_private_key_is_detected(tmp_path):
+    """`keytool -genkeypair -storetype JKS` writes a format no other check here understands.
+
+    Not PEM, not DER, not a container -- so a store holding a complete private key returned None,
+    and `.jks` is not in the filename exclusions either. A store of only trusted certificates
+    carries no secret and must still publish.
+    """
+    import os
+    import struct
+
+    from flash.env_secrets import credential_in_file
+
+    def keystore(tag: int) -> bytes:
+        alias = b"mykey"
+        entry = struct.pack(">I", tag) + struct.pack(">H", len(alias)) + alias
+        entry += struct.pack(">Q", 1700000000000)
+        entry += struct.pack(">I", 1200) + os.urandom(1200)
+        return b"\xfe\xed\xfe\xed" + struct.pack(">II", 2, 1) + entry
+
+    private = tmp_path / "keystore.jks"
+    private.write_bytes(keystore(1))
+    assert credential_in_file(private) == "a private key"
+
+    trusted = tmp_path / "truststore.jks"
+    trusted.write_bytes(keystore(2))
+    assert credential_in_file(trusted) is None
+
+
+def test_a_short_archive_magic_is_decisive_only_at_the_start(tmp_path):
+    """A 4-byte magic is not distinctive enough to refuse a file over, at an arbitrary offset.
+
+    Searching every signature across the whole stream refused an ordinary model shard that happened
+    to contain four bytes; the 6-to-8-byte signatures of the formats that actually ship
+    self-extracting archives stay searched, because those are the ones a stub can hide.
+    """
+    import os
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    for name, magic in (
+        ("zstd", b"\x28\xb5\x2f\xfd"),
+        ("lz4", b"\x04\x22\x4d\x18"),
+        ("lz4legacy", b"\x02\x21\x4c\x18"),
+        ("7z", b"7z\xbc\xaf\x27\x1c"),
+        ("rar", b"Rar!\x1a\x07\x01\x00"),
+    ):
+        at_start = tmp_path / f"{name}.bin"
+        at_start.write_bytes(magic + os.urandom(4096))
+        with pytest.raises(_Unscannable):
+            credential_in_file(at_start)
+
+    # embedded in a shard: the short magics are not decisive, the long ones still are
+    for name, magic, refuses in (
+        ("zstd", b"\x28\xb5\x2f\xfd", False),
+        ("lz4", b"\x04\x22\x4d\x18", False),
+        ("7z", b"7z\xbc\xaf\x27\x1c", True),
+        ("rar", b"Rar!\x1a\x07\x01\x00", True),
+    ):
+        shard = tmp_path / f"shard_{name}.bin"
+        shard.write_bytes(os.urandom(8192) + magic + os.urandom(8192))
+        if refuses:
+            with pytest.raises(_Unscannable):
+                credential_in_file(shard)
+        else:
+            assert credential_in_file(shard) is None, name

@@ -112,7 +112,12 @@ SHORTEST_TOKEN_BYTES = 15
 # body then failed to match, and the key published. Both orders are named because a writer that
 # emits an explicit indentation indicator -- which is what ruamel and several Helm chart
 # generators do when the first body line is itself indented -- naturally puts the digit first.
-_BLOCK_SCALAR = rb"(?:[|>](?:[+-][0-9]?|[0-9][+-]?)?\s*)?"
+#
+# A trailing COMMENT is allowed after the indicators. YAML permits `KEY: | # generated`, which is
+# what templating tools annotate injected values with, and stopping at the `#` left the body
+# unmatched so the key published. Only the remainder of the header LINE is consumed -- the body
+# begins on the next one -- so this cannot swallow a value that follows on the same line.
+_BLOCK_SCALAR = rb"(?:[|>](?:[+-][0-9]?|[0-9][+-]?)?[ \t]*(?:\#[^\r\n]*)?\s*)?"
 # The opening quote, if any. A single optional quote character consumed only ONE of the three in a
 # triple-quote delimiter, leaving a quote sitting where the body had to begin, so an ordinary
 # Python or TOML multiline assignment matched nothing and published. Whole delimiters are named,
@@ -178,11 +183,21 @@ _JWK_ESCAPED = {
     name: b"".join(rb"(?:%c|(?i:\\[uU]00%02x))" % (byte, byte) for byte in name)
     for name in (b"d", b"dp", b"dq", b"qi", b"k")
 }
+#
+# The VALUE admits escapes too, for the same reason the name does. A base64url scalar is all
+# ASCII, so any of its characters may legally be written `\u00XX` -- a Node-exported JWK whose `d`
+# begins `"\u0078..."` is the same key to `JSON.parse` and `createPrivateKey`, but a run of plain
+# base64 characters matched nothing and the whole private key published. Each position is either
+# one literal character or one six-character escape, and the LENGTH floor counts positions rather
+# than bytes, so escaping cannot shrink a value below it either.
+_JWK_VALUE_CHAR = rb"(?:[A-Za-z0-9+/\-_]|(?i:\\[uU]00[0-9a-f]{2}))"
 _JWK_PRIVATE = re.compile(
     rb"\"(?:"
     + b"|".join(_JWK_ESCAPED[name] for name in (b"dp", b"dq", b"qi", b"d", b"k"))
     # longest first: `d` would otherwise win against `dp` and leave the `p` outside the quote
-    + rb")\"\s*:\s*\"[A-Za-z0-9+/\-_]{20,}={0,2}\""
+    + rb")\"\s*:\s*\""
+    + _JWK_VALUE_CHAR
+    + rb"{20,}={0,2}\""
 )
 
 
@@ -238,12 +253,19 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
     # Those five keys are named exactly, for the same reason `Proc-Type:`/`DEK-Info:` are below. A
     # general `[A-Za-z-]+:` would also skip `Warning:` and `Note:`, which is prose about a key
     # rather than a key, and reopens the false positive the base64 requirement exists to close.
+    #
+    # The 32 body characters are counted ACROSS line breaks, not within one line. PEM does not fix
+    # a wrap width -- RFC 7468 recommends 64 but permits any -- and `openssl pkey -check` accepts a
+    # key rewrapped at 16 columns as valid. Requiring 32 contiguous characters meant such a key
+    # matched neither this pattern nor the 64/76-column wrapped-base64 joining, and a complete
+    # Ed25519 PKCS#8 private key published. Each character may be followed by a break, so the floor
+    # counts body characters however they are laid out.
     (
         "a private key block",
         re.compile(
             rb"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\r\n\s]*"
             rb"(?:(?:Version|Comment|MessageID|Hash|Charset):[^\r\n]*[\r\n\s]*)*"
-            rb"(?:[A-Za-z0-9+/=]{32,}|Proc-Type:|DEK-Info:)"
+            rb"(?:(?:[A-Za-z0-9+/=][ \t]*\r?\n?[ \t]*){32,}|Proc-Type:|DEK-Info:)"
         ),
     ),
     # PuTTY's own key format, which PuTTYgen writes and `pageant`/`plink` read. It is neither PEM
