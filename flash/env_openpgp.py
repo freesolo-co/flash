@@ -22,6 +22,26 @@ _MAX_OPENPGP_MARKERS = 8
 # already parsed as OpenPGP.
 _MAX_OPENPGP_PACKETS = 64
 
+# The largest body a packet may declare and still be walked as OpenPGP. Beyond it the header is read
+# as ordinary binary that happens to carry the shape of one, and the walk ends rather than reporting
+# the sequence undecided.
+#
+# Bit 7 alone is set on half of all random bytes, so the walk entered on ordinary binary, read what
+# followed as a body length -- averaging two gigabytes -- and reported "this packet runs past my
+# buffer". The caller turns that into a refusal, so 11.7% of megabyte chunks of ordinary binary were
+# refused when more data followed: a model shard or a padded archive member blocked over noise.
+#
+# 64 MiB is set against `_MAX_NESTED_BUFFER_BYTES`, the most this scan ever holds: a body larger than
+# that could not be examined even in principle, so calling it a packet boundary claims a precision
+# the scan does not have. Real key material is nowhere near it -- a measured RSA-4096
+# `gpg --export-secret-keys` declares at most 1,816 bytes -- and the margin leaves room for the large
+# legitimate packets a keyring carries, such as a photo user ID, without letting noise through.
+#
+# This cannot hide a key behind a huge packet: a real one that large would have to be READ to reach
+# whatever follows it, and nothing here can read it, so the honest statement about those bytes is
+# the one the literal scan already makes rather than a boundary invented from an unverifiable length.
+_MAX_OPENPGP_BODY_BYTES = 64 << 20
+
 # Yielded by the packet walk in place of a boundary when a packet's declared body runs past the
 # bytes in hand. A distinct object rather than a flag so the sequence test can tell "no secret key
 # in this sequence" from "the sequence continues somewhere this never read", which are the same
@@ -301,6 +321,8 @@ def _openpgp_packet_starts(head: bytes) -> Iterator[bytes]:
             return
         body = _openpgp_body_length(head, offset)
         if body is None or body <= 0:
+            return
+        if body > _MAX_OPENPGP_BODY_BYTES:
             return
         if offset + body > len(head):
             # The packet declares more body than is here. On a whole file that means a truncated or
