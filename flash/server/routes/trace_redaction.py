@@ -130,6 +130,20 @@ _JSON_SCHEMA_VALUE_KEYWORDS = frozenset(
     }
 )
 _JSON_SCHEMA_WRAPPER_KEYS = frozenset({"schema", "parameters", "input_schema", "output_schema"})
+# containers that genuinely declare schemas. a wrapper key is honoured only beneath one of these,
+# so ordinary request metadata that happens to be shaped like a schema cannot claim the exemption.
+_SCHEMA_HOST_KEYS = frozenset(
+    {
+        "tools",
+        "functions",
+        "tool_choice",
+        "function_call",
+        "function",
+        "response_format",
+        "json_schema",
+        "text_format",
+    }
+)
 _JSON_SCHEMA_TYPES = frozenset(
     {"null", "boolean", "object", "array", "number", "string", "integer"}
 )
@@ -657,6 +671,21 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
     return refs
 
 
+def _redact_tool_result_content(value: str, *, depth: int, flag: _SanitizationFlag | None) -> str:
+    """Redact a tool message's `content`, which carries the tool's output rather than prose."""
+    try:
+        parsed = json.loads(value)
+    except (ValueError, RecursionError):
+        # unlike function arguments, a tool result is not required to be json: prose is the
+        # ordinary case. a parse failure here means "this was never structured", so the text is
+        # kept as-is rather than blanked -- blanking would destroy legitimate tool output.
+        return value
+    if not isinstance(parsed, dict | list):
+        return value
+    redacted = _redact_secret_fields(parsed, depth=depth + 1, flag=flag)
+    return json.dumps(redacted, separators=(",", ":"))
+
+
 def _redact_secret_fields(
     value: Any,
     *,
@@ -672,7 +701,10 @@ def _redact_secret_fields(
     logprobs: bool = False,
     logprob_entries: bool = False,
     function_arguments: bool = False,
+    tool_result_content: bool = False,
+    message_list: bool = False,
     function_container: bool = False,
+    schema_host: bool = False,
     schema_wrapper: bool = False,
     tool_call_list: bool = False,
     tool_call: bool = False,
@@ -716,8 +748,15 @@ def _redact_secret_fields(
                     or schema_property_map
                     or key in _JSON_SCHEMA_KEYWORDS
                 )
+                # a wrapper key only grants the schema exemption inside a container that actually
+                # declares schemas. `{"parameters": {"type": "object", "properties": {...}}}` is a
+                # perfectly ordinary metadata shape, and honouring the wrapper anywhere let it claim
+                # the exemption: its secret-named property kept an unknown `value` verbatim, so a
+                # third-party credential that is not in `context.secrets` reached the raw export.
                 wrapper_has_schema = (
-                    key in _JSON_SCHEMA_WRAPPER_KEYS and _has_schema_wrapper_evidence(item)
+                    schema_host
+                    and key in _JSON_SCHEMA_WRAPPER_KEYS
+                    and _has_schema_wrapper_evidence(item)
                 )
                 if wrapper_has_schema:
                     child_schema_context = True
@@ -738,9 +777,18 @@ def _redact_secret_fields(
                     logprob_entries=logprob_entries
                     or (logprobs and key in {"content", "refusal", "top_logprobs"}),
                     function_arguments=function_container and key == "arguments",
+                    # a tool message's `content` carries the tool's OUTPUT, and tools routinely
+                    # return serialized json there. treating it as an opaque scalar preserved
+                    # `{"password": "..."}` verbatim, so a third-party credential a tool returned --
+                    # never in `context.secrets` -- reached the raw export intact.
+                    tool_result_content=(
+                        key == "content" and value.get("role") in {"tool", "function"}
+                    ),
+                    message_list=key == "messages" and isinstance(item, list),
                     function_container=(
                         key == "function_call" or (tool_call and key == "function")
                     ),
+                    schema_host=schema_host or key in _SCHEMA_HOST_KEYS,
                     schema_wrapper=schema_wrapper
                     or wrapper_has_schema
                     or (schema_context and _is_schema_map_keyword(key, item)),
@@ -765,6 +813,7 @@ def _redact_secret_fields(
                 choice=choice_list,
                 logprobs=logprobs,
                 logprob_entries=logprob_entries,
+                schema_host=schema_host,
                 tool_call=tool_call_list,
                 schema_wrapper=schema_wrapper,
                 secret_schema_refs=secret_schema_refs,
@@ -773,6 +822,8 @@ def _redact_secret_fields(
             )
             for index, item in enumerate(value)
         ]
+    if tool_result_content and isinstance(value, str):
+        return _redact_tool_result_content(value, depth=depth, flag=flag)
     if function_arguments and isinstance(value, str):
         try:
             parsed = json.loads(value)

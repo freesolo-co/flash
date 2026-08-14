@@ -672,7 +672,14 @@ class SseAccumulator:
             # explicit null is the ordinary provider spelling for "no fragment", just like absence.
             # only a present non-null value of the wrong type can have silently lost response data.
             if choice.get("finish_reason") is not None and self._reserve(choice["finish_reason"]):
-                state["finish_reason"] = choice["finish_reason"]
+                previous = state["finish_reason"]
+                if previous is None:
+                    state["finish_reason"] = choice["finish_reason"]
+                elif previous != choice["finish_reason"]:
+                    # the FIRST terminal reason is the true one. overwriting it turned a stream that
+                    # reported `length` with partial content and then `stop` into a clean stopped
+                    # reply, so `records` exported truncated text as a completed training target.
+                    self._note_defect("stream choice reported conflicting finish reasons")
 
     def _consume_delta(self, state: dict[str, Any], delta: dict[str, Any]) -> None:
         if self.truncated:
@@ -723,6 +730,10 @@ class SseAccumulator:
                 self._note_defect("stream tool_calls was not a list")
             return
         accumulated_calls: dict[int, dict[str, Any]] = state["tool_calls"]
+        # repeating an index across successive events is how streaming assembles one call, but
+        # repeating it inside ONE array means two distinct calls collided: merging them produced a
+        # single invocation named `onetwo` with arguments `AB`, recorded OK and exported as real.
+        seen_indices: set[int] = set()
         for position, tool_call in enumerate(tool_calls):
             if not isinstance(tool_call, dict):
                 # `tool_calls: null` means no invocation, but a null or scalar SLOT inside an
@@ -737,6 +748,10 @@ class SseAccumulator:
                 continue
             else:
                 index = raw_index
+            if index in seen_indices:
+                self._note_defect("stream tool_calls repeated an index within one delta")
+                continue
+            seen_indices.add(index)
             tool_call_entry_bytes = max(64, self._value_size(index) + 12)
             if index not in accumulated_calls and not self._reserve(b"x" * tool_call_entry_bytes):
                 return

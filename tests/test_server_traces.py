@@ -4093,25 +4093,34 @@ def test_bare_properties_with_custom_vocabulary_remains_instance_data() -> None:
     "wrapper",
     ["schema", "parameters", "input_schema", "output_schema"],
 )
-def test_schema_wrapper_names_require_real_schema_evidence(wrapper: str) -> None:
+def test_schema_wrapper_names_require_a_schema_bearing_container(wrapper: str) -> None:
+    """A wrapper name is schema evidence only beneath a container that declares schemas.
+
+    A coherent `type`/`properties` pair is not enough on its own: ordinary request metadata is
+    routinely shaped that way, and honouring the wrapper anywhere let such metadata claim the
+    exemption and keep an unknown literal beside a secret-named property verbatim.
+    """
     instance = {wrapper: {"properties": {"password": {"type": "text", "value": "SECRET"}}}}
-    schema = {
+    bare_schema_shape = {
         wrapper: {
             "type": "object",
             "properties": {
-                "password": {
-                    "type": "string",
-                    "vendorKeyword": True,
-                    "default": "SECRET",
-                }
+                "password": {"type": "string", "vendorKeyword": True, "default": "SECRET"}
             },
         }
     }
+    hosted = {"tools": [{"type": "function", "function": {"name": "f", **bare_schema_shape}}]}
 
     assert traces._redact_secret_fields(instance)[wrapper]["properties"]["password"] == (
         "[redacted]"
     )
-    assert traces._redact_secret_fields(schema)[wrapper]["properties"]["password"] == {
+    # no schema-bearing host, so the wrapper earns nothing and the property redacts wholesale.
+    assert traces._redact_secret_fields(bare_schema_shape)[wrapper]["properties"]["password"] == (
+        "[redacted]"
+    )
+    # the same bytes beneath a real tool container keep their schema structure, literal redacted.
+    hosted_function = traces._redact_secret_fields(hosted)["tools"][0]["function"]
+    assert hosted_function[wrapper]["properties"]["password"] == {
         "type": "string",
         "vendorKeyword": True,
         "default": "[redacted]",
@@ -4247,6 +4256,93 @@ def test_deeply_nested_fragment_is_bounded_instead_of_recursing() -> None:
     # the helper reports truncation directly, and an ordinary fragment is unaffected
     assert trace_sse._merge_fragment_dict({}, json.loads(deep_json(500))) is False
     assert trace_sse._merge_fragment_dict({}, json.loads(deep_json(3))) is True
+
+
+def test_first_terminal_finish_reason_survives_a_later_one() -> None:
+    """The FIRST terminal reason is the true one.
+
+    A stream that reports `length` with partial content and later `stop` was stored as a clean
+    stopped reply, so `records` exported the truncated text as a completed training target.
+    """
+    conflicting = trace_sse.SseAccumulator()
+    conflicting.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":"length"}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    conflicting.finish()
+
+    assert conflicting.defect == "stream choice reported conflicting finish reasons"
+    assert conflicting.output()["choices"][0]["finish_reason"] == "length"
+
+    # repeating the SAME reason is how providers restate a terminal state, not a conflict
+    repeated = trace_sse.SseAccumulator()
+    repeated.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":"stop"}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    repeated.finish()
+
+    assert repeated.defect is None
+    assert repeated.output()["choices"][0]["finish_reason"] == "stop"
+
+
+def test_tool_call_index_repeated_within_one_delta_is_malformed() -> None:
+    """Two entries sharing an index inside ONE array are colliding calls, not a fragment pair.
+
+    Merging them produced a single invocation named `onetwo` with arguments `AB`, recorded OK.
+    Repeating an index across SUCCESSIVE events is the ordinary way a call is streamed.
+    """
+    collided = trace_sse.SseAccumulator()
+    collided.feed(
+        b'data: {"choices":[{"index":0,"delta":{"tool_calls":['
+        b'{"index":0,"function":{"name":"one","arguments":"A"}},'
+        b'{"index":0,"function":{"name":"two","arguments":"B"}}]}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    collided.finish()
+
+    assert collided.defect == "stream tool_calls repeated an index within one delta"
+    calls = collided.output()["choices"][0]["message"]["tool_calls"]
+    assert calls[0]["function"] == {"name": "one", "arguments": "A"}
+
+    streamed = trace_sse.SseAccumulator()
+    streamed.feed(
+        b'data: {"choices":[{"index":0,"delta":{"tool_calls":'
+        b'[{"index":0,"function":{"name":"get","arguments":"{\\"a\\""}}]}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{"tool_calls":'
+        b'[{"index":0,"function":{"arguments":":1}"}}]}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    streamed.finish()
+
+    assert streamed.defect is None
+    streamed_call = streamed.output()["choices"][0]["message"]["tool_calls"][0]
+    assert streamed_call["function"] == {"name": "get", "arguments": '{"a":1}'}
+
+
+def test_tool_message_json_content_is_redacted() -> None:
+    """A tool message's `content` is the tool's OUTPUT, and tools routinely return serialized json.
+
+    Treating it as an opaque scalar preserved `{"password": ...}` verbatim, so a credential a tool
+    returned -- never part of `context.secrets` -- reached the raw export intact.
+    """
+    payload = {
+        "messages": [
+            {"role": "tool", "tool_call_id": "c1", "content": '{"password":"HUNTER2"}'},
+            {"role": "user", "content": '{"password":"HUNTER2"}'},
+            {"role": "tool", "content": "the weather in paris is sunny"},
+        ]
+    }
+
+    redacted = traces._redact_secret_fields(payload)["messages"]
+
+    assert json.loads(redacted[0]["content"]) == {"password": "[redacted]"}
+    # a user turn quoting json is ordinary prose the caller wrote, not tool output
+    assert redacted[1]["content"] == '{"password":"HUNTER2"}'
+    # a tool result is not required to be json, so unparseable text survives rather than blanking
+    assert redacted[2]["content"] == "the weather in paris is sunny"
 
 
 def test_recursive_ref_reaches_an_outer_recursive_anchor() -> None:
