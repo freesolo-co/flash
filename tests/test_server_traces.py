@@ -8269,3 +8269,173 @@ def test_a_repeated_complete_message_is_not_a_fragment() -> None:
 
     assert single.defect is None
     assert single.output()["choices"][0]["message"]["content"] == "hello"
+
+
+def test_a_tools_entry_must_itself_be_a_tool_definition() -> None:
+    """The array SHAPE alone is not the declaration -- each entry must be a tool definition too.
+    `{"tools": [{"parameters": {...}}]}` passed the outer check, so the exemption propagated into
+    a bare `parameters` object and an unknown `value` beside a secret property survived verbatim."""
+    bare_wrapper = {
+        "tools": [
+            {
+                "parameters": {
+                    "type": "object",
+                    "properties": {"api_key": {"type": "string", "value": "ENTRYLEAK"}},
+                }
+            }
+        ]
+    }
+
+    assert "ENTRYLEAK" not in json.dumps(traces._redact_secret_fields(bare_wrapper))
+
+    # both real spellings still open a host: the nested `function` form and the flat name+schema one
+    nested = traces._redact_secret_fields(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"api_key": {"type": "string", "description": "key"}},
+                        },
+                    },
+                }
+            ]
+        }
+    )
+    flat = traces._redact_secret_fields(
+        {
+            "tools": [
+                {
+                    "name": "lookup",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"api_key": {"type": "string", "description": "key"}},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert nested["tools"][0]["function"]["parameters"]["properties"]["api_key"] == {
+        "type": "string",
+        "description": "key",
+    }
+    assert flat["tools"][0]["input_schema"]["properties"]["api_key"] == {
+        "type": "string",
+        "description": "key",
+    }
+
+
+def test_a_draft_04_id_anchor_resolves_like_a_modern_one() -> None:
+    """Draft-04 spells both resource ids and plain-name anchors with `id`. Reading only `$id` and
+    `$anchor` left `{"id": "#cred"}` unresolvable, so a `$ref: "#cred"` target reached from a secret
+    property was never marked secret and its `default` credential stayed in the raw export."""
+    legacy_anchor = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"api_key": {"$ref": "#cred"}},
+                        "definitions": {
+                            "Cred": {"id": "#cred", "type": "string", "default": "LEGACYANCHOR"}
+                        },
+                    },
+                },
+            }
+        ]
+    }
+    legacy_resource = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "id": "https://schemas.example.com/tool.json",
+                        "type": "object",
+                        "properties": {
+                            "api_key": {
+                                "$ref": "https://schemas.example.com/tool.json#/definitions/Cred"
+                            }
+                        },
+                        "definitions": {"Cred": {"type": "string", "default": "LEGACYRESOURCE"}},
+                    },
+                },
+            }
+        ]
+    }
+
+    assert "LEGACYANCHOR" not in json.dumps(traces._redact_secret_fields(legacy_anchor))
+    assert "LEGACYRESOURCE" not in json.dumps(traces._redact_secret_fields(legacy_resource))
+
+    # an ordinary `id` PROPERTY is instance vocabulary, not a resource identifier, and stays put
+    ordinary = traces._redact_secret_fields(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"id": {"type": "string", "default": "user-42"}},
+                        },
+                    },
+                }
+            ]
+        }
+    )
+
+    assert (
+        ordinary["tools"][0]["function"]["parameters"]["properties"]["id"]["default"] == "user-42"
+    )
+
+
+def test_a_secret_pattern_property_follows_its_references() -> None:
+    """`patternProperties` declares secret-named fields exactly like `properties` does. The ref
+    COLLECTOR walked only `properties`, so `{"^secret_": {"$ref": "#/$defs/Cred"}}` never marked
+    its target and the shared definition's `default` credential survived in the raw export."""
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "patternProperties": {"^secret_": {"$ref": "#/$defs/Cred"}},
+                        "$defs": {"Cred": {"type": "string", "default": "PATTERNLEAK"}},
+                    },
+                },
+            }
+        ]
+    }
+
+    assert "PATTERNLEAK" not in json.dumps(traces._redact_secret_fields(payload))
+
+    # a non-secret pattern's target is an ordinary declaration and keeps its default
+    ordinary = traces._redact_secret_fields(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "patternProperties": {"^item_": {"$ref": "#/$defs/Item"}},
+                            "$defs": {"Item": {"type": "string", "default": "widget"}},
+                        },
+                    },
+                }
+            ]
+        }
+    )
+
+    assert ordinary["tools"][0]["function"]["parameters"]["$defs"]["Item"]["default"] == "widget"

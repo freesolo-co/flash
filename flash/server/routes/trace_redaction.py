@@ -360,6 +360,23 @@ def _local_schema_pointer(
     return frozenset()
 
 
+def _schema_resource_id(node: dict[Any, Any]) -> str | None:
+    """The resource identifier a schema node declares, in either the modern or draft-04 spelling.
+
+    Draft-04 spells it `id`. Recognizing only `$id` left a legacy definition's resource unknown, so
+    a `$ref` to it resolved nowhere, the target was never marked secret, and its `default` stayed
+    verbatim in the raw export. A bare `#fragment` id is the draft-04 plain-name anchor form and is
+    handled by the anchor collector instead, so it is not a resource here.
+    """
+    resource_id = node.get("$id")
+    if isinstance(resource_id, str):
+        return resource_id
+    legacy_id = node.get("id")
+    if isinstance(legacy_id, str) and not legacy_id.startswith("#"):
+        return legacy_id
+    return None
+
+
 def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[str, ...]]:
     resources: dict[str, tuple[str, ...]] = {}
 
@@ -367,7 +384,7 @@ def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[
         if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
             return
         if isinstance(node, dict):
-            resource_id = node.get("$id")
+            resource_id = _schema_resource_id(node)
             if isinstance(resource_id, str):
                 base_uri = _safe_urljoin(base_uri, resource_id)
                 resources.setdefault(_canonical_resource_uri(_safe_urldefrag(base_uri)[0]), path)
@@ -394,6 +411,11 @@ def _schema_anchor_pointers(value: Any, *, depth: int = 0) -> dict[str, frozense
                 anchor = node.get(keyword)
                 if isinstance(anchor, str):
                     anchors.setdefault(anchor, set()).add(path)
+            # draft-04 spells a plain-name anchor as `id: "#name"`. without it a `$ref: "#cred"`
+            # resolved to nothing and the legacy target kept its secret literal.
+            legacy_id = node.get("id")
+            if isinstance(legacy_id, str) and legacy_id.startswith("#") and len(legacy_id) > 1:
+                anchors.setdefault(legacy_id[1:], set()).add(path)
             if node.get("$recursiveAnchor") is True:
                 anchors.setdefault("", set()).add(path)
             for key, item in node.items():
@@ -443,7 +465,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
     if not isinstance(value, dict):
         return set()
     refs: set[tuple[str, ...]] = set()
-    document_id = value.get("$id")
+    document_id = _schema_resource_id(value) if isinstance(value, dict) else None
     base_uri = document_id if isinstance(document_id, str) else ""
     resources = _schema_resource_pointers(value, depth=depth)
     resources.setdefault(_canonical_resource_uri(_safe_urldefrag(base_uri)[0]), ())
@@ -474,7 +496,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
             return set()
         found: set[tuple[str, ...]] = set()
         if isinstance(node, dict):
-            resource_id = node.get("$id")
+            resource_id = _schema_resource_id(node)
             if isinstance(resource_id, str):
                 scope_uri = _safe_urljoin(scope_uri, resource_id)
             for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
@@ -539,18 +561,23 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
         if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
             return
         if isinstance(node, dict):
-            resource_id = node.get("$id")
+            resource_id = _schema_resource_id(node)
             if isinstance(resource_id, str):
                 scope_uri = _safe_urljoin(scope_uri, resource_id)
-            properties = node.get("properties")
-            if isinstance(properties, dict):
-                for key, schema in properties.items():
-                    schema_path = (*path, "properties", str(key))
+            # `patternProperties` declares secret-looking members too: `{"^secret_": {...}}` marks
+            # every matching property secret. scanning only `properties` left a reference from such
+            # an entry uncollected, so its target definition kept its credential-bearing literal.
+            for map_keyword in ("properties", "patternProperties"):
+                property_map = node.get(map_keyword)
+                if not isinstance(property_map, dict):
+                    continue
+                for key, schema in property_map.items():
+                    schema_path = (*path, map_keyword, str(key))
                     if _is_secret_key(key) and _is_schema_definition(schema):
                         refs.update(collect_refs(schema, 0, schema_path, scope_uri))
                     collect_secret_properties(schema, node_depth + 1, schema_path, scope_uri)
             for key, item in node.items():
-                if key != "properties":
+                if key not in {"properties", "patternProperties"}:
                     collect_secret_properties(item, node_depth + 1, (*path, str(key)), scope_uri)
         elif isinstance(node, list | tuple):
             for index, item in enumerate(node):
@@ -685,6 +712,7 @@ def _redact_secret_fields(
     function_container: bool = False,
     schema_host: bool = False,
     schema_wrapper: bool = False,
+    tool_definition_list: bool = False,
     tool_call_list: bool = False,
     tool_call: bool = False,
     secret_schema_refs: set[tuple[str, ...]] | None = None,
@@ -771,6 +799,12 @@ def _redact_secret_fields(
                     # of either name is ordinary data rather than a declaration.
                     schema_host=schema_host
                     or (payload_root and _opens_root_schema_host(key, item)),
+                    # `tools`/`functions` hold tool DEFINITIONS; their entries must each qualify.
+                    tool_definition_list=(
+                        payload_root
+                        and key in _ARRAY_SHAPED_ROOT_HOST_KEYS
+                        and isinstance(item, list)
+                    ),
                     schema_wrapper=schema_wrapper
                     or wrapper_has_schema
                     or (schema_context and _is_schema_map_keyword(key, item)),
@@ -793,6 +827,7 @@ def _redact_secret_fields(
             logprob_entries=logprob_entries,
             tool_result_content=tool_result_content,
             schema_host=schema_host,
+            tool_definition_list=tool_definition_list,
             tool_call_list=tool_call_list,
             schema_wrapper=schema_wrapper,
             secret_schema_refs=secret_schema_refs,
@@ -805,6 +840,23 @@ def _redact_secret_fields(
         tool_result_content=tool_result_content,
         function_arguments=function_arguments,
         flag=flag,
+    )
+
+
+def _is_tool_definition(item: Any) -> bool:
+    """Whether an entry of a `tools`/`functions` array is really a tool definition.
+
+    The array shape alone is not the declaration: `{"tools": [{"parameters": {...}}]}` has the right
+    container but an entry no provider would accept, and honouring it let the nested wrapper keep a
+    secret property's literal. A real entry either wraps its declaration in `function`, or names the
+    tool directly alongside its schema (Anthropic's `input_schema`, the legacy `functions` form).
+    """
+    if not isinstance(item, dict):
+        return False
+    if isinstance(item.get("function"), dict):
+        return True
+    return isinstance(item.get("name"), str) and any(
+        isinstance(item.get(wrapper), dict) for wrapper in _JSON_SCHEMA_WRAPPER_KEYS
     )
 
 
@@ -821,6 +873,7 @@ def _redact_secret_sequence(
     logprob_entries: bool,
     tool_result_content: bool,
     schema_host: bool,
+    tool_definition_list: bool,
     tool_call_list: bool,
     schema_wrapper: bool,
     secret_schema_refs: set[tuple[str, ...]] | None,
@@ -847,7 +900,9 @@ def _redact_secret_sequence(
             # tool's output then sits in each part's `text`. dropping the flag at the list hop
             # left a serialized credential in a part verbatim.
             tool_result_content=tool_result_content,
-            schema_host=schema_host,
+            # inside a declaration array the host survives only for entries that really are tool
+            # definitions; a fake entry beside a real one gets no exemption of its own.
+            schema_host=schema_host and (not tool_definition_list or _is_tool_definition(item)),
             tool_call=tool_call_list,
             schema_wrapper=schema_wrapper,
             secret_schema_refs=secret_schema_refs,
