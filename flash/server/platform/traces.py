@@ -500,6 +500,13 @@ def _chat_reply(payload: Any) -> str | None:
         # audio is part of the assistant action. exporting only its text sibling would train a target
         # that differs from the multimodal response the caller received, including malformed payloads.
         return None
+    images = message.get("images")
+    if images is not None and (not isinstance(images, list) or images):
+        # generated images are the same case as audio: an image-generation reply carries its text in
+        # `content` and its assets here, so exporting the text alone trains toward a target the
+        # caller never received. an EMPTY list carries no image and is the ordinary shape providers
+        # send on a text-only reply, so it is accepted; a wrong-typed container is malformed.
+        return None
     if message.get("function_call") is not None:
         # a training target must contain the whole assistant action. exporting only the accompanying
         # text would silently discard the invocation, so skipping the row is the only faithful choice.

@@ -418,7 +418,12 @@ async def _stream_response(
                         output_payload=output_payload,
                         error=error,
                         output_truncated=(
-                            raw_output_truncated if raw_body else accumulator.truncated
+                            raw_output_truncated
+                            if raw_body
+                            # an over-wide collection trimmed during accumulation is a truncated
+                            # payload as much as one trimmed at the storage boundary, and the span
+                            # must say so either way.
+                            else accumulator.truncated or accumulator.collections_bounded
                         ),
                         usage=None if raw_body else accumulator.usage,
                     )

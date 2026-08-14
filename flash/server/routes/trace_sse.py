@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from typing import Any
 
-from flash.server.platform import traces as platform_traces
+from flash.server.routes.trace_fragments import (
+    _MAX_ENTRY_SLOTS,
+    _TOO_DEEP_DEFECT,
+    _append_fragment,
+    _bound_collections,
+    _carries_response,
+    _materialize_fragments,
+    _merge_fragment_dict,
+    _restates_call_identity,
+    _StringFragments,
+)
 
 _POST_DONE_SUFFIX_LIMIT = 1024
 _UTF8_BOM = b"\xef\xbb\xbf"
@@ -241,9 +250,6 @@ def _sse_data_value(line: bytes) -> bytes:
 # how many pieces a `_StringFragments` holds before compacting them into one. 256 keeps retention
 # to a few hundred objects for any reply length while copying each byte about twice on average, so
 # neither the memory nor the ingestion cost grows with the number of deltas.
-_FRAGMENT_COMPACT_THRESHOLD = 256
-
-
 def _is_padded_done_value(data: bytes) -> bool:
     return data != b"[DONE]" and data.strip(b" \t") == b"[DONE]"
 
@@ -255,207 +261,6 @@ def _could_be_done_line(line: bytes) -> bool:
     if not line.startswith(prefix):
         return False
     return b"[DONE]".startswith(_sse_data_value(line))
-
-
-class _StringFragments:
-    """Streamed text held as pieces, so the reply is assembled once rather than on every delta.
-
-    Joining on each append is quadratic in the reply length, so the pieces are retained. But
-    retaining one object per delta has its own cost the byte budget cannot see: a one-character
-    token is a few bytes of text carried by roughly fifty bytes of interpreter overhead plus a list
-    slot, so a reply streamed token by token held an order of magnitude more memory than the budget
-    that admitted it.
-
-    Pieces are therefore compacted in two levels. At most `_FRAGMENT_COMPACT_THRESHOLD` pieces are
-    pending at a time; when that many have arrived they become one block, and the block list is
-    compacted the same way. Retention stays bounded at roughly twice the threshold while each byte
-    is copied a constant number of times on average, so ingestion is still linear.
-    """
-
-    def __init__(self, value: str) -> None:
-        self._blocks: list[str] = []
-        self._pending: list[str] = [value] if value else []
-
-    @property
-    def parts(self) -> list[str]:
-        """The retained pieces, in order. Their concatenation is the accumulated text."""
-        return [*self._blocks, *self._pending]
-
-    def append(self, value: str) -> None:
-        if not value:
-            return
-        self._pending.append(value)
-        if len(self._pending) < _FRAGMENT_COMPACT_THRESHOLD:
-            return
-        self._blocks.append("".join(self._pending))
-        self._pending.clear()
-        if len(self._blocks) >= _FRAGMENT_COMPACT_THRESHOLD:
-            self._blocks = ["".join(self._blocks)]
-
-    def text(self) -> str:
-        return "".join(self.parts)
-
-
-def _utf8_safe_text(value: str) -> str:
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        return value.encode("utf-16", errors="surrogatepass").decode("utf-16", errors="replace")
-    return value
-
-
-def _materialize_fragments(
-    value: Any,
-    *,
-    depth: int = 0,
-    note_defect: Callable[[str], None] | None = None,
-) -> Any:
-    if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-        if note_defect is not None:
-            note_defect("stream output exceeded the maximum nesting depth")
-        return "[redacted]"
-    if isinstance(value, _StringFragments):
-        value = value.text()
-    if isinstance(value, str):
-        return _utf8_safe_text(value)
-    if isinstance(value, dict):
-        return {
-            _utf8_safe_text(key) if isinstance(key, str) else key: _materialize_fragments(
-                item, depth=depth + 1, note_defect=note_defect
-            )
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [
-            _materialize_fragments(item, depth=depth + 1, note_defect=note_defect) for item in value
-        ]
-    return value
-
-
-def _content_parts(value: Any) -> list[Any]:
-    if isinstance(value, list):
-        return list(value)
-    if isinstance(value, _StringFragments):
-        value = value.text()
-    if isinstance(value, str):
-        return [{"type": "text", "text": value}] if value else []
-    return [value]
-
-
-def _carries_response(fragment: dict[str, Any]) -> bool:
-    """Whether a message or delta actually carries reply data.
-
-    `role` alone restates what the choice already established, and an explicit null is the ordinary
-    provider spelling for "no fragment", so neither makes a trailing event a continuation.
-    """
-    return any(key != "role" and value is not None for key, value in fragment.items())
-
-
-def _append_fragment(target: dict[str, Any], key: str, value: Any) -> None:
-    current = target.get(key)
-    if isinstance(value, str):
-        if isinstance(current, _StringFragments):
-            current.append(value)
-        elif isinstance(current, str):
-            target[key] = _StringFragments(current)
-            target[key].append(value)
-        elif isinstance(current, list):
-            current.extend(_content_parts(value))
-        else:
-            target[key] = _StringFragments(value)
-    elif isinstance(value, list):
-        if isinstance(current, list):
-            current.extend(value)
-        elif isinstance(current, str | _StringFragments):
-            target[key] = [*_content_parts(current), *value]
-        else:
-            target[key] = list(value)
-    elif value is not None:
-        target[key] = value
-
-
-_TOO_DEEP_DEFECT = "stream fragment exceeded the payload depth bound"
-
-_IDENTITY_KEYS = frozenset({"id", "type"})
-
-# a choice or tool-call slot retains a nest of dicts (message, tool_calls, logprobs, extensions)
-# whose ~700 bytes are the structure itself, not the index that named it. the byte budget charged
-# only the index, so 100k empty `{"index":N,"delta":{}}` entries -- ~70 MB of retained state -- sat
-# inside an 8 MiB budget. slots are bounded by COUNT rather than folded into the byte budget: the
-# budget is also what a small deployment lowers to cap recorded text, and charging structure
-# against it made the first choice of a 256-byte stream unrecordable. a provider's `n` and its
-# parallel tool calls are small; this is the runaway bound, not a working limit.
-_MAX_ENTRY_SLOTS = 4096
-
-
-def _restates_call_identity(fragment: dict[str, Any]) -> bool:
-    """Whether a tool-call delta re-announces WHICH call it is, rather than continuing one.
-
-    A provider streaming a long function name sends the name alone; a delta that repeats the call
-    header is describing a call in full, so a second such header is a different call.
-    """
-    return any(key in fragment for key in _IDENTITY_KEYS)
-
-
-def _merge_fragment_dict(
-    target: dict[str, Any],
-    fragment: dict[str, Any],
-    *,
-    depth: int = 0,
-    on_identity_conflict: Callable[[], None] | None = None,
-    restates_identity: bool = False,
-) -> bool:
-    """Merge a streamed fragment into `target`. Returns False if the depth bound truncated it.
-
-    Recording must never be able to take down the paid call it is observing. This runs on the
-    proxy's own task before each chunk is relayed, so unbounded recursion here would interrupt the
-    upstream response and withhold an otherwise relayable event from the caller.
-    """
-    if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-        return False
-    bounded = True
-    for key, value in fragment.items():
-        if isinstance(value, dict):
-            nested = target.setdefault(key, {})
-            if isinstance(nested, dict):
-                bounded &= _merge_fragment_dict(
-                    nested,
-                    value,
-                    depth=depth + 1,
-                    on_identity_conflict=on_identity_conflict,
-                    restates_identity=restates_identity,
-                )
-            else:
-                target[key] = dict(value)
-        elif isinstance(value, str):
-            current = target.get(key)
-            if key in _IDENTITY_KEYS or (key == "name" and restates_identity):
-                # identity, not text: `id` and `type` name WHICH call this is, so successive values
-                # are alternatives rather than halves. concatenating them stored the nonexistent
-                # call `call_Acall_B` with no defect, exportable as a real invocation. the first
-                # value wins and a conflicting later one is reported.
-                #
-                # `name` is BOTH: providers split one function name across deltas, so it can only be
-                # read as identity when the delta restates the call header -- a fragment continuing
-                # a name carries the name alone. without that distinction two complete headers named
-                # `lookup` then `delete` merged into the invented call `lookupdelete`.
-                current_text = current.text() if isinstance(current, _StringFragments) else current
-                if current_text is not None:
-                    if current_text != value and on_identity_conflict is not None:
-                        on_identity_conflict()
-                    continue
-            if isinstance(current, _StringFragments):
-                current.append(value)
-            elif isinstance(current, str):
-                target[key] = _StringFragments(current)
-                target[key].append(value)
-            else:
-                target[key] = _StringFragments(value)
-        elif isinstance(value, list):
-            _append_fragment(target, key, value)
-        elif value is not None:
-            target[key] = value
-    return bounded
 
 
 class SseAccumulator:
@@ -477,6 +282,11 @@ class SseAccumulator:
         self._scan_start = 0
         self._at_stream_start = True
         self.truncated = False
+        # whether an over-wide collection was trimmed on the way in. distinct from `truncated`,
+        # which stops recording: the reply is still complete, so it is reported as a truncated
+        # payload rather than an incomplete stream, and the caller folds it into the span's
+        # `payload_truncated` sides.
+        self.collections_bounded = False
         self.usage: Any = None
         # why this stream cannot be trusted as a complete reply, if anything went wrong in it. a
         # 200 SSE stream can still fail: an unparseable `data:` event drops a fragment out of the
@@ -550,6 +360,9 @@ class SseAccumulator:
         """Record the FIRST thing that went wrong; later ones are usually consequences of it."""
         if self.defect is None:
             self.defect = reason
+
+    def _note_collections_bounded(self) -> None:
+        self.collections_bounded = True
 
     def _value_size(self, value: Any) -> int:
         if isinstance(value, bytes):
@@ -746,6 +559,13 @@ class SseAccumulator:
         if not isinstance(payload, dict):
             self._note_defect("stream contained a non-object data event")
             return
+        # trimmed before anything below retains a reference. every retention path -- envelope
+        # extensions, per-choice extensions, delta values, tool-call fragments -- keeps the parsed
+        # object itself, and the byte budget charges serialized size, which is no bound at all on
+        # the expanded width of a compact mapping. doing it once here covers them all.
+        payload, bounded = _bound_collections(payload)
+        if bounded:
+            self.collections_bounded = True
         if payload.get("error") is not None:
             # providers report a mid-stream failure in-band, as a data event on a 200 response,
             # sometimes after real deltas have already arrived. the partial text is not a reply.
@@ -829,7 +649,9 @@ class SseAccumulator:
                 logprobs = choice["logprobs"]
                 if isinstance(logprobs, dict):
                     if self._reserve(logprobs) and not _merge_fragment_dict(
-                        state["logprobs"], logprobs
+                        state["logprobs"],
+                        logprobs,
+                        on_collection_bound=self._note_collections_bounded,
                     ):
                         self._note_defect(_TOO_DEEP_DEFECT)
                 elif logprobs is not None:
@@ -915,12 +737,16 @@ class SseAccumulator:
             if not self._reserve(value, retained_key=retained_key):
                 return
             if isinstance(value, dict) and isinstance(message.get(key), dict):
-                if not _merge_fragment_dict(message[key], value):
+                if not _merge_fragment_dict(
+                    message[key], value, on_collection_bound=self._note_collections_bounded
+                ):
                     self._note_defect(_TOO_DEEP_DEFECT)
             elif isinstance(value, str | list) or (
                 key in message and isinstance(message[key], str | _StringFragments)
             ):
-                _append_fragment(message, key, value)
+                _append_fragment(
+                    message, key, value, on_collection_bound=self._note_collections_bounded
+                )
             elif key not in message:
                 message[key] = value
         function_call = delta.get("function_call")
@@ -935,6 +761,7 @@ class SseAccumulator:
                     on_identity_conflict=lambda: self._note_defect(
                         "stream function_call reported a conflicting name"
                     ),
+                    on_collection_bound=self._note_collections_bounded,
                     # the legacy dialect carries at most one call per reply and sends its name whole
                     # in the opening delta, streaming only `arguments` afterwards. so a second name
                     # here is a different function rather than the tail of this one.
@@ -989,6 +816,7 @@ class SseAccumulator:
                 on_identity_conflict=lambda: self._note_defect(
                     "stream tool_call reported a conflicting identity"
                 ),
+                on_collection_bound=self._note_collections_bounded,
                 restates_identity=_restates_call_identity(fragment),
             ):
                 self._note_defect(_TOO_DEEP_DEFECT)

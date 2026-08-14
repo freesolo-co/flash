@@ -26,6 +26,7 @@ from flash.server.platform.traces import (
     store_trace,
 )
 from flash.server.routes import (
+    trace_fragments,
     trace_redaction,
     trace_secret_names,
     trace_sse,
@@ -1315,14 +1316,14 @@ def test_large_function_call_still_truncates_at_a_small_stream_budget() -> None:
 
 def test_fragment_accounting_does_not_materialize_arguments_per_delta(monkeypatch) -> None:
     text_calls = 0
-    original_text = trace_sse._StringFragments.text
+    original_text = trace_fragments._StringFragments.text
 
     def counted_text(fragments) -> str:
         nonlocal text_calls
         text_calls += 1
         return original_text(fragments)
 
-    monkeypatch.setattr(trace_sse._StringFragments, "text", counted_text)
+    monkeypatch.setattr(trace_fragments._StringFragments, "text", counted_text)
     accumulator = trace_sse.SseAccumulator(max_accumulated_bytes=100_000)
     event = (
         b'data: {"choices":[{"index":0,"delta":{"tool_calls":'
@@ -4275,8 +4276,8 @@ def test_deeply_nested_fragment_is_bounded_instead_of_recursing() -> None:
 
     assert accumulator.defect == "stream fragment exceeded the payload depth bound"
     # the helper reports truncation directly, and an ordinary fragment is unaffected
-    assert trace_sse._merge_fragment_dict({}, json.loads(deep_json(500))) is False
-    assert trace_sse._merge_fragment_dict({}, json.loads(deep_json(3))) is True
+    assert trace_fragments._merge_fragment_dict({}, json.loads(deep_json(500))) is False
+    assert trace_fragments._merge_fragment_dict({}, json.loads(deep_json(3))) is True
 
 
 def test_unparseable_structured_tool_result_is_redacted() -> None:
@@ -6355,8 +6356,8 @@ def test_many_stream_fragments_stay_unjoined_until_output() -> None:
         )
 
     content = accumulator._choices[0]["message"]["content"]
-    assert isinstance(content, trace_sse._StringFragments)
-    assert len(content.parts) <= 2 * trace_sse._FRAGMENT_COMPACT_THRESHOLD
+    assert isinstance(content, trace_fragments._StringFragments)
+    assert len(content.parts) <= 2 * trace_fragments._FRAGMENT_COMPACT_THRESHOLD
     assert "".join(content.parts) == fragment * 32_000
     assert accumulator.output()["choices"][0]["message"]["content"] == fragment * 32_000
 
@@ -9281,7 +9282,7 @@ def test_retained_stream_fragments_are_bounded_by_compaction() -> None:
     accumulator.finish()
 
     content = accumulator._choices[0]["message"]["content"]
-    assert len(content.parts) <= 2 * trace_sse._FRAGMENT_COMPACT_THRESHOLD
+    assert len(content.parts) <= 2 * trace_fragments._FRAGMENT_COMPACT_THRESHOLD
     assert accumulator.output()["choices"][0]["message"]["content"] == "x" * 20_000
     assert accumulator.defect is None
 
@@ -9626,7 +9627,7 @@ def test_the_number_of_retained_choice_slots_is_bounded() -> None:
     )
     flooded.finish()
 
-    assert len(flooded._choices) <= trace_sse._MAX_ENTRY_SLOTS
+    assert len(flooded._choices) <= trace_fragments._MAX_ENTRY_SLOTS
     assert flooded.defect == "stream exceeded the choice slot bound"
 
 
@@ -9644,7 +9645,7 @@ def test_the_number_of_retained_tool_call_slots_is_bounded() -> None:
     flooded.finish()
 
     calls = flooded.output()["choices"][0]["message"]["tool_calls"]
-    assert len(calls) <= trace_sse._MAX_ENTRY_SLOTS
+    assert len(calls) <= trace_fragments._MAX_ENTRY_SLOTS
     assert flooded.defect == "stream exceeded the tool call slot bound"
 
 
@@ -9961,3 +9962,207 @@ def test_an_ordinary_schema_literal_is_neither_truncated_nor_flagged() -> None:
     assert len(bounded["enum"]) == 3
     assert flag.hit is False
     assert "SECRETVALUE" not in json.dumps(bounded)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "secret"),
+    [
+        ("^pass(?:wo(?:rd))$", True),
+        ("^(?:api(?:_(?:key)))$", True),
+        ("^(?:(?:password))$", True),
+        ("^pass(?:wo(?:[Rr])d)$", True),
+        ("^cit(?:y(?:x))$", False),
+        ("^pass(?:wo(?:rd)?)$", False),
+        ("^pass(?:wo(?:rd|phrase))$", False),
+        ("^pass(?:wo(?=rd))$", False),
+        ("^pass(?:wo(?:rd)$", False),
+    ],
+    ids=[
+        "two-levels",
+        "three-levels",
+        "doubled-whole-expression",
+        "class-inside-group",
+        "benign-nested",
+        "inner-quantified",
+        "inner-alternation",
+        "inner-lookahead",
+        "unbalanced",
+    ],
+)
+def test_nested_groups_are_flattened_to_the_name_they_bracket(pattern: str, secret: bool) -> None:
+    """One splicing pass removes only the OUTERMOST layer, so `pass(?:wo(?:rd))` became
+    `passwo(?:rd)` -- still a regex rather than `password`. A name bracketed more than one level
+    deep therefore failed the name test and its schema kept its credential literals. Splicing
+    repeats to a fixed point; constructs that do not plainly consume their contents are still
+    refused at every depth, because guessing at them is the unsafe direction."""
+
+    assert trace_secret_names._is_secret_property_pattern(pattern) is secret
+
+
+def test_a_nested_group_pattern_redacts_its_schema_literal() -> None:
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "patternProperties": {
+                            "^pass(?:wo(?:rd))$": {"type": "string", "default": "HUNTER2"},
+                            "^cit(?:y(?:x))$": {"type": "string", "default": "Boston"},
+                        },
+                    },
+                },
+            }
+        ]
+    }
+
+    patterns = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"][
+        "patternProperties"
+    ]
+
+    assert patterns["^pass(?:wo(?:rd))$"]["default"] == "[redacted]"
+    assert patterns["^cit(?:y(?:x))$"]["default"] == "Boston"
+
+
+@pytest.mark.parametrize(
+    ("payload", "secret"),
+    [
+        ({"error": {"message": 'Invalid metadata: {"password":"THIRDPARTY"}'}}, "THIRDPARTY"),
+        ({"error": {"metadata": {"raw": '{"api_key":"SECRETVAL"}'}}}, "SECRETVAL"),
+        ({"error": {"details": [{"msg": 'bad request: {"password":"LEAKEDONE"}'}]}}, "LEAKEDONE"),
+        ({"error": {"message": 'field "password": "QUOTEDLEAK" was rejected'}}, "QUOTEDLEAK"),
+    ],
+    ids=["message", "nested-object", "detail-list", "quoted-pair"],
+)
+def test_serialized_json_in_an_upstream_error_message_is_redacted(
+    payload: dict, secret: str
+) -> None:
+    """An upstream rejection quotes the fragment it rejected, so its diagnostic strings carry
+    request json. Those are ordinary scalars, so nothing inspected them and a third-party
+    credential -- one the caller never registered in `context.secrets` -- reached the raw export.
+    The error context is sticky from the `error` key down because providers spell the detail as a
+    nested object, a list of details, or the message itself."""
+
+    assert secret not in json.dumps(traces._sanitize_for_trace(payload, (), response=True))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"error": {"message": "Rate limit exceeded. Try again in 30 seconds."}},
+        {"error": {"code": 429, "type": "rate_limit"}},
+        {"error": None, "choices": []},
+    ],
+    ids=["prose", "scalars", "null-error"],
+)
+def test_an_ordinary_upstream_error_survives_verbatim(payload: dict) -> None:
+    """The recorded error is the operator's record of why a paid call failed. Blanking ordinary
+    diagnostics would destroy it, so only text that LOOKS structured is treated as an
+    uninspectable fragment."""
+
+    assert traces._sanitize_for_trace(payload, (), response=True) == payload
+
+
+def test_error_context_does_not_escape_the_error_subtree() -> None:
+    payload = {"error": {"message": "bad"}, "id": 'resp: {"a":1}'}
+
+    assert traces._sanitize_for_trace(payload, (), response=True)["id"] == 'resp: {"a":1}'
+
+
+def test_a_request_side_error_key_is_not_response_error_context() -> None:
+    """`response_root` is what opens the error context, so an ordinary request field named `error`
+    is untouched -- it is caller metadata, not an upstream rejection."""
+
+    payload = {"metadata": {"note": 'saw {"password":"P"} once'}}
+
+    assert (
+        traces._sanitize_for_trace(payload, ())["metadata"]["note"] == 'saw {"password":"P"} once'
+    )
+
+
+@pytest.mark.parametrize(
+    ("images", "expected"),
+    [
+        ([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}], None),
+        ("oops", None),
+        ([], "here it is"),
+    ],
+    ids=["generated-image", "wrong-type", "empty-list"],
+)
+def test_a_reply_with_generated_images_is_not_exported_as_text_only(
+    images: object, expected: str | None
+) -> None:
+    """An image-generation reply carries its text in `content` and its assets in `images`, so
+    exporting the text alone trains toward a target the caller never received -- the same mismatch
+    the `audio` branch already rejects. An EMPTY list carries no image and is the ordinary shape a
+    provider sends on a text-only reply, so it still exports."""
+
+    response = _reply_envelope("here it is")
+    response["choices"][0]["finish_reason"] = "stop"
+    response["choices"][0]["message"]["images"] = images
+
+    assert platform_traces._chat_reply(response) == expected
+
+
+def _stream_output(deltas: list[dict]) -> tuple[dict, bool]:
+    accumulator = trace_sse.SseAccumulator(
+        max_accumulated_bytes=platform_traces.MAX_PAYLOAD_TOTAL_BYTES
+    )
+    for delta in deltas:
+        event = json.dumps({"choices": [{"index": 0, "delta": delta}]})
+        accumulator.feed(b"data: " + event.encode() + b"\n\n")
+    accumulator.finish()
+    return accumulator.output()["choices"][0]["message"], accumulator.collections_bounded
+
+
+def test_a_wide_mapping_extension_is_bounded_during_accumulation() -> None:
+    """The byte budget charges a value's SERIALIZED size, and a mapping of shallow members
+    serializes far smaller than it expands to: a 4 MB event carrying 300k `{"k":1}` pairs sat
+    inside an 8 MiB budget while retaining the whole expanded dict per concurrent stream, for
+    members the storage boundary was going to drop anyway."""
+
+    wide = {f"k{index}": 1 for index in range(platform_traces._MAX_PAYLOAD_COLLECTION + 20_000)}
+
+    message, bounded = _stream_output([{"vendor_ext": wide}])
+
+    assert len(message["vendor_ext"]) <= platform_traces._MAX_PAYLOAD_COLLECTION
+    assert bounded is True
+
+
+def test_a_wide_collection_split_across_deltas_is_bounded() -> None:
+    """Bounding each event alone is no bound at all: a provider can rebuild an over-wide
+    collection out of narrow deltas that each pass it, so the accumulating merge has to hold the
+    same limit."""
+
+    half = platform_traces._MAX_PAYLOAD_COLLECTION // 2 + 20_000
+
+    mappings, mapping_bounded = _stream_output(
+        [
+            {"vendor_ext": {f"a{index}": 1 for index in range(half)}},
+            {"vendor_ext": {f"b{index}": 1 for index in range(half)}},
+        ]
+    )
+    lists, list_bounded = _stream_output(
+        [{"vendor_list": ["a"] * half}, {"vendor_list": ["b"] * half}]
+    )
+
+    assert len(mappings["vendor_ext"]) <= platform_traces._MAX_PAYLOAD_COLLECTION
+    assert len(lists["vendor_list"]) <= platform_traces._MAX_PAYLOAD_COLLECTION
+    assert mapping_bounded is True
+    assert list_bounded is True
+
+
+def test_an_ordinary_stream_extension_is_retained_whole_and_not_reported() -> None:
+    """Bounding must be invisible to real traffic. A provider extension is the recorded reply as
+    much as `content` is, and marking an ordinary stream truncated would tell a reader its payload
+    was cut when nothing was dropped."""
+
+    message, bounded = _stream_output(
+        [{"vendor_ext": {"a": 1}, "content": "hel"}, {"vendor_ext": {"b": 2}, "content": "lo"}]
+    )
+
+    assert message["vendor_ext"] == {"a": 1, "b": 2}
+    assert message["content"] == "hello"
+    assert bounded is False

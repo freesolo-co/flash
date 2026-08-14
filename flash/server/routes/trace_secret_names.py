@@ -294,7 +294,20 @@ def _flatten_inner_groups(pattern: str) -> str:
     matches with OR without the fragment, so it names two different fields and is left alone rather
     than guessed at; a lookaround consumes nothing; alternation is a branch set handled separately.
     Anything left unspliced simply fails the name test, which is the safe direction.
+
+    Splicing repeats until it changes nothing, because one pass only removes the OUTERMOST layer:
+    `pass(?:wo(?:rd))` became `passwo(?:rd)`, still a regex rather than `password`, so a name
+    bracketed more than one level deep kept its schema's credential literals in the raw export.
     """
+    previous = None
+    while pattern != previous:
+        previous = pattern
+        pattern = _splice_outer_groups(pattern)
+    return pattern
+
+
+def _splice_outer_groups(pattern: str) -> str:
+    """One splicing pass: remove the outermost layer of plainly-consuming groups."""
     result: list[str] = []
     index = 0
     while index < len(pattern):

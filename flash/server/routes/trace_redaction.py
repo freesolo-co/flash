@@ -401,6 +401,7 @@ def _child_response_shape_flags(
     logprobs: bool,
     logprob_entries: bool,
     assistant_content: bool,
+    response_error: bool,
 ) -> dict[str, bool]:
     """The response-envelope flags a child inherits: where it sits in `choices` and `logprobs`.
 
@@ -409,6 +410,12 @@ def _child_response_shape_flags(
     a secret key is not redacted out of a logprob table.
     """
     return {
+        # an upstream rejection quotes the fragment it rejected, so its diagnostic strings carry
+        # serialized request json -- `Invalid metadata: {"password":"THIRDPARTY"}`. those are
+        # ordinary scalars, so nothing inspected them, and a third-party credential the caller
+        # never registered as a secret reached the raw export. sticky from the `error` key down:
+        # providers spell the detail as a nested object, a list of details, or the message itself.
+        "response_error": response_error or (response_root and key == "error"),
         "choice_list": response_root and key == "choices" and isinstance(item, list),
         "choice": choice_list,
         "logprobs": choice and key == "logprobs" and isinstance(item, dict),
@@ -473,6 +480,7 @@ def _redact_secret_child(
     logprobs: bool,
     logprob_entries: bool,
     assistant_content: bool,
+    response_error: bool,
     function_container: bool,
     tool_result_content: bool,
     schema_host: bool,
@@ -535,6 +543,7 @@ def _redact_secret_child(
             logprobs=logprobs,
             logprob_entries=logprob_entries,
             assistant_content=assistant_content,
+            response_error=response_error,
         ),
         function_arguments=function_container and key == "arguments",
         tool_result_content=_carries_tool_result(
@@ -585,6 +594,7 @@ def _redact_secret_fields(
     logprobs: bool = False,
     logprob_entries: bool = False,
     assistant_content: bool = False,
+    response_error: bool = False,
     function_arguments: bool = False,
     tool_result_content: bool = False,
     function_container: bool = False,
@@ -643,6 +653,7 @@ def _redact_secret_fields(
                     logprobs=logprobs,
                     logprob_entries=logprob_entries,
                     assistant_content=assistant_content,
+                    response_error=response_error,
                     function_container=function_container,
                     tool_result_content=tool_result_content,
                     schema_host=schema_host,
@@ -666,6 +677,7 @@ def _redact_secret_fields(
             logprobs=logprobs,
             logprob_entries=logprob_entries,
             assistant_content=assistant_content,
+            response_error=response_error,
             tool_result_content=tool_result_content,
             schema_host=schema_host,
             tool_definition_list=tool_definition_list,
@@ -681,6 +693,7 @@ def _redact_secret_fields(
         tool_result_content=tool_result_content,
         function_arguments=function_arguments,
         assistant_content=assistant_content,
+        response_error=response_error,
         flag=flag,
     )
 
@@ -744,6 +757,7 @@ def _redact_secret_sequence(
     logprobs: bool,
     logprob_entries: bool,
     assistant_content: bool,
+    response_error: bool,
     tool_result_content: bool,
     schema_host: bool,
     tool_definition_list: str | None,
@@ -771,6 +785,9 @@ def _redact_secret_sequence(
             # a message's `content` may be a list of parts; the reply text then sits in each
             # part's `text`, so the flag has to survive the list hop like `tool_result_content`.
             assistant_content=assistant_content,
+            # providers spell the detail of a rejection as a LIST of details as often as an object,
+            # so the error context has to survive the list hop too.
+            response_error=response_error,
             payload_root=False,
             # a tool message's `content` may be a list of parts rather than one string, and the
             # tool's output then sits in each part's `text`. dropping the flag at the list hop
@@ -822,11 +839,20 @@ def _redact_secret_scalar(
     tool_result_content: bool,
     function_arguments: bool,
     assistant_content: bool,
+    response_error: bool,
     flag: _SanitizationFlag | None,
 ) -> Any:
     """Redact a leaf value, whose handling depends on the field that carries it."""
     if tool_result_content and isinstance(value, str):
         return _redact_tool_result_content(value, depth=depth, flag=flag)
+    if response_error and isinstance(value, str):
+        # an upstream rejection quotes the fragment it rejected, so a diagnostic string carries
+        # request json spliced into prose -- `Invalid metadata: {"password":"THIRDPARTY"}`. it is
+        # not a json document, so parsing alone left it verbatim and the quoted credential reached
+        # the raw export whenever it was a third party's rather than one of `context.secrets`.
+        # a fragment cannot be inspected in place, so anything that LOOKS structured is blanked and
+        # ordinary diagnostic prose survives -- the same trade the tool-result path already makes.
+        return _redact_json_text(value, depth=depth, flag=flag, on_unparseable=_looks_structured)
     if function_arguments and isinstance(value, str):
         # malformed arguments cannot be inspected for nested credentials, so preserving their bytes
         # would turn parse failure into a secret exfiltration path. keep the wire type only.
