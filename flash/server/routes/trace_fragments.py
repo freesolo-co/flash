@@ -173,6 +173,11 @@ _IDENTITY_KEYS = frozenset({"id", "type"})
 # parallel tool calls are small; this is the runaway bound, not a working limit.
 _MAX_ENTRY_SLOTS = 4096
 
+# how far the width trim descends BELOW the payload depth cutoff. the payload bound stops the
+# structure from being rebuilt; this one only stops the walk itself from recursing without limit on
+# input the depth bound has already refused to reproduce, so it can be generous.
+_MAX_TRIM_DEPTH = 256
+
 
 def _bound_collections(value: Any, *, depth: int = 0) -> tuple[Any, bool]:
     """Trim a retained value to the member count storage will keep. Returns it and whether it was.
@@ -188,7 +193,16 @@ def _bound_collections(value: Any, *, depth: int = 0) -> tuple[Any, bool]:
     that failed to deliver its reply.
     """
     if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-        return value, False
+        # returning the value whole here let a collection nested at exactly the cutoff sit in the
+        # accumulator at full width for the life of the stream -- the retention this helper exists
+        # to prevent, reached by nesting instead of by width. so the width bound applies at the
+        # cutoff too; only the RECURSION stops, which is what the depth bound is for.
+        #
+        # trimmed to the bound rather than discarded outright. emptying the node destroys the shape
+        # below it, and the merge reads that shape to decide a fragment is too deeply nested --
+        # a stream that exceeds the depth bound would have stopped reporting itself defective, so
+        # `records` would export its holed text as a complete training target.
+        return _trim_to_bound(value)
     if isinstance(value, dict):
         bounded = len(value) > platform_traces._MAX_PAYLOAD_COLLECTION
         trimmed: dict[Any, Any] = {}
@@ -204,6 +218,34 @@ def _bound_collections(value: Any, *, depth: int = 0) -> tuple[Any, bool]:
             trimmed_list.append(entry)
             bounded |= item_bounded
         return trimmed_list, bounded
+    return value, False
+
+
+def _trim_to_bound(value: Any, *, depth: int = 0) -> tuple[Any, bool]:
+    """Everything retained at and below the depth cutoff, cut to the storage width bound.
+
+    Depth stops the payload from being REBUILT past the bound, but the subtree below the cutoff is
+    still retained by reference, so an over-wide collection anywhere beneath it is held whole. This
+    keeps descending for width alone, under its own recursion guard, so nesting cannot be used to
+    smuggle width past the bound.
+    """
+    if depth >= _MAX_TRIM_DEPTH:
+        return value, False
+    if isinstance(value, dict):
+        bounded = len(value) > platform_traces._MAX_PAYLOAD_COLLECTION
+        trimmed: dict[Any, Any] = {}
+        for key, item in islice(value.items(), platform_traces._MAX_PAYLOAD_COLLECTION):
+            trimmed[key], item_bounded = _trim_to_bound(item, depth=depth + 1)
+            bounded |= item_bounded
+        return trimmed, bounded
+    if isinstance(value, list):
+        bounded = len(value) > platform_traces._MAX_PAYLOAD_COLLECTION
+        entries: list[Any] = []
+        for item in islice(value, platform_traces._MAX_PAYLOAD_COLLECTION):
+            entry, item_bounded = _trim_to_bound(item, depth=depth + 1)
+            entries.append(entry)
+            bounded |= item_bounded
+        return entries, bounded
     return value, False
 
 

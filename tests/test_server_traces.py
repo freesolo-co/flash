@@ -10166,3 +10166,52 @@ def test_an_ordinary_stream_extension_is_retained_whole_and_not_reported() -> No
     assert message["vendor_ext"] == {"a": 1, "b": 2}
     assert message["content"] == "hello"
     assert bounded is False
+
+
+def _nested_delta_value(leaf: object, *, wrappers: int) -> tuple[object, bool]:
+    """Feed `leaf` nested `wrappers` deep and return what the accumulator RETAINED, plus its flag.
+
+    The retained state is the point: `output()` replaces anything past the depth bound with
+    "[redacted]", so reading the output would hide how much was held while the stream was open.
+    """
+    node: object = leaf
+    for _ in range(wrappers):
+        node = {"n": node}
+    accumulator = trace_sse.SseAccumulator(
+        max_accumulated_bytes=platform_traces.MAX_PAYLOAD_TOTAL_BYTES
+    )
+    event = json.dumps({"choices": [{"index": 0, "delta": {"vendor_ext": node}}]})
+    accumulator.feed(b"data: " + event.encode() + b"\n\n")
+    retained = accumulator._choices[0]["message"].get("vendor_ext")
+    while isinstance(retained, dict) and len(retained) == 1 and "n" in retained:
+        retained = retained["n"]
+    return retained, accumulator.collections_bounded
+
+
+@pytest.mark.parametrize("shape", ["mapping", "list"], ids=["mapping", "list"])
+def test_a_wide_collection_at_the_depth_cutoff_is_not_retained(shape: str) -> None:
+    """The depth cutoff returned the value whole, so a collection nested AT it sat in the
+    accumulator at full width for the life of the stream -- the retention this helper exists to
+    prevent, reached by nesting instead of by width. The width bound therefore applies at and
+    below the cutoff too -- only the RECURSION stops there, which is what the depth bound is for."""
+
+    width = platform_traces._MAX_PAYLOAD_COLLECTION + 20_000
+    leaf = {f"k{index}": 1 for index in range(width)} if shape == "mapping" else [1] * width
+
+    retained, bounded = _nested_delta_value(leaf, wrappers=platform_traces._MAX_PAYLOAD_DEPTH)
+
+    assert len(retained) <= platform_traces._MAX_PAYLOAD_COLLECTION
+    assert bounded is True
+
+
+def test_a_scalar_at_the_depth_cutoff_is_untouched_and_unreported() -> None:
+    """Only collections are dropped at the cutoff. A scalar there costs nothing to keep, and
+    reporting it as trimmed would mark an intact payload truncated. The envelope already consumes
+    four levels, so the leaf sits at the cutoff four wrappers short of the bound."""
+
+    retained, bounded = _nested_delta_value(
+        "plain", wrappers=platform_traces._MAX_PAYLOAD_DEPTH - 4
+    )
+
+    assert retained == "plain"
+    assert bounded is False
