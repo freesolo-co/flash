@@ -300,12 +300,26 @@ def _append_fragment(target: dict[str, Any], key: str, value: Any) -> None:
         target[key] = value
 
 
-def _merge_fragment_dict(target: dict[str, Any], fragment: dict[str, Any]) -> None:
+_TOO_DEEP_DEFECT = "stream fragment exceeded the payload depth bound"
+
+
+def _merge_fragment_dict(
+    target: dict[str, Any], fragment: dict[str, Any], *, depth: int = 0
+) -> bool:
+    """Merge a streamed fragment into `target`. Returns False if the depth bound truncated it.
+
+    Recording must never be able to take down the paid call it is observing. This runs on the
+    proxy's own task before each chunk is relayed, so unbounded recursion here would interrupt the
+    upstream response and withhold an otherwise relayable event from the caller.
+    """
+    if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
+        return False
+    bounded = True
     for key, value in fragment.items():
         if isinstance(value, dict):
             nested = target.setdefault(key, {})
             if isinstance(nested, dict):
-                _merge_fragment_dict(nested, value)
+                bounded &= _merge_fragment_dict(nested, value, depth=depth + 1)
             else:
                 target[key] = dict(value)
         elif isinstance(value, str):
@@ -325,6 +339,7 @@ def _merge_fragment_dict(target: dict[str, Any], fragment: dict[str, Any]) -> No
             _append_fragment(target, key, value)
         elif value is not None:
             target[key] = value
+    return bounded
 
 
 class SseAccumulator:
@@ -621,6 +636,14 @@ class SseAccumulator:
                 continue
             state = self._choice_state(index)
             message = choice.get("message")
+            if message is not None and choice.get("delta") is not None:
+                # `message` is the whole reply and `delta` is a fragment of it: two alternative
+                # representations, not two halves. consuming both concatenated them into a
+                # completion the provider never sent ("FULL" + "DELTA"), stored OK and exportable
+                # as a training target. an explicit null on either side is the ordinary spelling
+                # for "no fragment" and is not this case.
+                self._note_defect("stream choice contained both message and delta")
+                continue
             if message is not None:
                 if isinstance(message, dict):
                     self._consume_delta(state, message)
@@ -640,8 +663,10 @@ class SseAccumulator:
             if "logprobs" in choice:
                 logprobs = choice["logprobs"]
                 if isinstance(logprobs, dict):
-                    if self._reserve(logprobs):
-                        _merge_fragment_dict(state["logprobs"], logprobs)
+                    if self._reserve(logprobs) and not _merge_fragment_dict(
+                        state["logprobs"], logprobs
+                    ):
+                        self._note_defect(_TOO_DEEP_DEFECT)
                 elif logprobs is not None:
                     self._note_defect("stream choice contained non-object logprobs")
             # explicit null is the ordinary provider spelling for "no fragment", just like absence.
@@ -673,7 +698,8 @@ class SseAccumulator:
             if not self._reserve(value, retained_key=retained_key):
                 return
             if isinstance(value, dict) and isinstance(message.get(key), dict):
-                _merge_fragment_dict(message[key], value)
+                if not _merge_fragment_dict(message[key], value):
+                    self._note_defect(_TOO_DEEP_DEFECT)
             elif isinstance(value, str | list) or (
                 key in message and isinstance(message[key], str | _StringFragments)
             ):
@@ -683,8 +709,12 @@ class SseAccumulator:
         function_call = delta.get("function_call")
         if isinstance(function_call, dict):
             target = message.setdefault("function_call", {})
-            if isinstance(target, dict) and self._reserve_tool_call_fragment(target, function_call):
-                _merge_fragment_dict(target, function_call)
+            if (
+                isinstance(target, dict)
+                and self._reserve_tool_call_fragment(target, function_call)
+                and not _merge_fragment_dict(target, function_call)
+            ):
+                self._note_defect(_TOO_DEEP_DEFECT)
         elif function_call is not None:
             self._note_defect("stream function_call was not an object")
         tool_calls = delta.get("tool_calls")
@@ -714,4 +744,5 @@ class SseAccumulator:
             target = accumulated_calls.setdefault(index, {})
             if not self._reserve_tool_call_fragment(target, fragment):
                 return
-            _merge_fragment_dict(target, fragment)
+            if not _merge_fragment_dict(target, fragment):
+                self._note_defect(_TOO_DEEP_DEFECT)

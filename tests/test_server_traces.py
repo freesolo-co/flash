@@ -4168,11 +4168,85 @@ def test_legacy_dependencies_map_preserves_subschema_entries() -> None:
     stored = traces._redact_secret_fields(schema)
 
     assert stored["dependencies"]["password"] == {"type": "object", "default": "[redacted]"}
-    # the ARRAY form lists required property names: instance data, redacted as before
+    # the ARRAY form lists required property NAMES. those are declarations too, so the entry is
+    # preserved: redacting it would corrupt the schema without protecting any credential.
     array_form = traces._redact_secret_fields(
-        {"type": "object", "dependencies": {"password": ["a", "b"]}}
+        {"type": "object", "dependencies": {"password": ["username"]}}
     )
-    assert array_form["dependencies"]["password"] == "[redacted]"
+    assert array_form["dependencies"]["password"] == ["username"]
+    # a plain scalar under the same keyword is ordinary instance data and still redacts
+    instance = traces._redact_secret_fields({"dependencies": {"password": "SECRET-VALUE"}})
+    assert instance["dependencies"]["password"] == "[redacted]"
+
+
+def test_decoded_host_escape_is_case_folded() -> None:
+    """The host is case-insensitive, so `%4A` and a plain `j` are the same host.
+
+    Case-folding ran before the escape was decoded, so `%4A` normalized to `J`, never matched `j`,
+    and the referenced definition's literals stayed visible in raw exports.
+    """
+    schema = {
+        "$id": "https://%4A.com/schema",
+        "type": "object",
+        "properties": {"api_key": {"$ref": "https://j.com/schema#/$defs/Cred"}},
+        "$defs": {"Cred": {"default": "SECRET", "const": "SECRET-C"}},
+    }
+
+    stored = traces._redact_secret_fields(schema)
+
+    assert stored["$defs"]["Cred"]["default"] == "[redacted]"
+    assert stored["$defs"]["Cred"]["const"] == "[redacted]"
+    assert trace_redaction._canonical_resource_uri("https://%4A.com/s") == "https://j.com/s"
+    # the PATH is case-sensitive: a decoded escape there keeps its case
+    assert trace_redaction._canonical_resource_uri("https://x.com/%4A") == "https://x.com/J"
+
+
+def test_choice_with_both_message_and_delta_is_malformed() -> None:
+    """`message` is the whole reply and `delta` a fragment of it: alternatives, not two halves.
+
+    Consuming both concatenated them into a completion the provider never sent, stored OK and
+    exportable as a training target.
+    """
+    both = trace_sse.SseAccumulator()
+    both.feed(
+        b'data: {"choices":[{"index":0,"message":{"content":"FULL"},'
+        b'"delta":{"content":"DELTA"}}]}\n\ndata: [DONE]\n\n'
+    )
+    both.finish()
+
+    assert both.defect == "stream choice contained both message and delta"
+
+    # an explicit null on either side is the ordinary spelling for "no fragment"
+    null_delta = trace_sse.SseAccumulator()
+    null_delta.feed(
+        b'data: {"choices":[{"index":0,"message":{"content":"M"},"delta":null}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    null_delta.finish()
+
+    assert null_delta.defect is None
+    assert null_delta.output()["choices"][0]["message"]["content"] == "M"
+
+
+def test_deeply_nested_fragment_is_bounded_instead_of_recursing() -> None:
+    """Recording must never take down the paid call it observes.
+
+    `_merge_fragment_dict` recursed without a bound while running on the proxy's own task before
+    each chunk is relayed, so a deep fragment could interrupt the upstream response.
+    """
+
+    def deep_json(levels: int) -> str:
+        return '{"n":' * levels + '{"content":"D"}' + "}" * levels
+
+    body = '{"choices":[{"index":0,"delta":{"function_call":' + deep_json(500) + "}}]}"
+    accumulator = trace_sse.SseAccumulator()
+    accumulator.feed(b"data: " + body.encode() + b"\n\n")
+    accumulator.finish()
+
+    assert accumulator.defect == "stream fragment exceeded the payload depth bound"
+    # the helper reports truncation directly, and an ordinary fragment is unaffected
+    assert trace_sse._merge_fragment_dict({}, json.loads(deep_json(500))) is False
+    assert trace_sse._merge_fragment_dict({}, json.loads(deep_json(3))) is True
 
 
 def test_recursive_ref_reaches_an_outer_recursive_anchor() -> None:

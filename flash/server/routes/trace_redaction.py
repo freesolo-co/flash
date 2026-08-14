@@ -166,20 +166,26 @@ def _is_schema_definition(value: Any, *, allow_custom_vocabulary: bool = False) 
     return bool(keys) and all(key in _JSON_SCHEMA_KEYWORDS for key in keys)
 
 
-def _is_schema_map_keyword(key: str, item: Any) -> bool:
-    """Whether `key` maps property names to SUBSCHEMAS rather than to instance data.
+def _is_property_name_list(value: Any) -> bool:
+    """Whether `value` is a draft-07 `dependencies` array: a list of declared property names.
 
-    Draft-07 `dependencies` is polymorphic: a schema value states a conditional subschema, while an
-    array value lists required property names, which is ordinary instance data. Only the schema form
-    may be traversed as a schema, or a secret-named entry is replaced wholesale by `"[redacted]"` and
-    the stored JSON Schema stops being valid.
+    These are schema declarations, not instance data, so a secret-looking entry is a property name
+    and replacing the list with `"[redacted]"` corrupts the stored schema.
     """
-    if key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS:
-        return True
-    return (
-        key == "dependencies"
-        and isinstance(item, dict)
-        and any(isinstance(entry, dict) for entry in item.values())
+    return isinstance(value, list) and all(isinstance(entry, str) for entry in value)
+
+
+def _is_schema_map_keyword(key: str, item: Any) -> bool:
+    """Whether `key`'s entries are keyed by PROPERTY NAME rather than being instance data.
+
+    Under such a keyword a secret-looking key is a declared property name, not a credential, so
+    replacing the entry with `"[redacted]"` corrupts the stored schema instead of protecting
+    anything. Draft-07 `dependencies` qualifies in both of its forms: a schema value states a
+    conditional subschema and an array value lists required property names, and neither is a secret.
+    Only its entry VALUES differ, which the ordinary schema traversal already distinguishes.
+    """
+    return key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS or (
+        key == "dependencies" and isinstance(item, dict)
     )
 
 
@@ -325,7 +331,13 @@ def _local_schema_pointer(
     return frozenset()
 
 
-def _normalize_percent_encoding(value: str) -> str:
+def _normalize_percent_encoding(value: str, *, fold_decoded: bool = False) -> str:
+    """Decode unreserved escapes and uppercase the rest, per RFC 3986 6.2.2.
+
+    `fold_decoded` case-folds the characters an escape decodes to. It is for the host, which is
+    case-insensitive: without it `%4A` normalizes to `J` and never matches a plain `j`. Folding the
+    whole string instead would lowercase the hex digits of escapes that stay encoded.
+    """
     unreserved = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
     normalized: list[str] = []
     index = 0
@@ -337,7 +349,10 @@ def _normalize_percent_encoding(value: str) -> str:
             except ValueError:
                 pass
             else:
-                normalized.append(decoded if decoded in unreserved else f"%{escaped.upper()}")
+                if decoded in unreserved:
+                    normalized.append(decoded.casefold() if fold_decoded else decoded)
+                else:
+                    normalized.append(f"%{escaped.upper()}")
                 index += 3
                 continue
         normalized.append(value[index])
@@ -394,12 +409,17 @@ def _canonical_resource_uri(uri: str) -> str:
             hostport = host.casefold()
         else:
             hostport = f"{host.casefold()}:{port}" if port_separator else hostport.casefold()
-    # after casefolding, never before: casefold would lowercase the escape's hex digits, and
-    # `_normalize_percent_encoding` is what restores the uppercase form rfc 3986 6.2.2.1 wants.
-    # decoding is delimiter-safe in either order because no unreserved character is a delimiter,
-    # so `@`, `:` and the brackets stay encoded and the split above still describes the authority.
-    normalized_netloc = _normalize_percent_encoding(
-        f"{userinfo}@{hostport}" if user_separator else hostport
+    # the host is case-insensitive, so a character an escape DECODES to must fold too: `%4A` and a
+    # plain `j` are the same host. the casefold above cannot do it (the escape is still encoded) and
+    # folding the whole string afterwards would lowercase the hex digits rfc 3986 6.2.2.1 wants
+    # uppercase, so the fold is applied to decoded characters only. the userinfo is case-sensitive
+    # and keeps the plain normalization. decoding is delimiter-safe here because no unreserved
+    # character is a delimiter: `@`, `:` and the brackets stay encoded and the split above holds.
+    normalized_netloc = (
+        f"{_normalize_percent_encoding(userinfo)}@"
+        f"{_normalize_percent_encoding(hostport, fold_decoded=True)}"
+        if user_separator
+        else _normalize_percent_encoding(hostport, fold_decoded=True)
     )
     normalized_path = _remove_dot_segments(_normalize_percent_encoding(path))
     if normalized_scheme in {"http", "https"} and normalized_netloc and not normalized_path:
@@ -642,6 +662,7 @@ def _redact_secret_fields(
     *,
     depth: int = 0,
     schema_property_map: bool = False,
+    schema_property_dependencies: bool = False,
     schema_context: bool = False,
     secret_schema_definition: bool = False,
     secret_schema_property: bool = False,
@@ -678,8 +699,9 @@ def _redact_secret_fields(
         redact_schema_literals = secret_schema_definition or secret_schema_property
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
-            schema_definition = schema_property_map and _is_schema_definition(
-                item, allow_custom_vocabulary=schema_wrapper
+            schema_definition = schema_property_map and (
+                _is_schema_definition(item, allow_custom_vocabulary=schema_wrapper)
+                or (schema_property_dependencies and _is_property_name_list(item))
             )
             current_schema_path = (*schema_definition_path, str(key))
             referenced_secret_definition = current_schema_path in active_secret_schema_refs
@@ -703,6 +725,7 @@ def _redact_secret_fields(
                     item,
                     depth=depth + 1,
                     schema_property_map=(schema_context and _is_schema_map_keyword(key, item)),
+                    schema_property_dependencies=key == "dependencies",
                     schema_context=child_schema_context,
                     secret_schema_definition=secret_schema_definition
                     or referenced_secret_definition,
