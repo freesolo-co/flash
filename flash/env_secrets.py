@@ -40,6 +40,7 @@ from flash.env_formats import (
     _MAX_OPENPGP_MARKERS,
     _UNEXPANDABLE_MAGIC,
     _ZIP_TAIL_BYTES,
+    OVERLAY_UNPROBED,
     _after_skippable_frames,
     _has_openpgp_message_armor,
     _has_zip_end_record,
@@ -60,6 +61,7 @@ from flash.env_patterns import (
     _MAX_BODY,
     _PAIRED_PATTERNS,
     _TOKEN_PATTERNS,
+    SHORTEST_TOKEN_BYTES,
     _match,
 )
 
@@ -114,11 +116,17 @@ _SFX_MAGIC_BYTES = 6
 # key of any of those lengths was detected as ASCII and missed in its UTF-16 form, which is the
 # encoding this narrowing exists to cover. A run must hold the whole credential to decode it.
 #
-# Lowered to exactly 20 rather than further, because every character of slack admits more machine
-# code: the NUL-column gate is what keeps an ELF from narrowing into a token, and a shorter run is
-# a weaker gate. Re-measured at 20 over 500 system binaries -- still zero false positives.
+# DERIVED from the shortest token, not written as a number. Lowering the base64 floor for Slack
+# left this one at a hardcoded 20, so `xoxb-` plus its 10-character body -- 15 bytes, 15 NUL columns
+# in UTF-16 -- was detected as ASCII and missed in the encoding this narrowing exists to cover. The
+# two floors answer the same question about the same patterns, so they move together or one of them
+# silently stops matching what the other admits.
+#
+# The NUL-column gate is what keeps an ELF from narrowing into a token, and a shorter run is a
+# weaker gate, so the floor is re-measured whenever it moves: at 15 over 500 system binaries, still
+# zero false positives.
 _NUL_MARKER = bytes(1 if byte == 0 else 0 for byte in range(256))
-_WIDE_RUN = re.compile(rb"\x01{20,}")
+_WIDE_RUN = re.compile(rb"\x01{%d,}" % SHORTEST_TOKEN_BYTES)
 
 
 # How many container layers deep to expand. A zip holding a gzipped shard is an ordinary way to
@@ -477,6 +485,9 @@ def _looks_like_container(data: bytes) -> bool:
         # the tests above sees past it, since each asks what the file BEGINS with and it begins with
         # `#!/bin/sh`. `is_zipfile` covers the same shape for a zip payload; this covers the gzip,
         # bzip2 and xz payloads that `makeself` and `.run` installers actually carry.
+        #
+        # `False` -- the search gave up with candidates unprobed -- counts as a container too, so
+        # the handler runs and turns it into a refusal rather than passing it off as ordinary bytes.
         or _overlay_offset(data) is not None
     )
 
@@ -551,6 +562,8 @@ def _credential_in_overlay(source: Path | bytes, *, deadline: float, depth: int)
     """
     if (at := _overlay_offset(source)) is None:
         return None
+    if at == OVERLAY_UNPROBED:
+        raise _Unscannable("contains more appended archive candidates than this check can probe")
     payload = _overlay_payload(source, at, _MAX_NESTED_BUFFER_BYTES)
     if payload is None:
         return None

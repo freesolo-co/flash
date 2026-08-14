@@ -4932,6 +4932,160 @@ def test_a_real_zip_still_counts_its_members(tmp_path):
     assert _zip_member_count(sfx, 100_000) == 250
 
 
+def test_decoy_magics_do_not_hide_an_appended_payload(tmp_path):
+    """The overlay candidate cap was itself fail-open.
+
+    Only a candidate that actually inflates ends the search, so an attacker chooses how many failing
+    magics sit in front of the real payload. Returning "no overlay" once the cap was hit meant
+    padding a stub with enough decoys published the credential in the stream behind them.
+    """
+    import gzip
+    import os
+
+    from flash.env_formats import _MAX_OVERLAY_CANDIDATES
+    from flash.env_secrets import credential_in_file
+
+    stub = b'#!/bin/sh\ntail -c +NNN "$0" | gzip -dc\nexit 0\n'
+    payload = gzip.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
+
+    def decoys(count: int) -> bytes:
+        """`count` gzip magics that cannot inflate -- three fixed bytes then noise."""
+        return b"".join(b"\x1f\x8b\x08" + os.urandom(29) for _ in range(count))
+
+    # Comfortably past the old cap of 64, which returned None and published. Every candidate in a
+    # window is probed before the bound is consulted, so a decoy count the file chooses cannot push
+    # the real payload out of reach -- the key is FOUND rather than merely refused.
+    many = tmp_path / "many.run"
+    many.write_bytes(stub + decoys(65) + payload)
+    assert credential_in_file(many) == "a Freesolo API key"
+
+    beyond = tmp_path / "beyond.run"
+    beyond.write_bytes(stub + decoys(_MAX_OVERLAY_CANDIDATES + 50) + payload)
+    assert credential_in_file(beyond) == "a Freesolo API key"
+
+    few = tmp_path / "few.run"
+    few.write_bytes(stub + decoys(3) + payload)
+    assert credential_in_file(few) == "a Freesolo API key"
+
+    # The bound still exists, and when it genuinely bites it REFUSES. It is consulted per window,
+    # so exhausting it takes decoys spanning more than one -- and the file behind them is then
+    # unverified rather than clean.
+    from flash.env_formats import _STREAM_WINDOW_BYTES
+    from flash.env_secrets import _Unscannable
+
+    per_window = decoys(_MAX_OVERLAY_CANDIDATES + 100)
+    pad = b"\x00" * max(0, _STREAM_WINDOW_BYTES - len(per_window))
+    spanning = tmp_path / "spanning.run"
+    spanning.write_bytes(stub + per_window + pad + per_window + pad + payload)
+    with pytest.raises(_Unscannable, match="candidates"):
+        credential_in_file(spanning)
+
+
+def test_a_marker_packet_does_not_hide_an_encrypted_message(tmp_path):
+    """Marker normalization was applied to one OpenPGP predicate and not the other.
+
+    A marker packet is a legal no-op that GnuPG skips, so `ca 03 50 47 50` in front of a real
+    encrypted message still decrypts -- while the encrypted-message test saw tag 10, reported "not
+    encrypted", and published the ciphertext.
+    """
+    import struct
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    body = b"\x03" + b"\x00" * 8 + b"\x01" + b"\x00" * 258
+    message = b"\x85" + struct.pack(">H", 268) + body + b"\xd2\x40" + b"\x00" * 64
+
+    marked = tmp_path / "marked.gpg"
+    marked.write_bytes(b"\xca\x03PGP" + message)
+    with pytest.raises(_Unscannable, match="encrypted OpenPGP"):
+        credential_in_file(marked)
+
+    # the same message without the marker, which was already refused: the control proving the
+    # assertion above is about the marker rather than about the message
+    plain = tmp_path / "plain.gpg"
+    plain.write_bytes(message)
+    with pytest.raises(_Unscannable, match="encrypted OpenPGP"):
+        credential_in_file(plain)
+
+
+def test_an_uncorroborated_member_count_does_not_refuse_a_clean_file(tmp_path):
+    """The member bound refused files that contain no archive at all.
+
+    The count is read from a record found by SEARCHING the tail, so any file can carry one: a tar
+    member of ordinary text plus `PK\x05\x06` and a zip64 record claimed 100,001 members. The
+    resulting refusal made a clean tar unpublishable, and `is_zipfile` cannot tell the difference --
+    it accepts those bytes too. Only a count the directory walk corroborates may refuse.
+    """
+    import io
+    import struct
+    import tarfile
+    import zipfile
+
+    from flash.env_formats import _zip_member_count
+    from flash.env_secrets import credential_in_file
+
+    forged = (
+        b"PK\x06\x06"
+        + struct.pack("<QHHIIQQQQ", 44, 45, 45, 0, 0, 100_001, 100_001, 0, 0)
+        + b"PK\x06\x07"
+        + struct.pack("<IQI", 0, 0, 1)
+        + b"PK\x05\x06"
+        + struct.pack("<HHHHIIH", 0, 0, 0xFFFF, 0xFFFF, 0, 0, 0)
+    )
+    body = b"harmless text\n" * 10 + forged
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as archive:
+        info = tarfile.TarInfo("data.bin")
+        info.size = len(body)
+        archive.addfile(info, io.BytesIO(body))
+    clean = tmp_path / "clean.tar"
+    clean.write_bytes(buf.getvalue())
+    assert credential_in_file(clean) is None
+
+    # The bound must still fire on a REAL oversized archive, which has a real directory to walk --
+    # and a real archive whose count field is forged DOWN still reports the walked truth.
+    real = tmp_path / "real.zip"
+    with zipfile.ZipFile(real, "w") as package:
+        for index in range(300):
+            package.writestr(f"m{index}.txt", b"x")
+    assert _zip_member_count(real, 100) == 300
+    patched = bytearray(real.read_bytes())
+    at = patched.rfind(b"PK\x05\x06")
+    patched[at + 8 : at + 12] = struct.pack("<HH", 1, 1)
+    shrunk = tmp_path / "shrunk.zip"
+    shrunk.write_bytes(bytes(patched))
+    assert _zip_member_count(shrunk, 100_000) == 300
+
+
+def test_the_wide_text_floor_admits_the_shortest_token(tmp_path):
+    """Lowering the base64 floor for Slack left the independent wide-text floor at 20.
+
+    The two floors answer the same question about the same patterns. `xoxb-` plus its 10-character
+    body is 15 bytes, so its UTF-16 form carries 15 NUL columns -- under a hardcoded 20, and the
+    token that was detected as ASCII was missed in the encoding this narrowing exists to cover.
+    """
+    from flash.env_patterns import SHORTEST_TOKEN_BYTES
+    from flash.env_secrets import _WIDE_RUN, _credential_kind
+
+    token = b"xoxb-AbCdEf0123"
+    assert len(token) == SHORTEST_TOKEN_BYTES
+    assert _credential_kind(token) == "a Slack token"
+    assert _credential_kind(token.decode().encode("utf-16-le")) == "a Slack token"
+    assert _credential_kind(token.decode().encode("utf-16-be")) == "a Slack token"
+
+    # derived, not written: the floor moves with the shortest token the patterns admit
+    assert _WIDE_RUN.pattern == rb"\x01{%d,}" % SHORTEST_TOKEN_BYTES
+
+    # the NUL-column gate still keeps ordinary machine code from narrowing into a token
+    import pathlib
+
+    binary = pathlib.Path("/usr/bin/python3")
+    if binary.exists():
+        from flash.env_secrets import credential_in_file
+
+        assert credential_in_file(binary) is None
+
+
 def test_a_secret_key_behind_the_marker_bound_is_refused(tmp_path):
     """Bounding the marker walk turned the bound itself into the bypass.
 

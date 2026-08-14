@@ -122,7 +122,11 @@ _OVERLAY_PROBE_BYTES = 1 << 16
 # rejecting a few bytes, so the bound is only there to keep a file of nothing but fake magics from
 # becoming a cost of its own -- and a REAL stream ends the search at the first hit. Measured 20
 # chance occurrences of the gzip magic across 400 MiB of random bytes, of which 0 inflated.
-_MAX_OVERLAY_CANDIDATES = 64
+_MAX_OVERLAY_CANDIDATES = 4096
+
+# The "gave up with candidates unprobed" answer, distinct from both an offset and from None. A
+# plain sentinel rather than a bool so no caller can confuse it with a falsy offset.
+OVERLAY_UNPROBED = -1
 
 # How much of a stream is read at a time while looking for an overlay, and while walking a zip's
 # central directory. One record's variable-length fields are three 16-bit lengths, so a window this
@@ -298,6 +302,19 @@ def _windows(source: Path | bytes) -> Iterator[tuple[int, bytes]]:
 def _overlay_offset(source: Path | bytes) -> int | None:
     """Where a compressed stream sits behind a stub in `source`, or None if none does.
 
+    `OVERLAY_UNPROBED` is returned when the search gave up with candidates still unexamined, which
+    is undecided rather than clean -- the caller turns it into a refusal.
+
+    That third answer is the whole point of the bound being here. Returning None on exhaustion made
+    the cap itself the bypass: padding a stub with more failing magics than the limit sent the real
+    appended stream unprobed and its credential published. Since only a candidate that actually
+    inflates ends the search, an attacker chooses how many decoys sit in front of the real one.
+
+    Every candidate in a window is probed before the bound is consulted, so the limit bites on the
+    number of WINDOWS walked rather than on a decoy count an attacker sets. A probe is a
+    decompressor rejecting a few bytes -- measured 20 chance gzip magics across 400 MiB of random
+    data, none of which inflated -- so probing them all is cheap and a real payload is still found.
+
     Offset 0 is excluded deliberately: a stream that begins the file is not an overlay and the
     ordinary openers already read it.
     """
@@ -307,11 +324,11 @@ def _overlay_offset(source: Path | bytes) -> int | None:
             at for magic in _OVERLAY_MAGIC for at in _offsets_of(window, magic) if base + at > 0
         )
         for at in found:
-            probed += 1
-            if probed > _MAX_OVERLAY_CANDIDATES:
-                return None
             if _decompresses(_read_at(source, base + at, _OVERLAY_PROBE_BYTES) or b""):
                 return base + at
+        probed += len(found)
+        if probed > _MAX_OVERLAY_CANDIDATES:
+            return OVERLAY_UNPROBED
     return None
 
 
@@ -396,6 +413,20 @@ def _looks_like_zlib(head: bytes) -> bool:
 
 
 def _is_openpgp_encrypted(head: bytes) -> bool | None:
+    """Whether `head` begins an encrypted OpenPGP message, or None if that cannot be decided.
+
+    Marker packets are stripped first, exactly as the secret-key test strips them. Normalizing for
+    one predicate and not the other meant `ca 03 50 47 50` in front of a real encrypted message --
+    which GnuPG decrypts happily -- made this see tag 10, report "not encrypted", and publish the
+    ciphertext. Stopping ON a marker at the bound is undecided, not clean.
+    """
+    head, stopped_on_marker = _after_openpgp_markers(head)
+    if stopped_on_marker:
+        return None
+    return _encrypted_message_head(head)
+
+
+def _encrypted_message_head(head: bytes) -> bool | None:
     """Whether `head` begins an encrypted OpenPGP message.
 
     `gpg --symmetric` and `gpg --encrypt` write a session-key packet followed by an encrypted data
@@ -812,9 +843,19 @@ def _zip_member_count(source: Path | bytes, limit: int = _MAX_ARCHIVE_MEMBERS) -
     # 500-entry archive down to 1 left all 500 entries materialized while this bound saw one
     # member. The directory itself is walked instead, which is the same bytes the constructor
     # reads but without allocating a `ZipInfo` per entry -- the cost this bound exists to avoid.
+    # Only a WALKED count may exceed the bound. The claimed field is attacker-controlled and the
+    # record holding it is found by searching the tail, so any file can carry one: a tar member of
+    # ordinary text plus `PK\x05\x06` and a zip64 record claimed 100,001 members and made a clean
+    # tar -- holding no zip at all -- unpublishable. A claim the directory does not corroborate is
+    # not evidence of members; it is evidence of four bytes.
+    #
+    # This does not weaken the bound it exists for. A real oversized archive HAS a real directory,
+    # so the walk reaches it and the refusal still fires; and an archive whose directory cannot be
+    # walked is rejected by `ZipFile` itself, with the per-member loop enforcing the same limit.
     walked = _zip_directory_entries(source, tail, offset, limit)
-    if walked is not None:
-        total = max(total, walked)
+    if walked is None:
+        return min(total, limit)
+    total = max(total, walked)
     if total != 0xFFFF:
         return total
     # zip64 end-of-central-directory: the 8-byte total sits 32 bytes into its own record
