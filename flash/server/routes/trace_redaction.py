@@ -11,6 +11,7 @@ from typing import Any
 from flash.server.platform import traces as platform_traces
 from flash.server.routes.trace_schema_identity import (
     SchemaResourceScopes,
+    _declares_legacy_id_dialect,
     _local_schema_pointer,
     _schema_resource_id,
 )
@@ -87,6 +88,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
         return set()
     refs: set[tuple[str, ...]] = set()
     scopes = SchemaResourceScopes.build(value, depth=depth)
+    legacy_id_dialect = _declares_legacy_id_dialect(value, depth=depth)
     base_uri = scopes.base_uri
     resources = scopes.resources
     anchors = scopes.anchors
@@ -100,7 +102,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
             return set()
         found: set[tuple[str, ...]] = set()
         if isinstance(node, dict):
-            resource_id = _schema_resource_id(node)
+            resource_id = _schema_resource_id(node, legacy_id_dialect=legacy_id_dialect)
             if isinstance(resource_id, str):
                 scope_uri = _safe_urljoin(scope_uri, resource_id)
             for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
@@ -173,7 +175,7 @@ def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[s
         if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
             return
         if isinstance(node, dict):
-            resource_id = _schema_resource_id(node)
+            resource_id = _schema_resource_id(node, legacy_id_dialect=legacy_id_dialect)
             if isinstance(resource_id, str):
                 scope_uri = _safe_urljoin(scope_uri, resource_id)
             # `patternProperties` declares secret-looking members too: `{"^secret_": {...}}` marks
@@ -282,7 +284,12 @@ def _redact_json_text(
         return "[redacted]" if on_unparseable(value) else value
     if not isinstance(parsed, dict | list):
         return value
-    redacted = _redact_secret_fields(parsed, depth=depth + 1, flag=flag)
+    # the document that was just parsed may itself carry a SERIALIZED document in one of its
+    # fields -- `{"payload": "{\"password\": \"...\"}"}` is what a tool that forwards another
+    # tool's output emits. the recursion re-enters the walker, where such a field is an ordinary
+    # scalar, so nothing parsed it and the inner credential reached the raw export. the flag makes
+    # every string leaf below here eligible for the same parse-and-redact treatment.
+    redacted = _redact_secret_fields(parsed, depth=depth + 1, flag=flag, structured_content=True)
     return json.dumps(redacted, separators=(",", ":"))
 
 
@@ -483,6 +490,7 @@ def _redact_secret_child(
     response_error: bool,
     function_container: bool,
     tool_result_content: bool,
+    structured_content: bool,
     schema_host: bool,
     schema_wrapper: bool,
     tool_call: bool,
@@ -545,6 +553,7 @@ def _redact_secret_child(
             assistant_content=assistant_content,
             response_error=response_error,
         ),
+        structured_content=structured_content,
         function_arguments=function_container and key == "arguments",
         tool_result_content=_carries_tool_result(
             value, key, inside_tool_result=tool_result_content
@@ -597,6 +606,7 @@ def _redact_secret_fields(
     response_error: bool = False,
     function_arguments: bool = False,
     tool_result_content: bool = False,
+    structured_content: bool = False,
     function_container: bool = False,
     schema_host: bool = False,
     schema_wrapper: bool = False,
@@ -656,6 +666,7 @@ def _redact_secret_fields(
                     response_error=response_error,
                     function_container=function_container,
                     tool_result_content=tool_result_content,
+                    structured_content=structured_content,
                     schema_host=schema_host,
                     schema_wrapper=schema_wrapper,
                     tool_call=tool_call,
@@ -679,6 +690,7 @@ def _redact_secret_fields(
             assistant_content=assistant_content,
             response_error=response_error,
             tool_result_content=tool_result_content,
+            structured_content=structured_content,
             schema_host=schema_host,
             tool_definition_list=tool_definition_list,
             tool_call_list=tool_call_list,
@@ -694,6 +706,7 @@ def _redact_secret_fields(
         function_arguments=function_arguments,
         assistant_content=assistant_content,
         response_error=response_error,
+        structured_content=structured_content,
         flag=flag,
     )
 
@@ -759,6 +772,7 @@ def _redact_secret_sequence(
     assistant_content: bool,
     response_error: bool,
     tool_result_content: bool,
+    structured_content: bool,
     schema_host: bool,
     tool_definition_list: str | None,
     tool_call_list: bool,
@@ -793,6 +807,9 @@ def _redact_secret_sequence(
             # tool's output then sits in each part's `text`. dropping the flag at the list hop
             # left a serialized credential in a part verbatim.
             tool_result_content=tool_result_content,
+            # a parsed document's arrays hold its strings too, so the serialized-document flag
+            # has to survive the list hop for the same reason.
+            structured_content=structured_content,
             # inside a declaration array the host survives only for entries that really are tool
             # definitions; a fake entry beside a real one gets no exemption of its own.
             schema_host=schema_host
@@ -840,11 +857,20 @@ def _redact_secret_scalar(
     function_arguments: bool,
     assistant_content: bool,
     response_error: bool,
+    structured_content: bool,
     flag: _SanitizationFlag | None,
 ) -> Any:
     """Redact a leaf value, whose handling depends on the field that carries it."""
     if tool_result_content and isinstance(value, str):
         return _redact_tool_result_content(value, depth=depth, flag=flag)
+    if structured_content and isinstance(value, str):
+        # a leaf INSIDE a document that was itself parsed out of a string. one tool forwarding
+        # another's output nests the serialization -- `{"payload": "{\"password\": \"...\"}"}` --
+        # and each level is an ordinary scalar to the walker, so the inner credential survived.
+        # unparseable text is left alone here: this leaf is a member of a document that already
+        # parsed, so it is ordinary data rather than the truncated-envelope case, and blanking on
+        # appearance would destroy prose that merely quotes a `"name": value` pair.
+        return _redact_json_text(value, depth=depth, flag=flag, on_unparseable=lambda _: False)
     if response_error and isinstance(value, str):
         # an upstream rejection quotes the fragment it rejected, so a diagnostic string carries
         # request json spliced into prose -- `Invalid metadata: {"password":"THIRDPARTY"}`. it is

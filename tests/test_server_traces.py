@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import sqlite3
 import sys
 import threading
@@ -30,6 +31,7 @@ from flash.server.platform.traces import (
 from flash.server.routes import (
     trace_fragments,
     trace_redaction,
+    trace_schema_identity,
     trace_secret_names,
     trace_sse,
     trace_uri,
@@ -10465,3 +10467,181 @@ def test_single_candidate_export_is_unchanged(
     payload: dict[str, Any], expected: str | None
 ) -> None:
     assert platform_traces._chat_reply(payload) == expected
+
+
+def _tool_result(content: str) -> dict[str, Any]:
+    return {"messages": [{"role": "tool", "content": content}]}
+
+
+def _tool_result_text(payload: dict[str, Any]) -> str:
+    sanitized = traces._sanitize_for_trace(payload, ())
+    return sanitized["messages"][0]["content"]
+
+
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        lambda inner: {"payload": inner},
+        lambda inner: {"a": json.dumps({"b": inner})},
+        lambda inner: {"items": [inner]},
+    ],
+    ids=["nested", "twice-nested", "in-array"],
+)
+def test_a_serialized_document_inside_a_parsed_one_is_redacted(wrap) -> None:
+    """A tool that forwards another tool's output nests the serialization, so a parsed document
+    carries a SERIALIZED document in one of its fields. Each level is an ordinary scalar to the
+    walker, so nothing parsed the inner one and its credential reached the raw export."""
+
+    inner = json.dumps({"password": "NESTEDLEAK"})
+
+    text = _tool_result_text(_tool_result(json.dumps(wrap(inner))))
+
+    assert "NESTEDLEAK" not in text
+    assert "[redacted]" in text
+
+
+@pytest.mark.parametrize(
+    ("leaf", "expected"),
+    [
+        ('field "name": required', 'field "name": required'),
+        ("all good", "all good"),
+        ('{"password":"TRUNC', '{"password":"TRUNC'),
+    ],
+    ids=["quotes-a-pair", "plain-prose", "unparseable-fragment"],
+)
+def test_an_ordinary_leaf_of_a_parsed_document_survives(leaf: str, expected: str) -> None:
+    """The nested-document pass must not blank ordinary members. A leaf here belongs to a document
+    that already parsed, so it is data rather than a truncated envelope: prose that quotes a
+    `"name": value` pair survives, and so does a fragment that cannot be parsed."""
+
+    text = _tool_result_text(_tool_result(json.dumps({"note": leaf})))
+
+    assert json.loads(text)["note"] == expected
+
+
+def _dialect_payload(dialect: str | None) -> dict[str, Any]:
+    parameters: dict[str, Any] = {
+        "$id": "https://example.com/root.json",
+        "properties": {
+            "wrapper": {"id": "sub/", "properties": {"password": {"$ref": "creds.json"}}}
+        },
+        "$defs": {
+            "atRoot": {
+                "$id": "https://example.com/creds.json",
+                "properties": {"town": {"default": "ROOT_ANNOT"}},
+            },
+            "atSub": {
+                "$id": "https://example.com/sub/creds.json",
+                "properties": {"town": {"default": "SUB_ANNOT"}},
+            },
+        },
+    }
+    if dialect is not None:
+        parameters = {"$schema": dialect, **parameters}
+    return {"tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}]}
+
+
+@pytest.mark.parametrize(
+    ("dialect", "redacted", "preserved"),
+    [
+        ("https://json-schema.org/draft/2020-12/schema", "atRoot", "atSub"),
+        ("http://json-schema.org/draft-07/schema#", "atRoot", "atSub"),
+        ("http://json-schema.org/draft-04/schema#", "atSub", "atRoot"),
+        (None, "atSub", "atRoot"),
+    ],
+    ids=["2020-12", "draft-07", "draft-04", "no-dialect"],
+)
+def test_a_plain_id_declares_a_resource_only_in_the_dialect_that_spells_it(
+    dialect: str | None, redacted: str, preserved: str
+) -> None:
+    """Draft-06 renamed the identifier to `$id`, so under a later dialect a plain `id` is an
+    unknown annotation. Reading every `id` as draft-04 moved the base URI and pointed the relative
+    `$ref` at the wrong definition: the real target kept its credential-bearing literals while an
+    unrelated sibling was rewritten."""
+
+    definitions = traces._sanitize_for_trace(_dialect_payload(dialect), ())["tools"][0]["function"][
+        "parameters"
+    ]["$defs"]
+
+    assert definitions[redacted]["properties"]["town"]["default"] == "[redacted]"
+    assert definitions[preserved]["properties"]["town"]["default"] != "[redacted]"
+
+
+@pytest.mark.parametrize(
+    ("dialect", "legacy"),
+    [
+        ("http://json-schema.org/draft-04/schema#", True),
+        ("http://json-schema.org/draft-03/schema#", True),
+        ("http://json-schema.org/draft-07/schema#", False),
+        ("https://json-schema.org/draft/2020-12/schema", False),
+        (None, True),
+    ],
+    ids=["draft-04", "draft-03", "draft-07", "2020-12", "absent"],
+)
+def test_the_dialect_is_found_wherever_the_schema_document_sits(
+    dialect: str | None, legacy: bool
+) -> None:
+    """The resolver runs on the payload root and on each envelope above `parameters`, none of which
+    carry `$schema`. Reading it off the top node alone left every enclosing call on the legacy
+    reading, and the outermost of those decided the result."""
+
+    assert trace_schema_identity._declares_legacy_id_dialect(_dialect_payload(dialect)) is legacy
+
+
+@pytest.mark.parametrize(
+    ("pattern", "secret"),
+    [
+        (r"^pass\x77ord$", True),
+        (r"^pass\167ord$", True),
+        (r"^password$", True),
+        (r"^pass\U00000077ord$", True),
+        (r"^api\x5Fkey$", True),
+        (r"^cit\x79$", False),
+        (r"^cit\171$", False),
+        (r"^pass\dord$", False),
+        (r"^pass\word$", False),
+        (r"^(pass)\1ord$", False),
+        (r"^pass\x7$", False),
+        (r"^pass\xZZord$", False),
+        (r"^pass\u007$", False),
+        (r"^pass\400ord$", False),
+    ],
+    ids=[
+        "hex",
+        "octal",
+        "unicode-short",
+        "unicode-long",
+        "hex-underscore",
+        "hex-benign",
+        "octal-benign",
+        "digit-class",
+        "word-class",
+        "backreference",
+        "short-hex",
+        "non-hex",
+        "short-unicode",
+        "out-of-range-octal",
+    ],
+)
+def test_a_fixed_numeric_escape_spells_the_character_it_denotes(pattern: str, secret: bool) -> None:
+    """`\\x77`, `\\167` and `\\u0077` all spell `w`, so `^pass\\x77ord$` matches exactly `password`.
+    Reading the escape as an opaque construct left that credential's schema unrecognized and its
+    `default`/`const`/`enum` visible. A backreference matches whatever a group captured and a class
+    escape matches many names, so neither names one field."""
+
+    assert trace_secret_names._is_secret_property_pattern(pattern) is secret
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [r"^pass\x77ord$", r"^pass\167ord$", r"^pass\u0077ord$", r"^password$", r"^\x70assword$"],
+    ids=["hex", "octal", "unicode", "plain", "leading-hex"],
+)
+def test_a_decoded_name_is_the_name_the_regex_engine_matches(pattern: str) -> None:
+    """The decoder's claim is checked against the real engine: whatever name it reports must be
+    exactly what the pattern matches, or the redaction decision rests on a fiction."""
+
+    name = trace_secret_names._literal_name(trace_secret_names._unwrap_pattern_groups(pattern))
+
+    assert name is not None
+    assert re.fullmatch(pattern, name)

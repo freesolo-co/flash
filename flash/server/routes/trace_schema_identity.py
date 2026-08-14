@@ -52,24 +52,80 @@ def _local_schema_pointer(
     return frozenset()
 
 
-def _schema_resource_id(node: dict[Any, Any]) -> str | None:
+# dialects that spell the resource identifier `id`. draft-06 renamed it to `$id`, and from there
+# on a plain `id` is an unknown keyword -- an ordinary annotation, not an identity declaration.
+_LEGACY_ID_DIALECT_MARKERS = ("draft-03", "draft-04")
+
+
+def _declares_legacy_id_dialect(document: Any, *, depth: int = 0) -> bool:
+    """Whether a payload's own `$schema` selects a dialect that spells the identifier `id`.
+
+    A modern document may legitimately carry an `id` MEMBER -- `{"properties": {"id": ...}}` is the
+    commonest property name there is, and a 2020-12 schema node may annotate itself with one.
+    Reading every `id` as draft-04 started a resource scope that the dialect does not declare, which
+    moved the base URI and pointed a relative `$ref` at the wrong definition: the real target kept
+    its credential-bearing literals while an unrelated sibling was rewritten to "[redacted]".
+
+    The value handed in is often an ENVELOPE rather than the schema -- the resolver runs on the
+    payload root, on `tools`, and on each tool entry before it reaches `parameters` -- so the
+    declaration is searched for rather than read off the top node. Finding it only at the top left
+    every enclosing call reading the legacy dialect, and the outermost of those decided the result.
+
+    Absent or unrecognized `$schema` keeps the legacy reading. A schema that declares no dialect is
+    most often legacy, and the failure direction there is redacting a definition that did not need
+    it rather than exporting a credential.
+    """
+    dialect = _declared_dialect(document, depth=depth)
+    if dialect is None:
+        return True
+    return any(marker in dialect for marker in _LEGACY_ID_DIALECT_MARKERS)
+
+
+def _declared_dialect(value: Any, *, depth: int = 0) -> str | None:
+    """The `$schema` a payload declares, at whatever depth the schema document sits."""
+    if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
+        return None
+    if isinstance(value, dict):
+        dialect = value.get("$schema")
+        if isinstance(dialect, str):
+            return dialect
+        for key, item in value.items():
+            if key in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
+                continue
+            found = _declared_dialect(item, depth=depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(value, list | tuple):
+        for item in value:
+            found = _declared_dialect(item, depth=depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _schema_resource_id(node: dict[Any, Any], *, legacy_id_dialect: bool = True) -> str | None:
     """The resource identifier a schema node declares, in either the modern or draft-04 spelling.
 
     Draft-04 spells it `id`. Recognizing only `$id` left a legacy definition's resource unknown, so
     a `$ref` to it resolved nowhere, the target was never marked secret, and its `default` stayed
     verbatim in the raw export. A bare `#fragment` id is the draft-04 plain-name anchor form and is
     handled by the anchor collector instead, so it is not a resource here.
+
+    `legacy_id_dialect` is false when the document's own `$schema` selects a dialect that renamed
+    the keyword, where a plain `id` declares no resource at all.
     """
     resource_id = node.get("$id")
     if isinstance(resource_id, str):
         return resource_id
+    if not legacy_id_dialect:
+        return None
     legacy_id = node.get("id")
     if isinstance(legacy_id, str) and not legacy_id.startswith("#"):
         return legacy_id
     return None
 
 
-def _legacy_id_anchor_name(node: dict[Any, Any]) -> str | None:
+def _legacy_id_anchor_name(node: dict[Any, Any], *, legacy_id_dialect: bool = True) -> str | None:
     """The plain-name anchor a draft-04 `id` declares, in either of its two spellings.
 
     Draft-04 writes an anchor as a bare `#name` OR as a relative URI carrying that fragment, as in
@@ -81,6 +137,8 @@ def _legacy_id_anchor_name(node: dict[Any, Any]) -> str | None:
     instead. `$id` is deliberately excluded: modern schemas spell anchors with `$anchor`, and a
     fragment on `$id` is not an anchor declaration.
     """
+    if not legacy_id_dialect:
+        return None
     legacy_id = node.get("id")
     if not isinstance(legacy_id, str):
         return None
@@ -91,7 +149,7 @@ def _legacy_id_anchor_name(node: dict[Any, Any]) -> str | None:
 
 
 def _schema_resource_pointers(
-    value: Any, *, depth: int = 0
+    value: Any, *, depth: int = 0, legacy_id_dialect: bool = True
 ) -> dict[str, frozenset[tuple[str, ...]]]:
     """Every path declaring each canonical resource id.
 
@@ -106,7 +164,7 @@ def _schema_resource_pointers(
         if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
             return
         if isinstance(node, dict):
-            resource_id = _schema_resource_id(node)
+            resource_id = _schema_resource_id(node, legacy_id_dialect=legacy_id_dialect)
             if isinstance(resource_id, str):
                 base_uri = _safe_urljoin(base_uri, resource_id)
                 canonical = _canonical_resource_uri(_safe_urldefrag(base_uri)[0])
@@ -122,7 +180,9 @@ def _schema_resource_pointers(
     return {uri: frozenset(paths) for uri, paths in resources.items()}
 
 
-def _schema_anchor_pointers(value: Any, *, depth: int = 0) -> dict[str, frozenset[tuple[str, ...]]]:
+def _schema_anchor_pointers(
+    value: Any, *, depth: int = 0, legacy_id_dialect: bool = True
+) -> dict[str, frozenset[tuple[str, ...]]]:
     anchors: dict[str, set[tuple[str, ...]]] = {}
     keywords = ("$anchor", "$dynamicAnchor")
 
@@ -137,7 +197,7 @@ def _schema_anchor_pointers(value: Any, *, depth: int = 0) -> dict[str, frozense
             # draft-04 spells a plain-name anchor as `id: "#name"` or as a relative URI carrying
             # that fragment (`id: "defs#cred"`). without both a `$ref` to it resolved to nothing
             # and the legacy target kept its secret literal.
-            legacy_anchor = _legacy_id_anchor_name(node)
+            legacy_anchor = _legacy_id_anchor_name(node, legacy_id_dialect=legacy_id_dialect)
             if legacy_anchor is not None:
                 anchors.setdefault(legacy_anchor, set()).add(path)
             if node.get("$recursiveAnchor") is True:
@@ -202,9 +262,16 @@ class SchemaResourceScopes:
 
     @classmethod
     def build(cls, value: Any, *, depth: int = 0) -> SchemaResourceScopes:
-        document_id = _schema_resource_id(value) if isinstance(value, dict) else None
+        legacy_id_dialect = _declares_legacy_id_dialect(value, depth=depth)
+        document_id = (
+            _schema_resource_id(value, legacy_id_dialect=legacy_id_dialect)
+            if isinstance(value, dict)
+            else None
+        )
         base_uri = document_id if isinstance(document_id, str) else ""
-        resources = _schema_resource_pointers(value, depth=depth)
+        resources = _schema_resource_pointers(
+            value, depth=depth, legacy_id_dialect=legacy_id_dialect
+        )
         resources.setdefault(_canonical_resource_uri(_safe_urldefrag(base_uri)[0]), frozenset({()}))
         return cls(
             base_uri=base_uri,
@@ -212,7 +279,9 @@ class SchemaResourceScopes:
             # `$dynamicAnchor` also declares an ordinary plain-name fragment, so a static `$ref`
             # resolves to it as well. one map serves both keywords: splitting them let
             # `{"$ref": "#Name"}` miss a `$dynamicAnchor: "Name"` target and persist its literals.
-            anchors=_schema_anchor_pointers(value, depth=depth),
+            anchors=_schema_anchor_pointers(
+                value, depth=depth, legacy_id_dialect=legacy_id_dialect
+            ),
             dynamic_anchors=_schema_dynamic_anchor_pointers(value, depth=depth),
             _scopes=tuple(
                 sorted(

@@ -142,6 +142,55 @@ _PATTERN_METACHARACTERS = frozenset(".+*?()[]{}|^$")
 # left `^api\-key$` -- a perfectly ordinary spelling of a credential name -- unrecognized.
 _ESCAPABLE_LITERALS = _PATTERN_METACHARACTERS | frozenset("-/\\ ")
 
+# escapes that spell one fixed character by NUMBER rather than by itself, as `\x77`, `\167` and
+# `w` all spell `w`. each is a literal, so `^pass\x77ord$` matches exactly `password` -- and
+# reading the escape as an opaque construct left that credential's schema unrecognized.
+_HEX_ESCAPE_WIDTHS: dict[str, int] = {"x": 2, "u": 4, "U": 8}
+_OCTAL_ESCAPE_DIGITS = 3
+_MAX_OCTAL_ESCAPE = 0o377
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_OCTAL_DIGITS = frozenset("01234567")
+
+
+def _decode_numeric_escape(pattern: str, index: int) -> tuple[str, int] | None:
+    """The character a fixed numeric escape at `index` denotes, and the index just past it.
+
+    `index` addresses the character AFTER the backslash. None means this is not a fixed numeric
+    escape, which leaves the caller to refuse the pattern rather than guess at what it matches.
+    """
+    marker = pattern[index]
+    width = _HEX_ESCAPE_WIDTHS.get(marker)
+    if width is not None:
+        digits = pattern[index + 1 : index + 1 + width]
+        if len(digits) != width or not all(digit in _HEX_DIGITS for digit in digits):
+            return None
+        return _character_for(int(digits, 16), index + 1 + width)
+    if marker not in _OCTAL_DIGITS:
+        return None
+    digits = ""
+    while (
+        len(digits) < _OCTAL_ESCAPE_DIGITS
+        and index + len(digits) < len(pattern)
+        and pattern[index + len(digits)] in _OCTAL_DIGITS
+    ):
+        digits += pattern[index + len(digits)]
+    # `\0` opens an octal escape, and so does any run of exactly three octal digits: `\167` is `w`.
+    # a SHORTER run that does not start at zero is a group backreference, which matches whatever
+    # that group captured rather than one fixed character.
+    if marker != "0" and len(digits) != _OCTAL_ESCAPE_DIGITS:
+        return None
+    code = int(digits, 8)
+    # past `\377` the escape is not a valid pattern at all, so it names nothing.
+    if code > _MAX_OCTAL_ESCAPE:
+        return None
+    return _character_for(code, index + len(digits))
+
+
+def _character_for(code: int, end: int) -> tuple[str, int] | None:
+    """The character a decoded code point denotes. None past the Unicode range, which no name
+    contains, so refusing it judges nothing secret -- the safe direction."""
+    return (chr(code), end) if code <= 0x10FFFF else None
+
 
 def _literal_name(pattern: str) -> str | None:
     """The single field name a pattern matches, or None if it matches more than that one name.
@@ -152,19 +201,31 @@ def _literal_name(pattern: str) -> str | None:
     literals in the raw export -- the leak this test exists to close, arrived at from the other
     side. Escapes are therefore decoded to the character they denote.
 
-    Only escapes of a metacharacter are decoded. `\\d`, `\\w` and `\\s` are classes that match many
-    names, and an unterminated trailing backslash is not a name at all; both return None, which
-    judges nothing secret and is the safe direction.
+    A FIXED numeric escape is a literal for the same reason: `\\x77`, `\\167` and `\\u0077` all spell
+    `w`, so `^pass\\x77ord$` matches exactly `password`.
+
+    What is not decoded is what does not denote one character. `\\d`, `\\w` and `\\s` are classes
+    matching many names; `\\1` is a backreference to whatever a group captured; an unterminated
+    trailing backslash is not a name at all. Each returns None, which judges nothing secret and is
+    the safe direction.
     """
     decoded: list[str] = []
     index = 0
     while index < len(pattern):
         character = pattern[index]
         if character == "\\":
-            if index + 1 >= len(pattern) or pattern[index + 1] not in _ESCAPABLE_LITERALS:
+            if index + 1 >= len(pattern):
                 return None
-            decoded.append(pattern[index + 1])
-            index += 2
+            following = pattern[index + 1]
+            if following in _ESCAPABLE_LITERALS:
+                decoded.append(following)
+                index += 2
+                continue
+            numeric = _decode_numeric_escape(pattern, index + 1)
+            if numeric is None:
+                return None
+            literal, index = numeric
+            decoded.append(literal)
             continue
         if character in _PATTERN_METACHARACTERS:
             return None
