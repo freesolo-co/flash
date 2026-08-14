@@ -39,6 +39,7 @@ class SseDoneGate:
         self._event_prefix_relayed = False
         self._at_stream_start = True
         self._leading_bom = False
+        self._relayed_tail_is_open = False
         self.done_event: bytes | None = None
 
     @property
@@ -48,6 +49,23 @@ class SseDoneGate:
     @property
     def done_event_has_relayed_prefix(self) -> bool:
         return self.done_event is not None and self._event_prefix_relayed
+
+    @property
+    def relayed_tail_is_open(self) -> bool:
+        """Whether the bytes relayed so far end mid-line, with no terminating newline.
+
+        A caller appending its own SSE line (the record-failed comment) must know this: appending
+        to an unterminated line FUSES the two, mutating bytes the provider actually sent. The
+        existing `done_event_has_relayed_prefix` cannot answer it -- that is False both for a
+        `[DONE]` whose prefix was withheld and for a stream carrying no `[DONE]` at all.
+        """
+        return self._relayed_tail_is_open
+
+    def _emit(self, forwarded: bytes) -> list[bytes]:
+        if not forwarded:
+            return []
+        self._relayed_tail_is_open = not forwarded.endswith(b"\n")
+        return [forwarded]
 
     def feed(self, chunk: bytes) -> list[bytes]:
         if self.done_event is not None:
@@ -84,7 +102,7 @@ class SseDoneGate:
                     self._buffer.clear()
                     self._line_start = 0
                     self._scan_start = 0
-                    return [bytes(forwarded)] if forwarded else []
+                    return self._emit(bytes(forwarded))
                 forwarded.extend(self._buffer[:next_cursor])
                 del self._buffer[:next_cursor]
                 self._line_start = 0
@@ -137,7 +155,7 @@ class SseDoneGate:
                 self._holding_done_candidate = False
             else:
                 self._scan_start = _resume_scan_at(self._buffer)
-            return [bytes(forwarded)] if forwarded else []
+            return self._emit(bytes(forwarded))
 
         trailing = bytes(self._buffer)
         parsed_trailing = (
@@ -176,7 +194,7 @@ class SseDoneGate:
                 b"data:"
             )
             self._leading_bom = False
-        return [bytes(forwarded)] if forwarded else []
+        return self._emit(bytes(forwarded))
 
     def finish(self) -> list[bytes]:
         if self.done_event is not None:
@@ -192,7 +210,7 @@ class SseDoneGate:
         self._event_in_progress = False
         self._partial_line_in_progress = False
         self._holding_done_candidate = False
-        return [forwarded] if forwarded else []
+        return self._emit(forwarded)
 
 
 def _is_data_field(line: bytes) -> bool:

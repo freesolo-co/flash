@@ -423,6 +423,11 @@ async def _stream_response(
     if not client_disconnected and done_gate is not None:
         if context.record_failed:
             comment = b": freesolo-record-failed\n"
+            # the comment must START its own line, or it fuses to whatever was relayed last and
+            # mutates the provider's bytes. that happens when the stream ended mid-line -- no
+            # `[DONE]`, no trailing newline -- which `done_event_has_relayed_prefix` cannot report.
+            if done_gate.relayed_tail_is_open:
+                comment = b"\n" + comment
             if not done_gate.done_event_has_relayed_prefix:
                 comment += b"\n"
             yield comment

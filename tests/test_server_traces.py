@@ -8439,3 +8439,145 @@ def test_a_secret_pattern_property_follows_its_references() -> None:
     )
 
     assert ordinary["tools"][0]["function"]["parameters"]["$defs"]["Item"]["default"] == "widget"
+
+
+def test_a_tool_selector_is_not_a_schema_declaration() -> None:
+    """`tool_choice` and a root `function_call` SELECT an already-declared function by name; the
+    schema lives in `tools`, not in the selector. Treating them as schema hosts let a nested
+    `parameters` wrapper read `password` as a declared property and keep its unknown `value`."""
+    choice = {
+        "tool_choice": {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"password": {"type": "string", "value": "CHOICELEAK"}},
+                },
+            },
+        }
+    }
+    call = {
+        "function_call": {
+            "name": "lookup",
+            "parameters": {
+                "type": "object",
+                "properties": {"api_key": {"type": "string", "value": "CALLLEAK"}},
+            },
+        }
+    }
+
+    assert "CHOICELEAK" not in json.dumps(traces._redact_secret_fields(choice))
+    assert "CALLLEAK" not in json.dumps(traces._redact_secret_fields(call))
+
+    # the ordinary selector spellings are untouched, and a real declaration still hosts a schema
+    assert traces._redact_secret_fields({"tool_choice": "auto"}) == {"tool_choice": "auto"}
+    named = traces._redact_secret_fields(
+        {"tool_choice": {"type": "function", "function": {"name": "lookup"}}}
+    )
+    assert named["tool_choice"]["function"]["name"] == "lookup"
+    declared = traces._redact_secret_fields(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"password": {"type": "string", "description": "pw"}},
+                        },
+                    },
+                }
+            ]
+        }
+    )
+    assert declared["tools"][0]["function"]["parameters"]["properties"]["password"] == {
+        "type": "string",
+        "description": "pw",
+    }
+
+
+def test_a_uri_form_draft_04_id_declares_an_anchor_too() -> None:
+    """Draft-04 writes an anchor as a bare `#name` OR as a relative URI carrying that fragment.
+    Accepting only the bare form left `$ref: "defs#cred"` resolving to a known resource but an
+    unknown anchor, so the target was never marked secret and its literal stayed in raw export."""
+
+    def payload(literal_keyword: str, literal: str) -> dict:
+        return {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"api_key": {"$ref": "defs#cred"}},
+                            "definitions": {
+                                "Cred": {
+                                    "id": "defs#cred",
+                                    "type": "string",
+                                    literal_keyword: literal,
+                                }
+                            },
+                        },
+                    },
+                }
+            ]
+        }
+
+    assert "URIFORMLEAK" not in json.dumps(
+        traces._redact_secret_fields(payload("default", "URIFORMLEAK"))
+    )
+    assert "URICONSTLEAK" not in json.dumps(
+        traces._redact_secret_fields(payload("const", "URICONSTLEAK"))
+    )
+
+    # a `#/pointer` fragment is a JSON pointer, not a plain name, and declares no anchor
+    pointer_form = traces._redact_secret_fields(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"item": {"$ref": "#/definitions/Item"}},
+                            "definitions": {
+                                "Item": {"id": "defs#/definitions/Item", "default": "widget"}
+                            },
+                        },
+                    },
+                }
+            ]
+        }
+    )
+    parameters = pointer_form["tools"][0]["function"]["parameters"]
+    assert parameters["definitions"]["Item"]["default"] == "widget"
+
+
+def test_a_truncated_stream_keeps_its_partial_line_intact(trace_api, monkeypatch) -> None:
+    """A provider stream can end mid-line, with no trailing newline and no `[DONE]`. Appending the
+    record-failed comment straight onto that tail FUSED the two into one corrupted line, mutating
+    bytes the provider actually sent -- and `done_event_has_relayed_prefix` cannot detect it,
+    because it is False both for a withheld `[DONE]` prefix and for no `[DONE]` at all."""
+    _StreamingAsyncClient.requests = []
+    _StreamingAsyncClient.status_code = 200
+    completion = b'data: {"choices":[{"index":0,"delta":{"content":"world"}}]}\n\n'
+    partial = b'data: {"choices":[{"index":0,"del'
+    _StreamingAsyncClient.body = _StreamingBody([completion, partial])
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StreamingAsyncClient)
+
+    def _explode(**kwargs) -> str:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(traces, "store_trace", _explode)
+
+    response = trace_api.post(
+        "/v1/chat/completions", headers=_HEADERS, json={**_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 200
+    assert partial + b": freesolo-record-failed" not in response.content
+    assert response.content == completion + partial + b"\n: freesolo-record-failed\n\n"

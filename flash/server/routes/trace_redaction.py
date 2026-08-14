@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import unquote
 
 from flash.server.platform import traces as platform_traces
+from flash.server.routes.trace_schema_identity import (
+    _local_schema_pointer,
+    _schema_anchor_pointers,
+    _schema_dynamic_anchor_pointers,
+    _schema_resource_id,
+    _schema_resource_pointers,
+)
 from flash.server.routes.trace_uri import (
     _canonical_resource_uri,
     _safe_urldefrag,
@@ -147,9 +152,11 @@ _JSON_SCHEMA_WRAPPER_KEYS = frozenset({"schema", "parameters", "input_schema", "
 # only these names are a request's OWN top-level declaration. the rest of the host vocabulary is
 # spelled only INSIDE one of them, so accepting those at the root let an unrelated top-level
 # extension named `function` or `json_schema` open a host for its whole subtree.
-_ROOT_SCHEMA_HOST_KEYS = frozenset(
-    {"tools", "functions", "tool_choice", "function_call", "response_format", "text_format"}
-)
+# `tool_choice` and a root `function_call` SELECT an already-declared function by name; neither
+# carries a schema. Listing them here let `{"tool_choice": {"function": {"parameters": ...}}}` open
+# a host, and the nested wrapper then read `password` as a schema property and kept its unknown
+# `value` verbatim -- a credential in a selector, which the tool declaration itself never contains.
+_ROOT_SCHEMA_HOST_KEYS = frozenset({"tools", "functions", "response_format", "text_format"})
 # a declaration is its NAME and its SHAPE. `tools` and `functions` are arrays of tool definitions;
 # the rest are single objects. accepting the name alone let `{"tools": {"parameters": {...}}}` --
 # which no provider would accept -- open a host whose nested wrapper then kept a secret property's
@@ -333,132 +340,6 @@ def _redact_schema_literal(value: Any, *, depth: int, flag: _SanitizationFlag | 
     if isinstance(value, list | tuple):
         return [_redact_schema_literal(item, depth=depth + 1, flag=flag) for item in value]
     return "[redacted]"
-
-
-def _local_schema_pointer(
-    ref: str,
-    anchors: Mapping[str, frozenset[tuple[str, ...]]],
-    *,
-    base_uri: str = "",
-) -> frozenset[tuple[str, ...]]:
-    if not ref.startswith("#"):
-        ref_base, fragment = _safe_urldefrag(_safe_urljoin(base_uri, ref))
-        document_base = _safe_urldefrag(base_uri)[0]
-        if not document_base or ref_base != document_base:
-            return frozenset()
-        ref = f"#{fragment}"
-    ref = unquote(ref)
-    if ref == "#":
-        return frozenset({()})
-    if ref.startswith("#/"):
-        segments = tuple(
-            segment.replace("~1", "/").replace("~0", "~") for segment in ref[2:].split("/")
-        )
-        return frozenset({segments}) if segments else frozenset()
-    if ref.startswith("#") and len(ref) > 1:
-        return anchors.get(ref[1:], frozenset())
-    return frozenset()
-
-
-def _schema_resource_id(node: dict[Any, Any]) -> str | None:
-    """The resource identifier a schema node declares, in either the modern or draft-04 spelling.
-
-    Draft-04 spells it `id`. Recognizing only `$id` left a legacy definition's resource unknown, so
-    a `$ref` to it resolved nowhere, the target was never marked secret, and its `default` stayed
-    verbatim in the raw export. A bare `#fragment` id is the draft-04 plain-name anchor form and is
-    handled by the anchor collector instead, so it is not a resource here.
-    """
-    resource_id = node.get("$id")
-    if isinstance(resource_id, str):
-        return resource_id
-    legacy_id = node.get("id")
-    if isinstance(legacy_id, str) and not legacy_id.startswith("#"):
-        return legacy_id
-    return None
-
-
-def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[str, ...]]:
-    resources: dict[str, tuple[str, ...]] = {}
-
-    def collect(node: Any, path: tuple[str, ...], base_uri: str, depth: int) -> None:
-        if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-            return
-        if isinstance(node, dict):
-            resource_id = _schema_resource_id(node)
-            if isinstance(resource_id, str):
-                base_uri = _safe_urljoin(base_uri, resource_id)
-                resources.setdefault(_canonical_resource_uri(_safe_urldefrag(base_uri)[0]), path)
-            for key, item in node.items():
-                if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
-                    collect(item, (*path, str(key)), base_uri, depth + 1)
-        elif isinstance(node, list | tuple):
-            for index, item in enumerate(node):
-                collect(item, (*path, str(index)), base_uri, depth + 1)
-
-    collect(value, (), "", depth)
-    return resources
-
-
-def _schema_anchor_pointers(value: Any, *, depth: int = 0) -> dict[str, frozenset[tuple[str, ...]]]:
-    anchors: dict[str, set[tuple[str, ...]]] = {}
-    keywords = ("$anchor", "$dynamicAnchor")
-
-    def collect(node: Any, path: tuple[str, ...], depth: int) -> None:
-        if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-            return
-        if isinstance(node, dict):
-            for keyword in keywords:
-                anchor = node.get(keyword)
-                if isinstance(anchor, str):
-                    anchors.setdefault(anchor, set()).add(path)
-            # draft-04 spells a plain-name anchor as `id: "#name"`. without it a `$ref: "#cred"`
-            # resolved to nothing and the legacy target kept its secret literal.
-            legacy_id = node.get("id")
-            if isinstance(legacy_id, str) and legacy_id.startswith("#") and len(legacy_id) > 1:
-                anchors.setdefault(legacy_id[1:], set()).add(path)
-            if node.get("$recursiveAnchor") is True:
-                anchors.setdefault("", set()).add(path)
-            for key, item in node.items():
-                if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
-                    collect(item, (*path, str(key)), depth + 1)
-        elif isinstance(node, list | tuple):
-            for index, item in enumerate(node):
-                collect(item, (*path, str(index)), depth + 1)
-
-    collect(value, (), depth)
-    return {name: frozenset(paths) for name, paths in anchors.items()}
-
-
-def _schema_dynamic_anchor_pointers(
-    value: Any, *, depth: int = 0
-) -> dict[str, frozenset[tuple[str, ...]]]:
-    """Pointers a dynamic reference can reach, keyed by anchor name (`""` for `$recursiveAnchor`).
-
-    `$dynamicRef` and `$recursiveRef` resolve against the dynamic scope, so the target is chosen by
-    the outermost resource that declares the anchor rather than by the reference's own resource.
-    Which resource that is depends on the evaluation entry point, which a redactor recording a
-    payload cannot know, so every same-named dynamic anchor counts as a possible target.
-    """
-    anchors: dict[str, set[tuple[str, ...]]] = {}
-
-    def collect(node: Any, path: tuple[str, ...], depth: int) -> None:
-        if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-            return
-        if isinstance(node, dict):
-            anchor = node.get("$dynamicAnchor")
-            if isinstance(anchor, str):
-                anchors.setdefault(anchor, set()).add(path)
-            if node.get("$recursiveAnchor") is True:
-                anchors.setdefault("", set()).add(path)
-            for key, item in node.items():
-                if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
-                    collect(item, (*path, str(key)), depth + 1)
-        elif isinstance(node, list | tuple):
-            for index, item in enumerate(node):
-                collect(item, (*path, str(index)), depth + 1)
-
-    collect(value, (), depth)
-    return {name: frozenset(paths) for name, paths in anchors.items()}
 
 
 def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[str, ...]]:
