@@ -7,8 +7,9 @@ and is separable from deciding which literals are secret.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any
 from urllib.parse import unquote
 
@@ -25,6 +26,19 @@ from flash.server.routes.trace_uri import (
 _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS = frozenset(
     {"default", "const", "enum", "examples", "example"}
 )
+
+
+def _bounded(members: Iterable[Any]) -> list[Any]:
+    """The leading members of a collection, bounded by the limit storage will apply.
+
+    The wire limit bounds BYTES, so a payload inside 8 MiB can still carry hundreds of thousands of
+    compact members -- 120,000 `$defs` each with a distinct `$id` fits in under 5 MiB. Identity
+    discovery ran before the walker's own bound and retained a resource-map entry and a path tuple
+    for every one of them, and the anchor and scope collectors repeated the same walk, so one
+    request cost hundreds of MB. Members past the bound are dropped here for the same reason the
+    walker drops them: storage will not keep them either.
+    """
+    return list(islice(members, platform_traces._MAX_PAYLOAD_COLLECTION))
 
 
 def _local_schema_pointer(
@@ -103,6 +117,18 @@ def _declared_dialect(value: Any, *, depth: int = 0) -> str | None:
     return None
 
 
+def _node_legacy_id_dialect(node: dict[Any, Any], inherited: bool) -> bool:
+    """The dialect in force AT this node: its own `$schema` if it declares one, else the inherited.
+
+    An embedded resource may select a different dialect from its parent, so the reading cannot be
+    fixed once for the whole payload.
+    """
+    dialect = node.get("$schema")
+    if not isinstance(dialect, str):
+        return inherited
+    return any(marker in dialect for marker in _LEGACY_ID_DIALECT_MARKERS)
+
+
 def _schema_resource_id(node: dict[Any, Any], *, legacy_id_dialect: bool = True) -> str | None:
     """The resource identifier a schema node declares, in either the modern or draft-04 spelling.
 
@@ -160,23 +186,30 @@ def _schema_resource_pointers(
     """
     resources: dict[str, set[tuple[str, ...]]] = {}
 
-    def collect(node: Any, path: tuple[str, ...], base_uri: str, depth: int) -> None:
+    def collect(
+        node: Any, path: tuple[str, ...], base_uri: str, depth: int, legacy_id_dialect: bool
+    ) -> None:
         if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
             return
         if isinstance(node, dict):
-            resource_id = _schema_resource_id(node, legacy_id_dialect=legacy_id_dialect)
+            # an embedded resource may declare its OWN dialect: a 2020-12 document can hold a
+            # draft-04 subschema, where `id` really is the identifier. choosing one dialect for the
+            # whole payload left that resource undiscovered, so a `$ref` to it resolved nowhere and
+            # its credential-bearing literals stayed in the export.
+            legacy_here = _node_legacy_id_dialect(node, legacy_id_dialect)
+            resource_id = _schema_resource_id(node, legacy_id_dialect=legacy_here)
             if isinstance(resource_id, str):
                 base_uri = _safe_urljoin(base_uri, resource_id)
                 canonical = _canonical_resource_uri(_safe_urldefrag(base_uri)[0])
                 resources.setdefault(canonical, set()).add(path)
-            for key, item in node.items():
+            for key, item in _bounded(node.items()):
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
-                    collect(item, (*path, str(key)), base_uri, depth + 1)
+                    collect(item, (*path, str(key)), base_uri, depth + 1, legacy_here)
         elif isinstance(node, list | tuple):
-            for index, item in enumerate(node):
-                collect(item, (*path, str(index)), base_uri, depth + 1)
+            for index, item in enumerate(_bounded(node)):
+                collect(item, (*path, str(index)), base_uri, depth + 1, legacy_id_dialect)
 
-    collect(value, (), "", depth)
+    collect(value, (), "", depth, legacy_id_dialect)
     return {uri: frozenset(paths) for uri, paths in resources.items()}
 
 
@@ -186,10 +219,11 @@ def _schema_anchor_pointers(
     anchors: dict[str, set[tuple[str, ...]]] = {}
     keywords = ("$anchor", "$dynamicAnchor")
 
-    def collect(node: Any, path: tuple[str, ...], depth: int) -> None:
+    def collect(node: Any, path: tuple[str, ...], depth: int, legacy_id_dialect: bool) -> None:
         if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
             return
         if isinstance(node, dict):
+            legacy_here = _node_legacy_id_dialect(node, legacy_id_dialect)
             for keyword in keywords:
                 anchor = node.get(keyword)
                 if isinstance(anchor, str):
@@ -197,19 +231,19 @@ def _schema_anchor_pointers(
             # draft-04 spells a plain-name anchor as `id: "#name"` or as a relative URI carrying
             # that fragment (`id: "defs#cred"`). without both a `$ref` to it resolved to nothing
             # and the legacy target kept its secret literal.
-            legacy_anchor = _legacy_id_anchor_name(node, legacy_id_dialect=legacy_id_dialect)
+            legacy_anchor = _legacy_id_anchor_name(node, legacy_id_dialect=legacy_here)
             if legacy_anchor is not None:
                 anchors.setdefault(legacy_anchor, set()).add(path)
             if node.get("$recursiveAnchor") is True:
                 anchors.setdefault("", set()).add(path)
-            for key, item in node.items():
+            for key, item in _bounded(node.items()):
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
-                    collect(item, (*path, str(key)), depth + 1)
+                    collect(item, (*path, str(key)), depth + 1, legacy_here)
         elif isinstance(node, list | tuple):
-            for index, item in enumerate(node):
-                collect(item, (*path, str(index)), depth + 1)
+            for index, item in enumerate(_bounded(node)):
+                collect(item, (*path, str(index)), depth + 1, legacy_id_dialect)
 
-    collect(value, (), depth)
+    collect(value, (), depth, legacy_id_dialect)
     return {name: frozenset(paths) for name, paths in anchors.items()}
 
 
@@ -234,11 +268,11 @@ def _schema_dynamic_anchor_pointers(
                 anchors.setdefault(anchor, set()).add(path)
             if node.get("$recursiveAnchor") is True:
                 anchors.setdefault("", set()).add(path)
-            for key, item in node.items():
+            for key, item in _bounded(node.items()):
                 if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                     collect(item, (*path, str(key)), depth + 1)
         elif isinstance(node, list | tuple):
-            for index, item in enumerate(node):
+            for index, item in enumerate(_bounded(node)):
                 collect(item, (*path, str(index)), depth + 1)
 
     collect(value, (), depth)

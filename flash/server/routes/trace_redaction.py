@@ -9,12 +9,12 @@ from itertools import islice
 from typing import Any
 
 from flash.server.platform import traces as platform_traces
-from flash.server.routes.trace_schema_identity import (
-    SchemaResourceScopes,
-    _declares_legacy_id_dialect,
+from flash.server.routes.trace_schema_identity import (  # noqa: F401
     _local_schema_pointer,
+    _node_legacy_id_dialect,
     _schema_resource_id,
 )
+from flash.server.routes.trace_schema_refs import _secret_schema_definition_refs
 from flash.server.routes.trace_schema_shape import (  # noqa: F401
     _ARRAY_SHAPED_ROOT_HOST_KEYS,
     _JSON_SCHEMA_KEYWORDS,
@@ -43,11 +43,6 @@ from flash.server.routes.trace_secret_names import (  # noqa: F401
     _is_secret_property_pattern,
     _secret_key_candidates,
     _unwrap_pattern_groups,
-)
-from flash.server.routes.trace_uri import (
-    _canonical_resource_uri,
-    _safe_urldefrag,
-    _safe_urljoin,
 )
 
 # short strings occur naturally in prompts and object keys. treating one as a global substring
@@ -81,155 +76,6 @@ def _redact_schema_literal(value: Any, *, depth: int, flag: _SanitizationFlag | 
             for item in _bounded_members(value, flag=flag)
         ]
     return "[redacted]"
-
-
-def _secret_schema_definition_refs(value: Any, *, depth: int = 0) -> set[tuple[str, ...]]:
-    if not isinstance(value, dict):
-        return set()
-    refs: set[tuple[str, ...]] = set()
-    scopes = SchemaResourceScopes.build(value, depth=depth)
-    legacy_id_dialect = _declares_legacy_id_dialect(value, depth=depth)
-    base_uri = scopes.base_uri
-    resources = scopes.resources
-    anchors = scopes.anchors
-    dynamic_anchors = scopes.dynamic_anchors
-    anchor_belongs_to_resource = scopes.anchor_belongs_to_resource
-
-    def collect_refs(
-        node: Any, node_depth: int, path: tuple[str, ...], scope_uri: str
-    ) -> set[tuple[str, ...]]:
-        if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-            return set()
-        found: set[tuple[str, ...]] = set()
-        if isinstance(node, dict):
-            resource_id = _schema_resource_id(node, legacy_id_dialect=legacy_id_dialect)
-            if isinstance(resource_id, str):
-                scope_uri = _safe_urljoin(scope_uri, resource_id)
-            for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
-                ref = node.get(keyword)
-                if isinstance(ref, str):
-                    # a dynamic reference leaves its own resource by design: the target is the
-                    # outermost dynamic scope declaring the anchor, which depends on the evaluation
-                    # entry point. restricting it to the reference's resource kept literals on the
-                    # outer target exposed, so dynamic keywords consider every same-named anchor.
-                    is_dynamic = keyword in {"$dynamicRef", "$recursiveRef"}
-                    resolved_base, fragment = _safe_urldefrag(_safe_urljoin(scope_uri, ref))
-                    canonical_base = _canonical_resource_uri(resolved_base)
-                    # a canonical id may be declared by several nodes. duplicates make the schema
-                    # ambiguous, so every declaring path is an equally valid resolution of this
-                    # reference and all of them are redacted; keeping one left the others' secret
-                    # literals in the raw export.
-                    resource_paths = resources.get(canonical_base)
-                    if resource_paths:
-                        resource_ref = f"#{fragment}"
-                        if keyword == "$recursiveRef" and resource_ref == "#":
-                            # `$recursiveRef` resolves against the dynamic scope, so an ENCLOSING
-                            # resource that also declares `$recursiveAnchor` can be the target. a
-                            # sibling embedded resource cannot: it is not on this reference's
-                            # evaluation path, so its anchor is never in scope. with no anchor
-                            # reachable at all the target is this resource's own root.
-                            pointers = frozenset(
-                                pointer
-                                for pointer in anchors.get("", frozenset())
-                                if anchor_belongs_to_resource(pointer, canonical_base)
-                                or path[: len(pointer)] == pointer
-                            )
-                            found.update(pointers or resource_paths)
-                        elif is_dynamic and resource_ref != "#":
-                            # union, not replacement: a plain-name fragment also names an ordinary
-                            # `$anchor`, so dropping the static resolution would leave a same-named
-                            # `$anchor` target unredacted.
-                            found.update(_local_schema_pointer(resource_ref, dynamic_anchors))
-                            found.update(
-                                pointer
-                                for pointer in _local_schema_pointer(resource_ref, anchors)
-                                if anchor_belongs_to_resource(pointer, canonical_base)
-                            )
-                        else:
-                            pointers = _local_schema_pointer(resource_ref, anchors)
-                            if resource_ref == "#" or resource_ref.startswith("#/"):
-                                found.update(
-                                    (*resource_path, *pointer)
-                                    for resource_path in resource_paths
-                                    for pointer in pointers
-                                )
-                            else:
-                                found.update(
-                                    pointer
-                                    for pointer in pointers
-                                    if anchor_belongs_to_resource(pointer, canonical_base)
-                                )
-                    else:
-                        found.update(_local_schema_pointer(ref, anchors, base_uri=scope_uri))
-            for key, item in node.items():
-                if key not in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
-                    found.update(collect_refs(item, node_depth + 1, (*path, str(key)), scope_uri))
-        elif isinstance(node, list | tuple):
-            for index, item in enumerate(node):
-                found.update(collect_refs(item, node_depth + 1, (*path, str(index)), scope_uri))
-        return found
-
-    def collect_secret_properties(
-        node: Any, node_depth: int, path: tuple[str, ...], scope_uri: str
-    ) -> None:
-        if node_depth >= platform_traces._MAX_PAYLOAD_DEPTH:
-            return
-        if isinstance(node, dict):
-            resource_id = _schema_resource_id(node, legacy_id_dialect=legacy_id_dialect)
-            if isinstance(resource_id, str):
-                scope_uri = _safe_urljoin(scope_uri, resource_id)
-            # `patternProperties` declares secret-looking members too: `{"^secret_": {...}}` marks
-            # every matching property secret. scanning only `properties` left a reference from such
-            # an entry uncollected, so its target definition kept its credential-bearing literal.
-            # `dependentSchemas` (and its draft-07 `dependencies` spelling) is keyed by property
-            # name too, so `{"password": {"$ref": ...}}` declares a secret member exactly like
-            # `properties` does. scanning only the two property maps left that reference
-            # uncollected, and the target definition kept its credential-bearing literal.
-            for map_keyword in _SECRET_DECLARING_PROPERTY_MAPS:
-                property_map = node.get(map_keyword)
-                if not isinstance(property_map, dict):
-                    continue
-                for key, schema in property_map.items():
-                    schema_path = (*path, map_keyword, str(key))
-                    secret_declaration = (
-                        _is_secret_property_pattern(key)
-                        if map_keyword == "patternProperties"
-                        else _is_secret_key(key)
-                    )
-                    if secret_declaration and _is_schema_definition(schema):
-                        refs.update(collect_refs(schema, 0, schema_path, scope_uri))
-                    collect_secret_properties(schema, node_depth + 1, schema_path, scope_uri)
-            for key, item in node.items():
-                if key not in _SECRET_DECLARING_PROPERTY_MAPS:
-                    collect_secret_properties(item, node_depth + 1, (*path, str(key)), scope_uri)
-        elif isinstance(node, list | tuple):
-            for index, item in enumerate(node):
-                collect_secret_properties(item, node_depth + 1, (*path, str(index)), scope_uri)
-
-    def resolve(pointer: tuple[str, ...]) -> Any:
-        target: Any = value
-        for segment in pointer:
-            if isinstance(target, dict) and segment in target:
-                target = target[segment]
-            elif isinstance(target, list | tuple) and segment.isdigit():
-                index = int(segment)
-                if index >= len(target):
-                    return None
-                target = target[index]
-            else:
-                return None
-        return target
-
-    collect_secret_properties(value, depth, (), base_uri)
-    pending = list(refs)
-    while pending:
-        target_path = pending.pop()
-        target = resolve(target_path)
-        for pointer in collect_refs(target, 0, target_path, scopes.scope_for(target_path)):
-            if pointer not in refs:
-                refs.add(pointer)
-                pending.append(pointer)
-    return refs
 
 
 def _looks_structured(value: str) -> bool:
@@ -282,7 +128,24 @@ def _redact_json_text(
         parsed = json.loads(value)
     except (ValueError, RecursionError):
         return "[redacted]" if on_unparseable(value) else value
+    # a tool that serializes an already-serialized result emits `json.dumps(json.dumps({...}))`, so
+    # the first parse yields a STRING rather than the document. returning it here left the inner
+    # credential in the stored payload, so each string layer is decoded in turn -- bounded by the
+    # payload depth, which every other traversal in this module shares.
+    layers = depth
+    while isinstance(parsed, str) and layers < platform_traces._MAX_PAYLOAD_DEPTH:
+        layers += 1
+        try:
+            unwrapped = json.loads(parsed)
+        except (ValueError, RecursionError):
+            break
+        if not isinstance(unwrapped, dict | list | str):
+            break
+        parsed = unwrapped
     if not isinstance(parsed, dict | list):
+        # the text was a bare json scalar (`"42"`, `"null"`, a quoted string), which carries no
+        # fields to inspect. the ORIGINAL bytes are returned rather than the decoded value: this is
+        # recorded content, and rewriting `"\"hi\""` to `hi` would corrupt it.
         return value
     # the document that was just parsed may itself carry a SERIALIZED document in one of its
     # fields -- `{"payload": "{\"password\": \"...\"}"}` is what a tool that forwards another
@@ -439,6 +302,7 @@ def _child_response_shape_flags(
 
 def _child_secret_schema_flags(
     key: Any,
+    item: Any,
     *,
     schema_definition: bool,
     schema_property_pattern_map: bool,
@@ -461,10 +325,25 @@ def _child_secret_schema_flags(
     declares_secret_property = schema_definition and (
         _is_secret_property_pattern(key) if schema_property_pattern_map else _is_secret_key(key)
     )
+    # a schema may declare what it holds instead of naming it. `format: "password"` is the
+    # OpenAPI/JSON Schema spelling for a credential field, so `{"login_value": {"format":
+    # "password", "default": "..."}}` carries one under an ordinary name -- judged by name alone,
+    # its literals stayed in the raw export.
+    declares_secret_property = declares_secret_property or _declares_secret_format(item)
     return (
         secret_schema_definition or referenced_secret_definition,
         secret_schema_property or declares_secret_property,
     )
+
+
+def _declares_secret_format(item: Any) -> bool:
+    """Whether a schema node declares, by `format`, that it holds a credential.
+
+    Only `password` is treated this way. It is the one format keyword whose whole purpose is to say
+    the value is a secret; `email`, `uri` and the rest describe a syntax, and treating those as
+    credentials would blank ordinary annotations.
+    """
+    return isinstance(item, dict) and item.get("format") == "password"
 
 
 def _redact_secret_child(
@@ -523,6 +402,7 @@ def _redact_secret_child(
         child_schema_context = True
     child_secret_definition, child_secret_property = _child_secret_schema_flags(
         key,
+        item,
         schema_definition=schema_definition,
         schema_property_pattern_map=schema_property_pattern_map,
         secret_schema_definition=secret_schema_definition,

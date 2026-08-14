@@ -27,6 +27,10 @@ _SECRET_KEY_SUFFIXES = (
     "token",
     "password",
     "passwd",
+    # a passphrase protects a private key or an encrypted archive. it is the same kind of secret as
+    # a password and is spelled this way by ssh, gpg and pkcs tooling, but it ends in neither
+    # `password` nor `passwd`, so `key_passphrase` was persisted unchanged.
+    "passphrase",
     "credential",
     "credentials",
     "privatekey",

@@ -4231,9 +4231,9 @@ def test_decoded_host_escape_is_case_folded() -> None:
 
     assert stored["$defs"]["Cred"]["default"] == "[redacted]"
     assert stored["$defs"]["Cred"]["const"] == "[redacted]"
-    assert trace_redaction._canonical_resource_uri("https://%4A.com/s") == "https://j.com/s"
+    assert trace_uri._canonical_resource_uri("https://%4A.com/s") == "https://j.com/s"
     # the PATH is case-sensitive: a decoded escape there keeps its case
-    assert trace_redaction._canonical_resource_uri("https://x.com/%4A") == "https://x.com/J"
+    assert trace_uri._canonical_resource_uri("https://x.com/%4A") == "https://x.com/J"
 
 
 def test_choice_with_both_message_and_delta_is_malformed() -> None:
@@ -4351,7 +4351,7 @@ def test_zero_padded_default_port_resolves_to_the_local_resource() -> None:
     A textual comparison kept the padding, classified the reference external, and left the local
     target's secret schema literals visible.
     """
-    canonical = trace_redaction._canonical_resource_uri
+    canonical = trace_uri._canonical_resource_uri
 
     assert canonical("https://example.com:0443/schema") == canonical("https://example.com/schema")
     assert canonical("http://example.com:080/s") == canonical("http://example.com/s")
@@ -4373,7 +4373,7 @@ def test_malformed_resource_uri_does_not_abandon_the_trace() -> None:
     assert traces._redact_secret_fields(malformed) == traces._redact_secret_fields(well_formed) | {
         "$id": "http://[broken"
     }
-    assert trace_redaction._canonical_resource_uri("http://[broken") == "http://[broken"
+    assert trace_uri._canonical_resource_uri("http://[broken") == "http://[broken"
 
 
 def test_choice_switching_between_message_and_delta_is_malformed() -> None:
@@ -4957,7 +4957,7 @@ def test_percent_encoded_unreserved_schema_resource_uri_matches() -> None:
         "const": "[redacted]",
         "enum": ["[redacted]"],
     }
-    assert trace_redaction._canonical_resource_uri("https://example.com/%73chema/%7e") == (
+    assert trace_uri._canonical_resource_uri("https://example.com/%73chema/%7e") == (
         "https://example.com/schema/~"
     )
 
@@ -4975,22 +4975,20 @@ def test_http_root_resource_ids_match_explicit_slash_refs() -> None:
     stored = traces._redact_secret_fields(schema)
 
     assert stored["$defs"]["Cred"]["default"] == "[redacted]"
-    assert trace_redaction._canonical_resource_uri("https://example.com") == (
-        "https://example.com/"
+    assert trace_uri._canonical_resource_uri("https://example.com") == ("https://example.com/")
+    assert trace_uri._canonical_resource_uri("https://other.example.com") != (
+        trace_uri._canonical_resource_uri("https://example.com/")
     )
-    assert trace_redaction._canonical_resource_uri("https://other.example.com") != (
-        trace_redaction._canonical_resource_uri("https://example.com/")
+    assert trace_uri._canonical_resource_uri("https://example.com/path") != (
+        trace_uri._canonical_resource_uri("https://example.com/")
     )
-    assert trace_redaction._canonical_resource_uri("https://example.com/path") != (
-        trace_redaction._canonical_resource_uri("https://example.com/")
+    assert trace_uri._canonical_resource_uri("https://example.com/%2F") != (
+        trace_uri._canonical_resource_uri("https://example.com/")
     )
-    assert trace_redaction._canonical_resource_uri("https://example.com/%2F") != (
-        trace_redaction._canonical_resource_uri("https://example.com/")
-    )
-    assert trace_redaction._canonical_resource_uri("https://example.com/a/../b") == (
+    assert trace_uri._canonical_resource_uri("https://example.com/a/../b") == (
         "https://example.com/b"
     )
-    assert trace_redaction._canonical_resource_uri("urn:example:") == "urn:example:"
+    assert trace_uri._canonical_resource_uri("urn:example:") == "urn:example:"
 
 
 def test_percent_encoded_reserved_schema_resource_uri_stays_distinct() -> None:
@@ -5016,7 +5014,7 @@ def test_percent_encoded_reserved_schema_resource_uri_stays_distinct() -> None:
 
     assert stored["Encoded"]["$defs"]["Cred"]["default"] == "[redacted]"
     assert stored["Slash"]["$defs"]["Cred"]["default"] == "PUBLIC-SLASH"
-    assert trace_redaction._canonical_resource_uri("https://example.com/a%2fb") == (
+    assert trace_uri._canonical_resource_uri("https://example.com/a%2fb") == (
         "https://example.com/a%2Fb"
     )
 
@@ -5071,7 +5069,7 @@ def test_dot_segment_schema_resource_refs_match_only_the_same_resource(
     ids=["dot", "parent", "leading-parent", "trailing-dot", "trailing-parent", "trailing-slash"],
 )
 def test_canonical_resource_uri_removes_dot_segments(uri: str, canonical: str) -> None:
-    assert trace_redaction._canonical_resource_uri(uri) == canonical
+    assert trace_uri._canonical_resource_uri(uri) == canonical
 
 
 def test_secret_schema_ref_with_extension_keyword_redacts_neutral_target() -> None:
@@ -5145,10 +5143,10 @@ def test_schema_resource_uris_preserve_nondefault_ports() -> None:
     stored = traces._redact_secret_fields(schema)
 
     assert stored["$defs"]["Widget"]["default"] == "PUBLIC-8443"
-    assert trace_redaction._canonical_resource_uri("https://example.com:/schema") == (
+    assert trace_uri._canonical_resource_uri("https://example.com:/schema") == (
         "https://example.com/schema"
     )
-    assert trace_redaction._canonical_resource_uri("https://example.com:8443/schema") == (
+    assert trace_uri._canonical_resource_uri("https://example.com:8443/schema") == (
         "https://example.com:8443/schema"
     )
 
@@ -5191,9 +5189,7 @@ def test_schema_resource_uris_normalize_scheme_and_host_only() -> None:
     stored = traces._redact_secret_fields(schema)
     control = traces._redact_secret_fields(distinct_paths)
 
-    assert (
-        trace_redaction._canonical_resource_uri(userinfo) == "https://User:Pass@example.com/schema"
-    )
+    assert trace_uri._canonical_resource_uri(userinfo) == "https://User:Pass@example.com/schema"
     assert stored["$defs"]["Widget"] == {
         "type": "string",
         "default": "[redacted]",
@@ -5478,8 +5474,8 @@ def test_percent_encoded_unreserved_authority_matches_schema_resource() -> None:
     assert stored["$defs"]["Cred"]["const"] == "[redacted]"
     assert stored["$defs"]["Cred"]["enum"] == ["[redacted]"]
     # a reserved escape is NOT a decoded delimiter, so a genuinely different host stays distinct
-    assert trace_redaction._canonical_resource_uri("https://exa%2Fmple.com/s") != (
-        trace_redaction._canonical_resource_uri("https://exa/mple.com/s")
+    assert trace_uri._canonical_resource_uri("https://exa%2Fmple.com/s") != (
+        trace_uri._canonical_resource_uri("https://exa/mple.com/s")
     )
 
 
@@ -8050,16 +8046,16 @@ def test_equivalent_ipv6_schema_hosts_resolve_to_the_same_resource() -> None:
     """`[2001:db8::1]` and `[2001:0db8:0:0:0:0:0:1]` name the same host. Comparing their textual
     spellings classified a local `$id` referenced in its other form as external, so the local
     target's secret literals stayed visible in raw exports."""
-    assert trace_redaction._canonical_resource_uri(
+    assert trace_uri._canonical_resource_uri(
         "https://[2001:db8::1]/schema"
-    ) == trace_redaction._canonical_resource_uri("https://[2001:0DB8:0:0:0:0:0:1]/schema")
+    ) == trace_uri._canonical_resource_uri("https://[2001:0DB8:0:0:0:0:0:1]/schema")
     # distinct hosts stay distinct, and an invalid literal is not mapped onto a valid one
-    assert trace_redaction._canonical_resource_uri(
+    assert trace_uri._canonical_resource_uri(
         "https://[2001:db8::2]/schema"
-    ) != trace_redaction._canonical_resource_uri("https://[2001:db8::1]/schema")
-    assert trace_redaction._canonical_resource_uri(
+    ) != trace_uri._canonical_resource_uri("https://[2001:db8::1]/schema")
+    assert trace_uri._canonical_resource_uri(
         "https://[2001:db8::zz]/schema"
-    ) != trace_redaction._canonical_resource_uri("https://[2001:db8::1]/schema")
+    ) != trace_uri._canonical_resource_uri("https://[2001:db8::1]/schema")
 
     payload = {
         "tools": [
@@ -8193,7 +8189,7 @@ def test_zero_padded_ports_canonicalize_at_every_port() -> None:
     """Removing the scheme default was not enough: `:0444` and `:444` are the same non-default
     port, so keeping both spellings classified a local `$id` reached under one of them as external
     and left the local definition's secret literals in the raw export."""
-    canonical = trace_redaction._canonical_resource_uri
+    canonical = trace_uri._canonical_resource_uri
 
     assert canonical("https://example.com:444/schema") == canonical(
         "https://example.com:00444/schema"
@@ -10645,3 +10641,295 @@ def test_a_decoded_name_is_the_name_the_regex_engine_matches(pattern: str) -> No
 
     assert name is not None
     assert re.fullmatch(pattern, name)
+
+
+@pytest.mark.parametrize("layers", [1, 2, 3], ids=["once", "twice", "three-times"])
+def test_a_repeatedly_serialized_tool_result_is_redacted(layers: int) -> None:
+    """A relay that forwards another relay's output serializes what it received, so the recorded
+    content is a JSON string whose parse is ANOTHER JSON string. Parsing one layer and returning
+    the string result unexamined left every credential below the first envelope in the raw
+    export."""
+
+    serialized: Any = {"password": "REPEATLEAK"}
+    for _ in range(layers):
+        serialized = json.dumps(serialized)
+
+    text = _tool_result_text(_tool_result(serialized))
+
+    assert "REPEATLEAK" not in text
+    assert "[redacted]" in text
+
+
+@pytest.mark.parametrize(
+    "content",
+    ['"hello"', '"42"', "42", "true", "null", "just text"],
+    ids=["quoted-string", "quoted-number", "number", "boolean", "null", "prose"],
+)
+def test_a_serialized_scalar_keeps_the_bytes_that_were_recorded(content: str) -> None:
+    """Unwrapping stops at the first value that is not a document. A bare scalar holds no fields to
+    redact, and rewriting the recorded `"hello"` to `hello` would change content the raw export
+    promises verbatim."""
+
+    assert _tool_result_text(_tool_result(content)) == content
+
+
+def _compound_schema(root: str, embedded: str | None, id_key: str) -> dict[str, Any]:
+    embedded_resource: dict[str, Any] = {}
+    if embedded is not None:
+        embedded_resource["$schema"] = embedded
+    embedded_resource[id_key] = "https://example.com/legacy.json"
+    embedded_resource["properties"] = {"town": {"default": "EMBEDDED_ANNOT"}}
+    parameters = {
+        "$schema": root,
+        "$id": "https://example.com/root.json",
+        "properties": {"password": {"$ref": "https://example.com/legacy.json"}},
+        "$defs": {"legacy": embedded_resource},
+    }
+    return {"tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}]}
+
+
+_DIALECT_2020 = "https://json-schema.org/draft/2020-12/schema"
+_DIALECT_04 = "http://json-schema.org/draft-04/schema#"
+
+
+@pytest.mark.parametrize(
+    ("root", "embedded", "id_key", "redacted"),
+    [
+        (_DIALECT_2020, _DIALECT_04, "id", True),
+        (_DIALECT_2020, _DIALECT_2020, "$id", True),
+        (_DIALECT_04, _DIALECT_04, "id", True),
+        (_DIALECT_2020, None, "id", False),
+    ],
+    ids=["legacy-embedded", "modern-embedded", "legacy-throughout", "no-embedded-dialect"],
+)
+def test_an_embedded_resource_is_read_in_the_dialect_it_declares(
+    root: str, embedded: str | None, id_key: str, redacted: bool
+) -> None:
+    """A bundle carries resources written against different drafts, and each may declare its own
+    `$schema`. Choosing one dialect for the whole document read a draft-04 resource's `id` as an
+    unknown annotation under a 2020-12 root, so the reference to that credential-bearing resource
+    resolved nowhere and its literals stayed in the export."""
+
+    definitions = traces._sanitize_for_trace(_compound_schema(root, embedded, id_key), ())["tools"][
+        0
+    ]["function"]["parameters"]["$defs"]
+
+    assert (definitions["legacy"]["properties"]["town"]["default"] == "[redacted]") is redacted
+
+
+@pytest.mark.parametrize(
+    ("declared", "inherited", "legacy"),
+    [
+        (None, True, True),
+        (None, False, False),
+        (_DIALECT_04, False, True),
+        (_DIALECT_2020, True, False),
+    ],
+    ids=["inherits-legacy", "inherits-modern", "overrides-to-legacy", "overrides-to-modern"],
+)
+def test_a_node_without_its_own_dialect_inherits_the_enclosing_one(
+    declared: str | None, inherited: bool, legacy: bool
+) -> None:
+    node = {} if declared is None else {"$schema": declared}
+
+    assert trace_schema_identity._node_legacy_id_dialect(node, inherited) is legacy
+
+
+def _pointer_defaults(segment: str) -> list[Any]:
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"password": {"$ref": "#/allOf/" + segment}},
+                        "allOf": [{"default": "FIRST"}, {"default": "SECOND"}],
+                    },
+                },
+            }
+        ]
+    }
+    entries = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"]["allOf"]
+    return [entry.get("default") for entry in entries]
+
+
+def test_an_oversized_pointer_index_is_refused_rather_than_raised() -> None:
+    """`int()` refuses a decimal literal longer than `sys.get_int_max_str_digits()`, so a pointer
+    whose index segment runs past 4300 digits raised out of the redaction walk and lost the whole
+    recorded call. No sequence has an index that long, so the segment resolves nowhere and the
+    length alone decides it."""
+
+    assert len(str(sys.maxsize)) < sys.get_int_max_str_digits()
+
+    assert _pointer_defaults("9" * (sys.get_int_max_str_digits() + 700)) == ["FIRST", "SECOND"]
+
+
+@pytest.mark.parametrize(
+    ("segment", "expected"),
+    [
+        ("0", ["[redacted]", "SECOND"]),
+        ("1", ["FIRST", "[redacted]"]),
+        ("7", ["FIRST", "SECOND"]),
+        ("01", ["FIRST", "SECOND"]),
+    ],
+    ids=["first", "second", "out-of-range", "leading-zero"],
+)
+def test_an_ordinary_pointer_index_still_resolves(segment: str, expected: list[Any]) -> None:
+    assert _pointer_defaults(segment) == expected
+
+
+@pytest.mark.parametrize(
+    ("key", "secret"),
+    [
+        ("passphrase", True),
+        ("key_passphrase", True),
+        ("private_key_passphrase", True),
+        ("pass phrase", True),
+        ("PassPhrase", True),
+        ("passphrase_confirmation", True),
+        ("passphrase_hint", False),
+        ("token_count", False),
+        ("city", False),
+    ],
+    ids=[
+        "bare",
+        "qualified",
+        "key-material",
+        "spaced",
+        "cased",
+        "confirmation",
+        "hint",
+        "count",
+        "unrelated",
+    ],
+)
+def test_a_passphrase_is_a_credential(key: str, secret: bool) -> None:
+    """A passphrase unlocks a private key, so it is exactly as sensitive as the key. It shares no
+    suffix with `password` or `passwd`, so nothing matched it and it reached the export in full. A
+    qualifier that changes the meaning -- a hint about the passphrase is not the passphrase -- keeps
+    its content."""
+
+    assert trace_secret_names._is_secret_key(key) is secret
+
+
+def _property_annotations(properties: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {"type": "object", "properties": properties},
+                },
+            }
+        ]
+    }
+    return traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"][
+        "properties"
+    ]
+
+
+def test_a_password_format_declares_a_credential_whatever_the_field_is_called() -> None:
+    """`format: "password"` is the schema's own statement that the field carries a secret, and a
+    third-party tool names such a field whatever it likes. Judging by name alone left
+    `login_value`'s `default`, `enum` and `const` -- the literals a schema author fills with a
+    working credential -- in the export."""
+
+    annotated = _property_annotations(
+        {
+            "login_value": {
+                "type": "string",
+                "format": "password",
+                "default": "THIRDPARTY",
+                "enum": ["A", "B"],
+                "const": "C",
+            }
+        }
+    )["login_value"]
+
+    assert annotated["default"] == "[redacted]"
+    assert annotated["enum"] == ["[redacted]", "[redacted]"]
+    assert annotated["const"] == "[redacted]"
+    # the format itself is the declaration, not the secret, and dropping it would misreport the
+    # schema that was actually sent.
+    assert annotated["format"] == "password"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"type": "string", "format": "email", "default": "a@b.com"},
+        {"type": "string", "format": "uri", "default": "https://example.com"},
+        {"type": "string", "default": "Boston"},
+    ],
+    ids=["email", "uri", "unannotated"],
+)
+def test_an_ordinary_format_keeps_its_annotations(field: dict[str, Any]) -> None:
+    assert _property_annotations({"town": field})["town"]["default"] != "[redacted]"
+
+
+def _wide_definitions() -> dict[str, Any]:
+    width = platform_traces._MAX_PAYLOAD_COLLECTION + 20_000
+    return {f"d{index}": {"$id": f"https://example.com/{index}.json"} for index in range(width)}
+
+
+def test_identity_discovery_is_bounded_by_the_payload_collection_limit() -> None:
+    """Storage keeps at most `_MAX_PAYLOAD_COLLECTION` members, so discovering identities for more
+    than that costs memory for resources no export can hold. The walk had no width bound of its
+    own, so a wide `$defs` was materialized whole before anything was trimmed."""
+
+    resources = trace_schema_identity._schema_resource_pointers(
+        {"$id": "https://example.com/root.json", "$defs": _wide_definitions()}
+    )
+
+    assert len(resources) <= platform_traces._MAX_PAYLOAD_COLLECTION + 1
+
+
+def test_a_narrowed_schema_is_reported_truncated() -> None:
+    flag = trace_redaction._SanitizationFlag()
+
+    sanitized = traces._sanitize_for_trace(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "f",
+                        "parameters": {"type": "object", "$defs": _wide_definitions()},
+                    },
+                }
+            ]
+        },
+        (),
+        flag=flag,
+    )
+
+    kept = sanitized["tools"][0]["function"]["parameters"]["$defs"]
+    assert len(kept) == platform_traces._MAX_PAYLOAD_COLLECTION
+    assert flag.hit is True
+
+
+def test_an_ordinary_schema_is_kept_whole_and_not_reported() -> None:
+    flag = trace_redaction._SanitizationFlag()
+    definitions = {f"d{index}": {"$id": f"https://example.com/{index}.json"} for index in range(25)}
+
+    sanitized = traces._sanitize_for_trace(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "f",
+                        "parameters": {"type": "object", "$defs": definitions},
+                    },
+                }
+            ]
+        },
+        (),
+        flag=flag,
+    )
+
+    assert len(sanitized["tools"][0]["function"]["parameters"]["$defs"]) == 25
+    assert flag.hit is False
