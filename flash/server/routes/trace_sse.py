@@ -217,6 +217,20 @@ def _is_data_field(line: bytes) -> bool:
     return line == b"data" or line.startswith(b"data:")
 
 
+def _buffer_holds_data_field(buffer: bytes) -> bool:
+    """Whether unconsumed bytes contain a `data:` field on ANY line, not just the first.
+
+    Once the gate abandons an oversized `[DONE]` candidate it stops holding bytes back, so what is
+    left here can be whole lines rather than one partial line. Testing only the buffer's own start
+    meant a suffix beginning `event: message` or `id: 42` was cleared without a defect -- the caller
+    received the later reply while the recording stopped at `[DONE]`, and a clean-looking partial
+    was exportable as a complete training target.
+
+    A buffer of comments or bare field lines is genuinely nothing to record, so it stays silent.
+    """
+    return any(_is_data_field(line) for line in buffer.replace(b"\r\n", b"\n").split(b"\n"))
+
+
 def _sse_data_value(line: bytes) -> bytes:
     if line == b"data":
         return b""
@@ -459,7 +473,7 @@ class SseAccumulator:
             fragment = bytes(self._buffer[:-1])
             self._buffer.clear()
             self._consume_line(fragment)
-        elif _is_data_field(bytes(self._buffer)):
+        elif _buffer_holds_data_field(bytes(self._buffer)):
             self._note_defect("stream ended with an unterminated data event")
         self._buffer.clear()
         self._scan_start = 0

@@ -149,6 +149,11 @@ _ROOT_SCHEMA_HOST_KEYS = frozenset({"tools", "functions", "response_format", "te
 # which no provider would accept -- open a host whose nested wrapper then kept a secret property's
 # literal, so an upstream-rejected request still persisted a third-party credential.
 _ARRAY_SHAPED_ROOT_HOST_KEYS = frozenset({"tools", "functions"})
+# these two name the SAME declaration in the chat-completions and responses spellings, and both
+# state a discriminator: a response format only declares a schema as `{"type": "json_schema",
+# "json_schema": {...}}`. accepting any object under the name let a direct `schema` wrapper the
+# provider rejects open the exemption and keep an unknown keyword's credential literal.
+_SCHEMA_DECLARING_FORMAT_KEYS = frozenset({"response_format", "text_format"})
 _NESTED_SCHEMA_HOST_KEYS = frozenset({"function", "json_schema"})
 _SCHEMA_HOST_KEYS = _ROOT_SCHEMA_HOST_KEYS | _NESTED_SCHEMA_HOST_KEYS
 _JSON_SCHEMA_TYPES = frozenset(
@@ -496,7 +501,25 @@ def _opens_root_schema_host(key: Any, item: Any) -> bool:
         return False
     if key in _ARRAY_SHAPED_ROOT_HOST_KEYS:
         return isinstance(item, list)
-    return isinstance(item, dict)
+    if not isinstance(item, dict):
+        return False
+    if key in _SCHEMA_DECLARING_FORMAT_KEYS:
+        return _declares_schema_response_format(item)
+    return True
+
+
+def _declares_schema_response_format(item: dict[Any, Any]) -> bool:
+    """Whether a response-format object is the shape that actually declares a schema.
+
+    A chat-completions response format states `type: "json_schema"` and nests the declaration under
+    `json_schema`. Accepting any object let `{"response_format": {"schema": {...}}}` -- which the
+    provider rejects -- open the exemption, so the wrapper preserved an unknown keyword's literal
+    and the recorded rejection carried the credential into the raw export.
+
+    Both halves are required. `json_object` and `text` declare no schema at all, and a bare
+    `json_schema` wrapper without the discriminator is not a request any provider accepts.
+    """
+    return item.get("type") == "json_schema" and isinstance(item.get("json_schema"), dict)
 
 
 def _carries_tool_result(container: dict[Any, Any], key: Any, *, inside_tool_result: bool) -> bool:

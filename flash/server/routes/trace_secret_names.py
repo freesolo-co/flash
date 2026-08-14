@@ -61,20 +61,30 @@ def _is_secret_key(key: Any, *, allow_token: bool = False) -> bool:
 
 
 def _secret_key_candidates(normalized: str) -> tuple[str, ...]:
-    """The key itself, plus the form left after a conventional trailing qualifier is removed.
+    """The key itself, plus each form left as conventional trailing qualifiers are peeled off.
 
     The suffix rule needs the sensitive term to END the key, so `password_confirmation` and
     `client_secret_value` fell through and their credentials were persisted unchanged. Only the
     qualifiers above are stripped, and only as a whole trailing word: they carry no meaning of
     their own, so what precedes them is still the field being named.
 
+    Qualifiers STACK in practice -- `new_password_confirmation_value`, `client_secret_plaintext_value`
+    -- and peeling only the last one left a form that still did not end in a secret suffix, so the
+    credential survived. Peeling continues until no qualifier remains.
+
     Free-form containment would be wrong here -- `token_count` is a length and `password_policy_url`
     is a link, and redacting either would eat legitimate recorded content.
     """
-    for qualifier in _SECRET_KEY_QUALIFIERS:
-        if normalized.endswith(qualifier) and len(normalized) > len(qualifier):
-            return (normalized, normalized[: -len(qualifier)])
-    return (normalized,)
+    candidates = [normalized]
+    current = normalized
+    while True:
+        for qualifier in _SECRET_KEY_QUALIFIERS:
+            if current.endswith(qualifier) and len(current) > len(qualifier):
+                current = current[: -len(qualifier)]
+                candidates.append(current)
+                break
+        else:
+            return tuple(candidates)
 
 
 def _is_secret_property_pattern(pattern: Any) -> bool:

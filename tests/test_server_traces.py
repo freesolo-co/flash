@@ -9002,3 +9002,133 @@ def test_content_after_an_abandoned_done_candidate_is_not_silently_dropped() -> 
     clean.finish()
     assert clean.defect is None
     assert "HELLO" in json.dumps(clean.output(), default=str)
+
+
+_RESPONSE_FORMAT_SECRET_SCHEMA = {
+    "type": "object",
+    "properties": {"password": {"type": "string", "value": "RESPONSEFORMATLEAK"}},
+}
+
+
+@pytest.mark.parametrize(
+    ("declaration", "hosts"),
+    [
+        # a chat-completions response format declares `type: "json_schema"` AND nests under
+        # `json_schema`. anything else is a request the provider rejects.
+        ({"schema": _RESPONSE_FORMAT_SECRET_SCHEMA}, False),
+        ({"type": "text", "json_schema": {"schema": _RESPONSE_FORMAT_SECRET_SCHEMA}}, False),
+        ({"json_schema": {"schema": _RESPONSE_FORMAT_SECRET_SCHEMA}}, False),
+        ({"type": "json_object", "schema": _RESPONSE_FORMAT_SECRET_SCHEMA}, False),
+        ({"type": "json_schema", "json_schema": {"schema": _RESPONSE_FORMAT_SECRET_SCHEMA}}, True),
+    ],
+)
+def test_a_response_format_needs_its_discriminator_to_host(declaration: dict, hosts: bool) -> None:
+    """Accepting any object under `response_format` let a direct `schema` wrapper -- which the
+    provider rejects -- open the schema exemption, so the wrapper preserved an unknown keyword's
+    literal and the recorded rejection carried the credential into the raw export."""
+
+    redacted = json.dumps(traces._sanitize_for_trace({"response_format": declaration}, ()))
+    assert ("RESPONSEFORMATLEAK" in redacted) is hosts
+
+
+def test_the_responses_text_format_spelling_needs_it_too() -> None:
+    """`text_format` names the same declaration in the responses spelling, so it carries the same
+    discriminator and must not be honoured on shape alone."""
+
+    invalid = {"text_format": {"schema": _RESPONSE_FORMAT_SECRET_SCHEMA}}
+    assert "RESPONSEFORMATLEAK" not in json.dumps(traces._sanitize_for_trace(invalid, ()))
+
+    valid = {
+        "text_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string", "default": "TEXTFORMATKEEP"}},
+                }
+            },
+        }
+    }
+    assert "TEXTFORMATKEEP" in json.dumps(traces._sanitize_for_trace(valid, ()))
+
+
+@pytest.mark.parametrize("prefix", [b"event: message\n", b"id: 42\n", b"retry: 500\n"])
+def test_a_non_data_suffix_after_an_abandoned_terminator_is_not_silently_dropped(
+    prefix: bytes,
+) -> None:
+    """`finish()` recognized an unterminated event only when the leftover buffer STARTED with
+    `data`, so a suffix beginning `event:` or `id:` was cleared without a defect -- the caller
+    received the later reply while the recording stopped at `[DONE]`, leaving a clean-looking
+    partial that `records` would export as a complete training target."""
+
+    gate = trace_sse.SseDoneGate()
+    accumulator = trace_sse.SseAccumulator()
+    relayed = bytearray()
+    comments = b"".join(b": comment-%04d\n" % index for index in range(120))
+    assert len(comments) > trace_sse._POST_DONE_SUFFIX_LIMIT
+    # one chunk, and the stream ENDS here: nothing later can trip the post-terminator guard.
+    for chunk in (
+        b'data: {"choices":[{"delta":{"content":"EARLY"}}]}\n\n',
+        b"data: [DONE]\n"
+        + comments
+        + b"\n"
+        + prefix
+        + b'data: {"choices":[{"delta":{"content":"LATE"}}]}\n\n',
+    ):
+        for forwarded in gate.feed(chunk):
+            relayed.extend(forwarded)
+            accumulator.feed(forwarded)
+    for forwarded in gate.finish():
+        relayed.extend(forwarded)
+        accumulator.feed(forwarded)
+    accumulator.finish()
+
+    assert b"LATE" in relayed
+    recorded = json.dumps(accumulator.output(), default=str)
+    assert "LATE" in recorded or accumulator.defect is not None
+
+
+def test_a_comment_only_tail_is_still_not_a_defect() -> None:
+    """Widening the end-of-stream check must not start reporting a defect for a tail that carries
+    no event at all -- comments and bare field lines are genuinely nothing to record."""
+
+    gate = trace_sse.SseDoneGate()
+    accumulator = trace_sse.SseAccumulator()
+    for chunk in (
+        b'data: {"choices":[{"delta":{"content":"HELLO"}}]}\n\n',
+        b"data: [DONE]\n\n",
+        b": trailing comment\n",
+    ):
+        for forwarded in gate.feed(chunk):
+            accumulator.feed(forwarded)
+    for forwarded in gate.finish():
+        accumulator.feed(forwarded)
+    accumulator.finish()
+
+    assert accumulator.defect is None
+    assert "HELLO" in json.dumps(accumulator.output(), default=str)
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_secret"),
+    [
+        ("new_password_confirmation_value", True),
+        ("client_secret_plaintext_value", True),
+        ("access_token_raw_value", True),
+        ("password_confirmation_value", True),
+        # stacking qualifiers onto a name that is not a credential must not create one.
+        ("name_confirmation_value", False),
+        ("count_raw_value", False),
+        # a key made only of qualifiers names nothing sensitive.
+        ("raw_value", False),
+        ("new_value", False),
+    ],
+)
+def test_stacked_qualifiers_cannot_hide_a_secret_name(field: str, expected_secret: bool) -> None:
+    """Peeling only the LAST qualifier left `newpasswordconfirmation`, which does not end in a
+    recognized secret suffix, so a parsed tool result using that name kept its credential."""
+
+    payload = {"messages": [{"role": "tool", "content": json.dumps({field: "STACKEDLEAK"})}]}
+
+    redacted = json.dumps(traces._sanitize_for_trace(payload, ()))
+    assert ("STACKEDLEAK" not in redacted) is expected_secret
