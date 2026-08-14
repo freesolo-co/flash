@@ -2636,10 +2636,18 @@ def test_an_oversized_tar_refuses_rather_than_passing(tmp_path, monkeypatch):
     instead of committing to the first one that claims the bytes -- the tar is enumerated, the
     gzipped member expanded, and the key found rather than merely suspected. Both outcomes are
     accepted here because both are safe; a None is the bug.
+
+    The padding is SEEDED rather than `os.urandom`. It only has to be incompressible enough to
+    carry the tar past the cap, and 4 MiB of unpredictable bytes contains a plausible OpenPGP
+    packet header often enough to matter: measured 4 failures in 40 runs, where the scan refuses
+    with an unwalkable-packet message instead. That refusal is the scanner being correctly
+    fail-closed about bytes it cannot account for, so widening the assertion to accept it would
+    dissolve the very outcome this test exists to pin. A fixed sequence compresses no better
+    (4.19 MB gzipped, still four times the cap) and removes the dice roll from CI.
     """
     import gzip
     import io
-    import os
+    import random
     import tarfile
 
     from flash import env_secrets as secrets
@@ -2649,7 +2657,7 @@ def test_an_oversized_tar_refuses_rather_than_passing(tmp_path, monkeypatch):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as archive:
         for name, body in (
-            ("pad.bin", os.urandom(4 << 20)),
+            ("pad.bin", random.Random(0).randbytes(4 << 20)),
             ("shard.gz", gzip.compress(f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode())),
         ):
             info = tarfile.TarInfo(name)
