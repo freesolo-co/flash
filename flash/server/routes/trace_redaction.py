@@ -6,9 +6,14 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import unquote, urldefrag, urljoin, urlsplit, urlunsplit
+from urllib.parse import unquote
 
 from flash.server.platform import traces as platform_traces
+from flash.server.routes.trace_uri import (
+    _canonical_resource_uri,
+    _safe_urldefrag,
+    _safe_urljoin,
+)
 
 # short strings occur naturally in prompts and object keys. treating one as a global substring
 # secret corrupts unrelated training text, while real bearer credentials are comfortably longer.
@@ -109,6 +114,13 @@ _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS = frozenset(
 _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS = frozenset(
     {"properties", "patternProperties", "dependentSchemas", "$defs", "definitions"}
 )
+# keyed by property name like the maps above, but its VALUES are arrays of declared property names
+# rather than subschemas. both halves are declarations: `{"password": ["username"]}` names two
+# fields, so redacting either corrupts the stored schema instead of protecting a credential.
+_JSON_SCHEMA_PROPERTY_NAME_MAP_KEYWORDS = frozenset({"dependentRequired"})
+# tool output can arrive as content PARTS instead of one string. a part's `text` is still the tool's
+# output, so it needs the same parsed-or-conservative handling the scalar form gets.
+_TEXT_CONTENT_PART_TYPES = frozenset({"text", "output_text", "input_text"})
 _JSON_SCHEMA_VALUE_KEYWORDS = frozenset(
     {
         "items",
@@ -132,18 +144,14 @@ _JSON_SCHEMA_VALUE_KEYWORDS = frozenset(
 _JSON_SCHEMA_WRAPPER_KEYS = frozenset({"schema", "parameters", "input_schema", "output_schema"})
 # containers that genuinely declare schemas. a wrapper key is honoured only beneath one of these,
 # so ordinary request metadata that happens to be shaped like a schema cannot claim the exemption.
-_SCHEMA_HOST_KEYS = frozenset(
-    {
-        "tools",
-        "functions",
-        "tool_choice",
-        "function_call",
-        "function",
-        "response_format",
-        "json_schema",
-        "text_format",
-    }
+# only these names are a request's OWN top-level declaration. the rest of the host vocabulary is
+# spelled only INSIDE one of them, so accepting those at the root let an unrelated top-level
+# extension named `function` or `json_schema` open a host for its whole subtree.
+_ROOT_SCHEMA_HOST_KEYS = frozenset(
+    {"tools", "functions", "tool_choice", "function_call", "response_format", "text_format"}
 )
+_NESTED_SCHEMA_HOST_KEYS = frozenset({"function", "json_schema"})
+_SCHEMA_HOST_KEYS = _ROOT_SCHEMA_HOST_KEYS | _NESTED_SCHEMA_HOST_KEYS
 _JSON_SCHEMA_TYPES = frozenset(
     {"null", "boolean", "object", "array", "number", "string", "integer"}
 )
@@ -198,8 +206,10 @@ def _is_schema_map_keyword(key: str, item: Any) -> bool:
     conditional subschema and an array value lists required property names, and neither is a secret.
     Only its entry VALUES differ, which the ordinary schema traversal already distinguishes.
     """
-    return key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS or (
-        key == "dependencies" and isinstance(item, dict)
+    return (
+        key in _JSON_SCHEMA_PROPERTY_MAP_KEYWORDS
+        or key in _JSON_SCHEMA_PROPERTY_NAME_MAP_KEYWORDS
+        or (key == "dependencies" and isinstance(item, dict))
     )
 
 
@@ -343,149 +353,6 @@ def _local_schema_pointer(
     if ref.startswith("#") and len(ref) > 1:
         return anchors.get(ref[1:], frozenset())
     return frozenset()
-
-
-def _normalize_percent_encoding(value: str, *, fold_decoded: bool = False) -> str:
-    """Decode unreserved escapes and uppercase the rest, per RFC 3986 6.2.2.
-
-    `fold_decoded` case-folds the characters an escape decodes to. It is for the host, which is
-    case-insensitive: without it `%4A` normalizes to `J` and never matches a plain `j`. Folding the
-    whole string instead would lowercase the hex digits of escapes that stay encoded.
-    """
-    unreserved = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
-    normalized: list[str] = []
-    index = 0
-    while index < len(value):
-        if index + 2 < len(value) and value[index] == "%":
-            escaped = value[index + 1 : index + 3]
-            try:
-                decoded = chr(int(escaped, 16))
-            except ValueError:
-                pass
-            else:
-                if decoded in unreserved:
-                    normalized.append(decoded.casefold() if fold_decoded else decoded)
-                else:
-                    normalized.append(f"%{escaped.upper()}")
-                index += 3
-                continue
-        normalized.append(value[index])
-        index += 1
-    return "".join(normalized)
-
-
-def _remove_dot_segments(path: str) -> str:
-    input_buffer = path
-    output: list[str] = []
-    while input_buffer:
-        if input_buffer.startswith("../"):
-            input_buffer = input_buffer[3:]
-        elif input_buffer.startswith("./"):
-            input_buffer = input_buffer[2:]
-        elif input_buffer.startswith("/./"):
-            input_buffer = f"/{input_buffer[3:]}"
-        elif input_buffer == "/.":
-            input_buffer = "/"
-        elif input_buffer.startswith("/../"):
-            input_buffer = f"/{input_buffer[4:]}"
-            if output:
-                output.pop()
-        elif input_buffer == "/..":
-            input_buffer = "/"
-            if output:
-                output.pop()
-        elif input_buffer in {".", ".."}:
-            input_buffer = ""
-        else:
-            segment_end = input_buffer.find("/", 1 if input_buffer.startswith("/") else 0)
-            if segment_end < 0:
-                output.append(input_buffer)
-                input_buffer = ""
-            else:
-                output.append(input_buffer[:segment_end])
-                input_buffer = input_buffer[segment_end:]
-    return "".join(output)
-
-
-def _safe_urljoin(base: str, ref: str) -> str:
-    """Resolve `ref` against `base`, treating an unparseable URI as unresolvable.
-
-    Both arguments come from the recorded payload, so a malformed `$id` or `$ref` is untrusted
-    input rather than a bug. Letting `ValueError` escape abandoned the ENTIRE trace after the
-    upstream call had already completed -- not even the provider's rejection could be exported.
-    """
-    try:
-        return urljoin(base, ref)
-    except ValueError:
-        return ref
-
-
-def _safe_urldefrag(uri: str) -> tuple[str, str]:
-    try:
-        base, fragment = urldefrag(uri)
-    except ValueError:
-        return uri, ""
-    return base, fragment
-
-
-def _is_default_port(port: str, default_port: str | None) -> bool:
-    """Whether `port` denotes the scheme's default, compared numerically rather than textually.
-
-    `0443` and `443` are the same port: a string comparison kept the padded form, so the same
-    resource reached under it was classified external and its secret schema literals survived.
-    """
-    if default_port is None or not port.isdigit():
-        return False
-    return int(port) == int(default_port)
-
-
-def _canonical_resource_uri(uri: str) -> str:
-    try:
-        scheme, netloc, path, query, fragment = urlsplit(uri)
-    except ValueError:
-        # a malformed `$id` (an unterminated IPv6 literal, say) is untrustworthy input from the
-        # recorded payload, not a bug here. raising abandoned the WHOLE trace after the upstream
-        # call had already been paid for, so the identifier is treated as unresolvable instead and
-        # redaction continues conservatively: an unmatched reference redacts rather than exempts.
-        return uri
-    normalized_scheme = scheme.casefold()
-    default_port = {"http": "80", "https": "443"}.get(normalized_scheme)
-    userinfo, user_separator, hostport = netloc.rpartition("@")
-    if hostport.startswith("[") and (host_end := hostport.find("]")) >= 0:
-        suffix = hostport[host_end + 1 :]
-        if suffix == ":" or (suffix.startswith(":") and _is_default_port(suffix[1:], default_port)):
-            suffix = ""
-        hostport = f"[{hostport[1:host_end].casefold()}]{suffix}"
-    else:
-        host, port_separator, port = hostport.rpartition(":")
-        if port_separator and (not port or _is_default_port(port, default_port)):
-            hostport = host.casefold()
-        else:
-            hostport = f"{host.casefold()}:{port}" if port_separator else hostport.casefold()
-    # the host is case-insensitive, so a character an escape DECODES to must fold too: `%4A` and a
-    # plain `j` are the same host. the casefold above cannot do it (the escape is still encoded) and
-    # folding the whole string afterwards would lowercase the hex digits rfc 3986 6.2.2.1 wants
-    # uppercase, so the fold is applied to decoded characters only. the userinfo is case-sensitive
-    # and keeps the plain normalization. decoding is delimiter-safe here because no unreserved
-    # character is a delimiter: `@`, `:` and the brackets stay encoded and the split above holds.
-    normalized_netloc = (
-        f"{_normalize_percent_encoding(userinfo)}@"
-        f"{_normalize_percent_encoding(hostport, fold_decoded=True)}"
-        if user_separator
-        else _normalize_percent_encoding(hostport, fold_decoded=True)
-    )
-    normalized_path = _remove_dot_segments(_normalize_percent_encoding(path))
-    if normalized_scheme in {"http", "https"} and normalized_netloc and not normalized_path:
-        normalized_path = "/"
-    return urlunsplit(
-        (
-            normalized_scheme,
-            normalized_netloc,
-            normalized_path,
-            _normalize_percent_encoding(query),
-            _normalize_percent_encoding(fragment),
-        )
-    )
 
 
 def _schema_resource_pointers(value: Any, *, depth: int = 0) -> dict[str, tuple[str, ...]]:
@@ -738,6 +605,46 @@ def _redact_tool_result_content(value: str, *, depth: int, flag: _SanitizationFl
     return json.dumps(redacted, separators=(",", ":"))
 
 
+def _carries_tool_result(container: dict[Any, Any], key: Any, *, inside_tool_result: bool) -> bool:
+    """Whether `key`'s value is a tool's OUTPUT rather than ordinary prose.
+
+    Tools routinely return serialized json, so treating the value as an opaque scalar preserved
+    `{"password": "..."}` verbatim and a third-party credential a tool returned -- never in
+    `context.secrets` -- reached the raw export intact. Output arrives either as `content` directly
+    or, in the parts form, as a part's `text`; the parts case is narrowed to that key so a part's
+    `type` or `id` is not parsed as output.
+    """
+    if key == "content" and container.get("role") in {"tool", "function"}:
+        return True
+    return (
+        inside_tool_result and key == "text" and container.get("type") in _TEXT_CONTENT_PART_TYPES
+    )
+
+
+def _resolve_secret_schema_refs(
+    value: dict[Any, Any],
+    *,
+    depth: int,
+    secret_schema_definition: bool,
+    secret_schema_refs: set[tuple[str, ...]] | None,
+    schema_definition_path: tuple[str, ...],
+) -> tuple[set[tuple[str, ...]], bool]:
+    """Collect the pointers whose targets hold secret literals, and whether THIS node is one.
+
+    A node that declares its own `$id` starts a new resource scope, so it inherits the flag only
+    when something actually references it -- otherwise an unrelated sibling definition's secrecy
+    would leak across the scope boundary.
+    """
+    active = (secret_schema_refs or set()) | {
+        (*schema_definition_path, *pointer)
+        for pointer in _secret_schema_definition_refs(value, depth=depth)
+    }
+    referenced = schema_definition_path in active
+    if schema_definition_path and isinstance(value.get("$id"), str):
+        return active, referenced
+    return active, secret_schema_definition or referenced
+
+
 def _redact_secret_fields(
     value: Any,
     *,
@@ -771,16 +678,13 @@ def _redact_secret_fields(
         return "[redacted]"
     if isinstance(value, dict):
         schema_context = schema_context or schema_wrapper or _has_schema_context(value)
-        local_secret_schema_refs = {
-            (*schema_definition_path, *pointer)
-            for pointer in _secret_schema_definition_refs(value, depth=depth)
-        }
-        active_secret_schema_refs = (secret_schema_refs or set()) | local_secret_schema_refs
-        referenced_schema_definition = schema_definition_path in active_secret_schema_refs
-        if schema_definition_path and isinstance(value.get("$id"), str):
-            secret_schema_definition = referenced_schema_definition
-        else:
-            secret_schema_definition = secret_schema_definition or referenced_schema_definition
+        active_secret_schema_refs, secret_schema_definition = _resolve_secret_schema_refs(
+            value,
+            depth=depth,
+            secret_schema_definition=secret_schema_definition,
+            secret_schema_refs=secret_schema_refs,
+            schema_definition_path=schema_definition_path,
+        )
         redact_schema_literals = secret_schema_definition or secret_schema_property
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
@@ -817,7 +721,9 @@ def _redact_secret_fields(
                     item,
                     depth=depth + 1,
                     schema_property_map=(schema_context and _is_schema_map_keyword(key, item)),
-                    schema_property_dependencies=key == "dependencies",
+                    schema_property_dependencies=(
+                        key == "dependencies" or key in _JSON_SCHEMA_PROPERTY_NAME_MAP_KEYWORDS
+                    ),
                     schema_context=child_schema_context,
                     secret_schema_definition=secret_schema_definition
                     or referenced_secret_definition,
@@ -831,12 +737,8 @@ def _redact_secret_fields(
                     logprob_entries=logprob_entries
                     or (logprobs and key in {"content", "refusal", "top_logprobs"}),
                     function_arguments=function_container and key == "arguments",
-                    # a tool message's `content` carries the tool's OUTPUT, and tools routinely
-                    # return serialized json there. treating it as an opaque scalar preserved
-                    # `{"password": "..."}` verbatim, so a third-party credential a tool returned --
-                    # never in `context.secrets` -- reached the raw export intact.
-                    tool_result_content=(
-                        key == "content" and value.get("role") in {"tool", "function"}
+                    tool_result_content=_carries_tool_result(
+                        value, key, inside_tool_result=tool_result_content
                     ),
                     function_container=(
                         key == "function_call" or (tool_call and key == "function")
@@ -845,8 +747,10 @@ def _redact_secret_fields(
                     # payload root. recognizing the names anywhere let ordinary nested metadata --
                     # `{"metadata": {"tools": {...}}}` -- open one for its whole subtree and keep a
                     # secret-named property's literal verbatim. inside a host the flag stays set,
-                    # since a real declaration nests (`tools[].function.parameters`).
-                    schema_host=schema_host or (payload_root and key in _SCHEMA_HOST_KEYS),
+                    # since a real declaration nests (`tools[].function.parameters`). `function`
+                    # and `json_schema` are spelled only INSIDE a host, so a top-level extension
+                    # of either name is ordinary data rather than a declaration.
+                    schema_host=schema_host or (payload_root and key in _ROOT_SCHEMA_HOST_KEYS),
                     schema_wrapper=schema_wrapper
                     or wrapper_has_schema
                     or (schema_context and _is_schema_map_keyword(key, item)),
@@ -857,30 +761,24 @@ def _redact_secret_fields(
                 )
         return redacted
     if isinstance(value, list | tuple):
-        return [
-            _redact_secret_fields(
-                item,
-                depth=depth + 1,
-                schema_property_map=schema_property_map,
-                schema_context=schema_context,
-                secret_schema_definition=(
-                    secret_schema_definition
-                    or (*schema_definition_path, str(index)) in (secret_schema_refs or set())
-                ),
-                secret_schema_property=secret_schema_property,
-                choice=choice_list,
-                logprobs=logprobs,
-                logprob_entries=logprob_entries,
-                payload_root=False,
-                schema_host=schema_host,
-                tool_call=tool_call_list,
-                schema_wrapper=schema_wrapper,
-                secret_schema_refs=secret_schema_refs,
-                schema_definition_path=(*schema_definition_path, str(index)),
-                flag=flag,
-            )
-            for index, item in enumerate(value)
-        ]
+        return _redact_secret_sequence(
+            value,
+            depth=depth,
+            schema_property_map=schema_property_map,
+            schema_context=schema_context,
+            secret_schema_definition=secret_schema_definition,
+            secret_schema_property=secret_schema_property,
+            choice_list=choice_list,
+            logprobs=logprobs,
+            logprob_entries=logprob_entries,
+            tool_result_content=tool_result_content,
+            schema_host=schema_host,
+            tool_call_list=tool_call_list,
+            schema_wrapper=schema_wrapper,
+            secret_schema_refs=secret_schema_refs,
+            schema_definition_path=schema_definition_path,
+            flag=flag,
+        )
     return _redact_secret_scalar(
         value,
         depth=depth,
@@ -888,6 +786,56 @@ def _redact_secret_fields(
         function_arguments=function_arguments,
         flag=flag,
     )
+
+
+def _redact_secret_sequence(
+    value: list[Any] | tuple[Any, ...],
+    *,
+    depth: int,
+    schema_property_map: bool,
+    schema_context: bool,
+    secret_schema_definition: bool,
+    secret_schema_property: bool,
+    choice_list: bool,
+    logprobs: bool,
+    logprob_entries: bool,
+    tool_result_content: bool,
+    schema_host: bool,
+    tool_call_list: bool,
+    schema_wrapper: bool,
+    secret_schema_refs: set[tuple[str, ...]] | None,
+    schema_definition_path: tuple[str, ...],
+    flag: _SanitizationFlag | None,
+) -> list[Any]:
+    """Redact each entry of an array, carrying the flags its position implies."""
+    return [
+        _redact_secret_fields(
+            item,
+            depth=depth + 1,
+            schema_property_map=schema_property_map,
+            schema_context=schema_context,
+            secret_schema_definition=(
+                secret_schema_definition
+                or (*schema_definition_path, str(index)) in (secret_schema_refs or set())
+            ),
+            secret_schema_property=secret_schema_property,
+            choice=choice_list,
+            logprobs=logprobs,
+            logprob_entries=logprob_entries,
+            payload_root=False,
+            # a tool message's `content` may be a list of parts rather than one string, and the
+            # tool's output then sits in each part's `text`. dropping the flag at the list hop
+            # left a serialized credential in a part verbatim.
+            tool_result_content=tool_result_content,
+            schema_host=schema_host,
+            tool_call=tool_call_list,
+            schema_wrapper=schema_wrapper,
+            secret_schema_refs=secret_schema_refs,
+            schema_definition_path=(*schema_definition_path, str(index)),
+            flag=flag,
+        )
+        for index, item in enumerate(value)
+    ]
 
 
 def _redact_secret_scalar(

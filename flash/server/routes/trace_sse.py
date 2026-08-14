@@ -277,6 +277,15 @@ def _content_parts(value: Any) -> list[Any]:
     return [value]
 
 
+def _carries_response(fragment: dict[str, Any]) -> bool:
+    """Whether a message or delta actually carries reply data.
+
+    `role` alone restates what the choice already established, and an explicit null is the ordinary
+    provider spelling for "no fragment", so neither makes a trailing event a continuation.
+    """
+    return any(key != "role" and value is not None for key, value in fragment.items())
+
+
 def _append_fragment(target: dict[str, Any], key: str, value: Any) -> None:
     current = target.get(key)
     if isinstance(value, str):
@@ -652,7 +661,9 @@ class SseAccumulator:
                 continue
             if message is not None:
                 if isinstance(message, dict):
-                    if self._switches_mode(state, "message"):
+                    if self._arrives_after_finish(state, message) or self._switches_mode(
+                        state, "message"
+                    ):
                         continue
                     self._consume_delta(state, message)
                 else:
@@ -665,7 +676,9 @@ class SseAccumulator:
             if "delta" in choice:
                 delta = choice["delta"]
                 if isinstance(delta, dict):
-                    if not self._switches_mode(state, "delta"):
+                    if not self._arrives_after_finish(state, delta) and not self._switches_mode(
+                        state, "delta"
+                    ):
                         self._consume_delta(state, delta)
                 elif delta is not None:
                     self._note_defect("stream choice contained a non-object delta")
@@ -689,6 +702,20 @@ class SseAccumulator:
                     # reported `length` with partial content and then `stop` into a clean stopped
                     # reply, so `records` exported truncated text as a completed training target.
                     self._note_defect("stream choice reported conflicting finish reasons")
+
+    def _arrives_after_finish(self, state: dict[str, Any], fragment: dict[str, Any]) -> bool:
+        """Whether a response-bearing fragment arrived after this choice already finished.
+
+        A provider that declares `finish_reason` has stated the choice is complete, so later content
+        is not part of the reply. Appending it produced an `AB` completion the provider never sent,
+        stored with the earlier clean `stop` and exportable as a training target. Fragments that
+        carry no response -- an empty delta, a usage-only trailer -- are the ordinary spelling for
+        "nothing more" and stay clean.
+        """
+        if state["finish_reason"] is None or not _carries_response(fragment):
+            return False
+        self._note_defect("stream choice continued after reporting a finish reason")
+        return True
 
     def _switches_mode(self, state: dict[str, Any], mode: str) -> bool:
         """Whether this choice already streamed the OTHER representation; records a defect if so."""

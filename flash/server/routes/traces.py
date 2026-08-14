@@ -441,7 +441,7 @@ async def _stream_response(
 
 
 async def _non_streaming_response(
-    context: _UpstreamRequestContext, forwarded_body: dict[str, Any]
+    context: _UpstreamRequestContext, forwarded_body: bytes
 ) -> Response:
     try:
         async with (
@@ -450,7 +450,7 @@ async def _non_streaming_response(
                 "POST",
                 context.url,
                 headers=context.headers,
-                json=forwarded_body,
+                content=forwarded_body,
             ) as upstream_response,
         ):
             upstream_status = upstream_response.status_code
@@ -640,19 +640,23 @@ async def chat_completions(
         metadata=metadata,
         record_trace=record_trace,
     )
-    # the CALLER'S request, verbatim. redaction belongs to the stored copy only (`_record_trace`
-    # sanitizes `context.body` itself): a proxy that rewrote the body before forwarding would send
-    # the provider something the caller never wrote -- a tool schema whose `password` property got
-    # replaced by the string "[redacted]", or a prompt that happens to quote the key. the caller
-    # would be billed for inference on a request they did not make, and could not tell from the
-    # response that it had been altered.
-    forwarded_body = context.body
+    # the CALLER'S request, verbatim -- the ORIGINAL BYTES, not a reserialization of the parsed
+    # copy. redaction belongs to the stored copy only (`_record_trace` sanitizes `context.body`
+    # itself): a proxy that rewrote the body before forwarding would send the provider something the
+    # caller never wrote -- a tool schema whose `password` property got replaced by the string
+    # "[redacted]", or a prompt that happens to quote the key. the caller would be billed for
+    # inference on a request they did not make, and could not tell from the response that it had
+    # been altered. reserializing is a quieter version of the same defect: python's json round trip
+    # is not representation-preserving, so `0.1234567890123456789` reached the provider as
+    # `0.12345678901234568` and duplicate members were collapsed, silently changing a
+    # provider-specific parameter after the caller had already submitted it.
+    forwarded_body = raw_body
 
     if body.get("stream") is True:
         client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT_SECONDS)
         try:
             upstream_request = client.build_request(
-                "POST", context.url, headers=context.headers, json=forwarded_body
+                "POST", context.url, headers=context.headers, content=forwarded_body
             )
             upstream_response = await client.send(upstream_request, stream=True)
         except asyncio.CancelledError:

@@ -88,6 +88,15 @@ def _raw(trace_api: TestClient, project_id: str = _PROJECT_ID) -> dict:
     return response.json()
 
 
+def _sent_request(url: str, headers: dict, content: bytes) -> dict:
+    """Record an upstream request. `content` is the caller's ORIGINAL bytes, forwarded verbatim.
+
+    `json` is the parsed view for assertions about what the provider received semantically; `content`
+    is what actually went on the wire and is the only view that can show a lost representation.
+    """
+    return {"url": url, "headers": headers, "content": content, "json": json.loads(content)}
+
+
 class _StaticAsyncClient:
     response = httpx.Response(200, json=_RESPONSE)
     requests: ClassVar[list[dict]] = []
@@ -111,9 +120,9 @@ class _StaticAsyncClient:
         async def __aexit__(self, *args) -> None:
             await self.response.aclose()
 
-    def stream(self, method, url, *, headers, json):
+    def stream(self, method, url, *, headers, content):
         assert method == "POST"
-        type(self).requests.append({"url": url, "headers": headers, "json": json})
+        type(self).requests.append(_sent_request(url, headers, content))
         return self._StreamContext(type(self).response)
 
     async def aclose(self) -> None:
@@ -155,9 +164,9 @@ class _StreamingAsyncClient(_StaticAsyncClient):
     body = _StreamingBody([])
     status_code = 200
 
-    def build_request(self, method, url, *, headers, json) -> httpx.Request:
-        type(self).requests.append({"url": url, "headers": headers, "json": json})
-        return httpx.Request(method, url, headers=headers, json=json)
+    def build_request(self, method, url, *, headers, content) -> httpx.Request:
+        type(self).requests.append(_sent_request(url, headers, content))
+        return httpx.Request(method, url, headers=headers, content=content)
 
     async def send(self, request, *, stream) -> httpx.Response:
         assert stream is True
@@ -358,7 +367,7 @@ def test_streaming_request_encoding_failure_closes_the_client(trace_api, monkeyp
             super().__init__(*args, **kwargs)
             clients.append(self)
 
-        def build_request(self, method, url, *, headers, json) -> httpx.Request:
+        def build_request(self, method, url, *, headers, content) -> httpx.Request:
             raise ValueError("encoding failed")
 
     monkeypatch.setattr(traces.httpx, "AsyncClient", _EncodingFailureClient)
@@ -2291,8 +2300,8 @@ async def test_streaming_header_wait_cancellation_closes_client_and_propagates(
             super().__init__(*args, **kwargs)
             type(self).instance = self
 
-        def build_request(self, method, url, *, headers, json) -> httpx.Request:
-            return httpx.Request(method, url, headers=headers, json=json)
+        def build_request(self, method, url, *, headers, content) -> httpx.Request:
+            return httpx.Request(method, url, headers=headers, content=content)
 
         async def send(self, request, *, stream) -> httpx.Response:
             assert stream is True
@@ -2375,7 +2384,7 @@ async def test_non_streaming_cancellation_records_trace_and_propagates(
 
 def test_upstream_transport_failure_returns_502_and_records(trace_api, monkeypatch) -> None:
     class _FailingClient(_StaticAsyncClient):
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             raise httpx.ConnectError("offline", request=httpx.Request(method, url))
 
     monkeypatch.setattr(traces.httpx, "AsyncClient", _FailingClient)
@@ -2395,7 +2404,7 @@ def test_a_transport_failure_502_reports_when_persistence_failed(trace_api, monk
     diagnostic write also fails, the 502 must say so instead of looking recorded when no row exists."""
 
     class _FailingClient(_StaticAsyncClient):
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             raise httpx.ConnectError("offline", request=httpx.Request(method, url))
 
     monkeypatch.setattr(traces.httpx, "AsyncClient", _FailingClient)
@@ -2419,7 +2428,7 @@ def test_a_transport_failure_502_omits_record_failed_when_persistence_succeeded(
     persisted transport error keeps the header absent so callers do not retry or flag a false gap."""
 
     class _FailingClient(_StaticAsyncClient):
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             raise httpx.ConnectError("offline", request=httpx.Request(method, url))
 
     monkeypatch.setattr(traces.httpx, "AsyncClient", _FailingClient)
@@ -6510,7 +6519,9 @@ def test_redaction_failure_does_not_break_the_relay(trace_api, monkeypatch) -> N
     sanitize_for_trace = traces._sanitize_for_trace
 
     def _explode_on_request(value, *args, **kwargs):
-        if value is _StaticAsyncClient.requests[-1]["json"]:
+        # the forwarded body is the caller's raw BYTES, so the recorded dict is no longer the same
+        # object; match the request by value instead. the response envelope differs from it.
+        if value == _StaticAsyncClient.requests[-1]["json"]:
             raise RecursionError("redaction depth exceeded")
         return sanitize_for_trace(value, *args, **kwargs)
 
@@ -7921,3 +7932,183 @@ def test_a_failed_recording_on_a_non_sse_stream_is_reported(trace_api, monkeypat
     # the caller still receives the provider's body unaltered -- no SSE comment spliced into JSON
     assert response.content == envelope
     assert any("trace not recorded" in record.message for record in caplog.records)
+
+
+def test_tool_result_content_parts_are_redacted_like_scalar_content() -> None:
+    """Tool output can arrive as content PARTS, and the tool's result then sits in each part's
+    `text`. Dropping the tool-result context at the list hop left a serialized third-party
+    credential -- never in `context.secrets` -- verbatim in the raw export."""
+    payload = {
+        "messages": [
+            {"role": "tool", "content": [{"type": "text", "text": '{"password":"HUNTER2"}'}]},
+            {"role": "tool", "content": [{"type": "text", "text": '{"password":"HUNT'}]},
+            {"role": "tool", "content": [{"type": "text", "text": "the weather is fine"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": '{"note":"kept"}'}]},
+        ]
+    }
+
+    redacted = traces._redact_secret_fields(payload)["messages"]
+
+    assert "HUNTER2" not in json.dumps(redacted)
+    # the part envelope survives: only the tool's own output text is reinterpreted
+    assert redacted[0]["content"][0]["type"] == "text"
+    # truncated structured output cannot be inspected, so it is blanked rather than kept
+    assert redacted[1]["content"][0]["text"] == "[redacted]"
+    assert redacted[2]["content"][0]["text"] == "the weather is fine"
+    # an assistant turn is a reply, not tool output, and is never reinterpreted
+    assert redacted[3]["content"][0]["text"] == '{"note":"kept"}'
+
+
+def test_only_root_legal_declaration_names_open_a_schema_host() -> None:
+    """`function` and `json_schema` are spelled only INSIDE a host, so a top-level extension of
+    either name is ordinary data. Accepting them at the root opened the schema exemption for the
+    whole subtree and persisted a secret-named property's literal."""
+    extension = {
+        "function": {
+            "parameters": {
+                "type": "object",
+                "properties": {"password": {"type": "string", "value": "SECRET"}},
+            }
+        }
+    }
+
+    assert "SECRET" not in json.dumps(traces._redact_secret_fields(extension))
+
+    # the real nesting still opens a host: `tools[].function.parameters` keeps its declaration
+    declaration = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"password": {"type": "string", "description": "the pw"}},
+                    },
+                },
+            }
+        ]
+    }
+
+    kept = traces._redact_secret_fields(declaration)
+    assert kept["tools"][0]["function"]["parameters"]["properties"]["password"] == {
+        "type": "string",
+        "description": "the pw",
+    }
+
+
+def test_dependent_required_declares_property_names() -> None:
+    """`dependentRequired` is keyed by property name and its arrays list property names too, so
+    both halves are declarations. Redacting either corrupts the stored schema."""
+    schema = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "signup",
+                    "parameters": {
+                        "type": "object",
+                        "dependentRequired": {"password": ["username"]},
+                    },
+                },
+            }
+        ]
+    }
+
+    redacted = traces._redact_secret_fields(schema)
+
+    assert redacted["tools"][0]["function"]["parameters"]["dependentRequired"] == {
+        "password": ["username"]
+    }
+    # outside a schema the same shape is ordinary data and still redacts
+    plain = traces._redact_secret_fields({"metadata": {"dependentRequired": {"password": ["u"]}}})
+    assert plain["metadata"]["dependentRequired"]["password"] == "[redacted]"
+
+
+def test_equivalent_ipv6_schema_hosts_resolve_to_the_same_resource() -> None:
+    """`[2001:db8::1]` and `[2001:0db8:0:0:0:0:0:1]` name the same host. Comparing their textual
+    spellings classified a local `$id` referenced in its other form as external, so the local
+    target's secret literals stayed visible in raw exports."""
+    assert trace_redaction._canonical_resource_uri(
+        "https://[2001:db8::1]/schema"
+    ) == trace_redaction._canonical_resource_uri("https://[2001:0DB8:0:0:0:0:0:1]/schema")
+    # distinct hosts stay distinct, and an invalid literal is not mapped onto a valid one
+    assert trace_redaction._canonical_resource_uri(
+        "https://[2001:db8::2]/schema"
+    ) != trace_redaction._canonical_resource_uri("https://[2001:db8::1]/schema")
+    assert trace_redaction._canonical_resource_uri(
+        "https://[2001:db8::zz]/schema"
+    ) != trace_redaction._canonical_resource_uri("https://[2001:db8::1]/schema")
+
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "auth",
+                    "parameters": {
+                        "$id": "https://[2001:db8::1]/schema",
+                        "type": "object",
+                        "properties": {
+                            "password": {
+                                "$ref": "https://[2001:0db8:0:0:0:0:0:1]/schema#/$defs/Cred"
+                            }
+                        },
+                        "$defs": {"Cred": {"type": "string", "default": "SUPERSECRET"}},
+                    },
+                },
+            }
+        ]
+    }
+
+    assert "SUPERSECRET" not in json.dumps(traces._redact_secret_fields(payload))
+
+
+def test_content_after_a_finish_reason_is_malformed() -> None:
+    """A provider that declares `finish_reason` has stated the choice is complete. Appending later
+    content produced an `AB` completion it never sent, stored with the earlier clean `stop` and
+    exportable as a training target."""
+    continued = trace_sse.SseAccumulator()
+    continued.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"A"},"finish_reason":"stop"}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{"content":"B"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    continued.finish()
+
+    assert continued.defect == "stream choice continued after reporting a finish reason"
+    output = continued.output()
+    assert output["choices"][0]["message"]["content"] == "A"
+    assert output["choices"][0]["finish_reason"] == "stop"
+
+    # a trailing event that carries no reply is the ordinary spelling for "nothing more"
+    trailing = trace_sse.SseAccumulator()
+    trailing.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"A"},"finish_reason":"stop"}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{}}]}\n\n'
+        b'data: {"choices":[],"usage":{"total_tokens":5}}\n\n'
+        b'data: {"choices":[{"index":1,"delta":{"content":"B"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    trailing.finish()
+
+    assert trailing.defect is None
+
+
+def test_the_caller_s_original_request_bytes_reach_the_provider(trace_api, monkeypatch) -> None:
+    """Reserializing the parsed copy is not verbatim forwarding: python's json round trip is not
+    representation-preserving, so a high-precision literal reached the provider as a different
+    number and duplicate members were collapsed -- silently changing a provider-specific parameter
+    after the caller had already submitted it."""
+    body = (
+        b'{"model":"gpt-test","messages":[{"role":"user","content":"hello"}],'
+        b'"temperature":0.1234567890123456789,"top_p":0.5,"top_p":0.9}'
+    )
+    _StaticAsyncClient.requests = []
+    _StaticAsyncClient.response = httpx.Response(200, json=_RESPONSE)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, content=body)
+
+    assert response.status_code == 200
+    assert _StaticAsyncClient.requests[0]["content"] == body
