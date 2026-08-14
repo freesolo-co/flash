@@ -543,7 +543,18 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
     # COMPLETES has genuinely enumerated the bytes, so its answer settles the question; the
     # deferred refusal is re-raised only when no handler managed that, which keeps a real
     # oversized archive fail-closed.
+    # A handler that returns None has either enumerated its format and found nothing, or declined
+    # bytes that were never its format -- and `None` alone cannot tell those apart, so a deferred
+    # refusal was re-raised over a scan that had already answered the question. A tar whose first
+    # member is named `x data.txt` reproduces it: the leading `x ` satisfies the zlib FDICT header
+    # rule, that handler defers a dictionary-stream refusal, the tar walk then enumerates the
+    # archive successfully, and the file was refused anyway.
+    #
+    # Only the two archive handlers count as settling it. Their success is a statement about the
+    # WHOLE file -- every member listed and read -- whereas a stream handler returning None has
+    # read one payload and says nothing about bytes another handler could not reach.
     refusal: _Unscannable | None = None
+    settled = False
     for handler in (
         _credential_in_zip,
         _credential_in_tar,
@@ -555,11 +566,12 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
         try:
             if kind := handler(source, deadline=deadline, depth=depth):
                 return kind
+            settled = settled or handler in (_credential_in_zip, _credential_in_tar)
         except _Unscannable as unscannable:
             refusal = refusal or unscannable
         except _UNREADABLE_ARCHIVE:
             continue  # not this format, or corrupt in it; the remaining formats still get a turn
-    if refusal is not None:
+    if refusal is not None and not settled:
         raise refusal
     return None
 
@@ -707,13 +719,20 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
             try:
                 plain = inflate.decompress(remaining, budget)
             except zlib.error:
-                if record:
+                if record and _looks_like_zlib(remaining[:2]):
                     # Records inflated and then one did not: the trailing bytes are a compressed
                     # stream this cannot read, and undecided is not clean. Only the FIRST record
                     # failing means "not zlib after all", which the openers below still handle.
                     raise _Unscannable(
                         "contains trailing compressed data this check cannot inspect"
                     ) from None
+                # A remainder that does not even open like a record is a footer, a checksum or the
+                # next section of a framed file -- ordinary bytes rather than something unreadable.
+                # Refusing on any remainder rejected `zlib.compress(b"harmless") + b"footer"`, whose
+                # single record decoded perfectly, and with it the framed and cache formats that
+                # write exactly that shape. Those bytes are still SCANNED: falling through leaves
+                # them to the literal pass over the file, which is where a credential in a footer
+                # would be found anyway.
                 break
             # `max_length` TRUNCATES rather than raising, so a credential past the cap would read
             # as a clean scan. `unconsumed_tail` is non-empty exactly when that happened.

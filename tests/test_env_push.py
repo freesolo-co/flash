@@ -2184,6 +2184,97 @@ def test_a_gzip_with_trailing_bytes_is_not_published_as_unreadable(tmp_path):
     assert credential_in_file(shard) is None
 
 
+def test_a_completed_archive_scan_discards_an_earlier_heuristics_refusal(tmp_path):
+    """A handler that enumerated the whole file has answered the question a guess deferred.
+
+    A tar whose first member is named `x data.txt` starts with bytes the zlib FDICT header rule
+    accepts, so that handler defers a dictionary-stream refusal on content that is not a zlib
+    stream at all. The tar walk then lists and reads every member successfully -- and the deferred
+    refusal was raised anyway, because a handler returning None looks identical whether it
+    enumerated the format or declined bytes that were never its own.
+    """
+    import io
+    import tarfile
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    def _tar(name: str, body: bytes) -> bytes:
+        buffered = io.BytesIO()
+        with tarfile.open(fileobj=buffered, mode="w") as archive:
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(body))
+        return buffered.getvalue()
+
+    harmless = tmp_path / "dataset.tar"
+    harmless.write_bytes(_tar("x data.txt", b"harmless\n"))
+    assert credential_in_file(harmless) is None
+
+    # the same archive really holding a key is still reported, so this did not silence the scan
+    keyed = tmp_path / "keyed.tar"
+    keyed.write_bytes(_tar("x data.txt", b'KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode()))
+    assert credential_in_file(keyed) == "a Freesolo API key"
+
+    # and a refusal about content the completed walk ACTUALLY reached must survive: an encrypted
+    # member is unverifiable however successfully the archive around it enumerated
+    opaque = tmp_path / "opaque.zip"
+    with zipfile.ZipFile(opaque, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("only.txt", "x" * 200)
+    raw = bytearray(opaque.read_bytes())
+    for index in range(len(raw) - 4):
+        if raw[index : index + 4] == b"PK\x03\x04":
+            raw[index + 6] |= 0x01
+        elif raw[index : index + 4] == b"PK\x01\x02":
+            raw[index + 8] |= 0x01
+    opaque.write_bytes(bytes(raw))
+    with pytest.raises(_Unscannable, match="encrypted archive member"):
+        credential_in_file(opaque)
+
+    wrapped = tmp_path / "wrapped.tar"
+    wrapped.write_bytes(_tar("inner.zip", bytes(raw)))
+    with pytest.raises(_Unscannable, match="encrypted archive member"):
+        credential_in_file(wrapped)
+
+
+def test_a_plain_footer_after_a_zlib_record_is_not_a_refusal(tmp_path):
+    """A remainder that does not open like a record is data, not an unreadable stream.
+
+    Refusing on ANY trailing bytes rejected `zlib.compress(b"harmless") + b"footer"` -- one record
+    that decoded perfectly, followed by bytes plainly not another one -- and with it the framed and
+    cache formats that write exactly that shape. The refusal still has to fire for a remainder that
+    really does begin a record and cannot be read, which is the case it exists for.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+
+    footed = tmp_path / "cache.bin"
+    footed.write_bytes(zlib.compress(b"harmless") + b"footer")
+    assert credential_in_file(footed) is None
+
+    # the trailing bytes are still SCANNED, so a credential sitting in the footer is found
+    keyed_footer = tmp_path / "keyed.bin"
+    keyed_footer.write_bytes(zlib.compress(b"harmless") + b"footer " + key)
+    assert credential_in_file(keyed_footer) == "a Freesolo API key"
+
+    # a real second record still gets inflated, which is what the loop is for
+    chained = tmp_path / "chained.z"
+    chained.write_bytes(zlib.compress(b"hi") + zlib.compress(key))
+    assert credential_in_file(chained) == "a Freesolo API key"
+
+    # and a remainder that DOES open like a record but cannot be read is still refused: unreadable
+    # is not clean, and narrowing the refusal must not reopen that hole
+    damaged = bytearray(zlib.compress(key * 40))
+    damaged[len(damaged) // 2] ^= 0xFF
+    broken = tmp_path / "broken.z"
+    broken.write_bytes(zlib.compress(b"hi") + bytes(damaged))
+    with pytest.raises(_Unscannable, match="trailing compressed data"):
+        credential_in_file(broken)
+
+
 def test_a_corrupt_xz_does_not_crash_the_publish(tmp_path):
     """`lzma.LZMAError` inherits straight from Exception, so it needs naming explicitly.
 
