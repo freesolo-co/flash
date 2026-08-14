@@ -118,6 +118,15 @@ SHORTEST_TOKEN_BYTES = 15
 # unmatched so the key published. Only the remainder of the header LINE is consumed -- the body
 # begins on the next one -- so this cannot swallow a value that follows on the same line.
 _BLOCK_SCALAR = rb"(?:[|>](?:[+-][0-9]?|[0-9][+-]?)?[ \t]*(?:\#[^\r\n]*)?\s*)?"
+# YAML node properties, which may sit between the assignment and the scalar: a tag (`!!str`, or a
+# named handle such as `!ruby/object`) and/or an anchor (`&name`). Either order, either alone, and
+# a tag may be followed by an anchor. The parser yields the same scalar, so
+# `AWS_SECRET_ACCESS_KEY: !!str <key>` and `... : &aws <key>` are live credentials that matched
+# nothing -- the body was expected immediately after the block header and the optional quote.
+#
+# Deliberately narrow: a tag is `!` plus tag characters, an anchor `&` plus non-space. Neither can
+# contain a quote or whitespace, so this cannot swallow the value it precedes.
+_NODE_PROPERTIES = rb"(?:(?:![!A-Za-z0-9_/:.-]*|&[^\s\"']+)[ \t]+)*"
 # The opening quote, if any. A single optional quote character consumed only ONE of the three in a
 # triple-quote delimiter, leaving a quote sitting where the body had to begin, so an ordinary
 # Python or TOML multiline assignment matched nothing and published. Whole delimiters are named,
@@ -138,6 +147,7 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
         re.compile(
             rb"(?i:wandb_api_key)[\"']?\s*[:=]\s*"
             + _BLOCK_SCALAR
+            + _NODE_PROPERTIES
             + _OPEN_QUOTE
             + rb"([A-Za-z0-9_-]{40,%d})" % _MAX_BODY
         ),
@@ -152,6 +162,7 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
             # without admitting a longer unrelated identifier ending in the same characters.
             rb"(?i:aws_secret_access_key|(?<![A-Za-z0-9_])secretaccesskey)[\"']?\s*[:=]\s*"
             + _BLOCK_SCALAR
+            + _NODE_PROPERTIES
             + _OPEN_QUOTE
             + rb"([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])"
         ),
@@ -174,9 +185,22 @@ class _Searchable(Protocol):
 #
 # Its name is escapable exactly like the private members below, and for the same reason: escaping
 # only the `kty` half left the pair unmatched even when the private member was spelled plainly.
+def _json_escapable(text: bytes) -> bytes:
+    """`text` as a pattern matching itself or any character written as its `\\u00XX` escape.
+
+    JSON says the two spellings are the same string, so a parser loads `"R\\u0053A"` as `RSA` and
+    a literal-byte pattern sees neither. Applied to member NAMES and to the `kty` VALUE: escaping
+    only the names left the key-type marker matchable by a one-character escape.
+    """
+    return b"".join(rb"(?:%s|(?i:\\[uU]00%02x))" % (re.escape(bytes([b])), b) for b in text)
+
+
 _JWK_KTY = re.compile(
-    rb"\"(?:k|(?i:\\[uU]006b))(?:t|(?i:\\[uU]0074))(?:y|(?i:\\[uU]0079))\""
-    rb"\s*:\s*\"(?:RSA|EC|OKP|oct)\""
+    rb"\""
+    + _json_escapable(b"kty")
+    + rb"\"\s*:\s*\"(?:"
+    + b"|".join(_json_escapable(kind) for kind in (b"RSA", b"EC", b"OKP", b"oct"))
+    + rb")\""
 )
 # `d` is the private exponent or scalar in every key type; for RSA the CRT parameters accompany it.
 # `k` is the symmetric case: an `oct` JWK holds its whole secret there and has no `d` at all, so

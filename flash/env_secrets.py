@@ -19,8 +19,6 @@ free of any import from it so the dependency runs one way.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import bz2
 import gzip
 import io
@@ -35,12 +33,15 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, NoReturn
 
+from flash.env_base64 import _match_base64
 from flash.env_formats import (
+    _KEYSTORE_MAGIC,
     _MAX_ARCHIVE_MEMBERS,
     _MAX_OPENPGP_MARKERS,
     _UNEXPANDABLE_MAGIC,
     _ZIP_TAIL_BYTES,
     _after_skippable_frames,
+    _has_openpgp_message_armor,
     _has_zip_end_record,
     _is_openpgp_encrypted,
     _is_openpgp_secret_key,
@@ -49,6 +50,8 @@ from flash.env_formats import (
     _looks_like_tar,
     _looks_like_textual,
     _looks_like_zlib,
+    _overlay_offset,
+    _overlay_payload,
     _zip_member_count,
 )
 from flash.env_patterns import (
@@ -57,7 +60,6 @@ from flash.env_patterns import (
     _MAX_BODY,
     _PAIRED_PATTERNS,
     _TOKEN_PATTERNS,
-    SHORTEST_TOKEN_BYTES,
     _match,
 )
 
@@ -79,6 +81,16 @@ _SKIPPABLE_SCAN_BYTES = 64 << 10
 # fixed 24 left too few behind four markers to reach the version and algorithm fields.
 _OPENPGP_HEAD_BYTES = 24 + 5 * _MAX_OPENPGP_MARKERS
 
+# How much of a stream is accumulated to walk a key store to its end. The walk is head-anchored, so
+# a store larger than one chunk had its remaining entries unread -- and a private key BEHIND a
+# certificate whose body crossed the boundary published intact.
+#
+# Buffered rather than refused because refusing is a false alarm on exactly the ordinary case: a
+# truststore is mostly certificates, holds no private key at all, and grows past a chunk simply by
+# holding enough of them. The walk itself is cheap whatever the size -- it steps entry to entry by
+# arithmetic and never reads a certificate body -- so the cap only has to sit above any real store.
+_MAX_KEYSTORE_BYTES = 16 << 20
+
 # How many concatenated zlib records are inflated before the stream is refused. A per-record cache
 # or an appended log writes a handful; the bound is what stops a file of many tiny records from
 # becoming an expansion cost of its own, and exceeding it refuses rather than passes.
@@ -92,29 +104,6 @@ _MAX_ZLIB_RECORDS = 64
 # at offset zero, where they mean what they say.
 _SFX_MAGIC_BYTES = 6
 
-# A base64 run long enough to hold the shortest credential a pattern admits. The lower bound makes
-# the scan walk past ordinary prose rather than decoding every word it meets. There is deliberately
-# no upper bound: capping the run split a long encoded file into adjacent pieces, and a credential
-# straddling the cut decoded into neither half -- so base64 of a whole `env.sh` published clean.
-# Length is instead bounded by `_decode_windows` below, which slides a window over the run.
-#
-# The URL-safe alphabet (`-` and `_` for `+` and `/`, RFC 4648 section 5) is admitted too. It is
-# what `base64.urlsafe_b64encode`, a JWT, and most token-in-a-URL configs emit, and accepting only
-# `+/` split such a value at its first `-` so the fragments decoded to neither the whole token nor
-# anything matching. The two alphabets are disjoint apart from the shared 62 characters, so one
-# pattern covers both and the decode below translates whichever pair is present.
-#
-# The floor is DERIVED from the shortest credential the patterns admit, not chosen. At a fixed 24
-# it sat above the encoding of the shortest Slack token: `xoxb-` plus its 10-character body is 15
-# bytes, which encodes to 20 characters, so `eG94Yi1BYkNkRWYwMTIz` in a Kubernetes Secret or any
-# other base64 config was never decoded even though the same token in plaintext was caught. Any
-# future lowering of a body minimum moves this with it.
-_MIN_BASE64_RUN = -(-SHORTEST_TOKEN_BYTES * 4 // 3)  # ceil, unpadded base64 length
-_BASE64_RUN = re.compile(rb"[A-Za-z0-9+/\-_]{%d,}={0,2}" % _MIN_BASE64_RUN)
-
-# Maps the URL-safe alphabet onto the standard one so a single decoder handles both. A run mixing
-# the two is not valid base64 either way, and translating it simply fails to decode as before.
-_URL_SAFE_ALPHABET = bytes.maketrans(b"-_", b"+/")
 
 # Marks NUL as 1 and everything else as 0, so an unbroken stretch of padding bytes becomes a run
 # `_WIDE_RUN` can find. The length floor is the shortest credential worth decoding; below it a
@@ -131,48 +120,6 @@ _URL_SAFE_ALPHABET = bytes.maketrans(b"-_", b"+/")
 _NUL_MARKER = bytes(1 if byte == 0 else 0 for byte in range(256))
 _WIDE_RUN = re.compile(rb"\x01{20,}")
 
-# A fixed-width wrapped base64 block: one or more full-width lines, then a final line of any
-# length. The widths are the two conventions in use -- 76 for MIME (`base64.encodebytes`, mail,
-# many `kubectl -o yaml` outputs) and 64 for PEM bodies. Joining ONLY these leaves ordinary
-# adjacent lines alone, so no arbitrary pair of values is welded into a run that decodes to
-# something neither line contained.
-#
-# ONE full line is enough to qualify, not two. Requiring two meant the commonest shape of all --
-# a blob just over the width, so one full line plus a short tail -- never joined, and a key
-# straddling its single break decoded into neither side.
-#
-# `\r?\n` because a Windows checkout or a YAML export wraps with CRLF, and matching only `\n` left
-# every CRLF blob unjoined. The `\r` is dropped along with the `\n` when the block is joined.
-#
-# `[ \t]*` after each break because a wrapped blob is routinely INDENTED: a YAML block scalar, a
-# base64 value under a `data:` key, a heredoc inside a function body. Requiring the next line to
-# start in column 0 missed 20 of 60 key offsets on a two-space-indented block, at both widths --
-# and an indented blob is the commonest way a key is embedded in a config file.
-#
-# The URL-safe alphabet is admitted here for the same reason `_BASE64_RUN` admits it: `-` and `_`
-# are what a JWT, a token-in-a-URL, or `base64.urlsafe_b64encode` emits, and accepting only `+/`
-# meant a url-safe blob was never recognised as wrapped. Its lines were then left unjoined and a
-# credential straddling a break decoded into neither side -- the exact bypass joining exists to
-# close, reachable by encoding with the other alphabet.
-_WRAPPED_BLOCK = re.compile(
-    rb"(?:[A-Za-z0-9+/\-_]{76}\r?\n[ \t]*)+[A-Za-z0-9+/\-_]{1,76}={0,2}"
-    rb"|(?:[A-Za-z0-9+/\-_]{64}\r?\n[ \t]*)+[A-Za-z0-9+/\-_]{1,64}={0,2}"
-)
-# A necessary condition for the block above: a full-width line of base64 followed by a break. Cheap
-# to reject, and it fails on essentially every real file, so the expensive alternation only runs
-# where a wrapped block could actually be. Same alphabet as the block, or the guard rejects
-# precisely the url-safe blobs the block was widened to join.
-_WRAPPED_HINT = re.compile(rb"[A-Za-z0-9+/\-_]{64}\r?\n")
-# The break itself, removed when a block is joined -- with any indent that follows it, or the
-# joined run would still carry spaces outside the base64 alphabet. Both endings, so a CRLF blob
-# joins into a continuous run rather than one still carrying stray `\r` bytes.
-_WRAPPED_BREAK = re.compile(rb"\r?\n[ \t]*")
-
-# How much of one base64 run to decode at a time, and how far the windows overlap. The overlap
-# exceeds the encoded length of the longest possible match (4/3 of `_MAX_BODY` plus its prefix), so
-# a credential anywhere in a run of any length lands whole inside some window.
-_BASE64_WINDOW = 8192
-_BASE64_WINDOW_OVERLAP = 1024
 
 # How many container layers deep to expand. A zip holding a gzipped shard is an ordinary way to
 # ship a dataset, and stopping at one level meant the inner member's bytes were treated as final
@@ -235,90 +182,6 @@ _UNREADABLE_ARCHIVE = (
     # bug than the hole being closed.
     tarfile.TarError,
 )
-
-
-def _match_base64(data: bytes) -> str | None:
-    """The kind of credential hidden in a base64 run, or None.
-
-    A Kubernetes Secret stores every value base64-encoded, and that is an ordinary file to keep
-    beside an environment. The encoded key shares no substring with the plaintext, so none of the
-    patterns can see it, and `data: <base64 of an fslo_ key>` published with exit 0.
-
-    Only runs long enough to hold a credential are decoded, and only the base64 alphabet is
-    considered, so this walks past prose. The decoded bytes go through `_match` rather than the full
-    `_credential_kind`, which keeps the recursion one level deep: base64 of base64 is not a
-    convention worth chasing, and unbounded re-decoding is a denial-of-service surface.
-
-    A run is decoded in overlapping windows rather than whole, so memory stays bounded on a large
-    encoded blob while a credential anywhere in it still lands whole inside some window. Slicing a
-    long run into ADJACENT pieces was a bypass: a key straddling the cut decoded into neither half,
-    so base64 of an ordinary config file published clean.
-
-    Measured against the false-positive risk before adopting it: 630,011 base64-shaped runs across
-    8,769 real hub files decode to zero credential matches, so this costs no legitimate publish.
-    """
-    for run in _BASE64_RUN.finditer(_unwrapped(data)):
-        candidate = run.group(0)
-        for window in _decode_windows(candidate):
-            # base64 packs 3 bytes per 4 characters, so a run rarely starts on a boundary; all four
-            # alignments are tried, each trimmed to a whole number of quartets.
-            for start in range(min(len(window), 4)):
-                chunk = window[start:]
-                # Restore the padding rather than discarding the tail. Trimming to a whole quartet
-                # threw away up to three encoded characters, which is up to two decoded bytes off
-                # the END of the value -- enough to take a token below its pattern's minimum
-                # length, so unpadded base64url of a 20-character `pit_` key published clean.
-                # Unpadded output is what `b64encode(...).rstrip("=")`, a JWT segment, and most
-                # token-in-a-URL encodings emit, so this is the common case rather than the odd one.
-                if remainder := len(chunk) % 4:
-                    chunk = chunk + b"=" * (4 - remainder) if remainder > 1 else chunk[:-1]
-                # The same derived floor as the run pattern, not a second hardcoded 24. Lowering
-                # only the pattern left this one rejecting exactly the encodings it had started
-                # admitting, so the fix would have looked applied while the bypass stayed open.
-                if len(chunk) < _MIN_BASE64_RUN:
-                    continue
-                try:
-                    decoded = base64.b64decode(chunk.translate(_URL_SAFE_ALPHABET), validate=True)
-                except (ValueError, binascii.Error):
-                    continue
-                if kind := _match(decoded):
-                    return kind
-    return None
-
-
-def _unwrapped(data: bytes) -> bytes:
-    """`data` with the line breaks of a fixed-width base64 block removed, joining it into one run.
-
-    MIME base64 breaks every 76 characters (`base64.encodebytes`, mail attachments, many
-    `kubectl get -o yaml` outputs) and PEM bodies every 64. The run pattern stops at the newline,
-    so a wrapped blob arrived as a series of per-line runs and a credential straddling a break
-    decoded into neither -- measured at 20 of 60 possible key offsets missed, which is every key
-    that happens to cross a line.
-
-    Only FIXED-WIDTH sequences are joined, never any break between two base64 characters. That
-    distinction matters: `KEY=aGVsbG8\\nOTHER=d29ybGQ` is two unrelated values, and welding those
-    together would decode arbitrary line pairs and invent credentials that were never there.
-    Wrapping is what the width identifies, and a real wrapped blob always has it.
-
-    Guarded by a cheap substring test first. The joining pattern alternates over two widths and
-    retries at every offset, which cost most of the scan's throughput when it ran over every chunk
-    of every file; almost no file contains a wrapped block, and one that does always contains a
-    full-width run of base64 characters. Measured on ordinary source: 9 MB/s without the guard,
-    back to the pre-existing rate with it.
-    """
-    if b"\n" not in data or not _WRAPPED_HINT.search(data):
-        return data
-    return _WRAPPED_BLOCK.sub(lambda match: _WRAPPED_BREAK.sub(b"", match.group(0)), data)
-
-
-def _decode_windows(run: bytes) -> Iterator[bytes]:
-    """Overlapping slices of a base64 run, each small enough to decode eagerly."""
-    if len(run) <= _BASE64_WINDOW:
-        yield run
-        return
-    step = _BASE64_WINDOW - _BASE64_WINDOW_OVERLAP
-    for start in range(0, len(run), step):
-        yield run[start : start + _BASE64_WINDOW]
 
 
 def _credential_kind(data: bytes) -> str | None:
@@ -408,35 +271,23 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     container_head = False
     overflowed = False
     seen: set[tuple[int, str]] = set()
+    store_head = bytearray()
+    walking_store = True
     while chunk := handle.read(_SCAN_CHUNK_BYTES):
         if deadline is not None and time.monotonic() > deadline:
             raise _Unscannable("takes too long to decompress")
-        if not carry and (store := _jks_private_key_entries(chunk)) is not False:
-            if store is None:
-                raise _Unscannable(
-                    "contains a key store with more entries than this check can walk"
-                )
-            # A Java KeyStore or JCEKS holding a key entry, recognised structurally. Head-anchored
-            # like the OpenPGP test and for the same reason: the magic plus a plausible version and
-            # count is only decisive at offset 0. The WHOLE first chunk is passed, not the 16-byte
-            # header: the walk has to reach entries past the first, and a store larger than one
-            # chunk is bounded by `_MAX_JKS_ENTRIES` rather than by the read.
-            #
-            # Named for the STORE rather than for the entry inside it. The walk stops at the first
-            # key entry, which may be a private key or a JCEKS symmetric key, and the author has to
-            # rotate the store either way -- calling a `-genseckey` AES key "a private key" would
-            # send them looking for the wrong thing.
-            return "a key store"
-        if not carry:
-            # only ever at offset 0, and `carry` is empty only on the first chunk. Every file and
-            # every archive member reaches this, so the binary export is covered wherever it sits.
-            secret_key = _is_openpgp_secret_key(chunk[:_OPENPGP_HEAD_BYTES])
-            if secret_key is None:
-                raise _Unscannable("contains more OpenPGP marker packets than this check can walk")
-            if secret_key:
-                return "a private key"
-            if _is_openpgp_encrypted(chunk[:_OPENPGP_HEAD_BYTES]):
-                raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
+        if walking_store:
+            store_head.extend(chunk)
+            walking_store = _keystore_undecided(bytes(store_head))
+            if walking_store is None:
+                # Named for the STORE rather than for the entry inside it: the walk stops at the
+                # first key entry, which may be a private key or a JCEKS symmetric key, and the
+                # author has to rotate the store either way.
+                return "a key store"
+            if not walking_store:
+                store_head = bytearray()
+        if not carry and (kind := _openpgp_kind(chunk)):
+            return kind
         if not carry:
             # zstd and LZ4 both allow a metadata envelope before the real frame. What matters here
             # is only whether that prelude could be READ to its end: a frame declaring a payload
@@ -482,6 +333,11 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         # 256 MiB of random bytes for all six.
         if fmt := _unexpandable_format(window, anchored=False):
             raise _Unscannable(f"contains a {fmt} archive this check cannot expand")
+        # Armored OpenPGP ciphertext, over the same window and for the same reason as the binary
+        # form above: the body is opaque, so neither a pattern nor a base64 decode can see what is
+        # inside, and treating it as ordinary text published the message intact.
+        if _has_openpgp_message_armor(window):
+            raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
         if kind := _credential_kind(window):
             return kind
         # A two-marker credential is paired across the WHOLE stream, not within one window. Those
@@ -492,10 +348,60 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         if kind := _paired_markers_kind(window, seen):
             return kind
         carry = window[-_SCAN_OVERLAP_BYTES:]
+    if walking_store and store_head:
+        # The stream ENDED with the walk still undecided, which more bytes can no longer settle --
+        # either it ran off the end of the file or it exhausted the entry bound. Both mean the
+        # entries behind the stopping point are unread, and unread is not clean.
+        raise _Unscannable("contains a key store this check cannot finish walking")
     if overflowed and _has_zip_end_record(tail):
         raise _Unscannable("contains an archive too large to inspect")
     if buffered and _looks_like_container(bytes(buffered)):
         return _credential_in_container(bytes(buffered), deadline=deadline or 0.0, depth=depth + 1)
+    return None
+
+
+def _keystore_undecided(head: bytes) -> bool | None:
+    """Whether more bytes are needed to settle if `head` is a keystore holding a key.
+
+    None means it IS one holding a key entry; False means it is not a keystore at all; True means
+    the walk ran out of bytes and the answer is still open.
+
+    ACCUMULATED across chunks by the caller rather than tested on the first one. A store whose walk
+    ran off the end of a chunk reported "not a keystore" -- indistinguishable from bytes that never
+    were one -- and since the overlap carry is non-empty from the second chunk on, nothing
+    re-entered the parser. A single trusted certificate larger than a chunk was enough to hide the
+    private key stored behind it.
+
+    Re-walking the growing head each time is cheap: the walk steps from entry to entry by
+    arithmetic and never reads a certificate body, so its cost is per ENTRY, not per byte.
+    """
+    if not head.startswith(_KEYSTORE_MAGIC):
+        return False  # settled in four bytes, so nothing needs accumulating
+    if (store := _jks_private_key_entries(head)) is None:
+        if len(head) >= _MAX_KEYSTORE_BYTES:
+            raise _Unscannable("contains a key store this check cannot finish walking")
+        return True
+    return None if store else False
+
+
+def _openpgp_kind(chunk: bytes) -> str | None:
+    """The kind of OpenPGP key a stream BEGINS with, or None if it holds no key.
+
+    Anchored at offset 0, where every packet format is decisive. Every file and every archive
+    member reaches this, so a binary export is covered wherever it sits.
+
+    Raises rather than returning None for the two undecided cases: more marker packets than the
+    walk allows, and an encrypted message whose body cannot be read at all. The WHOLE chunk goes to
+    the encrypted test, since a public-key session packet carries the encrypted session key inline
+    and runs to a few hundred bytes -- a fixed head could not reach the data packet behind it.
+    """
+    secret_key = _is_openpgp_secret_key(chunk[:_OPENPGP_HEAD_BYTES])
+    if secret_key is None:
+        raise _Unscannable("contains more OpenPGP marker packets than this check can walk")
+    if secret_key:
+        return "a private key"
+    if _is_openpgp_encrypted(chunk) is not False:
+        raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
     return None
 
 
@@ -564,7 +470,14 @@ def _looks_like_container(data: bytes) -> bool:
     holding a tar of gzipped shards left the innermost key unreached.
     """
     return (
-        _looks_compressed(data[:6]) or _looks_like_tar(data) or zipfile.is_zipfile(io.BytesIO(data))
+        _looks_compressed(data[:6])
+        or _looks_like_tar(data)
+        or zipfile.is_zipfile(io.BytesIO(data))
+        # A self-extracting SHELL archive, whose stub is a script rather than an executable: none of
+        # the tests above sees past it, since each asks what the file BEGINS with and it begins with
+        # `#!/bin/sh`. `is_zipfile` covers the same shape for a zip payload; this covers the gzip,
+        # bzip2 and xz payloads that `makeself` and `.run` installers actually carry.
+        or _overlay_offset(data) is not None
     )
 
 
@@ -608,7 +521,12 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
     # deferred refusal is re-raised only when no handler managed that, which keeps a real
     # oversized archive fail-closed.
     refusal: _Unscannable | None = None
-    for handler in (_credential_in_zip, _credential_in_tar, _credential_in_compressed):
+    for handler in (
+        _credential_in_zip,
+        _credential_in_tar,
+        _credential_in_compressed,
+        _credential_in_overlay,
+    ):
         try:
             if kind := handler(source, deadline=deadline, depth=depth):
                 return kind
@@ -619,6 +537,26 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
     if refusal is not None:
         raise refusal
     return None
+
+
+def _credential_in_overlay(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
+    """The kind of credential in a compressed payload appended after a stub, or None.
+
+    Last of the handlers, and it re-enters the ordinary container path on the payload alone rather
+    than reimplementing any format: what sits behind the stub is an ordinary gzip, bzip2 or xz
+    stream, so once the offset is known there is nothing special about it.
+
+    The stub's own bytes are NOT re-scanned here. `_scan_stream` already read them literally on the
+    way in -- it is text -- so this only has to cover the part that scan could not see.
+    """
+    if (at := _overlay_offset(source)) is None:
+        return None
+    payload = _overlay_payload(source, at, _MAX_NESTED_BUFFER_BYTES)
+    if payload is None:
+        return None
+    if not payload:
+        raise _Unscannable("contains an appended archive too large to inspect")
+    return _credential_in_container(payload, deadline=deadline, depth=depth + 1)
 
 
 def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: int) -> str | None:

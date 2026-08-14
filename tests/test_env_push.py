@@ -2318,7 +2318,8 @@ def test_a_credential_straddling_a_base64_window_is_still_decoded(tmp_path):
     """
     import base64
 
-    from flash.env_secrets import _BASE64_WINDOW, _credential_kind, credential_in_file
+    from flash.env_base64 import _BASE64_WINDOW
+    from flash.env_secrets import _credential_kind, credential_in_file
 
     secret = f"fslo_{_FAKE_KEY_BODY}".encode()
 
@@ -4431,8 +4432,9 @@ def test_the_base64_floor_admits_the_shortest_token_the_patterns_match(tmp_path)
     """
     import base64
 
+    from flash.env_base64 import _MIN_BASE64_RUN
     from flash.env_patterns import SHORTEST_TOKEN_BYTES
-    from flash.env_secrets import _MIN_BASE64_RUN, credential_in_file
+    from flash.env_secrets import credential_in_file
 
     token = b"xoxb-AbCdEf0123"
     assert len(token) == SHORTEST_TOKEN_BYTES
@@ -4711,8 +4713,223 @@ def test_a_java_keystore_holding_a_private_key_is_detected(tmp_path):
 
     beyond = tmp_path / "beyond.jks"
     beyond.write_bytes(keystore(*([2] * _MAX_JKS_ENTRIES), 1))
-    with pytest.raises(_Unscannable, match="more entries"):
+    with pytest.raises(_Unscannable, match="cannot finish walking"):
         credential_in_file(beyond)
+
+
+def test_the_truststore_every_jdk_ships_still_publishes(tmp_path):
+    """The entry bound must sit above real stores, not above a guessed handful.
+
+    `/etc/ssl/certs/java/cacerts` holds 146 trusted certificates and no private key at all. A bound
+    chosen as "a real store holds a handful" refused the most ordinary keystore in existence, which
+    is a false alarm on a file that carries no secret whatsoever.
+    """
+    import os
+    import struct
+
+    from flash.env_secrets import credential_in_file
+
+    body = b""
+    for index in range(200):
+        alias = b"cert%d" % index
+        body += struct.pack(">I", 2) + struct.pack(">H", len(alias)) + alias
+        body += struct.pack(">Q", 1700000000000)
+        body += struct.pack(">H", 5) + b"X.509" + struct.pack(">I", 900) + os.urandom(900)
+    store = tmp_path / "cacerts"
+    store.write_bytes(b"\xfe\xed\xfe\xed" + struct.pack(">II", 2, 200) + body + os.urandom(20))
+    assert credential_in_file(store) is None
+
+
+def test_a_key_behind_a_certificate_larger_than_a_chunk_is_detected(tmp_path):
+    """The keystore walk is head-anchored, so a store larger than one chunk was half-read.
+
+    A trusted certificate whose body crosses the chunk boundary made the bounded walk run off the
+    end, which reported "not a keystore" -- indistinguishable from bytes that never were one. From
+    the second chunk on nothing re-enters the parser, so the private key stored BEHIND that
+    certificate published intact. One oversized certificate is all it takes.
+    """
+    import os
+    import struct
+
+    from flash.env_secrets import _SCAN_CHUNK_BYTES, credential_in_file
+
+    def store(cert_bytes: int) -> bytes:
+        body = struct.pack(">I", 2) + struct.pack(">H", 4) + b"cert"
+        body += struct.pack(">Q", 1700000000000)
+        body += struct.pack(">H", 5) + b"X.509"
+        body += struct.pack(">I", cert_bytes) + os.urandom(cert_bytes)
+        body += struct.pack(">I", 1) + struct.pack(">H", 3) + b"key"
+        body += struct.pack(">Q", 1700000000000)
+        body += struct.pack(">I", 1200) + os.urandom(1200)
+        body += struct.pack(">I", 1)
+        body += struct.pack(">H", 5) + b"X.509" + struct.pack(">I", 64) + os.urandom(64)
+        return b"\xfe\xed\xfe\xed" + struct.pack(">II", 2, 2) + body + os.urandom(20)
+
+    spanning = tmp_path / "spanning.jks"
+    spanning.write_bytes(store(_SCAN_CHUNK_BYTES + 100))
+    assert credential_in_file(spanning) == "a key store"
+
+    # the same store with a certificate that fits, which was already detected: the control that
+    # proves the assertion above is about the chunk boundary rather than about the layout
+    fitting = tmp_path / "fitting.jks"
+    fitting.write_bytes(store(64))
+    assert credential_in_file(fitting) == "a key store"
+
+
+def test_an_encrypted_openpgp_message_larger_than_the_head_is_refused(tmp_path):
+    """The session packet had to be reachable, and a fixed head could not reach it.
+
+    `gpg --encrypt` writes a public-key session packet carrying the encrypted session key inline,
+    which runs to a few hundred bytes for an ordinary RSA key. Reading a fixed 64-byte head meant
+    the encrypted-data packet BEHIND it was never seen, the file read as "not encrypted", and the
+    ciphertext published. The whole chunk is read now, and a packet longer than that refuses rather
+    than reporting the bytes clean.
+    """
+    import struct
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    def session(body_bytes: int, *, follow: bytes) -> bytes:
+        """A v3 PKESK packet of `body_bytes`, then `follow`, laid out as real gpg writes one.
+
+        Old-format tag 1 with a two-byte length -- `0x85` is what `gpg --encrypt` actually emits,
+        verified against its output rather than assembled from the spec.
+        """
+        body = b"\x03" + b"\x00" * 8 + b"\x01" + b"\x00" * (body_bytes - 10)
+        return b"\x85" + struct.pack(">H", body_bytes) + body + follow
+
+    # A real 268-byte session packet: the data packet behind it sits far past any fixed head.
+    encrypted = tmp_path / "secret.gpg"
+    encrypted.write_bytes(session(268, follow=b"\xd2" + b"\x40" + b"\x00" * 64))
+    with pytest.raises(_Unscannable, match="encrypted OpenPGP"):
+        credential_in_file(encrypted)
+
+    # A session packet declaring a body longer than the bytes that follow it cannot be walked to
+    # the packet behind it, and undecided is not clean.
+    truncated = tmp_path / "truncated.gpg"
+    truncated.write_bytes(session(268, follow=b"")[: 3 + 200])  # body cut short of its declared 268
+    with pytest.raises(_Unscannable, match="encrypted OpenPGP"):
+        credential_in_file(truncated)
+
+    # The control: a session packet followed by something that is NOT an encrypted-data packet is
+    # not an encrypted message, and must still publish.
+    lone = tmp_path / "lone.bin"
+    lone.write_bytes(session(268, follow=b"hello there, ordinary bytes"))
+    assert credential_in_file(lone) is None
+
+
+def test_an_armored_openpgp_message_is_refused(tmp_path):
+    """The armored form is the one an author actually commits, and it is not a key block.
+
+    `gpg --armor --symmetric` writes `-----BEGIN PGP MESSAGE-----`, which the private-key armor
+    pattern never matched, and whose base64 body is ciphertext -- so decoding it finds nothing
+    either. A Freesolo key inside published clean.
+    """
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    armored = tmp_path / "secret.asc"
+    armored.write_text(
+        "-----BEGIN PGP MESSAGE-----\n\n"
+        "jA0ECQMKfBUuPuHPCr3/0nUBOUEMgb7cvEQYOuU79Qk6ecIpdWiDm1BQOI8rD2Mm\n"
+        "vjOpOLTwrKclkwFi9fZHNA/ehv0mSbBXQnJhTfBCVQ==\n"
+        "=abcd\n-----END PGP MESSAGE-----\n"
+    )
+    with pytest.raises(_Unscannable, match="encrypted OpenPGP"):
+        credential_in_file(armored)
+
+    # A clear-signed message carries its payload in the CLEAR, so the ordinary scan reads it and
+    # refusing it would block a signed README.
+    signed = tmp_path / "README.asc"
+    signed.write_text(
+        "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n"
+        "this environment does nothing secret\n"
+        "-----BEGIN PGP SIGNATURE-----\n\nabcd\n-----END PGP SIGNATURE-----\n"
+    )
+    assert credential_in_file(signed) is None
+
+
+def test_a_credential_in_a_self_extracting_shell_archive_is_found(tmp_path):
+    """`makeself` puts a script first and the compressed payload after it.
+
+    Every container test asks what the file BEGINS with, and it begins with `#!/bin/sh` -- so the
+    gzip behind the stub was scanned as opaque bytes and the key inside published. The payload is
+    an ordinary gzip once its offset is known, so it is EXPANDED rather than refused.
+    """
+    import gzip
+
+    from flash.env_secrets import credential_in_file
+
+    stub = b'#!/bin/sh\n# self-extracting archive\ntail -c +NNN "$0" | gzip -dc\nexit 0\n'
+    payload = gzip.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
+    sfx = tmp_path / "install.run"
+    sfx.write_bytes(stub + payload)
+    assert credential_in_file(sfx) == "a Freesolo API key"
+
+    # bzip2 and xz payloads are as ordinary as gzip for this shape
+    import bz2
+    import lzma
+
+    for suffix, compress in (("bz2", bz2.compress), ("xz", lzma.compress)):
+        archive = tmp_path / f"install.{suffix}.run"
+        archive.write_bytes(
+            stub + compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
+        )
+        assert credential_in_file(archive) == "a Freesolo API key"
+
+    # The control: a shell script with no payload at all must still publish. Three bytes of magic
+    # occur by chance in any large binary, so the offset is proven by actually inflating it.
+    plain = tmp_path / "setup.sh"
+    plain.write_bytes(stub + b"\x1f\x8b\x08 not really a gzip stream at all\n" * 4)
+    assert credential_in_file(plain) is None
+
+
+def test_a_forged_directory_size_does_not_allocate_the_package(tmp_path):
+    """The member-count preflight exists to avoid `ZipFile`'s large allocation.
+
+    Reading the end record's 32-bit directory size into one `bytes` object re-created that cost in
+    the preflight itself: the field is attacker-controlled, so a forged value covering the file
+    allocated roughly the whole package before discovering the candidate was not a directory.
+    """
+    import os
+    import struct
+    import tracemalloc
+    import zipfile
+
+    from flash.env_formats import _zip_member_count
+
+    archive = tmp_path / "forged.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as package:
+        package.writestr("big.bin", os.urandom(6 << 20))
+    raw = bytearray(archive.read_bytes())
+    at = raw.rfind(b"PK\x05\x06")
+    raw[at + 12 : at + 16] = struct.pack("<I", at)  # directory size covers the whole file
+    raw[at + 16 : at + 20] = struct.pack("<I", 0)  # starting at offset 0
+    archive.write_bytes(bytes(raw))
+
+    tracemalloc.start()
+    count = _zip_member_count(archive, 100_000)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert count == 1
+    # bounded by the read window, not by the forged size: the pre-fix form peaked at the file size
+    assert peak < 3 << 20, f"preflight allocated {peak} bytes for a {at}-byte claim"
+
+
+def test_a_real_zip_still_counts_its_members(tmp_path):
+    """The bounded walk must still read an ordinary directory, including one behind a stub."""
+    import zipfile
+
+    from flash.env_formats import _zip_member_count
+
+    ordinary = tmp_path / "ordinary.zip"
+    with zipfile.ZipFile(ordinary, "w") as package:
+        for index in range(250):
+            package.writestr(f"member{index}.txt", b"x")
+    assert _zip_member_count(ordinary, 100_000) == 250
+
+    sfx = tmp_path / "sfx.zip"
+    sfx.write_bytes(b"MZ" + b"\x00" * 4094 + ordinary.read_bytes())
+    assert _zip_member_count(sfx, 100_000) == 250
 
 
 def test_a_secret_key_behind_the_marker_bound_is_refused(tmp_path):

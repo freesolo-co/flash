@@ -11,6 +11,10 @@ one way -- nothing here imports the pattern matching, so these can be tested on 
 
 from __future__ import annotations
 
+import bz2
+import lzma
+import zlib
+from collections.abc import Iterator
 from pathlib import Path
 
 # The end-of-central-directory signature, and how much of a stream's tail to keep so it can be
@@ -88,10 +92,52 @@ _MAX_SKIPPABLE_FRAMES = 16
 # than clean. Returning the remainder silently let five markers hide a secret key.
 _MAX_OPENPGP_MARKERS = 8
 
-# How many keystore entries are walked looking for a private key. A real store holds a handful;
-# the bound stops a forged count from being a scan cost. Reaching it means the walk never settled
-# the question, which the caller treats as unscannable rather than clean.
-_MAX_JKS_ENTRIES = 64
+# What a Java KeyStore and a JCEKS store begin with. Named so the scan can tell in four bytes
+# whether accumulating a stream is worth it at all.
+_KEYSTORE_MAGIC = (b"\xfe\xed\xfe\xed", b"\xce\xce\xce\xce")
+
+# How many keystore entries are walked looking for a private key. Reaching it means the walk never
+# settled the question, which the caller treats as unscannable rather than clean.
+#
+# NOT "a handful". That guess refused a file every JDK ships: `/etc/ssl/certs/java/cacerts` holds
+# 146 trusted certificates and no private key at all, so a bound of 64 turned the most ordinary
+# keystore in existence into an unpublishable one. The walk costs a few integer reads per entry and
+# is bounded by the buffer anyway -- every step advances at least four bytes or ends -- so the
+# bound only has to sit above any real store rather than above a handful.
+_MAX_JKS_ENTRIES = 4096
+
+# The expandable compressed formats worth looking for BEHIND a stub, and how much of one is read to
+# prove it is really a stream rather than three bytes of coincidence. A self-extracting shell
+# archive -- what `makeself` writes, and what ships as a `.run` installer -- puts a script first and
+# the payload after it, so recognition anchored at byte zero saw only `#!/bin/sh` and the compressed
+# credential behind it was scanned as opaque bytes and published.
+#
+# Distinct from the unanchored RAR/7-Zip search, which only has to REFUSE. These can be expanded, so
+# the payload is read rather than the publish blocked, and an offset that is wrong costs a failed
+# open rather than a false refusal.
+_OVERLAY_MAGIC = (b"\x1f\x8b\x08", b"BZh", b"\xfd7zXZ\x00")
+_OVERLAY_PROBE_BYTES = 1 << 16
+
+# How many candidate offsets are probed before the search gives up. Each probe is a decompressor
+# rejecting a few bytes, so the bound is only there to keep a file of nothing but fake magics from
+# becoming a cost of its own -- and a REAL stream ends the search at the first hit. Measured 20
+# chance occurrences of the gzip magic across 400 MiB of random bytes, of which 0 inflated.
+_MAX_OVERLAY_CANDIDATES = 64
+
+# How much of a stream is read at a time while looking for an overlay, and while walking a zip's
+# central directory. One record's variable-length fields are three 16-bit lengths, so a window this
+# size always holds a whole record once it is refilled from that record's start.
+_STREAM_WINDOW_BYTES = 1 << 20
+
+# The armor line of an OpenPGP message, as `gpg --armor --symmetric` and `--armor --encrypt` write
+# it. The binary form is recognised structurally by `_is_openpgp_encrypted`, but the ARMORED form is
+# the one an author actually commits -- it is what survives a copy-paste into a config -- and it is
+# not a key block, so the private-key armor pattern never saw it. Its base64 body is ciphertext, so
+# decoding it finds nothing either: a Freesolo key inside published clean.
+#
+# `SIGNED MESSAGE` is deliberately excluded. A clear-signed message carries its payload in the
+# CLEAR, so the ordinary scan reads it, and refusing it would block a signed README.
+_OPENPGP_MESSAGE_ARMOR = b"-----BEGIN PGP MESSAGE-----"
 
 # How much of a stream `_looks_like_textual` reads. A multi-byte UTF-8 character straddling the cut
 # would decode-fail on the truncation rather than on the content, so the sample is taken at a
@@ -152,16 +198,17 @@ def _jks_private_key_entries(store: bytes) -> bool | None:
     a distinct bypass: `keytool -storetype JCEKS` produced a store whose encrypted key matched no
     textual or DER check.
     """
-    if len(store) < 16 or store[:4] not in (b"\xfe\xed\xfe\xed", b"\xce\xce\xce\xce"):
+    if len(store) < 16 or store[:4] not in _KEYSTORE_MAGIC:
         return False
     if int.from_bytes(store[4:8], "big") not in (1, 2):
         return False
-    count, at = int.from_bytes(store[8:12], "big"), 12
+    count, at, truncated = int.from_bytes(store[8:12], "big"), 12, False
 
     def read(width: int) -> int | None:
         """The next `width`-byte big-endian field, or None once the walk runs off the end."""
-        nonlocal at
+        nonlocal at, truncated
         if at < 0 or at + width > len(store):
+            truncated = True
             return None
         value = int.from_bytes(store[at : at + width], "big")
         at += width
@@ -169,11 +216,26 @@ def _jks_private_key_entries(store: bytes) -> bool | None:
 
     def skip(length: int | None) -> bool:
         """Advance over a variable-length field, refusing a length that leaves the buffer."""
-        nonlocal at
-        if length is None or length < 0 or at + length > len(store):
+        nonlocal at, truncated
+        if length is None:
+            return False
+        if length < 0:
+            return False
+        if at + length > len(store):
+            truncated = True
             return False
         at += length
         return True
+
+    def unwalked() -> bool | None:
+        """What a stopped walk means: undecided if it ran out of bytes, otherwise not this format.
+
+        The distinction is the whole fix. A trusted certificate whose DER runs past the buffer made
+        the skip fail, which reported "not a keystore" -- so a private key stored BEHIND that
+        certificate published intact, and no later chunk re-entered the parser. Running out of bytes
+        proves nothing about what follows, and undecided is not clean.
+        """
+        return None if truncated else False
 
     for walked in range(count):
         if walked >= _MAX_JKS_ENTRIES:
@@ -190,11 +252,106 @@ def _jks_private_key_entries(store: bytes) -> bool | None:
         if tag != 2:
             # not an entry tag this format defines: the walk is off the rails, so this is not the
             # structure it claimed and the other checks get their turn
-            return False
+            return unwalked()
         # the alias, then an 8-byte creation timestamp, then the certificate's type and its DER
         if not skip(read(2)) or not skip(8) or not skip(read(2)) or not skip(read(4)):
-            return False
+            return unwalked()
     return False
+
+
+def _decompresses(probe: bytes) -> bool:
+    """Whether `probe` really begins a compressed stream, proven by inflating some of it.
+
+    The magic alone is not proof: three fixed bytes occur by chance in any large binary. Attempting
+    the decompression is what separates a payload from a coincidence, and it is decisive -- a
+    stream that yields a byte is a stream.
+    """
+    try:
+        if probe.startswith(b"\x1f\x8b\x08"):
+            return bool(zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(probe, 4096))
+        if probe.startswith(b"BZh"):
+            return bool(bz2.BZ2Decompressor().decompress(probe, 4096))
+        if probe.startswith(b"\xfd7zXZ\x00"):
+            return bool(lzma.LZMADecompressor().decompress(probe, 4096))
+    except (OSError, EOFError, ValueError, zlib.error, lzma.LZMAError):
+        return False
+    return False
+
+
+def _windows(source: Path | bytes) -> Iterator[tuple[int, bytes]]:
+    """`source` in bounded windows as (absolute offset, bytes), overlapping so no magic is split."""
+    if isinstance(source, bytes):
+        yield 0, source
+        return
+    overlap = max(len(magic) for magic in _OVERLAY_MAGIC) - 1
+    try:
+        with source.open("rb") as handle:
+            at, carry = 0, b""
+            while block := handle.read(_STREAM_WINDOW_BYTES):
+                yield at - len(carry), carry + block
+                at += len(block)
+                carry = block[-overlap:]
+    except OSError:
+        return
+
+
+def _overlay_offset(source: Path | bytes) -> int | None:
+    """Where a compressed stream sits behind a stub in `source`, or None if none does.
+
+    Offset 0 is excluded deliberately: a stream that begins the file is not an overlay and the
+    ordinary openers already read it.
+    """
+    probed = 0
+    for base, window in _windows(source):
+        found = sorted(
+            at for magic in _OVERLAY_MAGIC for at in _offsets_of(window, magic) if base + at > 0
+        )
+        for at in found:
+            probed += 1
+            if probed > _MAX_OVERLAY_CANDIDATES:
+                return None
+            if _decompresses(_read_at(source, base + at, _OVERLAY_PROBE_BYTES) or b""):
+                return base + at
+    return None
+
+
+def _overlay_payload(source: Path | bytes, at: int, cap: int) -> bytes | None:
+    """`source`'s bytes from `at`, empty if they exceed `cap`, or None if they cannot be read.
+
+    Empty and None are deliberately different answers: too large to buffer is undecided, which the
+    caller turns into a refusal, while unreadable is not this shape and the other handlers get a
+    turn.
+    """
+    if isinstance(source, bytes):
+        return b"" if len(source) - at > cap else source[at:]
+    try:
+        if source.stat().st_size - at > cap:
+            return b""
+        with source.open("rb") as handle:
+            handle.seek(at)
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _offsets_of(window: bytes, magic: bytes) -> Iterator[int]:
+    """Every offset in `window` where `magic` appears."""
+    at = window.find(magic)
+    while at >= 0:
+        yield at
+        at = window.find(magic, at + 1)
+
+
+def _has_openpgp_message_armor(window: bytes) -> bool:
+    """Whether `window` carries the armor line of an encrypted OpenPGP message.
+
+    Searched at any offset rather than anchored: armor is text, so it is ordinarily embedded -- a
+    key pasted into a YAML block or appended to a config sits well past byte zero.
+
+    No false-positive budget is spent on this. The line is 27 fixed bytes ending in five dashes; it
+    does not occur in prose that is not quoting an actual message.
+    """
+    return _OPENPGP_MESSAGE_ARMOR in window
 
 
 def _looks_like_textual(data: bytes) -> bool:
@@ -238,7 +395,7 @@ def _looks_like_zlib(head: bytes) -> bool:
     )
 
 
-def _is_openpgp_encrypted(head: bytes) -> bool:
+def _is_openpgp_encrypted(head: bytes) -> bool | None:
     """Whether `head` begins an encrypted OpenPGP message.
 
     `gpg --symmetric` and `gpg --encrypt` write a session-key packet followed by an encrypted data
@@ -297,7 +454,11 @@ def _is_openpgp_encrypted(head: bytes) -> bool:
             return False
     at = header + length
     if at + 1 > len(head):
-        return False
+        # The session packet is longer than the bytes available. A real PKESK for an RSA-2048 key
+        # is a few hundred bytes, so a fixed head could not reach the data packet behind it and
+        # reported "not encrypted" -- publishing the ciphertext. The caller passes the whole chunk
+        # now; still running out means the packet is longer than a chunk, which is undecided.
+        return None
     nxt = head[at]
     following = nxt & 0x3F if nxt & 0xC0 == 0xC0 else (nxt >> 2) & 0x0F if nxt & 0xC0 == 0x80 else 0
     return following in encrypted
@@ -577,32 +738,45 @@ def _zip_directory_entries(
     counts = [
         walked
         for candidate in dict.fromkeys((start, start + shift, start + shift - _ZIP64_END_BYTES))
-        if (walked := _walk_directory(_read_at(source, candidate, size), limit)) is not None
+        if (walked := _walk_directory(source, candidate, size, limit)) is not None
     ]
     return max(counts) if counts else None
 
 
-def _walk_directory(directory: bytes | None, limit: int) -> int | None:
-    """How many central-directory records `directory` holds, or None if it is not one.
+def _walk_directory(source: Path | bytes, at: int, size: int, limit: int) -> int | None:
+    """How many central-directory records sit at `at`, or None if that is not a directory.
 
     Stops one past `limit`: the caller only needs to know the bound is exceeded, and walking an
     unbounded directory would make this counter the very cost it exists to prevent.
+
+    Read in bounded windows rather than as one `size`-byte slice. `size` comes from the end record,
+    which is attacker-controlled, so a forged 32-bit value covering most of the file made this
+    counter allocate roughly the whole package -- the very cost it exists to avoid, arriving through
+    the preflight instead of through `ZipFile`. Each record's variable-length fields are three
+    16-bit lengths, so one always fits in a window and the walk refills from the record's own start.
     """
-    if directory is None or directory[:4] != b"PK\x01\x02":
+    if at < 0 or size <= 0:
         return None
-    count, cursor = 0, 0
-    while cursor + _ZIP_CENTRAL_HEADER_BYTES <= len(directory):
-        if directory[cursor : cursor + 4] != b"PK\x01\x02":
+    count, cursor, window, base = 0, 0, b"", at
+    while cursor < size:
+        if cursor + _ZIP_CENTRAL_HEADER_BYTES > len(window):
+            # Refill from THIS record's start, so a record straddling the previous window is whole.
+            base += cursor
+            window = _read_at(source, base, min(_STREAM_WINDOW_BYTES, size - (base - at))) or b""
+            cursor = 0
+            if len(window) < _ZIP_CENTRAL_HEADER_BYTES:
+                break
+        if window[cursor : cursor + 4] != b"PK\x01\x02":
             return None  # not a directory record, so this walk proves nothing
         name, extra, comment = (
-            int.from_bytes(directory[cursor + at : cursor + at + 2], "little")
-            for at in (28, 30, 32)
+            int.from_bytes(window[cursor + off : cursor + off + 2], "little")
+            for off in (28, 30, 32)
         )
         cursor += _ZIP_CENTRAL_HEADER_BYTES + name + extra + comment
         count += 1
         if count > limit:
             break
-    return count
+    return count or None
 
 
 def _zip_member_count(source: Path | bytes, limit: int = _MAX_ARCHIVE_MEMBERS) -> int:
