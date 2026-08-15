@@ -555,7 +555,8 @@ def _train_body(input_data: dict) -> dict:
                 # bootstrap._console_upload_loop, whose docstring has the rules; pinned against
                 # drift by test_first_console_snapshot_precedes_the_stall_teardown.
                 due_s, since, quiet_polls = 600.0, 0.0, 0
-                uploaded_size, size, quiet_spent, armed, committed = -1, -1, 0, False, False
+                sent = cursor = eof = -1
+                quiet_spent, armed, committed = 0, False, False
                 while not stop_upload.wait(120.0):
                     since += 120.0
                     try:
@@ -563,7 +564,7 @@ def _train_body(input_data: dict) -> dict:
                         with open(console, "rb") as hf:
                             hf.seek(0, os.SEEK_END)
                             end = hf.tell()
-                            cursor = min(max(size, 0), end)
+                            cursor = min(max(cursor, 0), end)
                             start = not cursor
                             if cursor:
                                 hf.seek(cursor - 1)
@@ -598,12 +599,12 @@ def _train_body(input_data: dict) -> dict:
                                 )
                                 beat_count += len(beat_lines)
                                 cursor += cut
-                            size = cursor
+                            eof = end
                     except OSError:
-                        size, staged, beat_count = -1, 0, 0
+                        cursor, eof, staged, beat_count = -1, -1, 0, 0
                     had_committed = committed
                     committed = committed or bool(staged)
-                    if committed and not had_committed and uploaded_size >= 0:
+                    if committed and not had_committed and sent >= 0:
                         due_s = 3600.0
                     # a wedge is progress that stopped: re-arm on it, spend only on a stall that
                     # bought an upload. two credits per run. uncommitted beats only arm the loop.
@@ -611,16 +612,18 @@ def _train_body(input_data: dict) -> dict:
                     armed = armed or bool(progress)
                     quiet_polls = 0 if progress else quiet_polls + 1
                     due = since >= due_s
-                    wedged = armed and quiet_polls >= 4 and quiet_spent < 2 and not due
-                    if size == uploaded_size or not (due or wedged):
+                    cap = armed and quiet_polls >= 4
+                    wedged = cap and quiet_spent < 2 and not due
+                    if eof == sent or not (due or wedged):
                         continue
                     ok = _upload_console(mode)  # swallows its own errors; false if it did not land
-                    uploaded_size = size if ok else uploaded_size
-                    quiet_spent += 1 if wedged and ok else 0
-                    armed = armed and not (wedged and ok)
-                    # only a landed upload advances the deadline: resetting on a swallowed failure
-                    # puts the retry an interval out, past the stall teardown.
+                    # only a landed upload changes the watermark, deadline, latch, quiet count, or
+                    # credits. resetting any of them on a swallowed failure can suppress the retry.
                     if ok:
+                        quiet_spent += 1 if cap and not due else 0
+                        if cap:
+                            armed, quiet_polls = False, 0
+                        sent = eof
                         since, due_s = 0.0, 3600.0 if committed else 1800.0
 
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line

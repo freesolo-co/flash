@@ -176,11 +176,11 @@ def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> st
     return tail[cut + 1 :] if cut >= 0 else ""
 
 
-def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
-    """Return ``(cursor, committed, any)`` after draining to the tail captured at call start.
+def _console_progress(console: str, offset: int) -> tuple[int, int, int, int]:
+    """Return ``(scan_cursor, observed_eof, committed, any)`` at the captured tail.
 
-    each read is capped. oversized lines are skipped in bounded chunks, while ordinary partial lines
-    remain behind the cursor until their newline arrives so they are judged once.
+    reads are capped. oversized lines skip in chunks; partial lines remain behind the cursor until
+    newline so they are judged once, while observed eof still exposes them to snapshot uploads.
     """
     try:
         with open(console, "rb") as f:
@@ -217,5 +217,5 @@ def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
                 beats += len(hb)
                 at += cut
     except OSError:
-        return -1, 0, 0
-    return at, hits, beats
+        return -1, -1, 0, 0
+    return at, end, hits, beats

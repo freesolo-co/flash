@@ -1141,19 +1141,18 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     body = inspect.getsource(endpoints._train_body)
     assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_POLL_S})" in body
     assert f"due_s, since, quiet_polls = {endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S}" in body
-    # a credit is spent only by a wedge snapshot that LANDED, and spending it disarms the latch
-    # until progress resumes.
-    assert "quiet_spent += 1 if wedged and ok else 0" in body
-    # the deadline advances only on a LANDED upload: resetting on a swallowed failure books a
+    # a credit is spent only by captured silence that bought a landed, non-scheduled upload.
+    assert "quiet_spent += 1 if cap and not due else 0" in body
+    # the deadline advances only on a landed upload: resetting on a swallowed failure books a
     # snapshot that reached no repo and puts the retry an interval out, past the stall teardown.
     assert "since, due_s = 0.0, 3600.0 if committed else 1800.0" in body
     assert "if ok:" in body
-    # the latch is spent only on silence that bought an upload, not on an already-due snapshot.
-    assert "and not due" in body
-    # progress RE-ARMS the latch: without this a healthy slow stage spends the only credit and a
-    # genuine wedge later is torn down with no failure-era console. the credits bound the total, so
-    # the re-arm cannot turn into an unbounded commit rate.
-    assert "armed = armed and not (wedged and ok)" in body
+    # sustained captured silence is computed independently of due so a scheduled upload clears the
+    # latch and quiet count, while only the emergency path is bounded by credits and charges one.
+    assert "cap = armed and quiet_polls" in body
+    assert "wedged = cap and quiet_spent" in body
+    assert "if cap:" in body
+    assert "armed, quiet_polls = False, 0" in body
     # the shipped loop inlines the credit cap; the instance loop reads it from the constant, and
     # they must agree or one provider detects a second wedge and the other does not.
     assert f"quiet_spent < {_instance_bootstrap._CONSOLE_UPLOAD_CREDITS}" in body
@@ -1163,9 +1162,9 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # the latch arms only after real progress: a cold image is quiet through startup and would
     # otherwise spend it on an empty console, leaving a later hang with no snapshot before teardown
     # (test_..._keeps_its_wedge_credit_through_a_slow_startup covers the behavior on the twin loop).
-    assert "wedged = armed and quiet_polls" in body
-    assert "quiet_spent, armed, committed = -1, -1, 0, False, False" in body
-    assert "uploaded_size = size if ok else uploaded_size" in body
+    assert "cap = armed and quiet_polls" in body
+    assert "sent = cursor = eof = -1" in body
+    assert "sent = eof" in body
     # the wedge signal is STAGED HEARTBEATS, not console bytes: a stuck worker still logs, so a
     # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
     assert "quiet_polls = 0 if progress else quiet_polls + 1" in body
@@ -1184,6 +1183,10 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     assert 'cut = buf.rfind(b"\\n") + 1' in body
     assert "buf = hf.read(min(1_048_576, end - cursor))" in body
     assert 'start = hf.read(1) == b"\\n"' in body
+    # the parser cursor remains line-aligned, while observed eof carries unterminated diagnostics to
+    # the uploader and the sent watermark changes only after success.
+    assert "eof = end" in body
+    assert "if eof == sent" in body
     # ONE scan yields both counts: the committed one drops "pending" lines (an uploaded heartbeat
     # that never reached HF), the arming one keeps them. Which drives the timer switches at the
     # first COMMITTED heartbeat. A run whose uploads all fail emits nothing but pending lines: on
@@ -1201,9 +1204,16 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
 
 
 def _drive_instance_upload_loop(
-    monkeypatch, sizes: list[int], cycles: int, *, succeed=True, staged=None, beats=None
+    monkeypatch,
+    sizes: list[int],
+    cycles: int,
+    *,
+    succeed=True,
+    staged=None,
+    beats=None,
+    scan_cursors=None,
 ) -> tuple[list, list]:
-    """Run the real instance loop over a scripted console-size series. Returns (waits, uploads).
+    """Run the real instance loop over scripted console eofs. Returns (waits, uploads).
 
     ``succeed`` is the upload result, either a bool or a predicate over the attempt number, so a
     test can script an upload that fails the way hf_upload does: swallowed, returning falsy.
@@ -1213,11 +1223,14 @@ def _drive_instance_upload_loop(
     healthy run, so a frozen console still reads as wedged. A test covering a worker that keeps
     logging without making progress passes its own series.
 
-    ``beats`` scripts the ARMING count separately. The real ``_console_progress`` returns both
+    ``beats`` scripts the arming count separately. The real ``_console_progress`` returns both
     because they answer different questions: only a committed heartbeat resets the wedge timer,
     but any heartbeat -- ``pending`` included -- proves the loop was reached and may arm it. It
     defaults to ``staged``, so a test that does not care about the distinction sees the old
     behaviour; a test covering failed heartbeat uploads scripts arming beats with zero staged.
+
+    ``scan_cursors`` may differ from ``sizes`` to model unterminated bytes: the line scanner stays
+    at the preceding newline while the observed eof advances and remains eligible for upload.
     """
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
 
@@ -1230,7 +1243,7 @@ def _drive_instance_upload_loop(
             waits.append(seconds)
             return len(waits) > cycles
 
-    def _progress(_console: str, _offset: int) -> tuple[int, int, int]:
+    def _progress(_console: str, _offset: int) -> tuple[int, int, int, int]:
         index = min(clock["i"], len(sizes) - 1)
         clock["i"] += 1
         if staged is not None:
@@ -1238,7 +1251,8 @@ def _drive_instance_upload_loop(
         else:  # grew since the previous poll -> one staged heartbeat
             progressed = 1 if index == 0 or sizes[index] != sizes[index - 1] else 0
         arming = progressed if beats is None else beats[min(index, len(beats) - 1)]
-        return sizes[index], progressed, arming
+        cursor = sizes[index] if scan_cursors is None else scan_cursors[index]
+        return cursor, sizes[index], progressed, arming
 
     def _upload(_payload, _console, _mode) -> bool:
         uploads.append(clock["i"])
@@ -1535,6 +1549,44 @@ def test_instance_console_upload_loop_never_charges_a_credit_to_a_scheduled_snap
     )
 
 
+def test_scheduled_console_snapshot_clears_captured_silence_without_spending_credit(monkeypatch):
+    """A due snapshot that captures a quiet wedge must not trigger another upload next poll."""
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    threshold = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
+    first_polls = int(
+        _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+        / _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    )
+    assert first_polls == threshold + 1
+
+    # progress arms the loop, then sustained silence overlaps the first scheduled snapshot.
+    staged = [1] + [0] * threshold
+    sizes = [1000] * first_polls
+    # a complete noise line arrives next. it changes the uploaded bytes but is not progress, so a
+    # latch left active by the scheduled upload would trigger a redundant emergency snapshot here.
+    sizes.append(2000)
+    staged.append(0)
+    # real progress re-arms the latch, and the later genuine wedge must still spend a credit.
+    sizes.append(3000)
+    staged.append(1)
+    sizes.extend([4000 + poll for poll in range(threshold + 3)])
+    staged.extend([0] * (threshold + 3))
+
+    _waits, uploads = _drive_instance_upload_loop(
+        monkeypatch, sizes, cycles=len(sizes), staged=staged
+    )
+
+    scheduled_poll = first_polls
+    noise_poll = scheduled_poll + 1
+    genuine_wedge_poll = noise_poll + 1 + threshold
+    assert uploads[0] == scheduled_poll
+    assert noise_poll not in uploads, (
+        "scheduled captured silence caused a redundant emergency upload"
+    )
+    assert genuine_wedge_poll in uploads, "the scheduled snapshot spent the real wedge's credit"
+
+
 def test_instance_console_upload_loop_keeps_a_slow_starting_run_in_budget(monkeypatch):
     """A silent setup must not buy the run a faster sustained cadence.
 
@@ -1748,6 +1800,21 @@ def test_shipped_upload_loop_decides_exactly_like_the_canonical_one(tmp_path):
             f"{''.join(step[0] for step in plan)}"
         )
 
+    deterministic = {
+        # sustained silence overlaps the scheduled poll. the next noise line must not cause a
+        # redundant emergency upload, but later progress and a real wedge must still upload.
+        "overlap": (["commit"] + ["silent"] * 4 + ["noise", "commit"] + ["silent"] * 4, [5, 11]),
+    }
+    lines["partial"] = b"unterminated diagnostic bytes"
+    deterministic["unterminated"] = (["commit"] * 5 + ["partial"] + ["silent"] * 3, [5, 9])
+    for name, (plan, expected) in deterministic.items():
+        schedules = []
+        for index, runner in enumerate((_shipped, _canonical)):
+            console = tmp_path / f"console_{name}_{index}.txt"
+            console.write_bytes(b"")
+            schedules.append(_count(runner, plan, [True] * 10, str(console)))
+        assert schedules == [expected, expected], f"{name} schedules differed: {schedules}"
+
     lines["chatty"] = b"x" * 2_100_000 + b"\n" + lines["commit"]
     plan = ["commit"] * 5 + ["chatty"] + ["silent"] * 8
     results = [True] * 10
@@ -1786,15 +1853,19 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     pings = _hb(liveness=True) + b"ray warning: worker is idle\n"
     console.write_bytes(progress + pings)
 
-    size, beats, _any = _instance_bootstrap._console_progress(str(console), 0)
-    assert (size, beats) == (len(progress) + len(pings), 1)
+    cursor, observed_eof, beats, _any = _instance_bootstrap._console_progress(str(console), 0)
+    assert (cursor, observed_eof, beats) == (
+        len(progress) + len(pings),
+        len(progress) + len(pings),
+        1,
+    )
 
     # the wedge: heartbeats keep arriving, but every one is a liveness ping.
     with open(console, "ab") as f:
         f.write(pings * 3)
-    size2, beats2, _any2 = _instance_bootstrap._console_progress(str(console), size)
+    cursor2, eof2, beats2, _any2 = _instance_bootstrap._console_progress(str(console), cursor)
     assert beats2 == 0, "liveness pings after the last real heartbeat must not read as progress"
-    assert size2 == size + len(pings) * 3
+    assert (cursor2, eof2) == (cursor + len(pings) * 3, observed_eof + len(pings) * 3)
 
     # a poll boundary can split a line, leaving a chunk that starts mid-payload. Neither half may
     # read as progress on its own: the tail has the disqualifying key but no prefix, and the head
@@ -1806,7 +1877,12 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     cut = ping.index(b'"liveness":') - 5  # past "stage", before "liveness"
     assert b'"stage":' not in ping[cut:]
     assert b'"liveness":' in ping[cut:]
-    assert _instance_bootstrap._console_progress(str(solo), cut) == (len(ping), 0, 0)
+    assert _instance_bootstrap._console_progress(str(solo), cut) == (
+        len(ping),
+        len(ping),
+        0,
+        0,
+    )
 
     # an UNCOMMITTED heartbeat (upload attempted, did not land) is excluded for the same reason
     # as a liveness ping: the provider's stall clock reads heartbeat.json from HF, so one that
@@ -1815,22 +1891,22 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     # exists to take gets scheduled after the teardown has already killed the box.
     pend = tmp_path / "console_pending.txt"
     pend.write_bytes(_hb(step=8, pending=True) * 2)
-    assert _instance_bootstrap._console_progress(str(pend), 0)[1] == 0
-    # but it DOES count toward arming, the third value: the line exists because a heartbeat was
+    assert _instance_bootstrap._console_progress(str(pend), 0)[2] == 0
+    # but it does count toward arming, the fourth value: the line exists because a heartbeat was
     # produced, so the training loop was reached. If arming used the progress count instead, a run
     # whose heartbeat uploads all fail would never arm and could never buy a wedge snapshot -- the
     # next scheduled one is an interval out, past the setup teardown, so the console is lost.
-    assert _instance_bootstrap._console_progress(str(pend), 0)[2] == 2
+    assert _instance_bootstrap._console_progress(str(pend), 0)[3] == 2
 
     throttled = tmp_path / "console_throttled.txt"
     throttled.write_bytes(_hb(step=9, throttled=True))
-    assert _instance_bootstrap._console_progress(str(throttled), 0)[1:] == (0, 1)
+    assert _instance_bootstrap._console_progress(str(throttled), 0)[2:] == (0, 1)
 
     # a liveness ping arms nothing: it prints from a daemon whether or not the training loop is
     # alive, so unlike a pending heartbeat it is not evidence the run ever reached the loop.
     lv_only = tmp_path / "console_liveness_only.txt"
     lv_only.write_bytes(_hb(liveness=True) * 3)
-    assert _instance_bootstrap._console_progress(str(lv_only), 0)[1:] == (0, 0)
+    assert _instance_bootstrap._console_progress(str(lv_only), 0)[2:] == (0, 0)
 
     # a THIRD-PARTY line carrying "stage" is not a heartbeat and must not read as progress. ray,
     # verl and any library are free to emit structured json, and a wedged worker keeps emitting it
@@ -1838,7 +1914,7 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     # `HEARTBEAT ` prefix names the producer instead of inferring it from a shared key.
     foreign = tmp_path / "console_foreign.txt"
     foreign.write_bytes(b'(raylet) {"ts":"t","level":"WARN","stage":"rollout","msg":"idle"}\n' * 5)
-    assert _instance_bootstrap._console_progress(str(foreign), 0)[1] == 0
+    assert _instance_bootstrap._console_progress(str(foreign), 0)[2] == 0
 
     # a line split by the poll boundary is counted EXACTLY ONCE, in whichever chunk carries its
     # `HEARTBEAT` prefix. The old subtraction could see the tail half alone, count its "stage" and
@@ -1847,13 +1923,15 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     split = tmp_path / "console_split_beat.txt"
     beat = _hb(step=11)
     split.write_bytes(beat[:20])
-    head_size, head_beats, _ = _instance_bootstrap._console_progress(str(split), 0)
+    head_cursor, _head_eof, head_beats, _ = _instance_bootstrap._console_progress(str(split), 0)
     with open(split, "ab") as f:
         f.write(beat[20:])
-    tail_size, tail_beats, _ = _instance_bootstrap._console_progress(str(split), head_size)
+    tail_cursor, tail_eof, tail_beats, _ = _instance_bootstrap._console_progress(
+        str(split), head_cursor
+    )
     assert head_beats + tail_beats == 1, "a split heartbeat is counted once, not zero or twice"
-    assert tail_size == len(beat)
-    assert _instance_bootstrap._console_progress(str(split), tail_size)[1] == 0, "no recount"
+    assert (tail_cursor, tail_eof) == (len(beat), len(beat))
+    assert _instance_bootstrap._console_progress(str(split), tail_cursor)[2] == 0, "no recount"
 
     # and the tail half of a split LIVENESS ping is never counted: the old rule saw its "stage"
     # without the "liveness" that disqualified it, so a wedge read as progress forever.
@@ -1865,15 +1943,21 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     with open(lv_split, "ab") as f:
         f.write(ping[cut:])
     lv_tail = _instance_bootstrap._console_progress(str(lv_split), lv_head[0])
-    assert lv_head[1] + lv_tail[1] == 0, "a split liveness ping must never read as progress"
+    assert lv_head[2] + lv_tail[2] == 0, "a split liveness ping must never read as progress"
 
-    # the offset itself stops at the last NEWLINE, not at EOF. Returning EOF strands the partial
-    # line behind the offset: its completing bytes arrive on the next poll without the `HEARTBEAT `
-    # prefix that identifies them, so a real heartbeat is dropped and a healthy run reads as wedged.
+    # the scan cursor stops at the last newline while observed eof exposes unterminated bytes to the
+    # upload state machine. when the line completes, it is parsed exactly once from that cursor.
     part = tmp_path / "console_partial.txt"
     whole = _hb(step=3)
-    part.write_bytes(whole + _hb(step=4)[:20])
-    assert _instance_bootstrap._console_progress(str(part), 0) == (len(whole), 1, 1)
+    partial = _hb(step=4)
+    part.write_bytes(whole + partial[:20])
+    first = _instance_bootstrap._console_progress(str(part), 0)
+    assert first == (len(whole), len(whole) + 20, 1, 1)
+    with open(part, "ab") as f:
+        f.write(partial[20:])
+    completed = _instance_bootstrap._console_progress(str(part), first[0])
+    assert completed == (len(whole) + len(partial), len(whole) + len(partial), 1, 1)
+    assert _instance_bootstrap._console_progress(str(part), completed[0])[2:] == (0, 0)
 
     # one poll drains to its captured tail in bounded chunks, so a chatty console cannot make the
     # heartbeat cursor fall farther behind on every cycle.
@@ -1882,11 +1966,16 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     cap = bootstrap_secrets._CONSOLE_SCAN_BYTES
     huge = tmp_path / "console_huge_line.txt"
     huge.write_bytes(b"x" * (2 * cap + 17) + b"\n" + _hb(step=99))
-    cursor, observed, any_beats = _instance_bootstrap._console_progress(str(huge), 0)
-    assert cursor == huge.stat().st_size
+    cursor, eof, observed, any_beats = _instance_bootstrap._console_progress(str(huge), 0)
+    assert (cursor, eof) == (huge.stat().st_size, huge.stat().st_size)
     assert (observed, any_beats) == (1, 1)
 
-    assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (-1, 0, 0)
+    assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (
+        -1,
+        -1,
+        0,
+        0,
+    )
 
 
 def test_instance_console_upload_loop_arms_on_a_heartbeat_whose_upload_failed(monkeypatch):
@@ -1959,12 +2048,12 @@ def test_throttled_heartbeat_cannot_push_snapshot_past_stall_teardown(monkeypatc
     first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
     stall_s = 1200.0
     cycles = 14
-    # one committed heartbeat arms the loop. the first scheduled snapshot lands at 600s, then no
-    # bytes change until a throttled heartbeat appears at 960s. it never reached hf, so treating it
-    # as committed resets the quiet clock and delays the next snapshot to 1440s, after teardown.
+    # the committed heartbeat at poll 4 arms the loop close enough to the first scheduled snapshot
+    # that poll 5 has not captured sustained silence. a throttled heartbeat appears at poll 8; it
+    # never reached hf, so treating it as committed would reset quiet and push the wedge past teardown.
     sizes = [1000] * 7 + [2000] + [2000] * (cycles - 8)
-    staged = [1] + [0] * (cycles - 1)
-    beats = [1] + [0] * 6 + [1] + [0] * (cycles - 8)
+    staged = [0] * 3 + [1] + [0] * (cycles - 4)
+    beats = [0] * 3 + [1] + [0] * 3 + [1] + [0] * (cycles - 8)
     _waits, uploads = _drive_instance_upload_loop(
         monkeypatch,
         sizes,
@@ -2039,6 +2128,44 @@ def test_instance_console_upload_loop_retries_a_failed_snapshot_before_any_progr
     assert uploads[1] * poll_s < setup_grace_s, "the retry landed after the setup teardown"
     # one poll later, not one interval later -- the deadline must not have advanced on the failure.
     assert (uploads[1] - uploads[0]) * poll_s <= poll_s
+
+
+def test_console_uploads_use_observed_eof_when_scan_cursor_matches_sent_eof(monkeypatch):
+    """Unterminated bytes remain uploadable on both scheduled and emergency paths."""
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_polls = int(_instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S / poll_s)
+
+    # after the first setup snapshot, an unterminated diagnostic advances eof but leaves the scanner
+    # at the successfully sent newline. the second setup deadline must still upload those bytes.
+    second_setup_polls = int(1800.0 / poll_s)
+    scheduled_eofs = [100] * first_polls + [150] * second_setup_polls
+    scheduled_cursors = [100] * len(scheduled_eofs)
+    _waits, scheduled = _drive_instance_upload_loop(
+        monkeypatch,
+        scheduled_eofs,
+        cycles=len(scheduled_eofs),
+        staged=[0] * len(scheduled_eofs),
+        scan_cursors=scheduled_cursors,
+    )
+    assert scheduled == [first_polls, first_polls + second_setup_polls]
+
+    # a committed heartbeat arms the loop. after its scheduled snapshot, unterminated diagnostics
+    # leave scan_cursor equal to sent_eof while observed_eof advances; sustained silence must still
+    # buy the emergency snapshot before teardown.
+    threshold = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
+    emergency_eofs = [100 * poll for poll in range(1, first_polls + 1)] + [550] * threshold
+    emergency_cursors = [100 * poll for poll in range(1, first_polls + 1)] + [500] * threshold
+    staged = [1] * first_polls + [0] * threshold
+    _waits, emergency = _drive_instance_upload_loop(
+        monkeypatch,
+        emergency_eofs,
+        cycles=len(emergency_eofs),
+        staged=staged,
+        scan_cursors=emergency_cursors,
+    )
+    assert emergency == [first_polls, first_polls + threshold]
 
 
 def test_instance_console_upload_takes_a_second_setup_snapshot_before_teardown(monkeypatch):

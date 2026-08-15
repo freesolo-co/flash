@@ -32,14 +32,15 @@ def _run_console_upload_loop(
 
     Before any heartbeat commits, one additional setup snapshot lands before the fixed 3000-second
     teardown. It does not enter the steady rate: the first committed heartbeat moves the deadline to
-    the normal interval. Failed uploads advance neither marker nor deadline, so the next poll retries.
+    the normal interval. failed uploads change no upload state, so the next poll retries.
     """
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
-    sent, size, since, quiet, armed, spent, ever = -1, -1, 0.0, 0.0, False, 0, False
+    sent = cursor = eof = -1
+    since, quiet, armed, spent, ever = 0.0, 0.0, False, 0, False
     while not stop_upload.wait(poll_s):
         since += poll_s
-        size, staged, beats = progress(console, max(size, 0))
+        cursor, eof, staged, beats = progress(console, max(cursor, 0))
         had_committed = ever
         ever = ever or bool(staged)
         if ever and not had_committed and sent >= 0:
@@ -48,13 +49,14 @@ def _run_console_upload_loop(
         armed = armed or bool(made_progress)
         quiet = 0.0 if made_progress else quiet + 1
         due = since >= due_s
-        wedged = armed and not due and spent < _CONSOLE_UPLOAD_CREDITS
-        wedged = wedged and quiet >= _CONSOLE_UPLOAD_QUIET_POLLS
-        if size == sent or not (due or wedged):
+        cap = armed and quiet >= _CONSOLE_UPLOAD_QUIET_POLLS
+        wedged = cap and spent < _CONSOLE_UPLOAD_CREDITS and not due
+        if eof == sent or not (due or wedged):
             continue
-        uploaded = upload()
-        spent += 1 if wedged and uploaded else 0
-        armed = armed and not (wedged and uploaded)
-        if uploaded:
-            next_due = interval_s if ever else min(1800.0, interval_s)
-            sent, since, due_s = size, 0.0, next_due
+        if not upload():
+            continue
+        spent += 1 if cap and not due else 0
+        if cap:
+            armed, quiet = False, 0.0
+        due_s = interval_s if ever else min(1800.0, interval_s)
+        sent, since = eof, 0.0
