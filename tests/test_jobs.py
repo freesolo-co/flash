@@ -2439,14 +2439,16 @@ def test_failure_detail_reader_preserves_full_worker_artifacts(monkeypatch):
     assert "CONSOLE-END" in detail
 
 
-def test_failure_detail_reader_falls_back_to_live_console(monkeypatch):
+def test_failure_detail_reader_reads_only_the_current_attempt_console(monkeypatch):
     from flash.providers.artifacts import hf as _hf_artifacts
 
     requested: list[str] = []
 
     def fake_reader(_hf_repo, path_in_repo, _min_interval_s):
         requested.append(path_in_repo)
-        return lambda force=False: "last live bytes" if path_in_repo.endswith("_live.txt") else None
+        return lambda force=False: (
+            "last live bytes" if path_in_repo.endswith("console_sft_attempt2.txt") else None
+        )
 
     monkeypatch.setattr(_hf_artifacts, "make_hf_text_reader", fake_reader)
     reader = _hf_artifacts.make_hf_failure_detail_reader(
@@ -2457,9 +2459,9 @@ def test_failure_detail_reader_falls_back_to_live_console(monkeypatch):
 
     assert requested[-2:] == [
         "sft/run-1/seed0/console_sft.txt",
-        "sft/run-1/seed0/console_sft_live.txt",
+        "sft/run-1/seed0/console_sft_attempt2.txt",
     ]
-    assert "--- console_sft_live.txt ---" in detail
+    assert "--- console_sft_attempt2.txt ---" in detail
     assert "last live bytes" in detail
 
 

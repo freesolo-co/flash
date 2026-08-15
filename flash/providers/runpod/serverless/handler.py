@@ -527,7 +527,12 @@ def _train_body(input_data: dict) -> dict:
                 if not final and console_teardown.is_set():
                     print(f"console upload dropped for {mode}; terminal snapshot has begun")
                     return False
-                artifact = f"console_{mode}.txt" if final else f"console_{mode}_live.txt"
+                attempt = int(env.get("ATTEMPT") or 0)
+                if attempt < 0 or attempt > (1 << 63) - 1:
+                    raise ValueError("attempt must be a bounded nonnegative integer")
+                artifact = (
+                    f"console_{mode}.txt" if final else f"console_{mode}_attempt{attempt}.txt"
+                )
                 HfApi(token=env.get("HF_TOKEN")).upload_file(
                     path_or_fileobj=tail_path,
                     path_in_repo=f"{prefix}/{artifact}",

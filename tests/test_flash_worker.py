@@ -2102,7 +2102,7 @@ def test_serverless_live_and_terminal_console_snapshots_use_distinct_repo_paths(
             "job_spec_json": json.dumps({"algorithm": "opd", "run_id": "r1"}),
             "hf_repo": "org/repo",
         },
-        "env": {},
+        "env": {"ATTEMPT": "2"},
         "console_teardown": teardown,
         "_require_deadline_allowance": lambda: None,
         "_safe_detail": lambda text, _env, _limit=0: text,
@@ -2115,7 +2115,7 @@ def test_serverless_live_and_terminal_console_snapshots_use_distinct_repo_paths(
     assert commit("train", str(console), tail, False) is True
     assert commit("train", str(console), tail + ".final", True) is True
     assert commits == [
-        "opd/r1/console_train_live.txt",
+        "opd/r1/console_train_attempt2.txt",
         "opd/r1/console_train.txt",
     ]
 
