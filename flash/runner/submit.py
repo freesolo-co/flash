@@ -93,10 +93,15 @@ def prepare_job(
                 raise ValueError(f"unknown gpu.provider {spec.gpu.provider!r}")
             if provider not in configured:
                 raise ValueError(f"requested gpu.provider {provider!r} is not configured")
-        elif spec.gpu.type and not any(name in configured for name in providers_for(spec.gpu.type)):
-            # the preference stays soft even when none of its named providers carries this class:
-            # unnamed configured providers still serve it, and only a fleet-wide miss is unsatisfiable.
-            raise ValueError(f"no configured provider can provision gpu.type {spec.gpu.type!r}")
+            for gpu_type in spec.gpu.acceptable_types:
+                if provider not in providers_for(gpu_type):
+                    raise ValueError(
+                        f"gpu.provider {provider!r} cannot provision gpu.type {gpu_type!r}"
+                    )
+        else:
+            for gpu_type in spec.gpu.acceptable_types:
+                if not any(name in configured for name in providers_for(gpu_type)):
+                    raise ValueError(f"no configured provider can provision gpu.type {gpu_type!r}")
     info = _runner().resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)
     if spec.algorithm == "opd" and spec.train.structured_outputs:
         # the generic serving preflight above validates the schema's SHAPE, but the

@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from decimal import ROUND_HALF_UP, Decimal
 
+from flash.core.spec import attributed_gpu_type
 from flash.server.platform.internal_client import (
     DEFAULT_TIMEOUT_S,
     build_internal_request,
@@ -96,9 +97,9 @@ def _charge_run(
     org_id = org_id_of(context)
     if not org_id:
         raise BillingError(400, "missing billing org id for training run")
-    spec = status.spec or {}
-    remote = status.remote or {}
-    gpu = remote.get("allocated_gpu") or (spec.get("gpu") or {}).get("type")
+    spec = status.spec if isinstance(status.spec, dict) else {}
+    remote = status.remote if isinstance(status.remote, dict) else {}
+    gpu = attributed_gpu_type(status)
     provider = remote.get("provider")
     total_usd = float(total_usd or 0.0)
     body = {
