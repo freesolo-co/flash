@@ -4873,6 +4873,36 @@ def test_child_failure_sanitizer_redacts_a_quoted_credential_containing_spaces(m
     )
 
 
+def test_child_failure_sanitizer_redacts_a_credential_containing_an_escaped_quote():
+    """A quoted value whose credential contains the delimiter must be consumed whole.
+
+    A credential is arbitrary bytes and may contain a quote. Serialized into a diagnostic it comes
+    back escaped -- ``{"password":"abc\\"tail"}`` -- and a quoted branch that stops at the first
+    unescaped-looking quote treats that ESCAPE as the terminator: it redacts ``abc`` and prints
+    ``tail`` verbatim, publishing the remainder of a live credential. The value is runtime-minted,
+    so it is in no environment variable and the value pass cannot remove the leaked suffix before
+    the record is persisted and served as an artifact. This shape rule is the only thing in front
+    of it, so it must treat ``\\"`` as one unit and run on to the true closing quote.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, leak in (
+        (r'{"password":"abc\"runtime-secret"}', "runtime-secret"),
+        (r'{"api_key":"pre\"post-leak"}', "post-leak"),
+        (r"{'token': 'aa\'bb-leak'}", "bb-leak"),
+        (r'Authorization: "Bearer ab\"cd-leak"', "cd-leak"),
+    ):
+        detail = _safe_child_failure_detail(ValueError(message))
+        assert leak not in detail, f"{message!r} leaked past the escaped quote: {detail!r}"
+        assert "<redacted>" in detail, message
+
+    # the ordinary quoted value is unaffected: consuming escapes must not change where an
+    # unescaped value ends, or every serialized field would over-redact to end of line.
+    assert _safe_child_failure_detail(ValueError('{"password":"hunter2"}')) == (
+        '{"password":"<redacted>"}'
+    )
+
+
 def test_child_failure_sanitizer_survives_a_non_utf8_credential_in_the_environment(monkeypatch):
     """A surrogate in an env value must not abort the sanitizer.
 

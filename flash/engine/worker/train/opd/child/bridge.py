@@ -43,6 +43,11 @@ _FAILURE_FALLBACK_MAX_CHARS = 8192
 # serialized field, so whitespace inside them is part of the value. an UNQUOTED value still ends at
 # whitespace -- there the space is the delimiter, and running past it would eat the sentence around
 # the credential. no closing quote on the line means the value runs to the end of it: fail closed.
+# an ESCAPED quote inside that value is consumed as one unit (`\\.` first, so the backslash pairs
+# with whatever follows): a credential carrying a delimiter survives json/repr encoding as
+# `{"password":"abc\"tail"}`, and treating the escaped quote as the terminator redacts `abc` and
+# prints `tail` verbatim. it is runtime-minted, so the value pass cannot remove that suffix either.
+# a value ending in a literal backslash over-redacts to end of line, which is the fail-closed side.
 # DIGEST is the exception to all of that: its value is a comma-separated parameter list, not one
 # token, so both rules above stop inside it and print the `nonce` and `response` that are the actual
 # secrets. it gets its own branch running to end of line. over-redacting the tail of a digest line
@@ -63,7 +68,7 @@ _SECRET_DETAIL = re.compile(
     rf"|{_SECRET_URL_PARAM})"
     r"(?P<sep>['\"]?\s*[:=]\s*)"
     rf"(?:(?P<quote>['\"])(?:digest\s+(?P<qdigest>[^\r\n]+)"
-    rf"|{_SECRET_SCHEME}(?P<quoted>(?:(?!(?P=quote))[^\r\n])*))"
+    rf"|{_SECRET_SCHEME}(?P<quoted>(?:\\.|(?!(?P=quote))[^\r\n])*))"
     r"|digest\s+(?P<digest>[^\r\n]+)"
     # `&` terminates an unquoted value: without it the first signed-url parameter swallows every
     # later one, so a single <redacted> replaces the whole query string including the benign
