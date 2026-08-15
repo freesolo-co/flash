@@ -704,7 +704,7 @@ def test_unbounded_capacity_grace_keeps_throttled_worker_failure(monkeypatch):
     assert "worker stuck THROTTLED" in res.detail
     capacity_lines = [line for line in logs.getvalue().splitlines() if "capacity grace" in line]
     assert capacity_lines
-    assert all("of infs capacity grace" in line for line in capacity_lines)
+    assert all("of unbounded capacity grace" in line for line in capacity_lines)
 
 
 def test_four_card_last_gpu_log_names_only_scaled_capacity_grace(monkeypatch):
