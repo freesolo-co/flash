@@ -2613,6 +2613,7 @@ def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_clas
     # and the operator is pointed at the two things that actually widen the search.
     assert "has already refused capacity twice" in out
     assert "drop the gpu.type pin" in out
+    assert 'type = ["A100 PCIe", "A100 SXM"]' in out
     assert "drop gpu.provider" in out
 
 
