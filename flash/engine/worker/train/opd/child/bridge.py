@@ -76,9 +76,15 @@ _SECRET_UNKNOWN_SCHEME = r"(?!(?:bearer|basic|token|digest)(?![\w-]))[A-Za-z][\w
 _SECRET_URL_PARAM = (
     r"x-(?:amz|goog)-(?:signature|credential|security-token)|signature|(?<![\w-])sig"
 )
+# a KEY-suffixed field is a credential only when a qualifier says so. `key` alone cannot join the
+# list above: `cache_key`, `partition_key` and `idempotency_key` are ordinary diagnostic fields, and
+# redacting them eats the message this record exists to carry. So the qualifier is required and
+# enumerated -- `private_key` and `secret_key` name a credential, `primary_key` does not. The
+# separator is optional so `privateKey` (camelCase, as json from a js caller arrives) matches too.
+_SECRET_KEY_FIELD = r"(?:private|secret|signing|encryption|session|access)[-_ ]?key(?:[-_ ]?id)?"
 _SECRET_DETAIL = re.compile(
-    rf"(?i)(?P<key>{_SECRET_AUTH_KEY}|api[-_ ]?key|access[-_ ]?token|token|secret|password"
-    rf"|{_SECRET_URL_PARAM})"
+    rf"(?i)(?P<key>{_SECRET_AUTH_KEY}|api[-_ ]?key|access[-_ ]?token|token|secret|password|passwd"
+    rf"|{_SECRET_KEY_FIELD}|{_SECRET_URL_PARAM})"
     # the quote around the key may itself be BACKSLASH-ESCAPED: a child exception that embeds
     # serialized json carries `{\"password\":\"secret\"}`, and a bare `['\"]?` stops at the
     # backslash, so the whole credential printed verbatim. a runtime-minted value is in no
@@ -312,9 +318,13 @@ def _secret_needles(secret: str) -> set[str]:
 
     A multiline credential (a PEM key, a pasted service-account blob) reaches a diagnostic one
     component line at a time, so the whole value never matches and only its registered components
-    do. Percent-escapes are case-insensitive and either case is emitted in the wild, so the encoded
-    form is registered in both. The 8-character floor keeps a short component such as ``}`` from
-    erasing innocent text.
+    do. The 8-character floor keeps a short component such as ``}`` from erasing innocent text.
+
+    Only the CANONICAL percent-encoding is registered. Triplet hex casing is case-insensitive and
+    every casing is valid in the wild, but they cannot be enumerated: a value with n escaped
+    characters has 2**n spellings, so registering a second all-lowercase form still misses every
+    MIXED one (``abc%2Fdef%3aghi``). ``_needle_pattern`` makes each triplet case-insensitive at
+    match time instead, which covers all of them from this one form.
     """
     forms = {secret}
     if "\n" in secret:
@@ -333,8 +343,24 @@ def _secret_needles(secret: str) -> set[str]:
             encoded = urllib.parse.quote(form, safe="")
         except (UnicodeEncodeError, UnicodeDecodeError):
             continue
-        needles.update({encoded, re.sub(r"%[0-9A-Fa-f]{2}", lambda m: m.group(0).lower(), encoded)})
+        needles.add(encoded)
     return needles
+
+
+def _needle_pattern(needle: str) -> str:
+    """``needle`` as a regex matching it literally, except that percent triplets ignore hex case.
+
+    RFC 3986 defines the triplet's hex digits as case-insensitive, so ``%2F`` and ``%2f`` are the
+    same character and both are emitted in the wild. Enumerating the spellings is not an option --
+    n escaped characters give 2**n of them -- so the case fold is applied here, per triplet, and the
+    rest of the needle stays case-SENSITIVE: a credential is case-sensitive, and folding it whole
+    would let an unrelated word that differs only in case erase itself from the diagnostic.
+    """
+    return re.sub(
+        r"%([0-9A-Fa-f])([0-9A-Fa-f])",
+        lambda m: f"%[{m[1].lower()}{m[1].upper()}][{m[2].lower()}{m[2].upper()}]",
+        re.escape(needle),
+    )
 
 
 def _is_token_id(match: re.Match[str]) -> bool:
@@ -396,12 +422,13 @@ def _safe_child_failure_detail(error: Exception) -> str:
     secrets = {value for name, value in os.environ.items() if value and _secret_env_name(name)}
     for secret in sorted(secrets, key=len, reverse=True):
         for needle in sorted(_secret_needles(secret), key=len, reverse=True):
+            pattern = _needle_pattern(needle)
             if len(needle) >= _MIN_SECRET_COMPONENT:
-                message = message.replace(needle, "<redacted>")
+                message = re.sub(pattern, "<redacted>", message)
                 continue
             left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""
             right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
-            message = re.sub(f"{left}{re.escape(needle)}{right}", "<redacted>", message)
+            message = re.sub(f"{left}{pattern}{right}", "<redacted>", message)
     message = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", message)
     # shape redaction stays as the fail-closed net for a credential this process cannot know by
     # value -- one minted at runtime (a presigned url, a broker capability) is in neither the

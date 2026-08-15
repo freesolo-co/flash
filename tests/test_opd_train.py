@@ -4777,6 +4777,94 @@ def test_child_failure_sanitizer_redacts_presigned_url_signatures(monkeypatch):
         assert _safe_child_failure_detail(ValueError(innocent)) == innocent, innocent
 
 
+def test_child_failure_sanitizer_redacts_key_named_credential_fields(monkeypatch):
+    """A ``*_key`` field naming a credential must be redacted, and an ordinary one must not.
+
+    A runtime-generated private key reaches the record as ``{"private_key":"..."}``. It is minted at
+    runtime, so it is in no environment variable and the value pass cannot see it -- the shape rule
+    is the only thing in front of it, and none of its key words matched, so it was persisted
+    verbatim and served as an artifact.
+
+    ``key`` alone cannot join that list, which is why this is a qualifier set rather than a suffix
+    rule: ``cache_key``, ``partition_key`` and ``idempotency_key`` are ordinary diagnostic fields,
+    and redacting them eats the message the record exists to carry. Both directions are asserted
+    because widening the pattern is the obvious fix and silently destroys the diagnostic.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for field in (
+        "private_key",
+        "privateKey",
+        "private-key",
+        "secret_key",
+        "signing_key",
+        "encryption_key",
+        "session_key",
+        "access_key",
+        "access_key_id",  # an AWS key id is half a credential pair, not an identifier
+        "passwd",
+    ):
+        message = f'child failed: {{"{field}":"runtime-minted-abc123"}}'
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "runtime-minted-abc123" not in redacted, f"{field} leaked: {redacted!r}"
+        assert "<redacted>" in redacted, field
+
+    # the other direction: an ordinary key-suffixed field keeps its value, or the failure reason
+    # this record carries is destroyed by its own sanitizer.
+    for field in ("cache_key", "idempotency_key", "partition_key", "primary_key", "row_key", "key"):
+        message = f'child failed: {{"{field}":"user-visible-value"}}'
+        assert _safe_child_failure_detail(ValueError(message)) == message, field
+
+
+def test_child_failure_sanitizer_redacts_every_percent_encoding_casing(monkeypatch):
+    """A secret's percent-escapes are matched whatever hex casing the exception rendered.
+
+    RFC 3986 makes triplet hex case-insensitive, so ``abc%2Fdef%3aghi`` and ``abc%2fdef%3Aghi`` are
+    the same credential. Registering extra spellings cannot close this: a value with n escaped
+    characters has 2**n of them, so a canonical form plus an all-lowercase one still misses every
+    MIXED casing. The fold is applied per triplet at MATCH time, so one registered form covers all
+    of them -- this asserts the full combinatorial set rather than one hand-picked variant.
+
+    The rest of the needle stays case-SENSITIVE. A credential is case-sensitive, and folding it
+    whole would let an unrelated word differing only in case erase itself from the diagnostic.
+    """
+    import itertools
+    import re
+    import urllib.parse
+
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    monkeypatch.setenv("RUNTIME_API_KEY", "a/b:c?d=e&f+g")
+    secret = "a/b:c?d=e&f+g"
+    canonical = urllib.parse.quote(secret, safe="")
+    spans = [m.span() for m in re.finditer(r"%[0-9A-Fa-f]{2}", canonical)]
+    assert len(spans) >= 6, "the point is the combinatorial set; a 1-escape value proves nothing"
+
+    for combo in itertools.product(*[[str.lower, str.upper]] * len(spans)):
+        chars = list(canonical)
+        for (start, end), fold in zip(spans, combo, strict=True):
+            chars[start:end] = list(fold(canonical[start:end]))
+        variant = "".join(chars)
+        redacted = _safe_child_failure_detail(ValueError(f"POST https://h/p?k={variant} -> 403"))
+        assert variant not in redacted, f"casing {variant!r} leaked: {redacted!r}"
+        assert "<redacted>" in redacted
+
+    # a percent sequence that is NOT the secret survives: the fold applies to the needle, not to
+    # every triplet in the message.
+    benign = "progress 100%2Fdone and 50%3Aok"
+    assert _safe_child_failure_detail(ValueError(benign)) == benign
+
+    # and the fold reaches ONLY the triplets. Applying `(?i)` to the whole needle also passes every
+    # assertion above, so without this the cheapest wrong fix looks correct: a case-sensitive
+    # credential would then erase any text differing from it only in case, and the failure reason
+    # this record exists to carry is destroyed by its own sanitizer.
+    monkeypatch.setenv("RUNTIME_API_KEY", "MixedCaseSecret123")
+    other_case = "the env var was mixedcasesecret123 in the manifest"
+    assert _safe_child_failure_detail(ValueError(other_case)) == other_case
+    assert "<redacted>" in _safe_child_failure_detail(ValueError("k=MixedCaseSecret123"))
+
+
 def test_child_failure_sanitizer_redacts_every_digest_parameter(monkeypatch):
     """A Digest value is a parameter LIST, so single-token capture leaves the secrets behind.
 
