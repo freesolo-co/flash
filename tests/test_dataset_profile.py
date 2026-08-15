@@ -12,6 +12,7 @@ from flash.engine.profiling.dataset_profile import (
     PackagedDatasetUnavailable,
     profile_packaged_sft_dataset,
 )
+from flash.engine.profiling.image_tokens import ImageGeometry
 from flash.engine.profiling.workload_profile import sft_profile_input_digest
 
 
@@ -43,6 +44,49 @@ class FakeTokenizer:
             assert max_length is not None
             ids = [row[:max_length] for row in ids]
         return {"input_ids": ids}
+
+
+class FakeMultimodalTokenizer(FakeTokenizer):
+    """A tokenizer that renders image blocks the way a real VL chat template does.
+
+    One ``<|image_pad|>`` per image block, which is exactly what the plain tokenizer emits; the
+    profiler is responsible for expanding it to the run the processor would produce.
+    """
+
+    IMAGE_PAD_ID = 700
+
+    def convert_tokens_to_ids(self, token):
+        return self.IMAGE_PAD_ID if token == "<|image_pad|>" else 5
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        enable_thinking,
+        return_dict=False,
+        **_kwargs,
+    ):
+        if not tokenize:
+            return super().apply_chat_template(
+                messages,
+                tokenize=tokenize,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
+            )
+        ids: list[int] = []
+        for message in messages:
+            content = message.get("content")
+            blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+            for block in blocks:
+                if block.get("type") == "image":
+                    ids.append(self.IMAGE_PAD_ID)
+                else:
+                    ids.extend(3 + ord(char) % 89 for char in str(block.get("text") or ""))
+        if add_generation_prompt:
+            ids.append(9)
+        return {"input_ids": ids} if return_dict else ids
 
 
 def _spec(
@@ -470,9 +514,9 @@ def test_profile_rejects_mixed_message_lists(tmp_path) -> None:
         _profile(entrypoint)
 
 
-def test_control_plane_profile_refuses_image_rows_before_loading_a_processor(
-    tmp_path, monkeypatch
-) -> None:
+def _image_package(tmp_path: Path, width: int = 640, height: int = 480) -> Path:
+    """An environment package whose single row carries a real packaged png."""
+    image_module = pytest.importorskip("PIL.Image")
     entrypoint = _package(
         tmp_path,
         {
@@ -481,17 +525,91 @@ def test_control_plane_profile_refuses_image_rows_before_loading_a_processor(
             )
         },
     )
-    spec = _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B")
+    image_module.new("RGB", (width, height), (200, 10, 10)).save(
+        entrypoint.parent / "dataset" / "red.png", format="PNG"
+    )
+    return entrypoint
+
+
+def test_control_plane_profiles_image_rows_without_loading_a_processor(
+    tmp_path, monkeypatch
+) -> None:
+    """Image sft is quotable on the torch-free plane, and never touches the VL processor.
+
+    The processor is what needs torch; the quote needs only token counts. The loader is booby
+    trapped so the test fails if profiling ever reaches for it again.
+    """
+    entrypoint = _image_package(tmp_path)
+    # the 640x480 image alone expands to 300 tokens, so the context has to hold it plus the
+    # completion or every row truncates to an empty target.
+    spec = replace(
+        _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B"),
+        train=TrainSpec(epochs=2, batch_size=2, max_context_tokens=1024),
+    )
     monkeypatch.setattr(
         "flash.engine.profiling.sft_workload._default_processor_loader",
         lambda *_args: (_ for _ in ()).throw(AssertionError("processor loader reached")),
     )
+    monkeypatch.setattr(
+        "flash.engine.profiling.image_tokens.load_image_geometry",
+        lambda *_args, **_kwargs: ImageGeometry(
+            patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
+        ),
+    )
 
-    with pytest.raises(PackagedDatasetUnavailable, match="torch-free control plane"):
+    profile = profile_packaged_sft_dataset(
+        spec,
+        producer_version="1.2.3",
+        tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
+        packing_support=lambda _model, _revision: ("gdn-hybrid", True),
+    )
+
+    assert profile.retained_examples == 1
+    # a 640x480 image expands to 300 pad tokens, so the row cannot be near-empty text.
+    assert profile.real_tokens_per_epoch > 300
+    # image rows are never packed, and the profile has to say so rather than quoting a packed run.
+    assert profile.packing_mode == "exact-unpacked"
+    assert profile.architecture_mode == "multimodal"
+
+
+def test_an_unreadable_image_is_a_packaging_error_not_a_crash(tmp_path, monkeypatch) -> None:
+    entrypoint = _package(
+        tmp_path,
+        {
+            "dataset/train.jsonl": (
+                '{"input":"describe","output":"red","image":"dataset/red.png"}\n'
+            ),
+            "dataset/red.png": "this is not a png",
+        },
+    )
+    spec = _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B")
+    monkeypatch.setattr(
+        "flash.engine.profiling.image_tokens.load_image_geometry",
+        lambda *_args, **_kwargs: ImageGeometry(
+            patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
+        ),
+    )
+
+    with pytest.raises(ValueError, match="not a valid image"):
         profile_packaged_sft_dataset(
             spec,
             producer_version="1.2.3",
-            tokenizer_loader=lambda _model, _revision: FakeTokenizer(),
+            tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
+            packing_support=lambda _model, _revision: ("gdn-hybrid", True),
+        )
+
+
+def test_image_sft_is_rejected_for_a_model_that_cannot_see_images(tmp_path) -> None:
+    # the capability gate stays: the fix makes image sft work on models that advertise it, not on
+    # every model.
+    entrypoint = _image_package(tmp_path)
+    spec = _spec(environment_id=str(entrypoint), model="test/model")
+
+    with pytest.raises(ValueError, match="does not support image-bearing"):
+        profile_packaged_sft_dataset(
+            spec,
+            producer_version="1.2.3",
+            tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
             packing_support=lambda _model, _revision: ("gdn-hybrid", True),
         )
 

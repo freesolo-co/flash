@@ -136,6 +136,101 @@ def _processor_tokenized_row(
     return input_ids, loss_mask, _serialize_multimodal_inputs(full), untruncated_length
 
 
+def _estimated_tokenized_row(
+    tokenizer,
+    prompt_messages: list[dict],
+    completion_messages: list[dict],
+    descriptors: list[str],
+    *,
+    package_root,
+    geometry,
+    max_length: int,
+    thinking: bool,
+) -> tuple[list[int], list[int], int]:
+    """Tokenize one image row without a processor, for the torch-free control plane.
+
+    The plain tokenizer renders an image block to a single ``<|image_pad|>``; expanding that
+    placeholder to the run the vision tower occupies reproduces the processor's exact id sequence,
+    so the prompt/full boundary -- and therefore the completion mask -- is unchanged. Pixels are
+    never decoded: only the image header is read, for its dimensions.
+    """
+    from flash.content.multimodal import IMAGE_PAD_TOKEN
+    from flash.engine.profiling.image_tokens import descriptor_pad_tokens, expand_image_pad_runs
+    from flash.engine.worker.model.packing import completion_mask_from_ids
+
+    pad_token_id = tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
+    if not isinstance(pad_token_id, int) or pad_token_id < 0:
+        raise ValueError(
+            f"tokenizer does not define the image placeholder {IMAGE_PAD_TOKEN!r}, so an "
+            "image-bearing sft dataset cannot be quoted for this model"
+        )
+    pad_counts = descriptor_pad_tokens(descriptors, package_root, geometry)
+
+    def ids(messages: list[dict], *, add_generation_prompt: bool) -> list[int]:
+        rendered = dict(
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=thinking,
+            )
+        )["input_ids"]
+        if rendered and isinstance(rendered[0], list):
+            rendered = rendered[0]
+        return expand_image_pad_runs([int(item) for item in rendered], pad_token_id, pad_counts)
+
+    untruncated_ids = ids([*prompt_messages, *completion_messages], add_generation_prompt=False)
+    untruncated_length = len(untruncated_ids)
+    input_ids = untruncated_ids[:max_length]
+    prompt_ids = ids(prompt_messages, add_generation_prompt=True)[:max_length]
+    return input_ids, completion_mask_from_ids(prompt_ids, input_ids), untruncated_length
+
+
+def _resolve_sft_tokenization(
+    spec,
+    *,
+    multimodal: bool,
+    require_processor: bool,
+    tokenizer_loader: Callable[[str, str], Any],
+    processor_loader: Callable[[str, str], Any] | None,
+):
+    """Pick how this workload turns messages into tokens, and validate it may.
+
+    Returns ``(tokenizer, processor, image_geometry)``. Exactly one of ``processor`` and
+    ``image_geometry`` is set for an image workload: the GPU worker tokenizes through the real VL
+    processor, while the torch-free control plane counts what that processor would produce.
+    """
+    from flash.content.multimodal import validate_multimodal_training
+    from flash.engine.profiling.image_tokens import load_image_geometry
+
+    processor = None
+    image_geometry = None
+    if multimodal:
+        validate_multimodal_training(
+            spec.model,
+            "sft",
+            getattr(spec.train, "teacher_model", None),
+        )
+        if require_processor:
+            processor = (processor_loader or _default_processor_loader)(
+                spec.model,
+                spec.model_revision,
+            )
+            tokenizer = processor.tokenizer
+        else:
+            # the control plane has transformers and pillow but no torch, and the VL AutoProcessor
+            # cannot even import without torchvision. it only needs token counts, so it reads the
+            # published image geometry and expands the rendered placeholders arithmetically.
+            image_geometry = load_image_geometry(spec.model, spec.model_revision)
+            tokenizer = tokenizer_loader(spec.model, spec.model_revision)
+    else:
+        tokenizer = tokenizer_loader(spec.model, spec.model_revision)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer, processor, image_geometry
+
+
 def _materialize_verl_images(
     descriptors: list[str],
     package_root,
@@ -301,6 +396,7 @@ def _tokenize_prompt_rows(
     package_root,
     tokenizer,
     processor,
+    image_geometry,
     max_length: int,
     image_dir: str | None,
     decode_image_descriptors: Callable,
@@ -333,19 +429,39 @@ def _tokenize_prompt_rows(
         ):
             coerced_singleturn_targets += 1
         if record_has_images(example, prompt_messages):
-            if processor is None:
-                raise RuntimeError("multimodal sft row has no processor")
             normalized = normalize_prompt_images(example, prompt_messages, package_root)
             completion_messages = text_only_prompt_messages(completion_messages)
-            decoded_images = decode_image_descriptors(normalized.descriptors, package_root)
-            input_ids, loss_mask, multimodal_inputs, untruncated_length = _processor_tokenized_row(
-                processor,
-                normalized.messages,
-                completion_messages,
-                decoded_images,
-                max_length=max_length,
-                thinking=bool(spec.thinking),
-            )
+            if processor is None:
+                # torch-free control plane: count the tokens the processor would produce rather
+                # than producing them. no pixels are decoded and no training tensors exist, so the
+                # row carries no multimodal_inputs -- the worker, which has the processor, builds
+                # the real ones (sft_train_runner passes a real image_dir).
+                input_ids, loss_mask, untruncated_length = _estimated_tokenized_row(
+                    tokenizer,
+                    normalized.messages,
+                    completion_messages,
+                    normalized.descriptors,
+                    package_root=package_root,
+                    geometry=image_geometry,
+                    max_length=max_length,
+                    thinking=bool(spec.thinking),
+                )
+                multimodal_inputs = b""
+            else:
+                decoded_images = decode_image_descriptors(normalized.descriptors, package_root)
+                (
+                    input_ids,
+                    loss_mask,
+                    multimodal_inputs,
+                    untruncated_length,
+                ) = _processor_tokenized_row(
+                    processor,
+                    normalized.messages,
+                    completion_messages,
+                    decoded_images,
+                    max_length=max_length,
+                    thinking=bool(spec.thinking),
+                )
             untruncated_by_index[row_index] = untruncated_length
             row_by_index[row_index] = {
                 "input_ids": input_ids,
@@ -572,18 +688,24 @@ def prepare_sft_workload(
     producer_version: str,
     processor_loader: Callable[[str, str], Any] | None = None,
     image_dir: str | None = None,
+    require_processor: bool = True,
     allow_packing: bool = True,
     packing_support: Callable[[str, str], tuple[str, bool]] | None = None,
     source_examples: int | None = None,
     examples_preselected: bool = False,
 ) -> PreparedSftWorkload:
-    """Render, tokenize, filter, and pack the exact rows consumed by SFT."""
+    """Render, tokenize, filter, and pack the exact rows consumed by SFT.
+
+    ``require_processor`` distinguishes the two callers. The GPU worker leaves it True and builds
+    real multimodal tensors through the VL processor. The control plane sets it False: it has no
+    torch, so it counts the tokens the processor would produce instead of producing them, which is
+    all a quote reads.
+    """
     from flash.content.multimodal import (
         decode_image_descriptors,
         normalize_prompt_images,
         record_has_images,
         text_only_prompt_messages,
-        validate_multimodal_training,
     )
 
     train_spec = spec.train
@@ -612,22 +734,13 @@ def prepare_sft_workload(
         record_has_images(example, prompt_messages)
         for example, prompt_messages, _completion, _used_fallback in prompt_rows
     )
-    processor = None
-    if multimodal:
-        validate_multimodal_training(
-            spec.model,
-            "sft",
-            getattr(spec.train, "teacher_model", None),
-        )
-        processor = (processor_loader or _default_processor_loader)(
-            spec.model,
-            spec.model_revision,
-        )
-        tokenizer = processor.tokenizer
-    else:
-        tokenizer = tokenizer_loader(spec.model, spec.model_revision)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer, processor, image_geometry = _resolve_sft_tokenization(
+        spec,
+        multimodal=multimodal,
+        require_processor=require_processor,
+        tokenizer_loader=tokenizer_loader,
+        processor_loader=processor_loader,
+    )
 
     tokenized = _tokenize_prompt_rows(
         spec,
@@ -635,6 +748,7 @@ def prepare_sft_workload(
         package_root=package_root,
         tokenizer=tokenizer,
         processor=processor,
+        image_geometry=image_geometry,
         max_length=max_length,
         image_dir=image_dir,
         decode_image_descriptors=decode_image_descriptors,

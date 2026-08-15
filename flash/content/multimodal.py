@@ -472,7 +472,7 @@ def descriptor_source_size(descriptor: str, package_root: str | Path | None) -> 
     raise ValueError("invalid internal image descriptor kind")
 
 
-def _read_descriptor_source(descriptor: str, package_root: str | Path | None) -> bytes:
+def read_descriptor_source(descriptor: str, package_root: str | Path | None) -> bytes:
     kind, value = _parse_descriptor(descriptor)
     if kind == "bytes":
         try:
@@ -523,7 +523,7 @@ def image_descriptors_to_data_uris(
     source_bytes = 0
     decoded_bytes = 0
     for descriptor in descriptors:
-        data = _read_descriptor_source(descriptor, package_root)
+        data = read_descriptor_source(descriptor, package_root)
         source_bytes += len(data)
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(
@@ -566,7 +566,7 @@ def decode_image_descriptors(
     source_bytes = 0
     decoded_bytes = 0
     for descriptor in descriptors:
-        data = _read_descriptor_source(descriptor, package_root)
+        data = read_descriptor_source(descriptor, package_root)
         source_bytes += len(data)
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(
