@@ -5531,6 +5531,75 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
     assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == str(gpu_count)
 
 
+def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
+    """The gate must size off `request.spec`, never the process-global JOB_SPEC.
+
+    `opd_train` resolves its spec as `spec or _w.JOB_SPEC`, so a caller that passes one gets a run
+    whose hardware is NOT what JOB_SPEC describes. Sizing the gate off the global there would let it
+    enable ZeRO-2 against a card the run never landed on -- the allocator/worker divergence the gate
+    exists to prevent. Pinned with the two disagreeing so reading the wrong one cannot pass.
+    """
+    from flash.engine.worker import opd_train as _opd_train
+    from flash.engine.worker import opd_train_runner as _runner
+
+    # the global says a card with room to spare; the passed spec says a card without it.
+    monkeypatch.setattr(
+        _opd_train._w,
+        "JOB_SPEC",
+        SimpleNamespace(gpu=SimpleNamespace(type="B200"), train=SimpleNamespace()),
+        raising=False,
+    )
+
+    def _build(spec):
+        return _runner._build_base_config(
+            request=SimpleNamespace(
+                multi_turn=False,
+                structured_outputs=None,
+                model_id="Qwen/Qwen3.5-4B",
+                model_revision="",
+                spec=spec,
+                knobs=SimpleNamespace(
+                    max_completion=512,
+                    learning_rate=1e-5,
+                    group_size=2,
+                    kl_coef=0.5,
+                    temperature=1.0,
+                    top_p=1.0,
+                ),
+            ),
+            prompt_state=SimpleNamespace(max_model_len=1536, prompt_budget=1024),
+            workload=SimpleNamespace(
+                prompts_per_step=8,
+                update_horizon=10,
+                local_dir="/w/checkpoints",
+                train_file="/w/train.parquet",
+                val_file="/w/val.parquet",
+                lora_rank=32,
+                lora_alpha=64,
+                target_modules="all-linear",
+                warmstart_adapter=None,
+            ),
+            runtime=SimpleNamespace(
+                model_path="/models/student",
+                gpu_count=2,
+                save_freq=20,
+                project_name="flash",
+                experiment_name="opd-test",
+                reward_path="/w/shim/flash_opd_reward.py",
+                bridge=SimpleNamespace(url="http://127.0.0.1:1234", token="token"),
+            ),
+            eos_token_ids=(151645,),
+        )
+
+    # a spec whose card cannot hold the retained copy must stay on zero-3 even though the global
+    # would have admitted it. reading JOB_SPEC here returns the B200 answer and fails.
+    tight = SimpleNamespace(gpu=SimpleNamespace(type="RTX 4090"), train=SimpleNamespace())
+    assert _build(tight)["reshard_after_forward"] is True
+
+    # and with no spec at all the gate falls closed rather than silently reaching for the global.
+    assert _build(None)["reshard_after_forward"] is True
+
+
 def test_rl_width_never_exceeds_the_sequences_one_step_holds():
     """The launched width must divide prompts * group, or verl aborts at step 0 on a paid box.
 
