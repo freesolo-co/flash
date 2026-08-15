@@ -661,30 +661,20 @@ def _build_child_callbacks(
     def steps_this_child() -> int:
         """optimizer steps THIS child has completed, by the validated parser.
 
-        two corrections in one number, both of which otherwise silence the stall signal for the
-        rest of a run:
+        two corrections in one number, and each one alone is enough to silence the wedge detector
+        for the rest of a run. `validated_step` rather than `step`, because the loose scan feeding
+        `step` counts a pre-training "global_step: 1" as an optimizer step and `stall_tail_fields`
+        returns {} forever once its argument goes positive. minus `resume_step`, because a resumed
+        attempt starts at the restored step -- and resumed attempts are the ones most likely to
+        wedge, since a resume re-runs the whole import and ray startup.
 
-        - `validated_step` rather than `step`: the loose scan feeding `step` counts a pre-training
-          "global_step: 1" as an optimizer step, and `stall_tail_fields` returns {} forever once its
-          argument goes positive, so one such line before a wedge hides it completely.
-        - minus `resume_step`: a resumed attempt starts at the restored step, and the attempts most
-          likely to wedge ARE the resumed ones, since a resume re-runs the whole import and ray
-          startup.
+        the liveness daemon publishes this as its `step` too, where the consequence is the
+        provider's rather than the worker's: `poll.is_training_heartbeat` reads an `opd_step`
+        heartbeat carrying step >= 1 as proof cold start is over and swaps the 3000s setup grace for
+        the 1500s training window, so an absolute step would make the provider report the retriable
+        "stalled" five minutes before this watchdog's own deadline could fire.
         """
         return max(0, int(progress["validated_step"] or 0) - resume_step)
-
-    def liveness_progress() -> int:
-        """the progress value the liveness daemon publishes as ``step``.
-
-        attempt-local for the same reason as the field above, but the consequence here is the
-        provider's, not the worker's: `poll.is_training_heartbeat` treats an `opd_step` heartbeat
-        carrying step >= 1 as proof that cold-start is over and swaps the 3000s setup grace for the
-        1500s training window. publishing the absolute restored step would do that on the FIRST tick
-        of every resumed attempt, so the provider would give up at 1500s and report the retriable
-        "stalled" -- five minutes before this watchdog's 30-minute deadline can fire, which is the
-        retry-and-rebill path the watchdog exists to cut off.
-        """
-        return steps_this_child()
 
     def liveness_fields() -> dict[str, object]:
         return _opd_train.stall_tail_fields(
@@ -696,7 +686,7 @@ def _build_child_callbacks(
         on_step,
         child_heartbeat,
         liveness_fields,
-        liveness_progress,
+        steps_this_child,
         progress,
         wandb_link,
         child_tail,
