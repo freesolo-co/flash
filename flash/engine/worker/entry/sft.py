@@ -34,11 +34,10 @@ def has_real_target(input_ids, loss_mask, special_ids: set[int]) -> bool:
 
 
 def _pretokenize_completion_only(texts, tokenizer, max_length):
-    """Pre-tokenize SFT rows into ``{input_ids, completion_mask}``, dropping rows with no real completion target.
+    """Pre-tokenize completion-only rows and drop rows with no real target.
 
-    Returns ``(kept_texts, pretok, n_dropped)``. Each pretok row also carries
-    ``untruncated_length``: its token count BEFORE the cap. The post-slice length can never exceed
-    max_length, so it cannot say whether the cap actually bound; this can.
+    Returns ``(kept_texts, pretok, n_dropped)``. Each pretok row also carries its uncapped token
+    length and whether the active ChatML template supported role-aware assistant-body masking.
     """
     full_ids = tokenize_for_packing([t["text"] for t in texts], tokenizer, max_length)
     # the same encode without the cap, so a truncated row reports its real size rather than the cap.
@@ -46,30 +45,31 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
     prompt_ids = tokenizer(
         [t["prompt_text"] for t in texts], truncation=True, max_length=max_length
     )["input_ids"]
-    pretok = [
-        {
-            "input_ids": ids,
-            # role-aware: the prompt boundary alone would also supervise the environment's replies
-            # between assistant turns of a multi-turn target.
-            "completion_mask": assistant_only_mask(
-                completion_mask_from_ids(pids, ids),
-                ids,
-                tokenizer,
-                t["target_messages"],
-                source_messages=t.get("source_messages"),
-                template_kwargs=t.get("template_kwargs"),
-            ),
-            "untruncated_length": length,
-        }
-        for t, ids, pids, length in zip(texts, full_ids, prompt_ids, untruncated, strict=True)
-    ]
+    pretok = []
+    for text, ids, pids, length in zip(texts, full_ids, prompt_ids, untruncated, strict=True):
+        role_mask = assistant_only_mask(
+            completion_mask_from_ids(pids, ids),
+            ids,
+            tokenizer,
+            text["target_messages"],
+            source_messages=text.get("source_messages"),
+            template_kwargs=text.get("template_kwargs"),
+        )
+        pretok.append(
+            {
+                "input_ids": ids,
+                "completion_mask": role_mask.mask,
+                "assistant_mask_applied": role_mask.role_aware,
+                "untruncated_length": length,
+            }
+        )
     special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
     kept = [
-        (t, r)
-        for t, r in zip(texts, pretok, strict=True)
-        if has_real_target(r["input_ids"], r["completion_mask"], special_ids)
+        (text, row)
+        for text, row in zip(texts, pretok, strict=True)
+        if has_real_target(row["input_ids"], row["completion_mask"], special_ids)
     ]
-    return [t for t, _ in kept], [r for _, r in kept], len(pretok) - len(kept)
+    return [text for text, _ in kept], [row for _, row in kept], len(pretok) - len(kept)
 
 
 def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:

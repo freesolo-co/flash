@@ -262,21 +262,30 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
     max_length = _sft_train._sft_profile_max_length(realized_profile)
     dropped = realized_profile.dropped_examples
     selected_count = realized_profile.selected_examples
+    retained_count = realized_profile.retained_examples
     sampled_texts = prepared_workload.sampled_texts
     multiturn_targets = prepared_workload.multiturn_targets
     coerced_singleturn_targets = prepared_workload.coerced_singleturn_targets
+    role_aware_multiturn_targets = prepared_workload.role_aware_multiturn_targets
+    fallback_multiturn_targets = prepared_workload.fallback_multiturn_targets
     if dropped:
         print(
             f"[sft] dropped {dropped} rows with no real completion target "
             "(sft_max_len truncated away the whole completion, or it was content-free)"
         )
-    if multiturn_targets:
+    if role_aware_multiturn_targets:
         print(
-            f"[sft] multi-turn SFT: {multiturn_targets}/{selected_count} rows train on the "
-            "assistant turns of a target transcript; interleaved environment/tool/user "
-            "observations are masked out of the loss"
+            f"[sft] multi-turn SFT: {role_aware_multiturn_targets}/{retained_count} rows use "
+            "assistant-body masking; interleaved environment/tool/user observations are masked "
+            "out of the loss"
         )
-    elif getattr(options.env, "multi_turn", False):
+    if fallback_multiturn_targets:
+        print(
+            f"[sft][warn] multi-turn SFT: {fallback_multiturn_targets}/{retained_count} rows use "
+            "completion-only fallback because the rendered transcript was not parseable ChatML; "
+            "interleaved observations are not proven masked"
+        )
+    elif not multiturn_targets and getattr(options.env, "multi_turn", False):
         print(
             "[sft][warn] this is a multi-turn environment but no row ships a multi-turn "
             "target completion"

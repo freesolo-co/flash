@@ -844,9 +844,10 @@ Pick SFT when you already have good answers and want the model to imitate them.
   observations), Flash supervises the assistant turns and masks the observations out of the
   loss — the model is trained to produce its own replies, not to predict the environment's.
   For every ChatML target, including a single assistant turn, control strings `<|im_start|>` and
-  `<|im_end|>` are reserved in rendered message body fields such as `content` and assistant
-  `reasoning_content`. They are indistinguishable from structural turn delimiters after tokenization.
-  The run logs `[sft] multi-turn SFT: N/M rows ...` when any row carries such a target.
+  `<|im_end|>` are reserved in every message field the active template renders into the body,
+  including text content, reasoning, and tool-call serialization. They are indistinguishable from
+  structural turn delimiters after tokenization. The run logs role-aware masked rows and any
+  completion-only fallback rows separately.
 - **For Qwen3.5 thinking multi-turn SFT, put reasoning only in the final assistant
   turn.** Qwen3.5's chat template strips literal `<think>` blocks from prior assistant
   history and pre-opens `<think>\n` in the next generation prompt. If every assistant

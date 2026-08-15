@@ -145,6 +145,34 @@ def test_exact_sft_workload_packs_retained_prefix_rows_deterministically() -> No
     assert first.profile.authoritative_compute_tokens == first.profile.authoritative_real_tokens
 
 
+def test_retained_workload_counts_mixed_role_aware_and_fallback_multiturn_rows() -> None:
+    from flash.engine.profiling.sft_workload import (
+        _filter_retained_rows,
+        _RowReasoning,
+        _TokenizedSftRows,
+    )
+
+    tokenized = _TokenizedSftRows(
+        row_by_index={
+            0: {"input_ids": [10], "loss_mask": [1]},
+            1: {"input_ids": [11], "loss_mask": [1]},
+        },
+        untruncated_by_index={0: 1, 1: 1},
+        sampled_texts=[],
+        multiturn_targets=2,
+        coerced_singleturn_targets=0,
+        assistant_mask_applied_by_index={0: True, 1: False},
+        multiturn_indexes={0, 1},
+        reasoning_by_index={0: _RowReasoning(0, 0, 0), 1: _RowReasoning(0, 0, 0)},
+        dropped=0,
+    )
+
+    retained = _filter_retained_rows(tokenized, FakeTokenizer())
+
+    assert retained.role_aware_multiturn_targets == 1
+    assert retained.fallback_multiturn_targets == 1
+
+
 def test_exact_unpacked_mode_trains_one_example_per_update() -> None:
     prepared = _prepare(_spec(), packed=False)
     packed = _prepare(_spec(), packed=True)

@@ -50,6 +50,8 @@ class PreparedSftWorkload:
     sampled_texts: list[str]
     multiturn_targets: int
     coerced_singleturn_targets: int
+    role_aware_multiturn_targets: int
+    fallback_multiturn_targets: int
     authored_reasoning_turns: int
     rendered_reasoning_spans: int
     truncated_reasoning_spans: int
@@ -104,7 +106,7 @@ def _processor_tokenized_row(
     *,
     max_length: int,
     thinking: bool,
-) -> tuple[list[int], list[int], bytes, int]:
+) -> tuple[list[int], list[int], bytes, int, bool]:
     from flash.engine.worker.model.packing import assistant_only_mask, completion_mask_from_ids
 
     prepared_prompt = _multimodal_messages_with_images(prompt_messages, images)
@@ -144,17 +146,23 @@ def _processor_tokenized_row(
     input_ids = untruncated_ids[:max_length]
     prompt_ids = ids(prompt["input_ids"])[:max_length]
     # the span reader needs the text tokenizer's vocabulary; a processor exposes it as .tokenizer.
-    loss_mask = assistant_only_mask(
+    role_mask = assistant_only_mask(
         completion_mask_from_ids(prompt_ids, input_ids),
         input_ids,
         getattr(processor, "tokenizer", processor),
         completion_messages,
         template_source=processor,
-        source_messages=[*prompt_messages, *completion_messages],
+        source_messages=full_messages,
         template_kwargs={"enable_thinking": thinking},
     )
     full.pop("attention_mask", None)
-    return input_ids, loss_mask, _serialize_multimodal_inputs(full), untruncated_length
+    return (
+        input_ids,
+        role_mask.mask,
+        _serialize_multimodal_inputs(full),
+        untruncated_length,
+        role_mask.role_aware,
+    )
 
 
 def _materialize_verl_images(
@@ -278,6 +286,8 @@ class _TokenizedSftRows:
     sampled_texts: list[str]
     multiturn_targets: int
     coerced_singleturn_targets: int
+    assistant_mask_applied_by_index: dict[int, bool]
+    multiturn_indexes: set[int]
     reasoning_by_index: dict[int, _RowReasoning]
     dropped: int
 
@@ -289,6 +299,8 @@ class _RetainedSftRows:
     authored_reasoning_turns: int
     rendered_reasoning_spans: int
     truncated_reasoning_spans: int
+    role_aware_multiturn_targets: int
+    fallback_multiturn_targets: int
     dropped: int
     # kept PER ROW, in the retained order, so the warning can be bounded to the rows the optimizer
     # actually consumes. the totals above describe the whole retained dataset, which is what the
@@ -395,6 +407,44 @@ def _row_reasoning(
     return _RowReasoning(authored, rendered, truncated)
 
 
+def _text_sft_row_spec(
+    spec,
+    prompt_messages: list[dict],
+    completion_messages: list[dict],
+    *,
+    tokenizer,
+    render_transcript: Callable[[list[dict]], str],
+    max_length: int,
+    row_index: int,
+) -> tuple[str, _RowReasoning, dict[str, Any]]:
+    text = render_transcript([*prompt_messages, *completion_messages])
+    prompt_text = tokenizer.apply_chat_template(
+        prompt_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=spec.thinking,
+    )
+    reasoning = _row_reasoning(
+        prompt_messages,
+        completion_messages,
+        render=render_transcript,
+        tokenizer=tokenizer,
+        max_length=max_length,
+    )
+    return (
+        text,
+        reasoning,
+        {
+            "text": text,
+            "prompt_text": prompt_text,
+            "target_messages": completion_messages,
+            "source_messages": [*prompt_messages, *completion_messages],
+            "template_kwargs": {"enable_thinking": spec.thinking},
+            "row_index": row_index,
+        },
+    )
+
+
 def _tokenize_prompt_rows(
     spec,
     prompt_rows: list[tuple[Any, list[dict], list[dict], bool]],
@@ -418,6 +468,8 @@ def _tokenize_prompt_rows(
     sampled_texts: list[str] = []
     multiturn_targets = 0
     coerced_singleturn_targets = 0
+    assistant_mask_applied_by_index: dict[int, bool] = {}
+    multiturn_indexes: set[int] = set()
     # kept per row rather than summed here, for the same reason as `untruncated_by_index`: rows that
     # lose their whole completion to the cap are dropped below, and folding their reasoning into a
     # running total would report loss from rows the run never trains on against a retained-row
@@ -441,6 +493,7 @@ def _tokenize_prompt_rows(
         _reject_image_completion(completion_messages)
         if len(completion_messages) > 1:
             multiturn_targets += 1
+            multiturn_indexes.add(row_index)
         elif (
             coerced_scalar_output
             and len(completion_messages) == 1
@@ -453,7 +506,13 @@ def _tokenize_prompt_rows(
             normalized = normalize_prompt_images(example, prompt_messages, package_root)
             completion_messages = text_only_prompt_messages(completion_messages)
             decoded_images = decode_image_descriptors(normalized.descriptors, package_root)
-            input_ids, loss_mask, multimodal_inputs, untruncated_length = _processor_tokenized_row(
+            (
+                input_ids,
+                loss_mask,
+                multimodal_inputs,
+                untruncated_length,
+                assistant_mask_applied,
+            ) = _processor_tokenized_row(
                 processor,
                 normalized.messages,
                 completion_messages,
@@ -462,6 +521,7 @@ def _tokenize_prompt_rows(
                 thinking=bool(spec.thinking),
             )
             untruncated_by_index[row_index] = untruncated_length
+            assistant_mask_applied_by_index[row_index] = assistant_mask_applied
             row_by_index[row_index] = {
                 "input_ids": input_ids,
                 "loss_mask": loss_mask,
@@ -489,31 +549,18 @@ def _tokenize_prompt_rows(
                 max_length=max_length - visual_inflation,
             )
         else:
-            text = render_transcript([*prompt_messages, *completion_messages])
-            prompt_text = tokenizer.apply_chat_template(
-                prompt_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=spec.thinking,
-            )
-            sampled_texts.append(text)
-            reasoning_by_index[row_index] = _row_reasoning(
+            text, reasoning, text_spec = _text_sft_row_spec(
+                spec,
                 prompt_messages,
                 completion_messages,
-                render=render_transcript,
                 tokenizer=tokenizer,
+                render_transcript=render_transcript,
                 max_length=max_length,
+                row_index=row_index,
             )
-            text_specs.append(
-                {
-                    "text": text,
-                    "prompt_text": prompt_text,
-                    "target_messages": completion_messages,
-                    "source_messages": [*prompt_messages, *completion_messages],
-                    "template_kwargs": {"enable_thinking": spec.thinking},
-                    "row_index": row_index,
-                }
-            )
+            sampled_texts.append(text)
+            reasoning_by_index[row_index] = reasoning
+            text_specs.append(text_spec)
 
     dropped = 0
     if text_specs:
@@ -524,9 +571,11 @@ def _tokenize_prompt_rows(
         )
         dropped += text_dropped
         for spec_row, tokenized in zip(kept_specs, tokenized_rows, strict=True):
+            row_index = spec_row["row_index"]
             input_ids = tokenized["input_ids"]
-            untruncated_by_index[spec_row["row_index"]] = tokenized["untruncated_length"]
-            row_by_index[spec_row["row_index"]] = {
+            untruncated_by_index[row_index] = tokenized["untruncated_length"]
+            assistant_mask_applied_by_index[row_index] = tokenized["assistant_mask_applied"]
+            row_by_index[row_index] = {
                 "input_ids": input_ids,
                 "loss_mask": tokenized["completion_mask"],
                 "images": [],
@@ -538,6 +587,8 @@ def _tokenize_prompt_rows(
         sampled_texts=sampled_texts,
         multiturn_targets=multiturn_targets,
         coerced_singleturn_targets=coerced_singleturn_targets,
+        assistant_mask_applied_by_index=assistant_mask_applied_by_index,
+        multiturn_indexes=multiturn_indexes,
         reasoning_by_index=reasoning_by_index,
         dropped=dropped,
     )
@@ -551,6 +602,8 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
     authored_reasoning = 0
     rendered_reasoning = 0
     truncated_reasoning = 0
+    role_aware_multiturn_targets = 0
+    fallback_multiturn_targets = 0
     per_row: list[_RowReasoning] = []
     dropped = tokenized.dropped
     for row_index in sorted(tokenized.row_by_index):
@@ -560,6 +613,11 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
             # appended in lockstep with the row it measures, so the truncation counts below describe
             # the rows that are actually trained on rather than the ones that were dropped.
             retained_untruncated.append(tokenized.untruncated_by_index[row_index])
+            if row_index in tokenized.multiturn_indexes:
+                if tokenized.assistant_mask_applied_by_index.get(row_index, False):
+                    role_aware_multiturn_targets += 1
+                else:
+                    fallback_multiturn_targets += 1
             # summed here for the same reason, so the reasoning-loss warning describes the rows the
             # run trains on. a dropped row contributes neither its authored reasoning nor its
             # survivors, which would otherwise be reported against a retained-row denominator.
@@ -584,6 +642,8 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
         authored_reasoning_turns=authored_reasoning,
         rendered_reasoning_spans=rendered_reasoning,
         truncated_reasoning_spans=truncated_reasoning,
+        role_aware_multiturn_targets=role_aware_multiturn_targets,
+        fallback_multiturn_targets=fallback_multiturn_targets,
         dropped=dropped,
         row_reasoning=per_row,
     )
@@ -913,6 +973,8 @@ def prepare_sft_workload(
         sampled_texts=tokenized.sampled_texts,
         multiturn_targets=tokenized.multiturn_targets,
         coerced_singleturn_targets=tokenized.coerced_singleturn_targets,
+        role_aware_multiturn_targets=retained.role_aware_multiturn_targets,
+        fallback_multiturn_targets=retained.fallback_multiturn_targets,
         authored_reasoning_turns=retained.authored_reasoning_turns,
         rendered_reasoning_spans=retained.rendered_reasoning_spans,
         truncated_reasoning_spans=retained.truncated_reasoning_spans,
