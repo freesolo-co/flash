@@ -27,7 +27,11 @@ from flash.adapters.artifacts import (
     has_loadable_adapter_weights,
     is_adapter_weight_filename,
 )
-from flash.adapters.lora_rank import declared_lora_ranks, lora_tensor_rank_disagrees
+from flash.adapters.lora_rank import (
+    DeclaredLoraRanks,
+    declared_lora_ranks,
+    lora_tensor_rank_disagrees,
+)
 from flash.serve.deploy import ServingError
 
 logger = get_logger(__name__)
@@ -470,8 +474,8 @@ class _AdapterRankMismatch(ValueError):
     """
 
 
-def _declared_export_ranks(adapter_dir: Path) -> set[int]:
-    """Every rank ``adapter_config.json`` declares, or empty when it declares none we can read.
+def _declared_export_ranks(adapter_dir: Path) -> DeclaredLoraRanks:
+    """The rank structure ``adapter_config.json`` declares, or an empty one we cannot judge from.
 
     Empty rather than an error: a config carrying no readable rank is the pre-existing shape of
     every fixture and of adapters PEFT wrote without one, and export has never required it. The
@@ -480,8 +484,8 @@ def _declared_export_ranks(adapter_dir: Path) -> set[int]:
     try:
         config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return set()
-    return declared_lora_ranks(config) if isinstance(config, dict) else set()
+        return DeclaredLoraRanks()
+    return declared_lora_ranks(config) if isinstance(config, dict) else DeclaredLoraRanks()
 
 
 def _verify_export_tensor_ranks(adapter_dir: Path, scans: list[_WeightScan]) -> None:
@@ -494,9 +498,8 @@ def _verify_export_tensor_ranks(adapter_dir: Path, scans: list[_WeightScan]) -> 
     while deploying the identical artifact failed. Export exiting 0 is what made a broken adapter
     look like a finished deliverable.
 
-    Deliberately narrow: `lora_tensor_rank_disagrees` accepts a rank axis that is a positive
-    multiple of ANY declared rank, so neither a `rank_pattern` override nor a fused MoE parameter
-    stacking its experts on that axis is refused. Only an axis no declared rank divides is.
+    `lora_tensor_rank_disagrees` resolves the rank PER MODULE the way PEFT does, so a
+    `rank_pattern` override is judged against its own rank rather than a summary of the config.
 
     Only safetensors headers are read, because they carry shapes as metadata and are already parsed
     here. A `.bin` would have to be loaded through torch, which the control plane does not install,
@@ -516,12 +519,11 @@ def _verify_export_tensor_ranks(adapter_dir: Path, scans: list[_WeightScan]) -> 
     if not mismatched:
         return
     shown = ", ".join(sorted(mismatched)[:3])
-    ranks = ", ".join(f"r={rank}" for rank in sorted(declared))
     raise _AdapterRankMismatch(
-        f"adapter_config.json declares {ranks} but {len(mismatched)} LoRA tensor(s) carry a rank "
-        f"axis that is a multiple of none of them (e.g. {shown}); a serving engine sizes its LoRA "
-        "slots from the config, so this adapter cannot be loaded and exporting it would publish a "
-        "broken artifact"
+        f"adapter_config.json declares r={declared.default} but {len(mismatched)} LoRA tensor(s) "
+        f"do not carry the rank configured for their module (e.g. {shown}); a serving engine sizes "
+        "its LoRA slots from the config, so this adapter cannot be loaded and exporting it would "
+        "publish a broken artifact"
     )
 
 

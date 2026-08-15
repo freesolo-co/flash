@@ -7,7 +7,7 @@ import json
 import math
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
@@ -283,33 +283,78 @@ _LORA_A_INFIX = ".lora_A."
 _LORA_B_INFIX = ".lora_B."
 
 
-def declared_lora_ranks(config: Mapping[str, Any]) -> set[int]:
-    """Every rank ``adapter_config.json`` declares: the ``r`` default plus any ``rank_pattern``.
+@dataclass(frozen=True)
+class DeclaredLoraRanks:
+    """The ranks a config declares, and whether a fused stacked rank axis is possible at all.
 
-    A set rather than the maximum, unlike :func:`rank_from_adapter_config`. That function answers
-    "how large a LoRA slot must serving be able to hold", where the largest is the only number that
-    matters. The question here is the opposite one -- "is this tensor's rank one this config
-    accounts for" -- and against the maximum alone every module a ``rank_pattern`` did NOT override
-    reads as a contradiction, which would refuse a correct adapter.
+    ``by_module`` holds the ``rank_pattern`` overrides keyed by the pattern PEFT matches against the
+    module path; ``default`` is the ``r`` every non-overridden module gets. Kept apart rather than
+    collapsed to one summary number because PEFT resolves the rank PER MODULE
+    (``lora.LoraModel._create_and_replace``: ``rank_pattern.get(matched_key, config.r)``), so any
+    single number is wrong for every module it did not come from.
 
-    Empty when nothing readable is declared, which leaves the caller with no basis to refuse.
+    ``allows_stacked_rank_axis`` is true only when ``target_parameters`` is non-empty. That is what
+    routes a module through ``lora.ParamWrapper``, the one code path that builds
+    ``nn.Linear(in_features, r * num_experts)`` and so legitimately carries a rank axis larger than
+    ``r``. Ordinary ``target_modules`` never do, and their axis must equal the module's rank exactly.
+    """
+
+    default: int | None = None
+    by_module: Mapping[str, int] = field(default_factory=dict)
+    allows_stacked_rank_axis: bool = False
+
+    def __bool__(self) -> bool:
+        return self.default is not None or bool(self.by_module)
+
+
+def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
+    """Read the per-module LoRA rank structure out of ``adapter_config.json``.
+
+    Falsy when nothing readable is declared, which leaves the caller with no basis to refuse.
     """
     if not isinstance(config, Mapping):
-        return set()
-    ranks: set[int] = set()
-    for field in ("r", "rank_pattern"):
-        value = config.get(field)
-        candidates = value.values() if isinstance(value, Mapping) else [value]
-        for candidate in candidates:
+        return DeclaredLoraRanks()
+    try:
+        default = _positive_int(config["r"], source="adapter_config.json", field="r")
+    except (KeyError, ValueError):
+        default = None
+    by_module: dict[str, int] = {}
+    pattern = config.get("rank_pattern")
+    if isinstance(pattern, Mapping):
+        for module, value in pattern.items():
             try:
-                ranks.add(_positive_int(candidate, source="adapter_config.json", field=field))
+                by_module[str(module)] = _positive_int(
+                    value, source="adapter_config.json", field="rank_pattern"
+                )
             except ValueError:
                 continue
-    return ranks
+    targets = config.get("target_parameters")
+    return DeclaredLoraRanks(
+        default=default,
+        by_module=by_module,
+        allows_stacked_rank_axis=bool(targets) and not isinstance(targets, (str, bytes)),
+    )
 
 
-def lora_tensor_rank_disagrees(key: str, shape: Any, declared: set[int]) -> bool:
-    """True only when a weight's own shape provably contradicts every rank the config declares.
+def _rank_for_module(key: str, declared: DeclaredLoraRanks) -> int | None:
+    """The rank this tensor's own module is configured for, mirroring PEFT's pattern matching.
+
+    PEFT matches a ``rank_pattern`` entry against the module path either exactly or as a suffix
+    (``peft.tuners.tuners_utils.get_pattern_key``), so the longest matching entry wins and anything
+    unmatched falls back to ``r``.
+    """
+    matched = [
+        (module, rank)
+        for module, rank in declared.by_module.items()
+        if module and (f".{module}." in key or key.startswith(f"{module}.") or module in key)
+    ]
+    if matched:
+        return max(matched, key=lambda pair: len(pair[0]))[1]
+    return declared.default
+
+
+def lora_tensor_rank_disagrees(key: str, shape: Any, declared: DeclaredLoraRanks) -> bool:
+    """True only when a weight's own shape provably contradicts its module's configured rank.
 
     PEFT writes ``lora_A`` as ``[r, in_features]`` and ``lora_B`` as ``[out_features, r]``, so the
     rank is legible from the tensor itself rather than taken on the config's word. That second
@@ -317,15 +362,14 @@ def lora_tensor_rank_disagrees(key: str, shape: Any, declared: set[int]) -> bool
     different code paths and can disagree, and the config is the half a serving engine sizes its
     LoRA slots from.
 
-    A rank axis is accepted when it is a positive multiple of ANY declared rank. Both halves of
-    that are load-bearing:
-
-    - *any*, because ``rank_pattern`` gives different modules different ranks, and checking against
-      one summary number refuses every module that number did not come from.
-    - *multiple*, because a fused MoE parameter targeted via ``target_parameters`` stacks its
-      experts on that axis -- ``lora.ParamWrapper.update_layer`` builds ``nn.Linear(in_features,
-      r * num_experts)``, so an ``r=32`` adapter over 256 experts really does carry an 8192-long
-      axis, and demanding equality would refuse adapters that load correctly.
+    The axis must EQUAL the rank resolved for that module. Equality is the rule because loading a
+    rank-64 tensor into a rank-32 LoRA layer is a size mismatch, and accepting any multiple would
+    wave through exactly that. The single exception is a config declaring ``target_parameters``,
+    where ``lora.ParamWrapper`` stacks every expert on the rank axis
+    (``nn.Linear(in_features, r * num_experts)``) and a positive multiple is the correct shape.
+    Applying that exception unconditionally is what would let the original 35B report through: its
+    config carried ``target_parameters: None`` with ``experts`` as an ordinary ``target_modules``
+    entry, so its rank-8192 tensors had no fused layout to justify them.
 
     False for everything whose shape cannot answer the question at all -- ``modules_to_save``
     copies, biases, ``lora_embedding_A``/``_B`` (which the infixes deliberately do not match), and
@@ -342,8 +386,11 @@ def lora_tensor_rank_disagrees(key: str, shape: Any, declared: set[int]) -> bool
     dims = [d for d in shape if isinstance(d, int) and not isinstance(d, bool) and d > 0]
     if len(dims) != 2:
         return False
+    rank = _rank_for_module(key, declared)
+    if rank is None:
+        return False
     axis = dims[0] if is_a else dims[1]
-    return all(axis % rank != 0 for rank in declared)
+    return axis % rank != 0 if declared.allows_stacked_rank_axis else axis != rank
 
 
 def alpha_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:

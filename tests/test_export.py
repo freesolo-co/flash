@@ -1238,15 +1238,15 @@ def test_export_refuses_adapter_whose_tensors_contradict_its_declared_rank(tmp_p
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 8))
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32, "lora_alpha": 64}))
 
-    with pytest.raises(ValueError, match=r"declares r=32.*a multiple of none of them"):
+    with pytest.raises(ValueError, match=r"declares r=32.*do not carry the rank configured"):
         export._normalize_export_adapter_keys(tmp_path)
 
 
-def test_export_accepts_fused_moe_experts_stacked_on_the_rank_axis(tmp_path):
-    """The exact LMR-030 shapes, which are LEGITIMATE: `lora.ParamWrapper.update_layer` builds
-    `nn.Linear(in_features, r * num_experts)`, so an r=32 adapter over 256 experts really does
-    carry an 8192-long rank axis. Demanding equality here would refuse adapters that load, which
-    is a worse failure than the one being fixed -- export is the user's escape hatch."""
+def test_export_accepts_fused_moe_experts_when_target_parameters_declares_them(tmp_path):
+    """A stacked rank axis is legitimate ONLY through `target_parameters`, which is what routes a
+    module into `lora.ParamWrapper` -- the one path that builds `nn.Linear(in_features,
+    r * num_experts)`. With it declared, an r=32 adapter over 256 experts really does carry an
+    8192-long axis, and refusing it would break adapters that load."""
     from flash.serve import export
 
     header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
@@ -1256,9 +1256,64 @@ def test_export_accepts_fused_moe_experts_stacked_on_the_rank_axis(tmp_path):
         )
     )
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 8))
-    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32, "lora_alpha": 64}))
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 32,
+                "lora_alpha": 64,
+                "target_parameters": ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
+            }
+        )
+    )
 
     assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+
+def test_export_refuses_the_reported_35b_artifact_with_no_target_parameters(tmp_path):
+    """The LMR-030 artifact itself. Its config carried `target_parameters: None` with `experts` as
+    an ordinary `target_modules` entry, so its rank-8192 tensors had NO fused layout to justify
+    them -- exactly the adapter that exported clean and then failed to deploy.
+
+    This is the case a plain "any multiple of r" rule would wave through, because 8192 = 32 x 256.
+    The fused allowance has to be gated on `target_parameters` or the original bug survives."""
+    from flash.serve import export
+
+    header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
+    header.update(
+        _lora_pair_header(
+            8192, 8192, prefix="base_model.model.model.layers.0.mlp.experts", offset=4
+        )
+    )
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 8))
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 32,
+                "lora_alpha": 64,
+                "target_parameters": None,
+                "target_modules": ["q_proj", "experts", "base_layer"],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="do not carry the rank configured"):
+        export._normalize_export_adapter_keys(tmp_path)
+
+
+def test_export_refuses_an_ordinary_module_at_an_exact_multiple_of_the_declared_rank(tmp_path):
+    """For ordinary `target_modules` the axis must EQUAL the module's rank: loading a rank-64
+    tensor into a rank-32 LoRA layer is a size mismatch. An exact multiple is the case an
+    "any multiple" rule accepts and a serving engine still rejects."""
+    from flash.serve import export
+
+    header = _lora_pair_header(64, 64, prefix="base_model.model.model.layers.0.self_attn.q_proj")
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps({"r": 32, "target_modules": ["q_proj"]})
+    )
+
+    with pytest.raises(ValueError, match="do not carry the rank configured"):
+        export._normalize_export_adapter_keys(tmp_path)
 
 
 def test_export_rank_mismatch_reaches_the_caller_as_itself(tmp_path):
@@ -1269,7 +1324,7 @@ def test_export_rank_mismatch_reaches_the_caller_as_itself(tmp_path):
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}))
 
-    with pytest.raises(ValueError, match="a multiple of none of them") as excinfo:
+    with pytest.raises(ValueError, match="do not carry the rank configured") as excinfo:
         export._normalize_export_adapter_keys(tmp_path)
     assert "could not normalize exported adapter keys" not in str(excinfo.value)
 
@@ -1301,7 +1356,7 @@ def test_export_refuses_rank_mismatch_before_touching_the_destination_repo(monke
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
     from flash.serve.export import export_adapter
 
-    with pytest.raises(ValueError, match="a multiple of none of them"):
+    with pytest.raises(ValueError, match="do not carry the rank configured"):
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="sft/run-x/adapter",
@@ -1430,7 +1485,7 @@ def test_export_checks_ranks_across_every_shard_not_just_the_first(tmp_path):
     )
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32}))
 
-    with pytest.raises(ValueError, match="a multiple of none of them"):
+    with pytest.raises(ValueError, match="do not carry the rank configured"):
         export._normalize_export_adapter_keys(tmp_path)
 
 
