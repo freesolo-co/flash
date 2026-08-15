@@ -208,15 +208,15 @@ def _grpo_is_multimodal(train, message_prompts):
 
 
 def _resolve_sequence_lengths(model_id, model_revision, train_spec, rl, gcfg, tok, multi_turn):
-    # same resolver the spec-parse prompt-budget guard uses, so a run rejected at submit is exactly
-    # the run this would have failed here after the gpu was already paid for.
-    from flash.engine.plan.vram import grpo_completion_len
+    from flash.engine.plan.vram import grpo_completion_len, grpo_rollout_seq_len
 
-    max_completion = grpo_completion_len(gcfg.get("max_tokens"), bool(_w.THINKING))
+    thinking = bool(_w.THINKING)
+    max_tokens = gcfg.get("max_tokens")
+    max_completion = grpo_completion_len(max_tokens, thinking)
     train_ctx = (
         train_spec.max_context_tokens if (train_spec and train_spec.max_context_tokens) else 0
     )
-    requested_len = int(train_ctx or max(1024, rl.max_prompt_len + max_completion))
+    requested_len = grpo_rollout_seq_len(train_ctx, max_tokens, thinking)
     # clamp to the architecture BEFORE deriving the prompt budget, so every downstream length agrees.
     # clamping only the engine would admit prompts up to the unclamped budget and then fail them at
     # rollout, and would let the token budget pack more than the one-sequence memory floor intends.
