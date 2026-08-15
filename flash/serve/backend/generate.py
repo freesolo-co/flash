@@ -11,6 +11,7 @@ import re
 from importlib import resources
 from pathlib import Path
 
+from flash.content.multimodal import _IMAGE_BLOCK_TYPES
 from flash.core.catalog import ModelInfo
 from flash.serve.backend.gpus import MODAL_GPUS_BY_NAME, ModalGpu, default_gpu, serving_dtype
 
@@ -82,6 +83,11 @@ def render_app(
         max_lora_rank=serving.max_lora_rank,
         gpu_memory_utilization=serving.gpu_memory_utilization or 0.90,
         vllm_version=VLLM_VERSION,
+        # Substituted, not written into the template, so the generated backend rejects exactly the
+        # block types the renderer accepts. A literal in the template is a second copy that drifts:
+        # `input_image` was already supported here and missing there, so it reached the tokenizer
+        # with no decoded pixels instead of the promised 400.
+        image_block_types=", ".join(f'"{t}"' for t in sorted(_IMAGE_BLOCK_TYPES)),
         scaledown_window=scaledown_window,
         secret_name=secret_name,
         app_file=app_file,

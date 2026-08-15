@@ -2342,7 +2342,7 @@ def api():
             if not isinstance(content, list):
                 continue
             if any(
-                isinstance(block, dict) and block.get("type") in ("image", "image_url")
+                isinstance(block, dict) and block.get("type") in ({image_block_types})
                 for block in content
             ):
                 raise HTTPException(

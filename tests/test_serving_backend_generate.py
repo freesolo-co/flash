@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from flash.content.multimodal import _IMAGE_BLOCK_TYPES
 from flash.core.catalog import MODELS
 from flash.serve.backend.generate import (
     VLLM_VERSION,
@@ -368,3 +369,30 @@ def test_image_carries_the_cuda_toolchain_the_engine_jits_against(model_id):
     assert "nvidia/cuda:12.8.0-devel-ubuntu22.04" in source
     for tool in ("build-essential", "ninja-build"):
         assert tool in source, tool
+
+
+@pytest.mark.parametrize("model_id", _MODEL_IDS)
+def test_text_only_guard_rejects_every_image_block_the_renderer_accepts(model_id):
+    """The 400 must name the same block types `flash/content/multimodal.py` decodes.
+
+    The guard once hardcoded ("image", "image_url") while the renderer had accepted `input_image`
+    for as long as it had existed. That block form went straight past a check whose only job is to
+    refuse it, reaching the tokenizer with no decoded pixels and no `multi_modal_data`: the model
+    answered having never seen the image, which is the exact outcome the guard promises not to
+    produce. Asserted against the renderer's own set so a fourth block type cannot reintroduce it.
+    """
+    source = render_app(MODELS[model_id])
+    guard = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Compare)
+        and isinstance(node.ops[0], ast.In)
+        and isinstance(node.comparators[0], ast.Tuple)
+        and all(isinstance(e, ast.Constant) for e in node.comparators[0].elts)
+        and "image" in {e.value for e in node.comparators[0].elts}
+    )
+    rejected = {e.value for e in guard.comparators[0].elts}
+    assert rejected == set(_IMAGE_BLOCK_TYPES), (
+        f"text-only guard rejects {sorted(rejected)} but the renderer decodes "
+        f"{sorted(_IMAGE_BLOCK_TYPES)}"
+    )
