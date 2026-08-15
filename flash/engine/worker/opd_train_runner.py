@@ -530,8 +530,7 @@ def _write_child_shims(
     )
     if gdn_reset_arch is not None:
         opd_shim_source += _opd_train.render_gdn_varlen_shim(gdn_reset_arch)
-    # fail closed: base-model rollouts complete with descending loss while distilling the wrong
-    # policy, so a guard that failed to apply must stop the child rather than let it train unguarded.
+    # fail closed because base-model rollouts can look healthy while distilling the wrong policy.
     opd_shim_source += render_lora_rollout_guard_fragment()
     if "wandb" in loggers:
         opd_shim_source += _opd_train.render_wandb_link_shim()
@@ -630,6 +629,7 @@ def _build_child_callbacks(
         "step": resume_step,
         "loss": None,
         "truncation_rate": None,
+        "discarded_rollouts": None,
         "truncation_step": None,
     }
     wandb_link: dict[str, str | None] = {}
@@ -665,7 +665,10 @@ def _build_child_callbacks(
             # when NO step ever produced a distillation loss.
             return
         progress["loss"] = loss
-        progress["truncation_rate"] = progress_state.record_step(step_number, loss, bridge)
+        (
+            progress["truncation_rate"],
+            progress["discarded_rollouts"],
+        ) = progress_state.record_step(step_number, loss, bridge)
         progress["truncation_step"] = step_number
 
     def on_step(step: int) -> None:
@@ -675,6 +678,7 @@ def _build_child_callbacks(
             payload["loss"] = progress["loss"]
         if progress["truncation_step"] == step and progress["truncation_rate"] is not None:
             payload["truncation_rate"] = progress["truncation_rate"]
+            payload["discarded_rollouts"] = progress["discarded_rollouts"]
         _opd_train._w.heartbeat("opd_step", **payload)
 
     def child_heartbeat() -> None:
