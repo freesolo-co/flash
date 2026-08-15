@@ -21,6 +21,7 @@ from flash.providers.base import (
     AllocationConstraints,
     Candidate,
     CapacityLookupError,
+    CapacityUnavailableError,
     UnsupportedGpuError,
     _run_cost_key,
     authored_gpu_ceiling,
@@ -731,7 +732,7 @@ def _raise_no_candidate_error(
     )
     if exact:
         if live_only and could_fit:
-            raise CapacityLookupError(
+            raise CapacityUnavailableError(
                 f"exact GPU {exact!r} is structurally supported but currently has no capacity on "
                 f"{', '.join(supported_available)}"
             )
@@ -743,7 +744,7 @@ def _raise_no_candidate_error(
     # without that guard a genuinely oversized run would retry until its infra budget ran out
     # instead of failing immediately with the reason.
     if live_only and could_fit:
-        raise CapacityLookupError(
+        raise CapacityUnavailableError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) right now: a fitting class is "
             f"structurally offered on {', '.join(supported_available)} but has no capacity — "
             f"retry may find it"
