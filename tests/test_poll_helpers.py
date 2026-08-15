@@ -206,6 +206,18 @@ def test_format_heartbeat_is_unchanged_when_no_child_tail_is_present():
     assert "child output" not in _format_heartbeat(hb)
 
 
+def test_format_heartbeat_renders_the_opd_per_step_discard_count():
+    # opd writes its step metrics as top-level heartbeat fields rather than the grpo-shaped
+    # metrics_last backlog, so the streamed log is the surface that carries them. a count missing
+    # from this allowlist is silently dropped next to the rate it belongs with.
+    msg = _format_heartbeat(
+        {"stage": "opd_step", "step": 3, "truncation_rate": 0.5, "discarded_rollouts": 4}
+    )
+
+    assert "truncation_rate=0.500" in msg
+    assert "discarded_rollouts=4" in msg
+
+
 def test_format_heartbeat_ignores_a_malformed_child_tail():
     # this payload crosses a process boundary as json; a bad one must not break the whole line.
     for bad in ("not a list", 17, {"a": 1}, [], [None, 3, ""], None):

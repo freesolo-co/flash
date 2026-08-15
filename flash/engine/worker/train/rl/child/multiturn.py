@@ -107,8 +107,9 @@ class _EpisodeTranscript:
         """the largest completion this turn may request under all three binding budgets.
 
         the configured per-turn cap, the engine's remaining context, and the response tensor's
-        remaining width. the first is what the user asked for and the other two are what the episode
-        can still hold, so one turn never spends the whole transcript.
+        remaining width. the first applies fresh to each model turn. response_capacity is the
+        whole-episode tensor width, widened by the parent for multi-turn, and the other two terms
+        bound what the accumulated episode can still hold.
         """
         return min(
             max_completion_tokens,
