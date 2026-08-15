@@ -1956,6 +1956,83 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     assert [step for _adapter, step in captured["published"]] == [2]
 
 
+def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
+    from flash.engine.plan import vram
+    from flash.engine.worker import sft_train_runner
+
+    class LoraConfig:
+        r = 16
+        lora_alpha = 32
+        target_modules = "all-linear"
+
+    options = sft_train_runner._SftOptions(
+        spec=None,
+        env=None,
+        started_at=0.0,
+        gpu_probe={"memory_gb": 24, "capability": [8, 9]},
+        model_id="Qwen/Qwen3.5-0.8B",
+        model_revision="revision",
+        epochs=1,
+        learning_rate=5e-5,
+        effective_batch=64,
+        max_steps=0,
+        save_at_steps=save_at_steps,
+        save_every=save_every,
+        gpu_count=1,
+        paths=None,
+    )
+    data = sft_train_runner._SftData(
+        rows=[{}] * 800,
+        multimodal=False,
+        profile=SimpleNamespace(examples_per_update=64, authoritative_steps=horizon),
+        max_length=1024,
+        realized_max_length=128,
+        train_file="/train.parquet",
+    )
+    monkeypatch.setattr(sft_train_runner._w, "prefetch_model", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(sft_train_runner._w, "heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sft_train_runner._w, "gpu_diagnostics", lambda **_kwargs: {})
+    monkeypatch.setattr(sft_train_runner._w, "make_lora", lambda _model: LoraConfig())
+    monkeypatch.setattr(sft_train_runner._sft_train, "_warmstart_adapter_path", lambda *_args: None)
+    monkeypatch.setattr(sft_train_runner._sft_train, "_resolve_sft_vocab_size", lambda *_args: 100)
+    monkeypatch.setattr(
+        sft_train_runner._sft_train, "_model_arch_dims", lambda *_args, **_kwargs: (64, 2)
+    )
+    monkeypatch.setattr(
+        sft_train_runner._sft_train, "_resolve_sft_grad_accum", lambda *_args, **_kwargs: (1, 1)
+    )
+    monkeypatch.setattr(
+        sft_train_runner._sft_train,
+        "_resolve_sft_gradient_checkpointing",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        sft_train_runner._sft_train,
+        "_resolve_sft_reentrant_gradient_checkpointing",
+        lambda _model: False,
+    )
+    monkeypatch.setattr(vram, "sft_chunked_nll_enabled", lambda _model: False)
+    return sft_train_runner._prepare_sft_model(options, data).save_freq
+
+
+def test_sft_save_freq_clamps_to_a_short_derived_horizon(monkeypatch):
+    from flash.engine.plan.steps import sft_update_steps
+
+    horizon = sft_update_steps(epochs=1, example_count=800, examples_per_update=64)
+    assert horizon == 13
+    save_freq = _sft_model_save_freq(monkeypatch, save_at_steps=(), save_every=20, horizon=horizon)
+    assert save_freq == 13
+    assert horizon % save_freq == 0
+
+
+def test_sft_save_freq_preserves_long_run_interval_and_exact_step_gcd(monkeypatch):
+    assert _sft_model_save_freq(monkeypatch, save_at_steps=(), save_every=15, horizon=100) == 15
+    assert (
+        _sft_model_save_freq(monkeypatch, save_at_steps=(10, 25, 100), save_every=15, horizon=100)
+        == 5
+    )
+
+
 def test_worker_uses_the_accepted_unpacked_quote_when_its_stack_can_pack(monkeypatch):
     """worker capability must not replace the packing contract the user accepted.
 
