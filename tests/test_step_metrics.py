@@ -174,12 +174,16 @@ def test_backlog_is_mutated_in_place_for_the_heartbeat_reader():
 
 
 def _verl_rl_tree() -> ast.Module:
-    from flash.engine.worker import rl_train
+    from flash.engine.worker import rl_train, rl_train_runner
 
+    # the rl_step liveness wrap moved out of run_rl_train into _run_rl_child_under_liveness when the
+    # entry function hit the 150-line gate. parse both halves, or the liveness assertions below stop
+    # seeing the call they exist to pin.
     source = "\n".join(
         inspect.getsource(fn)
         for fn in (
             rl_train.run_rl_train,
+            rl_train_runner._run_rl_child_under_liveness,
             rl_train._ingest_step_metrics,
             rl_train._write_terminal_metadata,
         )

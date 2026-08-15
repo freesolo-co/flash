@@ -81,8 +81,18 @@ def test_scoring_validates_total_before_aggregating_breakdown() -> None:
 def test_reward_metrics_reach_the_step_heartbeat() -> None:
     """verl's trainer is out of process and cannot host trl's TrainerCallback, so the per-name
     breakdowns travel through the reward-observability buffer into the rl_step liveness fields."""
+    # _run_rl_child_under_liveness holds the rl_step wrap that used to sit inside run_rl_train, so
+    # the fields hook this test follows now spans both halves of the entry path.
+    from flash.engine.worker.rl_train_runner import _run_rl_child_under_liveness
+
     source = "\n".join(
-        inspect.getsource(fn) for fn in (run_rl_train, _start_reward_runtime, _ingest_step_metrics)
+        inspect.getsource(fn)
+        for fn in (
+            run_rl_train,
+            _run_rl_child_under_liveness,
+            _start_reward_runtime,
+            _ingest_step_metrics,
+        )
     )
 
     assert (

@@ -443,10 +443,14 @@ def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     import ast
     import textwrap
 
-    from flash.engine.worker import rl_train
+    from flash.engine.worker import rl_train, rl_train_runner
 
-    source = inspect.getsource(rl_train.run_rl_train) + inspect.getsource(
-        rl_train._write_terminal_metadata
+    # the rl_step wrap lives in _run_rl_child_under_liveness since run_rl_train hit the 150-line
+    # gate; rl_finalizing stayed behind. both are part of one entry path, so both are parsed here.
+    source = (
+        inspect.getsource(rl_train.run_rl_train)
+        + inspect.getsource(rl_train_runner._run_rl_child_under_liveness)
+        + inspect.getsource(rl_train._write_terminal_metadata)
     )
     tree = ast.parse(textwrap.dedent(source))
     terminal_calls = [
@@ -1095,15 +1099,26 @@ def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatc
 # intentionally absent, for the same reason SFT is absent from the warmup test below: verl builds
 # its trainer in a subprocess, so there is no in-process build window to wrap.
 @pytest.mark.parametrize(
-    ("modname", "outer", "stage"),
+    ("modname", "outer", "stage", "delegate"),
     [
-        ("flash.engine.worker.rl_train", "run_rl_train", "rl_step"),
-        ("flash.engine.worker.sft_train", "run_sft_train", "sft_step"),
+        (
+            "flash.engine.worker.rl_train",
+            "run_rl_train",
+            "rl_step",
+            ("flash.engine.worker.rl_train_runner", "_run_rl_child_under_liveness"),
+        ),
+        ("flash.engine.worker.sft_train", "run_sft_train", "sft_step", None),
     ],
 )
-def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
+def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage, delegate):
     mod = importlib.import_module(modname)
     src = inspect.getsource(getattr(mod, outer))
+    if delegate is not None:
+        # run_rl_train hit the 150-line function gate, so the rl_step wrap moved into a helper it
+        # calls. the entry path is both halves: reading only the outer function would leave the
+        # wrap this test exists to pin completely unasserted.
+        delegate_modname, delegate_attr = delegate
+        src += inspect.getsource(getattr(importlib.import_module(delegate_modname), delegate_attr))
     # formatting-robust: the wrap sits at different nesting depths across backends, so match the
     # call shape rather than a fixed indent (the sibling quiet-phase test does the same).
     assert re.search(rf'liveness_heartbeat\(\s*"{re.escape(stage)}",\s*progress=', src), (
