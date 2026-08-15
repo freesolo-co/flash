@@ -389,6 +389,40 @@ class TestDescriptorPadTokens:
         with pytest.raises(ValueError, match="not a valid image"):
             descriptor_pad_tokens([descriptor], None, QWEN_GEOMETRY, ImageProfileValidationState())
 
+    def test_rejects_a_deferred_truncated_path_without_committing_state(
+        self, tmp_path, monkeypatch
+    ):
+        from flash.content import multimodal
+
+        dataset = tmp_path / "dataset"
+        dataset.mkdir()
+        corrupt_path = dataset / "corrupt.bmp"
+        corrupt_path.write_bytes(_truncated_bmp_bytes(64, 64))
+        reads = []
+        real_read_bytes = type(corrupt_path).read_bytes
+
+        def count_read(path):
+            if path.resolve() == corrupt_path.resolve():
+                reads.append(path.resolve())
+            return real_read_bytes(path)
+
+        monkeypatch.setattr(type(corrupt_path), "read_bytes", count_read)
+        state = ImageProfileValidationState()
+        normalized = multimodal.normalize_prompt_images(
+            {"image": "dataset/corrupt.bmp"},
+            [{"role": "user", "content": "describe"}],
+            tmp_path,
+            defer_path_validation=True,
+        )
+
+        assert reads == []
+        with pytest.raises(ValueError, match="not a valid image"):
+            descriptor_pad_tokens(normalized.descriptors, tmp_path, QWEN_GEOMETRY, state)
+
+        assert reads == [corrupt_path.resolve()]
+        assert state.descriptor_metadata == {}
+        assert state.decoded_work_bytes == 0
+
     def test_rejects_aggregate_decoded_bytes_before_full_decode(self, monkeypatch):
         from flash.content import multimodal
 

@@ -7,6 +7,7 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -801,7 +802,11 @@ def prepare_sft_workload(
         validation_state=validation_state,
         max_length=max_length,
         image_dir=image_dir,
-        normalize_prompt_images=normalize_prompt_images,
+        normalize_prompt_images=(
+            partial(normalize_prompt_images, defer_path_validation=True)
+            if processor is None
+            else normalize_prompt_images
+        ),
         record_has_images=record_has_images,
         text_only_prompt_messages=text_only_prompt_messages,
     )

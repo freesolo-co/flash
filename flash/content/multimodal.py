@@ -188,7 +188,12 @@ def _pil_descriptor(image: object) -> str:
     return _descriptor("bytes", base64.b64encode(data).decode("ascii"))
 
 
-def normalize_image_source(source: object, package_root: str | Path | None) -> str:
+def normalize_image_source(
+    source: object,
+    package_root: str | Path | None,
+    *,
+    defer_path_validation: bool = False,
+) -> str:
     """Convert one supported image source to an Arrow-safe descriptor."""
     root = Path(package_root) if package_root is not None else None
     if isinstance(source, bytearray):
@@ -221,8 +226,10 @@ def normalize_image_source(source: object, package_root: str | Path | None) -> s
     if scheme:
         raise ValueError(f"unsupported image URL scheme: {scheme}")
     path = _package_image_path(value, root)
-    _inspect_image_bytes(path.read_bytes())
-    return _descriptor("path", path.relative_to(root.resolve()).as_posix())
+    descriptor = _descriptor("path", path.relative_to(root.resolve()).as_posix())
+    if not defer_path_validation:
+        _inspect_image_bytes(path.read_bytes())
+    return descriptor
 
 
 def _image_source_from_block(block: dict) -> object | None:
@@ -378,6 +385,8 @@ def normalize_prompt_images(
     record: dict,
     messages: list[dict],
     package_root: str | Path | None,
+    *,
+    defer_path_validation: bool = False,
 ) -> NormalizedImages:
     """Normalize prompt image blocks and top-level fields without mutating the record."""
     if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
@@ -395,7 +404,11 @@ def normalize_prompt_images(
                 f"example contains {image_count} images, exceeding the "
                 f"{MAX_IMAGES_PER_EXAMPLE}-image limit"
             )
-        descriptor = normalize_image_source(source, package_root)
+        descriptor = normalize_image_source(
+            source,
+            package_root,
+            defer_path_validation=defer_path_validation,
+        )
         descriptor_bytes += _descriptor_size(descriptor)
         if descriptor_bytes > MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES:
             raise ValueError(

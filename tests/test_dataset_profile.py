@@ -647,6 +647,20 @@ def test_repeated_descriptors_decode_once_but_count_every_occurrence(tmp_path, m
         return image
 
     monkeypatch.setattr(multimodal, "_decode_image_bytes", count_successful_decode)
+    image_paths = {
+        (entrypoint.parent / "dataset" / "a.png").resolve(),
+        (entrypoint.parent / "dataset" / "b.png").resolve(),
+    }
+    image_reads = []
+    real_read_bytes = Path.read_bytes
+
+    def count_image_read(path):
+        resolved = path.resolve()
+        if resolved in image_paths:
+            image_reads.append(resolved)
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", count_image_read)
 
     spec = replace(
         _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B"),
@@ -660,6 +674,7 @@ def test_repeated_descriptors_decode_once_but_count_every_occurrence(tmp_path, m
     )
 
     assert successful_decodes == [(56, 56), (300, 200)]
+    assert sorted(path.name for path in image_reads) == ["a.png", "b.png"]
     assert profile.retained_examples == 3
     # 64 + 2*64 + 64 + 70 image pads, plus the fixed text ids for three rows.
     assert profile.real_tokens_per_epoch == 356
