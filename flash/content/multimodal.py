@@ -7,7 +7,7 @@ import binascii
 import io
 import json
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 MAX_IMAGES_PER_EXAMPLE = 8
@@ -39,6 +39,12 @@ class ImageDescriptorMetadata:
     decoded_rgb_bytes: int
     width: int
     height: int
+
+
+@dataclass
+class ImageProfileValidationState:
+    descriptor_metadata: dict[str, ImageDescriptorMetadata] = field(default_factory=dict)
+    decoded_work_bytes: int = 0
 
 
 def _is_pil_image(value: object) -> bool:
@@ -582,26 +588,32 @@ def _decode_image_bytes(data: bytes):
 def image_descriptor_metadata(
     descriptors: list[str],
     package_root: str | Path | None,
-    validation_cache: dict[str, ImageDescriptorMetadata] | None = None,
+    validation_state: ImageProfileValidationState,
+    *,
+    profile_decoded_work_limit: int,
 ) -> list[ImageDescriptorMetadata]:
-    """return fully validated dimensions while counting every descriptor occurrence."""
+    """return fully validated dimensions while bounding unique profile decode work."""
     if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
         raise ValueError(
             f"example contains {len(descriptors)} images, exceeding the {MAX_IMAGES_PER_EXAMPLE}-image limit"
         )
-    cache = validation_cache if validation_cache is not None else {}
     pending: dict[str, tuple[bytes, ImageDescriptorMetadata]] = {}
+    metadata = []
     source_bytes = 0
     decoded_bytes = 0
+    new_decoded_work = 0
     for descriptor in descriptors:
-        item = cache.get(descriptor)
+        item = validation_state.descriptor_metadata.get(descriptor)
         if item is None:
             prepared = pending.get(descriptor)
             if prepared is None:
                 data = _read_descriptor_source(descriptor, package_root)
-                prepared = data, _inspect_image_metadata(data)
-                pending[descriptor] = prepared
-            _, item = prepared
+                item = _inspect_image_metadata(data)
+                pending[descriptor] = data, item
+                new_decoded_work += item.decoded_rgb_bytes
+            else:
+                item = prepared[1]
+        metadata.append(item)
         source_bytes += item.source_bytes
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(
@@ -613,11 +625,20 @@ def image_descriptor_metadata(
                 f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
             )
 
-    for descriptor, (data, item) in pending.items():
+    prospective_decoded_work = validation_state.decoded_work_bytes + new_decoded_work
+    if prospective_decoded_work > profile_decoded_work_limit:
+        raise ValueError(
+            f"profile decoded image work exceeds the {profile_decoded_work_limit}-byte limit"
+        )
+
+    for data, _item in pending.values():
         image = _decode_image_bytes(data)
         image.close()
-        cache[descriptor] = item
-    return [cache[descriptor] for descriptor in descriptors]
+    validation_state.descriptor_metadata.update(
+        {descriptor: item for descriptor, (_data, item) in pending.items()}
+    )
+    validation_state.decoded_work_bytes = prospective_decoded_work
+    return metadata
 
 
 def decode_image_descriptors(

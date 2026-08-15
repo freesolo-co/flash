@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from flash.content.multimodal import normalize_image_source
+from flash.content.multimodal import ImageProfileValidationState, normalize_image_source
 from flash.engine.profiling.image_tokens import geometry_from_preprocessor_config
 from flash.engine.profiling.sft_image_rows import (
     estimate_sft_image_row,
@@ -72,7 +72,7 @@ def test_estimator_matches_the_processor_at_the_production_seam(image_stack, siz
         completion,
         descriptors,
         geometry=geometry,
-        validation_cache={},
+        validation_state=ImageProfileValidationState(),
         **common,
     )
     processed = process_sft_image_row(

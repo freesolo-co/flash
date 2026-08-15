@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.content.multimodal import ImageProfileValidationState
 from flash.engine.profiling.image_tokens import (
     ImageGeometry,
     ImageGeometryUnavailable,
@@ -369,12 +370,14 @@ class TestDescriptorPadTokens:
             normalize_image_source(_png_bytes(640, 480), None),
             normalize_image_source(_png_bytes(56, 56), None),
         ]
-        assert descriptor_pad_tokens(descriptors, None, QWEN_GEOMETRY) == [300, 64]
+        assert descriptor_pad_tokens(
+            descriptors, None, QWEN_GEOMETRY, ImageProfileValidationState()
+        ) == [300, 64]
 
     def test_rejects_a_descriptor_that_is_not_an_image(self):
         descriptor = json.dumps({"kind": "bytes", "value": "bm90YW5pbWFnZQ=="})
         with pytest.raises(ValueError, match="not a valid image"):
-            descriptor_pad_tokens([descriptor], None, QWEN_GEOMETRY)
+            descriptor_pad_tokens([descriptor], None, QWEN_GEOMETRY, ImageProfileValidationState())
 
     def test_rejects_a_truncated_payload_that_still_has_valid_dimensions(self):
         image_module = pytest.importorskip("PIL.Image")
@@ -384,7 +387,7 @@ class TestDescriptorPadTokens:
         descriptor = json.dumps({"kind": "bytes", "value": base64.b64encode(data).decode("ascii")})
 
         with pytest.raises(ValueError, match="not a valid image"):
-            descriptor_pad_tokens([descriptor], None, QWEN_GEOMETRY)
+            descriptor_pad_tokens([descriptor], None, QWEN_GEOMETRY, ImageProfileValidationState())
 
     def test_rejects_aggregate_decoded_bytes_before_full_decode(self, monkeypatch):
         from flash.content import multimodal
@@ -399,4 +402,59 @@ class TestDescriptorPadTokens:
         )
 
         with pytest.raises(ValueError, match="decoded images"):
-            descriptor_pad_tokens(descriptors, None, QWEN_GEOMETRY)
+            descriptor_pad_tokens(descriptors, None, QWEN_GEOMETRY, ImageProfileValidationState())
+
+    def test_source_limit_stops_before_reading_the_next_distinct_descriptor(self, monkeypatch):
+        from flash.content import multimodal
+
+        data = _png_bytes(10, 10)
+        first = multimodal.normalize_image_source(data, None)
+        second = multimodal.normalize_image_source(_png_bytes(11, 10), None)
+        descriptors = [first, first, second]
+        reads = []
+        real_read = multimodal._read_descriptor_source
+
+        def record_read(descriptor, package_root):
+            reads.append(descriptor)
+            return real_read(descriptor, package_root)
+
+        monkeypatch.setattr(multimodal, "MAX_TOTAL_IMAGE_SOURCE_BYTES", len(data) * 2 - 1)
+        monkeypatch.setattr(multimodal, "_read_descriptor_source", record_read)
+        monkeypatch.setattr(
+            multimodal,
+            "_decode_image_bytes",
+            lambda _data: (_ for _ in ()).throw(AssertionError("full decode reached")),
+        )
+
+        with pytest.raises(ValueError, match="image sources"):
+            descriptor_pad_tokens(descriptors, None, QWEN_GEOMETRY, ImageProfileValidationState())
+
+        assert reads == [first]
+
+    def test_failed_row_commits_no_partial_profile_cache_accounting(self, monkeypatch):
+        from flash.content import multimodal
+
+        valid = multimodal.normalize_image_source(_png_bytes(10, 10), None)
+        corrupt_data = _truncated_bmp_bytes(64, 64)
+        corrupt = json.dumps(
+            {"kind": "bytes", "value": base64.b64encode(corrupt_data).decode("ascii")}
+        )
+        successful_decodes = []
+        real_decode = multimodal._decode_image_bytes
+
+        def count_successful_decode(data):
+            image = real_decode(data)
+            successful_decodes.append(image.size)
+            return image
+
+        monkeypatch.setattr(multimodal, "_decode_image_bytes", count_successful_decode)
+        state = ImageProfileValidationState()
+
+        with pytest.raises(ValueError, match="not a valid image"):
+            descriptor_pad_tokens([valid, corrupt], None, QWEN_GEOMETRY, state)
+
+        assert state.descriptor_metadata == {}
+        assert state.decoded_work_bytes == 0
+        assert descriptor_pad_tokens([valid], None, QWEN_GEOMETRY, state) == [64]
+        assert successful_decodes == [(10, 10), (10, 10)]
+        assert state.decoded_work_bytes == 300

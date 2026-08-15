@@ -14,7 +14,12 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from flash.content.multimodal import ImageDescriptorMetadata, image_descriptor_metadata
+from flash.content.multimodal import (
+    MAX_IMAGES_PER_EXAMPLE,
+    MAX_TOTAL_DECODED_BYTES,
+    ImageProfileValidationState,
+    image_descriptor_metadata,
+)
 
 # qwen VL publishes its pixel budget under `size`, older revisions under min_pixels/max_pixels.
 # these defaults are the transformers fallbacks, used only when the config declares neither.
@@ -22,6 +27,8 @@ _DEFAULT_MIN_PIXELS = 56 * 56
 _DEFAULT_MAX_PIXELS = 14 * 14 * 4 * 1280
 # the same bound transformers enforces: beyond it smart_resize cannot hold the aspect ratio.
 _MAX_ASPECT_RATIO = 200
+# profile-wide unique full-decode work; per-row decoded bytes keep their separate bound.
+MAX_PROFILE_DECODED_WORK_BYTES = MAX_TOTAL_DECODED_BYTES * MAX_IMAGES_PER_EXAMPLE
 
 
 class ImageGeometryUnavailable(ValueError):
@@ -166,10 +173,15 @@ def descriptor_pad_tokens(
     descriptors: list[str],
     package_root: str | Path | None,
     geometry: ImageGeometry,
-    validation_cache: dict[str, ImageDescriptorMetadata] | None = None,
+    validation_state: ImageProfileValidationState,
 ) -> list[int]:
     """return each descriptor occurrence's validated pad-token run length."""
-    metadata = image_descriptor_metadata(descriptors, package_root, validation_cache)
+    metadata = image_descriptor_metadata(
+        descriptors,
+        package_root,
+        validation_state,
+        profile_decoded_work_limit=MAX_PROFILE_DECODED_WORK_BYTES,
+    )
     return [image_pad_tokens(item.width, item.height, geometry) for item in metadata]
 
 

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from flash.content.multimodal import ImageDescriptorMetadata
+from flash.content.multimodal import ImageProfileValidationState
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
 from flash.engine.profiling.sft_image_rows import (
@@ -345,7 +345,7 @@ def _tokenize_prompt_rows(
     tokenizer,
     processor,
     image_geometry,
-    validation_cache: dict[str, ImageDescriptorMetadata],
+    validation_state: ImageProfileValidationState,
     max_length: int,
     image_dir: str | None,
     normalize_prompt_images: Callable,
@@ -402,7 +402,7 @@ def _tokenize_prompt_rows(
                         normalized.descriptors,
                         package_root=package_root,
                         geometry=image_geometry,
-                        validation_cache=validation_cache,
+                        validation_state=validation_state,
                         max_length=max_length,
                         thinking=bool(spec.thinking),
                     )
@@ -778,7 +778,7 @@ def prepare_sft_workload(
         completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
         prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
     package_root = getattr(env, "package_root", None)
-    validation_cache: dict[str, ImageDescriptorMetadata] = {}
+    validation_state = ImageProfileValidationState()
     multimodal = any(
         record_has_images(example, prompt_messages)
         for example, prompt_messages, _completion, _used_fallback in prompt_rows
@@ -798,7 +798,7 @@ def prepare_sft_workload(
         tokenizer=tokenizer,
         processor=processor,
         image_geometry=image_geometry,
-        validation_cache=validation_cache,
+        validation_state=validation_state,
         max_length=max_length,
         image_dir=image_dir,
         normalize_prompt_images=normalize_prompt_images,

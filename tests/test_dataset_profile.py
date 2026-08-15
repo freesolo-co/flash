@@ -665,6 +665,60 @@ def test_repeated_descriptors_decode_once_but_count_every_occurrence(tmp_path, m
     assert profile.real_tokens_per_epoch == 356
 
 
+def test_profile_rejects_cumulative_unique_decoded_work_before_crossing_decode(
+    tmp_path, monkeypatch
+) -> None:
+    from flash.content import multimodal
+    from flash.engine.profiling import image_tokens
+
+    image_module = pytest.importorskip("PIL.Image")
+    rows = [
+        {"input": "first", "output": "answer", "image": "dataset/a.png"},
+        {"input": "second", "output": "answer", "image": "dataset/b.png"},
+    ]
+    entrypoint = _package(
+        tmp_path / "images",
+        {"dataset/train.jsonl": "".join(json.dumps(row) + "\n" for row in rows)},
+    )
+    image_module.new("RGB", (56, 56), (200, 10, 10)).save(
+        entrypoint.parent / "dataset" / "a.png", format="PNG"
+    )
+    image_module.new("RGB", (300, 200), (10, 200, 10)).save(
+        entrypoint.parent / "dataset" / "b.png", format="PNG"
+    )
+    monkeypatch.setattr(
+        image_tokens,
+        "load_image_geometry",
+        lambda *_args, **_kwargs: ImageGeometry(
+            patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
+        ),
+    )
+    monkeypatch.setattr(image_tokens, "MAX_PROFILE_DECODED_WORK_BYTES", 56 * 56 * 3)
+    successful_decodes = []
+    real_decode = multimodal._decode_image_bytes
+
+    def count_successful_decode(data):
+        image = real_decode(data)
+        successful_decodes.append(image.size)
+        return image
+
+    monkeypatch.setattr(multimodal, "_decode_image_bytes", count_successful_decode)
+    spec = replace(
+        _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B"),
+        train=TrainSpec(epochs=2, batch_size=2, max_context_tokens=4096),
+    )
+
+    with pytest.raises(ValueError, match="profile decoded image work"):
+        profile_packaged_sft_dataset(
+            spec,
+            producer_version="1.2.3",
+            tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
+            packing_support=lambda _model, _revision: ("gdn-hybrid", True),
+        )
+
+    assert successful_decodes == [(56, 56)]
+
+
 def test_an_unreadable_image_is_a_packaging_error_not_a_crash(tmp_path, monkeypatch) -> None:
     entrypoint = _package(
         tmp_path,

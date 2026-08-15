@@ -7,7 +7,7 @@ from pathlib import Path
 
 from flash.content.multimodal import (
     IMAGE_PAD_TOKEN,
-    ImageDescriptorMetadata,
+    ImageProfileValidationState,
     decode_image_descriptors,
 )
 from flash.engine.profiling.image_tokens import (
@@ -75,7 +75,7 @@ def estimate_sft_image_row(
     *,
     package_root: str | Path | None,
     geometry: ImageGeometry,
-    validation_cache: dict[str, ImageDescriptorMetadata],
+    validation_state: ImageProfileValidationState,
     max_length: int,
     thinking: bool,
 ) -> tuple[list[int], list[int], bytes, int]:
@@ -90,7 +90,7 @@ def estimate_sft_image_row(
         descriptors,
         package_root,
         geometry,
-        validation_cache,
+        validation_state,
     )
 
     def token_ids(messages: list[dict], *, add_generation_prompt: bool) -> list[int]:
