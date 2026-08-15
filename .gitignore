@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
-.venv/
+# no trailing slash: a checkout may point `.venv` at a venv stored elsewhere, and a `.venv/` rule
+# matches only a directory, so the symlink itself stays trackable and `git add -A` commits it.
+# committing it breaks CI on the next run, where `uv sync` aborts on an existing `.venv` path.
+.venv
 venv/
 *.egg-info/
 dist/
