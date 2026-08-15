@@ -1714,7 +1714,8 @@ def test_shipped_upload_loop_decides_exactly_like_the_canonical_one(tmp_path):
             "stop_upload": stop,
             "_upload_console": upload,
         }
-        exec(textwrap.dedent(loop_src), namespace)  # noqa: S102 - the shipped source is the subject
+        # exec is the point: this is the same source text the RunPod worker executes.
+        exec(textwrap.dedent(loop_src), namespace)
         namespace["_upload_loop"]()
 
     def _canonical(stop, upload, path):
