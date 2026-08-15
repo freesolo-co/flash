@@ -242,6 +242,187 @@ except Exception:
 """
 
 
+FLASH_FLASH_QLA_MARKER = "[flash-verl] flashqla gdn backend active"
+
+
+# Why the fragment below binds the kernel directly, on sm90 only, and never fails the run.
+#
+# MEASURED, on a real H200 (Qwen3.5-4B, seq 4096, 24 GDN layers), through THIS fragment as rendered
+# and wrapped by the shipped code path: 1.065x end-to-end training step, null-corrected against an
+# A/A null of 0.9914, 22/24 paired wins. both kernels timed in ONE process, ABBA-interleaved per
+# step and both pre-warmed, because two identical control PROCESSES differ by more than the effect.
+# a standalone kernel harness on the same shape independently measured 1.055x, with forward and all
+# five gradients matching fla's own kernel to 8e-3 at identical peak memory.
+#
+# sm90 ONLY, and that is a correctness floor rather than a preference. flashqla is tilelang-based
+# and on sm100 it computes WRONG gradients at the production call shapes: measured dq 1.006,
+# dk 0.942, dg 0.997 relative error on a B200, with the training loss diverging to 14.91 against
+# the control's 13.96 from identical weights -- while REPORTING a 1.047x speedup with a clean null.
+# that is the same failure class as the tilelang backward this worker already opts out of
+# (`perf._force_fla_triton_gdn_on_sm100`), and it caused the B200 35B-A3B SFT incident. note that
+# `FLA_TILELANG=0` does NOT cover this: flashqla is a separate registry backend keyed on
+# `FLA_FLASH_QLA`, so the existing sm100 guard would leave it enabled.
+#
+# BINDING, rather than setting the env var, because the env var provably does nothing: at import
+# transformers captures `chunk_gated_delta_rule` into a module global and each GDN layer copies that
+# object onto `self` in `__init__`, so the layer holds a bare `@torch.compiler.disable` function and
+# fla's `@dispatch` wrapper -- the only thing that reads `FLA_FLASH_QLA` -- is never on the call
+# path. setting the env var alone passes every availability probe and changes nothing, which is
+# exactly how the FA3 wheel stayed dead in this image for its whole life.
+#
+# DEFERRED through a meta_path finder for the same reason as the varlen shim: an import at
+# sitecustomize time initializes cuda against the full device list before ray narrows the actor to
+# its own card.
+#
+# FAIL-OPEN, unlike every other required fragment: the boundary shims fail closed because skipping
+# them corrupts training, while skipping this one only costs ~6% and leaves the child on the kernel
+# it used before. that matters for the deploy window -- `worker_image_for_gpu` returns a MUTABLE tag
+# whose image presets FLASH_VERL_PYTHON, so `resolve_verl_python` returns early and never installs
+# the wheel; until the image is rebuilt, every GDN child takes the unavailable path.
+def render_flash_qla_shim(model_type: str) -> str:
+    """child-side sitecustomize fragment routing GDN through fla's flashqla backend on sm90.
+
+    takes the arch the gate already verified, exactly like ``render_gdn_varlen_shim``: `qwen3_5`
+    and `qwen3_5_moe` are different modules, and a fragment that watched BOTH would have to decide
+    when to stop watching. one target makes "patch it, then step off meta_path" unambiguous.
+    """
+    return f'''
+# --- flash: route gdn through the flashqla backend on sm90 (child_io.render_flash_qla_shim) ---
+import sys as _flash_qla_sys
+
+_FLASH_QLA_TARGET = "transformers.models.{model_type}.modeling_{model_type}"
+
+
+def _flash_qla_supported():
+    """sm90 only. anything else keeps the kernel fla would have chosen on its own."""
+    import torch as _flash_qla_torch
+
+    if not _flash_qla_torch.cuda.is_available():
+        return False
+    return _flash_qla_torch.cuda.get_device_capability()[0] == 9
+
+
+def _flash_qla_impl():
+    """the flashqla backend's own chunk_gated_delta_rule, or None when unavailable.
+
+    resolved through fla's registry rather than imported by path so a pin bump that moves the
+    module cannot silently bind something else.
+
+    every failure is a None, never an exception. this is called from an import LOADER, so anything
+    raised here propagates out of the child's `import transformers...` and kills the run. an fla
+    older than 0.5.2 has no ``backends`` subpackage at all and raises ModuleNotFoundError on the
+    line below -- which is precisely the state of a worker whose image has not been rebuilt yet.
+    """
+    try:
+        from fla.ops.gated_delta_rule.backends import gdr_registry as _flash_qla_registry
+
+        for backend in _flash_qla_registry._get_sorted_backends():
+            if getattr(backend, "backend_type", "") != "flash_qla":
+                continue
+            if not backend.is_available():
+                return None
+            return getattr(backend, "chunk_gated_delta_rule", None)
+    except Exception:
+        return None
+    return None
+
+
+def _flash_qla_patch(module):
+    if not _flash_qla_supported():
+        return
+    impl = _flash_qla_impl()
+    if impl is None:
+        # NOT fatal, and deliberately so. this is a pure speed swap: without it the child trains on
+        # fla's own kernel, which is exactly what every run before this fragment did. the boundary
+        # shims fail closed because skipping them CORRUPTS training; skipping this one only costs
+        # ~6%.
+        #
+        # and the failure is expected in production for a window: the worker image is a mutable tag
+        # (worker_image_for_gpu -> flash-worker:cu128-smXX) that presets FLASH_VERL_PYTHON, so
+        # resolve_verl_python returns that interpreter and never runs the venv provisioning that
+        # installs FLASH_QLA_REQUIREMENT. until the image carrying the wheel is built and pushed,
+        # every GDN child would hit this line -- hard-exiting here would take down all GDN SFT.
+        print(
+            "[flash-verl] flashqla gdn backend unavailable (flash-qla wheel missing, or "
+            "flash-linear-attention older than the 0.5.2 that carries the dispatch); "
+            "continuing on fla's own kernel",
+            file=_flash_qla_sys.stderr,
+            flush=True,
+        )
+        return
+
+    def _flash_qla_call(*args, **kwargs):
+        # fla's dispatcher passes cu_seqlens_cpu to backends that accept it; flashqla does not.
+        kwargs.pop("cu_seqlens_cpu", None)
+        return impl(*args, **kwargs)
+
+    _flash_qla_call._flash_qla_patched = True
+    # the module global is the only binding that needs rewriting HERE: each GDN layer copies it onto
+    # self in __init__, and this runs from the loader the moment the modeling module finishes
+    # executing -- before any layer exists. patching after a layer was built would miss it.
+    module.chunk_gated_delta_rule = _flash_qla_call
+    print({FLASH_FLASH_QLA_MARKER!r}, module.__name__, flush=True)
+
+
+class _FlashQlaLoader:
+    def __init__(self, inner):
+        self._inner = inner
+
+    def create_module(self, spec):
+        return self._inner.create_module(spec)
+
+    def exec_module(self, module):
+        self._inner.exec_module(module)
+        _flash_qla_uninstall()
+        _flash_qla_patch(module)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _FlashQlaFinder:
+    # delegate only to finders positioned AFTER this one, rather than to "everything that is not
+    # my own class". two fragments can target the SAME modeling module -- the varlen shim is
+    # rendered under the same gate as this one -- and each is rendered independently, so neither
+    # can name the other's class.
+    #
+    # skipping only `isinstance(self)` sends each into the other's find_spec forever
+    # (RecursionError before the model is built, killing every GDN SFT child). skipping ALL flash
+    # finders is worse: the first one resolves the spec, python never consults the second, and that
+    # fragment's patch silently never applies while its marker still records success. slicing past
+    # our own position keeps both wrappers stacked, so both patches land.
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != _FLASH_QLA_TARGET:
+            return None
+        here = [i for i, f in enumerate(_flash_qla_sys.meta_path) if f is self]
+        rest = _flash_qla_sys.meta_path[here[0] + 1 :] if here else _flash_qla_sys.meta_path
+        for finder in rest:
+            find = getattr(finder, "find_spec", None)
+            if find is None:
+                continue
+            spec = find(fullname, path, target)
+            if spec is not None and spec.loader is not None:
+                spec.loader = _FlashQlaLoader(spec.loader)
+                return spec
+        return None
+
+
+def _flash_qla_uninstall():
+    _flash_qla_sys.meta_path[:] = [
+        f for f in _flash_qla_sys.meta_path if not isinstance(f, _FlashQlaFinder)
+    ]
+
+
+# already imported (a parent process may have loaded it): patch now, there is no import left to
+# intercept. otherwise arm the finder and let the child's own import trigger it.
+_flash_qla_loaded = _flash_qla_sys.modules.get(_FLASH_QLA_TARGET)
+if _flash_qla_loaded is not None:
+    _flash_qla_patch(_flash_qla_loaded)
+else:
+    _flash_qla_sys.meta_path.insert(0, _FlashQlaFinder())
+'''
+
+
 FLASH_GDN_VARLEN_MARKER = "[flash-verl] gdn packed-boundary resets active"
 
 FLASH_LORA_ROLLOUT_MARKER = "[flash-verl] lora rollout guard active"
@@ -489,12 +670,20 @@ class _FlashGdnFinder:
 
     delegating to the finders AFTER this one resolves the real spec without importing anything,
     so nothing here touches torch or cuda; only the loader is wrapped.
+
+    delegate to the finders positioned AFTER this one, not to "everything that is not this class":
+    the flashqla fragment arms a finder on the SAME module under the same gate, and each fragment
+    is rendered independently so neither can name the other's class. delegating into it by class
+    recurses until RecursionError; skipping every flash finder instead would let whichever runs
+    first resolve the spec alone, silently dropping the other patch while its marker still records
+    success. slicing past our own position keeps both loaders stacked.
     """
 
     def find_spec(self, fullname, path=None, target=None):
         if fullname != _FLASH_GDN_TARGET:
             return None
-        rest = [f for f in _flash_gdn_sys.meta_path if not isinstance(f, _FlashGdnFinder)]
+        here = [i for i, f in enumerate(_flash_gdn_sys.meta_path) if f is self]
+        rest = _flash_gdn_sys.meta_path[here[0] + 1 :] if here else _flash_gdn_sys.meta_path
         for finder in rest:
             find = getattr(finder, "find_spec", None)
             if find is None:

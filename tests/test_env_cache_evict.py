@@ -16,6 +16,20 @@ from flash.envs import cache_security
 from flash.envs import loader as adapter
 
 
+def _make_private_cache_root(root: Path) -> None:
+    """Create ``root`` and its intermediates 0700, independently of the caller's umask.
+
+    ``root.mkdir(parents=True, mode=0o700)`` applies the mode to the LEAF only -- every intermediate
+    it creates gets ``0o777 & ~umask`` instead. Under CI's umask 022 that is 0755 and the ancestor
+    checks pass; under a developer's umask 002 it is 0775, which is group-writable, so
+    ``_ensure_cache_root`` refuses the root and the test fails on a clean checkout for a reason that
+    has nothing to do with the behaviour under test. Set the mode explicitly on the way down.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    for path in (root, root.parent):
+        path.chmod(0o700)
+
+
 def test_cache_config_ignores_ambient_overrides(tmp_path):
     # the on-disk env cache location and bounds are hardcoded, not env-tunable: ambient
     # FLASH_ENV_CACHE_* vars (a stray shell or CI export) must never change them. the root
@@ -337,7 +351,7 @@ def test_ensure_cache_root_refuses_foreign_owned_ancestor(monkeypatch, tmp_path)
     outer = tmp_path / "outer"
     outer.mkdir()
     root = outer / "flash" / "env-cache"
-    root.mkdir(parents=True, mode=0o700)
+    _make_private_cache_root(root)
     monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
     resolved_outer = outer.resolve()
     real_lstat = os.lstat
@@ -418,7 +432,7 @@ def test_ensure_cache_root_allows_world_writable_ancestor_with_sticky_bit(monkey
     outer.mkdir()
     outer.chmod(0o777 | stat.S_ISVTX)
     root = outer / "flash" / "env-cache"
-    root.mkdir(parents=True, mode=0o700)
+    _make_private_cache_root(root)
     monkeypatch.setattr(adapter, "_CACHE_ROOT", root)
 
     assert adapter._ensure_cache_root() == root
