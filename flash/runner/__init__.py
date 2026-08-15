@@ -290,6 +290,14 @@ class WorkloadProfileUnavailable(ValueError):
     """the sft packaged-dataset estimate failed or cannot be trusted."""
 
 
+class EnvironmentRefNotFound(ValueError):
+    """the environment ref does not exist on GitHub, or the plane's token cannot read it.
+
+    A ValueError so the submit route's existing classifier answers 400: this is a spec the submitter
+    must change, not an outage they can wait out.
+    """
+
+
 class _RunCancelled(RuntimeError):
     """User cancellation observed mid-run; terminal, never retried/overwritten."""
 
@@ -751,9 +759,11 @@ from flash.runner.artifacts import (  # noqa: E402,F401
     _assign_resolved_env_sha,
     _environment_artifact_repo_name,
     _file_digest,
+    _pin_env_sha_with_reason,
     artifact_namespace,
     flash_code_prefix,
     managed_hf_repo_for_environment,
+    preflight_validate_environment_ref,
 )
 from flash.runner.attempts import (  # noqa: E402,F401
     _heartbeat_attempt_is_current,

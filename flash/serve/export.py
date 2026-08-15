@@ -27,6 +27,11 @@ from flash.adapters.artifacts import (
     has_loadable_adapter_weights,
     is_adapter_weight_filename,
 )
+from flash.adapters.lora_rank import (
+    DeclaredLoraRanks,
+    declared_lora_ranks,
+    lora_tensor_rank_disagrees,
+)
 from flash.serve.deploy import ServingError
 
 logger = get_logger(__name__)
@@ -395,6 +400,9 @@ def _normalize_adapter_key_namespace(adapter_dir: Path) -> str:
         raise ValueError("no adapter_model weight file to normalize")
     if paths[0].name.endswith(".safetensors"):
         scans = [_scan_safetensors(path) for path in paths]
+        # before any rewrite: the shapes are what they are, and an adapter whose tensors contradict
+        # its own config is unloadable regardless of which key namespace it ends up in.
+        _verify_export_tensor_ranks(adapter_dir, scans)
     elif any(_bin_may_carry_infixed_keys(path) for path in paths):
         # one shard mentioning the infix commits every shard to a full scan. liveness and
         # post-rename collisions are properties of the union of the shards, so a shard that never
@@ -445,11 +453,78 @@ def _normalize_export_adapter_keys(adapter_dir: Path) -> str:
     """
     try:
         return _normalize_adapter_key_namespace(adapter_dir)
+    except _AdapterRankMismatch:
+        # a self-contradicting adapter, not an unreadable key namespace. reported as itself.
+        raise
     except Exception as exc:
         raise ServingError(
             f"could not normalize exported adapter keys ({exc}); refusing to export weights "
             "vanilla peft would load as a no-op"
         ) from exc
+
+
+class _AdapterRankMismatch(ValueError):
+    """The adapter's tensors contradict its own config, so it is unloadable as published.
+
+    Distinct from the errors `_normalize_export_adapter_keys` wraps: that wrapper reports a key
+    namespace it could not normalize, which is a different defect with a different remedy, and
+    letting this one be reported as that would send the user looking in the wrong place. A
+    ValueError so it reaches the export route as a 404 beside the sibling "no loadable LoRA
+    adapter" refusal, rather than as a 502 that blames the Hub for a bad artifact.
+    """
+
+
+def _declared_export_ranks(adapter_dir: Path) -> DeclaredLoraRanks:
+    """The rank structure ``adapter_config.json`` declares, or an empty one we cannot judge from.
+
+    Empty rather than an error: a config carrying no readable rank is the pre-existing shape of
+    every fixture and of adapters PEFT wrote without one, and export has never required it. The
+    check below exists to catch a config and its tensors DISAGREEING, which needs both halves.
+    """
+    try:
+        config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return DeclaredLoraRanks()
+    return declared_lora_ranks(config) if isinstance(config, dict) else DeclaredLoraRanks()
+
+
+def _verify_export_tensor_ranks(adapter_dir: Path, scans: list[_WeightScan]) -> None:
+    """Refuse an export whose LoRA tensors do not carry the rank its config declares.
+
+    A serving engine sizes its LoRA slots from ``adapter_config.json`` and then binds the tensors,
+    so the two disagreeing is not a cosmetic metadata bug: it is an adapter that cannot be loaded.
+    That is not hypothetical -- a 35B MoE SFT run published `r: 32` beside expert tensors export
+    checked only for presence and key-namespace readability, so it succeeded and printed a Hub URL
+    while deploying the identical artifact failed. Export exiting 0 is what made a broken adapter
+    look like a finished deliverable.
+
+    `lora_tensor_rank_disagrees` resolves the rank PER MODULE the way PEFT does, so a
+    `rank_pattern` override is judged against its own rank rather than a summary of the config.
+
+    Only safetensors headers are read, because they carry shapes as metadata and are already parsed
+    here. A `.bin` would have to be loaded through torch, which the control plane does not install,
+    and paying that cost is not warranted for a representation the trainer no longer writes.
+    """
+    declared = _declared_export_ranks(adapter_dir)
+    if not declared:
+        return
+    mismatched = [
+        f"{key} has shape {descriptor.get('shape')}"
+        for scan in scans
+        for key, descriptor in (scan.header or {}).items()
+        if key != "__metadata__"
+        and isinstance(descriptor, dict)
+        and lora_tensor_rank_disagrees(key, descriptor.get("shape"), declared)
+    ]
+    if not mismatched:
+        return
+    shown = ", ".join(sorted(mismatched)[:3])
+    raise _AdapterRankMismatch(
+        f"adapter_config.json declares r={declared.default} but {len(mismatched)} LoRA tensor(s) "
+        f"do not carry the rank configured for their module (e.g. {shown}); a serving engine sizes "
+        "its LoRA slots from the config, so this adapter cannot be loaded and exporting it would "
+        "publish a broken artifact"
+    )
 
 
 def _rewrite_adapter_config_base_model(

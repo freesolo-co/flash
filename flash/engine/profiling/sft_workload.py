@@ -15,8 +15,17 @@ from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
 from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
+    horizon_row_count,
+    marked_reasoning_end,
+    reasoned_assistant_turns,
+    reasoning_marker_prefix,
+    reasoning_markers,
+    reasoning_warning_rows,
+    rendered_reasoning_loss_warning,
     sft_sample_policy,
+    strip_reasoning_markers,
     unpacked_batch_warning,
+    with_marked_reasoning,
 )
 from flash.engine.worker.entry.sft import (
     _pretokenize_completion_only,
@@ -41,6 +50,9 @@ class PreparedSftWorkload:
     sampled_texts: list[str]
     multiturn_targets: int
     coerced_singleturn_targets: int
+    authored_reasoning_turns: int
+    rendered_reasoning_spans: int
+    truncated_reasoning_spans: int
 
 
 def _serialize_multimodal_inputs(values: dict) -> bytes:
@@ -257,6 +269,7 @@ class _TokenizedSftRows:
     sampled_texts: list[str]
     multiturn_targets: int
     coerced_singleturn_targets: int
+    reasoning_by_index: dict[int, _RowReasoning]
     dropped: int
 
 
@@ -264,7 +277,14 @@ class _TokenizedSftRows:
 class _RetainedSftRows:
     rows: list[dict[str, Any]]
     untruncated_lengths: list[int]
+    authored_reasoning_turns: int
+    rendered_reasoning_spans: int
+    truncated_reasoning_spans: int
     dropped: int
+    # kept PER ROW, in the retained order, so the warning can be bounded to the rows the optimizer
+    # actually consumes. the totals above describe the whole retained dataset, which is what the
+    # profile records; a run stopped early by max_steps trains on a PREFIX of these rows.
+    row_reasoning: list[_RowReasoning]
 
 
 @dataclass(frozen=True)
@@ -294,6 +314,78 @@ def _sft_completion_with_provenance(env, example: dict) -> tuple[list[dict], boo
     return env.sft_completion(example), False
 
 
+def _encoded_length(tokenizer, text: str) -> int:
+    """Token count of ``text``, for either the batched or unbatched ``input_ids`` shape.
+
+    A tokenizer handed a single string may answer with one id list or with a batch holding one
+    row. Reading ``len()`` off the batch would count ROWS -- always 1 -- and silently declare every
+    span to be within the cap.
+    """
+    ids = tokenizer(text)["input_ids"]
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    return len(ids)
+
+
+@dataclass(frozen=True)
+class _RowReasoning:
+    """One row's reasoning accounting, with the two causes of loss kept apart.
+
+    They have opposite remedies: reasoning the TEMPLATE dropped is fixed by splitting a K-turn
+    transcript into K single-turn rows, while reasoning the CAP cut is fixed by raising
+    ``max_context_tokens``. Folding both into one survivor count makes the warning prescribe
+    restructuring for a dataset whose only problem is that the row is too long.
+    """
+
+    authored_turns: int
+    rendered_spans: int
+    truncated_spans: int
+
+
+def _row_reasoning(
+    prompt_messages: list[dict],
+    completion_messages: list[dict],
+    *,
+    render: Callable[[list[dict]], str],
+    tokenizer,
+    max_length: int,
+) -> _RowReasoning:
+    """One row's authored reasoning, and how much of it reaches the loss.
+
+    The row is rendered once with each reasoning-authoring turn's reasoning marked. A turn survives
+    exactly when its marker reaches the render: a marker rides only inside text the template chose
+    to keep as THIS turn's reasoning, so a ``<think>`` an answer merely quotes carries none and a
+    span in a system or user message -- never supervised, since the split is assistant-only -- cannot
+    be credited either. Counting rendered tags instead gets both wrong, and scores the total-loss
+    case as one survivor because the template injects an empty block on trailing assistant turns.
+
+    A survivor also has to fit inside ``max_length``: the cap slices the token row, so a block past
+    it never reaches the loss. Truncation is judged per turn rather than per row, because the cap
+    usually cuts the answer tail while leaving an earlier reasoning block whole.
+
+    Markers are stripped before measuring, so the length charged against the cap is the real render's
+    rather than one inflated by the measurement's own bytes.
+    """
+    authored = reasoned_assistant_turns(completion_messages)
+    if not authored:
+        # nothing authored means nothing to lose, and the marked render would equal the full one.
+        # skipped rather than rendered so a dataset with no reasoning pays nothing for this check.
+        return _RowReasoning(0, 0, 0)
+    prefix = reasoning_marker_prefix(render([*prompt_messages, *completion_messages]))
+    marked = render([*prompt_messages, *with_marked_reasoning(completion_messages, prefix)])
+    rendered = 0
+    truncated = 0
+    for marker in reasoning_markers(completion_messages, prefix):
+        end = marked_reasoning_end(marked, marker)
+        if end is None:
+            continue
+        rendered += 1
+        through = strip_reasoning_markers(marked[:end], prefix)
+        if _encoded_length(tokenizer, through) > max_length:
+            truncated += 1
+    return _RowReasoning(authored, rendered, truncated)
+
+
 def _tokenize_prompt_rows(
     spec,
     prompt_rows: list[tuple[Any, list[dict], list[dict], bool]],
@@ -317,6 +409,20 @@ def _tokenize_prompt_rows(
     sampled_texts: list[str] = []
     multiturn_targets = 0
     coerced_singleturn_targets = 0
+    # kept per row rather than summed here, for the same reason as `untruncated_by_index`: rows that
+    # lose their whole completion to the cap are dropped below, and folding their reasoning into a
+    # running total would report loss from rows the run never trains on against a retained-row
+    # denominator. summed after filtering instead.
+    reasoning_by_index: dict[int, _RowReasoning] = {}
+
+    def render_transcript(messages: list[dict]) -> str:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=spec.thinking,
+        )
+
     for row_index, (
         example,
         prompt_messages,
@@ -358,21 +464,23 @@ def _tokenize_prompt_rows(
                 ),
                 "multimodal_inputs": multimodal_inputs,
             }
-            sampled_texts.append(
-                tokenizer.apply_chat_template(
-                    [*normalized.messages, *completion_messages],
-                    tokenize=False,
-                    add_generation_prompt=False,
-                    enable_thinking=spec.thinking,
-                )
+            text = render_transcript([*normalized.messages, *completion_messages])
+            sampled_texts.append(text)
+            # training truncates the PROCESSOR's ids, which expand each image into visual tokens the
+            # text render never contains, so measuring a span against the raw cap would call a block
+            # retained that the visual tokens had already pushed past it. every image is in the
+            # prompt (`_reject_image_completion` above), so the expansion is a constant shift on
+            # every completion position: charging it to the budget puts the two back in scale.
+            visual_inflation = max(0, untruncated_length - _encoded_length(tokenizer, text))
+            reasoning_by_index[row_index] = _row_reasoning(
+                normalized.messages,
+                completion_messages,
+                render=render_transcript,
+                tokenizer=tokenizer,
+                max_length=max_length - visual_inflation,
             )
         else:
-            text = tokenizer.apply_chat_template(
-                [*prompt_messages, *completion_messages],
-                tokenize=False,
-                add_generation_prompt=False,
-                enable_thinking=spec.thinking,
-            )
+            text = render_transcript([*prompt_messages, *completion_messages])
             prompt_text = tokenizer.apply_chat_template(
                 prompt_messages,
                 tokenize=False,
@@ -380,6 +488,13 @@ def _tokenize_prompt_rows(
                 enable_thinking=spec.thinking,
             )
             sampled_texts.append(text)
+            reasoning_by_index[row_index] = _row_reasoning(
+                prompt_messages,
+                completion_messages,
+                render=render_transcript,
+                tokenizer=tokenizer,
+                max_length=max_length,
+            )
             text_specs.append({"text": text, "prompt_text": prompt_text, "row_index": row_index})
 
     dropped = 0
@@ -405,6 +520,7 @@ def _tokenize_prompt_rows(
         sampled_texts=sampled_texts,
         multiturn_targets=multiturn_targets,
         coerced_singleturn_targets=coerced_singleturn_targets,
+        reasoning_by_index=reasoning_by_index,
         dropped=dropped,
     )
 
@@ -414,6 +530,10 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
     special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
     rows = []
     retained_untruncated: list[int] = []
+    authored_reasoning = 0
+    rendered_reasoning = 0
+    truncated_reasoning = 0
+    per_row: list[_RowReasoning] = []
     dropped = tokenized.dropped
     for row_index in sorted(tokenized.row_by_index):
         row = tokenized.row_by_index[row_index]
@@ -422,6 +542,17 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
             # appended in lockstep with the row it measures, so the truncation counts below describe
             # the rows that are actually trained on rather than the ones that were dropped.
             retained_untruncated.append(tokenized.untruncated_by_index[row_index])
+            # summed here for the same reason, so the reasoning-loss warning describes the rows the
+            # run trains on. a dropped row contributes neither its authored reasoning nor its
+            # survivors, which would otherwise be reported against a retained-row denominator.
+            row_reasoning = tokenized.reasoning_by_index.get(row_index)
+            if row_reasoning is not None:
+                authored_reasoning += row_reasoning.authored_turns
+                rendered_reasoning += row_reasoning.rendered_spans
+                truncated_reasoning += row_reasoning.truncated_spans
+            # appended for EVERY retained row, including one that authored nothing, so this list
+            # stays index-aligned with ``rows``. a prefix of it is then the same prefix of rows.
+            per_row.append(row_reasoning if row_reasoning is not None else _RowReasoning(0, 0, 0))
         else:
             dropped += 1
     if not rows:
@@ -432,7 +563,11 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
     return _RetainedSftRows(
         rows=rows,
         untruncated_lengths=retained_untruncated,
+        authored_reasoning_turns=authored_reasoning,
+        rendered_reasoning_spans=rendered_reasoning,
+        truncated_reasoning_spans=truncated_reasoning,
         dropped=dropped,
+        row_reasoning=per_row,
     )
 
 
@@ -561,7 +696,81 @@ def _build_sft_profile(
         authoritative_steps=horizon.authoritative_steps,
         packing_efficiency=measurements.real_tokens / measurements.padded_compute_tokens,
         sample_policy=sft_sample_policy(max_examples),
+        # bounded to the rows the horizon reaches, not the whole retained dataset. these three
+        # fields exist only to carry the reasoning-loss warning, and the warning is rendered TWICE:
+        # here on the worker's stderr, and again by the CLI off the serialized profile, because
+        # control-plane profiling runs server-side where its stderr never reaches the submitter.
+        # bounding them at the source is what keeps those two renderings from disagreeing.
+        #
+        # `retained_examples` deliberately stays whole-dataset: it sizes the GPU allocation and
+        # carries the profile invariant retained + dropped == selected.
+        **_horizon_reasoning_fields(retained, horizon),
     )
+
+
+def _horizon_reasoning_fields(
+    retained: _RetainedSftRows, horizon: _SftStepHorizon
+) -> dict[str, int]:
+    """The three reasoning counts, plus the row count they were totalled over.
+
+    ``retained.row_reasoning`` is index-aligned with the retained rows, so the horizon's row count
+    is also its prefix length. An empty prefix -- a horizon of zero updates -- totals zero and
+    stays silent, which is correct: a run that performs no update cannot lose reasoning to one.
+
+    The prefix length travels with the counts as ``reasoning_rows``. Both a bounded and an
+    unbounded profile carry the same horizon inputs, so a reader that re-derived this could not
+    tell which it held.
+    """
+    rows = horizon_row_count(
+        len(retained.row_reasoning),
+        examples_per_update=horizon.examples_per_update,
+        updates=horizon.authoritative_steps,
+    )
+    consumed = retained.row_reasoning[:rows]
+    return {
+        "authored_reasoning_turns": sum(row.authored_turns for row in consumed),
+        "rendered_reasoning_spans": sum(row.rendered_spans for row in consumed),
+        "truncated_reasoning_spans": sum(row.truncated_spans for row in consumed),
+        "reasoning_rows": rows,
+    }
+
+
+def _print_workload_warnings(
+    profile: SftWorkloadProfile,
+    retained: _RetainedSftRows,
+    *,
+    batch_size: object,
+) -> None:
+    """Emit the pre-allocation warnings a finished run's metrics would report too late.
+
+    Both run for the control-plane estimate and again on the training worker, so they land in both
+    logs -- before a GPU is paid for, while the config or dataset can still be changed.
+    """
+    # one example per update instead of the authored batch is an optimization-semantics change
+    # whose only other trace is `notes["packing"]` in the finished run's metrics, which is not
+    # visible until after the run is paid for. pass the authored batch_size rather than
+    # `effective_batch`: the helper resolves None to the same recipe default but keeps the value's
+    # source, so an omitted knob is not reported to the user as one they configured.
+    warning = unpacked_batch_warning(
+        packing_mode=profile.packing_mode,
+        architecture_mode=profile.architecture_mode,
+        examples_per_update=profile.examples_per_update,
+        configured_batch_size=batch_size,
+    )
+    if warning:
+        print(f"warning: [train] {warning}", file=sys.stderr)
+    # read straight off the profile, which already carries the horizon-bounded counts. this line is
+    # rendered twice -- here, and again by the CLI off the serialized profile -- and recomputing it
+    # from `retained` would let the worker's stderr and the submitter's warning disagree about the
+    # same run. one source, one answer.
+    reasoning_warning = rendered_reasoning_loss_warning(
+        authored_turns=profile.authored_reasoning_turns,
+        rendered_spans=profile.rendered_reasoning_spans,
+        truncated_spans=profile.truncated_reasoning_spans,
+        rows=reasoning_warning_rows(profile),
+    )
+    if reasoning_warning:
+        print(f"warning: [train] {reasoning_warning}", file=sys.stderr)
 
 
 def prepare_sft_workload(
@@ -676,20 +885,7 @@ def prepare_sft_workload(
         measurements=measurements,
         horizon=horizon,
     )
-    # one example per update instead of the authored batch is an optimization-semantics change
-    # whose only other trace is `notes["packing"]` in the finished run's metrics, which is not
-    # visible until after the run is paid for. this function runs for the control-plane estimate and
-    # again on the training worker, so the warning lands in both logs. pass the authored batch_size
-    # rather than `effective_batch`: the helper resolves None to the same recipe default but keeps the
-    # value's source, so an omitted knob is not reported to the user as one they configured.
-    warning = unpacked_batch_warning(
-        packing_mode=profile.packing_mode,
-        architecture_mode=profile.architecture_mode,
-        examples_per_update=profile.examples_per_update,
-        configured_batch_size=train_spec.batch_size,
-    )
-    if warning:
-        print(f"warning: [train] {warning}", file=sys.stderr)
+    _print_workload_warnings(profile, retained, batch_size=train_spec.batch_size)
     return PreparedSftWorkload(
         rows=retained.rows,
         profile=profile,
@@ -699,4 +895,7 @@ def prepare_sft_workload(
         sampled_texts=tokenized.sampled_texts,
         multiturn_targets=tokenized.multiturn_targets,
         coerced_singleturn_targets=tokenized.coerced_singleturn_targets,
+        authored_reasoning_turns=retained.authored_reasoning_turns,
+        rendered_reasoning_spans=retained.rendered_reasoning_spans,
+        truncated_reasoning_spans=retained.truncated_reasoning_spans,
     )

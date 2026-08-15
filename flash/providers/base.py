@@ -234,6 +234,10 @@ class CapacityLookupError(RuntimeError):
     """
 
 
+class CapacityUnavailableError(CapacityLookupError):
+    """A live provider answered successfully but currently offers no fitting capacity."""
+
+
 class UnreconciledCreateError(RuntimeError):
     """An ambiguous non-idempotent create could not be reconciled.
 
@@ -441,33 +445,19 @@ def _run_cost_key(
         return None
 
 
-# FSDP shards parameters/optimizer across cards but replicates activations and adds collective
-# buffers; a combination only counts as fitting when the combined VRAM clears the need with this
-# margin. conservative on purpose: a too-optimistic shard model OOMs a paid run.
-SHARD_VRAM_EFFICIENCY = 0.85
-# activations/buffers replicate PER CARD regardless of sharding; every card in a combination must
-# individually hold this floor on top of its parameter shard, so tiny cards cannot fake a fit by
-# count alone (e.g. 4 x 12 GB is not 40 GB of usable capacity for a 24 GB-activation job).
-REPLICATED_PER_CARD_GB = 8
-# the public gpu.count maximum is 8, and every managed model's attention-head count is divisible by
-# 8. keep the allocator aligned with that contract so a live 8-card provider SKU is reachable rather
-# than silently clamping the authored ceiling to 4.
-MAX_COMBINATION_CARDS = 8
-
-
-def combined_vram_gb(vram_gb: int, gpu_count: int) -> float:
-    """Return run-usable VRAM for a multi-card shape.
-
-    All fit gates share this model. Return 0.0 when any card cannot hold the replicated floor; card
-    count cannot compensate for that requirement.
-    """
-    if gpu_count <= 1:
-        return float(vram_gb)
-    if vram_gb <= REPLICATED_PER_CARD_GB:
-        return 0.0
-    return gpu_count * (vram_gb - REPLICATED_PER_CARD_GB) * SHARD_VRAM_EFFICIENCY + (
-        REPLICATED_PER_CARD_GB
-    )
+# The FSDP sharding model lives in a sibling module (this file is at its size limit) and is
+# re-exported here so every existing `from flash.providers.base import ...` keeps resolving to the
+# one definition. See `flash/providers/sharding.py` for the measured constants.
+from flash.providers.sharding import (  # noqa: E402,F401
+    MAX_COMBINATION_CARDS,
+    REPLICATED_PER_CARD_GB,
+    SHARD_VRAM_EFFICIENCY,
+    ZERO2_CHARGED_RESIDENCY,
+    ZERO2_WEIGHT_RESIDENCY,
+    combined_vram_gb,
+    zero2_enabled,
+    zero2_replicated_floor_gb,
+)
 
 
 def authored_gpu_ceiling(gpu_type: str, gpu_count: int | None) -> int | None:

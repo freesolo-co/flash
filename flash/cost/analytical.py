@@ -17,7 +17,6 @@ from flash.cost.facts import (
     gpu_vram_gb,
     has_nvlink,
     model_quant,
-    reward_seconds_per_completion,
     teacher_seconds_per_completion,
     teacher_token_cost_usd,
     total_params_b,
@@ -47,9 +46,7 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # small-model overhead that peak-FLOPs scaling misses. this aggregate will drift with hardware,
 # verl, and engine changes.
 #
-# this floor and the deleted per-completion reward wall are coupled: the wall's fictitious 1.0
-# s/completion had been cancelling this missing overhead, so removing it WITHOUT this term scores
-# 49.8x geometric bias. do not drop one without re-fitting the other.
+# grading cost is already inside this fitted step floor and is deliberately not modelled separately.
 STEP_FLOOR_BASE_SECONDS = 62.7
 STEP_FLOOR_SECONDS_PER_COMPLETION = 0.805
 
@@ -158,10 +155,6 @@ MOE_STEP_OVERHEAD_S = 2.0  # routing/dispatch/kernel-launch overhead an MoE pays
 COMPILE_MOE_SFT_S = 35.0
 COMPILE_MOE_ROLLOUT_S = 48.0  # GRPO / OPD (adds vLLM cudagraph capture)
 
-# single-turn grpo scoring is serial under the global env lock in worker/rl_train.py, protecting
-# non-thread-safe scorers. reward latency is therefore fixed wall time, not gpu work. multi-turn
-# concurrency is unknown to this offline quote, so serial scoring is the conservative default.
-
 # cold-start seconds are empirically calibrated from a fresh worker. model load dominates short
 # jobs: MODEL_LOAD_BASE_S covers fixed deserialize/init work; download scales with checkpoint size.
 WORKER_BOOT_S = 120.0  # container pull + start
@@ -210,38 +203,7 @@ def _opd_step_shape(n: RunConfig) -> tuple[int, float]:
     config. completions = batch x group; each is billed over the FULL prompt+completion length
     (not completion-only) since the loss forward runs model(prompt_ids + student_ids)."""
     completions = n.batch_size * n.group_size
-    return completions, completions * _sequence_tokens(n)
-
-
-def _sequence_tokens(n: RunConfig) -> float:
-    """Return measured prompt plus completion tokens, or the context cap.
-
-    ``n.seq_len`` is capacity, not work. Prompt and completion must be measured together to avoid
-    pricing a short completion against a full-context prompt.
-    """
-    if n.measured_completion_tokens is None or n.measured_prompt_tokens is None:
-        return float(n.seq_len)
-    measured = n.measured_prompt_tokens + n.measured_completion_tokens
-    # the ceiling still binds: a measured mean above it would mean the profile and the run
-    # disagree about the engine's context, and the engine wins.
-    return min(float(n.seq_len), measured)
-
-
-def _completion_tokens(n: RunConfig) -> float:
-    """Tokens ONE rollout generates, measured when a profile exists, else the declared cap."""
-    if n.measured_completion_tokens is None:
-        return float(n.completion_len)
-    return min(float(n.completion_len), n.measured_completion_tokens)
-
-
-def _describe_rollout_tokens(n: RunConfig) -> str:
-    """Describe whether rollout length is measured or cap-based.
-
-    The two can differ several-fold, so the note must not present a measured mean as the cap.
-    """
-    if n.measured_completion_tokens is None:
-        return f"{n.completion_len} tok"
-    return f"{_completion_tokens(n):.0f} tok measured (cap {n.completion_len})"
+    return completions, completions * float(n.seq_len)
 
 
 def required_save_overhead_seconds(config: RunConfig) -> float:
@@ -375,8 +337,8 @@ def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int, provider: 
 def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     """Return ``(gpu-bound, gpu-independent)`` seconds for one optimizer step.
 
-    Remote scoring and reward grading stay fixed across cards; hardware ranking shards only the
-    gpu-bound half. ``seconds_per_step`` is their sum.
+    Remote OPD scoring stays fixed across cards; hardware ranking shards only the gpu-bound half.
+    ``seconds_per_step`` is their sum.
     """
     n = config.normalized()
     peak = effective_train_tflops(gpu) * 1e12  # FLOP/s (realized training throughput; see facts)
@@ -425,23 +387,16 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * sft_mfu), overhead
 
-    # GRPO step = rollout (G completions/prompt) + serial reward grading + policy/ref update.
+    # GRPO step = rollout (G completions/prompt) + policy/ref update. grading is represented in
+    # the fitted step floor rather than modelled as a separate wall.
     completions = n.batch_size * n.group_size
-    # measured realized generation when a rollout profile exists, else max_completion_tokens. this
-    # count feeds BOTH terms below, so quoting the cap multiplies its error through the two largest
-    # parts of a grpo step.
-    gen_tokens = completions * _completion_tokens(n)
+    gen_tokens = completions * float(n.completion_len)
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * update_mfu)
-    latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
-    # every completion is scored, one at a time (see the serial-scoring note above).
-    reward_s = completions * latency
-    # old_log_prob, weight sync, and checkpointing are gpu work without a flops term. only the
-    # STEP_FLOOR_SHARDED_FRACTION part shards; grpo/opd callers must use sharded_step_seconds().
+    # old_log_prob, weight sync, checkpointing, and grading are covered by the fitted floor. only
+    # the STEP_FLOOR_SHARDED_FRACTION part shards; callers must use sharded_step_seconds().
     floor_s = step_floor_seconds(gpu, completions)
-    # reward grading runs off-gpu, so like the opd teacher it is fixed wall time no card choice
-    # changes. a grpo step dominated by it is latency-bound, not compute-bound.
-    return gen_s + update_s + floor_s, overhead + reward_s
+    return gen_s + update_s + floor_s, overhead
 
 
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
@@ -822,18 +777,15 @@ def _notes(
         teacher_name = resolve_teacher(n.teacher_model).display_name
         notes.append(
             f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {_describe_rollout_tokens(n)} + {teacher_name} teacher scoring "
+            f"@ {n.completion_len} tok + {teacher_name} teacher scoring "
             f"({tsec:.2f}s/request, {OPD_TEACHER_SCORING_CONCURRENCY} concurrent) + policy "
             "update (no local reference forward)"
         )
     elif n.is_grpo:
         comps = n.batch_size * n.group_size
-        rsec = reward_seconds_per_completion(n.reward_seconds_per_completion)
         notes.append(
             f"GRPO step = vLLM rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {_describe_rollout_tokens(n)} + reward ({rsec:.2f}s/completion"
-            + (f", env {n.environment}" if n.environment else "")
-            + ") + policy+reference update"
+            f"@ {n.completion_len} tok + policy+reference update"
         )
     elif n.train_tokens is not None:
         profile_shape = (
