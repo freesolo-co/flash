@@ -128,11 +128,17 @@ def _rollback_throttle_slot(
             _w._HB_LAST_FORCED_UPLOAD = prev_last_forced
 
 
-def _console_heartbeat_snapshot(payload: dict, payload_committed: bool = True) -> str:
+def _console_heartbeat_snapshot(
+    payload: dict, upload_due: bool = True, payload_committed: bool = True
+) -> str:
     console_payload = dict(payload)
     metrics_last = console_payload.pop("metrics_last", None)
     if isinstance(metrics_last, list):
         console_payload["metrics_last_count"] = len(metrics_last)
+    if upload_due and not payload_committed:
+        console_payload["pending"] = True
+    elif not upload_due:
+        console_payload["throttled"] = True
     if not payload_committed and console_payload.get("sampled_completions"):
         console_payload.pop("sampled_completions", None)
     return json.dumps(console_payload)
@@ -285,7 +291,7 @@ def heartbeat(
                     f"initial heartbeat upload lock remained busy >{lock_timeout}s for {stage}"
                 )
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
-    print("HEARTBEAT", _console_heartbeat_snapshot(payload, payload_committed))
+    print("HEARTBEAT", _console_heartbeat_snapshot(payload, upload_due, payload_committed))
     return payload_committed
 
 

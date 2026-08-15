@@ -183,12 +183,12 @@ def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
 
     The two counts answer different questions and must not be collapsed. The first is the COMMITTED
     count: a heartbeat that reached HF, the only thing the provider's stall clock advances on. The
-    second additionally counts ``pending`` ones -- produced, but whose upload failed. Which one the
-    uploader's wedge timer keys on switches at the first COMMITTED heartbeat. After one, only
-    committed ones may count: the stall clock is anchored to it and already counting down to a
-    teardown, so treating a later ``pending`` line as progress would push the wedge snapshot past
+    second additionally counts ``pending`` and ``throttled`` ones produced only for the console.
+    Which count drives the uploader's wedge timer switches at the first COMMITTED heartbeat. After
+    one, only committed ones may count: the stall clock is anchored to it and already counting down
+    to a teardown, so treating a later uncommitted line as progress would push the wedge snapshot past
     the box's own death. Before one there is no such clock to contradict -- teardown is the fixed
-    setup grace -- and a run whose heartbeat uploads ALL fail emits nothing but ``pending`` lines,
+    setup grace -- and a run before its first upload can emit only uncommitted console lines,
     indistinguishable on the committed count from a worker that never reached the training loop. It
     would never arm, buy no wedge snapshot, and reach only the hourly cadence at 4200s: past the
     3000s grace, with the console covering the hang lost entirely. Bytes cannot tell a
@@ -201,9 +201,9 @@ def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
     never be detected at all. Liveness pings are excluded: EVERY payload carries ``"stage"`` and
     those print every 30s from a daemon, so counting them reads a worker wedged inside a liveness
     block as busy forever -- ``poll`` refuses to advance on them for the same reason, and this must
-    agree or the run dies with no console. ``"pending"`` heartbeats are excluded too: their upload
-    did not land, so the provider's stall clock is still anchored to the older committed one, and
-    counting them would reset this timer against a teardown already counting down. A match spans
+    agree or the run dies with no console. ``pending`` and ``throttled`` heartbeats are excluded too:
+    neither reached HF, so the provider's stall clock is still anchored to the older committed one.
+    Counting them would reset this timer against a teardown already counting down. A match spans
     a WHOLE line and the offset stops at the last newline, not at EOF, so a line split across two
     polls is judged exactly once, on the poll completing it. Both halves must be inert alone or the
     split decides the run: the head carries the prefix but not yet the ``"liveness"`` disqualifying
@@ -220,4 +220,8 @@ def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
         return -1, 0, 0
     cut = buf.rfind(b"\n") + 1
     hb = re.findall(rb'(?m)^HEARTBEAT (?!.*"liveness":).*$', buf[:cut])
-    return offset + cut, sum(b'"pending":' not in b for b in hb), len(hb)
+    return (
+        offset + cut,
+        sum(b'"pending":' not in b and b'"throttled":' not in b for b in hb),
+        len(hb),
+    )

@@ -1188,7 +1188,9 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # the committed count it never arms, buys no wedge snapshot, and the next scheduled upload is
     # an interval out, past the setup teardown. After a commit exists the provider's stall clock is
     # anchored and counting down, so only committed ones may count.
-    assert "staged = sum(b'\"pending\":' not in b for b in beats)" in body
+    assert "b'\"pending\":' not in b and b'\"throttled\":' not in b" in body
+    assert "if staged and not committed and since < due_s:" in body
+    assert f"due_s = {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
     assert "committed = committed or bool(staged)" in body
     assert "progress = staged if committed else len(beats)" in body
     assert "armed = armed or bool(progress)" in body
@@ -1248,61 +1250,151 @@ def _drive_instance_upload_loop(
     return waits, uploads
 
 
-def test_instance_console_upload_loop_polls_faster_than_it_commits(monkeypatch):
-    """A healthy, growing run polls often but still commits only on the hourly boundary.
+def _drive_serverless_upload_loop(statuses: list[str], *, succeed=True) -> list[int]:
+    import ast
+    import contextlib
+    import inspect
+    import json
+    import os
+    import re
+    import textwrap
 
-    The poll cadence must not become the COMMIT cadence: the shared artifact repo budgets 5
-    commits/hour and the heartbeat already spends 4 (see
-    test_live_console_uploads_are_throttled_for_shared_artifact_repos).
-    """
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_loop"
+    )
+    mode = f"test_{os.getpid()}_{time.time_ns()}"
+    console = f"/tmp/console_{mode}.txt"
+    state = {"poll": 0}
+    uploads: list[int] = []
+
+    class _Stop:
+        def wait(self, _seconds: float) -> bool:
+            if state["poll"] >= len(statuses):
+                return True
+            status = statuses[state["poll"]]
+            state["poll"] += 1
+            payload = {"stage": "train", "step": state["poll"]}
+            if status in {"pending", "throttled"}:
+                payload[status] = True
+            line = (
+                f"HEARTBEAT {json.dumps(payload)}\n"
+                if status != "none"
+                else f"worker chatter {state['poll']}\n"
+            )
+            with open(console, "a") as f:
+                f.write(line)
+            return False
+
+    def _upload(_mode: str) -> bool:
+        uploads.append(state["poll"])
+        return succeed(len(uploads)) if callable(succeed) else succeed
+
+    namespace = {
+        "console": console,
+        "mode": mode,
+        "re": re,
+        "stop_upload": _Stop(),
+        "_upload_console": _upload,
+    }
+    try:
+        with open(console, "w"):
+            pass
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+        namespace["_upload_loop"]()
+        return uploads
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(console)
+
+
+def test_instance_and_source_shipped_console_upload_loops_stay_in_parity(monkeypatch):
+    cases = [
+        (["committed"] * 31, True),
+        (["none"] * 6, True),
+        (["committed"] + ["none"] * 6, True),
+        (["throttled"] * 14 + ["none"] * 6, True),
+        (["none"] * 7, lambda attempt: attempt > 1),
+    ]
+    for statuses, succeed in cases:
+        staged = [int(status == "committed") for status in statuses]
+        beats = [int(status != "none") for status in statuses]
+        sizes = [1000 * (n + 1) for n in range(len(statuses))]
+        _waits, instance_uploads = _drive_instance_upload_loop(
+            monkeypatch,
+            sizes,
+            cycles=len(statuses),
+            staged=staged,
+            beats=beats,
+            succeed=succeed,
+        )
+        assert _drive_serverless_upload_loop(statuses, succeed=succeed) == instance_uploads
+
+
+def test_instance_console_upload_loop_promotes_healthy_run_to_hourly(monkeypatch):
+    """a committed heartbeat before 600s removes the routine fallback console write."""
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
 
     poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
     interval_s = _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
-    # run long enough to pass the first commit AND the following hourly one.
-    cycles = int((first_s + interval_s) / poll_s) + 1
-    # console keeps growing every poll: never quiet, so only the elapsed-interval rule can fire.
+    cycles = int(2 * interval_s / poll_s) + 1
     growing = [1000 * (n + 1) for n in range(cycles + 2)]
     waits, uploads = _drive_instance_upload_loop(monkeypatch, growing, cycles=cycles)
 
     assert waits[0] == poll_s
     assert set(waits) == {poll_s}
-    # exactly two commits: the first snapshot and one hourly -- NOT one per poll.
     assert len(uploads) == 2
-    assert uploads[0] * poll_s == first_s
+    assert uploads[0] * poll_s == interval_s
     assert (uploads[1] - uploads[0]) * poll_s == interval_s
 
 
-def test_instance_console_upload_loop_commits_when_a_wedged_run_goes_quiet(monkeypatch):
-    """The wedge case: output stops, and the snapshot must land before the stall teardown.
-
-    A run that hangs at 700s is torn down around 1900s while the next hourly snapshot would not be
-    due until 4200s, so an interval-only loop uploads a console that PREDATES the hang -- losing
-    the last lines, which are the whole diagnostic. Going quiet is what triggers the commit.
-    """
+def test_instance_console_upload_loop_keeps_600s_fallback_without_a_commit(monkeypatch):
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
 
     poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
     first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    # the run must wedge AFTER its first snapshot -- the case the interval rule cannot cover on its
-    # own. a series that wedges BEFORE the first commit proves nothing: the elapsed-interval rule
-    # fires there anyway, so the test would still pass with the quiet trigger deleted.
-    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
-    grow_polls = int(first_s / poll_s) + 1
-    cycles = grow_polls + quiet_polls + 6
-    wedged = [1000 * (n + 1) for n in range(grow_polls)] + [1000 * grow_polls] * (quiet_polls + 8)
-    _waits, uploads = _drive_instance_upload_loop(monkeypatch, wedged, cycles=cycles)
+    cycles = int(first_s / poll_s) + 1
+    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
 
-    # two commits: the first snapshot, then one more once output stopped.
-    assert len(uploads) == 2, "a run that wedges after its first snapshot must commit again"
-    # measured from when OUTPUT STOPPED, which is when the stall classifier starts counting -- not
-    # from run start. the deadline is 1200s of no progress, so the lag is what has to fit inside it.
-    silence_began_s = grow_polls * poll_s
-    assert uploads[1] * poll_s - silence_began_s < 1200.0
-    assert uploads[1] * poll_s < _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
-    # and it must not keep re-uploading identical bytes once the run is silent.
-    assert uploads[1] < cycles
+    _waits, uploads = _drive_instance_upload_loop(
+        monkeypatch, sizes, cycles=cycles, staged=[0] * (cycles + 2), beats=[0] * (cycles + 2)
+    )
+
+    assert uploads == [int(first_s / poll_s)]
+
+
+def test_healthy_first_hour_uses_only_terminal_console_budget(monkeypatch):
+    import flash.engine.worker as worker
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    cycles = int(_instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S / poll_s) - 1
+    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
+    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles)
+
+    terminal_uploads = 1
+    heartbeat_uploads = int(3600.0 / worker._HB_MIN_INTERVAL_S)
+    assert uploads == []
+    assert heartbeat_uploads + terminal_uploads <= 5
+
+
+def test_instance_console_upload_loop_commits_when_a_wedged_run_goes_quiet(monkeypatch):
+    """a first commit promotes the cadence, but its later wedge still buys a timely snapshot."""
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
+    progress_polls = 2
+    cycles = progress_polls + quiet_polls + 4
+    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
+    staged = [1] * progress_polls + [0] * (cycles + 2 - progress_polls)
+    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles, staged=staged)
+
+    assert len(uploads) == 1
+    assert (uploads[0] - progress_polls) * poll_s < 1200.0
+    assert uploads[0] * poll_s < _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
 
 
 def test_instance_console_upload_loop_keeps_a_sparsely_logging_run_in_budget(monkeypatch):
@@ -1700,6 +1792,15 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     # whose heartbeat uploads all fail would never arm and could never buy a wedge snapshot -- the
     # next scheduled one is an interval out, past the setup teardown, so the console is lost.
     assert _instance_bootstrap._console_progress(str(pend), 0)[2] == 2
+
+    # local cadence suppression is uncommitted too, but remains available to arm pre-commit liveness.
+    throttled = tmp_path / "console_throttled.txt"
+    throttled.write_bytes(_hb(step=9, throttled=True) * 2)
+    assert _instance_bootstrap._console_progress(str(throttled), 0)[1:] == (0, 2)
+
+    mixed = tmp_path / "console_mixed.txt"
+    mixed.write_bytes(_hb(step=10) + _hb(step=11, pending=True) + _hb(step=12, throttled=True))
+    assert _instance_bootstrap._console_progress(str(mixed), 0)[1:] == (1, 3)
 
     # a liveness ping arms nothing: it prints from a daemon whether or not the training loop is
     # alive, so unlike a pending heartbeat it is not evidence the run ever reached the loop.

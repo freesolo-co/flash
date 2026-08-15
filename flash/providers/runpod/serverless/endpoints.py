@@ -27,14 +27,12 @@ from flash.providers.runpod.serverless.backoff import _patch_runpod_backoff
 FLASH_SDK_LOCK = threading.Lock()
 
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-# an interval-only uploader can never fire for a wedged run: teardown comes at 1200s (training stall)
-# or 3000s (setup grace), both under the hour. one early snapshot, then the hourly cadence -- one
-# extra commit per RUN, not per hour, so the repo's rate budget is unchanged.
+# no committed heartbeat falls back at 600s; committed progress promotes directly to the hourly
+# cadence, while a wedge snapshot still lands before the 1200s training stall.
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
 # how often the uploader LOOKS at the console, not how often it commits: reading is free against the
 # commit budget, and it is what notices a wedge before the next hourly boundary.
 _CONSOLE_UPLOAD_POLL_S = 120.0
-
 _ENDPOINT_CACHE: dict[str, Any] = {}
 
 
@@ -631,10 +629,8 @@ def _train_body(input_data: dict) -> dict:
             stop_upload = threading.Event()
 
             def _upload_loop() -> None:
-                # literals, not the module-level constants: only this function's SOURCE ships to the
-                # worker, so a name reference is a NameError before training. Mirrors
-                # bootstrap._console_upload_loop, whose docstring has the rules; pinned against
-                # drift by test_first_console_snapshot_precedes_the_stall_teardown.
+                # literals, not module constants: only this function's source ships to the worker.
+                # mirrors bootstrap._console_upload_loop and its first-commit cadence promotion.
                 due_s, since, quiet_polls = 600.0, 0.0, 0
                 uploaded_size, size, quiet_spent, armed, committed = -1, -1, 0, False, False
                 while not stop_upload.wait(120.0):
@@ -651,10 +647,13 @@ def _train_body(input_data: dict) -> dict:
                     buf, size = buf[:cut], at + cut
                     pat = rb'(?m)^HEARTBEAT (?!.*"liveness":).*$'
                     beats = re.findall(pat, buf)
-                    staged = sum(b'"pending":' not in b for b in beats)
+                    staged = sum(b'"pending":' not in b and b'"throttled":' not in b for b in beats)
+                    if staged and not committed and since < due_s:
+                        due_s = 3600.0
                     committed = committed or bool(staged)
                     # a wedge is progress that STOPPED: re-arm on it, spend only on a stall that
-                    # BOUGHT an upload. 2 credits per RUN. `pending` counts until the first commit.
+                    # bought an upload. 2 credits per run. uncommitted beats count before the first
+                    # commit.
                     progress = staged if committed else len(beats)
                     armed = armed or bool(progress)
                     quiet_polls = 0 if progress else quiet_polls + 1

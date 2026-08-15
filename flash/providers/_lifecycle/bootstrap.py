@@ -264,43 +264,22 @@ def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str 
     return hf_upload(payload, tail_path, f"console_{mode}.txt")
 
 
-def _console_upload_loop(
-    payload: dict, console: str, mode: str, interval_s: float, stop_upload
-) -> None:
-    """Snapshot the console until ``stop_upload`` is set, polling cheaply for a wedge. Polling is
-    free; committing is not (the heartbeat spends 4 of this repo's 5 commits/hour), and the stall
-    classifier kills a wedged run at 1200s/3000s -- long before an hourly snapshot would capture the
-    hang. So commit only on un-uploaded bytes AND either the interval elapsing or sustained silence
-    (``_console_progress`` explains why bytes cannot be the signal). QUIET_POLLS is sized so
-    (it + 1) * poll stays under poll_job's 1200s stall.
+def _console_upload_loop(job: dict, console: str, mode: str, interval: float, stop) -> None:
+    """snapshot hourly or after sustained heartbeat silence.
 
-    ``armed`` is the wedge latch. A wedge is progress that STOPPED, so it arms only after a
-    heartbeat: startup is quiet by nature and counting it would spend a credit on an empty console.
-    WHICH of `_console_progress`'s two counts drives it switches at the first COMMITTED heartbeat
-    (``ever``), for the reason that function's docstring gives: until one lands, a ``pending``
-    heartbeat is the only evidence the run exists, and counts as progress.
-    It RE-ARMS on progress, because a healthy slow stage -- one transition, then only liveness pings,
-    which ``_console_progress`` subtracts -- reads as silence and buys a snapshot; with a single
-    permanent credit that run could never buy another, so a genuine hang later would wait for the
-    hourly cadence and die at 1200s with no failure-era console, the exact loss this uploader exists
-    to prevent. CREDITS keeps the re-arm honest: a run alternating a heartbeat with silence re-arms
-    every cycle, and uncapped that buys 6/hr against a 5.0/hr budget the heartbeat already spends 4
-    of; they are per RUN, so they never enter the SUSTAINED rate. ``wedged`` excludes an already-due
-    poll, so a credit is spent only when a stall BOUGHT an upload.
-
-    A setup that NEVER reaches a heartbeat stays uncovered on purpose: holding the first-snapshot
-    cadence until progress starts costs a commit in the SUSTAINED rate (5.25/hr against a hard 5.0,
-    measured by ..._keeps_a_slow_starting_run_in_budget), so it is left to the 3000s grace. A FAILED
-    upload advances neither ``sent`` nor the deadline: hf_upload swallows its exception and returns
-    falsy, so resetting ``since`` books a snapshot that reached no repo and puts the retry an
-    interval out, past both teardowns. Staying due retries until one lands."""
-    poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
-    due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
+    the 600s fallback remains until the first committed heartbeat. an earlier commit promotes the
+    deadline without resetting ``since``. wedge detection uses every non-liveness heartbeat before
+    that commit and only committed ones after it. failed uploads advance no watermark or deadline.
+    """
+    poll = min(_CONSOLE_UPLOAD_POLL_S, interval)
+    due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval)
     sent, size, since, quiet, armed, spent, ever = -1, -1, 0.0, 0.0, False, 0, False
-    while not stop_upload.wait(poll_s):
-        since += poll_s
+    while not stop.wait(poll):
+        since += poll
         size, staged, beats = _console_progress(console, max(size, 0))
-        ever = ever or bool(staged)
+        if staged and not ever and since < due_s:
+            due_s = interval
+        ever |= bool(staged)
         progress = staged if ever else beats
         armed = armed or bool(progress)
         quiet = 0.0 if progress else quiet + 1
@@ -310,15 +289,15 @@ def _console_upload_loop(
         if size == sent or not (due or wedged):
             continue
         try:
-            up = _upload_console_snapshot(payload, console, mode)
+            up = _upload_console_snapshot(job, console, mode)
         except Exception as exc:
-            detail = _safe_detail(exc, secrets=_payload_secrets(payload))
+            detail = _safe_detail(exc, secrets=_payload_secrets(job))
             print(f"console upload warn: {detail}", flush=True)
             up = False
         spent += 1 if wedged and up else 0
         armed = armed and not (wedged and up)
         if up:
-            sent, since, due_s = size, 0.0, interval_s
+            sent, since, due_s = size, 0.0, interval
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
