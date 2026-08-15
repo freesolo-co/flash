@@ -513,7 +513,21 @@ def _classify_queue_state(
             # between unhealthy and empty cannot make a broken box look like starvation.
             state.ever_saw_worker = True
         if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
-            context.say(f"queued; workers: {workers}")
+            message = f"queued; workers: {workers}"
+            if (
+                not usable
+                and not recovering
+                and not state.ever_saw_worker
+                and state.queued_timer.since is not None
+            ):
+                elapsed_s = max(0, int(now - state.queued_timer.since))
+                budget = (
+                    f"{context.queue_grace_s:g}s"
+                    if _jobs.math.isfinite(context.queue_grace_s)
+                    else "unbounded"
+                )
+                message += f"; waited {elapsed_s}s of {budget} capacity grace"
+            context.say(message)
         if state.unhealthy_timer.expired(
             workers.get("unhealthy") and not usable and not recovering,
             now,
