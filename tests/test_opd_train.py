@@ -4856,6 +4856,52 @@ def test_child_failure_sanitizer_redacts_a_generically_labelled_credential(monke
         assert _safe_child_failure_detail(ValueError(message)) == message, message
 
 
+def test_child_failure_sanitizer_redacts_a_whole_cookie_header(monkeypatch):
+    """A cookie header is credential-bearing as a WHOLE value, not at one inner name.
+
+    `Cookie: a=1; sessionid=X; b=2` carries the session in a semicolon-delimited list. The bare
+    value branch stops at `;` -- the very delimiter that list uses -- so matching the inner name
+    would redact `sessionid=X` and print the rest of the header, including anything else it
+    carries, verbatim. So an unquoted cookie runs to end of line, like an unrecognised auth scheme.
+
+    `Set-Cookie` is the response spelling of the same credential. A runtime-issued cookie need not
+    exist in ``os.environ``, so the value pass cannot remove it and this shape rule is the only
+    thing in front of it.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message in (
+        "child failed: Cookie: sessionid=runtime-cookie-abc123",
+        "child failed: Set-Cookie: sessionid=runtime-cookie-abc123; Path=/; HttpOnly",
+        # the delimited list: every field after the first must go too, not just the matched one
+        "child failed: Cookie: a=1; sessionid=runtime-cookie-abc123; b=2",
+        'child failed: {"Cookie":"sessionid=runtime-cookie-abc123"}',
+        "child failed: set_cookie=runtime-cookie-abc123",
+        "child failed: COOKIE: runtime-cookie-abc123",  # matched case-insensitively
+        r"child failed: {\"cookie\":\"sessionid=runtime-cookie-abc123\"}",
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "runtime-cookie-abc123" not in redacted, f"leaked: {redacted!r}"
+        assert "<redacted>" in redacted, message
+
+    # a JSON-embedded cookie still ends at its closing quote: the end-of-line branch sits after the
+    # quoted ones, so the object structure around it survives and the record stays readable.
+    assert (
+        _safe_child_failure_detail(ValueError('child failed: {"Cookie":"sessionid=abc"} at step 3'))
+        == 'child failed: {"Cookie":"<redacted>"} at step 3'
+    )
+
+    # the other direction: the word in prose carries no credential, and a field merely describing
+    # cookie handling is not one.
+    for message in (
+        "child failed: cookie jar is empty",
+        "child failed: failed to parse cookie header",
+        'child failed: {"cookie_policy": "strict"}',
+    ):
+        assert _safe_child_failure_detail(ValueError(message)) == message, message
+
+
 def test_child_failure_sanitizer_redacts_every_percent_encoding_casing(monkeypatch):
     """A secret's percent-escapes are matched whatever hex casing the exception rendered.
 

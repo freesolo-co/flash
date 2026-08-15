@@ -82,6 +82,15 @@ _SECRET_URL_PARAM = (
 # enumerated -- `private_key` and `secret_key` name a credential, `primary_key` does not. The
 # separator is optional so `privateKey` (camelCase, as json from a js caller arrives) matches too.
 _SECRET_KEY_FIELD = r"(?:private|secret|signing|encryption|session|access)[-_ ]?key(?:[-_ ]?id)?"
+# a COOKIE header is credential-bearing as a WHOLE value, not at one inner name: `Cookie: a=1;
+# sessionid=X; b=2` carries the session in a semicolon-delimited list, and matching only the inner
+# name leaves the rest -- including whatever else the header carries -- verbatim. So the header is
+# consumed to end of line like an unknown auth scheme, rather than stopping at `;` the way a bare
+# value does. A runtime-issued cookie is in no environment variable, so the value pass cannot reach
+# it either. `Set-Cookie` needs no branch of its own: the key is unanchored, so it matches the
+# `Cookie` inside it and the value is consumed identically -- only the literal `Set-` stays
+# visible, which is a header name rather than a secret.
+_SECRET_COOKIE_KEY = r"(?P<cookie>cookie)"
 _SECRET_DETAIL = re.compile(
     rf"(?i)(?P<key>{_SECRET_AUTH_KEY}|api[-_ ]?key|access[-_ ]?token|token|secret|password|passwd"
     # `credential`/`credentials` is the generic label a library reaches for when the value has no
@@ -89,7 +98,7 @@ _SECRET_DETAIL = re.compile(
     # unlike `key` it needs no qualifier. plural included: `{"credentials": ...}` is the commoner
     # json spelling. a runtime-minted value is in no environment variable, so the value pass cannot
     # reach it and this shape rule is the only thing standing between it and the record.
-    rf"|credentials?|{_SECRET_KEY_FIELD}|{_SECRET_URL_PARAM})"
+    rf"|credentials?|{_SECRET_COOKIE_KEY}|{_SECRET_KEY_FIELD}|{_SECRET_URL_PARAM})"
     # the quote around the key may itself be BACKSLASH-ESCAPED: a child exception that embeds
     # serialized json carries `{\"password\":\"secret\"}`, and a bare `['\"]?` stops at the
     # backslash, so the whole credential printed verbatim. a runtime-minted value is in no
@@ -114,6 +123,12 @@ _SECRET_DETAIL = re.compile(
     # conditional, because `(?(auth)yes|no)` makes the bare branch the ELSE -- unreachable for the
     # very key that needs it, so `Bearer`/`Basic` would stop being consumed at all.
     rf"|(?(auth){_SECRET_UNKNOWN_SCHEME}[^\r\n]+|(?!))"
+    # an UNQUOTED cookie header runs to end of line for the same reason, but a different stop: the
+    # bare branch ends at `;`, which is the very delimiter a cookie list uses, so it would redact
+    # `sessionid=X` and print the rest of the header verbatim. Same conditional shape as `auth`,
+    # and it sits AFTER the quoted branches so a json-embedded cookie still ends at its closing
+    # quote and keeps the object structure around it.
+    r"|(?(cookie)[^\r\n]+|(?!))"
     # `&` terminates an unquoted value: without it the first signed-url parameter swallows every
     # later one, so a single <redacted> replaces the whole query string including the benign
     # `X-Amz-Expires` that says WHY a capability failed. each parameter is redacted on its own.
