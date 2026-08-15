@@ -9,10 +9,8 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 
 from __future__ import annotations
 
-import itertools
 import math
 import os
-import statistics
 
 from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.profiling.sft_workload import _multimodal_messages_with_images
@@ -664,47 +662,6 @@ def _build_verl_training_cfg(
     }
 
 
-def _step_intervals(step_line_times: list[float]) -> list[float]:
-    """measure step walls from consecutive metric arrival times.
-
-    n lines bound n-1 steps; startup before the first and partial work after the last are excluded.
-    """
-    return [
-        later - earlier for earlier, later in itertools.pairwise(step_line_times) if later > earlier
-    ]
-
-
-def _measured_idle_fraction(
-    reward_profile,
-    *,
-    completions_per_step: int,
-    step_intervals: list[float],
-) -> float | None:
-    """measure the gpu's grading-idle share from this run's own timings.
-
-    combine profiled grading latency with the median gap between consecutive step metric lines.
-    ``train_wall / steps_run`` is invalid because it includes startup/upload and mixes session wall
-    with an absolute resumed step count. the median resists checkpoint and lazy-compilation outliers.
-
-    return none when the profile or completed-step evidence is missing, or grading consumes the
-    entire measured step and leaves no trustworthy gpu-bound remainder.
-    """
-    if reward_profile is None or not reward_profile.trustworthy:
-        return None
-    completions = max(0, int(completions_per_step))
-    intervals = [float(gap) for gap in step_intervals if gap > 0]
-    if completions <= 0 or not intervals:
-        return None
-    step_wall = statistics.median(intervals)
-    reward_s = reward_profile.seconds_per_completion * completions
-    gpu_seconds = step_wall - reward_s
-    if gpu_seconds <= 0:
-        return None
-    from flash.engine.profiling.reward_profile import gpu_idle_fraction
-
-    return gpu_idle_fraction(reward_profile.seconds_per_completion, completions, gpu_seconds)
-
-
 def _build_verl_train_notes(
     inp: dict,
     *,
@@ -720,8 +677,6 @@ def _build_verl_train_notes(
     wandb_run_name: str | None = None,
     wandb_url: str | None = None,
     wandb_id: str | None = None,
-    reward_profile=None,
-    step_intervals: list[float] | None = None,
     reward_bridge_batching: bool = False,
     gdn_boundary_resets: bool | None = None,
 ) -> dict:
@@ -779,24 +734,7 @@ def _build_verl_train_notes(
         # wandb.run, verl from the child marker (see backend_common.render_wandb_link_shim).
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
-        # scalar grader latency remains useful after batching, but multiplying it by every completion
-        # no longer measures the reward wall. publish no idle fraction until the batch-aware estimator
-        # has a measured batch denominator rather than presenting the old serial projection as fact.
         "reward_bridge_batching": bool(reward_bridge_batching),
-        "reward_seconds_per_completion": (
-            reward_profile.seconds_per_completion
-            if reward_profile is not None and reward_profile.trustworthy
-            else None
-        ),
-        "reward_gpu_idle_fraction": (
-            None
-            if reward_bridge_batching
-            else _measured_idle_fraction(
-                reward_profile,
-                completions_per_step=inp["prompts_per_step"] * inp["group_size"],
-                step_intervals=step_intervals or [],
-            )
-        ),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],

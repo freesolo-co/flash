@@ -27,8 +27,6 @@ class RunConfig:
     group_size: int | None = None  # GRPO completions per prompt (G)
     lora_rank: int | None = None
     thinking: bool = False
-    # GRPO only: seconds to score one completion. None -> the single average grader latency.
-    reward_seconds_per_completion: float | None = None
     # opd only: the canonical friendly teacher alias from [train].teacher_model.
     # prices the teacher-api estimate; an empty value resolves to the default glm 5.2 teacher (an
     # omitted [train].teacher_model).
@@ -54,11 +52,6 @@ class RunConfig:
     sft_packed_blocks: int | None = None
     opd_multi_turn: bool = False
     opd_max_turns: int | None = None
-    # use measured mean rollout tokens for pricing but retain completion_len/seq_len caps for gpu
-    # sizing. conflating them either overbills expected generation or provisions for the mean and ooms
-    # on the tail; sft uses the same split through train_tokens.
-    measured_completion_tokens: float | None = None
-    measured_prompt_tokens: float | None = None
     # rows the trainer iterates (profile `retained_examples`), which is what verl's sampler shards.
     # NOT derivable from sft_packed_blocks: that is ceil(rows / examples_per_update), so a packed
     # profile with 10 rows and a batch of 8 reports 2 blocks and reconstructs as 16.
