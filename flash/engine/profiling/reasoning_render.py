@@ -5,12 +5,11 @@ it from earlier history, so a K-turn gold transcript delivers roughly 1/K of its
 loss. The stored messages are never wrong -- only the render is -- so a correct-looking dataset and
 a green ``flash env test`` both survive it.
 
-Survival is answered by IDENTITY, never by counting ``<think>`` tags in the render. The row is
-rendered a second time with each reasoning-authoring turn's reasoning marked, and a turn survives
-exactly when its marker reaches the render. Counting cannot answer it: the template opens an empty
-``<think>`` block on every trailing assistant turn whether or not it authored anything, so a
-transcript stripped of all its reasoning still renders one block and counts as a survivor -- the
-exact case this measurement exists to catch. A marker rides inside the reasoning itself, so a
+Survival is answered by IDENTITY: the row is rendered again with each reasoning-authoring turn's
+reasoning marked, and a turn survives exactly when its marker reaches the render. Counting
+``<think>`` tags cannot answer it -- the template opens an EMPTY block on every trailing assistant
+turn, so a transcript stripped of all its reasoning still renders one and scores as a survivor,
+the exact case this exists to catch. A marker also rides inside the reasoning itself, so a
 ``<think>`` an answer merely quotes carries none and can never be credited.
 """
 
@@ -41,23 +40,18 @@ def _message_text(content: object) -> str:
 def _reasoning_body_end(text: str) -> int | None:
     """Where this turn's reasoning BODY ends, or ``None`` when the turn authored no reasoning.
 
-    The template takes the reasoning as the text after the LAST ``<think>`` preceding the FIRST
-    ``</think>``. An opener-less ``reasoned</think>answer`` is reasoning too: the prompt supplies
-    the opening tag, so a completion sampled against it carries only the close.
+    The template's own rule: the text after the LAST ``<think>`` preceding the FIRST ``</think>``.
+    An opener-less ``reasoned</think>answer`` counts, being the shape a completion sampled against a
+    prompt-supplied opening tag carries.
 
-    Emptiness is judged on the body, because the template stamps an empty ``<think>\\n\\n</think>``
-    onto qualifying trailing turns -- treating that as authored would put a turn in the denominator
-    that never had reasoning to lose.
+    Emptiness is judged on the body: the template stamps an empty ``<think>\\n\\n</think>`` onto
+    qualifying trailing turns, and counting that as authored puts a turn in the denominator that
+    never had reasoning to lose.
 
-    One rule for both jobs: it decides whether a turn authored reasoning and where that turn's
-    marker goes. Were the two to disagree, a turn would enter the denominator with no way to prove
-    it survived, and report a drop that never happened.
-
-    The end is the last NON-WHITESPACE character, because the template renders the reasoning through
-    ``|trim``. A marker placed after trailing whitespace shields that whitespace from the trim, so
-    the marked render keeps a run the real one drops -- the measurement's own bytes changing the row
-    it measures. It tokenizes one token longer through the closing tag, and a cap landing exactly at
-    the real block's end then reports a block that fully fits as cut by ``max_context_tokens``.
+    The end excludes trailing whitespace because the template renders reasoning through ``|trim``. A
+    marker placed after that whitespace shields it from the trim, so the marked render keeps bytes
+    the real one drops and tokenizes one token longer -- a cap at the block's real end then reports
+    a block that fits as cut.
     """
     close = text.find(_THINK_CLOSE)
     if close < 0:
@@ -70,14 +64,14 @@ def _reasoning_body_end(text: str) -> int | None:
 def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:
     """Assistant turns that author reasoning, counted from the SOURCE messages.
 
-    Every shape the template accepts counts, because a shape missed here reads as "authored no
-    reasoning" and silences the warning for a row losing all of it: an inline span in string or
-    content-block ``content``, a separate ``reasoning_content`` field, and the opener-less form.
+    Every accepted shape counts -- inline span, content blocks, ``reasoning_content``, opener-less --
+    because a shape missed here reads as "authored no reasoning" and silences the warning for a row
+    losing all of it.
 
-    A ``reasoning_content`` STRING is authoritative even when empty: the template renders that field
-    and leaves ``content`` whole as the answer, so an empty field means the turn authored nothing
-    however the answer is written. Falling back to inline detection there reads a ``<think>`` the
-    ANSWER quotes as reasoning. Absent and ``None`` are different -- both parse the inline span.
+    A ``reasoning_content`` STRING is authoritative even when EMPTY: the template renders that field
+    and leaves ``content`` whole, so an empty field means the turn authored nothing however the
+    answer is written, and falling back to inline detection would read a ``<think>`` the ANSWER
+    quotes as reasoning. Absent and ``None`` differ -- both parse the inline span.
     """
     turns = 0
     for message in messages:
@@ -97,10 +91,9 @@ def reasoning_marker_prefix(text: str) -> str:
     Extended rather than assumed unique: a dataset containing the stem would otherwise let its own
     text answer "did this turn's reasoning survive?".
 
-    Extending one character at a time is quadratic on the input that forces it -- text holding the
-    stem followed by N filler characters keeps every candidate a substring, so each of the N scans
-    walks the whole row. Doubling bounds it at a logarithmic number of scans, then bisection trims
-    back to the shortest absent length so the marker stays short.
+    Doubling then bisecting, not growing one character at a time: text holding the stem followed by
+    N filler characters keeps every one-character extension a substring, so each of N scans walks
+    the whole row (1.4s on a 50k row, before tokenization).
     """
     stem = "flashreasoningmark"
     if stem not in text:
@@ -117,11 +110,8 @@ def reasoning_marker_prefix(text: str) -> str:
 def _turn_marker(prefix: str, index: int) -> str:
     """The marker naming ONE turn's reasoning.
 
-    Per-turn rather than one shared stamp: survival is asked per turn, and a caller holding only the
-    shared prefix could not tell which turn a surviving marker belongs to.
-
-    The trailing ``e`` terminates the index. Without it ``{prefix}1`` is a substring of
-    ``{prefix}10``, so a dropped turn 1 would read as surviving whenever turn 10 does.
+    The trailing ``e`` terminates the index: without it ``{prefix}1`` is a substring of
+    ``{prefix}10``, so a dropped turn 1 reads as surviving whenever turn 10 does.
     """
     return f"{prefix}{index}e"
 
@@ -129,8 +119,8 @@ def _turn_marker(prefix: str, index: int) -> str:
 def _marks_reasoning(message: dict) -> bool:
     """Whether this turn gets a marker stamped into it.
 
-    One predicate for both the stamping and the listing: a turn listed but not stamped reads as
-    reasoning the template dropped, and a turn stamped but not listed cannot be checked at all.
+    One predicate for both stamping and listing: a turn listed but not stamped reads as a template
+    drop, and a turn stamped but not listed cannot be checked at all.
     """
     return message.get("role") == "assistant" and bool(reasoned_assistant_turns([message]))
 
@@ -138,9 +128,8 @@ def _marks_reasoning(message: dict) -> bool:
 def reasoning_markers(messages: list[dict], prefix: str) -> list[str]:
     """The marker for each reasoning-authoring turn, in order.
 
-    Callers need them separately to ask survival per turn. Searching a render for the shared prefix
-    answers only "did any reasoning survive", which is the wrong question for a row whose turns are
-    answered differently -- one surviving turn would cover a stripped neighbour.
+    Separate markers because survival is asked per turn: searching for the shared prefix answers
+    only "did ANY reasoning survive", so one surviving turn would cover a stripped neighbour.
     """
     return [
         _turn_marker(prefix, index)
@@ -192,11 +181,10 @@ def with_marked_reasoning(messages: list[dict], prefix: str) -> list[dict]:
     """The same messages with each reasoning-authoring assistant turn's reasoning marked.
 
     Only reasoning TEXT changes, so the template's ``last_query_index`` rule sees identical roles in
-    identical positions and keeps every turn's reasoning exactly where it would have anyway.
+    identical positions and keeps exactly the blocks it would have anyway.
 
-    The marker lands on the ``|trim``-ed reasoning in both shapes. Appended after trailing
-    whitespace it would shield that whitespace from the template's trim, so the marked render would
-    carry a run the real one drops (see ``_reasoning_body_end``).
+    Both shapes mark the ``|trim``-ed reasoning; marking after trailing whitespace would shield it
+    from the template's trim (see ``_reasoning_body_end``).
     """
     marked: list[dict] = []
     for index, message in enumerate(messages):
@@ -222,14 +210,12 @@ def strip_reasoning_markers(text: str, prefix: str) -> str:
 def marked_reasoning_end(marked_text: str, marker: str) -> int | None:
     """Where this turn's rendered reasoning ENDS in the marked render, or ``None`` if it was dropped.
 
-    ``None`` is the survival answer: a marker rides only inside text the template chose to keep as
-    this turn's reasoning, so its absence is exactly a turn whose reasoning was stripped.
+    ``None`` IS the survival answer: a marker rides only inside text the template kept as this
+    turn's reasoning, so its absence is exactly a stripped turn.
 
-    The offset runs through the block's closing tag rather than stopping at the marker, so a caller
-    comparing it against ``max_context_tokens`` asks whether the whole block reached the loss. It
-    deliberately stops THERE rather than at the blank line separating reasoning from the answer:
-    that separator tokenizes to a real token, so measuring to it would call a block whose every
-    reasoning token was retained truncated whenever the cap lands just past the closing tag.
+    The offset runs through the closing tag -- so the caller asks whether the WHOLE block fit -- and
+    stops there rather than at the blank line before the answer, which costs a real token and would
+    call a fully retained block truncated.
     """
     at = marked_text.find(marker)
     if at < 0:
@@ -241,11 +227,9 @@ def marked_reasoning_end(marked_text: str, marker: str) -> int | None:
 def horizon_row_count(row_count: int, *, examples_per_update: int, updates: int) -> int:
     """How many retained rows an update horizon reaches, in retained order.
 
-    Updates consume ``examples_per_update`` rows each, wrapping at the end of an epoch, so a horizon
-    at or past one full pass reaches every row and the answer saturates at ``row_count`` rather than
-    counting a row twice. Shared by the profile producer, which bounds the counts it serializes, and
-    by the CLI, which needs the matching denominator: a bounded count over a whole-dataset
-    denominator would understate the survival rate it reports.
+    Updates wrap at the end of an epoch, so a horizon past one full pass saturates at ``row_count``
+    rather than counting a row twice. Shared with the CLI so the denominator matches: a bounded
+    count over a whole-dataset denominator would understate the survival rate.
     """
     per_update = max(int(examples_per_update), 1)
     return min(int(row_count), max(int(updates) * per_update, 0))
@@ -254,13 +238,10 @@ def horizon_row_count(row_count: int, *, examples_per_update: int, updates: int)
 def reasoning_warning_rows(profile: object) -> int:
     """The row denominator the reasoning counts were totalled over, from a profile OBJECT or dict.
 
-    Both shapes are accepted because the same line is rendered from both: the worker holds the
-    profile itself, while the CLI only ever sees the dict that travelled on the quote.
-
-    The producer serializes this alongside the counts rather than leaving it to be re-derived. A
-    reader cannot tell a horizon-bounded count from a whole-dataset one by inspection -- both carry
-    ``examples_per_update`` and ``authoritative_steps`` -- so deriving the denominator from those
-    would pair a binding horizon with counts measured over every retained row.
+    Both shapes render the same line: the worker holds the profile, the CLI only sees the dict that
+    travelled on the quote. It is serialized rather than re-derived because a horizon-bounded count
+    is indistinguishable from a whole-dataset one by inspection -- both carry ``examples_per_update``
+    and ``authoritative_steps`` -- so deriving it would pair a binding horizon with unbounded counts.
     """
 
     def _int(key: str) -> int | None:
@@ -283,14 +264,11 @@ def rendered_reasoning_loss_warning(
 ) -> str | None:
     """One user-facing line when authored reasoning does not reach the loss.
 
-    Reasoning is lost two ways with OPPOSITE remedies: the template strips it from earlier history,
-    or ``max_context_tokens`` cuts a block the template kept off the end of the row. Telling the
-    second user to split their transcript would be wrong advice for a dataset whose structure is
-    fine, so the causes are counted separately and each names its own fix.
-
-    Silent when nothing was authored (the existing thinking-mode check owns that case) and when
-    everything survived. Reports the measurement rather than a fixed threshold: any drop is real
-    lost supervision, and the count is exact rather than sampled.
+    Reasoning is lost two ways with OPPOSITE remedies -- the template strips earlier history, or
+    ``max_context_tokens`` cuts a block the template KEPT off the end of the row -- so the causes are
+    counted separately and each names its own fix. Silent when nothing was authored (the thinking-
+    mode check owns that) or when everything survived; any drop is reported, since the count is
+    exact rather than sampled and any loss is real lost supervision.
     """
     if authored_turns <= 0:
         return None

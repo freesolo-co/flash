@@ -1,13 +1,12 @@
 """Pin the offline thinking-template fake against the real Qwen3.5 chat template.
 
 ``tests/test_sft_workload.py`` measures reasoning loss through ``ThinkingTokenizer``, a
-transcription of Qwen3.5's template. A fake is a claim about the real template, and the whole
-warning rests on that claim, so it is checked here against the shipped tokenizer rather than
-trusted. Downloads a tokenizer, so it is opt-in like the other live tests.
+transcription of Qwen3.5's template. A fake is a CLAIM about the real template and the whole warning
+rests on it, so it is checked against the shipped tokenizer rather than trusted. Downloads a
+tokenizer, so it is opt-in like the other live tests.
 
-Survival is measured the way the profiler measures it -- mark the reasoning, render, and ask which
-markers arrived -- so these tests exercise the real decision procedure rather than a paraphrase of
-it.
+Survival is measured the way the profiler measures it -- mark the reasoning, render, ask which
+markers arrived -- so these exercise the real decision procedure, not a paraphrase of it.
 """
 
 from __future__ import annotations
@@ -82,11 +81,10 @@ def test_the_real_template_drops_all_but_the_final_turns_reasoning(tokenizer) ->
 def test_the_real_template_injects_an_empty_think_block_with_no_authored_reasoning(
     tokenizer,
 ) -> None:
-    """Why survival is asked of a marker: the raw tag is present either way.
-
-    This is the input that loses ALL of its reasoning, and a raw ``count("<think>")`` would score it
-    as one survivor -- the smallest apparent loss on the worst transcript. No marker arrives, so the
-    marker procedure reports the total loss it is.
+    """Why survival is asked of a marker: the raw tag is present either way. This input loses ALL of
+    its reasoning, and a raw ``count("<think>")`` would score it as one survivor -- the smallest
+    apparent loss on the worst transcript. No marker arrives, so the marker procedure reports the
+    total loss.
     """
     messages = [
         {"role": "user", "content": "u1"},
@@ -114,10 +112,9 @@ def test_the_real_template_keeps_reasoning_authored_in_final_position(tokenizer)
 
 
 def test_a_think_span_quoted_by_an_answer_never_carries_a_marker(tokenizer) -> None:
-    """A ``<think>`` the ANSWER quotes renders a real block, and must never be credited.
-
-    This is why survival is an identity question. The quoting turn is stripped, the final turn is
-    kept, and any procedure counting rendered tags sees the quoted one and reports no loss.
+    """A ``<think>`` the ANSWER quotes renders a real block, and must never be credited. The quoting
+    turn is stripped, the final turn is kept, and any procedure counting rendered tags reports no
+    loss.
 
     The quote sits in the turn that KEEPS its reasoning, because a stripped turn is split at the
     last ``<think>`` and the quote would be discarded along with the reasoning -- leaving nothing
@@ -140,10 +137,9 @@ def test_a_think_span_quoted_by_an_answer_never_carries_a_marker(tokenizer) -> N
 
 
 def test_reasoning_writing_out_the_turn_layout_is_still_credited(tokenizer) -> None:
-    """Control tokens inside reasoning are content, and the real template keeps the turn.
-
-    The bytes are byte-identical to a turn boundary, so nothing reading the rendered text alone can
-    tell them apart. The marker can, because it rides inside whatever the template kept.
+    """Control tokens inside reasoning are content, and the real template keeps the turn. The bytes
+    are identical to a turn boundary, so nothing reading the rendered text alone can tell them
+    apart. The marker can, because it rides inside whatever the template kept.
     """
     messages = [
         {"role": "user", "content": "u1"},
@@ -159,10 +155,8 @@ def test_reasoning_writing_out_the_turn_layout_is_still_credited(tokenizer) -> N
 
 
 def test_consecutive_trailing_assistant_turns_both_keep_their_reasoning(tokenizer) -> None:
-    """The rule is ``loop.index0 > ns.last_query_index``, not "the final turn".
-
-    A fake paraphrasing it as "the last message" would keep one block where the template keeps two,
-    and understate what reaches the loss.
+    """The rule is ``loop.index0 > ns.last_query_index``, not "the final turn". A fake paraphrasing
+    it as "the last message" would keep one block where the template keeps two.
     """
     messages = [
         {"role": "user", "content": "u1"},
@@ -176,10 +170,9 @@ def test_consecutive_trailing_assistant_turns_both_keep_their_reasoning(tokenize
 
 
 def test_a_tool_response_turn_does_not_reset_the_reasoning_window(tokenizer) -> None:
-    """A ``tool`` message renders as a ``<tool_response>`` user turn and does NOT end the window.
-
-    The fake reproduces that shape; a fake emitting an ``<|im_start|>tool`` header would render a
-    turn the template never produces and could agree by accident while disagreeing on the rule.
+    """A ``tool`` message renders as a ``<tool_response>`` user turn and does NOT end the window. A
+    fake emitting an ``<|im_start|>tool`` header would render a turn the template never produces and
+    could agree by accident while disagreeing on the rule.
     """
     messages = [
         {"role": "user", "content": "u1"},
@@ -192,10 +185,8 @@ def test_a_tool_response_turn_does_not_reset_the_reasoning_window(tokenizer) -> 
 
 
 def test_the_real_template_prefers_reasoning_content_over_an_inline_span(tokenizer) -> None:
-    """The field wins, and ``content`` stays whole as the answer.
-
-    A fake that always split ``content`` at a ``<think>`` tag would tear an answer apart at a tag it
-    merely quotes and disagree with the template about which text is this turn's reasoning.
+    """The field wins, and ``content`` stays whole as the answer. A fake that always split
+    ``content`` at a ``<think>`` tag would tear an answer apart at a tag it merely quotes.
     """
     messages = [
         {"role": "user", "content": "u1"},
@@ -210,12 +201,10 @@ def test_the_real_template_prefers_reasoning_content_over_an_inline_span(tokeniz
 
 
 def test_a_marked_render_differs_from_the_real_one_only_by_its_markers(tokenizer) -> None:
-    """The measurement must not perturb what it measures.
-
-    Only reasoning TEXT changes, so the template sees identical roles in identical positions and
-    keeps exactly the blocks it would have. Stripping the markers back out must return the real
-    render byte for byte -- otherwise the token length charged against the cap is the marked
-    render's, and truncation is judged against a row training never sees.
+    """The measurement must not perturb what it measures. Only reasoning TEXT changes, so the
+    template sees identical roles in identical positions. Stripping the markers back out must return
+    the real render byte for byte -- otherwise the token length charged against the cap is the
+    MARKED render's, and truncation is judged against a row training never sees.
     """
     for messages in (
         MULTITURN,
@@ -249,10 +238,9 @@ def test_a_marked_render_differs_from_the_real_one_only_by_its_markers(tokenizer
 
 
 def test_a_blocks_end_offset_lands_past_its_own_closing_tag(tokenizer) -> None:
-    """The offset truncation is judged against runs through the block's closer, and no further.
-
-    Measuring to the blank line separating reasoning from the answer would call a block whose every
-    reasoning token was retained truncated whenever the cap lands just past the closing tag.
+    """Truncation is judged against an offset running through the block's closer, and no further.
+    Measuring to the blank line before the answer would call a block whose every reasoning token was
+    retained truncated whenever the cap lands just past the closing tag.
     """
     messages = [
         {"role": "user", "content": "u"},
@@ -271,10 +259,9 @@ def test_a_blocks_end_offset_lands_past_its_own_closing_tag(tokenizer) -> None:
 
 
 def test_a_closer_quoted_inside_reasoning_does_not_bound_the_block_short(tokenizer) -> None:
-    """The closing tag is found FORWARD of the marker, so quoted closers lie behind it.
-
-    A block bounded at a quoted closer ends too early, and a cap landing between that closer and the
-    real one scores a block training cuts as fully retained -- the direction that hides the loss.
+    """The closing tag is found FORWARD of the marker, so quoted closers lie behind it. A block
+    bounded at a quoted closer ends too early, and a cap between that closer and the real one scores
+    a block training cuts as fully retained -- the direction that hides the loss.
     """
     messages = [
         {"role": "user", "content": "u"},

@@ -237,9 +237,9 @@ def test_unpacked_warning_is_silent_when_the_authored_batch_was_already_one() ->
 
 @pytest.mark.parametrize("authored", [True, False])
 def test_worker_unpacked_warning_names_the_batch_source_truthfully(capsys, authored: bool) -> None:
-    """The worker path resolves batch_size to the recipe default before it warns, so handing the
-    resolved number to the helper made an omitted knob read as one the user configured -- the
-    opposite of what the cli says about the same run.
+    """The worker resolves batch_size to the recipe default before warning, so handing the resolved
+    number to the helper made an omitted knob read as one the user configured -- the opposite of
+    what the cli says about the same run.
     """
     from flash.engine.plan.recipe import RECIPE
 
@@ -279,8 +279,7 @@ def _spec_with_max_steps(max_steps: int) -> JobSpec:
 def _training_order(count: int) -> list[str]:
     """The prompts in the order the TRAINER consumes them, from its own selection function.
 
-    The rows are shuffled under the job seed, so file order is not training order. A test that
-    assumed the latter would assert against a sequence no run ever sees.
+    The rows are shuffled under the job seed, so file order is not training order.
     """
     rows = [{"prompt": f"board{index}", "answer": "ignored"} for index in range(count)]
     return [row["prompt"] for row in select_sft_examples(rows, 0, _spec().seed)]
@@ -363,10 +362,9 @@ def test_zero_updates_consume_no_tokens() -> None:
 def test_probe_failure_fails_the_profile_instead_of_freezing_a_wrong_label(monkeypatch) -> None:
     """A transient config-fetch failure must not mint an ``unsupported`` architecture label.
 
-    The label is frozen into the profile and compared byte-for-byte by the training worker. If a
-    hub blip could answer "unsupported" here, a later re-derivation that reached the config would
-    say "gdn-hybrid" and every training run built on that profile would die with a false
-    "sft workload changed after the quote was frozen" -- with no takeover path, because the profile
+    The label is frozen into the profile and compared byte-for-byte by the training worker, so a hub
+    blip answering "unsupported" here would make every run built on that profile die with a false
+    "sft workload changed after the quote was frozen" -- with no takeover path, since the profile
     itself stays ``done``.
     """
     from flash.engine.profiling import sft_workload
@@ -410,9 +408,9 @@ def test_gdn_probe_failure_also_fails_closed(monkeypatch) -> None:
 class LongRowEnvironment(FakeEnvironment):
     """One row far past any cap under test, one comfortably inside it.
 
-    FakeTokenizer emits one id per character, so an answer of N characters is N tokens. The long
-    row is what gives the truncation assertions the ability to fail: a fixture where nothing
-    exceeds the cap would report zero truncated rows no matter what the measurement did.
+    FakeTokenizer emits one id per character, so an N-character answer is N tokens. The long row is
+    what gives the truncation assertions the ability to fail: a fixture where nothing exceeds the
+    cap reports zero truncated rows no matter what the measurement does.
     """
 
     def __init__(self):
@@ -443,12 +441,10 @@ def _measured(max_context_tokens: int):
 
 
 def test_binding_cap_reports_the_true_length_not_the_censored_one(capsys) -> None:
-    """The profile must say how long the rows really are, and the warning must name that number.
-
-    ``realized_max_length`` is measured after the slice, so it saturates at the cap exactly when the
-    cap binds -- the one case where the number matters. Asserting it equals the cap while
-    ``untruncated_max_length`` runs past it is what distinguishes a real measurement from reading
-    the setting back.
+    """``realized_max_length`` is measured after the slice, so it saturates at the cap exactly when
+    the cap binds -- the one case where the number matters. Asserting it equals the cap while
+    ``untruncated_max_length`` runs past it distinguishes a real measurement from reading the
+    setting back.
     """
     prepared = _measured(64)
 
@@ -478,18 +474,16 @@ def test_a_cap_that_does_not_bind_reports_no_truncation_and_stays_quiet(capsys) 
 class ThinkingTokenizer(FakeTokenizer):
     """A tokenizer whose chat template reproduces Qwen3.5's ``<think>`` placement rule.
 
-    Transcribed from ``Qwen/Qwen3.5-0.8B``'s own template rather than paraphrased, because the two
-    details that make the warning necessary are both easy to get wrong from memory:
+    Transcribed from ``Qwen/Qwen3.5-0.8B``'s own template rather than paraphrased, because three
+    details are easy to get wrong from memory:
 
-    * reasoning survives only on assistant turns AFTER the last non-tool user message
-      (``loop.index0 > ns.last_query_index``), not merely on the last turn;
-    * a trailing assistant turn ALWAYS opens a ``<think>`` block, empty when that turn authored no
-      reasoning. That empty block is why survival is counted as non-empty spans;
-    * ``reasoning_content`` is read in PREFERENCE to an inline span. A fake that only ever splits
-      ``content`` would tear an answer apart at a ``<think>`` tag the answer merely quotes, and
-      then disagree with the real template about which text is this turn's reasoning.
+    * reasoning survives only on assistant turns AFTER the last non-tool user message (``loop.index0
+      > ns.last_query_index``), not merely on the last turn;
+    * a trailing assistant turn ALWAYS opens a ``<think>`` block, empty when it authored nothing;
+    * ``reasoning_content`` is read in PREFERENCE to an inline span, so a fake that only splits
+      ``content`` would tear an answer apart at a ``<think>`` it merely quotes.
 
-    ``tests/test_sft_workload_live.py`` pins this fake against the real tokenizer.
+    ``tests/live/test_sft_thinking_render_live.py`` pins this fake against the real tokenizer.
     """
 
     def apply_chat_template(
@@ -621,11 +615,10 @@ _MULTITURN_TARGET = [
 
 
 def test_a_multiturn_thinking_target_warns_that_the_template_ate_its_reasoning(capsys) -> None:
-    """The defect: 3 authored reasoning blocks, 1 trained on, and nothing said so.
-
-    A green ``flash env test`` and a correct-looking dataset both survive this, because the stored
-    messages were never wrong -- only the render is. The warning has to name how much was lost,
-    since "some reasoning was dropped" cannot be acted on.
+    """The defect: 3 authored reasoning blocks, 1 trained on, and nothing said so. A green ``flash
+    env test`` and a correct-looking dataset both survive it, because the stored messages are never
+    wrong -- only the render is. The warning names how much was lost, since "some reasoning was
+    dropped" cannot be acted on.
     """
     prepared = _thinking_prepared(_MULTITURN_TARGET)
 
@@ -650,11 +643,9 @@ def test_a_final_position_thinking_target_keeps_its_reasoning_and_stays_quiet(ca
 
 
 def test_reasoning_stripped_to_nothing_is_not_read_as_one_surviving_block(capsys) -> None:
-    """The trap that makes naive ``count("<think>")`` wrong, and it fires on the WORST input.
-
-    Reasoning on every turn but the last renders one EMPTY ``<think>`` block. Counting raw opening
-    tags scores that as one survivor, so the transcript that lost ALL of its reasoning is the one
-    that would report the smallest loss.
+    """The trap that makes naive ``count("<think>")`` wrong, and it fires on the WORST input:
+    reasoning on every turn but the last renders one EMPTY block, so counting raw opening tags
+    scores the transcript that lost ALL its reasoning as having a survivor.
     """
     prepared = _thinking_prepared(
         [
@@ -673,10 +664,8 @@ def test_reasoning_stripped_to_nothing_is_not_read_as_one_surviving_block(capsys
 
 
 def test_a_dataset_with_no_authored_reasoning_stays_quiet(capsys) -> None:
-    """The other control: the always-injected empty block must not be read as lost reasoning.
-
-    Every thinking render carries one empty ``<think>`` block, so a rule keyed on tags rather than
-    content would warn about dropped reasoning for a dataset that authored none.
+    """The other control. Every thinking render carries one empty ``<think>`` block, so a rule keyed
+    on tags rather than content warns about dropped reasoning for a dataset that authored none.
     """
     prepared = _thinking_prepared([{"role": "assistant", "content": "plain answer"}])
 
@@ -686,10 +675,9 @@ def test_a_dataset_with_no_authored_reasoning_stays_quiet(capsys) -> None:
 
 
 def test_reasoning_carried_in_reasoning_content_counts_as_authored(capsys) -> None:
-    """The template reads ``reasoning_content`` ahead of an inline span, so the source count must too.
-
-    Counting only literal ``<think>`` in ``content`` would score these rows as reasoning-free and
-    report no loss for a transcript that is losing all of it.
+    """The template reads ``reasoning_content`` ahead of an inline span, so the source count must
+    too. Counting only literal ``<think>`` in ``content`` scores these rows as reasoning-free and
+    reports no loss for a transcript losing all of it.
     """
     prepared = _thinking_prepared(
         [
@@ -704,11 +692,10 @@ def test_reasoning_carried_in_reasoning_content_counts_as_authored(capsys) -> No
 
 
 def test_adjacent_empty_think_blocks_do_not_merge_into_one_survivor(capsys) -> None:
-    """Two consecutive trailing assistant turns that authored nothing render two EMPTY blocks.
-
-    A span pattern whose body may cross a delimiter lets the required non-space character be the
-    ``<`` of the first closing tag, swallowing both blocks as one match. That reads as a surviving
-    span on a transcript where nothing survived, which suppresses the warning on the worst input.
+    """Two consecutive trailing assistant turns that authored nothing render two EMPTY blocks. A
+    span pattern whose body may cross a delimiter lets the required non-space character be the ``<``
+    of the first closing tag, swallowing both as one match -- a survivor on a transcript where
+    nothing survived.
     """
     prepared = _thinking_prepared(
         [
@@ -725,10 +712,9 @@ def test_adjacent_empty_think_blocks_do_not_merge_into_one_survivor(capsys) -> N
 
 
 def test_consecutive_reasoned_turns_are_counted_individually(capsys) -> None:
-    """The paired control for the pattern above: real adjacent spans must still count separately.
-
-    A pattern tightened until it stops merging empty blocks can also stop matching the second of two
-    real ones, which would invent reasoning loss for a transcript that lost none.
+    """The paired control for the case above: a pattern tightened until it stops merging empty
+    blocks can also stop matching the second of two real ones, inventing loss for a transcript that
+    lost none.
     """
     prepared = _thinking_prepared(
         [
@@ -743,11 +729,9 @@ def test_consecutive_reasoned_turns_are_counted_individually(capsys) -> None:
 
 
 def test_a_think_span_in_the_prompt_does_not_offset_reasoning_lost_from_the_target(capsys) -> None:
-    """Only the supervised span counts, so prompt text cannot pay for a target's lost reasoning.
-
-    An environment that documents the format by showing a literal ``<think>...</think>`` in its
-    system prompt renders a real span that is never trained on. Counting the full render would let
-    it cancel a dropped target block and silence the warning.
+    """An environment documenting the format with a literal ``<think>...</think>`` in its system
+    prompt renders a real span that is never trained on. Counting the full render lets it cancel a
+    dropped target block and silence the warning.
     """
 
     class PromptThinkEnvironment(ThinkingEnvironment):
@@ -775,10 +759,8 @@ def test_a_think_span_in_the_prompt_does_not_offset_reasoning_lost_from_the_targ
 
 def test_reasoning_in_a_dropped_row_is_not_reported_against_the_retained_rows(capsys) -> None:
     """A row whose completion is truncated away is not trained on, so its reasoning is not lost to
-    the template -- the row is simply gone, and the existing drop warning covers it.
-
-    Counting it here would report a reasoning loss "across N rows" that the retained rows did not
-    incur, and could warn about a run whose every trained row keeps its reasoning.
+    the template -- the row is gone, and the existing drop warning covers it. Counting it here
+    reports a loss "across N rows" the retained rows did not incur.
     """
 
     class MixedEnvironment(ThinkingEnvironment):
@@ -811,10 +793,9 @@ def test_reasoning_in_a_dropped_row_is_not_reported_against_the_retained_rows(ca
 
 
 def test_block_form_assistant_content_counts_as_authored_reasoning(capsys) -> None:
-    """Content blocks are a supported target shape, and a shape missed here silences the warning.
-
-    ``reasoned_assistant_turns`` reading only string ``content`` would score a block-form multi-turn
-    target as authoring nothing, so a row losing all its reasoning would report none.
+    """Content blocks are a supported target shape, and a shape missed here silences the warning:
+    ``reasoned_assistant_turns`` reading only string ``content`` scores a block-form multi-turn
+    target as authoring nothing.
     """
     prepared = _thinking_prepared(
         [
@@ -829,11 +810,10 @@ def test_block_form_assistant_content_counts_as_authored_reasoning(capsys) -> No
 
 
 def test_reasoning_the_cap_kept_is_not_reported_as_dropped(capsys) -> None:
-    """Truncation is judged per span, not per row: the cap usually cuts only the answer tail.
-
-    A single final assistant turn whose ``<think>`` block sits entirely inside the retained tokens
-    loses nothing, however much of its answer the cap removes. Discarding every span on a truncated
-    row would warn that the template dropped reasoning it actually kept.
+    """Truncation is judged per span, not per row: the cap usually cuts only the answer tail. A
+    final turn whose ``<think>`` block sits inside the retained tokens loses nothing however much of
+    its answer is removed, so discarding every span on a truncated row warns about reasoning it
+    kept.
     """
     completion = [{"role": "assistant", "content": "<think>kept</think>" + "tail " * 80}]
     # one token per character: the block's closing tag ends at 76 and the row runs to 489, so this
@@ -851,10 +831,9 @@ def test_an_answer_quoting_think_is_not_credited_when_reasoning_content_is_strip
     capsys,
 ) -> None:
     """``reasoning_content`` is the reasoning, so ``content`` is answer text and stays intact.
-
-    Splitting the answer on ``</think>`` as well would delete a span the full render still has, so
-    the baseline would come up short and credit that quoted span as a survivor -- offsetting an
-    earlier block the template really dropped and silencing the warning.
+    Splitting the answer on ``</think>`` too would delete a span the full render still has, so the
+    baseline comes up short and credits the quote as a survivor -- offsetting a block the template
+    really dropped.
     """
     prepared = _thinking_prepared(
         [
@@ -875,12 +854,10 @@ def test_an_answer_quoting_think_is_not_credited_when_reasoning_content_is_strip
 
 
 def test_an_answer_quoting_think_tags_cannot_mask_turns_the_template_dropped(capsys) -> None:
-    """Survivors are probed per turn, so quoted tags cannot pay for dropped reasoning.
-
-    A ``<think>`` tag inside a supervised answer is a real non-empty span, indistinguishable in the
-    rendered text from reasoning. Summing spans across the render lets an answer that quotes the
-    format cover several stripped turns and silence the warning entirely. Re-rendering with one
-    turn's reasoning removed is immune: the quote is identical in both renders.
+    """A ``<think>`` tag inside a supervised answer is a real non-empty span, indistinguishable in
+    the rendered text from reasoning, so summing spans across the render lets one quoting answer
+    cover several stripped turns. Probing per turn is immune: the quote is identical in both
+    renders.
     """
     prepared = _thinking_prepared(
         [
@@ -904,9 +881,7 @@ def test_an_answer_quoting_think_tags_cannot_mask_turns_the_template_dropped(cap
 
 def test_a_truncated_row_does_not_claim_reasoning_the_cap_removed(capsys) -> None:
     """A block past ``max_context_tokens`` never reaches the loss, so it is not a survivor.
-
-    Reporting it would understate the real reasoning loss while quoting an exact survival
-    percentage.
+    Reporting it understates the real loss while quoting an exact survival percentage.
     """
     long_reasoning = "<think>" + "survivor " * 30 + "</think>a2"
     completion = [
@@ -933,13 +908,10 @@ def test_a_truncated_row_does_not_claim_reasoning_the_cap_removed(capsys) -> Non
 def test_a_reasoned_assistant_turn_in_the_prompt_does_not_cancel_a_surviving_target_block(
     capsys,
 ) -> None:
-    """A prompt span the FULL render strips must not be subtracted from the full render's count.
-
-    A prompt ending in a reasoned assistant turn is trailing while the prompt is rendered alone, so
+    """A prompt ending in a reasoned assistant turn is trailing while the prompt renders ALONE, so
     that render keeps its reasoning -- but the completion adds a later user turn, which moves the
     template's boundary past it and strips it from the full render. Subtracting the prompt render's
-    count would remove a span the full render never had, cancelling the target's own surviving block
-    and warning about a row that lost nothing.
+    count removes a span the full render never had, cancelling the target's own surviving block.
     """
 
     class PriorTurnEnvironment(ThinkingEnvironment):
@@ -967,14 +939,11 @@ def test_a_reasoned_assistant_turn_in_the_prompt_does_not_cancel_a_surviving_tar
 def test_an_earlier_surviving_block_is_not_reported_lost_when_a_later_one_is_truncated(
     capsys,
 ) -> None:
-    """Each surviving span is measured against the cap at ITS OWN end offset.
-
-    Two consecutive trailing assistant turns both keep their reasoning, and the cap falls between
-    the two blocks. Measuring one span's position in a render that does not contain it -- as any
-    scheme comparing offsets from two DIFFERENT renders must -- reads the earlier, fully retained
-    block as ending where the later one does, and reports it truncated. The row would then claim
-    zero survivors and warn that the template dropped every block, while the first block is in fact
-    supervised.
+    """Each surviving span is measured against the cap at ITS OWN end offset. Two trailing assistant
+    turns both keep their reasoning and the cap falls between the blocks; measuring one span's
+    position in a render that does not contain it -- as any scheme comparing offsets from two
+    DIFFERENT renders must -- reads the earlier, fully retained block as ending where the later one
+    does.
     """
     completion = [
         {"role": "assistant", "content": "<think>" + "early " * 6 + "</think>a1"},
@@ -996,12 +965,10 @@ def test_an_earlier_surviving_block_is_not_reported_lost_when_a_later_one_is_tru
 
 
 def test_a_think_tag_quoted_in_the_prompt_does_not_swallow_the_turns_that_follow(capsys) -> None:
-    """A bare ``<think>`` in the PROMPT is content, and must not consume the blocks after it.
-
-    A user asking what the tag means renders a literal unmatched opener into the prompt. Tracking
-    delimiters by depth leaves that opener permanently unclosed, so the template's own closer
-    completes nothing and every later block reads as stripped -- a total-loss warning for a row the
-    template kept whole. The reasoning layout is what identifies a block, not the raw tags.
+    """A user asking what the tag means renders a literal unmatched opener into the prompt. Tracking
+    delimiters by depth leaves it permanently unclosed, so the template's own closer completes
+    nothing and every later block reads as stripped -- a total-loss warning for a row the template
+    kept whole.
     """
     completion = [{"role": "assistant", "content": "<think>real reasoning</think>an answer"}]
     prepared = _thinking_prepared(completion, prompt="what does the <think> tag mean?")
@@ -1030,16 +997,13 @@ def test_a_think_tag_quoted_in_the_prompt_does_not_swallow_the_turns_that_follow
 def test_a_closing_tag_quoted_inside_reasoning_does_not_end_the_block_early(
     capsys, label: str, quoted: str
 ) -> None:
-    """The block ends at the closer the TEMPLATE emits, not at one the reasoning happens to quote.
+    """The block ends at the closer the TEMPLATE emits, not one the reasoning quotes. Ending the
+    span early puts its end before the real one, so a cap between the two calls a cut block
+    retained.
 
-    Reasoning that discusses the delimiter renders an unmatched ``</think>`` inside its own body.
-    Ending the span there puts its end before the real one, so a cap falling between the two calls
-    a cut block retained and overstates what reaches the loss.
-
-    The cap has to sit BETWEEN the two candidate ends to discriminate them. Measured on this fake
-    (one token per character), an early end lands at 60 and the template's real closer at 132/141,
-    so 100 is truncated under the correct rule and retained under an early one. A cap below both --
-    40, as this test first used -- reports truncation either way and cannot fail.
+    The cap has to sit BETWEEN the candidate ends to discriminate them: on this fake (one token per
+    character) an early end lands at 60 and the real closer at 132/141, so 100 is truncated under
+    the correct rule and retained under an early one. A cap below both cannot fail.
     """
     completion = [
         {
@@ -1057,13 +1021,10 @@ def test_a_closing_tag_quoted_inside_reasoning_does_not_end_the_block_early(
 
 
 def test_an_empty_reasoning_field_is_authoritative_over_a_tag_the_answer_quotes(capsys) -> None:
-    """A STRING ``reasoning_content`` decides the turn, even when it is empty.
-
-    The template renders the field and leaves ``content`` whole, so an empty field means the turn
-    authored no reasoning however the answer is written. Falling back to inline detection reads a
-    ``<think>`` the ANSWER quotes as this turn's reasoning; the marker then lands outside the empty
-    block the template owns, and the turn reports as dropped -- a loss warning for a row that
-    authored nothing at all.
+    """The template renders a STRING ``reasoning_content`` and leaves ``content`` whole, so an empty
+    field means the turn authored nothing however the answer is written. Falling back to inline
+    detection reads a quoted ``<think>`` as this turn's reasoning; the marker then lands outside the
+    empty block the template owns and the turn reports as dropped.
     """
     completion = [
         {
@@ -1089,15 +1050,11 @@ def test_an_empty_reasoning_field_is_authoritative_over_a_tag_the_answer_quotes(
 )
 def test_reasoning_quoting_the_turn_layout_is_still_credited(capsys, label, reasoning) -> None:
     """Control-token layout inside reasoning is CONTENT, and the turn it sits in still survives.
-
     These bytes are what a turn boundary IS, so nothing reading the rendered text alone can tell a
-    quote from the real thing -- any scheme parsing the render for turn structure either finds no
-    block or bounds one short, and reports an intact survivor as dropped. That is a warning telling
-    the user to split a transcript that lost nothing, and unfalsifiable from their side since
-    rerunning reproduces it exactly.
-
-    The marker rides inside whatever the template kept, so it answers regardless of what the
-    reasoning says.
+    quote from the real thing -- any scheme parsing the render for turn structure reports an intact
+    survivor as dropped, and the user cannot falsify it since rerunning reproduces it exactly. The
+    marker rides inside whatever the template kept, so it answers regardless of what the reasoning
+    says.
     """
     completion = [{"role": "assistant", "reasoning_content": reasoning, "content": "answer"}]
     prepared = _thinking_prepared(completion)
@@ -1109,12 +1066,10 @@ def test_reasoning_quoting_the_turn_layout_is_still_credited(capsys, label, reas
 
 
 def test_a_real_loss_is_reported_beside_a_turn_that_writes_out_the_layout(capsys) -> None:
-    """One turn's quoting must not silence a neighbour's provable loss.
-
-    An ordinary user turn resets the template's ``last_query_index``, so the first turn's reasoning
-    is definitively stripped -- its marker reaches no render at all. The final turn writes out the
-    turn layout verbatim and is kept. Each is answered by its own marker, so the row reports the
-    real loss: 2 authored, 1 rendered, and the warning fires.
+    """One turn's quoting must not silence a neighbour's provable loss. An ordinary user turn resets
+    the template's ``last_query_index``, so the first turn's reasoning is definitively stripped
+    while the final turn -- which writes out the layout verbatim -- is kept. Each is answered by its
+    own marker.
     """
 
     class KnownLossBesideQuotingEnvironment(ThinkingEnvironment):
@@ -1138,15 +1093,12 @@ def test_a_real_loss_is_reported_beside_a_turn_that_writes_out_the_layout(capsys
 
 
 def test_a_closer_quoted_before_the_layout_does_not_bound_the_block_short(capsys) -> None:
-    """Reasoning quoting a closer AND the turn layout is measured to the template's own closer.
+    """The marker sits at the end of the reasoning body, so the closing tag is found by searching
+    FORWARD from it and every quoted closer lies behind it. A short bound would score a block the
+    cap cuts as fully retained, the direction that hides the loss.
 
-    The marker sits at the end of the reasoning body, so the closing tag is found by searching
-    FORWARD from it -- every closer the reasoning quotes lies behind and cannot bound the block
-    short. A short bound would put the block's end offset too early and score a block the cap cuts
-    as fully retained, the direction that hides the loss.
-
-    Asserted at the cap boundary, where the two answers differ: one token under the block's real
-    end reports truncation, one token over does not.
+    Asserted at the cap boundary, where the answers differ: one token under the block's real end
+    reports truncation, one token over does not.
     """
     completion = [
         {
@@ -1167,12 +1119,10 @@ def test_a_closer_quoted_before_the_layout_does_not_bound_the_block_short(capsys
 
 
 def test_a_turn_index_is_terminated_so_turn_one_is_not_read_inside_turn_ten(capsys) -> None:
-    """``{prefix}1`` is a substring of ``{prefix}10`` unless the index is terminated.
-
-    Without the terminator a dropped early turn reads as surviving whenever a later turn whose index
-    starts with the same digits does, and the row reports more survivors than it lost. This
-    transcript strips every turn but the last, and the last one's index shares a prefix with an
-    earlier one, so an unterminated marker would credit the earlier turn too.
+    """``{prefix}1`` is a substring of ``{prefix}10`` unless the index is terminated, so a dropped
+    early turn reads as surviving whenever a later turn whose index starts with the same digits
+    does. This transcript strips every turn but the last, whose index shares a prefix with an
+    earlier one.
     """
 
     class ManyTurnEnvironment(ThinkingEnvironment):
@@ -1195,17 +1145,14 @@ def test_a_turn_index_is_terminated_so_turn_one_is_not_read_inside_turn_ten(caps
 
 
 def test_reasoning_loss_is_measured_over_the_rows_the_horizon_reaches(capsys) -> None:
-    """``max_steps`` can stop a run before it loads every row, and only loaded rows can lose.
+    """``max_steps`` can stop a run before it loads every row, and only loaded rows can lose. The
+    counts describe the retained dataset, but the optimizer stops at ``authoritative_steps *
+    examples_per_update``, so reasoning past that point never reaches training and warning about it
+    names a remedy for a loss the run cannot suffer. Authoritative TOKEN accounting is already
+    bounded this way.
 
-    The counts describe the retained dataset, but the optimizer consumes rows in the retained order
-    and stops at ``authoritative_steps * examples_per_update``. Reasoning that sits only in rows
-    past that point never reaches training, so warning about it names a remedy for a loss the run
-    cannot suffer. Authoritative TOKEN accounting is already bounded this way; this is the same
-    bound applied to the same rows.
-
-    The rows here are ordered by the seeded shuffle the trainer itself uses, so the prefix the
-    horizon reaches is the prefix the optimizer really trains on -- picking the rows by file order
-    instead would assert against a sequence no run ever sees.
+    The rows are ordered by the seeded shuffle the trainer itself uses, so the prefix the horizon
+    reaches is the prefix the optimizer really trains on.
     """
     consumed = set(_training_order(4)[:2])
 
@@ -1259,14 +1206,11 @@ def test_reasoning_loss_is_measured_over_the_rows_the_horizon_reaches(capsys) ->
 
 
 def test_a_tool_response_bounds_the_span_of_the_turn_before_it(capsys) -> None:
-    """A block ends at its own turn even when no LATER turn opens reasoning of its own.
-
-    A ``<tool_response>`` user turn does not reset the template's ``last_query_index``, so the
-    assistant before it KEEPS its reasoning. If the scan advances its horizon only at the next
-    REASONING turn, that trailing tool message leaves the block unbounded: the span runs through
-    the answer and the turn terminator into the tool output, and ends at a closer the tool text
-    merely quotes. A cap between the real closer and the quoted one then scores intact reasoning as
-    truncated -- a cap warning for a row that lost nothing.
+    """A ``<tool_response>`` user turn does not reset the template's ``last_query_index``, so the
+    assistant before it KEEPS its reasoning. A scan advancing its horizon only at the next REASONING
+    turn leaves that block unbounded: the span runs through the answer and the turn terminator into
+    the tool output and ends at a closer the tool text quotes, so a cap between the two scores
+    intact reasoning as cut.
     """
 
     class ToolEnvironment(ThinkingEnvironment):
@@ -1292,13 +1236,9 @@ def test_a_tool_response_bounds_the_span_of_the_turn_before_it(capsys) -> None:
 
 
 def test_a_cap_landing_on_the_answer_separator_does_not_report_lost_reasoning(capsys) -> None:
-    """Truncation is judged at the CLOSING TAG, not at the blank line that follows it.
-
-    The span runs through the ``\\n\\n`` separating reasoning from the answer, because that layout
-    is what identifies the block. The separator is not reasoning, and it costs a real token, so a
-    cap landing between the closing tag and the answer retains every reasoning token while a span
-    measured to its own end reads as cut -- a cap-loss warning naming a remedy for a row that lost
-    nothing, and an understated survival percentage.
+    """Truncation is judged at the CLOSING TAG, not the blank line after it. The ``\n\n`` separator
+    is not reasoning and costs a real token, so a cap landing between the tag and the answer retains
+    every reasoning token while a span measured to its own end reads as cut.
     """
     completion = [{"role": "assistant", "content": "<think>short</think>answer text"}]
     # the fake is one token per character: the closing tag ends at 77 and the span at 79, so this
@@ -1313,11 +1253,10 @@ def test_a_cap_landing_on_the_answer_separator_does_not_report_lost_reasoning(ca
 
 
 def test_reasoning_sampled_without_an_opening_tag_still_counts_as_authored(capsys) -> None:
-    """``reasoned</think>answer`` is reasoning: the PROMPT supplied the opening tag.
-
-    ``flash/serve/thinking.py`` recognises the same shape. Requiring a balanced pair would leave
-    such a turn out of the authored denominator entirely, so an early turn whose reasoning the
-    template strips would be lost with nothing reporting it.
+    """``reasoned</think>answer`` is reasoning: the PROMPT supplied the opening tag, and
+    ``flash/serve/thinking.py`` recognises the same shape. Requiring a balanced pair leaves such a
+    turn out of the authored denominator entirely, so an early turn the template strips goes
+    unreported.
     """
     completion = [
         {"role": "assistant", "content": "early reasoning</think>a1"},
@@ -1334,12 +1273,9 @@ def test_reasoning_sampled_without_an_opening_tag_still_counts_as_authored(capsy
 
 
 def test_the_templates_own_empty_think_block_is_not_counted_as_authored(capsys) -> None:
-    """A turn carrying only ``<think>\\n\\n</think>`` authored nothing, so nothing can be lost.
-
-    The template stamps that empty block onto qualifying trailing assistant turns, so it comes back
-    in any transcript captured from a previous render. Counting it as authored marks a block the
-    real render does not have; the span counts then disagree and the row is reported as having lost
-    ALL of its reasoning -- a total-loss warning for a dataset that lost none.
+    """The template stamps ``<think>\n\n</think>`` onto qualifying trailing assistant turns, so it
+    comes back in any transcript captured from a previous render. Counting it as authored marks a
+    block the real render does not have, and the row reports having lost ALL of its reasoning.
     """
     completion = [{"role": "assistant", "content": "<think>\n\n</think>just an answer"}]
     prepared = _thinking_prepared(completion)
@@ -1367,11 +1303,9 @@ def test_the_templates_own_empty_think_block_is_not_counted_as_authored(capsys) 
 def test_reasoning_the_template_keeps_is_marked_wherever_its_delimiters_sit(
     label: str, content, capsys
 ) -> None:
-    """The marker must land inside the block the template keeps, not merely near a ``<think>``.
-
-    If it lands outside, the marker never reaches the render, and the row reports a drop for
-    reasoning that in fact reached the loss -- a false warning telling the user to restructure a
-    dataset that was fine.
+    """The marker must land inside the block the template keeps, not merely near a ``<think>``. If
+    it lands outside it never reaches the render, and the row reports a drop for reasoning that
+    reached the loss.
     """
     prepared = _thinking_prepared([{"role": "assistant", "content": content}])
 
@@ -1381,13 +1315,10 @@ def test_reasoning_the_template_keeps_is_marked_wherever_its_delimiters_sit(
 
 
 def test_a_quoting_answer_on_a_dropped_turn_is_not_credited_as_a_survivor(capsys) -> None:
-    """A turn whose reasoning the template dropped stays dropped, however its answer is written.
-
-    The early turn supplies reasoning through ``reasoning_content`` and its ANSWER quotes the
-    ``<think>`` format. The template strips that turn's reasoning but renders the quote verbatim, so
-    any scheme that asks "did perturbing this turn change the span count?" sees the quote move and
-    credits the turn. Survival is an identity question: the quote is not this turn's reasoning and
-    can never stand in for it.
+    """The early turn supplies reasoning through ``reasoning_content`` and its ANSWER quotes the
+    ``<think>`` format. The template strips the reasoning but renders the quote verbatim, so any
+    scheme asking "did perturbing this turn change the span count?" sees the quote move and credits
+    the turn. Survival is an identity question: the quote is not this turn's reasoning.
     """
     completion = [
         {
@@ -1407,12 +1338,9 @@ def test_a_quoting_answer_on_a_dropped_turn_is_not_credited_as_a_survivor(capsys
 
 
 def test_an_image_rows_visual_tokens_are_charged_against_the_reasoning_cap() -> None:
-    """On an image row the cap is spent on visual tokens before any text reaches it.
-
-    Training truncates the ids the PROCESSOR produced, in which each image has expanded into many
-    visual tokens; the text render contains none of them. Measuring a reasoning block against the
-    raw cap therefore calls it retained when the expansion has already pushed it past the end of
-    the supervised span, overstating how much reasoning reaches the loss.
+    """Training truncates the ids the PROCESSOR produced, in which each image has expanded into many
+    visual tokens the text render does not contain. Measuring a reasoning block against the raw cap
+    calls it retained when the expansion has already pushed it past the end of the supervised span.
     """
     import base64
     import io as _io
@@ -1497,12 +1425,10 @@ def test_an_image_rows_visual_tokens_are_charged_against_the_reasoning_cap() -> 
 def test_trailing_whitespace_in_reasoning_is_not_charged_against_the_cap(
     capsys, label, completion
 ) -> None:
-    """The template ``|trim``s the reasoning, so the marker must land on the TRIMMED body.
-
-    Appended after trailing whitespace, the marker shields that whitespace from the trim: the
-    marked render then carries a run the real render drops, and tokenizes longer through the closing
-    tag. A cap landing exactly at the real block's end reports a block that fully fits as cut by
-    ``max_context_tokens`` -- the measurement's own bytes deciding the answer.
+    """The template ``|trim``s the reasoning, so the marker must land on the TRIMMED body. Appended
+    after trailing whitespace it shields that whitespace from the trim, so the marked render carries
+    a run the real one drops and tokenizes longer through the closing tag -- the measurement's own
+    bytes deciding the answer.
 
     The cap is the real block's exact token end, the only value where the two rules differ: one
     token higher and neither reports truncation.
@@ -1519,18 +1445,15 @@ def test_trailing_whitespace_in_reasoning_is_not_charged_against_the_cap(
 
 
 def test_the_marker_stem_search_does_not_scan_once_per_character() -> None:
-    """A valid row must not cost quadratic time before tokenization even begins.
-
-    Text holding the stem followed by N filler characters keeps every one-character extension a
-    substring, so growing the stem one at a time walks the whole row N times. Profiling runs on the
-    control plane ahead of tokenization, so a large packaged row stalls it rather than failing
-    anything -- and the row is perfectly valid, so nothing else reports a problem.
+    """A valid row must not cost quadratic time before tokenization begins. Text holding the stem
+    followed by N filler characters keeps every one-character extension a substring, so growing the
+    stem one at a time walks the whole row N times. Profiling runs on the control plane ahead of
+    tokenization, so a large packaged row stalls it rather than failing anything.
 
     Two assertions, because either alone passes on a broken implementation. The equivalence cases
-    fix WHAT is returned -- the shortest absent stem, exactly what the one-at-a-time loop produced,
-    so a faster search cannot quietly hand back a longer marker. The budget fixes what it COSTS: the
-    one-at-a-time loop needs 21s on the large input below and a scan-bounded one needs milliseconds,
-    so a generous ceiling separates them without being flaky on a loaded machine.
+    fix WHAT is returned -- the shortest absent stem, so a faster search cannot hand back a longer
+    marker. The budget fixes what it COSTS: the one-at-a-time loop needs 21s on the input below and
+    a scan-bounded one needs milliseconds.
     """
     stem = "flashreasoningmark"
 
