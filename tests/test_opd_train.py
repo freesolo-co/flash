@@ -8874,6 +8874,8 @@ def test_the_watchdog_reexport_and_definition_are_the_same_object():
 
     assert plugin._bounded_replay_buffer_sample is watchdog._bounded_replay_buffer_sample
     assert plugin._init_transfer_queue is watchdog._init_transfer_queue
+
+
 def test_opd_sitecustomize_composes_into_valid_python_with_the_guard(tmp_path, monkeypatch):
     """the wrapper indents a whole rendered fragment into a try block; a syntax slip there would
     turn every opd child patch into a silent no-op, so compiling the composed file is the gate."""
