@@ -572,6 +572,39 @@ def test_control_plane_profiles_image_rows_without_loading_a_processor(
     assert profile.architecture_mode == "multimodal"
 
 
+def test_the_quote_grows_with_the_image_the_user_packaged(tmp_path, monkeypatch) -> None:
+    """The billed token total has to track image size, not just be non-zero.
+
+    A profile that counted one token per image would still "work" -- it would return, and the run
+    would train -- while quoting a 1024x768 screenshot at the price of a thumbnail. The whole point
+    of the arithmetic is that the number moves.
+    """
+    monkeypatch.setattr(
+        "flash.engine.profiling.image_tokens.load_image_geometry",
+        lambda *_args, **_kwargs: ImageGeometry(
+            patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
+        ),
+    )
+
+    def tokens_for(width: int, height: int, directory: str) -> int:
+        entrypoint = _image_package(tmp_path / directory, width=width, height=height)
+        spec = replace(
+            _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B"),
+            train=TrainSpec(epochs=2, batch_size=2, max_context_tokens=4096),
+        )
+        return profile_packaged_sft_dataset(
+            spec,
+            producer_version="1.2.3",
+            tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
+            packing_support=lambda _model, _revision: ("gdn-hybrid", True),
+        ).real_tokens_per_epoch
+
+    small = tokens_for(56, 56, "small")
+    large = tokens_for(1024, 768, "large")
+    # 64 pad tokens versus 768: the difference is the image, since every other input is identical.
+    assert large - small == 768 - 64
+
+
 def test_an_unreadable_image_is_a_packaging_error_not_a_crash(tmp_path, monkeypatch) -> None:
     entrypoint = _package(
         tmp_path,
