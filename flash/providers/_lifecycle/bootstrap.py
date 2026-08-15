@@ -41,6 +41,8 @@ CODE_ROOT = "/runcode"
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
 _CONSOLE_UPLOAD_POLL_S = 120.0
+# unchanged polls meaning wedged; (this + 1) * poll must stay under poll_job's 1200s training stall.
+_CONSOLE_UPLOAD_QUIET_POLLS = 4
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
@@ -235,8 +237,11 @@ def hf_upload(
     repo_subpath: str,
     *,
     enforce_deadline: bool = True,
-) -> None:
-    """Upload one artifact under the run's HF prefix; never raises."""
+) -> bool:
+    """Upload one artifact under the run's HF prefix; never raises. True only if it landed.
+
+    Swallowing the error keeps a failure from killing the run, but a caller tracking what is stored
+    would read a silent return as success and skip the retry it earned."""
     try:
         from huggingface_hub import HfApi
 
@@ -248,22 +253,24 @@ def hf_upload(
             repo_id=payload["hf_repo"],
             repo_type="dataset",
         )
+        return True
     except Exception as exc:
         print(
             f"hf upload warn ({repo_subpath}): {_safe_detail(exc, secrets=_payload_secrets(payload))}",
             flush=True,
         )
+        return False
 
 
-def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> None:
-    """Upload one console snapshot from an isolated process."""
+def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> bool:
+    """Upload one console snapshot from an isolated process. True only if it landed."""
     tail_path = console + ".tail"
     tail = _read_console_tail(console, 64_000, secrets=_payload_secrets(payload))
     if extra:
         tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
         f.write(_safe_detail(tail, 64_000, secrets=_payload_secrets(payload)))
-    hf_upload(payload, tail_path, f"console_{mode}.txt")
+    return hf_upload(payload, tail_path, f"console_{mode}.txt")
 
 
 def _console_size(console: str) -> int:
@@ -279,36 +286,33 @@ def _console_upload_loop(
 ) -> None:
     """Snapshot the console until ``stop_upload`` is set, polling cheaply for a wedge.
 
-    _CONSOLE_UPLOAD_POLL_S is how often the uploader LOOKS, not how often it commits: a stat() costs
-    nothing against the shared artifact repo's commit budget.
-
-    The stall classifier tears a wedged run down at 1200s (training) or 3000s (setup grace), so an
-    hourly loop uploads a console PREDATING the hang -- and the last lines before output stopped are
-    the whole diagnostic. Shortening the interval is not available: the heartbeat already spends 4
-    of the 5 commits/hour this shared artifact repo is budgeted (see
-    test_live_console_uploads_are_throttled_for_shared_artifact_repos).
-
-    So it polls often and commits rarely: only when the console holds un-uploaded bytes AND either
-    the interval elapsed or output just WENT QUIET, quiet being the wedge signature. A healthy run
-    still commits hourly; a wedged one commits once more when it falls silent, then never again
-    because later polls find nothing new.
+    Polling is free; committing is not (the heartbeat spends 4 of this repo's 5 commits/hour), and
+    the stall classifier kills a wedged run at 1200s/3000s -- long before an hourly snapshot would
+    capture the hang. So commit only on un-uploaded bytes AND either the interval elapsing or
+    silence sustained over _CONSOLE_UPLOAD_QUIET_POLLS samples; spend that quiet snapshot once per
+    run; and advance it and ``sent`` only on reported success, since hf_upload swallows its
+    exception. Each rule is pinned by a test_instance_console_upload_loop_* case.
     """
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
     sent = prev = -1
-    since = 0.0
+    since = quiet_polls = 0.0
+    quiet_used = False
     while not stop_upload.wait(poll_s):
         since += poll_s
         size = _console_size(console)
-        quiet = size == prev
+        quiet_polls = quiet_polls + 1 if size == prev else 0
         prev = size
-        if size == sent or not (since >= due_s or quiet):
+        wedged = quiet_polls >= _CONSOLE_UPLOAD_QUIET_POLLS and not quiet_used
+        if size == sent or not (since >= due_s or wedged):
             continue
         try:
-            _upload_console_snapshot(payload, console, mode)
+            uploaded = _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
             print(f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}")
-        sent, since, due_s = size, 0.0, interval_s
+            uploaded = False
+        quiet_used = quiet_used or (wedged and uploaded)
+        sent, since, due_s = (size if uploaded else sent), 0.0, interval_s
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:

@@ -1091,15 +1091,25 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # literals here so the shipped uploader cannot drift away from the deadlines above.
     body = inspect.getsource(endpoints._train_body)
     assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_POLL_S})" in body
+    assert f"due_s, since, quiet_polls = {endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S}" in body
+    assert f"quiet_used or (wedged and ok), 0.0, {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
+    # the sustained-silence threshold and the success-gated watermark, which keep a sparsely
+    # logging run inside the shared repo's commit budget and retry a swallowed upload failure.
     assert (
-        f"due_s, since, uploaded_size, previous_size = {endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S}"
+        f"quiet_polls >= {_instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS} and not quiet_used"
         in body
     )
-    assert f"due_s = size, 0.0, {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
+    assert "uploaded_size = size if ok else uploaded_size" in body
 
 
-def _drive_instance_upload_loop(monkeypatch, sizes: list[int], cycles: int) -> tuple[list, list]:
-    """Run the real instance loop over a scripted console-size series. Returns (waits, uploads)."""
+def _drive_instance_upload_loop(
+    monkeypatch, sizes: list[int], cycles: int, *, succeed=True
+) -> tuple[list, list]:
+    """Run the real instance loop over a scripted console-size series. Returns (waits, uploads).
+
+    ``succeed`` is the upload result, either a bool or a predicate over the attempt number, so a
+    test can script an upload that fails the way hf_upload does: swallowed, returning falsy.
+    """
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
 
     waits: list[float] = []
@@ -1116,12 +1126,12 @@ def _drive_instance_upload_loop(monkeypatch, sizes: list[int], cycles: int) -> t
         clock["i"] += 1
         return sizes[index]
 
+    def _upload(_payload, _console, _mode) -> bool:
+        uploads.append(clock["i"])
+        return succeed(len(uploads)) if callable(succeed) else succeed
+
     monkeypatch.setattr(_instance_bootstrap, "_console_size", _size)
-    monkeypatch.setattr(
-        _instance_bootstrap,
-        "_upload_console_snapshot",
-        lambda _payload, _console, _mode: uploads.append(clock["i"]),
-    )
+    monkeypatch.setattr(_instance_bootstrap, "_upload_console_snapshot", _upload)
     _instance_bootstrap._console_upload_loop({}, "/tmp/console.txt", "train", 3600.0, _Stop())
     return waits, uploads
 
@@ -1166,19 +1176,103 @@ def test_instance_console_upload_loop_commits_when_a_wedged_run_goes_quiet(monke
     # the run must wedge AFTER its first snapshot -- the case the interval rule cannot cover on its
     # own. a series that wedges BEFORE the first commit proves nothing: the elapsed-interval rule
     # fires there anyway, so the test would still pass with the quiet trigger deleted.
+    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
     grow_polls = int(first_s / poll_s) + 1
-    cycles = grow_polls + 6
-    wedged = [1000 * (n + 1) for n in range(grow_polls)] + [1000 * grow_polls] * 8
+    cycles = grow_polls + quiet_polls + 6
+    wedged = [1000 * (n + 1) for n in range(grow_polls)] + [1000 * grow_polls] * (quiet_polls + 8)
     _waits, uploads = _drive_instance_upload_loop(monkeypatch, wedged, cycles=cycles)
 
     # two commits: the first snapshot, then one more once output stopped.
     assert len(uploads) == 2, "a run that wedges after its first snapshot must commit again"
-    quiet_upload_s = uploads[1] * poll_s
-    # strictly inside the 1200s training stall deadline, and far short of the hourly interval.
-    assert quiet_upload_s < 1200.0
-    assert quiet_upload_s < _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
+    # measured from when OUTPUT STOPPED, which is when the stall classifier starts counting -- not
+    # from run start. the deadline is 1200s of no progress, so the lag is what has to fit inside it.
+    silence_began_s = grow_polls * poll_s
+    assert uploads[1] * poll_s - silence_began_s < 1200.0
+    assert uploads[1] * poll_s < _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
     # and it must not keep re-uploading identical bytes once the run is silent.
     assert uploads[1] < cycles
+
+
+def test_instance_console_upload_loop_keeps_a_sparsely_logging_run_in_budget(monkeypatch):
+    """A healthy run that logs slower than the poll must not be mistaken for a wedge.
+
+    Momentary quiet is normal: a worker in a teacher call or a compile emits nothing for minutes at
+    a time. Treating ONE unchanged sample as the wedge signature commits on nearly every poll, so
+    the loop that exists to respect the shared repo's 5 commits/hour spends 10 by itself. Silence
+    has to be sustained, and the resulting snapshot spent once, or the rate is unbounded.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
+    hours = 2
+    cycles = int(hours * 3600.0 / poll_s)
+    # alternating phases of sustained silence and output -- each silent phase is long enough to
+    # look wedged, so without the one-shot latch every cycle buys another commit.
+    phase = quiet_polls + 2
+    sizes = [1000 * (n // phase) for n in range(cycles + 2)]
+    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles)
+
+    import flash.engine.worker as worker
+
+    commits_per_hour = len(uploads) / hours
+    total = 3600.0 / worker._HB_MIN_INTERVAL_S + commits_per_hour
+    assert total <= 5.0, f"{commits_per_hour}/hr console + heartbeat = {total}/hr, budget is 5"
+
+
+def test_instance_console_upload_loop_saves_the_quiet_snapshot_for_a_real_wedge(monkeypatch):
+    """A brief healthy pause must not consume the one quiet snapshot the wedge case needs.
+
+    The quiet commit is taken once per run. If a single unchanged sample triggered it, an ordinary
+    pause between log lines would spend it early, and the hang that follows -- the failure this
+    whole path exists to capture -- would get no snapshot until the next hourly boundary, long
+    after the stall classifier tore the run down.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
+    grow_polls = int(first_s / poll_s) + 1
+    pause_polls = quiet_polls - 1  # a pause too short to be a wedge
+    wedge_at = grow_polls + pause_polls + 2
+    sizes = [1000 * (n + 1) for n in range(grow_polls)]
+    sizes += [1000 * grow_polls] * pause_polls  # brief pause, then output resumes
+    sizes += [1000 * (grow_polls + n + 1) for n in range(2)]
+    sizes += [1000 * (grow_polls + 2)] * (quiet_polls + 4)  # the real wedge
+    cycles = len(sizes)
+    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles)
+
+    after_wedge = [u for u in uploads if u > wedge_at]
+    assert after_wedge, "the brief pause consumed the snapshot the real wedge needed"
+    # and it lands inside the 1200s training stall, measured from when output actually stopped.
+    assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
+
+
+def test_instance_console_upload_loop_retries_when_an_upload_fails(monkeypatch):
+    """hf_upload swallows its exception, so a failed snapshot returns normally.
+
+    Advancing the uploaded-bytes watermark on that return marks bytes as stored that reached no
+    repo. For a wedged run producing nothing further, every later poll then sees size == sent and
+    skips -- so one transient 500 costs the entire console, which is the only evidence of the hang.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    # the run must produce NO new bytes after the failed upload -- that is the suppressed case. a
+    # console still growing supplies a different size on the next poll, so the retry happens by
+    # accident and the test would pass with the watermark bug restored.
+    grow_polls = int(first_s / poll_s) + 1
+    sizes = [1000] * (grow_polls + 14)
+    cycles = len(sizes)
+    _waits, uploads = _drive_instance_upload_loop(
+        monkeypatch, sizes, cycles=cycles, succeed=lambda attempt: attempt > 1
+    )
+
+    assert len(uploads) > 1, "a swallowed upload failure must not suppress every later attempt"
+    # the retry must land inside the stall window, not at the next hourly boundary.
+    assert (uploads[1] - uploads[0]) * poll_s < 1200.0
 
 
 def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots():

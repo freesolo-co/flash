@@ -516,7 +516,7 @@ def _train_body(input_data: dict) -> dict:
 
         console_upload_lock = threading.Lock()
 
-        def _upload_console(mode: str) -> None:
+        def _upload_console(mode: str) -> bool:
             """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
             console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
             from both the subprocess-failure path and the missing-metrics crash path: a worker killed
@@ -525,29 +525,29 @@ def _train_body(input_data: dict) -> dict:
             crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque.
 
             Serialized against itself: the periodic uploader is a daemon thread joined with a
-            timeout, so a slow snapshot can still be running when the final one begins. Both write
-            the same ``.tail`` file and commit to the same repo path, and if the older call landed
-            last it would replace the terminal console with bytes captured BEFORE the failure --
-            destroying the record. The lock makes the last caller the last writer.
+            timeout, so a slow snapshot can still run when the final one begins. Both write the same
+            ``.tail`` and commit to the same path; if the older landed last it would replace the
+            terminal console with pre-failure bytes. The lock makes the last caller the last writer.
 
-            The wait is BOUNDED. An unbounded acquire would hand a wedged network request the power
-            to block ``run_mode`` until the deadline timer hard-exits the process -- so a hung
-            periodic upload would cost the terminal snapshot entirely, the opposite of the point.
-            On timeout the upload is skipped rather than run concurrently: overlapping is what
-            could overwrite newer bytes with older ones, and the in-flight snapshot is still
-            uploading a superset of what this call would have sent."""
+            The wait is BOUNDED: an unbounded acquire would let a wedged network request block
+            ``run_mode`` until the deadline timer hard-exits the process, costing the terminal
+            snapshot. On timeout the upload is skipped, not run concurrently -- overlapping is what
+            overwrites newer bytes with older, and the in-flight snapshot already sends a superset.
+
+            Returns whether the tail landed: errors are swallowed, not raised, so a caller tracking
+            what is stored cannot read a normal return as success and skip the retry it earned."""
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
-                return
+                return False
             if not console_upload_lock.acquire(timeout=120.0):
                 print(f"console upload skipped for {mode}; a snapshot is still in flight")
-                return
+                return False
             try:
-                _upload_console_locked(mode, console)
+                return _upload_console_locked(mode, console)
             finally:
                 console_upload_lock.release()
 
-        def _upload_console_locked(mode: str, console: str) -> None:
+        def _upload_console_locked(mode: str, console: str) -> bool:
             try:
                 from huggingface_hub import HfApi
 
@@ -591,8 +591,10 @@ def _train_body(input_data: dict) -> dict:
                     repo_id=input_data["hf_repo"],
                     repo_type="dataset",
                 )
+                return True
             except Exception as e:
                 print("console upload warn:", _safe_detail(e, env))
+                return False
 
         def run_mode(mode: str, check: bool) -> int:
             """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
@@ -605,24 +607,26 @@ def _train_body(input_data: dict) -> dict:
                 # test_first_console_snapshot_precedes_the_stall_teardown pins these numbers to
                 # those constants so the shipped uploader cannot drift.
                 #
-                # polls every 120s but commits rarely: an upload happens only when the console has
-                # bytes not yet uploaded AND either the hourly interval elapsed or output just went
-                # quiet. quiet is the wedge signature, and a wedged run is torn down long before the
-                # next hourly boundary -- so without it the artifact predates the hang. the commit
-                # rate against the shared repo is unchanged for a healthy run.
-                due_s, since, uploaded_size, previous_size = 600.0, 0.0, -1, -1
+                # polls every 120s, commits rarely: only on un-uploaded bytes AND either the hourly
+                # interval elapsing or 4 SILENT polls, the quiet snapshot spent once per run and
+                # both watermarks advancing only on success. mirrors bootstrap._console_upload_loop,
+                # whose docstring carries the reasoning for each rule.
+                due_s, since, quiet_polls = 600.0, 0.0, 0
+                uploaded_size, previous_size, quiet_used = -1, -1, False
                 while not stop_upload.wait(120.0):
                     since += 120.0
                     try:
                         size = os.path.getsize(console)
                     except OSError:
                         size = -1
-                    went_quiet = size == previous_size
+                    quiet_polls = quiet_polls + 1 if size == previous_size else 0
                     previous_size = size
-                    if size == uploaded_size or not (since >= due_s or went_quiet):
+                    wedged = quiet_polls >= 4 and not quiet_used
+                    if size == uploaded_size or not (since >= due_s or wedged):
                         continue
-                    _upload_console(mode)  # best-effort; swallows its own errors
-                    uploaded_size, since, due_s = size, 0.0, 3600.0
+                    ok = _upload_console(mode)  # swallows its own errors; False if it did not land
+                    uploaded_size = size if ok else uploaded_size
+                    quiet_used, since, due_s = quiet_used or (wedged and ok), 0.0, 3600.0
 
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()

@@ -42,6 +42,8 @@ _SECRET_DETAIL = re.compile(
 # component lines of a multiline credential shorter than this are punctuation such as ``}``, not
 # secrets; redacting them would erase innocent text. Matches `bootstrap_secrets._MIN_SECRET_COMPONENT`.
 _MIN_SECRET_COMPONENT = 8
+# vocabulary ids run to ~7 digits at today's sizes; longer digit runs are not ids. see _is_token_id.
+_MAX_TOKEN_ID_DIGITS = 7
 
 
 def _plugin():
@@ -259,6 +261,31 @@ def _secret_needles(secret: str) -> set[str]:
     return needles
 
 
+def _is_token_id(match: re.Match[str]) -> bool:
+    """True for `token: 151643` -- a vocabulary id, not a credential.
+
+    The exemption exists because a bad eos or token-boundary id is often the entire diagnostic this
+    record carries, and shape redaction would eat it. But "any digit-only value" is far too wide a
+    hole to leave in the fail-closed net: `{"access_token": "123456789012"}` is a numeric credential,
+    and a runtime-minted one contributes no needle to the value pass either, so this predicate would
+    be the only thing between it and an artifact the user can fetch.
+
+    So the exemption is narrowed to the shape a vocabulary id actually has: the bare word `token`
+    (never `access_token`, `api_key`, `password`, or `authorization`, none of which label an id),
+    unquoted, and short enough to be one. A quoted value is a serialized field, not a number
+    rendered into a sentence.
+    """
+    key, separator, quote, value = match.group(1), match.group(2), match.group(3), match.group(4)
+    return (
+        value.isdigit()
+        and len(value) <= _MAX_TOKEN_ID_DIGITS
+        and not quote
+        and "'" not in separator
+        and '"' not in separator
+        and key.lower() == "token"
+    )
+
+
 def _safe_child_failure_detail(error: Exception) -> str:
     """``error`` rendered with credentials removed, never raising.
 
@@ -284,14 +311,11 @@ def _safe_child_failure_detail(error: Exception) -> str:
     message = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", message)
     # shape redaction stays as the fail-closed net for a credential this process cannot know by
     # value -- one minted at runtime (a presigned url, a broker capability) is in neither the
-    # environment nor any payload, so it contributes no needle above. the numeric exemption is the
-    # one place that net misfires on THIS path: `token: 151643` is a vocabulary id, and a bad eos or
-    # token-boundary id is often the entire diagnostic the record exists to carry. a bare integer
-    # cannot be a credential, so exempting it costs no coverage.
+    # environment nor any payload, so it contributes no needle above.
     return _SECRET_DETAIL.sub(
         lambda match: (
             match.group(0)
-            if match.group(4).isdigit()
+            if _is_token_id(match)
             else f"{match.group(1)}{match.group(2)}{match.group(3)}<redacted>"
         ),
         message,

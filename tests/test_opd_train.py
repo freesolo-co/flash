@@ -4656,6 +4656,32 @@ def test_child_failure_sanitizer_keeps_token_ids_and_redacts_encoded_and_multili
         assert "defghijkl" not in _safe_child_failure_detail(ValueError(f"url ?auth={encoded}"))
 
 
+def test_child_failure_sanitizer_redacts_digit_only_credentials():
+    """The token-id exemption must not become a hole for a numeric credential.
+
+    Exempting every digit-only value attached to a credential key lets `{"access_token":
+    "123456789012"}` and `password=123456` through verbatim. A numeric credential minted at runtime
+    is in no environment variable either, so the value pass cannot catch it and shape redaction is
+    the only net there is. Only the shape a vocabulary id actually has is exempt.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, secret in (
+        ('auth failed: {"access_token":"123456789012"}', "123456789012"),
+        ("password=123456", "123456"),
+        ("api_key: 987654321098", "987654321098"),
+        ('{"token": "123456789"}', "123456789"),  # quoted -> a serialized field, not an id
+        ("access_token=1234567", "1234567"),  # id-length, but not the bare word `token`
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert secret not in redacted, redacted
+        assert "<redacted>" in redacted
+
+    # the diagnostic the exemption exists for still survives.
+    for kept in ("unexpected token: 151643 while decoding", "eos token: 99 mismatch"):
+        assert _safe_child_failure_detail(ValueError(kept)) == kept
+
+
 def test_child_failure_sanitizer_redacts_a_runtime_credential_quoted_in_json_or_a_dict():
     """A credential minted at runtime is in NO environment variable, so shape is the only net.
 
