@@ -309,7 +309,7 @@ def _safe_child_failure_detail(error: Exception) -> str:
     secrets = {value for name, value in os.environ.items() if value and _secret_env_name(name)}
     for secret in sorted(secrets, key=len, reverse=True):
         for needle in sorted(_secret_needles(secret), key=len, reverse=True):
-            if len(needle) >= 8:
+            if len(needle) >= _MIN_SECRET_COMPONENT:
                 message = message.replace(needle, "<redacted>")
                 continue
             left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""

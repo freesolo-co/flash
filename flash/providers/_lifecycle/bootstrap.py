@@ -238,10 +238,9 @@ def hf_upload(
     *,
     enforce_deadline: bool = True,
 ) -> bool:
-    """Upload one artifact under the run's HF prefix; never raises. True only if it landed.
-
-    Swallowing the error keeps a failure from killing the run, but a caller tracking what is stored
-    would read a silent return as success and skip the retry it earned."""
+    """Upload one artifact under the run's HF prefix; never raises. True only if it landed: the
+    error is swallowed so it cannot kill the run, but a caller tracking what is stored would read
+    a silent return as success and skip the retry it earned."""
     try:
         from huggingface_hub import HfApi
 
@@ -291,8 +290,7 @@ def _console_upload_loop(
     capture the hang. So commit only on un-uploaded bytes AND either the interval elapsing or
     silence sustained over _CONSOLE_UPLOAD_QUIET_POLLS samples; spend that quiet snapshot once per
     run; and advance it and ``sent`` only on reported success, since hf_upload swallows its
-    exception. Each rule is pinned by a test_instance_console_upload_loop_* case.
-    """
+    exception. Each rule is pinned by a test_instance_console_upload_loop_* case."""
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
     sent = prev = -1
@@ -309,7 +307,9 @@ def _console_upload_loop(
         try:
             uploaded = _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
-            print(f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}")
+            # flush: the only trace of a failed upload, and teardown kills this process outright.
+            detail = _safe_detail(exc, secrets=_payload_secrets(payload))
+            print(f"console upload warn: {detail}", flush=True)
             uploaded = False
         quiet_used = quiet_used or (wedged and uploaded)
         sent, since, due_s = (size if uploaded else sent), 0.0, interval_s
