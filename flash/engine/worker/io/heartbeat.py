@@ -162,20 +162,20 @@ def heartbeat(
     stage: str, *, liveness: bool = False, force: bool = False, initial: bool = False, **kw
 ):
     global _HB_CLAIM_SEQ
-    ts = time.time()
-    # liveness pings don't count as progress; provider stall detection skips them.
-    if not liveness:
-        _w._HB_LAST_PROGRESS_TS = ts
+    genuine_progress = not liveness
     with _HB_LOCK:
-        if not liveness:
+        ts = time.time()
+        if genuine_progress:
+            _w._HB_LAST_PROGRESS_TS = ts
             _w._HB_PROGRESS_SEQ += 1
         elif _w._HB_PROGRESS_SEQ > _w._HB_PROGRESS_UPLOADED_SEQ:
             # progress-carry: a real heartbeat since the last committed snapshot never reached HF
             # (throttled away or its upload failed). upgrade this ping to a real heartbeat so the
             # control plane's stall clock sees that progress instead of killing a healthy run.
-            # deliberately after the _HB_LAST_PROGRESS_TS bump above: carried progress is not NEW
-            # progress, so the worker's own stall-dump timer keeps its original reference point.
+            # carried progress is not new progress, so do not advance _HB_LAST_PROGRESS_TS: the
+            # worker's own stall-dump timer and the published age keep the original reference point.
             liveness = False
+        latest_progress_ts = float(_w._HB_LAST_PROGRESS_TS or 0.0)
         my_progress_seq = _w._HB_PROGRESS_SEQ
     payload = {
         "stage": stage,
@@ -187,6 +187,12 @@ def heartbeat(
         **({"liveness": True} if liveness else {}),
         **kw,
     }
+    if genuine_progress:
+        payload["progress_age_s"] = 0.0
+    elif latest_progress_ts:
+        payload["progress_age_s"] = round(max(0.0, ts - latest_progress_ts), 1)
+    else:
+        payload.pop("progress_age_s", None)
     _dc = os.environ.get("RUNPOD_DC_ID") or ""
     if _dc:
         payload.setdefault("dc", _dc)
