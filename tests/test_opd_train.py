@@ -5965,6 +5965,7 @@ class _StubReplayBuffer:
     def __init__(self):
         self.partitions = {"train": {}}
         self.lock = threading.Lock()
+        self.poll_interval = 0
 
     def close(self):
         pass
@@ -6174,6 +6175,46 @@ def test_replay_buffer_refuses_to_train_on_a_batch_a_failed_rollout_shrank():
     # step must not fail this one
     buffer.partitions["train"]["prompt-b"] = {"global_steps": 99, "status": "failure"}
     assert buffer.sample("train", global_steps=3).keys == ["prompt-a"]
+
+
+def test_replay_buffer_fails_before_waiting_on_a_dead_workers_running_siblings():
+    """A hard-exited ray worker strands every other prompt in its chunk as "running".
+
+    verl's `ReplayBuffer.sample` breaks on the first running tag and waits forever, so calling it
+    before checking the failed uid makes the guard unreachable. The flash wrapper must abort the
+    step first; the parent implementation below raises if it is entered at all.
+    """
+    from flash.engine.worker.train.opd.child.multiturn import build_flash_replay_buffer
+
+    class _ParentMustNotRun(_StubReplayBuffer):
+        def sample(self, partition_id, global_steps=None, batch_size=None):
+            raise AssertionError("entered verl's unbounded wait before checking the failure tag")
+
+    buffer = build_flash_replay_buffer(_ParentMustNotRun)()
+    buffer.partitions["train"] = {
+        "failed-prompt": {"global_steps": 3, "status": "running"},
+        "dead-sibling-a": {"global_steps": 3, "status": "running"},
+        "dead-sibling-b": {"global_steps": 3, "status": "running"},
+        "other-worker": {"global_steps": 3, "status": "success"},
+    }
+
+    class _FailureArrivesAfterSamplingStarts:
+        polls = 0
+
+        def __enter__(self):
+            self.polls += 1
+            if self.polls == 2:
+                buffer.partitions["train"]["failed-prompt"]["status"] = "failure"
+
+        def __exit__(self, *_args):
+            return False
+
+    lock = _FailureArrivesAfterSamplingStarts()
+    buffer.lock = lock
+
+    with pytest.raises(RuntimeError, match="rollout failed for 1 prompt"):
+        buffer.sample("train", global_steps=3)
+    assert lock.polls == 2
 
 
 def test_agent_loops_are_registered_under_an_importable_qualname():

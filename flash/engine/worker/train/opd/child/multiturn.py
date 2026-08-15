@@ -476,6 +476,12 @@ def build_flash_replay_buffer(ReplayBuffer):
     worse: a hang is at least diagnosable, while a padded short batch publishes a model trained on
     data the run never collected.
 
+    The failure check must run BEFORE verl's `sample`, not after it. A ray actor owns every prompt
+    in one chunk of the step's batch, often several because flash caps the worker pool at 8. The
+    hard exit kills those sibling tasks too, leaving their tags "running" forever. Upstream
+    `sample` breaks on the first "running" tag and never returns, so a post-`super` guard is
+    unreachable on exactly the multi-prompt worker shape this fix has to handle.
+
     Raising reaches the parent as a nonzero child exit, the only channel that carries a rollout
     failure out of the verl child -- the rollout dies in a ray actor whose exit code ray never
     reports to the driver.
@@ -488,20 +494,30 @@ def build_flash_replay_buffer(ReplayBuffer):
             global_steps: int | None = None,
             batch_size: int | None = None,
         ):
-            batch = super().sample(partition_id, global_steps=global_steps, batch_size=batch_size)
-            with self.lock:
-                failed = sorted(
-                    key
-                    for key, tag in self.partitions[partition_id].items()
-                    if tag.get("global_steps") == global_steps and tag.get("status") == "failure"
+            if global_steps is None:
+                return super().sample(
+                    partition_id, global_steps=global_steps, batch_size=batch_size
                 )
-            if failed:
-                raise RuntimeError(
-                    f"flash OPD rollout failed for {len(failed)} prompt(s) at step "
-                    f"{global_steps} (first: {failed[0]}); refusing to train on the "
-                    f"{len(batch.keys)} rollout(s) that did survive"
-                )
-            return batch
+
+            while True:
+                time.sleep(self.poll_interval)
+                with self.lock:
+                    step_tags = [
+                        (key, tag)
+                        for key, tag in self.partitions[partition_id].items()
+                        if tag.get("global_steps") == global_steps
+                    ]
+                    failed = sorted(key for key, tag in step_tags if tag.get("status") == "failure")
+                    running = any(tag.get("status") == "running" for _, tag in step_tags)
+                if failed:
+                    raise RuntimeError(
+                        f"flash OPD rollout failed for {len(failed)} prompt(s) at step "
+                        f"{global_steps} (first: {failed[0]}); refusing to train on a partial batch"
+                    )
+                if not running:
+                    return super().sample(
+                        partition_id, global_steps=global_steps, batch_size=batch_size
+                    )
 
     return FlashReplayBuffer
 
