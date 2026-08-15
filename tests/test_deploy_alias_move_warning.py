@@ -119,13 +119,37 @@ def test_a_displaced_final_adapter_is_reachable_by_revision_not_a_step_selector(
     assert "no `/final` selector" in warning
 
 
-def test_a_displaced_final_adapter_without_a_revision_says_where_to_find_one() -> None:
-    """An older plane can answer without `adapter_revision`; never print an empty selector."""
+def test_a_displaced_final_adapter_without_a_revision_admits_it_is_unreachable() -> None:
+    """An older plane can answer without `adapter_revision`; never print an empty selector.
+
+    And never defer the user to a later command for it. `cmd_deploy` POSTs as soon as this prints,
+    after which the deployments listing carries only the NEW record -- `public_deployment` strips
+    `previous_deployment` -- so the displaced revision is not in it. Promising a selector the next
+    command cannot produce is worse than saying there is none.
+    """
     warning = _alias_move_warning(_Client(_ready(None)), "flash-1", 50) or ""
 
     assert "no `/final` selector" in warning
-    assert "models deployments" in warning
+    assert "not be addressable after this deploy" in warning
     assert "``" not in warning
+    # the listing does not contain the displaced revision, so it must not be offered as the way
+    # to recover one.
+    assert "models deployments" not in warning
+
+
+def test_the_step_selector_advice_is_qualified_by_plane_support() -> None:
+    """`ApiClient.chat` refuses a step target on a plane without `chat_step_selector_v1`.
+
+    The capability is only knowable via /v1/health, which an advisory warning must not spend, and
+    `_chat_step_selector_available` starts False -- so a negative reading here cannot distinguish
+    "unsupported" from "not checked yet". The warning therefore states the condition rather than
+    asserting the command works, and names the selector that works on every plane.
+    """
+    warning = _alias_move_warning(_Client(_ready(100)), "flash-1", 50) or ""
+
+    assert "step-N" in warning
+    assert "immutable adapter revision" in warning
+    assert "does not support step selectors" in warning
 
 
 def test_a_displaced_checkpoint_needs_no_revision_hint() -> None:

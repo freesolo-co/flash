@@ -295,9 +295,16 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
         # nothing is being served off the alias yet, so nothing is lost by moving it.
         return None
     cli = _commands().CLI_NAME
+    # `step-N` is not universally available: `ApiClient.chat` gates a step target behind
+    # `_require_chat_step_selector`, which refuses outright on a plane that does not advertise
+    # `chat_step_selector_v1`. the capability cannot be read here without spending a /v1/health on
+    # an advisory warning, and `_chat_step_selector_available` starts False, so a negative reading
+    # cannot tell "unsupported" from "not checked yet". state the condition instead of asserting
+    # the command works, and name the selector that works on every plane.
     tail = (
         f"so every client using bare `{base_run_id}` changes model. address a specific "
-        f"checkpoint with `{cli} models chat {base_run_id}/step-N` to compare them."
+        f"checkpoint with `{cli} models chat {base_run_id}/step-N` to compare them, or by "
+        "immutable adapter revision if this control plane does not support step selectors."
     )
     if revocation_failed:
         # same reason as the unknown-activation arm: this record's `checkpoint_step` describes the
@@ -346,9 +353,16 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
             f" the displaced final adapter has no `/final` selector; reach it by its immutable "
             f"revision `{revision}`."
             if revision
+            # without a revision on the record there is nothing to hand the user, and deferring
+            # them to a later command would be worse than saying so: `client.deploy` fires as soon
+            # as this prints, and the deployments listing then shows only the NEW record --
+            # `public_deployment` strips `previous_deployment` (flash/serve/urls.py), so the
+            # displaced revision is not in it. promising a selector that the next command cannot
+            # produce is the one outcome worse than admitting there is none.
             else (
-                " the displaced final adapter has no `/final` selector; reach it by its immutable "
-                f"revision, which `{cli} models deployments` prints."
+                " the displaced final adapter has no `/final` selector and this plane did not "
+                "report its immutable revision, so it will not be addressable after this deploy; "
+                "undeploy and redeploy it to serve it again."
             )
         )
     return (
