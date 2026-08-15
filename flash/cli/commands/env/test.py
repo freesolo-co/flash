@@ -9,7 +9,10 @@ from pathlib import Path
 
 from flash.cli.commands.env.episode import _effective_turn_cap
 from flash.cli.commands.env.push import _err, _resolve_local_env_entrypoint
-from flash.cli.commands.env.test_evaluations import _check_evaluation_suites
+from flash.cli.commands.env.test_evaluations import (
+    _check_evaluation_suites,
+    _normalize_prompt_images,
+)
 from flash.cli.commands.env.test_params import _env_params
 from flash.cli.commands.env.test_warnings import (
     _warn_on_low_replay_reward,
@@ -265,9 +268,20 @@ def _drive_single_turn(env, example: dict, record: dict, *, force_echo: bool = F
     )
 
 
-def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = False) -> None:
+def _new_multi_turn_replay_state(env, example: dict, record: dict) -> dict:
     state = env.new_rollout_state(example)
     record["prompt"] = _check_messages(state.get("prompt") or state.get("messages"), "prompt")
+    _normalize_prompt_images(env, example, record["prompt"])
+    return state
+
+
+def _validate_multi_turn_reply(env, example: dict, state: dict, messages: object) -> None:
+    _check_messages(messages, "env_reply")
+    _normalize_prompt_images(env, example, [dict(message) for message in state["messages"]])
+
+
+def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = False) -> None:
+    state = _new_multi_turn_replay_state(env, example, record)
     completion = _gold_completion(env, example)
     record["completion"] = completion
     reference_turns = _reference_turns(completion)
@@ -326,18 +340,19 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
             break
         env_msgs = env.env_reply(state["messages"], state)
         env_step_pending = False
-        if not env_msgs:
-            break
-        # the env's own reply messages feed the chat template for the next turn in the real
-        # rollout, so validate their envelope here too: a malformed reply that would break
-        # remotely must fail the episode instead of slipping through on a finite reward.
-        _check_messages(env_msgs, "env_reply")
         if gold_finished is None and turns >= len(reference_turns):
             # the gold answer has just run out and its last turn is applied: this is the only
             # moment the reference can be judged on its own, before junk padding touches the state.
             gold_finished = _episode_completed(env, state, hard_cap)
+        if not env_msgs:
+            break
         if env.rollout_done(state, max_turns=hard_cap):
             break
+        # the env's own reply messages feed the chat template for the next turn in the real
+        # rollout, so validate their envelope and accumulated images here too: a malformed reply
+        # that would break remotely must fail the episode instead of slipping through on a finite
+        # reward. normalize copies so the check cannot replace authoritative rollout messages.
+        _validate_multi_turn_reply(env, example, state, env_msgs)
 
     # the driver-side exits above stop before the inter-turn env_reply, so the last replayed turn
     # is still unapplied. a stateful env would then score a board or transcript missing the last
@@ -351,18 +366,9 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     # env that replied with nothing, a natural finish) -- stepping again there would be a spurious
     # extra move. rollout_done covers the env having declared the episode over.
     if env_step_pending and not env.rollout_done(state, hard_cap):
-        # validated exactly like the in-loop replies above: a malformed reply breaks the chat
-        # template on the paid run whether it was the last one or not. this call is the ONLY
-        # env_reply for an episode stopped at the ceiling, and a per-example `max_episode_turns`
-        # makes that the common case rather than a rare one -- leaving it unchecked let an env whose
-        # final reply is malformed reach `overall: PASS`.
-        #
-        # an EMPTY reply is allowed first, exactly as the in-loop path does (`if not env_msgs:
-        # break` precedes its own `_check_messages`): an env with nothing further to observe
-        # legitimately returns nothing, and `_check_messages` rejects an empty list.
-        final_msgs = env.env_reply(state["messages"], state)
-        if final_msgs:
-            _check_messages(final_msgs, "env_reply")
+        # apply the final action's side effects, but do not validate its reply as a future prompt:
+        # no later model generation consumes it in the online path.
+        env.env_reply(state["messages"], state)
     if gold_finished is None:
         # the gold answer never ran out inside the loop -- it covered the whole episode, so the
         # break came first and the mid-loop sample never fired. NOW is its moment: the deferred
