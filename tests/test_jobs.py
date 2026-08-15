@@ -666,6 +666,47 @@ def test_empty_workers_log_elapsed_capacity_grace_before_no_capacity(monkeypatch
     assert all(later > earlier for earlier, later in pairwise(elapsed_values))
 
 
+def test_unbounded_capacity_grace_keeps_throttled_worker_failure(monkeypatch):
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    statuses = iter(
+        [
+            *itertools.repeat({"status": "IN_QUEUE"}, 8),
+            {"status": "FAILED", "error": "throttled timer was skipped"},
+        ]
+    )
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: next(statuses))
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: {"workers": {"throttled": 1}},
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    logs = io.StringIO()
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        log=logs,
+        interval_s=0,
+        heartbeat_reader=lambda **_kw: None,
+        setup_grace_s=100000.0,
+        unhealthy_grace_s=100000.0,
+        throttled_grace_s=300.0,
+        queue_grace_s=float("inf"),
+    )
+
+    assert res.failure == "no_capacity"
+    assert "worker stuck THROTTLED" in res.detail
+    capacity_lines = [line for line in logs.getvalue().splitlines() if "capacity grace" in line]
+    assert capacity_lines
+    assert all("of infs capacity grace" in line for line in capacity_lines)
+
+
 def test_four_card_last_gpu_log_names_only_scaled_capacity_grace(monkeypatch):
     from flash.providers.runpod import jobs
 

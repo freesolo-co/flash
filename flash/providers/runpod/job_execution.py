@@ -521,7 +521,7 @@ def _classify_queue_state(
                 and state.queued_timer.since is not None
             ):
                 elapsed_s = max(0, int(now - state.queued_timer.since))
-                message += f"; waited {elapsed_s}s of {int(context.queue_grace_s)}s capacity grace"
+                message += f"; waited {elapsed_s}s of {context.queue_grace_s:g}s capacity grace"
             context.say(message)
         if state.unhealthy_timer.expired(
             workers.get("unhealthy") and not usable and not recovering,
