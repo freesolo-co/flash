@@ -33,6 +33,7 @@ from flash.server.routes import (
     trace_fragments,
     trace_redaction,
     trace_schema_identity,
+    trace_schema_refs,
     trace_secret_names,
     trace_sse,
     trace_uri,
@@ -11468,3 +11469,135 @@ def test_a_refusal_carrying_competing_content_is_still_rejected(message: dict[st
     )
 
     assert reply is None
+
+
+def _compound_legacy_resource(*, nested_id: bool = True, decoy: bool = False) -> dict[str, Any]:
+    """A 2020-12 document embedding a draft-04 resource whose DESCENDANT declares its own `id`.
+
+    Under draft-04 that `id` moves the base URI, so the secret property's relative `$ref: "cred"`
+    resolves to `.../root/nested/cred`. Under the modern reading `id` declares nothing and the
+    base never moves, so the same reference names `.../root/cred` instead.
+    """
+    holder: dict[str, Any] = {"properties": {"password": {"$ref": "cred"}}}
+    if nested_id:
+        holder["id"] = "nested/"
+    definitions: dict[str, Any] = {
+        "right": {"id": "https://example.test/root/nested/cred", "default": "SCOPELEAK"}
+    }
+    if decoy:
+        definitions["decoy"] = {"id": "https://example.test/root/cred", "default": "DECOYKEEP"}
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "$defs": {
+            "legacy": {
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "id": "https://example.test/root/",
+                "properties": {"holder": holder},
+                "definitions": definitions,
+            }
+        },
+    }
+
+
+def test_an_embedded_dialect_is_inherited_by_its_descendants() -> None:
+    """The dialect is read per node, but DESCENDANTS inherit that reading. The collectors passed
+    the outer dialect down, so a draft-04 resource's children reverted to the modern one, where a
+    plain `id` declares nothing: the base URI stopped moving and the relative `$ref` under it
+    resolved nowhere, leaving the real target's credential in the raw export."""
+
+    refs = trace_schema_refs._secret_schema_definition_refs(_compound_legacy_resource())
+
+    assert refs == {("$defs", "legacy", "definitions", "right")}
+
+
+def test_an_inherited_dialect_resolves_to_the_correctly_scoped_sibling() -> None:
+    """With both candidates present the lost dialect did not merely miss the target -- it redacted
+    the WRONG one, rewriting an unrelated definition while the real credential survived."""
+
+    refs = trace_schema_refs._secret_schema_definition_refs(_compound_legacy_resource(decoy=True))
+
+    assert refs == {("$defs", "legacy", "definitions", "right")}
+
+
+def test_a_descendant_without_its_own_identifier_keeps_the_enclosing_scope() -> None:
+    """The inheritance must not invent a scope: with no descendant `id` the base stays at the
+    resource root, so `cred` names a target that does not exist and nothing is marked secret."""
+
+    refs = trace_schema_refs._secret_schema_definition_refs(
+        _compound_legacy_resource(nested_id=False)
+    )
+
+    assert refs == set()
+
+
+def test_a_modern_document_still_reads_a_plain_id_as_an_annotation() -> None:
+    """The inherited reading is the node's own, not the outermost legacy default: a 2020-12
+    descendant's `id` declares no resource, so a pointer reference still resolves normally."""
+
+    payload = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "$defs": {
+            "holder": {"id": "nested/", "properties": {"password": {"$ref": "#/$defs/cred"}}},
+            "cred": {"default": "MODERNSECRET"},
+        },
+    }
+
+    refs = trace_schema_refs._secret_schema_definition_refs(payload)
+
+    assert ("$defs", "cred") in refs
+
+
+@pytest.mark.parametrize(
+    ("text", "structured"),
+    [
+        # JSON permits whitespace before a member's colon, and serializers emit it.
+        ('Invalid metadata: {"password" : "x"', True),
+        ('bad: {"password"\t: "x"', True),
+        ('bad: {"password"\n: "x"', True),
+        ('bad: {"password"   : "x"', True),
+        ('bad: {"password":"x"', True),
+        ('bad: {"password": "x"', True),
+        # ordinary prose must still survive verbatim.
+        ("the request was rejected", False),
+        ('the field "password" was bad', False),
+        ("error: bad request", False),
+        ('field "name" and then error: x', False),
+        ("", False),
+    ],
+)
+def test_a_quoted_member_separator_is_recognized_through_whitespace(
+    text: str, structured: bool
+) -> None:
+    """An unparseable diagnostic is blanked only when it LOOKS structured. Matching just `":`
+    read `{"password" : "THIRDPARTY"}` as prose, so the fragment was stored verbatim and the
+    third-party credential inside it survived."""
+
+    assert trace_redaction._looks_structured(text) is structured
+
+
+def test_a_spaced_fragment_in_a_tool_result_is_redacted() -> None:
+    payload = {
+        "messages": [
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": 'Upstream rejected: {"password" : "THIRDPARTY", "trunc',
+            }
+        ]
+    }
+
+    assert "THIRDPARTY" not in json.dumps(traces._sanitize_for_trace(payload, ()))
+
+
+def test_ordinary_tool_prose_still_survives_the_separator_check() -> None:
+    payload = {
+        "messages": [
+            {"role": "tool", "tool_call_id": "c1", "content": "the lookup returned no rows"}
+        ]
+    }
+
+    sanitized = traces._sanitize_for_trace(payload, ())
+
+    assert sanitized["messages"][0]["content"] == "the lookup returned no rows"

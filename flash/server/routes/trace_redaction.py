@@ -87,7 +87,26 @@ def _looks_structured(value: str) -> bool:
     stripped = value.strip()
     if stripped.startswith(("{", "[")):
         return True
-    return '":' in stripped or '": ' in stripped
+    return _has_json_member_separator(stripped)
+
+
+def _has_json_member_separator(value: str) -> bool:
+    """Whether a closing quote is followed by a colon, allowing whitespace between them.
+
+    JSON permits whitespace before a member's colon, and serializers emit it: a diagnostic quoting
+    `{"password" : "THIRDPARTY"}` is a legal fragment. Matching only `":` read that as ordinary
+    prose, so the whole string was stored verbatim and the third-party credential inside it
+    survived -- the parse failure that this test exists to catch, arrived at through a space.
+    """
+    index = value.find('"')
+    while index != -1:
+        following = index + 1
+        while following < len(value) and value[following].isspace():
+            following += 1
+        if following < len(value) and value[following] == ":":
+            return True
+        index = value.find('"', index + 1)
+    return False
 
 
 def _redact_tool_result_content(value: str, *, depth: int, flag: _SanitizationFlag | None) -> str:

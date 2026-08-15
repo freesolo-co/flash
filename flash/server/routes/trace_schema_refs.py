@@ -91,7 +91,11 @@ def _collect_secret_properties(
         return
     if isinstance(node, dict):
         # an embedded resource may declare its own dialect, so the reading is taken at each node
-        # rather than fixed for the payload.
+        # rather than fixed for the payload -- and DESCENDANTS inherit that reading. passing the
+        # outer dialect down reverted a draft-04 resource's children to the modern one, where a
+        # plain `id` declares nothing: the base uri never moved, so a relative `$ref` under it
+        # resolved to the wrong sibling or to nothing at all, and the real target kept its
+        # credential-bearing literal. `_schema_resource_pointers` propagates it the same way.
         legacy_here = _node_legacy_id_dialect(node, legacy_id_dialect)
         resource_id = _schema_resource_id(node, legacy_id_dialect=legacy_here)
         if isinstance(resource_id, str):
@@ -122,7 +126,7 @@ def _collect_secret_properties(
                             schema_path,
                             scope_uri,
                             scopes=scopes,
-                            legacy_id_dialect=legacy_id_dialect,
+                            legacy_id_dialect=legacy_here,
                         )
                     )
                 _collect_secret_properties(
@@ -131,7 +135,7 @@ def _collect_secret_properties(
                     schema_path,
                     scope_uri,
                     scopes=scopes,
-                    legacy_id_dialect=legacy_id_dialect,
+                    legacy_id_dialect=legacy_here,
                     refs=refs,
                 )
         for key, item in _bounded(node.items()):
@@ -142,7 +146,7 @@ def _collect_secret_properties(
                     (*path, str(key)),
                     scope_uri,
                     scopes=scopes,
-                    legacy_id_dialect=legacy_id_dialect,
+                    legacy_id_dialect=legacy_here,
                     refs=refs,
                 )
     elif isinstance(node, list | tuple):
@@ -172,8 +176,9 @@ def _collect_refs(
         return set()
     found: set[tuple[str, ...]] = set()
     if isinstance(node, dict):
-        # an embedded resource may declare its own dialect, so the reading is taken at each node
-        # rather than fixed for the payload.
+        # the reading is taken at each node and INHERITED by descendants, for the same reason as
+        # in `_collect_secret_properties`: a draft-04 resource's children must keep reading `id`
+        # as an identifier, or the base uri stops moving and the reference resolves wrongly.
         legacy_here = _node_legacy_id_dialect(node, legacy_id_dialect)
         resource_id = _schema_resource_id(node, legacy_id_dialect=legacy_here)
         if isinstance(resource_id, str):
@@ -191,7 +196,7 @@ def _collect_refs(
                         (*path, str(key)),
                         scope_uri,
                         scopes=scopes,
-                        legacy_id_dialect=legacy_id_dialect,
+                        legacy_id_dialect=legacy_here,
                     )
                 )
     elif isinstance(node, list | tuple):
