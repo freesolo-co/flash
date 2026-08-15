@@ -382,12 +382,21 @@ class GpuSpec:
     network_volume: str | None = None
     network_volume_gb: int = 100
     provider: str = ""
+    providers: tuple[str, ...] = ()
     # number of cards of `type` a single training worker occupies (1..8). count > 1 provisions a
     # multi-gpu pod; the training loop shards across them in the sft/opd multi-gpu paths.
     count: int = 1
 
     def __post_init__(self) -> None:
         # coerce/validate here so every path (from_dict and direct construction) is guarded.
+        from flash.providers import validated_provider_preferences
+
+        providers = validated_provider_preferences(
+            self.providers, allow_empty=isinstance(self.providers, tuple)
+        )
+        if self.provider and providers:
+            raise ValueError("gpu.provider and gpu.providers cannot both be set")
+        object.__setattr__(self, "providers", providers)
         object.__setattr__(self, "count", _gpu_count(self.count))
 
 
@@ -576,6 +585,10 @@ class JobSpec:
         gpu = data["gpu"]
         for managed in MANAGED_GPU_KEYS:
             gpu.pop(managed, None)
+        # omit the unset preference so an internal default does not become an authored empty list on
+        # the public round trip, where an explicit empty list is rejected as a likely configuration bug.
+        if not gpu.get("providers"):
+            gpu.pop("providers", None)
         data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
         # [environment] pip stays in the payload: it is the author's own scorer dependencies, which
         # only they can declare. The submit paths append it to worker_pip_for_env, so what travels
@@ -584,7 +597,12 @@ class JobSpec:
 
     def to_internal_dict(self) -> dict[str, Any]:
         """Return the complete control-plane and worker representation."""
-        return asdict(self)
+        data = asdict(self)
+        # missing and unset are the same internal state. omitting the empty value preserves that state
+        # without serializing it into an explicit empty preference, which every parser rejects.
+        if not data["gpu"].get("providers"):
+            data["gpu"].pop("providers", None)
+        return data
 
     def to_json(self) -> str:
         return json.dumps(self.to_internal_dict(), sort_keys=True)
@@ -634,8 +652,15 @@ class JobSpec:
         if not isinstance(provider, str):
             raise TypeError("gpu.provider must be a string")
         provider = provider.strip().lower()
-        if provider or gpu_type:
-            from flash.providers import PROVIDER_NAMES
+        providers_raw = gpu.get("providers", ())
+        from flash.providers import PROVIDER_NAMES, validated_provider_preferences
+
+        providers = validated_provider_preferences(
+            providers_raw, allow_empty="providers" not in gpu
+        )
+        if provider and providers:
+            raise ValueError("gpu.provider and gpu.providers cannot both be set")
+        if provider or providers or gpu_type:
             from flash.providers.base import providers_for
 
             if provider and provider not in PROVIDER_NAMES:
@@ -644,6 +669,8 @@ class JobSpec:
                 raise ValueError(
                     f"gpu.provider {provider!r} cannot provision gpu.type {gpu_type!r}"
                 )
+            # provider preferences are soft. an ineligible named provider contributes no candidate,
+            # while eligible named or unnamed configured providers remain available for failover.
         project_raw = data.get("project", "")
         if not isinstance(project_raw, str):
             raise TypeError("project must be a string")
@@ -698,6 +725,7 @@ class JobSpec:
             gpu=GpuSpec(
                 type=gpu_type,
                 provider=provider,
+                providers=providers,
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 5)),
