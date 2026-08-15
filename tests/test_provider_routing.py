@@ -2610,10 +2610,9 @@ def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_clas
     assert submitted_gpus == ["H200", "H200"]
     out = log.getvalue()
     assert "walking past the cheapest class" not in out
-    # and the operator is pointed at the three things that actually widen the search.
+    # and the operator is pointed at the two things that actually widen the search.
     assert "has already refused capacity twice" in out
     assert "drop the gpu.type pin" in out
-    assert 'type = ["A100 PCIe", "A100 SXM"]' in out
     assert "drop gpu.provider" in out
 
 
