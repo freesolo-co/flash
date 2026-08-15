@@ -783,7 +783,6 @@ def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Eve
     """Arm the absolute run-deadline watchdog around in-process snapshot downloads."""
     deadline_at = require_deadline_at(payload)
     remaining = deadline_at - time.time()
-    # done is set by the caller on clean finish; _fire checks it first to avoid a racing false alarm.
     done = threading.Event()
 
     def _fire() -> None:
@@ -833,7 +832,6 @@ def run_preload(payload: dict) -> dict:
     done, already, failed = [], [], {}
     for repo_id in payload.get("models") or []:
         try:
-            # Probe with local_files_only first (HF's own resolution, not a dir-name guess).
             try:
                 snapshot_download(
                     repo_id=repo_id,
@@ -859,7 +857,6 @@ def run_preload(payload: dict) -> dict:
 
 
 def main() -> int:
-    # SIGTERM → sys.exit so the finally block still uploads the terminal marker.
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(1))
     payload = load_payload()
     ok = False
@@ -880,7 +877,6 @@ def main() -> int:
             result = run_preload(payload)
             with open("/tmp/preload_result.json", "w") as f:
                 json.dump(result, f)
-            # preload_result.json is the completion signal the warm driver polls.
             confirmed = False
             for attempt in range(3):
                 remaining = deadline - _finite_positive_number(time.time(), "current clock")

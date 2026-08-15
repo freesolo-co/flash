@@ -18,7 +18,10 @@ _SECRET_RE = re.compile(
     r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)"
 )
 
-# long multiline-secret components are redacted individually; short punctuation is ignored.
+# a multiline secret (a PEM key) reaches diagnostics one component line at a time -- console tails
+# are truncated and child stdout is sanitized per line -- so the whole value never matches. long
+# component lines are registered as needles too; the floor keeps a common fragment such as ``}``
+# from erasing innocent output. Mirrors flash._internal.diagnostics.
 _MIN_SECRET_COMPONENT = 8
 _CONSOLE_PROGRESS_READ_LIMIT = 1_048_576
 _CONSOLE_PROGRESS_LINE_LIMIT = 64_000
