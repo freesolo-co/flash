@@ -31,12 +31,18 @@ class _Engine:
         self.added: list[_LoRARequest] = []
         self.pinned: list[int] = []
         self.removed: list[int] = []
+        self.fail_add_after_append = False
+        self.fail_pin = False
 
     async def add_lora(self, request: _LoRARequest) -> None:
         await asyncio.sleep(0)
         self.added.append(request)
+        if self.fail_add_after_append:
+            raise RuntimeError("add failed after partial registration")
 
     async def pin_lora(self, int_id: int) -> None:
+        if self.fail_pin:
+            raise RuntimeError("pin failed")
         self.pinned.append(int_id)
 
     async def remove_lora(self, int_id: int) -> None:
@@ -144,6 +150,54 @@ def test_replacement_reuses_id_and_stale_operations_fail(adapter_dir: Path) -> N
     assert asyncio.run(manager.unload("adapter", "two")) is True
 
 
+def test_add_failure_rolls_back_new_lora_and_preserves_old_incarnation(
+    adapter_dir: Path,
+) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    async def exercise() -> int:
+        await manager.register(_spec(adapter_dir, "one"))
+        int_id = engine.added[0].lora_int_id
+        engine.fail_add_after_append = True
+        with pytest.raises(RuntimeError, match="add failed"):
+            await manager.register(_spec(adapter_dir, "two"))
+        assert manager.registered_count == 1
+        assert manager.loaded_count == 0
+        engine.fail_add_after_append = False
+        async with manager.acquire("adapter", "one") as binding:
+            assert binding.spec.incarnation == "one"
+        return int_id
+
+    int_id = asyncio.run(exercise())
+    assert engine.removed == [int_id, int_id]
+    assert [request.lora_name for request in engine.added] == ["adapter"] * 3
+
+
+def test_pin_failure_rolls_back_new_lora_and_preserves_old_incarnation(
+    adapter_dir: Path,
+) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    async def exercise() -> int:
+        await manager.register(_spec(adapter_dir, "one"))
+        int_id = engine.added[0].lora_int_id
+        engine.fail_pin = True
+        with pytest.raises(RuntimeError, match="pin failed"):
+            await manager.register(_spec(adapter_dir, "two"))
+        assert manager.registered_count == 1
+        assert manager.loaded_count == 0
+        engine.fail_pin = False
+        async with manager.acquire("adapter", "one") as binding:
+            assert binding.spec.incarnation == "one"
+        return int_id
+
+    int_id = asyncio.run(exercise())
+    assert engine.removed == [int_id, int_id]
+    assert engine.pinned == [int_id, int_id]
+
+
 def test_collision_safe_ids_probe_without_cross_wiring(
     adapter_dir: Path,
     monkeypatch,
@@ -199,3 +253,29 @@ def test_per_adapter_pin_false_skips_pinning(adapter_dir: Path) -> None:
     )
     asyncio.run(manager.register(spec))
     assert engine.pinned == []
+
+
+def test_default_pinning_preserves_cpu_eviction_capacity(adapter_dir: Path) -> None:
+    eviction_engine = _Engine()
+    eviction_manager = AdapterManager(
+        eviction_engine,
+        EngineConfig(model="model", max_loras=1, max_cpu_loras=2),
+    )
+    asyncio.run(eviction_manager.register(_spec(adapter_dir)))
+    assert eviction_engine.pinned == []
+
+    covered_engine = _Engine()
+    covered_manager = AdapterManager(
+        covered_engine,
+        EngineConfig(model="model", max_loras=2, max_cpu_loras=2),
+    )
+    asyncio.run(covered_manager.register(_spec(adapter_dir)))
+    assert covered_engine.pinned == [covered_engine.added[0].lora_int_id]
+
+    explicit_engine = _Engine()
+    explicit_manager = AdapterManager(
+        explicit_engine,
+        EngineConfig(model="model", max_loras=1, max_cpu_loras=2, pin_loras=True),
+    )
+    asyncio.run(explicit_manager.register(_spec(adapter_dir)))
+    assert explicit_engine.pinned == [explicit_engine.added[0].lora_int_id]

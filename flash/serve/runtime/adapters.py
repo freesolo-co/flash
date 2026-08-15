@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import inspect
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -115,14 +115,13 @@ class AdapterManager:
             if current is not None and current.loaded:
                 await self._remove_lora(current.lora_request.lora_int_id)
                 current.loaded = False
-            if current is not None:
-                self._entries.pop(normalized.adapter_id, None)
             request = self._new_lora_request(normalized, int_id)
             entry = _AdapterEntry(spec=normalized, lora_request=request, loaded=False)
             try:
                 await self._load_entry(entry)
             except BaseException:
-                await self._release_failed_reservation(normalized.adapter_id, int_id)
+                if current is None:
+                    await self._release_failed_reservation(normalized.adapter_id, int_id)
                 raise
             self._entries[normalized.adapter_id] = entry
             return True
@@ -218,13 +217,19 @@ class AdapterManager:
         return LoRARequest(spec.adapter_id, int_id, spec.path)
 
     async def _load_entry(self, entry: _AdapterEntry) -> None:
-        await _maybe_await(self._engine.add_lora(entry.lora_request))
-        should_pin = self._config.pin_loras if entry.spec.pin is None else entry.spec.pin
-        if should_pin:
-            pin = getattr(self._engine, "pin_lora", None)
-            if pin is None:
-                raise AdapterError("this vllm build does not expose pin_lora")
-            await _maybe_await(pin(entry.lora_request.lora_int_id))
+        should_pin = self._config.effective_pin_loras if entry.spec.pin is None else entry.spec.pin
+        pin = getattr(self._engine, "pin_lora", None)
+        if should_pin and pin is None:
+            raise AdapterError("this vllm build does not expose pin_lora")
+        try:
+            await _maybe_await(self._engine.add_lora(entry.lora_request))
+            if should_pin:
+                await _maybe_await(pin(entry.lora_request.lora_int_id))
+        except BaseException:
+            entry.loaded = False
+            with suppress(Exception):
+                await self._remove_lora(entry.lora_request.lora_int_id)
+            raise
         entry.loaded = True
 
     async def _remove_lora(self, int_id: int) -> None:

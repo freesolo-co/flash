@@ -72,6 +72,58 @@ def test_engine_config_rejects_runtime_owned_engine_args() -> None:
         EngineConfig(model="model", tokenizer_kwargs={"token": "other"})
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_loras": 1.5},
+        {"max_lora_rank": "64"},
+        {"max_cpu_loras": 16.0},
+        {"image_limit": 1.0},
+        {"prompt_cache_size": 1.0},
+        {"trust_remote_code": "false"},
+        {"pin_loras": "true"},
+        {"liveness_interval_seconds": float("nan")},
+        {"liveness_interval_seconds": float("inf")},
+        {"liveness_interval_seconds": True},
+    ],
+)
+def test_engine_config_rejects_inexact_public_scalar_types(kwargs) -> None:
+    with pytest.raises(RuntimeConfigurationError):
+        EngineConfig(model="model", **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_tokens", 1.0),
+        ("max_tokens", "1"),
+        ("temperature", float("nan")),
+        ("temperature", float("inf")),
+        ("temperature", "0"),
+        ("top_p", float("nan")),
+        ("top_p", True),
+        ("thinking", "false"),
+    ],
+)
+def test_generation_request_rejects_inexact_public_scalar_types(field, value) -> None:
+    with pytest.raises(RuntimeConfigurationError):
+        GenerationRequest(prompt="x", **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("thinking", "false"), ("thinking", 0), ("pin", "true"), ("pin", 1)],
+)
+def test_adapter_spec_rejects_inexact_public_boolean_types(field, value) -> None:
+    with pytest.raises(RuntimeConfigurationError):
+        AdapterSpec(
+            adapter_id="adapter",
+            path="/tmp/adapter",
+            incarnation="one",
+            **{field: value},
+        )
+
+
 def test_generation_request_requires_exactly_one_prompt_form() -> None:
     with pytest.raises(RuntimeConfigurationError, match="exactly one"):
         GenerationRequest()
@@ -108,7 +160,18 @@ def test_adapter_thinking_and_structured_defaults_are_normalized() -> None:
     )
     assert spec.structured_outputs == {"json": SCHEMA}
     assert resolve_thinking(request, spec) is False
-    assert resolve_thinking(request, None) is True
+    assert resolve_thinking(request, None) is False
+    assert (
+        resolve_thinking(
+            GenerationRequest(
+                messages=[{"role": "user", "content": "hello"}],
+                thinking=True,
+                chat_template_kwargs={"enable_thinking": False},
+            ),
+            None,
+        )
+        is True
+    )
 
 
 class _Tokenizer:

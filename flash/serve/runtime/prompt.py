@@ -20,6 +20,7 @@ _RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
         "return_dict",
         "return_tensors",
         "return_assistant_tokens_mask",
+        "enable_thinking",
         "conversation",
         "documents",
         "chat_template",
@@ -51,14 +52,13 @@ def safe_chat_template_kwargs(raw: Any) -> dict[str, Any]:
     return {key: value for key, value in raw.items() if key not in _RESERVED_CHAT_TEMPLATE_KWARGS}
 
 
-def resolve_thinking(request: GenerationRequest, adapter: AdapterSpec | None) -> bool | None:
-    """bind prompt rendering to the same adapter incarnation as the lora weights."""
+def resolve_thinking(request: GenerationRequest, adapter: AdapterSpec | None) -> bool:
+    """bind a known thinking mode to the same request and adapter state as generation."""
     if adapter is not None:
         return adapter.thinking
     if request.thinking is not None:
         return request.thinking
-    caller_value = safe_chat_template_kwargs(request.chat_template_kwargs).get("enable_thinking")
-    return caller_value if isinstance(caller_value, bool) else None
+    return False
 
 
 def effective_chat_template_kwargs(

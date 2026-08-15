@@ -48,29 +48,10 @@ class _StreamState:
         self.final_output = request_output
         output = _single_sequence(request_output)
         chunk_ids = [int(value) for value in (getattr(output, "token_ids", None) or [])]
-        cumulative: bool | None = None
-        if chunk_ids:
-            if chunk_ids[: len(self.token_ids)] == self.token_ids:
-                self.token_ids = chunk_ids
-                cumulative = True
-            else:
-                self.token_ids.extend(chunk_ids)
-                cumulative = False
+        self.token_ids.extend(chunk_ids)
         chunk_text = str(getattr(output, "text", "") or "")
-        delta, self.text = _stream_text_delta(chunk_text, self.text, cumulative)
-        return delta
-
-
-def _stream_text_delta(
-    text: str,
-    previous_text: str,
-    cumulative_output: bool | None,
-) -> tuple[str, str]:
-    if not text:
-        return "", previous_text
-    if cumulative_output is not False and text.startswith(previous_text):
-        return text[len(previous_text) :], text
-    return text, previous_text + text
+        self.text += chunk_text
+        return chunk_text
 
 
 def _single_sequence(request_output: Any) -> Any:
@@ -163,6 +144,7 @@ class VllmLoraRuntime:
         self._adapters: AdapterManager | None = None
         self._start_lock = asyncio.Lock()
         self._liveness_task: asyncio.Task[None] | None = None
+        self._death_notification_lock = asyncio.Lock()
         self._death_notified = False
         self._closed = False
 
@@ -383,6 +365,7 @@ class VllmLoraRuntime:
         )
         kwargs: dict[str, Any] = {
             "model": self.config.effective_served_model,
+            "tokenizer": self.config.effective_tokenizer_model,
             "trust_remote_code": self.config.trust_remote_code,
             "enable_lora": True,
             "max_loras": self.config.max_loras,
@@ -560,26 +543,30 @@ class VllmLoraRuntime:
         if self._engine_is_dead():
             await self._notify_engine_death()
 
-    async def _notify_engine_death(self) -> None:
+    async def _notify_engine_death(self) -> bool:
         if self._death_notified or not self._engine_is_dead():
-            return
-        self._death_notified = True
-        callback = self._on_engine_death
-        if callback is None:
-            return
-        try:
-            result = callback(self.health())
-            if inspect.isawaitable(result):
-                await result
-        except Exception:
-            return
+            return self._death_notified
+        async with self._death_notification_lock:
+            if self._death_notified or not self._engine_is_dead():
+                return self._death_notified
+            callback = self._on_engine_death
+            if callback is None:
+                self._death_notified = True
+                return True
+            try:
+                result = callback(self.health())
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                return False
+            self._death_notified = True
+            return True
 
     async def _liveness_monitor(self) -> None:
         try:
             while True:
                 await asyncio.sleep(self.config.liveness_interval_seconds)
-                if self._engine_is_dead():
-                    await self._notify_engine_death()
+                if self._engine_is_dead() and await self._notify_engine_death():
                     return
         except asyncio.CancelledError:
             raise

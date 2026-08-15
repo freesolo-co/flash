@@ -69,6 +69,7 @@ class _Processor:
 @dataclass
 class _AsyncEngineArgs:
     model: str = ""
+    tokenizer: str = ""
     trust_remote_code: bool = False
     enable_lora: bool = False
     max_loras: int = 0
@@ -255,6 +256,7 @@ def test_exact_engine_args_and_processor_construction() -> None:
 
     assert _Engine.args == _AsyncEngineArgs(
         model="served/model",
+        tokenizer="tokenizer/model",
         trust_remote_code=True,
         enable_lora=True,
         max_loras=6,
@@ -346,7 +348,30 @@ def test_nonstream_generation_binds_thinking_structured_outputs_and_accounting(
     asyncio.run(runtime.close())
 
 
-def test_stream_normalizes_delta_and_cumulative_sequences() -> None:
+def test_adapterless_structured_generation_binds_default_thinking_false() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model", reasoning_parser="qwen3"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.responses.append([_output('{"answer":"yes"}', [1])])
+    request = GenerationRequest(
+        messages=[{"role": "user", "content": "answer"}],
+        chat_template_kwargs={"enable_thinking": True},
+        structured_outputs=SCHEMA,
+    )
+
+    result = asyncio.run(runtime.generate(request))
+
+    assert result.thinking is False
+    tokenizer = runtime._tokenizer
+    assert tokenizer.template_calls[0]["enable_thinking"] is False
+    call = engine.generate_calls[0]
+    assert call["reasoning_ended"] is True
+    assert call["reasoning_parser_kwargs"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    asyncio.run(runtime.close())
+
+
+def test_stream_trusts_pinned_delta_output_and_counts_chunks() -> None:
     runtime = VllmLoraRuntime(EngineConfig(model="model"))
     asyncio.run(runtime.start())
     engine = _Engine.latest
@@ -355,7 +380,7 @@ def test_stream_normalizes_delta_and_cumulative_sequences() -> None:
         [
             _output("he", [1], prompt_tokens=4),
             _output("llo", [2, 3], prompt_tokens=4, finish_reason=None),
-            _output("hello!", [1, 2, 3, 4], prompt_tokens=4, cached_tokens=None),
+            _output("!", [4], prompt_tokens=4, cached_tokens=None),
         ]
     )
 
@@ -373,6 +398,30 @@ def test_stream_normalizes_delta_and_cumulative_sequences() -> None:
     assert final.cached_tokens == 0
     assert final.cached_tokens_reported is False
     assert engine.generate_calls[0]["sampling"].kwargs["output_kind"] == "delta"
+    asyncio.run(runtime.close())
+
+
+def test_stream_preserves_repeated_prefix_delta_chunks() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.responses.append(
+        [
+            _output("a", [1], prompt_tokens=2, finish_reason=None),
+            _output("ab", [1, 2], prompt_tokens=2),
+        ]
+    )
+
+    async def collect():
+        return [event async for event in runtime.stream(GenerationRequest(prompt="hello"))]
+
+    events = asyncio.run(collect())
+    assert [event.text for event in events if isinstance(event, StreamDelta)] == ["a", "ab"]
+    final = events[-1]
+    assert isinstance(final, StreamFinished)
+    assert final.text == "aab"
+    assert final.completion_tokens == 3
     asyncio.run(runtime.close())
 
 
@@ -449,5 +498,36 @@ def test_engine_death_callback_receives_runtime_health_once() -> None:
     assert len(reports) == 1
     assert reports[0].engine_dead is True
     assert reports[0].ok is False
+    assert reports[0].runtime_id == runtime.runtime_id
+    asyncio.run(runtime.close())
+
+
+def test_engine_death_callback_retries_after_callback_failure() -> None:
+    attempts = 0
+    reports = []
+
+    def notify(health) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("host unavailable")
+        reports.append(health)
+
+    runtime = VllmLoraRuntime(
+        EngineConfig(model="model", liveness_interval_seconds=60),
+        on_engine_death=notify,
+    )
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.errored = True
+
+    with pytest.raises(EngineDeadError):
+        asyncio.run(runtime.generate(GenerationRequest(prompt="hello")))
+    with pytest.raises(EngineDeadError):
+        asyncio.run(runtime.generate(GenerationRequest(prompt="hello")))
+
+    assert attempts == 2
+    assert len(reports) == 1
     assert reports[0].runtime_id == runtime.runtime_id
     asyncio.run(runtime.close())
