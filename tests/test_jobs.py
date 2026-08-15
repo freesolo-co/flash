@@ -617,7 +617,7 @@ def test_no_capacity_detail_never_predicts_the_retry_disposition(monkeypatch):
     assert "next-best" not in res.detail
 
 
-def _queued_forever(monkeypatch, health, *, step=20.0):
+def _queued_forever(monkeypatch, health, *, step=20.0, queue_grace_s=900.0, log=None):
     """Poll a permanently queued job with controlled endpoint health.
 
     The clock step preserves the 90-second probe cadence and 300-second worker-coming-up TTL.
@@ -634,11 +634,157 @@ def _queued_forever(monkeypatch, health, *, step=20.0):
     monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
     return jobs.poll_job(
         _runpod_handle(jobs),
+        log=log,
         interval_s=0,
         heartbeat_reader=lambda: None,
         setup_grace_s=3000.0,
-        queue_grace_s=900.0,
+        queue_grace_s=queue_grace_s,
     )
+
+
+def test_empty_workers_log_elapsed_capacity_grace_before_no_capacity(monkeypatch):
+    from itertools import pairwise
+
+    logs = io.StringIO()
+    res = _queued_forever(
+        monkeypatch,
+        lambda eid, _fp, **_kw: {"workers": {}},
+        queue_grace_s=700.0,
+        log=logs,
+    )
+
+    assert not res.ok
+    assert res.failure == "no_capacity"
+    assert "no RunPod capacity" in res.detail
+    capacity_lines = [line for line in logs.getvalue().splitlines() if "capacity grace" in line]
+    elapsed_values = []
+    for line in capacity_lines:
+        match = re.search(r"; waited (\d+)s of 700s capacity grace$", line)
+        assert match
+        elapsed_values.append(int(match.group(1)))
+    assert len(elapsed_values) >= 2
+    assert all(later > earlier for earlier, later in pairwise(elapsed_values))
+
+
+def test_unbounded_capacity_grace_keeps_throttled_worker_failure(monkeypatch):
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    statuses = iter(
+        [
+            *itertools.repeat({"status": "IN_QUEUE"}, 8),
+            {"status": "FAILED", "error": "throttled timer was skipped"},
+        ]
+    )
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: next(statuses))
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: {"workers": {"throttled": 1}},
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    logs = io.StringIO()
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        log=logs,
+        interval_s=0,
+        heartbeat_reader=lambda **_kw: None,
+        setup_grace_s=100000.0,
+        unhealthy_grace_s=100000.0,
+        throttled_grace_s=300.0,
+        queue_grace_s=float("inf"),
+    )
+
+    assert res.failure == "no_capacity"
+    assert "worker stuck THROTTLED" in res.detail
+    capacity_lines = [line for line in logs.getvalue().splitlines() if "capacity grace" in line]
+    assert capacity_lines
+    assert all("of unbounded capacity grace" in line for line in capacity_lines)
+
+
+def test_four_card_last_gpu_log_names_only_scaled_capacity_grace(monkeypatch):
+    from flash.providers.runpod import jobs
+
+    logs = io.StringIO()
+    grace = jobs.stall_kwargs(on_last_gpu=True, gpu_count=4)["queue_grace_s"]
+    res = _queued_forever(
+        monkeypatch,
+        lambda eid, _fp, **_kw: {"workers": {}},
+        queue_grace_s=grace,
+        log=logs,
+    )
+
+    assert res.failure == "no_capacity"
+    capacity_output = "\n".join(
+        line for line in logs.getvalue().splitlines() if "capacity grace" in line
+    )
+    assert "of 3600s capacity grace" in capacity_output
+    assert "pinned" not in capacity_output.lower()
+    assert "escalation" not in capacity_output.lower()
+    assert "retry" not in capacity_output.lower()
+
+
+@pytest.mark.parametrize(
+    "workers",
+    [
+        {"initializing": 1},
+        {"ready": 1, "unhealthy": 1},
+    ],
+)
+def test_allocated_worker_log_suppresses_capacity_grace(monkeypatch, workers):
+    logs = io.StringIO()
+    res = _queued_forever(
+        monkeypatch,
+        lambda eid, _fp, **_kw: {"workers": workers},
+        log=logs,
+    )
+
+    assert res.failure == "stalled"
+    queued_lines = [line for line in logs.getvalue().splitlines() if "queued; workers:" in line]
+    assert queued_lines
+    assert all("capacity grace" not in line for line in queued_lines)
+
+
+def test_unhealthy_worker_log_suppresses_capacity_grace(monkeypatch):
+    logs = io.StringIO()
+    res = _queued_forever(
+        monkeypatch,
+        lambda eid, _fp, **_kw: {"workers": {"unhealthy": 1}},
+        log=logs,
+    )
+
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "worker stuck unhealthy" in res.detail
+    queued_lines = [line for line in logs.getvalue().splitlines() if "queued; workers:" in line]
+    assert queued_lines
+    assert all("capacity grace" not in line for line in queued_lines)
+
+
+@pytest.mark.parametrize("granted_workers", [{"initializing": 1}, {"ready": 1}])
+def test_empty_health_after_worker_grant_suppresses_capacity_grace(monkeypatch, granted_workers):
+    logs = io.StringIO()
+    probes = {"count": 0}
+
+    def health(eid, _fp, **_kw):
+        probes["count"] += 1
+        return {"workers": granted_workers if probes["count"] == 1 else {}}
+
+    res = _queued_forever(monkeypatch, health, queue_grace_s=5000.0, log=logs)
+
+    assert probes["count"] >= 2
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "setup (pre-training)" in res.detail
+    queued_lines = [line for line in logs.getvalue().splitlines() if "queued; workers:" in line]
+    assert queued_lines
+    assert any("workers: {}" in line for line in queued_lines)
+    assert all("capacity grace" not in line for line in queued_lines)
 
 
 def test_slow_image_pull_is_not_reported_as_missing_capacity(monkeypatch):
