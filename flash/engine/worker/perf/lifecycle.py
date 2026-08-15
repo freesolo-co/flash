@@ -149,10 +149,15 @@ def preflight_free_vram(*, max_occupied_fraction: float = 0.05) -> None:
     ``--pid=host`` a real co-tenant passes it and gets credited to us, silently waving through the
     exact card this exists to refuse.
 
-    So the check simply declines to run once this process has a CUDA context. At boot that is
-    guaranteed: nothing above ``_preflight_free_vram_for_spec`` touches CUDA except a capability
-    probe. ``wait_for_gpu`` calls this again, and by then a context exists -- that later call is a
-    no-op by design, and the boot reading is the one that counts.
+    So the check simply declines to run once this process has a CUDA context, which makes WHEN it
+    runs the whole design. There is exactly one call site, ``_preflight_free_vram_for_spec`` at the
+    top of ``_run_worker_mode``, and it is placed before ``_force_fla_triton_gdn_on_sm100`` because
+    that reads ``get_device_capability`` and creates the process's first context. Calling from
+    anywhere below that point is not a weaker check, it is no check at all: the guard above returns
+    immediately and the card is never read. A single early call site is therefore the invariant, not
+    an omission -- a later retry could only run after CUDA came up, when the reading is already
+    unusable. That also means one NVML failure at boot is one lost reading, not a lost run: the
+    guard below returns and training proceeds exactly as it did before this check existed.
     """
     if cuda_is_initialized():
         # some of `used` would be ours and there is no sound way to tell how much. a check that
