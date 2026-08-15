@@ -294,13 +294,16 @@ async def _opd_run_turns(
     num_preempted = -1
     prefix_ids = list(prompt_ids)
     for turn_ordinal in range(turn_limit):
-        remaining = max_model_len - len(prefix_ids)
-        if remaining <= 0:
+        remaining_context = max_model_len - len(prefix_ids)
+        if remaining_context <= 0:
             raise RuntimeError("multi-turn OPD dispatched a prompt without completion capacity")
-        max_tokens = min(int(self.rollout_config.response_length), remaining)
+        # the completion cap applies to each model turn; max_model_len bounds the accumulated episode.
+        # several long turns can exhaust the context without exceeding the per-turn cap. the episode
+        # then ends without eos, and opd drops the truncated turn before teacher scoring.
+        turn_max_tokens = min(int(self.rollout_config.response_length), remaining_context)
         params = _opd_turn_sampling_params(
             sampling_params,
-            max_tokens=max_tokens,
+            max_tokens=turn_max_tokens,
             seed=deterministic_seed(
                 flash_seed,
                 global_step,
@@ -324,7 +327,7 @@ async def _opd_run_turns(
             self.tokenizer,
             generated.token_ids,
             stop_reason=generated.stop_reason,
-            max_tokens=max_tokens,
+            max_tokens=turn_max_tokens,
             eos_token_ids=eos_token_ids,
             stop_sequences=stop_sequences,
         )

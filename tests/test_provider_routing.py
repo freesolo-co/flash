@@ -641,6 +641,104 @@ def test_sft_submission_fails_closed_when_the_environment_cannot_be_pinned(orch,
     assert persisted == []
 
 
+@pytest.mark.parametrize(
+    ("github_error", "expected"),
+    [
+        pytest.param(
+            'GitHub environment request failed (422): {"message":"No commit found for SHA: main"}',
+            "No commit found for SHA: main",
+            id="wrong-ref",
+        ),
+        pytest.param(
+            "GitHub API rate limit exceeded (403)",
+            "rate limit",
+            id="rate-limit",
+        ),
+        pytest.param(
+            'GitHub environment request failed (404): {"message":"Not Found"}',
+            "404",
+            id="private-or-missing",
+        ),
+    ],
+)
+def test_unpinnable_sft_environment_reports_githubs_own_diagnosis(
+    orch, monkeypatch, github_error, expected
+):
+    """The pin failure must name WHY, not just that a revision is missing.
+
+    `@main` against a master-default repo made GitHub answer "No commit found for SHA: main" -- the
+    ref, the cause and the fix in one line. The plane had that string and threw it away, reporting
+    only "sft workload profiling requires a pinned environment package revision", which names none
+    of the three. A rate limit, an outage and a private repo the token cannot read all produce the
+    identical missing pin and all need different fixes, so the generic text sends every one of them
+    to the wrong remedy.
+    """
+    from dataclasses import replace
+
+    import flash.envs.loader as env_loader
+    from flash.providers import allocator
+
+    def fail(_parsed, *_args, **_kwargs):
+        raise RuntimeError(github_error)
+
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", fail)
+    monkeypatch.setattr(
+        orch,
+        "_resolve_model_revision",
+        lambda spec, **_kw: replace(spec, model_revision="b" * 40, model_revision_auto=True),
+    )
+    monkeypatch.setattr(
+        allocator, "allocate", lambda *a, **k: pytest.fail("allocated without a profile")
+    )
+
+    with pytest.raises(orch.WorkloadProfileUnavailable) as excinfo:
+        orch.submit_job(_public_spec())
+
+    message = str(excinfo.value)
+    assert expected in message, message
+    # the ref itself has to appear too: the operator has to know WHICH environment to fix.
+    assert "github:owner/repo@main:env/environment.py" in message
+
+
+def test_the_reported_reason_describes_the_resolve_that_was_actually_used(orch, monkeypatch):
+    """One resolve, so a retry that would have succeeded cannot blank out the reason.
+
+    Diagnosing by re-resolving is wrong twice over. A transient cause (a rate-limit window that
+    resets, a blip that clears) can succeed on the second call, and the caller -- already committed
+    to rejecting on the FIRST result -- would then report no reason at all, landing back on the
+    generic message this change exists to replace. It also doubles GitHub calls on every failing
+    submit, against the same rate limit that is one of the causes.
+    """
+    from dataclasses import replace
+
+    import flash.envs.loader as env_loader
+    from flash.providers import allocator
+
+    calls = []
+
+    def flaky(_parsed, *_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("GitHub API rate limit exceeded (403)")
+        return "b" * 40  # a second attempt SUCCEEDS; the rejection is already decided
+
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", flaky)
+    monkeypatch.setattr(
+        orch,
+        "_resolve_model_revision",
+        lambda spec, **_kw: replace(spec, model_revision="b" * 40, model_revision_auto=True),
+    )
+    monkeypatch.setattr(
+        allocator, "allocate", lambda *a, **k: pytest.fail("allocated without a profile")
+    )
+
+    with pytest.raises(orch.WorkloadProfileUnavailable) as excinfo:
+        orch.submit_job(_public_spec())
+
+    assert "rate limit" in str(excinfo.value), str(excinfo.value)
+    assert calls == [1], f"the pin must be resolved exactly once, got {len(calls)} calls"
+
+
 def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     """A pin the lifecycle fallback recovers must survive a control-plane restart.
 
@@ -2463,6 +2561,72 @@ def test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up(orch, monkey
 
     assert metrics["train_tokens"] == 4096
     assert submitted_gpus == ["H200", "H200"], "the blip must cost a retry, not the run"
+    assert "has already refused capacity twice" not in log.getvalue()
+
+
+def test_auto_gpu_capacity_refusals_do_not_short_circuit_the_retry_budget(orch, monkeypatch):
+    """Automatic placement rebuilds its market search on every attempt, so seeing the same class
+    twice does not prove the next search has nowhere else to go."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner.supervise.lifecycle import INFRA_RETRY_FLOOR
+
+    candidates = (Candidate("runpod", "H200", 4.0, 141),)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
+
+    submitted_gpus = []
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        return PollResult(False, failure="no_capacity", detail="market search is dry")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(run_id="flash-auto-gpu-capacity", type="")
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert submitted_gpus == ["H200"] * (INFRA_RETRY_FLOOR + 1)
+    assert "has already refused capacity twice" not in log.getvalue()
+    assert "drop the gpu.type pin" not in log.getvalue()
+
+
+def test_a_provisioned_attempt_resets_the_class_capacity_refusals(orch, monkeypatch):
+    """A worker-side failure proves the class admitted the run, so an older shortage is stale."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (Candidate("runpod", "H200", 4.0, 141),)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
+
+    submitted_gpus = []
+    failures = ("no_capacity", "stalled", "no_capacity")
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        if attempt < len(failures):
+            return PollResult(False, failure=failures[attempt], detail="attempt failed")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(run_id="flash-capacity-recovers", type="H200", max_retries=3)
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert metrics["train_tokens"] == 4096
+    assert submitted_gpus == ["H200", "H200", "H200", "H200"]
     assert "has already refused capacity twice" not in log.getvalue()
 
 
