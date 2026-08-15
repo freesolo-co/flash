@@ -425,6 +425,182 @@ else:
 
 FLASH_GDN_VARLEN_MARKER = "[flash-verl] gdn packed-boundary resets active"
 
+FLASH_LORA_ROLLOUT_MARKER = "[flash-verl] lora rollout guard active"
+LORA_ROLLOUT_GUARD_SHIM = "lora-rollout-guard"
+
+_LORA_ROLLOUT_TARGET = "verl.workers.rollout.vllm_rollout.vllm_async_server"
+
+
+# why this fragment exists at all.
+#
+# verl's `vLLMHttpServer.generate` builds a LoRARequest only when `lora_as_adapter` is set and
+# `VLLM_LORA_INT_ID` is already in `await self.engine.list_loras()`; it then passes whatever it has
+# to `self.engine.generate(..., lora_request=lora_request, ...)`.
+#
+# when the adapter is missing, `lora_request` stays none and generation proceeds from the base
+# model. there is no raise, no warning and no counter, so the run completes and the loss descends
+# while every rollout came from a different policy than the one being trained. for opd that silently
+# turns on-policy distillation into off-policy distillation from the stock base model; for grpo it
+# scores trajectories the policy never produced. the symptom is "the method did not beat sft", which
+# reads as a failed experiment rather than a broken run, and no loss curve can distinguish the two.
+#
+# the guard wraps `self.engine.generate` rather than `vLLMHttpServer.generate`, because that is
+# where the decision is actually consumed. checking `list_loras` ourselves and then calling verl's
+# original would leave verl free to repeat its own lookup and reach the opposite conclusion, so an
+# adapter that disappeared between the two calls would still generate from the base model -- the
+# exact outcome this exists to prevent. reading the `lora_request` verl computed is also one fewer
+# engine round trip per rollout: `list_loras` is an awaited zeromq utility rpc, not a local read.
+#
+# every flash rollout is a lora rollout (train.lora_rank parses with minimum=1), and there is no
+# legitimate window where the adapter is missing:
+#   - ray_trainer.fit loads the checkpoint and calls update_weights before any generation,
+#     including the optional pre-train validation pass, so the first rollout is already post-sync.
+#   - the adapter is re-added on every step's weight sync (utils.py _update_weights -> add_lora),
+#     and the one remove_lora is inside that same awaited sync, with no generation scheduled in it.
+#   - lora rollouts sleep at level 1 rather than 2 specifically to keep the adapter across steps.
+#   - vllm is configured max_loras=1 against a single fixed id, so nothing evicts it under pressure.
+# `lora_as_adapter` is false for a merged-lora rollout, which serves the adapter through the base
+# weights and legitimately carries no LoRARequest, so mirroring that flag keeps the guard off the
+# one path where generating without a LoRARequest is correct.
+def render_lora_rollout_guard_shim(
+    *, applied_hook: str | None = None, failure_hook: str | None = None
+) -> str:
+    """child-side patch for a rollout whose lora never reached the engine.
+
+    deferred through a meta_path finder for the same reason as the gdn shim: importing the target at
+    interpreter startup pulls in vllm and torch, initializing cuda against every visible gpu before
+    ray narrows the actor to its own card. the optional hook names let the canonical wrapped fragment
+    report deferred success or failure without coupling the raw renderer to marker infrastructure.
+    """
+    applied = f"    {applied_hook}()\n" if applied_hook else ""
+    apply_patch = "    _flash_patch_lora_rollout(module)\n"
+    if failure_hook:
+        apply_patch = f"""    try:
+        _flash_patch_lora_rollout(module)
+    except BaseException:
+        {failure_hook}()
+"""
+    return f'''
+import sys as _flash_lora_sys
+
+_FLASH_LORA_TARGET = {_LORA_ROLLOUT_TARGET!r}
+
+
+def _flash_guard_lora_engine(engine, adapter_id):
+    """refuse an engine.generate that carries no LoRARequest on a lora rollout."""
+    inner = engine.generate
+
+    def guarded(*args, **kwargs):
+        if kwargs.get("lora_request") is None:
+            raise RuntimeError(
+                "[flash-verl] refusing to roll out from the base model: this run trains a lora "
+                f"adapter (id {{adapter_id}}), but it was not loaded in the vllm engine when this "
+                "request was built, so verl passed no LoRARequest. generating here would train "
+                "the adapter on tokens a different policy produced, which no loss curve can "
+                "distinguish from a healthy run."
+            )
+        return inner(*args, **kwargs)
+
+    engine.generate = guarded
+    engine._flash_lora_guarded = True
+
+
+def _flash_patch_lora_rollout(module):
+    server = module.vLLMHttpServer
+    if getattr(server.generate, "_flash_lora_guarded", False):
+        return
+    original = server.generate
+
+    async def generate(self, *args, **kwargs):
+        # arm the engine once, on the first lora request it serves. `lora_as_adapter` is derived
+        # from config and never changes for the life of the process, so from here on any request
+        # reaching the engine without a LoRARequest is the defect. installing once (rather than
+        # around each call) keeps this correct while many rollouts share the one engine object.
+        engine = self.engine
+        if self.lora_as_adapter and not getattr(engine, "_flash_lora_guarded", False):
+            _flash_guard_lora_engine(engine, module.VLLM_LORA_INT_ID)
+        return await original(self, *args, **kwargs)
+
+    generate._flash_lora_guarded = True
+    server.generate = generate
+{applied}    print({FLASH_LORA_ROLLOUT_MARKER!r}, flush=True)
+
+
+def _flash_apply_lora_patch(module):
+{apply_patch}
+
+
+class _FlashLoraLoader:
+    """patch after the real loader finishes, so the class the caller receives is the patched one."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def create_module(self, spec):
+        return self._inner.create_module(spec)
+
+    def exec_module(self, module):
+        self._inner.exec_module(module)
+        _flash_lora_uninstall()
+        _flash_apply_lora_patch(module)
+
+    def __getattr__(self, name):  # keep the rest of the loader protocol intact
+        return getattr(self._inner, name)
+
+
+class _FlashLoraFinder:
+    """intercept the first import of the rollout server module, then get out of the way."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != _FLASH_LORA_TARGET:
+            return None
+        # delegate only to finders positioned after this one: skipping every flash finder would let
+        # a sibling shim's patch be dropped while its marker still recorded success, and skipping
+        # only our own class recurses when two flash finders sit on the same module.
+        here = [i for i, f in enumerate(_flash_lora_sys.meta_path) if f is self]
+        rest = _flash_lora_sys.meta_path[here[0] + 1 :] if here else _flash_lora_sys.meta_path
+        for finder in rest:
+            find = getattr(finder, "find_spec", None)
+            if find is None:
+                continue
+            spec = find(fullname, path, target)
+            if spec is not None and spec.loader is not None:
+                spec.loader = _FlashLoraLoader(spec.loader)
+                return spec
+        return None
+
+
+def _flash_lora_uninstall():
+    _flash_lora_sys.meta_path[:] = [
+        f for f in _flash_lora_sys.meta_path if not isinstance(f, _FlashLoraFinder)
+    ]
+
+
+_flash_lora_loaded = _flash_lora_sys.modules.get(_FLASH_LORA_TARGET)
+if _flash_lora_loaded is not None:
+    _flash_apply_lora_patch(_flash_lora_loaded)
+else:
+    _flash_lora_sys.meta_path.insert(0, _FlashLoraFinder())
+'''
+
+
+def render_lora_rollout_guard_fragment() -> str:
+    """canonical wrapped lora guard, including deferred marker and failure reporting."""
+    applied_hook = "_flash_lora_rollout_guard_applied"
+    failure_hook = "_flash_lora_rollout_guard_failed"
+    lifecycle = f"""
+def {applied_hook}():
+    _flash_record_applied_shim({LORA_ROLLOUT_GUARD_SHIM!r})
+
+
+def {failure_hook}():
+    _flash_required_shim_failed({LORA_ROLLOUT_GUARD_SHIM!r})
+"""
+    source = lifecycle + render_lora_rollout_guard_shim(
+        applied_hook=applied_hook, failure_hook=failure_hook
+    )
+    return wrap_shim_fragment(LORA_ROLLOUT_GUARD_SHIM, source, record_immediately=False)
+
 
 # Why the shim below defers every import to the moment the child imports the modeling module.
 #
@@ -617,37 +793,43 @@ def _flash_record_applied_shim(name):
     # and short O_APPEND writes keep each line intact. the parent reads the file as a set.
     with open(_FLASH_SHIM_MARKER_FILE, "a") as _flash_shim_handle:
         _flash_shim_handle.write(name + "\\n")
-"""
 
 
-def wrap_shim_fragment(name: str, source: str) -> str:
-    """wrap one required sitecustomize fragment so it fails closed and proves it applied.
-
-    "" stays "": a feature that is off has nothing to prove. requires the prologue above earlier
-    in the same sitecustomize. optional fragments (tf32, the wandb link) stay unwrapped, since they
-    swallow their own failures by design and must never be able to kill a paid run.
-    """
-    if not source:
-        return ""
-    return f"""
-# --- flash required fragment: {name} (fails closed; see child_io.wrap_shim_fragment) ---
-try:
-{textwrap.indent(source, "    ")}
-    _flash_record_applied_shim({name!r})
-except BaseException:
+def _flash_required_shim_failed(name):
     import os as _flash_shim_os
     import sys as _flash_shim_sys
     import traceback as _flash_shim_traceback
 
     _flash_shim_traceback.print_exc()
     print(
-        "[flash-verl] required shim fragment {name} failed to apply; "
+        f"[flash-verl] required shim fragment {{name}} failed to apply; "
         "exiting {SHIM_FRAGMENT_FAILED_EXIT_CODE} rather than training unpatched",
         file=_flash_shim_sys.stderr,
         flush=True,
     )
     _flash_shim_sys.stderr.flush()
     _flash_shim_os._exit({SHIM_FRAGMENT_FAILED_EXIT_CODE})
+"""
+
+
+def wrap_shim_fragment(name: str, source: str, *, record_immediately: bool = True) -> str:
+    """wrap one required sitecustomize fragment so it fails closed and proves it applied.
+
+    "" stays "": a feature that is off has nothing to prove. requires the prologue above earlier
+    in the same sitecustomize. deferred fragments set ``record_immediately=False`` and call the
+    recorder themselves only after their target module is actually patched. optional fragments
+    (tf32, the wandb link) stay unwrapped, since they swallow their own failures by design and must
+    never be able to kill a paid run.
+    """
+    if not source:
+        return ""
+    record = f"    _flash_record_applied_shim({name!r})\n" if record_immediately else ""
+    return f"""
+# --- flash required fragment: {name} (fails closed; see child_io.wrap_shim_fragment) ---
+try:
+{textwrap.indent(source, "    ")}
+{record}except BaseException:
+    _flash_required_shim_failed({name!r})
 """
 
 

@@ -233,8 +233,6 @@ def _write_terminal_metadata(
             wandb_run_name=experiment_name if "wandb" in loggers else None,
             wandb_url=reward_runtime.wandb_link.get("wandb_url"),
             wandb_id=reward_runtime.wandb_link.get("wandb_id"),
-            reward_profile=reward_runtime.reward_profile,
-            step_intervals=_step_intervals(state.step_line_times),
             reward_bridge_batching=not inp["multi_turn"],
             gdn_boundary_resets=gdn_hybrid or None,
         ),
@@ -472,15 +470,7 @@ def run_rl_train():
     )
 
 
-# the total startup delay the reward profile hook is allowed to add, covering reference extraction
-# AND timing. both call user code, so one shared ceiling is the only number that means anything to a
-# caller. it stays HERE rather than moving with `_log_reward_profile`: the reward-profile tests
-# shorten the probe by patching it on this module, and the implementation reads it back through
-# `rl_train` at call time.
-_PROFILE_BUDGET_S = 30.0
-
-# single-turn scoring and the reward-wall probe, implemented in `.train.rl.single_turn`. imported at
-# the BOTTOM because that module reads the budget above, so a top-level import would be circular.
+# single-turn scoring, implemented in `.train.rl.single_turn`.
 # verl config rendering, implemented in `.train.rl.verl_config`.
 # the parent side of the multi-turn rollout loop, implemented in `.train.rl.multi_turn`.
 # checkpoint upload and the zero-gradient publish guard, implemented in `.train.rl.checkpoints`.
@@ -531,7 +521,6 @@ from flash.engine.worker.train.rl.multi_turn import (  # noqa: E402,F401
 )
 from flash.engine.worker.train.rl.single_turn import (  # noqa: E402,F401
     _finalize_single_turn_reward,
-    _log_reward_profile,
     _single_turn_scoring_state,
     score_single_turn,
     score_single_turn_batch,
@@ -540,9 +529,7 @@ from flash.engine.worker.train.rl.verl_config import (  # noqa: E402,F401
     _DEFAULT_GPU_MEM_UTIL,
     _build_verl_train_notes,
     _build_verl_training_cfg,
-    _measured_idle_fraction,
     _processor_expanded_prompt,
-    _step_intervals,
     _verl_epochs_for_horizon,
     _verl_grpo_parquet_features,
     build_verl_dataset_rows,

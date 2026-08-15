@@ -84,7 +84,7 @@ def _capacity_exhausted(
     cache lifts the volume's datacenter restriction and reaches hosts the cached attempt could not.
     Every other infra failure keeps its full retry budget.
     """
-    if outcome.result.failure != "no_capacity" or first_cache_drop:
+    if outcome.result.failure != "no_capacity" or first_cache_drop or not ctx.spec.gpu.type:
         return False
     if outcome.chosen is None:
         return False

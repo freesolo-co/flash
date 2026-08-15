@@ -2794,22 +2794,35 @@ def _progress_bridge_snapshot(*, samples_seen: int, truncated_rollouts: int):
     )
 
 
-def test_opd_progress_truncation_rate_is_per_step_not_cumulative():
+def _applied_shim_markers(tmp_path) -> str:
+    """a marker file recording the guard as applied, as a child with a working shim leaves it.
+
+    the callbacks verify it on the first step line, so tests that drive steps need the real
+    thing rather than a stub: a bare path would fail them for the reason the check exists.
+    """
+    marker = Path(opd_train.shim_marker_file(str(tmp_path)))
+    marker.write_text("lora-rollout-guard\n", encoding="utf-8")
+    return str(marker)
+
+
+def test_opd_progress_truncation_metrics_are_per_step_not_cumulative():
     progress = _OpdProgressState()
 
-    first = progress.record_step(
+    first_rate, first_discarded = progress.record_step(
         1,
         0.8,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
-    second = progress.record_step(
+    second_rate, second_discarded = progress.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=3),
     )
 
-    assert first == pytest.approx(0.75)
-    assert second == 0.0
+    assert first_rate == pytest.approx(0.75)
+    assert first_discarded == 3
+    assert second_rate == 0.0
+    assert second_discarded == 0
 
 
 def test_opd_progress_truncation_rate_zero_delta_does_not_reuse_history():
@@ -2820,28 +2833,30 @@ def test_opd_progress_truncation_rate_zero_delta_does_not_reuse_history():
         0.8,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
-    second = progress.record_step(
+    second_rate, second_discarded = progress.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
 
-    assert second == 0.0
+    assert second_rate == 0.0
+    assert second_discarded == 0
 
 
 def test_opd_progress_truncation_rate_handles_zero_rollouts():
     progress = _OpdProgressState()
 
-    rate = progress.record_step(
+    rate, discarded = progress.record_step(
         1,
         0.8,
         _progress_bridge_snapshot(samples_seen=0, truncated_rollouts=0),
     )
 
     assert rate == 0.0
+    assert discarded == 0
 
 
-def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
+def test_opd_progress_step_metrics_stay_out_of_the_persisted_resume_state(tmp_path):
     """checkpoint_state is spread verbatim into opd_state.json, whose schema is fail-closed.
 
     a per-step display value is meaningless on resume and no consumer reads it back: the CLI
@@ -2854,12 +2869,13 @@ def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
     # fail-closed schema, so a partial snapshot would fail before reaching the assertion below.
     full = _resume_accounting(step=1)
     progress = _OpdProgressState()
-    rate = progress.record_step(
+    rate, discarded = progress.record_step(
         1,
         0.8,
         SimpleNamespace(accounting_snapshot=lambda: dict(full)),
     )
     assert rate == pytest.approx(0.375)
+    assert discarded == 3
 
     checkpoint = tmp_path / "checkpoint"
     adapter = tmp_path / "adapter"
@@ -2883,6 +2899,7 @@ def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
 
     state = json.loads((checkpoint / "opd_state.json").read_text())
     assert "truncation_rate" not in state
+    assert "discarded_rollouts" not in state
 
 
 def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
@@ -2892,7 +2909,7 @@ def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
         0.8,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=0),
     )
-    high_rate = high.record_step(
+    high_rate, high_discarded = high.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=12, truncated_rollouts=8),
@@ -2903,13 +2920,16 @@ def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
         0.8,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=4),
     )
-    low_rate = low.record_step(
+    low_rate, low_discarded = low.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=12, truncated_rollouts=2),
     )
 
     assert [high_rate, low_rate] == pytest.approx([1.0, 0.0])
+    # the count is bounded by the step's own sample delta (8 -> 12 is 4 samples), so a split
+    # snapshot reporting 8 truncations cannot attribute more discards than the step drew.
+    assert [high_discarded, low_discarded] == [4, 0]
 
 
 def test_opd_failure_accounting_defaults_optional_no_signal_counter():
@@ -5251,10 +5271,15 @@ def test_no_signal_failure_does_not_blame_cap_without_dominant_truncation():
     assert str(parent_error.value) == "verl OPD subprocess exited with status 1"
 
 
-def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
+def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler(
+    monkeypatch, tmp_path
+):
     from contextlib import nullcontext
 
     import flash.engine.worker.opd_train_runner as opd_runner
+
+    watcher_failure = {"enabled": False}
+    sampler_stops = []
 
     class ProgressState:
         def __init__(self, _resume_state):
@@ -5275,12 +5300,15 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
 
         def stop(self, *, require_complete):
             assert require_complete is True
+            if watcher_failure["enabled"]:
+                raise RuntimeError("watcher cleanup failed")
 
     class GpuSampler:
         def start(self):
             return self
 
         def stop_gb(self):
+            sampler_stops.append(True)
             return 0.0
 
     callbacks = SimpleNamespace(
@@ -5320,23 +5348,32 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
     )
     monkeypatch.setattr(opd_runner, "_validate_checkpoint_progress", lambda *_args: None)
 
-    result = opd_runner._run_child(
-        SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
-        object(),
-        SimpleNamespace(update_horizon=1, local_dir="/unused"),
-        SimpleNamespace(
-            resume_state=None,
-            resume_step=0,
-            python_bin="python",
-            entry_path="entry.py",
-            bridge=object(),
-        ),
-        {},
-        (),
-    )
+    def run_child():
+        return opd_runner._run_child(
+            SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
+            object(),
+            SimpleNamespace(update_horizon=1, local_dir="/unused", shim_dir=str(tmp_path)),
+            SimpleNamespace(
+                resume_state=None,
+                resume_step=0,
+                python_bin="python",
+                entry_path="entry.py",
+                bridge=object(),
+            ),
+            {},
+            (),
+        )
+
+    result = run_child()
 
     assert reconciled == [None]
     assert result.final_accounting["loss_curve"] == [0.5]
+    assert sampler_stops == [True]
+
+    watcher_failure["enabled"] = True
+    with pytest.raises(RuntimeError, match="watcher cleanup failed"):
+        run_child()
+    assert sampler_stops == [True, True]
 
 
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
@@ -6621,7 +6658,7 @@ def test_on_line_parses_the_numpy2_distillation_loss_the_image_actually_prints()
     )
 
 
-def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
+def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch, tmp_path):
     import flash.engine.worker.opd_train_runner as opd_runner
 
     emitted = []
@@ -6635,6 +6672,7 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
         _OpdProgressState(),
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
+        _applied_shim_markers(tmp_path),
     )
 
     callbacks.on_line("step:1 - actor/distillation/loss:0.5")
@@ -6643,12 +6681,17 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
     assert emitted == [
         (
             "opd_step",
-            {"step": 1, "loss": 0.5, "truncation_rate": pytest.approx(0.75)},
+            {
+                "step": 1,
+                "loss": 0.5,
+                "truncation_rate": pytest.approx(0.75),
+                "discarded_rollouts": 3,
+            },
         )
     ]
 
 
-def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
+def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch, tmp_path):
     import flash.engine.worker.opd_train_runner as opd_runner
 
     emitted = []
@@ -6662,6 +6705,7 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
         _OpdProgressState(),
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
+        _applied_shim_markers(tmp_path),
     )
 
     callbacks.on_line("step:1 - actor/distillation/loss:0.5")
@@ -6672,9 +6716,10 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
     assert emitted[1][0] == "opd_step"
     assert emitted[1][1]["step"] == 2
     assert "truncation_rate" not in emitted[1][1]
+    assert "discarded_rollouts" not in emitted[1][1]
 
 
-def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch):
+def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch, tmp_path):
     """the step-match guard must not silently disable the rate in production.
 
     on_line gates on verl_step_number, on_step on backend_common's own step_pattern. the two
@@ -6698,6 +6743,7 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
         _OpdProgressState(),
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
+        _applied_shim_markers(tmp_path),
     )
 
     # the step number reaching on_step is the one backend_common parses, not a hand-picked int.
@@ -6711,6 +6757,7 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
 
     assert [payload["step"] for _, payload in emitted] == [1, 2]
     assert all("truncation_rate" in payload for _, payload in emitted)
+    assert [payload["discarded_rollouts"] for _, payload in emitted] == [3, 0]
 
 
 def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
@@ -7148,3 +7195,69 @@ def test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction():
     # rather than a second gradient path, so moving it changes the objective, not just the value.
     assert "flat_student.detach()" in source
     assert source.count(".detach()") == 1
+
+
+def test_opd_sitecustomize_composes_into_valid_python_with_the_guard(tmp_path, monkeypatch):
+    """the wrapper indents a whole rendered fragment into a try block; a syntax slip there would
+    turn every opd child patch into a silent no-op, so compiling the composed file is the gate."""
+    import flash.engine.worker.opd_train_runner as opd_runner
+    from flash.engine.worker import backend_common
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    monkeypatch.setattr(opd_runner.shutil, "copy2", lambda *_args: None)
+
+    opd_runner._write_child_shims(
+        SimpleNamespace(knobs=SimpleNamespace(save_at_steps=(3,))),
+        SimpleNamespace(shim_dir=str(shim_dir), update_horizon=3),
+        None,
+        [],
+    )
+
+    source = (shim_dir / "sitecustomize.py").read_text()
+    compile(source, "sitecustomize.py", "exec")
+    # the canonical fragment records once through its deferred hook, never at wrapper startup.
+    assert source.count("_flash_record_applied_shim('lora-rollout-guard')") == 1
+    assert "_flash_lora_rollout_guard_applied()" in source
+    assert f"_flash_shim_os._exit({backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE})" in source
+
+
+def test_opd_stops_an_unguarded_child_at_its_first_step(tmp_path):
+    """a child whose sitecustomize was skipped serves every rollout from the base model.
+
+    the marker is checked at the first step boundary and the raise tears the child down there, so
+    the failure costs one step instead of the whole gpu and teacher budget.
+    """
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    callbacks = opd_runner._build_child_callbacks(
+        SimpleNamespace(raise_if_failed=lambda: None),
+        _OpdProgressState(),
+        _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
+        0,
+        opd_train.shim_marker_file(str(tmp_path)),  # no marker: the shim never applied
+    )
+
+    # output before the first step is not a verdict: fragments still print while later ones apply.
+    callbacks.on_line("(TaskRunner pid=3125) loading checkpoint\n")
+
+    with pytest.raises(RuntimeError, match=r"never proved.*lora-rollout-guard"):
+        callbacks.on_line("step:1 - actor/distillation/loss:0.5")
+
+
+def test_opd_names_the_failed_fragment_when_the_child_exits_fail_closed():
+    """wrapping a fragment made exit 97 reachable from opd, so opd has to explain it.
+
+    the wrapped guard hard-exits the child rather than train unpatched. without this branch the
+    run surfaces as a bare "exited with status 97", which reads as an unclassified crash and
+    invites a retry that fails identically on the same interpreter.
+    """
+    from flash.engine.worker import backend_common
+
+    with pytest.raises(
+        RuntimeError, match="required flash runtime patch failed to apply"
+    ) as excinfo:
+        _raise_verl_failure(backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE, None)
+
+    # permanent: retrying re-runs the same incompatible verl/transformers stack.
+    assert not isinstance(excinfo.value, opd_train._w.RetriableInfraError)

@@ -16,6 +16,10 @@ from typing import Any
 
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
+from flash.engine.worker.verl.child_io import (
+    LORA_ROLLOUT_GUARD_SHIM,
+    render_lora_rollout_guard_fragment,
+)
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
     resolve_reshard_after_forward,
@@ -526,10 +530,15 @@ def _write_child_shims(
     )
     if gdn_reset_arch is not None:
         opd_shim_source += _opd_train.render_gdn_varlen_shim(gdn_reset_arch)
+    # fail closed because base-model rollouts can look healthy while distilling the wrong policy.
+    opd_shim_source += render_lora_rollout_guard_fragment()
     if "wandb" in loggers:
         opd_shim_source += _opd_train.render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(opd_shim_source)
+        file.write(
+            _opd_train.render_shim_marker_prologue(_opd_train.shim_marker_file(shim_dir))
+            + opd_shim_source
+        )
     return entry_path, reward_path
 
 
@@ -614,16 +623,20 @@ def _build_child_callbacks(
     progress_state: Any,
     bridge: Any,
     resume_step: int,
+    shim_markers: str,
 ) -> _ChildCallbacks:
     progress = {
         "step": resume_step,
         "loss": None,
         "truncation_rate": None,
+        "discarded_rollouts": None,
         "truncation_step": None,
     }
     wandb_link: dict[str, str | None] = {}
+    shims_verified = False
 
     def on_line(line: str) -> None:
+        nonlocal shims_verified
         watcher.raise_if_failed()
         link = _opd_train.parse_wandb_link(line)
         if link is not None:
@@ -631,6 +644,16 @@ def _build_child_callbacks(
         step_number = _opd_train.verl_step_number(line)
         if step_number is None:
             return
+        # the first step line is the training-start boundary: sitecustomize import is long finished
+        # by then, so a marker still missing means this child never ran ours at all -- a shadowing
+        # sitecustomize or a dropped PYTHONPATH entry -- and every rollout it has already served
+        # could have come from the base model. raising here kills the child (run_verl_training
+        # tears the process group down on a callback failure), which costs one step instead of the
+        # whole gpu and teacher budget. not on the first output line: fragments print while later
+        # ones are still applying.
+        if not shims_verified:
+            _opd_train.verify_applied_shim_markers(shim_markers, (LORA_ROLLOUT_GUARD_SHIM,))
+            shims_verified = True
         # use parse_verl_metric because numpy 2 pprint emits np.float64(...); float() would drop
         # every step and leave a trained run with an empty loss curve.
         loss = _opd_train.parse_verl_metric(line, "actor/distillation/loss")
@@ -642,7 +665,10 @@ def _build_child_callbacks(
             # when NO step ever produced a distillation loss.
             return
         progress["loss"] = loss
-        progress["truncation_rate"] = progress_state.record_step(step_number, loss, bridge)
+        (
+            progress["truncation_rate"],
+            progress["discarded_rollouts"],
+        ) = progress_state.record_step(step_number, loss, bridge)
         progress["truncation_step"] = step_number
 
     def on_step(step: int) -> None:
@@ -652,6 +678,7 @@ def _build_child_callbacks(
             payload["loss"] = progress["loss"]
         if progress["truncation_step"] == step and progress["truncation_rate"] is not None:
             payload["truncation_rate"] = progress["truncation_rate"]
+            payload["discarded_rollouts"] = progress["discarded_rollouts"]
         _opd_train._w.heartbeat("opd_step", **payload)
 
     def child_heartbeat() -> None:
@@ -689,7 +716,10 @@ def _run_child(
     overrides = _opd_train.build_opd_overrides(config)
     progress_state = _opd_train._OpdProgressState(runtime.resume_state)
     watcher = _build_checkpoint_watcher(request, workload, runtime, progress_state)
-    callbacks = _build_child_callbacks(watcher, progress_state, runtime.bridge, runtime.resume_step)
+    shim_markers = _opd_train.shim_marker_file(workload.shim_dir)
+    callbacks = _build_child_callbacks(
+        watcher, progress_state, runtime.bridge, runtime.resume_step, shim_markers
+    )
     child_env = _build_child_env(request, prompt_state, workload, runtime, eos_token_ids)
     command = [runtime.python_bin, runtime.entry_path, *overrides]
     gpu_sampler = _opd_train._NvidiaSmiPeakSampler().start()
@@ -716,8 +746,12 @@ def _run_child(
                 )
                 training_completed = return_code == 0
     finally:
-        watcher.stop(require_complete=training_completed)
-    peak_gpu_gb = gpu_sampler.stop_gb()
+        try:
+            watcher.stop(require_complete=training_completed)
+        finally:
+            # the sampler polls nvidia-smi on a thread of its own. stop it even when either the
+            # child callback or watcher cleanup raises, because this worker outlives the run.
+            peak_gpu_gb = gpu_sampler.stop_gb()
     truncation_window = None
     if return_code != 0:
         truncation_window = progress_state.truncation_window(
