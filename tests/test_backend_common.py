@@ -5316,7 +5316,7 @@ def _lora_rollout_server_module(loaded, *, lora_as_adapter=True):
             **kwargs,
         ):
             # verl's own body at vllm_async_server.py:524-538: it decides lora_request from its
-            # OWN lookup and hands it to the engine. reproducing that here is what makes these
+            # own lookup and hands it to the engine. reproducing that here is what makes these
             # tests able to fail -- a stub that never consults list_loras cannot catch a guard
             # that checks a different value than the one generation actually uses.
             lora_request = None
@@ -5506,7 +5506,7 @@ def test_the_lora_rollout_guard_patches_the_module_on_a_real_deferred_import(tmp
     for name in list(_sys.modules):
         if name == "verl" or name.startswith("verl."):
             monkeypatch.delitem(_sys.modules, name, raising=False)
-    # importing the fake tree ADDS entries monkeypatch never recorded, so undoing its deletions
+    # importing the fake tree adds entries monkeypatch never recorded, so undoing its deletions
     # would leave this tmp_path package shadowing the real verl for every later test in the run.
     imported = set(_sys.modules)
     armed = list(_sys.meta_path)

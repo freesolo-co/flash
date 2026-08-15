@@ -538,7 +538,7 @@ class _FlashLoraFinder:
     def find_spec(self, fullname, path=None, target=None):
         if fullname != _FLASH_LORA_TARGET:
             return None
-        # delegate only to finders positioned AFTER this one: skipping every flash finder would let
+        # delegate only to finders positioned after this one: skipping every flash finder would let
         # a sibling shim's patch be dropped while its marker still recorded success, and skipping
         # only our own class recurses when two flash finders sit on the same module.
         here = [i for i, f in enumerate(_flash_lora_sys.meta_path) if f is self]
