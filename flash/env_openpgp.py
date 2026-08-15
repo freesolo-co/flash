@@ -284,18 +284,29 @@ def _is_openpgp_secret_key(head: bytes) -> bool | None:
         offset = 2 if first < 192 else (3 if first < 224 else (6 if first == 0xFF else 0))
     else:
         offset = lengths.get(head[0] & 0x03, 0)
-    if offset == 0 or len(head) <= offset or head[offset] not in (4, 6):
+    if offset == 0 or len(head) <= offset:
         return False
+    # Version 3 as well as 4 and 6. A v3 secret key is obsolete, not unreadable: GnuPG still names
+    # a structurally complete tag-5 v3 packet an (obsolete) secret key, and its MPI key material
+    # matches no textual or DER detector -- so rejecting the version published the key intact.
+    #
+    # The v3 layout differs by two bytes: a validity period in DAYS follows the creation timestamp,
+    # before the algorithm. Reading it at the v4 offset lands inside that field, so the version
+    # decides the offset rather than one being assumed for all of them.
+    version = head[offset]
+    if version not in (3, 4, 6):
+        return False
+    algorithm_at = offset + (7 if version == 3 else 5)
     # The declared body length must actually reach the fields read below. A packet claiming a
     # one-byte body cannot hold a version, a four-byte timestamp and an algorithm, so reading them
     # takes bytes from BEYOND the packet -- `c5 01 04 00 00 00 00 01` is an ordinary binary that
     # was refused as a private key. Old-format length type 3 is indeterminate, which declares no
     # length at all, and is already excluded by the table above.
     body = _openpgp_body_length(head, offset)
-    if body is not None and body < 6:
+    if body is not None and body < algorithm_at - offset + 1:
         return False
-    # then a four-byte creation timestamp, then the algorithm
-    return len(head) > offset + 5 and head[offset + 5] in algorithms
+    # then a four-byte creation timestamp (and, for v3, a two-byte validity), then the algorithm
+    return len(head) > algorithm_at and head[algorithm_at] in algorithms
 
 
 def _openpgp_packet_starts(head: bytes) -> Iterator[bytes]:
@@ -462,18 +473,30 @@ def _past_partial_chunks(head: bytes, first: int) -> int | None:
         first = head[at]
         at += 1
         if first < 192:
-            return at + first
+            return _within(head, at + first)
         if first < 224:
             if at + 1 > len(head) - 1:
                 return None
             length = ((first - 192) << 8) + head[at] + 192
-            return at + 1 + length
+            return _within(head, at + 1 + length)
         if first == 255:
             if at + 4 > len(head):
                 return None
-            return at + 4 + int.from_bytes(head[at : at + 4], "big")
+            return _within(head, at + 4 + int.from_bytes(head[at : at + 4], "big"))
         # another partial chunk: loop, with `first` naming its size
     return None
+
+
+def _within(head: bytes, offset: int) -> int | None:
+    """`offset` when it lands inside `head`, otherwise None.
+
+    A final chunk's DECLARED length may reach past the bytes read so far -- the scan hands over one
+    buffer at a time, and a legal five-octet length can name a body larger than it. Returning the
+    offset regardless meant slicing at it produced an EMPTY remainder, and an empty remainder walks
+    to the end without finding a key: a secret-key packet behind such a chunk was reported clean.
+    The packet is not absent, it is unread, so the answer is the undecided one.
+    """
+    return offset if offset <= len(head) else None
 
 
 def _openpgp_body_length(head: bytes, offset: int) -> int | None:

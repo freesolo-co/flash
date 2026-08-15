@@ -80,8 +80,22 @@ _FILTER_NAME = b"".join(rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for le
 # the decompression error was skipped as "not really a stream", and the key inside published. The
 # encryption-key pattern already treats a comment as a separator; this is the same rule.
 _PDF_SEPARATOR = rb"(?:\s|%[^\r\n]*(?:\r\n|\r|\n))*"
+# How far back `_dictionary_start` will look for that opening bracket. A document is untrusted
+# input: without a bound, one that never opens a dictionary would be walked from every stream in it
+# back to byte zero. 64 KiB is far beyond any real object dictionary and still linear per stream.
+_MAX_DICTIONARY_REACH = 1 << 16
+
+# The two dictionary brackets, matched together so `_dictionary_start` can count depth. `<<` and
+# `>>` are the only tokens that change it; PDF's array brackets are a different pair and do not.
+_PDF_BRACKETS = re.compile(rb"<<|>>")
+
+# The array body is bounded by the dictionary reach rather than a short cap. 256 was enough for the
+# names a real chain chooses, but the body also carries whatever whitespace and comments sit between
+# them: a legal array with a 600-byte gap between `/ASCII85Decode` and `/FlateDecode]` exceeded the
+# cap, so no filters were reported at all and zlib was handed ASCII85 text. `[^\]]` cannot cross the
+# closing bracket, so widening it reads more of ONE array rather than pairing across objects.
 _PDF_FILTERS = re.compile(
-    rb"/%s%s(?:/([\w#]+)|\[([^\]]{0,256})\])" % (_FILTER_NAME, _PDF_SEPARATOR)
+    rb"/%s%s(?:/([\w#]+)|\[([^\]]{0,%d})\])" % (_FILTER_NAME, _PDF_SEPARATOR, _MAX_DICTIONARY_REACH)
 )
 _PDF_FILTER_NAME = re.compile(rb"/([\w#]+)")
 
@@ -136,8 +150,8 @@ _PREDICTOR_NAME = b"".join(
 )
 _PDF_PREDICTOR = re.compile(rb"/%s\s*(\d+)" % _PREDICTOR_NAME)
 
-# How far back from the `stream` keyword the owning object's dictionary is read. The same 512-byte
-# reach `_filter_stages` uses, for the same reason: the dictionary precedes the keyword.
+# How far FORWARD of the filter name the dictionary slice runs. Backwards it runs to the
+# dictionary's own `<<` instead, which is the real boundary rather than a guessed distance.
 _PDF_DICTIONARY_REACH = 512
 
 
@@ -372,14 +386,42 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
         raise _TooManyStreams
 
 
+def _dictionary_start(data: bytes, at: int) -> int:
+    """Where the dictionary containing `at` opens, or as far back as this is willing to read.
+
+    A dictionary's own `<<` is its boundary, so finding it reads exactly the object rather than a
+    guessed number of bytes around it. Searched backwards from `at` and bounded by
+    `_MAX_DICTIONARY_REACH`: a document is untrusted input, and an unbounded reverse scan over one
+    that never opens a dictionary would walk the whole file for every stream in it.
+
+    Nested dictionaries are why the LAST `<<` is not simply taken: `/DecodeParms << ... >>` opens
+    one INSIDE the object, and starting there would cut off the `/Filter` entry written before it.
+    Depth is counted instead, so the position returned is the outermost open bracket -- the object's
+    own -- and every entry it declares is inside the slice.
+    """
+    floor = max(0, at - _MAX_DICTIONARY_REACH)
+    depth = 0
+    for token in reversed([found.start() for found in _PDF_BRACKETS.finditer(data, floor, at)]):
+        depth += 1 if data[token : token + 2] == b">>" else -1
+        if depth < 0:
+            return token
+    return floor
+
+
 def _object_dictionary(data: bytes, at: int) -> bytes:
     """The bytes of the dictionary belonging to the stream whose filter name sits at `at`.
 
     Read backwards from the match for the same reason `_filter_stages` does: the dictionary
     precedes the `stream` keyword, and a slice starting at the filter name would miss the
     `/DecodeParms` entry when that entry is written before `/Filter`.
+
+    Back to the dictionary's OWN opening `<<`, not a fixed number of bytes. The reach was 512 on the
+    reasoning that a real object dictionary is short, which is a convention rather than a rule: a
+    legal `/DecodeParms << /Predictor 2 ... >>` written 600 bytes ahead of `/Filter` fell outside
+    the window, so the predictor named nothing, the stream was inflated, and horizontal differences
+    were scanned as though they were content while a conforming decode reconstructs the key.
     """
-    return data[max(0, at - _PDF_DICTIONARY_REACH) : at + _PDF_DICTIONARY_REACH]
+    return data[_dictionary_start(data, at) : at + _PDF_DICTIONARY_REACH]
 
 
 def _refuse_unreadable_streams(data: bytes) -> None:
@@ -394,10 +436,17 @@ def _refuse_unreadable_streams(data: bytes) -> None:
     A stream with NO `/Filter` at all is uncompressed, so its literal bytes are scanned by the
     ordinary pass over the document and need nothing from this.
     """
-    for found in itertools.islice(_PDF_ANY_STREAM.finditer(data), _MAX_PDF_STREAMS):
+    streams = _PDF_ANY_STREAM.finditer(data)
+    for found in itertools.islice(streams, _MAX_PDF_STREAMS):
         chain = _declared_filters(data, found.start())
         if any(name not in (_FLATE_FILTER, _ASCII85_FILTER) for name in chain):
             raise _UnreadableFilterChain
+    # Stopping at the bound treated every stream past it as readable, which is the same fail-open
+    # the flate walk already refuses: 4,096 unfiltered streams followed by an `/ASCIIHexDecode`
+    # stream holding a hex-spelled key never reached the filtered one, and the flate walk counts
+    # only flate streams so it did not reach it either. Undecided is not clean.
+    if next(streams, None) is not None:
+        raise _TooManyStreams
 
 
 def _declared_filters(data: bytes, at: int) -> list[bytes]:
@@ -408,11 +457,18 @@ def _declared_filters(data: bytes, at: int) -> list[bytes]:
     there is cut after the opening bracket, leaving `/Filter [` unmatched and the chain invisible.
     Reading from behind the whole dictionary is what makes the array visible; the last entry that
     starts before the stream keyword is the one this object declares.
+
+    Bounded by the dictionary's own `<<` rather than a fixed 512 bytes, for the same reason
+    `_object_dictionary` is: a legal array may put any amount of whitespace or comment between
+    `/Filter [/ASCII85Decode` and `/FlateDecode]`, and a 600-byte gap put the opening of the
+    declaration outside the window -- so no pre-filter was reported and zlib was handed ASCII85
+    text, which fails to inflate and reads as "not really a stream".
     """
-    dictionary = data[max(0, at - 512) : at + 512]
+    start = _dictionary_start(data, at)
+    dictionary = data[start : at + _PDF_DICTIONARY_REACH]
     names = None
     for candidate in _PDF_FILTERS.finditer(dictionary):
-        if candidate.start() <= min(at, 512):
+        if candidate.start() <= at - start:
             names = candidate
     if not names:
         return []

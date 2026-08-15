@@ -161,12 +161,18 @@ def credential_in_tar(
                         raise refusal("contains an archive with too many members to inspect")
                     if time.monotonic() > deadline:
                         raise refusal("takes too long to decompress")
-                    if not info.isfile():
-                        continue
                     # the member NAME is checked too: a tar entry called `fslo_<key>.json` publishes
                     # the key in the archive's listing whatever its contents are.
+                    #
+                    # Checked BEFORE the entry-type filter. A directory, symlink or device node has
+                    # no contents to scan, but its name is in the listing exactly as a file's is --
+                    # so skipping non-files first meant a directory named with base64 of an
+                    # OpenSSL-encrypted file returned clean here while the name scanner refused that
+                    # same string on its own.
                     if kind := named(info.name):
                         return kind
+                    if not info.isfile():
+                        continue
                     try:
                         member = archive.extractfile(info)
                         if member is None:
@@ -190,6 +196,89 @@ def credential_in_tar(
                 unreadable = unreadable or "an archive member this check cannot read"
     finally:
         handle.close()
+    if unreadable:
+        raise refusal(f"contains {unreadable}")
+    return None
+
+
+# What an ar archive begins with, and the fixed-width header each member carries: a 16-byte name, 12
+# bytes of mtime, 6 each of uid and gid, 8 of mode, 10 of size, then the two-byte magic that ends
+# it. Members are padded to an even offset.
+_AR_MAGIC = b"!<arch>\n"
+_AR_HEADER = 60
+_AR_SIZE_FIELD = slice(48, 58)
+_AR_NAME_FIELD = slice(0, 16)
+
+
+def credential_in_ar(
+    source: Path | bytes,
+    *,
+    deadline: float,
+    depth: int,
+    scan: Scanner,
+    refusal: type[Exception],
+    named: Namer,
+    member_limit: int,
+) -> str | None:
+    """The kind of credential in any readable member of an ar archive, or None.
+
+    A Debian package is an ar holding `debian-binary`, `control.tar.*` and `data.tar.*`, and it is
+    an ordinary thing to find beside an environment. None of the other handlers enumerates it: the
+    members' magic sits at their own offsets rather than at byte zero, so the anchored format check
+    could not see it, and the raw pass reads compressed member bytes as opaque content. A `.deb`
+    whose `data.tar.zst` this cannot expand therefore published clean, while the same zstd payload
+    standing alone was refused.
+
+    Each member's bytes go back to the scanner, exactly as a tar's do, so a container inside one is
+    expanded and an uninspectable one is refused rather than passed over.
+    """
+    # The signature is read from the first bytes rather than by loading the file. An ar archive is
+    # rare beside an environment while a large member is ordinary, so reading a 256 MiB shard whole
+    # to discover it is not an ar is a cost paid by every file to serve almost none of them -- the
+    # same reason the zlib probe reads a bounded prefix rather than the member.
+    if isinstance(source, Path):
+        with source.open("rb") as head:
+            if head.read(len(_AR_MAGIC)) != _AR_MAGIC:
+                return None
+        data = source.read_bytes()
+    else:
+        data = source
+        if not data.startswith(_AR_MAGIC):
+            return None
+    unreadable = ""
+    at = len(_AR_MAGIC)
+    for _ in range(member_limit):
+        if at + _AR_HEADER > len(data):
+            break
+        header = data[at : at + _AR_HEADER]
+        try:
+            size = int(header[_AR_SIZE_FIELD].decode("ascii", "replace").strip() or "-1")
+        except ValueError:
+            size = -1
+        if size < 0:
+            # A header whose size field is unreadable stops the walk: every later member is found by
+            # stepping over this one, so a wrong length would resynchronise on arbitrary bytes.
+            # Unread is not clean, and the archive is reported as such below.
+            unreadable = unreadable or "an archive member this check cannot read"
+            break
+        if time.monotonic() > deadline:
+            raise refusal("takes too long to decompress")
+        # The NAME leaks through the archive's listing exactly as a tar's does, and `ar` pads its
+        # names with spaces and ends them with `/`.
+        if kind := named(header[_AR_NAME_FIELD].decode("ascii", "replace").strip().rstrip("/")):
+            return kind
+        body = data[at + _AR_HEADER : at + _AR_HEADER + size]
+        if len(body) < size:
+            unreadable = unreadable or "an archive member this check cannot read"
+            break
+        try:
+            if kind := scan(io.BytesIO(body), deadline, depth):
+                return kind
+        except _UNREADABLE_MEMBER:
+            unreadable = unreadable or "an archive member this check cannot read"
+        at += _AR_HEADER + size + (size % 2)
+    else:
+        raise refusal("contains an archive with too many members to inspect")
     if unreadable:
         raise refusal(f"contains {unreadable}")
     return None

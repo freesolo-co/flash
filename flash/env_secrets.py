@@ -32,7 +32,7 @@ import zlib
 from pathlib import Path
 from typing import IO, NoReturn
 
-from flash.env_archive import credential_in_tar, credential_in_zip
+from flash.env_archive import credential_in_ar, credential_in_tar, credential_in_zip
 from flash.env_base64 import _Inspector, _match_base64, _RunTooLongToExpand
 from flash.env_buffers import (
     _SCAN_CHUNK_BYTES,
@@ -53,13 +53,11 @@ from flash.env_deflate import (
     _UnreadableFilterChain,
 )
 from flash.env_formats import (
-    _KEYSTORE_MAGIC,
     _MAX_ARCHIVE_MEMBERS,
     _ZIP_TAIL_BYTES,
     OVERLAY_UNPROBED,
     _after_skippable_frames,
     _has_zip_end_record,
-    _jks_private_key_entries,
     _looks_compressed,
     _looks_like_tar,
     _looks_like_textual,
@@ -71,12 +69,13 @@ from flash.env_formats import (
     _zip_member_count,  # noqa: F401
 )
 from flash.env_joined import _rejoined
-from flash.env_openpgp import (
-    _MAX_OPENPGP_MARKERS,
-    _has_openpgp_message_armor,
-    _is_openpgp_encrypted,
-    _openpgp_secret_key_in_sequence,
-)
+
+# The two head-anchored walks and the refusal they raise, split out to keep this module under the
+# file-size limit. `_Unscannable` lives THERE because those walks raise it and this module imports
+# them, so the other direction would be a cycle. Re-exported because every other raise site and
+# every test still reads all three from here.
+from flash.env_keystores import _keystore_undecided, _openpgp_kind, _Unscannable
+from flash.env_openpgp import _MAX_OPENPGP_MARKERS, _has_openpgp_message_armor
 from flash.env_patterns import (
     _ASSIGNED_PATTERNS,
     _LITERAL_PATTERNS,
@@ -320,17 +319,6 @@ def _decoded_container(deadline: float | None, depth: int) -> _Inspector | None:
     return inspect
 
 
-class _Unscannable(Exception):
-    """A member could not be scanned to the end, so the publish cannot be vouched for.
-
-    Every limit this module imposes -- time, nesting depth, buffer size -- raises this rather than
-    returning None. A limit that returns "no credential found" is indistinguishable from a clean
-    scan, so the cheapest way past the whole check is to make it expensive: bury the key deeper
-    than the depth cap, or behind a member too large to buffer. Refusing keeps the limits honest
-    about what they mean, which is "not verified", not "verified clean".
-    """
-
-
 def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int = 0) -> str | None:
     """The kind of credential anywhere in `handle`, or None.
 
@@ -470,62 +458,6 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     return None
 
 
-def _keystore_undecided(head: bytes) -> bool | None:
-    """Whether more bytes are needed to settle if `head` is a keystore holding a key.
-
-    None means it IS one holding a key entry; False means it is not a keystore at all; True means
-    the walk ran out of bytes and the answer is still open.
-
-    ACCUMULATED across chunks by the caller rather than tested on the first one. A store whose walk
-    ran off the end of a chunk reported "not a keystore" -- indistinguishable from bytes that never
-    were one -- and since the overlap carry is non-empty from the second chunk on, nothing
-    re-entered the parser. A single trusted certificate larger than a chunk was enough to hide the
-    private key stored behind it.
-
-    Re-walking the growing head each time is cheap: the walk steps from entry to entry by
-    arithmetic and never reads a certificate body, so its cost is per ENTRY, not per byte.
-    """
-    if not head.startswith(_KEYSTORE_MAGIC):
-        return False  # settled in four bytes, so nothing needs accumulating
-    if (store := _jks_private_key_entries(head)) is None:
-        if len(head) >= _MAX_KEYSTORE_BYTES:
-            raise _Unscannable("contains a key store this check cannot finish walking")
-        return True
-    return None if store else False
-
-
-def _openpgp_kind(chunk: bytes, *, truncated: bool) -> str | None:
-    """The kind of OpenPGP key a stream BEGINS with, or None if it holds no key.
-
-    Anchored at offset 0, where every packet format is decisive. Every file and every archive
-    member reaches this, so a binary export is covered wherever it sits.
-
-    Raises rather than returning None for the undecided cases: more marker packets than the walk
-    allows, a packet whose body runs past this chunk while `truncated` says more follows, and an
-    encrypted message whose body cannot be read at all. The WHOLE chunk goes to the encrypted test,
-    since a public-key session packet carries the encrypted session key inline and runs to a few
-    hundred bytes -- a fixed head could not reach the data packet behind it.
-
-    The whole chunk goes to the SEQUENCE walk too, rather than a fixed head. A keyring holding both
-    halves leads with the public block, which is thousands of bytes of key material, user IDs and
-    signatures, so any fixed prefix stops short of the secret packet behind it -- the walk needs to
-    reach whatever the earlier packets declare. It steps only between boundaries the packets
-    themselves state, so this stays anchored rather than becoming a search.
-    """
-    secret_key = _openpgp_secret_key_in_sequence(chunk, truncated=truncated)
-    if secret_key is None:
-        # Two undecided shapes share this verdict: a sequence still on a marker packet at the walk
-        # bound, and one whose packet declares a body running past the bytes in hand. The message
-        # names the sequence rather than either cause, because the author's remedy is the same and
-        # claiming the wrong one is worse than naming neither.
-        raise _Unscannable("contains an OpenPGP packet sequence this check cannot walk to the end")
-    if secret_key:
-        return "a private key"
-    if _is_openpgp_encrypted(chunk) is not False:
-        raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
-    return None
-
-
 def _credential_in_container(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
     """The kind of credential inside a compressed container, or None.
 
@@ -580,6 +512,7 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
     for handler in (
         _credential_in_zip,
         _credential_in_tar,
+        _credential_in_ar,
         _credential_in_compressed,
         _credential_in_overlay,
         _credential_in_raw_deflate,
@@ -827,6 +760,19 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
     )
 
 
+def _credential_in_ar(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
+    """The kind of credential in any readable member of an ar archive, or None."""
+    return credential_in_ar(
+        source,
+        deadline=deadline,
+        depth=depth,
+        scan=_scan_member,
+        refusal=_Unscannable,
+        named=credential_in_name,
+        member_limit=_MAX_ARCHIVE_MEMBERS,
+    )
+
+
 def _credential_in_tar(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
     """The kind of credential in any readable member of a tar, or None."""
     return credential_in_tar(
@@ -925,7 +871,18 @@ def _redacted(name: str) -> str:
     # printed the complete Ed25519 scalar to the terminal and any collected logs. Withhold the
     # name and give the author the directory instead, which is enough to find a file they just
     # tried to publish.
-    if any(pattern.search(masked) for _kind, pattern in _LITERAL_PATTERNS) or _match_base64(masked):
+    #
+    # The REJOINED form is tested too, because that is the spelling the detection used. A name
+    # whose key is split by an escape or an adjacent-literal seam -- `fslo_AbCd\x45f0123456789`,
+    # `'fslo_AbCd' 'Ef0123456789'` -- matches no pattern as written, so every substitution above
+    # left it untouched and the refusal printed the complete reversible spelling of the key into the
+    # terminal and any collected logs. Masking cannot fix that: the seam sits inside the body, so
+    # there is no contiguous run to substitute. Withholding is the same answer the base64 case gets.
+    if (
+        any(pattern.search(masked) for _kind, pattern in _LITERAL_PATTERNS)
+        or _match_base64(masked)
+        or _credential_kind(_rejoined(masked)) is not None
+    ):
         parent = name.rsplit("/", 1)[0] if "/" in name else ""
         return (
             f"{parent}/<a file whose name encodes a credential>"

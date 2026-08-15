@@ -33,7 +33,14 @@ import re
 # matched one was refused. What separates a concatenation from two list elements is the absence of
 # anything between the quotes, not which quote character each side uses -- `", "` and `', '` are
 # already excluded by the whitespace-only separator, and so is `","`.
-_ADJACENT_LITERALS = re.compile(rb"(?<!\\)[\"'][ \t]*(?:\r?\n[ \t]*)?[\"']")
+#
+# The second quote may carry a literal PREFIX. Python concatenates `b'fslo_AbCd' b'Ef0123456789'`
+# and the `r`, `f`, `u`, `rb`, `br` forms exactly as it does a bare pair, so a seam this could not
+# cross left the key split while the unprefixed spelling of the same value was refused. The prefix
+# is consumed with the seam, which is what a parser does with it. Bounded to the two-character
+# combinations the language defines, so an ordinary identifier ending in a quote cannot be eaten:
+# `x = foo["a"]["b"]` has no whitespace-only seam between its quotes and is unaffected either way.
+_ADJACENT_LITERALS = re.compile(rb"(?<!\\)[\"'][ \t]*(?:\r?\n[ \t]*)?(?i:[bruf]{0,2})[\"']")
 
 # A backslash immediately before a newline, which POSIX sh, make, C and YAML all remove to rejoin
 # the line. An EVEN number of preceding backslashes means the backslash is itself escaped and the

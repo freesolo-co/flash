@@ -96,6 +96,15 @@ _ANCHORED_ONLY_MAGIC = (
     # encrypted it is not evidence the publish is safe, since the hub copy is readable by everyone
     # the environment is and the passphrase travels beside the file about as often as not.
     (b"Salted__", "OpenSSL-encrypted"),
+    # age, in both spellings it defines: the native header, which is the first line of the file, and
+    # the PEM-style armor `rage`/`age --armor` writes. `secrets.age` beside an environment is an
+    # ordinary thing to keep -- age is what several secret-management tools reach for -- and the
+    # body is ciphertext, so no pattern and no base64 decode can see the key inside. It scanned as
+    # ordinary clean content, which made it the one encryption this let through while OpenSSL,
+    # OpenPGP, PDF and ZIP encryption were all refused. Same answer as those: the passphrase or
+    # identity file is not ours to have, and unverifiable is not clean.
+    (b"age-encryption.org/v1", "age-encrypted"),
+    (b"-----BEGIN AGE ENCRYPTED FILE-----", "age-encrypted"),
 )
 
 # Which recognised-but-uninspectable formats are ENCRYPTED rather than merely unexpandable. The
