@@ -25,7 +25,8 @@ command.
 
 ```bash
 pip install freesolo-flash          # installs the `flash` CLI (import name is also `flash`)
-flash login --api-key fslo_...       # or: export FREESOLO_API_KEY=fslo_...  (create a key at https://freesolo.co)
+export FREESOLO_API_KEY=fslo_...     # create a key at https://freesolo.co
+flash login                          # validates and stores the key without exposing it in argv
 flash whoami                         # confirm the identity behind your key
 flash projects create "my project"     # prints the canonical project UUID
 flash models list                     # supported base model ids
@@ -159,9 +160,13 @@ the git form instead — commit this folder to a repo your plane can read, then 
 
 ```toml
 [environment]
-id = "github:OWNER/REPO@main:environment.py"   # REF is a branch/tag name without `/`, or a commit
+id = "github:OWNER/REPO@REF:environment.py"    # REF is a branch/tag name without `/`, or a commit
                                                # sha; the path is the file, or a directory holding
-                                               # environment.py
+                                               # environment.py. For a branch, use the repo's
+                                               # actual DEFAULT branch -- check it rather than
+                                               # assuming `main`, since it depends on how the repo
+                                               # was created. A ref that does not exist fails with
+                                               # GitHub's "No commit found for SHA: <ref>".
 ```
 
 The ref is resolved at submit time, so re-pushing the repo and re-submitting picks up your edits
@@ -244,7 +249,7 @@ algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-poli
 
 [environment]
 id = "your-org/your-project/my-env"      # the id printed by `flash env push`
-                            # self-hosted plane: "github:OWNER/REPO@main:environment.py" (see above)
+                            # self-hosted plane: "github:OWNER/REPO@REF:environment.py" (see above)
 # params = { split = "train" }    # kwargs passed to load_environment(); the table is
                                    # `params` — NOT `args`
 # secrets = ["SERPAPI_API_KEY"]   # only the NAMES of env vars your environment reads;
@@ -339,8 +344,13 @@ subset instead of erroring. Re-check it whenever the dataset or the params chang
 
 GPU allocation and HF artifacts are **managed by default**: leave `[gpu] type` unset to
 let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains
-platform-managed. For controlled experiments, `[gpu] provider` restricts allocation to one
-provider and `[gpu] type` pins one exact active validated GPU class. Run artifacts are stored in a
+platform-managed. `[gpu] providers` takes an ordered list of provider names and prefers them in
+that order: the preference ranks ahead of cost, so a preferred provider wins even when a cheaper
+one is offered, but providers you did not name stay eligible behind them, so a preference never
+costs you failover. `[gpu] provider` instead hard-pins allocation to one provider, which does
+remove that failover, and cannot be combined with `providers`. An unknown name is rejected at parse
+time and the error lists the names your plane accepts. `[gpu] type` pins one exact active
+validated GPU class. Run artifacts are stored in a
 private environment-scoped repo with content-addressed Flash code snapshots. Set `seed` only at the
 top level. Compose or tweak configs without editing files: `--config extra.toml` (deep-merge) and
 `--set key=value` (e.g. `--set train.epochs=3`). `--gpus N` is
@@ -535,12 +545,11 @@ current hub — both swallow paths are present in every version Flash supports.)
 
 Two more details that make the difference between a probe and a placebo:
 
-- **Pass the same token the export will use.** Flash resolves the export token as
-  `--api-key` > `HF_TOKEN` in the environment > a local `.env` / `.env.local`, and forwards
-  exactly that value. `huggingface_hub` does none of that — with no `token=` it falls back to
-  your ambient cached login, so the probe can pass on one credential while the export fails
-  on a different one. If you are exporting with `--api-key`, or with a token that lives only
-  in `.env`, pass that literal value here.
+- **Pass the same token the export will use.** Prefer `HF_TOKEN` in the environment or a local
+  `.env` / `.env.local`; `--api-key` still wins when supplied, but exposes the token in process
+  listings. Flash forwards exactly the resolved value. `huggingface_hub` does none of that; with
+  no `token=` it falls back to your ambient cached login, so the probe can pass on one credential
+  while the export fails on a different one. Pass the resolved token explicitly to the probe.
 - **Ask for `private=True`.** The real export creates the repo private and only flips it
   public afterwards if you passed `--public`. A probe that omits this can leave a brand-new
   repo publicly visible until the export catches up, and it fails outright under an org
@@ -674,7 +683,7 @@ spending another GPU run:
 | Wrong identity spends the money                              | Push/train lands in an org you did not expect, or a run id you know is valid comes back "unknown"                                                                                        | `FREESOLO_API_KEY` in the environment silently overrides `flash login`. Run `flash whoami` first. Run visibility is scoped to the key that created the run, so archive result baselines to disk rather than relying on `flash runs list` to find them later.                                                                                                                                                                    |
 | `flash env test` passes but the run trains on the wrong data | Local validation is green; the remote run loads a different split                                                                                                                        | `flash env test` loads `environment.py` with **no** `[environment.params]`, so a params-driven split selection is not exercised. Assert the split inside your own test, or default to the split you actually train on.                                                                                                                                                                                                          |
 | Final checkpoint regresses                                   | Last step is worse than an earlier checkpoint                                                                                                                                            | Run `flash runs checkpoint <run-id>`, deploy a specific step with `flash models deploy <run-id>/step-N`, and compare with held-out probes before exporting or relying on the final adapter.                                                                                                                                                                                                                                     |
-| Export fails before upload                                   | CLI says no HuggingFace token                                                                                                                                                            | Pass `flash models export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`.                                                                                                                                                                                                                                                                          |
+| Export fails before upload                                   | CLI says no HuggingFace token                                                                                                                                                            | Set `HF_TOKEN` in your shell, `.env`, or `.env.local`, then run `flash models export`; avoid `--api-key` because argument values are visible in process listings. Exports are private unless you pass `--public`.                                                                                                                                                                                                               |
 | Exported adapter is a silent no-op locally                   | peft warns about missing adapter keys and local eval matches the bare base model                                                                                                         | The adapter's key namespace does not match the loaded model class. `model.layers.*` keys pair with `AutoModelForCausalLM`; `model.language_model.layers.*` keys pair with `Qwen3_5ForConditionalGeneration` / `Qwen3_5MoeForConditionalGeneration` (via `AutoModelForImageTextToText`). See "Loading an exported adapter locally".                                                                                              |
 | SFT loss improves but quality does not                       | Train loss falls while held-out behavior stalls or degrades                                                                                                                              | Keep a held-out split outside training. Deploy and score that split; if quality drops, reduce epochs or improve data instead of adding more passes.                                                                                                                                                                                                                                                                             |
 | Cost surprises                                               | A quick experiment uses more GPU time than intended                                                                                                                                      | Start with `--dry-run` and `--cost`, keep `epochs` and `max_examples` small for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time.                                                                                                                                                                                     |
@@ -1362,8 +1371,11 @@ Set a count only when you want to pin the maximum:
 [gpu]
 type = "B200"
 count = 4
-# provider is optional: allocation compares fitting shapes across every configured provider.
 ```
+
+Add `providers = [...]` to that table to rank providers by preference ahead of cost; providers you
+leave out still follow as failover candidates. An unknown name is rejected at parse time, and the
+error names the accepted set.
 
 `flash train configs/grpo.toml --gpus 4` sets the same key from the command line. The flag is exactly
 `--set gpu.count=4`, and the same 1..8 bound rejects a bad value.

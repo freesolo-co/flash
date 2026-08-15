@@ -1,10 +1,9 @@
-"""Single-turn rollout scoring and the reward-profile probe.
+"""Single-turn rollout scoring.
 
 GRPO scores each rollout by calling the environment's reward function. These helpers wrap that
 call: they strip the thinking prefix the student may have emitted, coerce whatever the environment
 returned into a finite float, and batch concurrent requests so one slow reward function does not
-serialize the step. `_log_reward_profile` is the startup probe that measures the reward wall before
-training begins.
+serialize the step.
 
 Split out of `flash.engine.worker.rl_train` to keep that module under the file-size limit.
 """
@@ -12,21 +11,8 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 from __future__ import annotations
 
 import math
-import time
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
-
-
-def _rl_train():
-    """The orchestrator module, imported lazily because it imports this one.
-
-    `_PROFILE_BUDGET_S` is patched on `rl_train` by the reward-profile tests to shorten the probe;
-    binding it here with a `from ... import` would capture the production value before the patch
-    lands, so the probe would run the full budget against an object the test never rebound.
-    """
-    from flash.engine.worker import rl_train
-
-    return rl_train
 
 
 def _single_turn_scoring_state(
@@ -87,7 +73,7 @@ def score_single_turn(
     """score one single-turn text completion against flash's live env.
 
     mirrors the training path, including optional thinking penalty. training errors become 0.0;
-    ``raise_on_error`` lets profiling distinguish a real zero from failed grading.
+    ``raise_on_error`` lets bridge callers propagate failed grading.
 
     append named breakdowns only when provided. grading failures append none so reported component
     means count them as zero without inventing metrics for scalar-only envs.
@@ -257,75 +243,3 @@ def score_single_turn_batch(
     # the caller zips these back onto its completions, so dropping a row would silently misalign the
     # whole batch rather than fail.
     return [row if row is not None else (0.0, []) for row in results]
-
-
-def _log_reward_profile(env, score_one, rollout_examples: list, completions_per_step: int):
-    """measure this env's grading latency once before training.
-
-    return and log the profile because latency affects cost and placement. references use each
-    example's real completion; blank text measures an early return rather than the grader.
-
-    ``_PROFILE_BUDGET_S`` bounds reference gathering and grading together because both call user code.
-    skip envs with ``reward_thread_safe = False``: profiling off-thread could mutate scorer state or
-    touch a thread-affine handle. the flag covers ``sft_completion`` here for the same reason.
-
-    advisory only and never fatal.
-    """
-    try:
-        from flash.content.multimodal import assistant_completion_text
-        from flash.engine.profiling.reward_profile import call_bounded, profile_reward_latency
-
-        if not getattr(env, "reward_thread_safe", True):
-            print(
-                "[rl-verl] reward profiling skipped: env declares reward_thread_safe = False, "
-                "so grading it early could change the rewards training sees",
-                flush=True,
-            )
-            return None
-
-        # sft_completion reaches user code (FreesoloEnvAdapter delegates to the env's own hook), so
-        # it can block on i/o exactly like a grader can. it shares the profiler's deadline instead
-        # of running before it: bounding only the timing phase would leave the startup delay this
-        # hook adds unbounded, which is the ceiling the docstring promises.
-        deadline = time.perf_counter() + _rl_train()._PROFILE_BUDGET_S
-        samples: list[tuple[int, str]] = []
-        for index, example in enumerate(rollout_examples[:4]):
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
-                break
-            # the env's own assistant-text semantics: takes the last assistant turn and
-            # flattens openai-style text blocks. hand-rolling this stringifies block dicts
-            # into a python repr and mixes in user/system turns.
-            ok, _, messages = call_bounded(
-                lambda ex=example: assistant_completion_text(env.sft_completion(ex)), remaining
-            )
-            if ok is None:
-                # report usable references gathered before the shared deadline expired. failed calls
-                # keep index placeholders and blank results are dropped, so counting either would claim
-                # samples that cannot be profiled and misdiagnose the env hook.
-                usable = sum(1 for _, text in samples if text and text.strip())
-                print(
-                    "[rl-verl] reward profiling skipped: env.sft_completion did not return within "
-                    f"{_rl_train()._PROFILE_BUDGET_S:.0f}s ({usable} usable reference completion(s) gathered "
-                    "before the deadline)",
-                    flush=True,
-                )
-                return None
-            samples.append((index, messages if ok and isinstance(messages, str) else ""))
-        if not samples:
-            return None
-        profile = profile_reward_latency(
-            score_one, samples, budget_s=max(0.0, deadline - time.perf_counter())
-        )
-        print(f"[rl-verl] {profile.describe()}", flush=True)
-        if profile.trustworthy and completions_per_step > 0:
-            print(
-                f"[rl-verl] scalar reward profile sampled "
-                f"{profile.seconds_per_completion:.3f}s per completion; runtime batching may "
-                f"overlap up to {completions_per_step} completions per step",
-                flush=True,
-            )
-        return profile
-    except Exception as exc:
-        print(f"[rl-verl] reward profiling skipped: {exc}", flush=True)
-        return None

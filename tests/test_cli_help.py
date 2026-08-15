@@ -74,9 +74,10 @@ def test_grouped_command_argparse_contracts() -> None:
     assert args.json is True
     assert args.func is cli.cmd_deployments
 
-    args = parser.parse_args(["runs", "status", "run-1", "-f"])
+    args = parser.parse_args(["runs", "status", "run-1", "-f", "--json"])
     assert args.run_id == "run-1"
     assert args.follow is True
+    assert args.json is True
     assert args.func is cli.cmd_status
 
     args = parser.parse_args(["models", "chat", "run-1", "-m", "hello"])
