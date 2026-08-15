@@ -96,13 +96,25 @@ def _declares_legacy_id_dialect(document: Any, *, depth: int = 0) -> bool:
 
 
 def _declared_dialect(value: Any, *, depth: int = 0) -> str | None:
-    """The `$schema` a payload declares, at whatever depth the schema document sits."""
+    """The `$schema` a payload declares, at whatever depth the schema document sits.
+
+    The descent crosses ENVELOPE layers only -- `tools`, a tool entry, `function`, `parameters` --
+    and stops at the first node that is itself a schema. Descending further let an EMBEDDED
+    resource answer for the document containing it: a dialect-less root, which this module reads as
+    legacy on purpose, inherited a nested 2020-12 `$schema` and so stopped honouring its own `id`
+    members. The relative `$ref` beside them then resolved nowhere and the credential-bearing
+    definition it named kept its `default` in the raw export.
+    """
     if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
         return None
     if isinstance(value, dict):
         dialect = value.get("$schema")
         if isinstance(dialect, str):
             return dialect
+        if _declares_schema_identity(value):
+            # this node IS the schema and it declares no dialect. its descendants are its own
+            # subschemas, and a subschema's dialect is never the document's.
+            return None
         for key, item in value.items():
             if key in _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS:
                 continue
@@ -115,6 +127,33 @@ def _declared_dialect(value: Any, *, depth: int = 0) -> str | None:
             if found is not None:
                 return found
     return None
+
+
+# keywords that only a schema carries, so a node holding one is the document itself rather than an
+# envelope on the way to it. `type` alone is deliberately absent: it is an ordinary field name in
+# request envelopes (`{"type": "function"}`), and treating that as the schema stopped the search
+# before it reached `parameters`.
+_SCHEMA_DECLARING_KEYWORDS = frozenset(
+    {
+        "properties",
+        "patternProperties",
+        "additionalProperties",
+        "items",
+        "prefixItems",
+        "definitions",
+        "$defs",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "not",
+        "$ref",
+    }
+)
+
+
+def _declares_schema_identity(node: Mapping[Any, Any]) -> bool:
+    """Whether this node is a schema document rather than an envelope leading to one."""
+    return any(keyword in node for keyword in _SCHEMA_DECLARING_KEYWORDS)
 
 
 def _node_legacy_id_dialect(node: dict[Any, Any], inherited: bool) -> bool:

@@ -531,7 +531,16 @@ def _redact_secret_fields(
             flag.hit = True
         return "[redacted]"
     if isinstance(value, dict):
-        schema_context = schema_context or schema_wrapper or _has_schema_context(value)
+        # an `$id`/`$schema` MEMBER only declares a schema where a declaration can live: beneath a
+        # recognized host, an inherited wrapper, or at the payload root. anywhere else it is an
+        # ordinary string, and honouring it let nested request data claim the schema exemption and
+        # keep a credential beside a secret-named property verbatim. the SHAPE tests are unaffected,
+        # so a `parameters` block that declares no identity is still recognized as before.
+        schema_context = (
+            schema_context
+            or schema_wrapper
+            or _has_schema_context(value, declaration_host=schema_host or payload_root)
+        )
         # an embedded resource may select its own dialect, so this is read per node rather than
         # once for the payload, and the reading in force here is what the children inherit.
         legacy_id_dialect = _node_legacy_id_dialect(value, legacy_id_dialect)

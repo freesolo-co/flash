@@ -222,10 +222,25 @@ def _is_schema_map_keyword(key: str, item: Any) -> bool:
     )
 
 
-def _has_schema_context(value: Any) -> bool:
+def _has_schema_context(value: Any, *, declaration_host: bool = True) -> bool:
+    """Whether this node establishes a JSON Schema reading for its subtree.
+
+    `declaration_host` is false where the node cannot be a declaration -- outside `tools`,
+    `response_format` and the rest of the host vocabulary. There, an `$id`/`$schema` MEMBER is not
+    honoured: a bare identifier is a string like any other, and ordinary request data carries one
+    freely, so `{"extra": {"$id": "note", "properties": {"password": {"type": "string", "value":
+    "THIRDPARTY"}}}}` claimed the schema exemption. `password` was then read as a property
+    DEFINITION rather than a credential field, and its unknown `value` keyword was kept verbatim.
+
+    The SHAPE tests below still apply, because they are what recognizes a schema that declares no
+    identity at all -- the ordinary case for a `parameters` block -- and they demand that every
+    property value be an unambiguous schema definition, which the payload above fails.
+    """
     if not isinstance(value, dict):
         return False
-    if isinstance(value.get("$schema"), str) or isinstance(value.get("$id"), str):
+    if declaration_host and (
+        isinstance(value.get("$schema"), str) or isinstance(value.get("$id"), str)
+    ):
         return True
     property_maps = [
         value[keyword]

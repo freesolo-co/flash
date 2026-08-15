@@ -35,6 +35,7 @@ from flash.server.routes import (
     trace_redaction,
     trace_schema_identity,
     trace_schema_refs,
+    trace_schema_shape,
     trace_secret_names,
     trace_sse,
     trace_uri,
@@ -11953,3 +11954,165 @@ def test_a_deeply_bracketed_credential_still_loses_its_schema_literals() -> None
 
     assert patterns["^(((password)))$"]["default"] == "[redacted]"
     assert patterns["^(((city)))$"]["default"] == "Boston"
+
+
+@pytest.mark.parametrize(
+    ("segment", "resolves"),
+    [
+        ("0", True),
+        ("1", True),
+        ("10", True),
+        # a JSON Pointer array index carries no leading zero, so these name nothing.
+        ("01", False),
+        ("00", False),
+        ("001", False),
+    ],
+    ids=["zero", "one", "ten", "leading-zero", "double-zero", "padded"],
+)
+def test_a_leading_zero_array_index_names_nothing(segment: str, resolves: bool) -> None:
+    """`01` is not a valid pointer index. Converting it to 1 followed a reference the pointer never
+    made, which is how an ordinary definition joined the secret closure."""
+    document = {"allOf": [{"n": index} for index in range(11)]}
+
+    resolved = trace_schema_refs._resolve_pointer(document, ("allOf", segment))
+
+    assert (resolved is not None) is resolves
+    if resolves:
+        assert resolved == {"n": int(segment)}
+
+
+def test_an_invalid_pointer_index_does_not_pull_a_definition_into_the_secret_closure() -> None:
+    """The observable end of the defect: a secret property referencing `#/allOf/01` reached
+    whatever `allOf[1]` referenced, so an unrelated definition's `default` and `const` -- ordinary
+    recorded content -- were rewritten to "[redacted]" on the strength of an invalid pointer."""
+    parameters = {
+        "type": "object",
+        "allOf": [{"title": "zero"}, {"$ref": "#/$defs/ordinary"}]
+        + [{"pad": index} for index in range(9)],
+        "properties": {"password": {"$ref": "#/allOf/01"}},
+        "$defs": {"ordinary": {"default": "KEEPME", "const": "KEEPTOO"}},
+    }
+    payload = {"tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}]}
+
+    stored = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"]
+
+    assert stored["$defs"]["ordinary"] == {"default": "KEEPME", "const": "KEEPTOO"}
+
+
+def test_a_valid_index_reference_still_reaches_its_definition() -> None:
+    """Control: the same shape through the VALID index still follows, so the fix rejects the
+    invalid spelling rather than disabling index references."""
+    parameters = {
+        "type": "object",
+        "allOf": [{"title": "zero"}, {"$ref": "#/$defs/target"}],
+        "properties": {"password": {"$ref": "#/allOf/1"}},
+        "$defs": {"target": {"default": "LEAK"}},
+    }
+    payload = {"tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}]}
+
+    stored = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"]
+
+    assert stored["$defs"]["target"]["default"] == "[redacted]"
+
+
+def test_an_embedded_resource_does_not_declare_its_parents_dialect() -> None:
+    """A dialect-less schema is read as legacy on purpose, so its `id` members declare resources.
+    Searching the whole subtree for a `$schema` let an EMBEDDED 2020-12 resource answer for the
+    document containing it, which switched the root to the modern reading: its own `id` members
+    stopped declaring anything, the relative `$ref` beside them resolved nowhere, and the
+    credential-bearing definition it named kept its `default` in the raw export."""
+    parameters = {
+        "id": "https://example.test/root/",
+        "type": "object",
+        "properties": {
+            "embedded": {"$schema": "https://json-schema.org/draft/2020-12/schema"},
+            "password": {"$ref": "cred"},
+        },
+        "definitions": {"target": {"id": "cred", "default": "LEAK"}},
+    }
+    payload = {"tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}]}
+
+    stored = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"]
+
+    assert stored["definitions"]["target"]["default"] == "[redacted]"
+
+
+@pytest.mark.parametrize(
+    ("parameters", "legacy"),
+    [
+        ({"$schema": "https://json-schema.org/draft/2020-12/schema", "properties": {}}, False),
+        ({"$schema": "http://json-schema.org/draft-04/schema#", "properties": {}}, True),
+        ({"type": "object", "properties": {}}, True),
+        (
+            {
+                "type": "object",
+                "properties": {"e": {"$schema": "https://json-schema.org/draft/2020-12/schema"}},
+            },
+            True,
+        ),
+    ],
+    ids=["modern-root", "legacy-root", "no-dialect", "embedded-modern"],
+)
+def test_the_dialect_is_the_documents_own_not_a_descendants(
+    parameters: dict[str, Any], legacy: bool
+) -> None:
+    """The search still crosses envelope layers to find the schema's own `$schema` -- the resolver
+    runs on the payload root and on each `tools` entry before it reaches `parameters` -- but stops
+    at the schema itself, so a subschema never answers for the document."""
+    payload = {"tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}]}
+
+    assert trace_schema_identity._declares_legacy_id_dialect(payload) is legacy
+
+
+def test_ordinary_request_data_cannot_declare_itself_a_schema() -> None:
+    """An `$id` member is an ordinary string outside a declaration host. Honouring it anywhere let
+    nested request data claim the schema exemption: `password` was read as a property DEFINITION
+    rather than a credential field, so its unknown `value` keyword was kept verbatim and a
+    third-party credential -- never in `context.secrets` -- reached the raw export."""
+    payload = {
+        "extra": {
+            "$id": "note",
+            "properties": {"password": {"type": "string", "value": "THIRDPARTY"}},
+        }
+    }
+
+    stored = traces._sanitize_for_trace(payload, ())
+
+    assert "THIRDPARTY" not in json.dumps(stored)
+    assert stored["extra"]["properties"]["password"] == "[redacted]"
+
+
+def test_a_declared_schema_beneath_a_real_host_keeps_its_identity() -> None:
+    """Control: beneath `tools` the same `$id` still declares a schema, so an ordinary property's
+    annotations survive and a credential property's literal is redacted rather than the whole
+    definition being blanked."""
+    parameters = {
+        "$id": "https://example.test/tool",
+        "type": "object",
+        "properties": {
+            "city": {"type": "string", "vendorKeyword": True, "default": "Boston"},
+            "password": {"type": "string", "vendorKeyword": True, "default": "SECRET"},
+        },
+    }
+    payload = {"tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}]}
+
+    stored = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"]
+
+    assert stored["properties"]["city"]["default"] == "Boston"
+    assert stored["properties"]["password"]["default"] == "[redacted]"
+
+
+def test_a_schema_shaped_node_is_still_recognized_without_an_identifier() -> None:
+    """Only the IDENTIFIER branch is gated. A schema that declares no identity -- the ordinary case
+    for a `parameters` block -- is still recognized by shape, which demands that every property
+    value be an unambiguous schema definition."""
+    node = {"type": "object", "properties": {"password": {"type": "string", "default": "S"}}}
+
+    assert trace_schema_shape._has_schema_context(node, declaration_host=False) is True
+    assert (
+        trace_schema_shape._has_schema_context(
+            {"$id": "note", "properties": {"password": {"type": "string", "value": "S"}}},
+            declaration_host=False,
+        )
+        is False
+    )

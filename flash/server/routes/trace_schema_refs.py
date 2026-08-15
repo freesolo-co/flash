@@ -277,6 +277,13 @@ def _resolve_pointer(value: Any, pointer: tuple[str, ...]) -> Any:
         if isinstance(target, dict) and segment in target:
             target = target[segment]
         elif isinstance(target, list | tuple) and segment.isdigit():
+            # a JSON Pointer array index carries no leading zero, so `01` names nothing. reading it
+            # as 1 followed a reference the pointer never made: a secret property pointing at
+            # `#/allOf/01` reached whatever `allOf[1]` referenced and pulled that ordinary
+            # definition into the secret closure, rewriting its `default`, `const` and `enum` to
+            # "[redacted]" -- recorded content destroyed on the strength of an invalid pointer.
+            if segment.startswith("0") and segment != "0":
+                return None
             # an index is compared by LENGTH before it is converted. `int()` refuses a digit string
             # past the interpreter's conversion limit (4300 digits by default), and the ValueError
             # escaped post-call sanitization, failing persistence and dropping the completed
