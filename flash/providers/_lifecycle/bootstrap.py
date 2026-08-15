@@ -22,9 +22,7 @@ from email.utils import parsedate_to_datetime
 if __package__:
     from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
-        _console_latch_update,
         _console_progress,
-        _console_wedge_credit,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
@@ -34,9 +32,7 @@ else:
     # same directory, and the script directory leads sys.path.
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
-        _console_latch_update,
         _console_progress,
-        _console_wedge_credit,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
@@ -48,7 +44,7 @@ _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
 _CONSOLE_UPLOAD_POLL_S = 120.0
 _CONSOLE_UPLOAD_QUIET_POLLS = 4
-_CONSOLE_UPLOAD_CREDITS = 2  # wedge snapshots per RUN; bounded, so it stays out of the rate budget
+_CONSOLE_UPLOAD_CREDITS = 2
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
@@ -240,9 +236,8 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dic
 def hf_upload(
     payload: dict, local_path: str, repo_subpath: str, *, enforce_deadline: bool = True
 ) -> bool:
-    """Upload one artifact under the run's HF prefix; never raises. True only if it landed: the error
-    is swallowed so it cannot kill the run, but a caller tracking what is stored would read a silent
-    return as success and skip the retry it earned."""
+    """Upload one artifact under the run's HF prefix; never raises. True only if it landed, so a
+    caller tracking what is stored cannot read a swallowed failure as success and skip its retry."""
     try:
         from huggingface_hub import HfApi
 
@@ -278,43 +273,48 @@ def _console_upload_loop(
     free; committing is not (the heartbeat spends 4 of this repo's 5 commits/hour), and the stall
     classifier kills a wedged run at 1200s/3000s -- long before an hourly snapshot would capture the
     hang. So commit only on un-uploaded bytes AND either the interval elapsing or sustained silence
-    (``_console_wedge_credit`` decides when silence has earned one, and its docstring carries the
-    arming, re-arming and per-run-cap rules; ``_console_progress`` explains why bytes cannot serve
-    as the signal). ``wedged`` excludes an already-due poll, so a credit is spent only when a stall
-    BOUGHT an upload -- charging it for one that was happening anyway would disarm detection for a
-    later hang. QUIET_POLLS is sized so that (it + 1) * poll stays under poll_job's 1200s training
-    stall, or the box dies before the wedge snapshot commits.
+    (``_console_progress`` explains why bytes cannot serve as the signal). QUIET_POLLS is sized so
+    (it + 1) * poll stays under poll_job's 1200s stall.
+
+    ``armed`` is the wedge latch. A wedge is progress that STOPPED, so it arms only after a staged
+    heartbeat: startup is quiet by nature and counting it would spend a credit on an empty console.
+    It RE-ARMS on progress, because a healthy slow stage -- one transition, then only liveness pings,
+    which ``_console_progress`` subtracts -- reads as silence and buys a snapshot; with a single
+    permanent credit that run could never buy another, so a genuine hang later would wait for the
+    hourly cadence and die at 1200s with no failure-era console, the exact loss this uploader exists
+    to prevent. CREDITS keeps the re-arm honest: a run alternating a heartbeat with silence re-arms
+    every cycle, and uncapped that buys 6/hr against a 5.0/hr budget the heartbeat already spends 4
+    of; they are per RUN, so they never enter the SUSTAINED rate. ``wedged`` excludes an already-due
+    poll, so a credit is spent only when a stall BOUGHT an upload.
 
     A setup that NEVER reaches a heartbeat stays uncovered on purpose: holding the first-snapshot
     cadence until progress starts costs a commit in the SUSTAINED rate (5.25/hr against a hard 5.0,
     measured by ..._keeps_a_slow_starting_run_in_budget), so it is left to the 3000s setup grace. A
     FAILED upload advances neither ``sent`` nor the deadline: hf_upload swallows its exception and
     returns falsy, so resetting ``since`` books a snapshot that reached no repo and puts the retry an
-    interval out, past both teardowns. Staying due retries until one lands. The failure is printed
-    with ``flush``: it is its only trace, and teardown kills this process outright. Each rule is
-    pinned by a test_instance_console_upload_loop_* case."""
+    interval out, past both teardowns. Staying due retries until one lands."""
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
-    sent = size = -1
-    since = quiet_polls = 0.0
-    latch = {"armed": False, "spent": 0, "credits": _CONSOLE_UPLOAD_CREDITS}
+    sent, size, since, quiet, armed, spent = -1, -1, 0.0, 0.0, False, 0
     while not stop_upload.wait(poll_s):
         since += poll_s
         size, staged = _console_progress(console, max(size, 0))
-        _console_latch_update(latch, progressed=bool(staged))
-        quiet_polls = 0.0 if staged else quiet_polls + 1
+        armed = armed or bool(staged)
+        quiet = 0.0 if staged else quiet + 1
         due = since >= due_s
-        wedged = not due and _console_wedge_credit(quiet_polls, _CONSOLE_UPLOAD_QUIET_POLLS, latch)
+        ok = armed and not due and spent < _CONSOLE_UPLOAD_CREDITS
+        wedged = ok and quiet >= _CONSOLE_UPLOAD_QUIET_POLLS
         if size == sent or not (due or wedged):
             continue
         try:
-            uploaded = _upload_console_snapshot(payload, console, mode)
+            up = _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
             detail = _safe_detail(exc, secrets=_payload_secrets(payload))
             print(f"console upload warn: {detail}", flush=True)
-            uploaded = False
-        _console_latch_update(latch, spent=bool(wedged and uploaded))
-        if uploaded:
+            up = False
+        spent += 1 if wedged and up else 0
+        armed = armed and not (wedged and up)
+        if up:
             sent, since, due_s = size, 0.0, interval_s
 
 
