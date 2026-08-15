@@ -163,7 +163,13 @@ def _console_heartbeat_snapshot(
 
 
 def heartbeat(
-    stage: str, *, liveness: bool = False, force: bool = False, initial: bool = False, **kw
+    stage: str,
+    *,
+    liveness: bool = False,
+    force: bool = False,
+    initial: bool = False,
+    first_timing: bool = False,
+    **kw,
 ):
     global _HB_CLAIM_SEQ, _HB_COMMITTED_CLAIM_SEQ, _HB_THROTTLE_CLAIM
     genuine_progress = not liveness
@@ -212,34 +218,28 @@ def heartbeat(
             )
         else:
             throttled = stage in _HB_THROTTLED_STAGES
-            # a one-shot STAGE TRANSITION into a model-load stage is the only ping that says the run
-            # reached it. the repeated liveness ticks that follow are what the throttle exists to
-            # coalesce, and they carry liveness=True -- so throttling the stage as a whole silently
-            # drops the transition whenever the preceding setup ping (usually model_prefetching,
-            # which pings all through the download right before it) committed inside the interval.
-            # that is the common case, and losing it defeats the stage this set was extended for.
+            # the model-load transition must commit even though its later liveness ticks are
+            # throttled; otherwise the preceding setup ping commonly hides the only record that
+            # model loading began.
             if stage in _HB_MODEL_LOAD_STAGES and not liveness:
                 throttled = False
             interval_s = _w._HB_MIN_INTERVAL_S
             if stage in _HB_TIGHT_LIVENESS_STAGES:
                 interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
             upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
-            # ``force`` bypasses the per-stage throttle when this payload must be on record. it normally
-            # requires a step advance, but a sample-bearing payload may match the committed step because
-            # the liveness daemon can commit that step first without the samples. the per-force floor still
-            # coalesces fast bursts to protect the hf commit cap, while an unrelated liveness commit does
-            # not arm the floor and therefore cannot suppress the first sample-bearing payload.
+            # force bypasses the stage throttle for step/sample payloads, with a floor protecting hf.
+            # samples may match a step whose liveness landed first. first timing gets one bypass because
+            # preceding forced metrics armed the floor; its caller retries until the upload succeeds.
             if force and not upload_due:
                 fstep = kw.get("step")
                 has_samples = bool(kw.get("sampled_completions"))
+                first_timing_due = first_timing and "step_duration_s" in kw
                 force_step_due = isinstance(fstep, (int, float)) and (
                     fstep > _w._HB_LAST_COMMITTED_STEP
                     or (has_samples and fstep == _w._HB_LAST_COMMITTED_STEP)
                 )
-                if (
-                    force_step_due
-                    and (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
-                ):
+                force_floor_due = (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
+                if force_step_due and (first_timing_due or force_floor_due):
                     upload_due = True
         # the initial training snapshot must land before the shared throttle can hide it.
         if initial:

@@ -332,6 +332,60 @@ def _superseded_hint(
     )
 
 
+def _finite_positive(value: object) -> float | None:
+    """return a finite positive number from an untrusted heartbeat field."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if number > 0 and math.isfinite(number) else None
+
+
+def _humanize_duration(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def _humanize_step_duration(seconds: float) -> str:
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    if seconds < 600:
+        return f"{seconds:.0f}s"
+    return f"{seconds / 60:.1f}m"
+
+
+def _step_timing_pairs(
+    heartbeat: dict,
+    *,
+    running: bool,
+    current_attempt: bool,
+) -> list[tuple[str, str]]:
+    """render measured RL pace only for the live running attempt."""
+    if not running or not current_attempt or heartbeat.get("stage") != "rl_step":
+        return []
+    step_duration_s = _finite_positive(heartbeat.get("step_duration_s"))
+    if step_duration_s is None:
+        return []
+
+    projected_remaining_s = _finite_positive(heartbeat.get("projected_remaining_s"))
+    pairs = [("median pace", f"{_humanize_step_duration(step_duration_s)}/step")]
+    if projected_remaining_s is not None:
+        pairs.append(("mean ETA", f"~{_humanize_duration(projected_remaining_s)} left"))
+    if heartbeat.get("wall_deadline_at_risk") is True and projected_remaining_s is not None:
+        pairs.append(
+            (
+                "warning",
+                "mean-based remaining-time projection exceeds the run's wall time left",
+            )
+        )
+    return pairs
+
+
 def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     """Worker heartbeat rows for the status panel: stage, step, age, and a quiet-is-normal hint."""
     hb = obj.get("last_heartbeat")
@@ -363,6 +417,13 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     if datacenter:
         label = "datacenter" if from_current_attempt else "datacenter (previous attempt)"
         pairs.append((label, str(datacenter)[:64]))
+    pairs.extend(
+        _step_timing_pairs(
+            hb,
+            running=running,
+            current_attempt=from_current_attempt,
+        )
+    )
     stale_step = _stale_step_hint(
         hb,
         heartbeat_age_seconds,
