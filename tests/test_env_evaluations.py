@@ -3414,7 +3414,11 @@ def test_env_eval_drives_every_turn_of_a_multi_turn_environment(
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
     # one generation per turn, and the graded text is the accumulated transcript.
     assert environment.generated == ["a", "b", "c"]
-    assert "case only: PASS" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "case only: PASS" in captured.out
+    assert "each episode will still be played out with one generation per turn" in captured.err
+    assert "only the episode's final response text, not the transcript" in captured.err
+    assert "score(case, response, state)" in captured.err
 
 
 def test_env_eval_reports_a_failed_turn_without_losing_the_case(
@@ -3506,7 +3510,9 @@ def test_env_eval_does_not_promote_a_first_action_suite_to_an_episode(
     # one generation, graded as the opening action -- the episode driver never ran.
     assert calls == ["gen"]
     assert environment.generated == []
-    assert "case only: PASS" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "case only: PASS" in captured.out
+    assert "one generation per turn" not in captured.err
 
 
 def test_env_eval_refuses_an_episode_suite_on_a_single_turn_environment(
@@ -3613,7 +3619,7 @@ def test_env_eval_normalizes_images_on_every_episode_turn() -> None:
     } in content
 
 
-def test_env_eval_hands_the_finished_episode_to_a_suite_that_accepts_it() -> None:
+def test_env_eval_hands_the_finished_episode_to_a_suite_that_accepts_it(capsys) -> None:
     """A transcript-grading suite must receive the episode, not just the last turn.
 
     `record_model_turn` overwrites `state["response_text"]` on every turn, so the scalar is the
@@ -3678,14 +3684,25 @@ def test_env_eval_hands_the_finished_episode_to_a_suite_that_accepts_it() -> Non
     assert results[0].error is None
     assert results[0].score == 1.0, results[0].reason
     assert results[0].reason == "saw 1,3,6"
+    assert "one generation per turn" not in capsys.readouterr().err
 
 
-def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes() -> None:
+def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes(capsys, monkeypatch) -> None:
     """A suite that takes only (case, response) must not be handed a third argument."""
     import argparse
 
     from flash.cli.commands.env import episode as episode_module
     from flash.cli.commands.env import eval as env_eval
+
+    style_checks = 0
+    real_state_argument = episode_module._state_argument
+
+    def counted_state_argument(scorer):
+        nonlocal style_checks
+        style_checks += 1
+        return real_state_argument(scorer)
+
+    monkeypatch.setattr(episode_module, "_state_argument", counted_state_argument)
 
     class Environment:
         multi_turn = True
@@ -3711,7 +3728,10 @@ def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes() -> None:
         grades_episodes = True
 
         def cases(self):
-            return [EvalCase(id="c", input="x", expected="b")]
+            return [
+                EvalCase(id="c1", input="x", expected="b"),
+                EvalCase(id="c2", input="x", expected="d"),
+            ]
 
         def score(self, case, response):
             return EvalResult(
@@ -3721,7 +3741,7 @@ def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes() -> None:
                 response=response,
             )
 
-    replies = iter(["a", "b"])
+    replies = iter(["a", "b", "c", "d"])
     original = env_eval._generate_case
     env_eval._generate_case = lambda client, target, messages, args: next(replies)
     try:
@@ -3732,9 +3752,12 @@ def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes() -> None:
     finally:
         env_eval._generate_case = original
 
-    # scored on the last turn, with no TypeError from an unexpected third argument
-    assert results[0].error is None
-    assert results[0].score == 1.0
+    # both cases are scored on their last turn, with no unexpected third argument.
+    assert [result.error for result in results] == [None, None]
+    assert [result.score for result in results] == [1.0, 1.0]
+    assert style_checks == 1
+    warning = capsys.readouterr().err
+    assert warning.count("each episode will still be played out") == 1
 
 
 def test_state_argument_detects_how_the_scorer_takes_state() -> None:
@@ -3750,18 +3773,20 @@ def test_state_argument_detects_how_the_scorer_takes_state() -> None:
     assert _state_argument(lambda case, response, **kwargs: None) == "keyword"
     assert _state_argument(lambda case, response, *args, **kwargs: None) == "keyword"
     assert _state_argument(lambda case, response, *args: None) == "positional"
-    assert _state_argument(lambda case, response, episode=None: None) == "positional"
+    assert _state_argument(lambda case, response, state, /: None) == "positional"
+    assert _state_argument(lambda case, response, threshold=0.5: None) is None
 
 
 @pytest.mark.parametrize(
     "scorer_source",
     [
         "def score(self, case, response, state=None): return _graded(case, state)",
+        "def score(self, case, response, state, /): return _graded(case, state)",
         "def score(self, case, response, *, state=None): return _graded(case, state)",
         "def score(self, case, response, **kwargs): return _graded(case, kwargs.get('state'))",
         "def score(self, case, response, *args): return _graded(case, args[0] if args else None)",
     ],
-    ids=["positional", "keyword_only", "kwargs", "varargs"],
+    ids=["positional", "positional_only", "keyword_only", "kwargs", "varargs"],
 )
 def test_every_state_accepting_scorer_shape_actually_receives_the_episode(
     scorer_source: str,

@@ -124,13 +124,33 @@ class EvalSuiteReport:
 
 @runtime_checkable
 class EvalSuite(Protocol):
-    """Authoring contract for one named held-out evaluation suite."""
+    """Authoring contract for a suite that grades one model response."""
 
-    name: str
+    @property
+    def name(self) -> str: ...
 
     def cases(self) -> list[EvalCase]: ...
 
     def score(self, case: EvalCase, response: str) -> EvalResult | float | bool: ...
+
+
+class EpisodeEvalSuite(Protocol):
+    """Suite contract for full-episode play at one generation per turn.
+
+    ``grades_episodes`` must be true at runtime. The finished transcript is passed in ``state``.
+    """
+
+    @property
+    def name(self) -> str: ...
+
+    grades_episodes: bool
+
+    def cases(self) -> list[EvalCase]: ...
+
+    def score(self, case: EvalCase, response: str, state: dict) -> EvalResult | float | bool: ...
+
+
+EvaluationSuite = EvalSuite | EpisodeEvalSuite
 
 
 class BaseEvalSuite:
@@ -194,7 +214,7 @@ def normalize_eval_result(
     )
 
 
-def validate_evaluation_cases(suite: EvalSuite, *, source: str | Path) -> list[EvalCase]:
+def validate_evaluation_cases(suite: EvaluationSuite, *, source: str | Path) -> list[EvalCase]:
     """Load and validate one suite's cases with source-aware errors."""
     try:
         cases = suite.cases()
@@ -398,7 +418,7 @@ class _ScopedSuite:
 
     __slots__ = ("_module_dir", "_suite")
 
-    def __init__(self, suite: EvalSuite, module_dir: str) -> None:
+    def __init__(self, suite: EvaluationSuite, module_dir: str) -> None:
         self._suite = suite
         self._module_dir = module_dir
 
@@ -492,7 +512,7 @@ def _call_factory(factory, kwargs: dict[str, object]) -> object:
     return factory(*positional, **filtered_kwargs)
 
 
-def _validate_suites(value: object, *, source: Path) -> list[EvalSuite]:
+def _validate_suites(value: object, *, source: Path) -> list[EvaluationSuite]:
     if not isinstance(value, (list, tuple)):
         raise TypeError(
             f"{source}: expected {_DEFAULT_EVALUATIONS_FACTORY}() or EVALUATIONS "
@@ -503,7 +523,7 @@ def _validate_suites(value: object, *, source: Path) -> list[EvalSuite]:
             f"{source}: expected at least one evaluation suite from "
             f"{_DEFAULT_EVALUATIONS_FACTORY}() or EVALUATIONS"
         )
-    suites: list[EvalSuite] = []
+    suites: list[EvaluationSuite] = []
     names: set[str] = set()
     for index, suite in enumerate(value, start=1):
         name = getattr(suite, "name", None)
@@ -526,7 +546,7 @@ def _validate_suites(value: object, *, source: Path) -> list[EvalSuite]:
 
 def load_evaluation_suites(
     env_ref_or_path: str | Path, *, environment: object | None = None
-) -> list[EvalSuite]:
+) -> list[EvaluationSuite]:
     """Load evaluations.py beside a resolved environment entrypoint."""
     source = _evaluation_path(env_ref_or_path)
     if not source.is_file():
@@ -574,10 +594,12 @@ def load_evaluation_suites(
 __all__ = [
     "_DEFAULT_EVALUATIONS_PATH",
     "BaseEvalSuite",
+    "EpisodeEvalSuite",
     "EvalCase",
     "EvalResult",
     "EvalSuite",
     "EvalSuiteReport",
+    "EvaluationSuite",
     "_evaluation_path",
     "has_evaluations",
     "load_evaluation_suites",
