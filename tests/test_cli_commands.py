@@ -140,12 +140,25 @@ class _FakeClient:
             }
         ]
 
-    def deployment_for(self, run_id: str) -> dict | None:
+    def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
         self.calls.append(("deployment_for", run_id))
         for entry in self.deployments():
             deployment = entry.get("deployment") or {}
             if entry.get("run_id") == run_id.split("/", 1)[0]:
                 return {**deployment, "run_id": entry["run_id"]}
+        return None
+
+    def deployed_checkpoint(
+        self,
+        run_id: str,
+        timeout: float | None = None,
+        *,
+        body_deadline: float | None = None,
+    ) -> dict | None:
+        # the real client reads the run-scoped route, NOT the listing: routing this through
+        # `deployments` would let the pre-deploy warning's read land in the rollback-lookup
+        # assertions of the `--wait` tests, which instrument that method.
+        self.calls.append(("deployed_checkpoint", run_id))
         return None
 
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
@@ -1957,6 +1970,8 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "GPU selection is not what you expected" in training_text
     assert "response_text.thinking" in training_text
     assert "Qwen3.5 thinking multi-turn SFT" in training_text
+    assert "`grades_episodes = True`" in training_text
+    assert "`score(case, response, state)`" in training_text
     assert "longest shared token prefix" in training_text
     assert "flash env pull your-org/your-project/my-env" in training_text
     assert "private environment-scoped repo" in training_text
@@ -2024,7 +2039,11 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
     # sends `_score_one` down the single-turn branch (flash/envs/adapter.py:237-243), which grades an
     # EMPTY transcript -- the arithmetic suite scored this guess-the-number env 1.0 on "12".
     assert "self.environment.reward(response, example)" not in evaluations_text
+    assert "`score(self, case, response, state)`" in evaluations_text
+    assert "passes the resulting transcript in `state`" in evaluations_text
     assert "step_episode" in evaluations_text
+    assert "`messages` already ends with this action" in env_py
+    assert "`messages[:-1]` and apply `assistant_response` once" in env_py
     # the docstring documents all three algorithms train off the multi-turn env (no opd carve-out)
     assert "distils EVERY assistant turn" in env_py
     assert "single-turn only" not in env_py

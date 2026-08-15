@@ -59,6 +59,46 @@ def test_protected_names_cover_live_runs_only(monkeypatch):
     assert _derived("RTX 5090", "flash-done") not in names
 
 
+def test_ordered_gpu_pin_is_protected_before_its_handle_is_persisted(monkeypatch):
+    """Every acceptable class is protected before the handle is persisted."""
+    rows = [{"run_id": "flash-ordered"}]
+    statuses = {
+        "flash-ordered": RunStatus(
+            run_id="flash-ordered",
+            state="provisioning",
+            spec={"gpu": {"type": ["A100 PCIe", "A100 SXM"]}},
+        )
+    }
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
+    monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
+
+    names = app_mod._protected_train_endpoint_names()
+
+    assert names, "an ordered-pin run contributed no protected name at all"
+    assert _derived("A100 PCIe", "flash-ordered") in names
+    assert _derived("A100 SXM", "flash-ordered") in names
+
+
+def test_an_orphaned_fallback_endpoint_stays_in_the_reapers_scope(monkeypatch):
+    """A terminal fallback endpoint remains within the reaper's known scope."""
+    rows = [{"run_id": "flash-orphan"}]
+    statuses = {
+        "flash-orphan": RunStatus(
+            run_id="flash-orphan",
+            state="failed",
+            spec={"gpu": {"type": ["A100 PCIe", "A100 SXM"]}},
+        )
+    }
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
+    monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
+
+    known = app_mod._known_train_endpoint_names()
+
+    # the fallback is the one the head-only index missed, and the one that leaks.
+    assert _derived("A100 SXM", "flash-orphan") in known
+    assert _derived("A100 PCIe", "flash-orphan") in known
+
+
 def test_reap_once_passes_protected_set_and_grace(monkeypatch):
     monkeypatch.setattr(app_mod, "_protected_train_endpoint_names", lambda: {"flash-live"})
     # The reaper also passes the KNOWN set (every run this plane has a record of) so it only reaps

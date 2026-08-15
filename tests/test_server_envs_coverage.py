@@ -26,8 +26,9 @@ pytest.importorskip("fastapi")
 from fastapi import HTTPException
 
 import flash.server.routes.serving as serving
+import flash.server.routes.serving_completion as serving_completion
 from flash.engine.plan.recipe import RECIPE
-from flash.serve.deploy import ServingError
+from flash.serve.deploy import AliasThinkingSilent, ServingError
 
 
 def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
@@ -570,11 +571,20 @@ def _smoke_spec(
 
 
 _SMOKE_REVISION = "run-1@final." + "a" * 40
+_MISSING_REASONING = object()
 
 
-def _smoke_response(content: str, finish_reason: str = "stop") -> dict:
+def _smoke_response(
+    content: str,
+    finish_reason: str = "stop",
+    *,
+    reasoning_content: object = _MISSING_REASONING,
+) -> dict:
+    message = {"content": content}
+    if reasoning_content is not _MISSING_REASONING:
+        message["reasoning_content"] = reasoning_content
     return {
-        "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
+        "choices": [{"message": message, "finish_reason": finish_reason}],
         "freesolo": {
             "adapter_revision": _SMOKE_REVISION,
             "checkpoint": "run-1",
@@ -715,7 +725,10 @@ def test_run_deployment_smoke_budgets_thinking_without_structured_outputs(
 
     def fake_serve_chat(**kwargs):
         calls.append(kwargs)
-        return _smoke_response("<think>2+2 is 4</think>The answer is 4")
+        return _smoke_response(
+            "<think>2+2 is 4</think>The answer is 4",
+            reasoning_content="2+2 is 4",
+        )
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
     out = _run_smoke(spec)
@@ -799,7 +812,10 @@ def test_sft_smoke_budget_ignores_the_rollout_only_completion_knob(monkeypatch):
 
     def fake_serve_chat(**kwargs):
         calls.append(kwargs)
-        return _smoke_response("<think>2+2 is 4</think>The answer is 4")
+        return _smoke_response(
+            "<think>2+2 is 4</think>The answer is 4",
+            reasoning_content="2+2 is 4",
+        )
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
     _run_smoke(
@@ -1520,3 +1536,292 @@ def test_nonthinking_structured_smoke_validates_whole_stripped_content(monkeypat
         ),
     )
     assert out["verify_sample"] == "<think>literal</think>4"
+
+
+def test_alias_thinking_verification_targets_the_mutable_alias(monkeypatch):
+    """The check must ask the alias, because that is what a bare `model: <run-id>` resolves to.
+
+    The deployment smoke pins the immutable revision, so asking the revision a second time would
+    re-prove what already passed and still never touch the surface the regression appeared on.
+    """
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response(
+            "<think>2+2 is 4</think>The answer is 4",
+            reasoning_content="2+2 is 4",
+        )
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    out = serving._verify_alias_thinking(
+        "run-1", _smoke_spec(thinking=True), _SMOKE_REVISION, "run-1"
+    )
+
+    assert calls[0]["run_id"] == "run-1"
+    assert calls[0]["run_id"] != _SMOKE_REVISION
+    assert calls[0]["thinking"] is True
+    assert 0 < calls[0]["timeout_s"] <= 600.0
+    assert calls[0]["expected_checkpoint"] == "run-1"
+    assert calls[0]["expected_adapter_revision"] == _SMOKE_REVISION
+    assert calls[0]["retry_unavailable"] is True
+    assert out["alias_thinking_tag"] is True
+    assert out["alias_thinking_latency_s"] >= 0.0
+
+
+def test_alias_thinking_verification_matches_the_smoke_request_shape(monkeypatch):
+    """Only the model id may differ from the revision smoke.
+
+    This asks a second model id with the same prompt; if the budget or the stop sequences differed
+    too, a failure here would be ambiguous between "the alias lost its reasoning" and "this request
+    was shaped differently". A run that terminates on a delimiter is the case that bites: without
+    its stops the generation runs past the answer to max_tokens.
+    """
+    spec = _smoke_spec(
+        algorithm="grpo",
+        thinking=True,
+        constraint={"json_object": True},
+        max_completion_tokens=40000,
+        stop_sequences=("</answer>",),
+    )
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response(
+            '<think>2+2 is 4</think>{"answer":"4"}',
+            reasoning_content="2+2 is 4",
+        )
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    _run_smoke(spec)
+    serving._verify_alias_thinking("run-1", spec, _SMOKE_REVISION, "run-1")
+
+    smoke_call, alias_call = calls
+    assert alias_call["stop"] == smoke_call["stop"] == ["</answer>"]
+    assert alias_call["max_tokens"] == smoke_call["max_tokens"] == 32512
+    assert alias_call["messages"] == smoke_call["messages"]
+    assert alias_call["temperature"] == smoke_call["temperature"]
+
+
+def test_alias_thinking_verification_rejects_a_silent_reasoning_channel(monkeypatch):
+    """The reproduced shape: healthy generation, `finish_reason: stop`, and no reasoning at all."""
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("The answer is 4"),
+    )
+    with pytest.raises(AliasThinkingSilent, match="alias_thinking_silent"):
+        serving._verify_alias_thinking(
+            "run-1", _smoke_spec(thinking=True), _SMOKE_REVISION, "run-1"
+        )
+
+
+def test_alias_thinking_verification_accepts_an_empty_reasoning_block(monkeypatch):
+    """A model that thought briefly still proves the parser ran, so it must not be failed.
+
+    `flash.serve.thinking` folds an empty `reasoning_content` to `<think></think>`, which is what
+    separates "thought little" from "the reasoning field never arrived".
+    """
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think></think>The answer is 4", reasoning_content=""),
+    )
+    out = serving._verify_alias_thinking(
+        "run-1", _smoke_spec(thinking=True), _SMOKE_REVISION, "run-1"
+    )
+    assert out["alias_thinking_tag"] is True
+
+
+@pytest.mark.parametrize(
+    ("content", "reasoning_content"),
+    [
+        ("<think>\nwhy\n</think>The answer is 4", "why"),
+        ("<think>\n</think>The answer is 4", ""),
+    ],
+)
+def test_alias_thinking_verification_accepts_whitespace_folded_reasoning(
+    monkeypatch, content, reasoning_content
+):
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_kwargs: _smoke_response(content, reasoning_content=reasoning_content),
+    )
+
+    out = serving._verify_alias_thinking(
+        "run-1", _smoke_spec(thinking=True), _SMOKE_REVISION, "run-1"
+    )
+
+    assert out["alias_thinking_tag"] is True
+
+
+def test_alias_thinking_verification_retries_with_one_deadline(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise serving.RetryableServingUnavailable("adapter_loading", 0.25)
+        return _smoke_response(
+            "<think>reasoning</think>The answer is 4",
+            reasoning_content="reasoning",
+        )
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving.time, "sleep", sleeps.append)
+
+    out = serving._verify_alias_thinking(
+        "run-1", _smoke_spec(thinking=True), _SMOKE_REVISION, "run-1"
+    )
+
+    assert out["alias_thinking_tag"] is True
+    assert sleeps == [0.25]
+    assert len(calls) == 2
+    assert all(call["retry_unavailable"] is True for call in calls)
+    assert 0 < calls[1]["timeout_s"] <= calls[0]["timeout_s"] <= 600.0
+
+
+def test_alias_thinking_verification_does_not_retry_other_errors(monkeypatch):
+    calls = []
+
+    def fail_once(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("transport broke")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fail_once)
+    monkeypatch.setattr(
+        serving.time,
+        "sleep",
+        lambda _delay: pytest.fail("ordinary errors must not retry"),
+    )
+
+    with pytest.raises(ServingError, match="could not reach run-1"):
+        serving._verify_alias_thinking(
+            "run-1", _smoke_spec(thinking=True), _SMOKE_REVISION, "run-1"
+        )
+
+    assert len(calls) == 1
+
+
+def test_alias_thinking_retry_stays_inside_the_600_second_deadline(monkeypatch):
+    clock = [100.0]
+    calls = []
+    sleeps = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        raise serving.RetryableServingUnavailable("engine_unavailable", 700.0)
+
+    def fake_sleep(delay):
+        sleeps.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(serving.time, "sleep", fake_sleep)
+
+    with pytest.raises(ServingError, match="bounded smoke exceeded 600s"):
+        serving._verify_alias_thinking(
+            "run-1", _smoke_spec(thinking=True), _SMOKE_REVISION, "run-1"
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["timeout_s"] == 600.0
+    assert sleeps == [600.0]
+
+
+def test_alias_thinking_verification_rejects_stale_provenance(monkeypatch):
+    response = _smoke_response(
+        "<think>reasoning</think>The answer is 4",
+        reasoning_content="reasoning",
+    )
+    response["freesolo"]["adapter_revision"] = "run-1@final." + "b" * 40
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+
+    with pytest.raises(ServingError, match="wrong adapter revision"):
+        serving._verify_alias_thinking(
+            "run-1", _smoke_spec(thinking=True), _SMOKE_REVISION, "run-1"
+        )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "The answer is 4",
+        "<think>answer-side literal</think>The answer is 4",
+        "<think>unmatched answer-side literal",
+        "unmatched answer-side literal</think>The answer is 4",
+    ],
+)
+def test_alias_thinking_verification_requires_direct_reasoning_content(monkeypatch, content):
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_kwargs: _smoke_response(content),
+    )
+
+    with pytest.raises(AliasThinkingSilent):
+        serving._verify_alias_thinking(
+            "run-1", _smoke_spec(thinking=True), _SMOKE_REVISION, "run-1"
+        )
+
+
+def test_alias_thinking_verification_rejects_non_string_reasoning_metadata(monkeypatch):
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_kwargs: _smoke_response(
+            "<think>reasoning</think>The answer is 4", reasoning_content=["reasoning"]
+        ),
+    )
+    with pytest.raises(ServingError, match="non-string reasoning_content"):
+        serving._verify_alias_thinking(
+            "run-1", _smoke_spec(thinking=True), _SMOKE_REVISION, "run-1"
+        )
+
+
+def test_pinned_revision_smoke_alone_would_not_catch_a_silent_alias(monkeypatch):
+    """Pin the gap itself: revision healthy, alias silent -- exactly the reported before/after.
+
+    The smoke passes against the immutable revision and reports `thinking_tag: True`, so a
+    pipeline that verified only the revision commits `ready` while every real request against the
+    alias comes back with its reasoning channel silent.
+    """
+    spec = _smoke_spec(thinking=True)
+
+    def by_target(**kwargs):
+        if kwargs["run_id"] == _SMOKE_REVISION:
+            return _smoke_response(
+                "<think>2+2 is 4</think>The answer is 4",
+                reasoning_content="2+2 is 4",
+            )
+        return _smoke_response("The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", by_target)
+
+    assert _run_smoke(spec)["thinking_tag"] is True
+    with pytest.raises(AliasThinkingSilent):
+        serving._verify_alias_thinking("run-1", spec, _SMOKE_REVISION, "run-1")
+
+
+def test_activated_alias_verification_uses_the_captured_activation_pair(monkeypatch):
+    calls = []
+    spec = _smoke_spec(thinking=True)
+    activation_target = (_SMOKE_REVISION, "run-1/custom-checkpoint")
+
+    def fake_verify(*args):
+        calls.append(args)
+        return {"alias_thinking_tag": True}
+
+    monkeypatch.setattr(serving, "_verify_alias_thinking", fake_verify)
+    smoke_result = {"thinking_tag": True}
+
+    serving_completion._verify_activated_alias_thinking(
+        "run-1", spec, activation_target, smoke_result
+    )
+
+    assert calls == [("run-1", spec, _SMOKE_REVISION, "run-1/custom-checkpoint")]
+    assert smoke_result["alias_thinking_tag"] is True
