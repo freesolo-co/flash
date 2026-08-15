@@ -21,18 +21,6 @@ from flash.engine.worker.verl.child_io import SHIM_FRAGMENT_FAILED_EXIT_CODE
 #
 #   Duplicate GPU detected : rank 1 and rank 0 both on CUDA device <pci>
 #
-# from `WorkerDict.actor_rollout_init_model()`, on hardware whose cards are all present and idle.
-#
-# `render_gdn_varlen_shim` (verl/child_io.py) already defers for exactly this reason. It fixed the
-# one fragment it owned; these were left eager, and the reentrant-checkpointing fragment renders on
-# EVERY grpo run -- `grpo_use_reentrant` is true for every catalog model, since all of them are
-# GatedDeltaNet hybrids -- so the collapse survived that fix on every multi-card run.
-#
-# A deferred patch runs at the first import of the module it patches instead, which happens inside
-# the actor after ray has pinned it. `render_deferred_patch_runtime` emits the ONE registry that
-# arranges this and `_deferred_patch` registers each fragment with it; `test_rl_train.py` asserts no
-# fragment reintroduces a module-scope import of torch, verl or vllm.
-#
 # ONE finder holding many callbacks, never one finder per fragment. Fragments genuinely share
 # targets -- the stop-sequence and image-pad patches both hook the agent loop -- and a finder that
 # has to delegate around its siblings either recurses forever (each skips only itself, so they call
@@ -986,6 +974,20 @@ def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
         "        with urllib.request.urlopen(req) as r:\n"
         "            payload = json.loads(r.read().decode())\n"
         "            return float(payload['score'])\n"
+        # handle http errors before url errors so the bridge's specific failure detail is preserved
+        # instead of being reduced to a generic status message that names no cause.
+        "    except urllib.error.HTTPError as exc:\n"
+        "        detail = ''\n"
+        "        try:\n"
+        "            detail = str(json.loads(exc.read().decode())['error'])\n"
+        "        except Exception:\n"
+        "            detail = ''\n"
+        "        fault = 'could not serve' if exc.code >= 500 else 'rejected'\n"
+        "        if detail:\n"
+        "            raise RuntimeError('flash reward bridge %s the request (HTTP %s): %s'\n"
+        "                               % (fault, exc.code, detail)) from exc\n"
+        "        raise RuntimeError('flash reward bridge %s the request: HTTP %s with no error detail'\n"
+        "                           % (fault, exc.code)) from exc\n"
         "    except urllib.error.URLError as exc:\n"
         "        raise RuntimeError('flash reward bridge request failed: %s' % exc) from exc\n"
         "    except Exception as exc:\n"

@@ -6,7 +6,6 @@ Split out of ``flash.engine.worker.rl_train`` to keep that module under the file
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -30,6 +29,7 @@ from flash.engine.worker.backend_common import (
     shim_marker_file,
     verify_applied_shim_markers,
     verl_device_capability,
+    verl_step_number,
     wrap_shim_fragment,
 )
 from flash.engine.worker.io.heartbeat import (
@@ -58,10 +58,10 @@ from flash.engine.worker.train.rl.shims import (
     render_stop_sequences_shim,
     render_structured_outputs_shim,
 )
-from flash.engine.worker.train.rl.single_turn import (
-    _log_reward_profile,
-    score_single_turn,
-    score_single_turn_batch,
+from flash.engine.worker.train.rl.single_turn import score_single_turn, score_single_turn_batch
+from flash.engine.worker.verl.child_io import (
+    LORA_ROLLOUT_GUARD_SHIM,
+    render_lora_rollout_guard_fragment,
 )
 
 
@@ -89,7 +89,6 @@ class _StepMetricState:
 class _RewardRuntime:
     observability: RewardObservabilityBuffer
     wandb_link: dict[str, str | None]
-    reward_profile: object
     multi_turn_bridge: object
     server: object
     reward_url: str
@@ -256,15 +255,18 @@ def _write_rl_shim(inp, files) -> list[str]:
             # card (see train/rl/shims.render_deferred_patch_runtime). unwrapped -- it only defines
             # the registry and touches no cuda, so there is no patch here that could fail open.
             render_deferred_patch_runtime(),
-            # records_own_marker: every fragment above defers its patch to the import of the module
-            # it targets, so this wrapper now spans only the REGISTRATION. a marker written here
-            # would prove a callback was queued, not that the patch ran, and the parent's
-            # verify_applied_shim_markers would pass for a child training unpatched. each deferred
-            # body records its own name once the patch is actually installed.
+            # every fragment above defers its patch to the import of the module it targets, so this
+            # wrapper now spans only the registration. a marker written here would prove a callback
+            # was queued, not that the patch ran, and the parent's verify_applied_shim_markers would
+            # pass for a child training unpatched. each deferred body records its own name once the
+            # patch is actually installed.
             *(
-                wrap_shim_fragment(name, source, records_own_marker=True)
+                wrap_shim_fragment(name, source, record_immediately=False)
                 for name, source in required_fragments
             ),
+            # unconditional: every flash rollout is a lora rollout, and a base-model fallback is
+            # indistinguishable from a working run in the metrics.
+            render_lora_rollout_guard_fragment(),
             # gated on the key rather than the resolved logger list: that list needs python_bin,
             # which is resolved after this file is written. the shim is inert either way -- it only
             # fires when verl actually calls wandb.init, which requires wandb in the logger list.
@@ -279,7 +281,7 @@ def _write_rl_shim(inp, files) -> list[str]:
     # import it (see copy_multi_turn_child_modules for why it is a copy and not an import).
     if inp["multi_turn"]:
         copy_multi_turn_child_modules(files["shim_dir"])
-    return [name for name, source in required_fragments if source]
+    return [name for name, source in required_fragments if source] + [LORA_ROLLOUT_GUARD_SHIM]
 
 
 def _prepare_rl_runtime(inp, env, tok, prompts):
@@ -317,10 +319,7 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
         return results
 
     def _score_for_profile(index: int, solution_str: str) -> float:
-        """score for profiling without training observability side effects.
-
-        do not seed rollout buffers. errors propagate so a broken grader is not measured as fast.
-        """
+        """score one bridge request without training observability side effects."""
         return score_single_turn(
             env,
             solution_str,
@@ -332,19 +331,6 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
             raise_on_error=True,
         )
 
-    # the profiler times the single-turn grading path (env.reward / env.scores_breakdown on one
-    # completion). a multi-turn env scores a terminal episode instead, so that timing would neither
-    # describe nor even validly reach its reward path.
-    reward_profile = (
-        None
-        if inp["multi_turn"]
-        else _log_reward_profile(
-            env,
-            _score_for_profile,
-            rollout_examples,
-            int(inp["prompts_per_step"]) * int(inp["group_size"]),
-        )
-    )
     multi_turn_bridge = (
         MultiTurnBridge(
             env,
@@ -369,7 +355,6 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
         observability=observability,
         # filled from the child's marker line; stays empty when wandb is off.
         wandb_link={},
-        reward_profile=reward_profile,
         multi_turn_bridge=multi_turn_bridge,
         server=server,
         reward_url=reward_url,
@@ -545,7 +530,6 @@ def _execute_rl_child(
         start_new_session=True,
     )
     child_stream = _rl_train()._GrpoSubprocessStream(proc)
-    step_re = re.compile(r"step:\s*(\d+)")
     progress, last_dump_step = state.progress, state.last_dump_step
     shim_markers = (files or {}).get("shim_markers")
     expected_shims = (files or {}).get("expected_shims", ())
@@ -556,9 +540,9 @@ def _execute_rl_child(
             link = parse_wandb_link(line)
             if link is not None:
                 reward_runtime.wandb_link.update(link)
-            m = step_re.search(line)
-            if m:
-                progress["step"] = int(m.group(1))
+            step_number = verl_step_number(line)
+            if step_number is not None:
+                progress["step"] = step_number
                 # the first step line is the training-start boundary: sitecustomize import is long
                 # finished by then, so a marker still missing means this child is training with no
                 # flash patch at all, so fail now rather than after the whole run is paid for. not

@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from flash.core.catalog import normalize_algorithm, optimizer_batch_key, samples_on_policy
 from flash.core.spec import parse_positive_int_tuple
 from flash.engine.plan.recipe import RECIPE
-from flash.providers import PROVIDER_NAMES
+from flash.providers import PROVIDER_NAMES, validated_provider_preferences
 from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
 
 
@@ -27,8 +27,6 @@ class RunConfig:
     group_size: int | None = None  # GRPO completions per prompt (G)
     lora_rank: int | None = None
     thinking: bool = False
-    # GRPO only: seconds to score one completion. None -> the single average grader latency.
-    reward_seconds_per_completion: float | None = None
     # opd only: the canonical friendly teacher alias from [train].teacher_model.
     # prices the teacher-api estimate; an empty value resolves to the default glm 5.2 teacher (an
     # omitted [train].teacher_model).
@@ -54,11 +52,6 @@ class RunConfig:
     sft_packed_blocks: int | None = None
     opd_multi_turn: bool = False
     opd_max_turns: int | None = None
-    # use measured mean rollout tokens for pricing but retain completion_len/seq_len caps for gpu
-    # sizing. conflating them either overbills expected generation or provisions for the mean and ooms
-    # on the tail; sft uses the same split through train_tokens.
-    measured_completion_tokens: float | None = None
-    measured_prompt_tokens: float | None = None
     # rows the trainer iterates (profile `retained_examples`), which is what verl's sampler shards.
     # NOT derivable from sft_packed_blocks: that is ceil(rows / examples_per_update), so a packed
     # profile with 10 rows and a batch of 8 reports 2 blocks and reconstructs as 16.
@@ -66,6 +59,8 @@ class RunConfig:
     # (see `test_runconfig_preserves_old_positional_constructor`), so inserting here would shift
     # every later field and silently rebind an old caller's opd flag to this one.
     sft_retained_examples: int | None = None
+    # appended for the same positional-constructor reason as sft_retained_examples above.
+    providers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -77,6 +72,12 @@ class RunConfig:
                 f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
             )
         object.__setattr__(self, "provider", prov)
+        providers = validated_provider_preferences(
+            self.providers, allow_empty=isinstance(self.providers, tuple)
+        )
+        if prov != "auto" and providers:
+            raise ValueError("provider and providers cannot both be set")
+        object.__setattr__(self, "providers", providers)
         exact = ""
         if self.gpu_type:
             exact = canonical_gpu(self.gpu_type)

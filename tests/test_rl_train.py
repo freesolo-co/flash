@@ -6,6 +6,7 @@ import ast
 import asyncio
 import contextlib
 import inspect
+import io
 import json
 import math
 import os
@@ -465,7 +466,7 @@ def test_a_deferred_fragment_records_its_marker_only_once_the_patch_applies(tmp_
             "import flash_marker_probe as _m\n_m.PATCHED = True\n",
             "probe-fragment",
         ),
-        records_own_marker=True,
+        record_immediately=False,
     )
     namespace: dict = {}
     with _defer_registry():
@@ -496,9 +497,9 @@ def test_a_deferred_fragment_records_its_marker_only_once_the_patch_applies(tmp_
 
 
 def test_every_rl_fragment_defers_its_marker_rather_than_recording_it_at_arming(tmp_path):
-    # the wiring half of the property above: _write_rl_shim must pass records_own_marker for these
-    # fragments, or the wrapper writes the name at registration and the guarantee is gone. asserted
-    # on the composed file, so a future fragment wired the old way fails here.
+    # the wiring half of the property above: _write_rl_shim must disable immediate recording for
+    # registry-backed fragments, or the wrapper writes the name at registration and the guarantee is
+    # gone. asserted on the composed file, so a future fragment wired the old way fails here.
     files = _shim_files(tmp_path)
     inp = {
         "dp_cards": 2,
@@ -518,9 +519,11 @@ def test_every_rl_fragment_defers_its_marker_rather_than_recording_it_at_arming(
     expected = rl_train._write_rl_shim(inp, files)
     source = Path(files["shim_py"]).read_text()
     for name in expected:
-        # exactly one record call per fragment, and it sits INSIDE the deferred body -- i.e. before
-        # the register() that queues that body, not after it.
         assert source.count(f"_flash_record_applied_shim({name!r})") == 1
+        if name == "lora-rollout-guard":
+            # dev's guard has its own deferred finder and applied hook rather than this registry.
+            continue
+        # the record call sits inside the deferred body, before the register() that queues it.
         marker_at = source.index(f"_flash_record_applied_shim({name!r})")
         register_after = source.index("_flash_defer_registry.register", marker_at)
         assert marker_at < register_after
@@ -1773,9 +1776,9 @@ def _save_steps_inputs(monkeypatch, *, save_at_steps=None, save_every=None, max_
 
 
 def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
-    # verl only saves when global_step % save_freq == 0, so it cannot hit an arbitrary set directly.
-    # the gcd is the largest interval every required step divides, so verl writes a superset of the
-    # checkpoints and the uploader publishes deployables at exactly the requested ones.
+    # periodic saves land only when global_step % save_freq == 0, so they cannot hit an arbitrary set
+    # directly. the gcd is the largest interval every required step divides, so verl writes a superset
+    # of the checkpoints and the uploader publishes deployables at exactly the requested ones.
     inp = _save_steps_inputs(monkeypatch, save_at_steps=(10, 25, 100))
     assert inp["save_freq"] == 5
     assert inp["save_at_steps"] == (10, 25, 100)
@@ -1784,10 +1787,22 @@ def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
 
 
 def test_save_freq_falls_back_to_save_every_without_exact_steps(monkeypatch):
-    # no exact steps: periodic saves are preserved on the customer's own interval.
+    # a long run preserves the customer's interval, so the clamp never increases normal frequency.
     inp = _save_steps_inputs(monkeypatch, save_every=15)
+    assert inp["steps"] == 100
     assert inp["save_freq"] == 15
     assert inp["save_at_steps"] == ()
+
+
+def test_short_derived_horizon_clamps_save_freq_to_the_final_step(monkeypatch):
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(example_count=800),
+        train={"max_examples": 800, "epochs": 1, "prompts_per_step": 64},
+    )
+    assert inp["steps"] == 13
+    assert inp["save_freq"] == 13
+    assert inp["steps"] % inp["save_freq"] == 0
 
 
 def test_save_steps_reach_the_horizon_they_were_validated_against(monkeypatch):
@@ -2656,6 +2671,8 @@ def test_reward_server_rejects_out_of_range_index_before_lookup(index):
 
 
 def test_reward_bridge_lookup_failure_raises(monkeypatch):
+    # the index is IN range, so the scorer's own IndexError is the ENV failing, not a bad request:
+    # it is reported as a server fault carrying the cause rather than as a malformed-payload 400.
     def missing_example(idx, solution_str):
         raise IndexError(idx)
 
@@ -2665,7 +2682,7 @@ def test_reward_bridge_lookup_failure_raises(monkeypatch):
         ns: dict = {}
         src = rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL")
         exec(compile(src, "<reward>", "exec"), ns)
-        with pytest.raises(RuntimeError, match="reward bridge request failed"):
+        with pytest.raises(RuntimeError, match=r"could not serve the request .*IndexError: 99"):
             ns["compute_score"](
                 "flash_env",
                 "answer",
@@ -2674,6 +2691,201 @@ def test_reward_bridge_lookup_failure_raises(monkeypatch):
             )
     finally:
         server.shutdown()
+
+
+def test_reward_server_reports_thread_exhaustion_as_a_server_fault():
+    """Thread exhaustion is 503 WITH its cause, not 400.
+
+    Under rollout concurrency the scoring thread pool can fail to start a thread; the handler used
+    to answer 400 for that, which asserts the caller sent something wrong. Here score_episode
+    cannot produce a 400 at all (it returns a well-formed result carrying `error`), so a 400 sent
+    every reader to the one component provably not at fault.
+    """
+
+    def exhausted(index, solution_str):
+        raise RuntimeError("can't start new thread")
+
+    server, url = rl_train.start_reward_server(exhausted, example_count=4)
+    try:
+        body = json.dumps({"index": 0, "solution_str": "answer"}).encode()
+        req = urllib.request.Request(
+            url + "/score", data=body, headers={"Content-Type": "application/json"}
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 503, "a resource fault must not be reported as a bad request"
+        # the cause has to survive to the client: naming the failing resource is the whole point.
+        assert "can't start new thread" in exc_info.value.read().decode()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    "env_error",
+    [IndexError("list index out of range"), KeyError("grader internal lookup failed")],
+)
+def test_an_env_raising_indexerror_or_keyerror_is_a_server_fault_not_a_bad_request(env_error):
+    """Classifying by exception TYPE reintroduces the bug one layer down.
+
+    The bridge rejects a bad index with IndexError and an unknown session with KeyError, so a tuple
+    of those types around the ROUTE CALL also catches the same types raised by a user env deep
+    inside its own scoring -- reporting a valid request as malformed. ScoreBatcher re-raises a GRPO
+    batch error into every waiter as-is, so one env KeyError would 400 every request in the batch.
+    """
+
+    def failing_env_scorer(index, solution_str):
+        raise env_error
+
+    server, url = rl_train.start_reward_server(failing_env_scorer, example_count=4)
+    try:
+        req = urllib.request.Request(
+            url + "/score",
+            data=json.dumps({"index": 0, "solution_str": "x"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 503, (
+            "the request was valid and the ENV failed; blaming the caller is the original bug"
+        )
+        assert type(env_error).__name__ in exc_info.value.read().decode()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"index": 1e309, "solution_str": "x"}, "not an integer"),  # json inf -> int() overflows
+        ([], "must be a json object"),  # valid json, invalid request object
+        ({"solution_str": "x"}, "missing required field"),
+    ],
+)
+def test_a_malformed_request_shape_is_a_client_error_not_a_server_fault(payload, expected):
+    """A body this bridge cannot read is the caller's fault, so it must not read as unavailable."""
+    server, url = rl_train.start_reward_server(lambda i, s: 1.0, example_count=4)
+    try:
+        req = urllib.request.Request(
+            url + "/score",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 400
+        body = exc_info.value.read().decode()
+        assert expected in body
+        # the private class name is not something a caller can act on.
+        assert "_Bad" not in body, "an internal exception class leaked into the client message"
+    finally:
+        server.shutdown()
+
+
+def test_the_generated_single_turn_reward_module_surfaces_the_bridges_cause(monkeypatch):
+    """The REAL single-turn caller must not drop the detail the server now supplies.
+
+    `HTTPError` is a `URLError` subclass, so a single `except URLError` catches it first and never
+    reads the body -- leaving "HTTP Error 503: Service Unavailable", which names no cause. Asserting
+    on the server response alone would pass while the user-visible path stayed detail-free.
+    """
+
+    def exhausted(index, solution_str):
+        raise RuntimeError("can't start new thread")
+
+    server, url = rl_train.start_reward_server(exhausted, example_count=4)
+    try:
+        monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
+        ns: dict = {}
+        src = rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL")
+        exec(compile(src, "<reward>", "exec"), ns)
+        with pytest.raises(RuntimeError) as exc_info:
+            ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": 0})
+        message = str(exc_info.value)
+        assert "can't start new thread" in message, "the cause never reached the training loop"
+        assert "could not serve" in message
+    finally:
+        server.shutdown()
+
+
+def test_reward_server_still_rejects_a_malformed_request_as_a_client_error():
+    """The 5xx split must not turn genuine client errors into server faults.
+
+    A non-integer index and an unknown session id are the caller's fault at any capacity, so both
+    stay 400 -- otherwise the new status would tell a caller to retry a request that can never work.
+    A no-regression guard, not evidence of the split: these were 400 under the old catch-all too.
+    """
+    bridge = rl_train.MultiTurnBridge(
+        _BridgeEnv(),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=2,
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+    try:
+        for path, payload in (
+            ("/score", {"index": "not-an-int", "solution_str": "x"}),
+            ("/multiturn/step", {"session_id": "nope", "completion_text": "x"}),
+        ):
+            req = urllib.request.Request(
+                url + path,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                urllib.request.urlopen(req, timeout=10)
+            assert exc_info.value.code == 400, f"{path} is a client error at any capacity"
+    finally:
+        server.shutdown()
+        bridge.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "expected_fault"),
+    [
+        (503, "RuntimeError: can't start new thread", "could not serve"),
+        (400, "IndexError: index 9 is outside [0, 4)", "rejected"),
+    ],
+)
+def test_the_child_surfaces_the_bridges_error_text_not_just_the_status(
+    monkeypatch, status, detail, expected_fault
+):
+    """`suppress(Exception)` around the raise swallowed the detail-bearing error itself.
+
+    The bridge puts its real cause in the response body, the child decoded it, built the
+    RuntimeError naming it -- and the suppress ate that raise, so the generic "returned HTTP 400"
+    was the ONLY message that could ever escape. The cause must reach the user, and a 5xx must not
+    read as a rejected request.
+    """
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
+
+    def raise_http_error(*_a, **_k):
+        payload = json.dumps({"error": detail}).encode()
+        raise urllib.error.HTTPError(
+            "http://bridge/multiturn/score", status, "err", {}, io.BytesIO(payload)
+        )
+
+    monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", raise_http_error)
+    with pytest.raises(RuntimeError) as exc_info:
+        grpo_multiturn.post_json("http://bridge", "/multiturn/score", {})
+    message = str(exc_info.value)
+    assert detail in message, "the bridge's own cause never reached the caller"
+    assert expected_fault in message
+
+
+def test_the_child_names_the_status_when_the_body_carries_no_detail(monkeypatch):
+    """An undecodable body must still produce a message naming what happened."""
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
+
+    def raise_http_error(*_a, **_k):
+        raise urllib.error.HTTPError(
+            "http://bridge/multiturn/score", 503, "err", {}, io.BytesIO(b"not json")
+        )
+
+    monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", raise_http_error)
+    with pytest.raises(RuntimeError, match=r"could not serve .*HTTP 503 with no error detail"):
+        grpo_multiturn.post_json("http://bridge", "/multiturn/score", {})
 
 
 def test_reward_server_scorer_can_capture_samples():
@@ -4299,7 +4511,7 @@ def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
 # each test pins one rejection message so deleting a guard cannot pass via another raise.
 
 
-def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
+def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None, example_count=8):
     """a minimal single-turn text env, optionally flipped to a shape verl grpo handles differently.
 
     ``image_uri`` must be a source the normalizer accepts offline (a data uri): a remote https url
@@ -4316,7 +4528,7 @@ def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
             self.max_turns = 3 if multi_turn else 0
 
         def dataset(self):
-            return [{"index": i} for i in range(8)]
+            return [{"index": i} for i in range(example_count)]
 
         # the four calls the multi-turn bridge drives an env through. defined unconditionally so a
         # test can delete one and assert the capability gate catches it.
@@ -5129,6 +5341,27 @@ def test_bridge_score_converts_a_non_finite_episode_to_zero():
         assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.0}
 
 
+def test_per_turn_credit_without_turn_rewards_warns_once_and_keeps_fallback(capsys):
+    env = _BridgeEnv(episode=0.75)
+    bridge = _bridge(env, per_turn_credit=True)
+    for index, session_id in enumerate(("a", "b")):
+        bridge.start({"index": index, "session_id": session_id})
+        bridge.step({"session_id": session_id, "completion_text": "answer"})
+        assert bridge.score({"session_id": session_id, "turn_count": 1}) == {
+            "score": 0.75,
+            "turns": None,
+        }
+
+    out = capsys.readouterr().out
+    warning = "per-turn credit was requested"
+    assert out.count(warning) == 1
+    # the fallback the shim actually applies is per group, not per run
+    # (test_per_turn_credit_shim_leaves_other_groups_on_episode_credit), so a warning claiming the
+    # run switched schemes would misreport which credit assignment trained the model.
+    assert "rollout group" in out
+    assert "this run falls back" not in out
+
+
 def test_bridge_hands_each_scored_episode_to_the_sample_recorder():
     # multi-turn has no per-completion breakdown -- the env scores a whole episode to a scalar --
     # so the transcript IS the only thing this path can publish for `flash runs log`.
@@ -5646,301 +5879,6 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
     assert f"data.max_response_length={inp['max_response_len']}" in rl_train.build_verl_overrides(
         cfg
     )
-
-
-# ---------------------- measured reward latency in train_meta ----------------------
-def _resolved_inputs_for_notes(monkeypatch):
-    """A resolved single-turn input dict, offline.
-
-    Mirrors the resolver fixture above: _resolve_grpo_inputs needs a loaded env, a spec and
-    a tokenizer, none of which exist in a unit test.
-    """
-    from flash.core.spec import JobSpec
-    from flash.engine.worker.runtime.pkg_proxy import W
-
-    class _Env:
-        multi_turn = False
-        is_tool_env = False
-
-        def dataset(self):
-            return [{"index": i} for i in range(33)]
-
-        def prompt_messages(self, ex):
-            return [{"role": "user", "content": f"question {ex['index']}"}]
-
-    class _Tokenizer:
-        pad_token = None
-        eos_token = "<eos>"
-
-        def apply_chat_template(self, messages, **kwargs):
-            return messages[0]["content"]
-
-        def __call__(self, text, **kwargs):
-            return SimpleNamespace(input_ids=[1])
-
-    spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "grpo",
-            "train": {"prompts_per_step": 16, "epochs": 2},
-        }
-    )
-    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
-    monkeypatch.setattr(W, "SEED", 42, raising=False)
-    monkeypatch.setattr(W, "THINKING", False, raising=False)
-    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
-    monkeypatch.setattr(W, "grpo_overrides", dict, raising=False)
-    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
-    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
-    monkeypatch.setattr(rl_train, "seed_training_rngs", lambda seed: None)
-    monkeypatch.setattr(rl_train, "model_max_position_embeddings", lambda *a, **k: 40960)
-    return rl_train._resolve_grpo_inputs()
-
-
-def _profile(seconds: float, *, trustworthy: bool = True):
-    """A RewardProfile shaped like the profiler's real output."""
-    from flash.engine.profiling.reward_profile import RewardProfile
-
-    return RewardProfile(
-        seconds_per_completion=seconds,
-        samples=0 if not trustworthy else 3,
-        degenerate=False,
-        failures=0,
-    )
-
-
-def test_train_notes_record_the_measured_grading_latency(monkeypatch):
-    """The measurement has to outlive the log line to be usable by anything downstream.
-
-    A latency that only reaches stdout cannot price a run or place one: the cost model would keep
-    using its single 1.0s average for an env just measured at 0.02s.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=5,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(0.25),
-        step_intervals=[10.0],
-    )
-    assert notes["reward_seconds_per_completion"] == 0.25
-
-
-def test_train_notes_omit_an_untrustworthy_profile(monkeypatch):
-    """A profile that measured nothing must record None, not a number.
-
-    RewardProfile.trustworthy is False when no sample graded successfully; writing its 0.0 into
-    train_meta would read downstream as a genuinely instant grader.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=5,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(0.0, trustworthy=False),
-        step_intervals=[10.0],
-    )
-    assert notes["reward_seconds_per_completion"] is None
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_train_notes_report_idle_fraction_from_the_runs_own_step_wall(monkeypatch):
-    """The idle share is computed from measured wall time, not from the cost model's estimate.
-
-    Deriving it from the modelled step would report the estimator's own opinion back to it, which
-    is exactly the number an operator would want to CHECK against reality.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    # a step wall of 10s, of which grading accounts for 8s -> 80% idle.
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 10,
-    )
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_train_notes_do_not_publish_the_serial_idle_projection_when_batching(monkeypatch):
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(8.0 / completions),
-        step_intervals=[10.0] * 10,
-        reward_bridge_batching=True,
-    )
-
-    assert notes["reward_bridge_batching"] is True
-    assert notes["reward_seconds_per_completion"] == 8.0 / completions
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_idle_fraction_is_none_when_grading_exceeds_the_measured_step(monkeypatch):
-    """Grading that fills the whole step leaves no gpu-bound remainder to divide.
-
-    The profile and the observed wall disagree here (a warm-up latency that no longer holds, or a
-    step wall dominated by something else), and neither can arbitrate, so the honest record is no
-    reading rather than a fabricated 100%.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        # 20s of grading inside a 10s measured step
-        reward_profile=_profile(20.0 / completions),
-        step_intervals=[10.0] * 10,
-    )
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_idle_fraction_ignores_steps_this_worker_did_not_run(monkeypatch):
-    """A resumed run must divide by ITS steps, not by the checkpoint's absolute step number.
-
-    steps_run comes from the checkpoint directory and counts every step the run has ever taken;
-    the wall clock only ever covers this session. A worker resuming at 90 and training to 100
-    walled ten steps, and charging those seconds against a hundred understates each step by 10x --
-    which inflates the idle share toward 100% and would route the run to a co-location tier it
-    cannot sustain. Feeding the measured intervals removes the term entirely.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        # the checkpoint says 100 steps; this worker observed ten, each a real 10s step.
-        steps_run=100,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 10,
-    )
-    # unchanged from the fresh-run case above: resume does not move the reading.
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_idle_fraction_is_unmoved_by_one_slow_step(monkeypatch):
-    """A checkpoint save lands inside a single step interval and must not set the verdict.
-
-    Every save-step gap carries an upload that the other steps never pay. Averaging lets one such
-    step drag the whole reading -- here a 200s outlier among 10s steps would report ~28s/step and
-    flip an 80% idle run to 29%. The median needs MOST steps to be slow before it moves.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 9 + [200.0],
-    )
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_idle_fraction_is_none_when_no_step_was_timed(monkeypatch):
-    """A run that never emitted two step lines has no measured step to divide by.
-
-    One step line yields zero intervals by design (the span before it is engine startup), and a
-    run that died in its first step yields none at all. Both must record no reading rather than
-    fall back to a modelled step, which is the number this metric exists to check.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=1,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(8.0 / completions),
-        step_intervals=[],
-    )
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_step_intervals_exclude_the_span_before_the_first_step():
-    """Engine init, weight load and cudagraph capture precede the first step line.
-
-    That span is setup, paid once, and often larger than a step. Counting it as a step would
-    inflate the step wall and understate the idle share on exactly the short runs where the
-    startup cost dominates. N step lines bound N-1 steps, never N.
-    """
-    assert rl_train._step_intervals([100.0, 110.0, 122.0]) == [10.0, 12.0]
-    # a single step line bounds no whole step: nothing is known about what came before it or after.
-    assert rl_train._step_intervals([100.0]) == []
-    assert rl_train._step_intervals([]) == []
-
-
-def test_the_profile_hook_returns_its_reading_to_the_caller():
-    """_log_reward_profile must RETURN the profile, not only print it.
-
-    Asserted against the real hook rather than a fixture: the wiring under test is that the run
-    body can capture what the profiler measured.
-    """
-
-    class Env:
-        def sft_completion(self, example):
-            return [{"role": "assistant", "content": "an answer worth grading"}]
-
-    profile = rl_train._log_reward_profile(
-        Env(), lambda index, completion: 1.0, [{"id": i} for i in range(4)], 32
-    )
-    assert profile is not None
-    assert profile.trustworthy
-
-
-def test_the_run_body_passes_the_measured_profile_into_train_meta():
-    """The captured profile must actually reach the notes builder.
-
-    Source-level, because reaching this line in a live run needs a gpu. Without it the hook could
-    return a profile that the run body drops on the floor, and every other test here would still
-    pass while train_meta always recorded None.
-    """
-    reward_src = inspect.getsource(rl_train._start_reward_runtime)
-    entry_src = inspect.getsource(rl_train.run_rl_train)
-    metadata_src = inspect.getsource(rl_train._write_terminal_metadata)
-    assert "_log_reward_profile(" in reward_src, "the hook is never called"
-    assert "reward_profile = " in reward_src, "the hook's reading is discarded"
-    assert "reward_runtime=reward_runtime" in entry_src, "the reading never reaches train_meta"
-    assert "reward_profile=reward_runtime.reward_profile" in metadata_src, (
-        "the reading never reaches train_meta"
-    )
-    assert 'reward_bridge_batching=not inp["multi_turn"]' in metadata_src
-
-
-def test_the_reward_profiler_is_skipped_on_multi_turn():
-    """The profiler times the SINGLE-TURN grading path, which a multi-turn env does not have.
-
-    Source-level for the same reason as above. Running it on a multi-turn env would call
-    env.reward/scores_breakdown on one completion -- a call that env's contract does not define --
-    and record the resulting number as if it described the episode reward path.
-    """
-    src = inspect.getsource(rl_train._start_reward_runtime)
-    profile_call = src[src.index("reward_profile = ") : src.index("multi_turn_bridge = ")]
-    assert 'if inp["multi_turn"]' in profile_call, "the profiler is not gated off multi-turn"
-    assert "None" in profile_call, "multi-turn must record no profile rather than a wrong one"
 
 
 # ---------------- reward observability: the buffer and the heartbeat drain ----------------
@@ -6620,7 +6558,7 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
     # sealed on the new-step branch, and BEFORE the preview reads the published rows so the logged
     # sample and the heartbeat describe the same generation.
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = int(m.group(1))') :]
+    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = step_number') :]
     assert 'reward_runtime.observability.close_generation(progress["step"])' in stdout_loop
     assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
         'samp = reward_runtime.observability.latest_for_step(progress["step"])'
@@ -7355,6 +7293,9 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
         "stop-sequences",
         "exact-save-steps",
         "kl-ref-adapter",
+        # unconditional: every flash rollout is a lora rollout, so there is no configuration in
+        # which a base-model fallback is the intended behavior.
+        "lora-rollout-guard",
     ]
     source = Path(files["shim_py"]).read_text()
     # the wrap indents whole fragments into try blocks; a syntax slip would turn the child's
@@ -7362,6 +7303,9 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
     compile(source, "sitecustomize.py", "exec")
     for name in expected:
         assert f"_flash_record_applied_shim({name!r})" in source
+    # the canonical fragment records once through its deferred hook, never at wrapper startup.
+    assert source.count("_flash_record_applied_shim('lora-rollout-guard')") == 1
+    assert "_flash_lora_rollout_guard_applied()" in source
     assert "per-turn-credit" not in source
     # tf32 stays first and unwrapped: it swallows its own failures by design and a later fragment
     # that raised must not be able to cost the run its tensor-core throughput.
@@ -7393,7 +7337,7 @@ def test_write_rl_shim_puts_the_rank_device_assert_first_when_the_run_spans_card
         "multi_turn": False,
     }
     expected = rl_train._write_rl_shim(inp, files)
-    assert expected == ["rank-device-assert", "reentrant-checkpointing"]
+    assert expected == ["rank-device-assert", "reentrant-checkpointing", "lora-rollout-guard"]
     source = Path(files["shim_py"]).read_text()
     compile(source, "sitecustomize.py", "exec")
     assert source.index("_flash_record_applied_shim('rank-device-assert')") < source.index(
@@ -7415,7 +7359,7 @@ def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
     provably finished (fragments print while later ones are still applying, so the first OUTPUT
     line would race the file). a missing marker there means the child trains unpatched."""
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    step_at = stdout_loop.index('progress["step"] = int(m.group(1))')
+    step_at = stdout_loop.index("step_number = verl_step_number(line)")
     verify_at = stdout_loop.index("verify_applied_shim_markers(shim_markers, expected_shims)")
     assert step_at < verify_at < stdout_loop.index("close_generation")
     # and the entry point wires the files dict (marker path + expected set) into both the loop
