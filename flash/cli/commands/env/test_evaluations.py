@@ -82,7 +82,13 @@ def _episode_evaluation_response(env, case) -> tuple[str, dict]:
     from flash.cli.commands.env.test import _drive_multi_turn, _new_record
 
     record = _new_record()
-    _drive_multi_turn(env, _evaluation_example(case), record, score=False)
+    _drive_multi_turn(
+        env,
+        _evaluation_example(case),
+        record,
+        score=False,
+        replay_gold=case.expected is not None,
+    )
     state = record["state"]
     response = state.get("response_text")
     if not isinstance(response, str):

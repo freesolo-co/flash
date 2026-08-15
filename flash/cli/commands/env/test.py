@@ -281,16 +281,22 @@ def _validate_multi_turn_reply(env, example: dict, state: dict, messages: object
 
 
 def _drive_multi_turn(
-    env, example: dict, record: dict, *, force_echo: bool = False, score: bool = True
+    env,
+    example: dict,
+    record: dict,
+    *,
+    force_echo: bool = False,
+    score: bool = True,
+    replay_gold: bool = True,
 ) -> None:
     state = _new_multi_turn_replay_state(env, example, record)
-    completion = _gold_completion(env, example)
+    completion = _gold_completion(env, example) if replay_gold else []
     record["completion"] = completion
     reference_turns = _reference_turns(completion)
-    policy = "echo" if force_echo else _resolve_policy(reference_turns)
+    policy = "echo" if force_echo or not replay_gold else _resolve_policy(reference_turns)
     record["policy"] = policy
-    record["gold_without_replayable_text"] = not force_echo and _gold_lacks_replayable_text(
-        completion, reference_turns
+    record["gold_without_replayable_text"] = (
+        replay_gold and not force_echo and _gold_lacks_replayable_text(completion, reference_turns)
     )
     record["thinking_markup"] = _carries_thinking_markup(reference_turns)
     # mirror the worker turn loop (flash/engine/worker/train/rl/child/multiturn.py): drive one model
@@ -368,18 +374,9 @@ def _drive_multi_turn(
     # env that replied with nothing, a natural finish) -- stepping again there would be a spurious
     # extra move. rollout_done covers the env having declared the episode over.
     if env_step_pending and not env.rollout_done(state, hard_cap):
-        # validated exactly like the in-loop replies above: a malformed reply breaks the chat
-        # template on the paid run whether it was the last one or not. this call is the ONLY
-        # env_reply for an episode stopped at the ceiling, and a per-example `max_episode_turns`
-        # makes that the common case rather than a rare one -- leaving it unchecked let an env whose
-        # final reply is malformed reach `overall: PASS`.
-        #
-        # an EMPTY reply is allowed first, exactly as the in-loop path does (`if not env_msgs:
-        # break` precedes its own `_check_messages`): an env with nothing further to observe
-        # legitimately returns nothing, and `_check_messages` rejects an empty list.
-        final_msgs = env.env_reply(state["messages"], state)
-        if final_msgs:
-            _validate_multi_turn_reply(env, example, state, final_msgs)
+        # apply the final action's side effects, but do not validate its reply as a future prompt:
+        # no later model generation consumes it in the online path.
+        env.env_reply(state["messages"], state)
     if gold_finished is None:
         # the gold answer never ran out inside the loop -- it covered the whole episode, so the
         # break came first and the mid-loop sample never fired. NOW is its moment: the deferred

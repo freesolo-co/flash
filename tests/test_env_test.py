@@ -358,6 +358,36 @@ def test_env_test_validates_episode_suite_with_finished_state(monkeypatch, tmp_p
     assert "overall: PASS" in captured.out
 
 
+def test_env_test_episode_suite_without_expected_does_not_require_sft_gold(
+    monkeypatch, tmp_path, capsys
+):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self): return [EvalCase(id='episode', input='held out')]\n"
+        "    def score(self, case, response, state):\n"
+        "        return response == 'test' and bool(state['messages'])\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class _NoEvaluationGoldEnv(_MultiTurnEnv):
+        def sft_completion(self, example):
+            if example.get("output") is None:
+                raise AssertionError("evaluation case requested an sft target")
+            return super().sft_completion(example)
+
+    _patch_loader(monkeypatch, _NoEvaluationGoldEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "evaluation suite episode: 1/1 cases passed contract checks" in captured.out
+    assert "evaluation case requested an sft target" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
 def test_env_test_warns_when_episode_suite_cannot_receive_state(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
@@ -3073,12 +3103,7 @@ def test_env_test_does_not_warn_when_an_episode_finishes_on_its_per_example_cap(
 
 
 class _MalformedFinalReplyEnv(_PerExampleCapDeadEnv):
-    """An env whose LAST `env_reply` is malformed, reached only at the ceiling.
-
-    Scalar `content` breaks the chat template in a real rollout, which is why every in-loop reply is
-    envelope-checked. This one is issued by the deferred call after the loop, and a per-example
-    budget makes that the common path rather than a rare one.
-    """
+    """An env whose terminal reply is not suitable for a future model prompt."""
 
     def env_reply(self, messages, state):
         state["turn"] += 1
@@ -3119,34 +3144,29 @@ class _ImageFinalReplyEnv(_PerExampleCapDeadEnv):
         return [reply]
 
 
-def test_env_test_validates_the_deferred_final_env_reply(monkeypatch, tmp_path, capsys):
-    """The last `env_reply` of a capped episode must be checked like every other one.
-
-    An episode stopped at the ceiling has its final reply issued by the deferred call after the
-    loop, so that call is the ONLY `env_reply` an author sees validated for such an episode. It was
-    unchecked, and an environment whose final reply is malformed reached `overall: PASS` -- then
-    broke tokenization on the paid run, which is precisely what the in-loop check exists to prevent.
-    """
+def test_env_test_does_not_validate_the_deferred_final_reply_as_a_prompt(
+    monkeypatch, tmp_path, capsys
+):
     env_dir = _environment_dir(tmp_path)
     _patch_loader(monkeypatch, _MalformedFinalReplyEnv())
 
-    assert cmd_env_test(_args(env_dir)) == 1
+    assert cmd_env_test(_args(env_dir)) == 0
     captured = capsys.readouterr()
-    assert "env_reply is not well-formed" in captured.err
-    assert "overall: FAIL" in captured.err
+    assert "env_reply is not well-formed" not in captured.err
+    assert "overall: PASS" in captured.out
 
 
-def test_env_test_validates_images_added_by_the_deferred_final_reply(monkeypatch, tmp_path, capsys):
+def test_env_test_allows_images_added_by_the_deferred_final_reply(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     env = _ImageFinalReplyEnv()
     _patch_loader(monkeypatch, env)
 
-    assert cmd_env_test(_args(env_dir)) == 1
+    assert cmd_env_test(_args(env_dir)) == 0
     captured = capsys.readouterr()
-    assert "remote image URLs are not supported" in captured.err
-    assert "overall: FAIL" in captured.err
+    assert "remote image URLs are not supported" not in captured.err
+    assert "overall: PASS" in captured.out
     assert env.reply_calls == 3
-    assert env.scored_state is None
+    assert env.scored_state is env.state
     assert env.state["messages"][-1]["content"][0]["type"] == "image_url"
 
 
@@ -3164,13 +3184,7 @@ class _NoFinalReplyEnv(_PerExampleCapDeadEnv):
 
 
 def test_env_test_allows_an_empty_deferred_final_env_reply(monkeypatch, tmp_path, capsys):
-    """Returning no final observation is legal, and must not be read as a malformed reply.
-
-    The paired negative for the test above. `_check_messages` rejects an empty list, so validating
-    the deferred reply without checking for emptiness first would fail every environment that simply
-    has nothing more to say -- the in-loop path breaks on that case before validating, and this one
-    has to agree.
-    """
+    """Returning no final observation is legal and still applies the final action."""
     env_dir = _environment_dir(tmp_path)
     _patch_loader(monkeypatch, _NoFinalReplyEnv())
 
