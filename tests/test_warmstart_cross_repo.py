@@ -412,7 +412,7 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
     """The inherited pin must be on the spec BEFORE `resolve_model` sizes the run.
 
     Sizing reads the revision: `resolve_model` re-derives params/vocab from the pinned commit and
-    raises `min_disk_gb` to `params_b * 2 + 64`, which for half of today's catalog exceeds the
+    raises `min_disk_gb` to `ceil(2 * params_b) + 64`, which for half of today's catalog exceeds the
     catalog default (Qwen3.5-4B: 0 -> 73). Inheriting inside `_prepare_init_from_adapter`, which
     runs after `resolve_model`, `_with_model_disk`, and `_assign_weight_cache_volume`, provisions
     the child as if unpinned while training it pinned, and skips the geometry validation the pin
