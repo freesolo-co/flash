@@ -3659,8 +3659,8 @@ def test_env_eval_hands_the_finished_episode_to_a_suite_that_accepts_it(capsys) 
         def cases(self):
             return [EvalCase(id="c", input="x", expected="1,3,6")]
 
-        def score(self, case, response, state=None):
-            turns = (state or {}).get("turns") or []
+        def score(self, case, response, episode):
+            turns = episode.get("turns") or []
             seen = ",".join(turns)
             return EvalResult(
                 case_id=case.id,
@@ -3774,6 +3774,8 @@ def test_state_argument_detects_how_the_scorer_takes_state() -> None:
     assert _state_argument(lambda case, response, *args, **kwargs: None) == "keyword"
     assert _state_argument(lambda case, response, *args: None) == "positional"
     assert _state_argument(lambda case, response, state, /: None) == "positional"
+    assert _state_argument(lambda case, response, episode: None) == "positional"
+    assert _state_argument(lambda case, response, episode, /: None) == "positional"
     assert _state_argument(lambda case, response, threshold=0.5: None) is None
 
 
@@ -3782,11 +3784,12 @@ def test_state_argument_detects_how_the_scorer_takes_state() -> None:
     [
         "def score(self, case, response, state=None): return _graded(case, state)",
         "def score(self, case, response, state, /): return _graded(case, state)",
+        "def score(self, case, response, episode): return _graded(case, episode)",
         "def score(self, case, response, *, state=None): return _graded(case, state)",
         "def score(self, case, response, **kwargs): return _graded(case, kwargs.get('state'))",
         "def score(self, case, response, *args): return _graded(case, args[0] if args else None)",
     ],
-    ids=["positional", "positional_only", "keyword_only", "kwargs", "varargs"],
+    ids=["state", "state_positional_only", "episode", "keyword_only", "kwargs", "varargs"],
 )
 def test_every_state_accepting_scorer_shape_actually_receives_the_episode(
     scorer_source: str,

@@ -275,6 +275,11 @@ def _new_multi_turn_replay_state(env, example: dict, record: dict) -> dict:
     return state
 
 
+def _validate_multi_turn_reply(env, example: dict, state: dict, messages: object) -> None:
+    _check_messages(messages, "env_reply")
+    _normalize_prompt_images(env, example, [dict(message) for message in state["messages"]])
+
+
 def _drive_multi_turn(
     env, example: dict, record: dict, *, force_echo: bool = False, score: bool = True
 ) -> None:
@@ -340,9 +345,10 @@ def _drive_multi_turn(
         if not env_msgs:
             break
         # the env's own reply messages feed the chat template for the next turn in the real
-        # rollout, so validate their envelope here too: a malformed reply that would break
-        # remotely must fail the episode instead of slipping through on a finite reward.
-        _check_messages(env_msgs, "env_reply")
+        # rollout, so validate their envelope and accumulated images here too: a malformed reply
+        # that would break remotely must fail the episode instead of slipping through on a finite
+        # reward. normalize copies so the check cannot replace authoritative rollout messages.
+        _validate_multi_turn_reply(env, example, state, env_msgs)
         if gold_finished is None and turns >= len(reference_turns):
             # the gold answer has just run out and its last turn is applied: this is the only
             # moment the reference can be judged on its own, before junk padding touches the state.
@@ -373,7 +379,7 @@ def _drive_multi_turn(
         # legitimately returns nothing, and `_check_messages` rejects an empty list.
         final_msgs = env.env_reply(state["messages"], state)
         if final_msgs:
-            _check_messages(final_msgs, "env_reply")
+            _validate_multi_turn_reply(env, example, state, final_msgs)
     if gold_finished is None:
         # the gold answer never ran out inside the loop -- it covered the whole episode, so the
         # break came first and the mid-loop sample never fired. NOW is its moment: the deferred

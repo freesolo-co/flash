@@ -216,6 +216,32 @@ class _MalformedReplyMultiTurnEnv(_MultiTurnEnv):
         return [reply]
 
 
+class _ImageReplyMultiTurnEnv(_MultiTurnEnv):
+    def __init__(self):
+        super().__init__()
+        self.reply_calls = 0
+        self.state = None
+
+    def new_rollout_state(self, example):
+        self.state = super().new_rollout_state(example)
+        return self.state
+
+    def env_reply(self, messages, state):
+        self.reply_calls += 1
+        state["turn"] += 1
+        reply = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/later.png"},
+                }
+            ],
+        }
+        messages.append(reply)
+        return [reply]
+
+
 def _environment_dir(tmp_path):
     env_dir = tmp_path / "local-env"
     env_dir.mkdir()
@@ -306,8 +332,8 @@ def test_env_test_validates_episode_suite_with_finished_state(monkeypatch, tmp_p
         "            {'role': 'assistant', 'content': 'first'},\n"
         "            {'role': 'assistant', 'content': 'second'},\n"
         "        ])]\n"
-        "    def score(self, case, response, state):\n"
-        "        turns = [m['content'] for m in state['messages'] if m['role'] == 'assistant']\n"
+        "    def score(self, case, response, episode):\n"
+        "        turns = [m['content'] for m in episode['messages'] if m['role'] == 'assistant']\n"
         "        return response == 'second' and turns == ['first', 'second']\n"
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
@@ -1313,6 +1339,20 @@ def test_env_test_multi_turn_malformed_env_reply_fails_contract(monkeypatch, tmp
     assert "0/1 episodes passed contract checks" in captured.out
     assert "env_reply is not well-formed" in captured.err
     assert "overall: FAIL" in captured.err
+
+
+def test_env_test_validates_images_added_by_an_in_loop_env_reply(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    env = _ImageReplyMultiTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "remote image URLs are not supported" in captured.err
+    assert "overall: FAIL" in captured.err
+    assert env.reply_calls == 1
+    assert env.scored_state is None
+    assert env.state["messages"][-1]["content"][0]["type"] == "image_url"
 
 
 def test_env_test_multi_turn_stops_on_empty_env_reply(monkeypatch, tmp_path, capsys):
@@ -3051,6 +3091,34 @@ class _MalformedFinalReplyEnv(_PerExampleCapDeadEnv):
         return [reply]
 
 
+class _ImageFinalReplyEnv(_PerExampleCapDeadEnv):
+    def __init__(self):
+        super().__init__()
+        self.reply_calls = 0
+        self.state = None
+
+    def new_rollout_state(self, example):
+        self.state = super().new_rollout_state(example)
+        return self.state
+
+    def env_reply(self, messages, state):
+        self.reply_calls += 1
+        state["turn"] += 1
+        content = (
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/final.png"},
+                }
+            ]
+            if state["turn"] >= 3
+            else "keep going"
+        )
+        reply = {"role": "user", "content": content}
+        messages.append(reply)
+        return [reply]
+
+
 def test_env_test_validates_the_deferred_final_env_reply(monkeypatch, tmp_path, capsys):
     """The last `env_reply` of a capped episode must be checked like every other one.
 
@@ -3066,6 +3134,20 @@ def test_env_test_validates_the_deferred_final_env_reply(monkeypatch, tmp_path, 
     captured = capsys.readouterr()
     assert "env_reply is not well-formed" in captured.err
     assert "overall: FAIL" in captured.err
+
+
+def test_env_test_validates_images_added_by_the_deferred_final_reply(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    env = _ImageFinalReplyEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "remote image URLs are not supported" in captured.err
+    assert "overall: FAIL" in captured.err
+    assert env.reply_calls == 3
+    assert env.scored_state is None
+    assert env.state["messages"][-1]["content"][0]["type"] == "image_url"
 
 
 class _NoFinalReplyEnv(_PerExampleCapDeadEnv):
