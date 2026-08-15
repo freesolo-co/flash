@@ -343,10 +343,10 @@ def _select_candidate(
     Escapes a congested/sick provider cross-provider before walking classes within it, then takes
     the allocator's own ranking.
 
-    That third key is the LIST POSITION, not a re-priced one. ``allocate()`` ranks candidates on
-    the dollars one optimizer STEP costs -- rate x how long that hardware takes -- so a faster card
-    wins whenever it finishes soon enough to pay for itself. Re-sorting here on total $/hr answered
-    a different question and silently overrode it: for Qwen3.5-0.8B OPD the allocator ranks the
+    That third key is the list position, not a re-priced one. ``allocate()`` first applies any
+    authored provider preference, then ranks within one preference rank on the dollars one optimizer
+    step costs, so preserving the list also preserves both policies. Re-sorting here on total $/hr
+    answered a different question and silently overrode it: for Qwen3.5-0.8B OPD the allocator ranks the
     RTX 5090 cheapest per step, while hourly price picks the slower RTX 4090, so the FIRST paid
     attempt ignored the choice the cost model had just made and ran slower for more money.
     Preserving the incoming order keeps one owner of the cost policy. ``min`` returns the FIRST
