@@ -29,6 +29,7 @@ build_sft_overrides = _sft_train.build_sft_overrides
 # taken from the parent like every other name here, so the runner and `sft_train`'s own
 # `sft_data_loading`/`sft_configuring` wraps use one object rather than two imports of it.
 liveness_heartbeat = _sft_train.liveness_heartbeat
+render_flash_qla_shim = _sft_train.render_flash_qla_shim
 render_gdn_varlen_shim = _sft_train.render_gdn_varlen_shim
 render_shim_marker_prologue = _sft_train.render_shim_marker_prologue
 render_wandb_link_shim = _sft_train.render_wandb_link_shim
@@ -548,6 +549,10 @@ def _write_sft_child_shims(
     required_fragments = [("sft-core", core_source)]
     if gdn_reset_arch is not None:
         required_fragments.append(("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
+        # same gate as the boundary resets (this is a gdn hybrid), and the fragment itself
+        # no-ops off sm90. measured 1.055x end-to-end on an H200; on sm100 flashqla computes
+        # wrong gradients, so render_flash_qla_shim binds nothing there.
+        required_fragments.append(("flashqla-gdn", render_flash_qla_shim(gdn_reset_arch)))
     shim_markers = shim_marker_file(shim_dir)
     # the workdir is wiped per attempt (_resolve_sft_options), so no stale marker can survive here.
     shim_source = render_shim_marker_prologue(shim_markers) + "".join(
