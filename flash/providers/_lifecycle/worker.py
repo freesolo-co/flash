@@ -65,7 +65,10 @@ WORKER_DEPS = [
     # backend on sm90 before model import (fla #640: chunk_bwd miscompute with Triton>=3.4 on Hopper)
     # and OPTS OUT of tilelang on sm100 (B200) where tilelang's chunk_bwd_dqkwg miscomputes grads
     # (worker _force_fla_triton_gdn_on_sm100; upstream default-gates tilelang to Hopper since fla #975).
-    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
+    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@9c8e42e762fce087c27b673af4922795d9edb85e",
+    # flashqla GDN backend (fla 0.5.2 dispatch); bound on sm90 only by the child shim, since on
+    # sm100 it miscomputes gradients the same way tilelang's backward does.
+    "flash-qla==0.1.2",
     # tilelang version-pinned with the worker image and flash/engine/worker/perf/__init__.py runtime reinstall.
     "tilelang==0.1.11",
     "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts

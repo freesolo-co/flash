@@ -163,11 +163,21 @@ def deployments_table(rows: list[dict]) -> str:
                     _GRAY,
                 ),
                 (str(deployment.get("openai_model") or run_id), _GREEN),
+                (str(deployment.get("openai_base_url") or "-"), _TEAL),
                 (detail, _GRAY),
             ]
         )
     table = _table(
-        ["RUN ID", "STEP", "REVISION", "STATE", "VERIFIED AT", "OPENAI MODEL", "DETAIL"],
+        [
+            "RUN ID",
+            "STEP",
+            "REVISION",
+            "STATE",
+            "VERIFIED AT",
+            "OPENAI MODEL",
+            "OPENAI BASE URL",
+            "DETAIL",
+        ],
         body,
     )
     return _safe(f"{header('deployments', f'{len(rows)} active')}\n{table}")

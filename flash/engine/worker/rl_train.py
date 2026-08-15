@@ -300,6 +300,9 @@ def _configure_rl_child(
         project_name=project_name,
         experiment_name=experiment_name,
         gpu_type=(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else ""),
+        # the authored knobs the allocator sized this run's shape from, so the zero-2 gate the
+        # worker applies is the same one the allocator admitted the shape under.
+        train_spec=(_w.JOB_SPEC.train if _w.JOB_SPEC else None),
         # the ranks verl will actually run, not the cards rented: with ulysses pinned off every rank
         # is a dp rank, and verl chunks the step's sequences across them with an exact-divisibility
         # assert. a wider launch than the sequences divide aborts at step 0 on a paid box. resolved

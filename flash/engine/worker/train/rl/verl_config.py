@@ -25,7 +25,10 @@ from flash.engine.worker.backend_common import (
 )
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.sft_train import _hydra_val, _verl_image_message_content
-from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
+from flash.engine.worker.verl.parallelism import (
+    ULYSSES_SEQUENCE_PARALLEL_SIZE,
+    resolve_reshard_after_forward,
+)
 
 # the data_source every flash-generated row carries. verl routes scoring by this key, so it must
 # match what the reward shim registers under.
@@ -287,6 +290,13 @@ def _actor_overrides(cfg: dict) -> list[str]:
         # shard by DATA, not by sequence -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why. ref inherits
         # this via dp_ref.yaml, and use_remove_padding is required either way.
         f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={ULYSSES_SEQUENCE_PARALLEL_SIZE}",
+        # zero-2 vs zero-3. NOT decided here: `zero2_enabled` is the allocator's own gate, and the
+        # value is resolved once in `build_verl_cfg` so the shape this run was admitted on is the
+        # shape it trains under. the ref policy needs no matching key -- lora makes verl reuse the
+        # actor module with the adapter disabled (`ref_in_actor`), so there is no second copy.
+        # absent -> True, verl's own default: a cfg built without the gate must render the
+        # lower-memory strategy, never fall into zero-2 by omission.
+        f"actor_rollout_ref.actor.fsdp_config.reshard_after_forward={_hydra_val(bool(cfg.get('reshard_after_forward', True)))}",
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the opd driver.
         *trainer_dtype_overrides(),
     ]
@@ -565,6 +575,9 @@ def _build_verl_training_cfg(
     experiment_name: str,
     gpu_type: str = "",
     n_gpus: int = 1,
+    # the authored [train] table, used only to size the zero-2 gate against the same knobs the
+    # allocator sized the shape with. absent -> the gate falls closed to verl's zero-3 default.
+    train_spec=None,
     # NOT named fused_ce_backend: that is the imported resolver, and a parameter of the same name
     # would shadow it inside this function so a later `fused_ce_backend(caps)` call silently
     # returned a string. required, since every caller resolves it from the capability probe.
@@ -618,6 +631,19 @@ def _build_verl_training_cfg(
             n_gpus=n_gpus,
             fp8_kv=fp8_kv,
             sleep_unsupported=sleep_unsupported,
+        ),
+        # `train` is the AUTHORED spec table, never `inp`: the sizer reads `max_context_tokens` /
+        # `max_completion_tokens`, which `inp` carries under resolved names (`engine_len`), so
+        # passing `inp` would size the gate against recipe defaults and answer a different question
+        # than the allocator asked.
+        "reshard_after_forward": resolve_reshard_after_forward(
+            model_id=inp["model_id"],
+            algorithm="grpo",
+            gpu_type=gpu_type,
+            n_gpus=n_gpus,
+            train=train_spec,
+            thinking=thinking,
+            model_revision=str(inp.get("model_revision") or ""),
         ),
         "n_gpus": n_gpus,
         "loggers": loggers,
