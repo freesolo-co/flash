@@ -65,7 +65,13 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     than sending the author to corrupt a working target. It stays silent when the grader was proven
     to separate - a centered scale paying gold 0.0 and junk -1.0, or a per-turn vector that
     separates while the scalar is only a placeholder - since both have a real gradient and calling
-    them unmeasured would be false. Neither probe behind that judgement is free: the junk probe
+    them unmeasured would be false. A per-turn vector only counts as separation when the paid
+    worker would actually train from it: `_validated_reward` discards a vector holding a non-number,
+    a non-finite value, or a count that disagrees with the assistant turns the episode emitted, and
+    falls back to the flat episode reward. Reading such a vector as separation here was therefore
+    backwards - it suppressed both the warning and the blocking gate on precisely the runs that do
+    train on all-zero rewards, so two rewards for a three-turn episode bought a silent `PASS`. The
+    same three checks now apply before a vector is believed. Neither probe behind that judgement is free: the junk probe
     drives a whole extra episode through user code, and the per-turn probe runs the environment's
     own `score_episodes`, which may be the same paid judge the episodes just used. Both are spent
     only where their answer can change what the command prints _and_ the algorithm trains from the
@@ -92,8 +98,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     that covered every turn and still never finished leaves the environment as the sole
     explanation. A gold trajectory _longer_ than the cap is separated out before either reading,
     since its cause is fully determined rather than guessed: only a prefix could be replayed, so
-    the environment's termination logic never ran, and the report names both numbers and the exact
-    remedy (raise the cap, or shorten the row) instead of sending the author to audit it. Otherwise
+    the remaining gold turns were never scored, and the report names both numbers and the exact
+    remedy (raise the cap, or shorten the row) instead of sending the author to audit it. That
+    mismatch is reported independently of whether the episode finished, because the two are not the
+    same question: an environment that sets `done` while applying the capped prefix ends the episode
+    tidily, so the not-done signal never fires, and the dropped gold turns went unmentioned on an
+    otherwise clean `overall: PASS`. Otherwise
     the wording stops short of a verdict, because `rollout_done`
     returns True at `turn >= cap` regardless of `state["done"]`, so a fixed-length episode that ends
     purely by using its whole budget is a supported shape that never sets `done` and is
