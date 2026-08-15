@@ -1073,9 +1073,11 @@ def test_ordered_gpu_pin_walks_to_its_fallback_when_the_first_class_is_dry(orch,
 
 
 def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch, monkeypatch):
-    """The stop must fire for a MULTI-class pin, which is the case this feature creates.
+    """The stop must fire for a multi-class pin when its provider market is also fixed.
 
-    The trap is that the picker never walks back to a dearer tried class: `_select_candidate`
+    Without a provider pin each allocation can discover the class on another provider, so #1195
+    deliberately preserves the full retry budget. With both boundaries fixed, the trap is that the
+    picker never walks back to a dearer tried class: `_select_candidate`
     prefers an untried shape once, then falls back to cheapest-per-step, so a dry ordered pin of
     PCIe ($1.19) and SXM ($1.89) walks PCIe, SXM, PCIe, PCIe, PCIe... Asking "have ALL classes
     refused twice?" therefore never becomes true -- SXM is stranded at one refusal forever -- and
@@ -1107,6 +1109,7 @@ def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch,
         run_id="flash-ordered-pin-stop",
         type="A100 PCIe",
         type_fallbacks=("A100 SXM",),
+        provider="runpod",
         max_retries=5,
     )
     _seed_status(orch, spec)
