@@ -80,6 +80,9 @@ _FILTER_NAME = b"".join(rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for le
 # the decompression error was skipped as "not really a stream", and the key inside published. The
 # encryption-key pattern already treats a comment as a separator; this is the same rule.
 _PDF_SEPARATOR = rb"(?:\s|%[^\r\n]*(?:\r\n|\r|\n))*"
+# An indirect reference needs at least one separator between each token. The lookahead supplies that
+# requirement while `_PDF_SEPARATOR` consumes comments as well as whitespace.
+_PDF_REQUIRED_SEPARATOR = rb"(?=[\s%])" + _PDF_SEPARATOR
 # How far back `_dictionary_start` will look for that opening bracket. A document is untrusted
 # input: without a bound, one that never opens a dictionary would be walked from every stream in it
 # back to byte zero. 64 KiB is far beyond any real object dictionary and still linear per stream.
@@ -135,8 +138,29 @@ _ENCRYPT_NAME = b"".join(rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for l
 _PDF_ENCRYPT = re.compile(rb"/%s(?:[\s/<>\[\]()%%]|$)" % _ENCRYPT_NAME)
 
 # A `/Filter` whose value is an indirect reference (`2 0 R`) rather than a name or an array of
-# names. Resolving it means following the xref table into another object.
-_PDF_INDIRECT_FILTER = re.compile(rb"/%s\s+\d+\s+\d+\s+R\b" % _FILTER_NAME)
+# names. Resolving it means following the xref table into another object. PDF comments are token
+# separators too: `%comment\n2 0 R` names the same reference as the spaced form, and the comment form
+# previously left the compressed credential unassociated with any filter and published it.
+_PDF_INDIRECT_FILTER = re.compile(
+    rb"/%s%s\d+%s\d+%sR\b"
+    % (_FILTER_NAME, _PDF_REQUIRED_SEPARATOR, _PDF_REQUIRED_SEPARATOR, _PDF_REQUIRED_SEPARATOR)
+)
+
+# `/DecodeParms` may also point at an indirect object. The predictor and its dimensions then sit
+# outside the local stream dictionary, so inflating and scanning the still-predicted bytes is not a
+# complete read. The key is escape-tolerant because `/#44ecodeParms` is the same PDF name.
+_DECODE_PARMS_NAME = b"".join(
+    rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for letter in b"DecodeParms"
+)
+_PDF_INDIRECT_DECODE_PARMS = re.compile(
+    rb"/%s%s\d+%s\d+%sR\b"
+    % (
+        _DECODE_PARMS_NAME,
+        _PDF_REQUIRED_SEPARATOR,
+        _PDF_REQUIRED_SEPARATOR,
+        _PDF_REQUIRED_SEPARATOR,
+    )
+)
 
 # A predictor declared in `/DecodeParms`. Predictor 1 is the identity and needs no undoing; any
 # higher value means the inflated bytes are differences rather than content.
@@ -357,6 +381,11 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     # never associated with flate and its credential published. Resolving object references means
     # parsing the xref table; refusing is the bounded answer, and these are rare in practice.
     if _PDF_INDIRECT_FILTER.search(data):
+        raise _UnreadableFilterChain
+    # Indirect decode parameters hide whether a predictor must be undone. A predictor-encoded key
+    # inflated into differences containing no literal credential, so unresolved parameters are
+    # unreadable rather than evidence that the stream is clean.
+    if _PDF_INDIRECT_DECODE_PARMS.search(data):
         raise _UnreadableFilterChain
     # A stream whose filters this cannot undo is refused BEFORE the flate walk, so a document
     # mixing one readable stream with one unreadable one does not report the readable verdict and

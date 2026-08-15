@@ -8253,3 +8253,274 @@ def test_prose_naming_the_pgp_armor_is_not_ciphertext(tmp_path):
     )
     with pytest.raises(_Unscannable, match="encrypted OpenPGP"):
         credential_in_file(real)
+
+
+def _ar_archive(members: list[tuple[str, bytes]]) -> bytes:
+    """An ar archive of `members`, each header 60 bytes and each body padded to an even offset."""
+    out = bytearray(b"!<arch>\n")
+    for name, body in members:
+        out += name.ljust(16).encode()[:16]
+        out += b"0".ljust(12) + b"0".ljust(6) + b"0".ljust(6) + b"100644".ljust(8)
+        out += str(len(body)).ljust(10).encode()[:10] + b"`\n"
+        out += body
+        if len(body) % 2:
+            out += b"\n"
+    return bytes(out)
+
+
+def test_an_ar_long_name_is_resolved_before_it_is_scanned(tmp_path):
+    """GNU ar stores a long member name in the `//` table and writes `/<offset>` in the header.
+
+    Only the placeholder was scanned, so the name that actually leaks through the archive's listing
+    was never read: a member whose resolved name is base64 of an OpenSSL-encrypted file returned
+    clean here while that same string handed to the name scanner refused it.
+    """
+    import base64
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    encrypted = b"Salted__12345678" + b"ciphertextciphertextciphertext"
+    long_name = base64.b64encode(encrypted).decode()
+
+    # the control: this name on its own is refused, so the archive carrying it must be too
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(long_name)
+
+    archive = tmp_path / "long.a"
+    archive.write_bytes(
+        _ar_archive([("//", (long_name + "/\n").encode()), ("/0", b"harmless contents here")])
+    )
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(archive)
+
+
+def test_a_clean_ar_walk_settles_a_deferred_refusal(tmp_path):
+    """A completed ar walk has enumerated the whole file exactly as a zip or tar walk has.
+
+    Only those two counted as settling the question, so an ordinary two-member ar -- a Debian
+    package is exactly this shape -- kept a deferred refusal from a stream handler that had read
+    one member and could say nothing about the rest, and a harmless archive failed to publish.
+    """
+    import gzip
+
+    from flash.env_secrets import credential_in_file
+
+    archive = tmp_path / "clean.a"
+    archive.write_bytes(
+        _ar_archive(
+            [
+                ("debian-binary", b"2.0\n"),
+                ("blob.gz", gzip.compress(b"nothing sensitive in here at all, just prose")),
+            ]
+        )
+    )
+    assert credential_in_file(archive) is None
+
+
+def test_an_ar_inside_a_zip_is_still_expanded(tmp_path):
+    """The container predicate never learned ar magic, so a nested one was final content.
+
+    A top-level ar holding a zlib-compressed key is reported, but the same archive stored as a zip
+    member returned clean -- compression keeps the key out of the raw byte pass, and nothing
+    reopened the member to walk it.
+    """
+    import zipfile
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    inner = _ar_archive([("payload.z", zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode()))])
+
+    control = tmp_path / "top.a"
+    control.write_bytes(inner)
+    assert credential_in_file(control) == "a Freesolo API key"  # the control the pair must match
+
+    nested = tmp_path / "outer.zip"
+    with zipfile.ZipFile(nested, "w") as archive:
+        archive.writestr("nested.a", inner)
+    assert credential_in_file(nested) == "a Freesolo API key"
+
+
+def test_exactly_the_member_limit_is_not_too_many_members(tmp_path):
+    """Exhausting the member range entered the `else` branch unconditionally.
+
+    An archive holding exactly the configured count was reported as having too many members, while
+    a zip or tar of the same size is allowed -- a false refusal that blocks an honest publish.
+    """
+    from flash.env_archive import credential_in_ar
+    from flash.env_secrets import _Unscannable
+
+    def _named(_name: str) -> str | None:
+        return None
+
+    def _scan(_handle, _deadline, _depth) -> str | None:
+        return None
+
+    at_limit = _ar_archive([("only.txt", b"nothing to see here at all")])
+    assert (
+        credential_in_ar(
+            at_limit,
+            deadline=1e18,
+            depth=0,
+            scan=_scan,
+            refusal=_Unscannable,
+            named=_named,
+            member_limit=1,
+        )
+        is None
+    )
+
+    # one MORE than the limit is still refused, so the bound itself still holds
+    over_limit = _ar_archive([("one.txt", b"aa"), ("two.txt", b"bb")])
+    with pytest.raises(_Unscannable, match="too many members"):
+        credential_in_ar(
+            over_limit,
+            deadline=1e18,
+            depth=0,
+            scan=_scan,
+            refusal=_Unscannable,
+            named=_named,
+            member_limit=1,
+        )
+
+
+def test_bytes_after_the_zip_end_record_are_still_scanned(tmp_path):
+    """`is_zipfile` stays true with arbitrary bytes appended after the end-of-central-directory.
+
+    The prefix before the first member is walked, but the suffix after the end record was not: a
+    zlib record carrying a key, appended to an ordinary zip, published intact while that same
+    record standing alone was reported.
+    """
+    import zipfile
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    trailing = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+
+    control = tmp_path / "alone.z"
+    control.write_bytes(trailing)
+    assert credential_in_file(control) == "a Freesolo API key"  # the control the pair must match
+
+    plain = io.BytesIO()
+    with zipfile.ZipFile(plain, "w") as archive:
+        archive.writestr("readme.txt", b"nothing here\n")
+    ordinary = plain.getvalue()
+
+    clean = tmp_path / "plain.zip"
+    clean.write_bytes(ordinary)
+    assert credential_in_file(clean) is None  # an ordinary zip has no suffix and is unaffected
+
+    appended = tmp_path / "appended.zip"
+    appended.write_bytes(ordinary + trailing)
+    assert zipfile.is_zipfile(appended)  # still a valid zip to every reader
+    assert credential_in_file(appended) == "a Freesolo API key"
+
+
+def test_a_tar_link_target_is_scanned_like_a_member_name(tmp_path):
+    """A symlink's TARGET is in the archive's listing exactly as its own name is.
+
+    Only `info.name` was read, so a link whose target is base64 of an OpenSSL-encrypted file was
+    passed over -- the entry is not a file, so the type filter skipped it before anything looked at
+    where it pointed, while the same string handed to the name scanner refused it.
+    """
+    import base64
+    import tarfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    encrypted = b"Salted__12345678" + b"ciphertextciphertextciphertext"
+    target = base64.b64encode(encrypted).decode()
+
+    # the control: this target on its own is refused, so the tar carrying it must be too
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(target)
+
+    archive = tmp_path / "linked.tar"
+    with tarfile.open(archive, "w") as tar:
+        info = tarfile.TarInfo("safe-link")
+        info.type = tarfile.SYMTYPE
+        info.linkname = target
+        tar.addfile(info)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(archive)
+
+
+def _pdf_with_stream(stream: bytes, entries: bytes, extra: bytes = b"") -> bytes:
+    """A one-object PDF whose stream declares `entries` in its dictionary."""
+    body = b"%PDF-1.4\n1 0 obj\n<< /Length " + str(len(stream)).encode() + entries
+    body += b" >>\nstream\n" + stream + b"\nendstream\nendobj\n" + extra
+    return body + b"trailer\n<< /Root 1 0 R >>\n%%EOF\n"
+
+
+def test_a_comment_before_an_indirect_pdf_filter_is_still_a_reference(tmp_path):
+    """PDF counts a `%` comment as whitespace, so it may sit between a key and its value.
+
+    The indirect-filter check accepted only whitespace before the reference, so `/Filter%c\\n2 0 R`
+    named nothing: the stream was inflated and its raw bytes scanned while a conforming reader
+    resolves object 2 to a filter this cannot undo. The spaced spelling was refused correctly.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    stream = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+    resolved = b"2 0 obj\n/FlateDecode\nendobj\n"
+
+    # the control: the same reference written with a space is refused
+    spaced = tmp_path / "spaced.pdf"
+    spaced.write_bytes(_pdf_with_stream(stream, b" /Filter 2 0 R", resolved))
+    with pytest.raises(_Unscannable, match="filter this cannot undo"):
+        credential_in_file(spaced)
+
+    commented = tmp_path / "commented.pdf"
+    commented.write_bytes(_pdf_with_stream(stream, b" /Filter%comment\n2 0 R", resolved))
+    with pytest.raises(_Unscannable, match="filter this cannot undo"):
+        credential_in_file(commented)
+
+
+def test_an_indirect_pdf_decode_parameter_is_refused(tmp_path):
+    """`/DecodeParms 2 0 R` puts the predictor in another object, out of the dictionary slice.
+
+    The predictor check reads the local dictionary, so an indirect reference declared nothing and
+    the inflated bytes were scanned as content while they were still PNG row differences -- a
+    conforming decode reconstructs the key, which is why the direct spelling is refused.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    columns = 8
+    raw = f"fslo_{_FAKE_KEY_BODY}".encode()
+    rows = [raw[at : at + columns].ljust(columns, b"\0") for at in range(0, len(raw), columns)]
+    encoded = bytearray()
+    previous = bytes(columns)
+    for row in rows:
+        encoded += b"\x02"  # the PNG `Up` predictor tag
+        encoded += bytes((row[at] - previous[at]) % 256 for at in range(columns))
+        previous = row
+    stream = zlib.compress(bytes(encoded))
+    assert raw not in zlib.decompress(stream)  # inflation alone does not reveal it
+
+    # the control: the same parameters written inline are refused
+    direct = tmp_path / "direct.pdf"
+    direct.write_bytes(
+        _pdf_with_stream(
+            stream, b" /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 8 >>"
+        )
+    )
+    with pytest.raises(_Unscannable, match="filter this cannot undo"):
+        credential_in_file(direct)
+
+    # the referenced object sits beyond the slice the predictor check reads
+    filler = b"%" + b"x" * 900 + b"\n"
+    indirect = tmp_path / "indirect.pdf"
+    indirect.write_bytes(
+        _pdf_with_stream(
+            stream,
+            b" /Filter /FlateDecode /DecodeParms 2 0 R",
+            filler + b"2 0 obj\n<< /Predictor 12 /Columns 8 >>\nendobj\n",
+        )
+    )
+    with pytest.raises(_Unscannable, match="filter this cannot undo"):
+        credential_in_file(indirect)

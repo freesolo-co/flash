@@ -623,6 +623,38 @@ def _read_at(source: Path | bytes, start: int, size: int) -> bytes | None:
     return source[start : start + size] if isinstance(source, bytes) else None
 
 
+def _zip_end_record(source: Path | bytes) -> tuple[bytes, int, int] | None:
+    """The tail, record offset in that tail, and tail offset for a zip end record."""
+    total = len(source) if isinstance(source, bytes) else _file_size(source)
+    if total is None:
+        return None
+    tail_at = max(0, total - _ZIP_TAIL_BYTES)
+    tail = (
+        source[tail_at:]
+        if isinstance(source, bytes)
+        else _read_at(source, tail_at, total - tail_at)
+    )
+    if tail is None:
+        return None
+    offset = tail.rfind(_ZIP_END_RECORD)
+    if offset < 0 or len(tail) < offset + 22:
+        return None
+    return tail, offset, tail_at
+
+
+def _zip_end_offset(source: Path | bytes) -> int | None:
+    """The first byte after the zip end record and its declared comment, or None."""
+    found = _zip_end_record(source)
+    if found is None:
+        return None
+    tail, offset, tail_at = found
+    comment = int.from_bytes(tail[offset + 20 : offset + 22], "little")
+    end = tail_at + offset + 22 + comment
+    # A suffix after the declared comment is outside the archive. Before this boundary was exposed,
+    # a zlib-compressed key appended after an otherwise valid zip was never handed back to the scan.
+    return end if end <= tail_at + len(tail) else None
+
+
 def _zip_directory_entries(
     source: Path | bytes, tail: bytes, offset: int, limit: int
 ) -> int | None:
@@ -727,17 +759,10 @@ def _zip_member_count(source: Path | bytes, limit: int = _MAX_ARCHIVE_MEMBERS) -
     Reporting 0 for an unreadable record is not a bypass: the constructor below then rejects the
     archive, and the per-member loop still enforces the same bound.
     """
-    tail = source[-_ZIP_TAIL_BYTES:] if isinstance(source, bytes) else b""
-    if isinstance(source, Path):
-        try:
-            with source.open("rb") as handle:
-                handle.seek(max(0, source.stat().st_size - _ZIP_TAIL_BYTES))
-                tail = handle.read()
-        except OSError:
-            return 0
-    offset = tail.rfind(_ZIP_END_RECORD)
-    if offset < 0 or len(tail) < offset + 12:
+    found = _zip_end_record(source)
+    if found is None:
         return 0
+    tail, offset, _tail_at = found
     total = int.from_bytes(tail[offset + 10 : offset + 12], "little")
     # The claimed count is not trusted on its own. `ZipFile` walks the central directory by its
     # SIZE (`while total < size_cd`), not by this count, so patching both count fields of a real

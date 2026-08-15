@@ -504,9 +504,10 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
     # rule, that handler defers a dictionary-stream refusal, the tar walk then enumerates the
     # archive successfully, and the file was refused anyway.
     #
-    # Only the two archive handlers count as settling it. Their success is a statement about the
-    # WHOLE file -- every member listed and read -- whereas a stream handler returning None has
-    # read one payload and says nothing about bytes another handler could not reach.
+    # Only the archive handlers count as settling it. Their success is a statement about the WHOLE
+    # file -- every member listed and read -- whereas a stream handler returning None has read one
+    # payload and says nothing about bytes another handler could not reach. Ar must count too: a
+    # clean Debian archive was fully walked, then refused on a false gzip guess over its outer bytes.
     refusal: _Unscannable | None = None
     settled = False
     for handler in (
@@ -521,7 +522,11 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
         try:
             if kind := handler(source, deadline=deadline, depth=depth):
                 return kind
-            settled = settled or handler in (_credential_in_zip, _credential_in_tar)
+            settled = settled or handler in (
+                _credential_in_zip,
+                _credential_in_tar,
+                _credential_in_ar,
+            )
         except _Unscannable as unscannable:
             refusal = refusal or unscannable
         except _UNREADABLE_ARCHIVE:
@@ -762,6 +767,15 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
 
 def _credential_in_ar(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
     """The kind of credential in any readable member of an ar archive, or None."""
+    if isinstance(source, bytes):
+        head = source[:8]
+    else:
+        with source.open("rb") as handle:
+            head = handle.read(8)
+    # Settlement means the handler actually walked an ar. Without this decline, every non-ar file
+    # returned None here and incorrectly suppressed a later PDF or tar refusal as already verified.
+    if head != b"!<arch>\n":
+        raise zipfile.BadZipFile("not an ar archive")
     return credential_in_ar(
         source,
         deadline=deadline,

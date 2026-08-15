@@ -24,7 +24,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import IO
 
-from flash.env_formats import _read_at, _zip_member_count
+from flash.env_formats import _read_at, _zip_end_offset, _zip_member_count
 
 # What "this member cannot be read" looks like, across both formats and every codec underneath them.
 #
@@ -148,6 +148,8 @@ def credential_in_zip(
         # by the lowest local-header offset, so this reads what the archive itself says precedes
         # its first member, and an ordinary zip has no prefix at all and pays nothing.
         prefix = min((info.header_offset for info in archive.infolist()), default=0)
+        suffix = _zip_end_offset(source)
+        source_size = len(source) if isinstance(source, bytes) else source.stat().st_size
     # A refusal the MEMBERS produced is reported first. The prefix is bytes this archive says it
     # does not own, so a vaguer complaint about them must not displace the specific answer the walk
     # already has -- an encrypted member inside a zip that itself sits inside a tar has a non-zero
@@ -165,6 +167,21 @@ def credential_in_zip(
                 # Only the ordinary unreadable cases are swallowed. A refusal the scanner itself
                 # raises is not caught here at all: it carries its own specific message and
                 # propagates, which is what a prefix holding real ciphertext should do.
+                raise refusal("contains an archive member this check cannot read") from None
+    # Bytes AFTER the declared end record are outside the zip just as the prefix is. `ZipFile`
+    # accepts that suffix but never enumerates it, so a zlib-compressed key appended after a valid
+    # archive returned clean while the same record standing alone was detected.
+    if suffix is not None and suffix < source_size:
+        tail = (
+            source[suffix:]
+            if isinstance(source, bytes)
+            else _read_at(source, suffix, source_size - suffix)
+        )
+        if tail:
+            try:
+                if kind := scan(io.BytesIO(tail), deadline, depth):
+                    return kind
+            except _UNREADABLE_MEMBER:
                 raise refusal("contains an archive member this check cannot read") from None
     return None
 
@@ -213,6 +230,11 @@ def credential_in_tar(
                     # OpenSSL-encrypted file returned clean here while the name scanner refused that
                     # same string on its own.
                     if kind := named(info.name):
+                        return kind
+                    # A symlink or hardlink publishes its TARGET in the listing too. Filtering
+                    # non-files first left a base64-encoded encrypted target clean even though the
+                    # same target passed directly to the name scanner was refused.
+                    if info.linkname and (kind := named(info.linkname)):
                         return kind
                     if not info.isfile():
                         continue
@@ -289,6 +311,7 @@ def credential_in_ar(
         if not data.startswith(_AR_MAGIC):
             return None
     unreadable = ""
+    gnu_names: bytes | None = None
     at = len(_AR_MAGIC)
     for _ in range(member_limit):
         if at + _AR_HEADER > len(data):
@@ -313,22 +336,58 @@ def credential_in_ar(
             break
         if time.monotonic() > deadline:
             raise refusal("takes too long to decompress")
+        raw_name = header[_AR_NAME_FIELD].decode("ascii", "replace").strip()
         # The NAME leaks through the archive's listing exactly as a tar's does, and `ar` pads its
-        # names with spaces and ends them with `/`.
-        if kind := named(header[_AR_NAME_FIELD].decode("ascii", "replace").strip().rstrip("/")):
+        # short names with spaces and ends them with `/`. The placeholder is checked before resolving
+        # long-name schemes so neither representation becomes a gap.
+        if kind := named(raw_name.rstrip("/")):
             return kind
         body = data[at + _AR_HEADER : at + _AR_HEADER + size]
         if len(body) < size:
             unreadable = unreadable or "an archive member this check cannot read"
             break
+        payload = body
+        resolved_name: str | None = None
+        if raw_name == "//":
+            gnu_names = body
+        elif raw_name.startswith("#1/"):
+            # BSD ar stores the real name at the front of the member body. Scanning only `#1/<len>`
+            # left an encoded credential in that resolved name unpublished by the name check.
+            try:
+                name_size = int(raw_name[3:])
+            except ValueError:
+                name_size = -1
+            if name_size < 0 or name_size > len(body):
+                unreadable = unreadable or "an archive member this check cannot read"
+            else:
+                resolved_name = body[:name_size].decode("ascii", "replace").rstrip("\0")
+                payload = body[name_size:]
+        elif raw_name.startswith("/") and raw_name[1:].isdigit():
+            # GNU ar stores names in the `//` member and writes `/<offset>` in each real header. The
+            # placeholder contains no credential, while the resolved newline-terminated name can.
+            offset = int(raw_name[1:])
+            if gnu_names is None or offset >= len(gnu_names):
+                unreadable = unreadable or "an archive member this check cannot read"
+            else:
+                end = gnu_names.find(b"\n", offset)
+                if end < 0:
+                    unreadable = unreadable or "an archive member this check cannot read"
+                else:
+                    resolved_name = gnu_names[offset:end].rstrip(b"/").decode("ascii", "replace")
+        if resolved_name and (kind := named(resolved_name)):
+            return kind
         try:
-            if kind := scan(io.BytesIO(body), deadline, depth):
+            if kind := scan(io.BytesIO(payload), deadline, depth):
                 return kind
         except _UNREADABLE_MEMBER:
             unreadable = unreadable or "an archive member this check cannot read"
         at += _AR_HEADER + size + (size % 2)
     else:
-        raise refusal("contains an archive with too many members to inspect")
+        # Reaching the bound is allowed when that member ended the archive. Only bytes still left
+        # prove there is a member beyond the configured limit; the old unconditional `else` refused
+        # a clean one-member archive when its limit was exactly one.
+        if at != len(data):
+            raise refusal("contains an archive with too many members to inspect")
     if unreadable:
         raise refusal(f"contains {unreadable}")
     return None

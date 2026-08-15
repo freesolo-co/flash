@@ -119,6 +119,9 @@ def _looks_like_container(data: bytes) -> bool:
     return (
         _looks_compressed(data[:6])
         or _looks_like_tar(data)
+        # ar has no nested predicate elsewhere: a top-level archive was walked by its handler, while
+        # the same bytes inside a zip were treated as final content and hid a compressed key member.
+        or data.startswith(b"!<arch>\n")
         or zipfile.is_zipfile(io.BytesIO(data))
         # A self-extracting SHELL archive, whose stub is a script rather than an executable: none of
         # the tests above sees past it, since each asks what the file BEGINS with and it begins with
