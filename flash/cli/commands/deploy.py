@@ -342,13 +342,18 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
     if served_step == requested_step:
         return None
     reach_displaced = ""
+    # the record being displaced carries the one identifier that survives the alias move, so name
+    # it whenever it is there. `step-N` is not a substitute: it is rejected outright on a plane
+    # without `chat_step_selector_v1`, and after this deploy the listing shows only the NEW record
+    # -- `public_deployment` strips `previous_deployment` (flash/serve/urls.py) -- so a revision
+    # not printed here is not recoverable from anywhere afterwards.
+    revision = str(current.get("adapter_revision") or "").strip()
     if served_step is None:
         # the displaced checkpoint is the FINAL adapter, and `_parse_chat_target` accepts only a
         # bare run id, `RUN/step-N`, or a full immutable revision -- there is no `/final`
         # selector. once the alias moves, `step-N` addresses the incoming checkpoint and the bare
         # id is the thing that just changed, so the generic advice cannot reach the final adapter
         # at all. its immutable revision can, and the record being displaced carries one.
-        revision = str(current.get("adapter_revision") or "").strip()
         reach_displaced = (
             f" the displaced final adapter has no `/final` selector; reach it by its immutable "
             f"revision `{revision}`."
@@ -365,6 +370,12 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
                 "undeploy and redeploy it to serve it again."
             )
         )
+    elif revision:
+        # a numbered checkpoint keeps its `step-N` selector, but only on a plane that advertises
+        # `chat_step_selector_v1`; where it does not, the qualified advice above leaves the user
+        # holding no identifier at all. this is that identifier, and this is the last moment it
+        # can be printed.
+        reach_displaced = f" the displaced checkpoint's immutable revision is `{revision}`."
     return (
         f"{base_run_id} currently serves {_served_step_label(served_step)}; deploying "
         f"{_served_step_label(requested_step)} moves that shared model id onto the new "

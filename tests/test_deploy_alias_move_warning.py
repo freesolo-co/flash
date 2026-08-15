@@ -159,6 +159,29 @@ def test_a_displaced_checkpoint_needs_no_revision_hint() -> None:
     assert "/final" not in warning
 
 
+def test_a_displaced_checkpoint_names_its_revision_when_the_record_carries_one() -> None:
+    """`step-N` is not enough on its own: a plane without `chat_step_selector_v1` rejects it.
+
+    The qualified advice tells such a user to reach the checkpoint by immutable revision, which is
+    useless without the revision itself. It is on this record, and this is the last moment it can
+    be printed -- after the deploy, the listing carries only the new record, because
+    `public_deployment` strips `previous_deployment`.
+    """
+    current = {
+        "run_id": "flash-1",
+        "state": "ready",
+        "checkpoint_step": 100,
+        "adapter_revision": "flash-1@abc123",
+    }
+
+    warning = _alias_move_warning(_Client(current), "flash-1", 50) or ""
+
+    assert "flash-1@abc123" in warning
+    # the final-adapter wording must not leak into a numbered checkpoint, which keeps `step-N`
+    # wherever the plane supports it.
+    assert "/final" not in warning
+
+
 def test_a_run_with_no_deployment_is_not_a_replacement() -> None:
     """A first deploy displaces nothing, so it must stay silent."""
     assert _alias_move_warning(_Client(None), "flash-1", 50) is None
