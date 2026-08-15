@@ -900,9 +900,10 @@ def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
     """Readiness is one leg of the attempt, and the other legs have no wall-clock bound of their own.
 
     The same deploy resolves the hub revision, downloads the adapter config to read its rank, checks
-    capabilities and registers BEFORE this wait, then runs the smoke budget and activates after it.
-    All of that has to finish before the control plane declares the attempt abandoned and before the
-    CLI's default `--wait` gives up, so the cap must reserve time rather than merely clear smoke.
+    capabilities and registers before this wait, then runs immutable smoke, activates, and verifies
+    the alias. all of that has to finish before the control plane declares the attempt abandoned and
+    before the CLI's default `--wait` gives up, so the cap must reserve time rather than merely clear
+    smoke.
     """
     import flash.serve.deploy as d
 
@@ -916,7 +917,7 @@ def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
         _build_parser().parse_args(["models", "deploy", "run-1", "--wait"]).wait
     )
 
-    bounded = d.REVISION_READY_MAX_BUDGET_SECONDS + _SMOKE_BUDGET_SECONDS
+    bounded = d.REVISION_READY_MAX_BUDGET_SECONDS + 2 * _SMOKE_BUDGET_SECONDS
     assert bounded < _DEPLOYMENT_STALE_SECONDS
     # and the CLI must not call a still-progressing deploy failed before the plane reaps it.
     assert bounded < cli_default_wait
@@ -1465,10 +1466,11 @@ def test_undeploy_propagates_serving_error(monkeypatch):
     assert d.undeploy_adapter("flash-7-abcd")["serving_deregistered"] is False
 
 
-def test_chat_classifies_recognized_retryable_smoke_503(monkeypatch):
+def test_chat_classifies_retryable_alias_smoke_503_for_the_expected_revision(monkeypatch):
     import flash.serve.deploy as d
 
-    revision = "run-1@final." + "a" * 40
+    run_id = "run-1"
+    revision = f"{run_id}@final." + "a" * 40
 
     class Response:
         status_code = 503
@@ -1483,7 +1485,7 @@ def test_chat_classifies_recognized_retryable_smoke_503(monkeypatch):
                     "code": "adapter_loading",
                     "message": "adapter revision is loading",
                     "retryable": True,
-                    "requested_model": revision,
+                    "requested_model": run_id,
                     "adapter_revision": revision,
                     "retry_after_seconds": 2,
                 }
@@ -1506,8 +1508,9 @@ def test_chat_classifies_recognized_retryable_smoke_503(monkeypatch):
 
     with pytest.raises(d.RetryableServingUnavailable) as exc_info:
         d.chat(
-            revision,
+            run_id,
             [{"role": "user", "content": "hello"}],
+            expected_adapter_revision=revision,
             timeout_s=5.0,
             retry_unavailable=True,
         )
