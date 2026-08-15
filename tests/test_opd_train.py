@@ -4682,6 +4682,35 @@ def test_child_failure_sanitizer_redacts_digit_only_credentials():
         assert _safe_child_failure_detail(ValueError(kept)) == kept
 
 
+def test_child_failure_sanitizer_redacts_the_credential_not_the_auth_scheme(monkeypatch):
+    """`Authorization: Basic <cred>` must lose the credential, not the word `Basic`.
+
+    The shape rule captures the first token after the separator, so an unconsumed scheme IS that
+    token: `Basic` was redacted and the credential after it printed verbatim -- redacting the one
+    word in the line that is not secret. Only `bearer` was consumed. A scheme is a fixed word, so
+    consuming the others cannot hide a value, and a runtime-minted credential is in no environment
+    variable, which makes this shape rule the only net it ever meets.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for scheme in ("Basic", "Bearer", "Digest", "Token", "basic"):
+        credential = "dXNlcjpwYXNzd29yZA"
+        for message in (
+            f"auth failed: Authorization: {scheme} {credential}",
+            f'denied {{"Authorization": "{scheme} {credential}"}}',  # json repr: quoted value
+            f"denied {{'authorization': '{scheme} {credential}'}}",  # dict repr: single quotes
+        ):
+            redacted = _safe_child_failure_detail(ValueError(message))
+            assert credential not in redacted, redacted
+            assert "<redacted>" in redacted
+
+    # the scheme is consumed, never treated as the secret, so it stays readable in the diagnostic.
+    assert "Authorization" in _safe_child_failure_detail(
+        ValueError("auth failed: Authorization: Basic dXNlcjpwYXNzd29yZA")
+    )
+
+
 def test_child_failure_sanitizer_survives_a_non_utf8_credential_in_the_environment(monkeypatch):
     """A surrogate in an env value must not abort the sanitizer.
 

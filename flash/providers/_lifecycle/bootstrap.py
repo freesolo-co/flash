@@ -254,21 +254,18 @@ def hf_upload(
         )
         return True
     except Exception as exc:
-        print(
-            f"hf upload warn ({repo_subpath}): {_safe_detail(exc, secrets=_payload_secrets(payload))}",
-            flush=True,
-        )
+        detail = _safe_detail(exc, secrets=_payload_secrets(payload))
+        print(f"hf upload warn ({repo_subpath}): {detail}", flush=True)
         return False
 
 
 def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> bool:
     """Upload one console snapshot from an isolated process. True only if it landed."""
     tail_path = console + ".tail"
-    tail = _read_console_tail(console, 64_000, secrets=_payload_secrets(payload))
-    if extra:
-        tail += extra
+    secrets = _payload_secrets(payload)
+    tail = _read_console_tail(console, 64_000, secrets=secrets) + extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
-        f.write(_safe_detail(tail, 64_000, secrets=_payload_secrets(payload)))
+        f.write(_safe_detail(tail, 64_000, secrets=secrets))
     return hf_upload(payload, tail_path, f"console_{mode}.txt")
 
 
@@ -290,7 +287,9 @@ def _console_upload_loop(
     capture the hang. So commit only on un-uploaded bytes AND either the interval elapsing or
     silence sustained over _CONSOLE_UPLOAD_QUIET_POLLS samples; spend that quiet snapshot once per
     run; and advance it and ``sent`` only on reported success, since hf_upload swallows its
-    exception. Each rule is pinned by a test_instance_console_upload_loop_* case."""
+    exception. ``wedged`` excludes an already-due poll, so the latch is spent only when silence
+    BOUGHT an upload -- charging it for a commit that was happening anyway would disarm wedge
+    detection for a later hang. Each rule is pinned by a test_instance_console_upload_loop_* case."""
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
     sent = prev = -1
@@ -301,8 +300,9 @@ def _console_upload_loop(
         size = _console_size(console)
         quiet_polls = quiet_polls + 1 if size == prev else 0
         prev = size
-        wedged = quiet_polls >= _CONSOLE_UPLOAD_QUIET_POLLS and not quiet_used
-        if size == sent or not (since >= due_s or wedged):
+        due = since >= due_s
+        wedged = quiet_polls >= _CONSOLE_UPLOAD_QUIET_POLLS and not quiet_used and not due
+        if size == sent or not (due or wedged):
             continue
         try:
             uploaded = _upload_console_snapshot(payload, console, mode)

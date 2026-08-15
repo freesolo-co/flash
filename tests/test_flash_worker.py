@@ -1093,6 +1093,8 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_POLL_S})" in body
     assert f"due_s, since, quiet_polls = {endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S}" in body
     assert f"quiet_used or (wedged and ok), 0.0, {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
+    # the latch is spent only on silence that bought an upload, not on an already-due snapshot.
+    assert "and not quiet_used and not due" in body
     # the sustained-silence threshold and the success-gated watermark, which keep a sparsely
     # logging run inside the shared repo's commit budget and retry a swallowed upload failure.
     assert (
@@ -1200,10 +1202,17 @@ def test_instance_console_upload_loop_keeps_a_sparsely_logging_run_in_budget(mon
     a time. Treating ONE unchanged sample as the wedge signature commits on nearly every poll, so
     the loop that exists to respect the shared repo's 5 commits/hour spends 10 by itself. Silence
     has to be sustained, and the resulting snapshot spent once, or the rate is unbounded.
+
+    The budget governs the SUSTAINED rate, so that is what is asserted here: the scheduled cadence
+    over the run, plus at most one wedge commit for the whole run. Dividing every commit by a short
+    window instead would charge that one-off snapshot as if it recurred -- 1.5/hr over 2h for a
+    loop that converges to 1.0/hr -- and would fail a correct implementation for being measured
+    over too short a horizon.
     """
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
 
     poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    interval_s = _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
     quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
     hours = 2
     cycles = int(hours * 3600.0 / poll_s)
@@ -1215,9 +1224,14 @@ def test_instance_console_upload_loop_keeps_a_sparsely_logging_run_in_budget(mon
 
     import flash.engine.worker as worker
 
-    commits_per_hour = len(uploads) / hours
-    total = 3600.0 / worker._HB_MIN_INTERVAL_S + commits_per_hour
-    assert total <= 5.0, f"{commits_per_hour}/hr console + heartbeat = {total}/hr, budget is 5"
+    # the scheduled cadence is one per interval after the first snapshot; anything beyond that is
+    # the one-shot wedge credit, which the latch caps at one for the entire run.
+    scheduled = int(hours * 3600.0 / interval_s) + 1
+    assert len(uploads) <= scheduled + 1, f"{len(uploads)} commits exceeds the schedule plus one"
+
+    sustained = 3600.0 / interval_s
+    total = 3600.0 / worker._HB_MIN_INTERVAL_S + sustained
+    assert total <= 5.0, f"{sustained}/hr console + heartbeat = {total}/hr, budget is 5"
 
 
 def test_instance_console_upload_loop_saves_the_quiet_snapshot_for_a_real_wedge(monkeypatch):
@@ -1246,6 +1260,34 @@ def test_instance_console_upload_loop_saves_the_quiet_snapshot_for_a_real_wedge(
     after_wedge = [u for u in uploads if u > wedge_at]
     assert after_wedge, "the brief pause consumed the snapshot the real wedge needed"
     # and it lands inside the 1200s training stall, measured from when output actually stopped.
+    assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
+
+
+def test_instance_console_upload_loop_does_not_spend_the_latch_on_a_due_snapshot(monkeypatch):
+    """A run quiet across its FIRST scheduled snapshot must keep its wedge credit.
+
+    At that poll the scheduled deadline and the sustained-silence rule are both true, so the upload
+    happens either way. Charging the one-shot latch there buys nothing and disarms wedge detection
+    for the rest of the run: if output resumes and the worker then truly hangs, the next snapshot is
+    a full interval away -- 4200s here, against a 1200s stall teardown -- so the hang is never
+    captured. The latch may only be spent when silence bought an upload that was not already due.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
+    # silent from the start, so the first scheduled snapshot and the wedge rule coincide.
+    silent_polls = int(first_s / poll_s)
+    assert silent_polls > quiet_polls, "the deadline must land after silence is already sustained"
+    sizes = [1000] * silent_polls
+    sizes += [1000 * (n + 2) for n in range(3)]  # output resumes
+    wedge_at = len(sizes)
+    sizes += [1000 * 4] * (quiet_polls + 6)  # then the run wedges for good
+    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=len(sizes))
+
+    after_wedge = [u for u in uploads if u > wedge_at]
+    assert after_wedge, "the overlapping scheduled snapshot consumed the real wedge's credit"
     assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
 
 

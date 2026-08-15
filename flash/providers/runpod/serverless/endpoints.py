@@ -24,16 +24,12 @@ from flash.providers.runpod.gpus import flash_gpu
 FLASH_SDK_LOCK = threading.Lock()
 
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-# the periodic uploader waits a full interval before its FIRST snapshot, but a wedged run is torn
-# down well before that: 1200s on the training stall limit and 3000s on the setup grace, both under
-# the hourly interval. so the hourly upload could never fire for the runs that need it most, and
-# they died carrying no console artifact at all. take one early snapshot, then settle into the
-# hourly cadence -- this costs one extra commit per run, not per hour, so the shared-artifact-repo
-# rate budget the interval exists to protect is unchanged.
+# an interval-only uploader can never fire for a wedged run: teardown comes at 1200s (training
+# stall) or 3000s (setup grace), both under the hour. one early snapshot, then the hourly cadence
+# -- one extra commit per RUN, not per hour, so the repo's rate budget is unchanged.
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
-# how often the uploader LOOKS at the console, not how often it commits: a stat() costs nothing
-# against the shared artifact repo's commit budget, and it is what lets a wedge be noticed two
-# polls after output stops rather than at the next hourly boundary.
+# how often the uploader LOOKS at the console, not how often it commits: a stat() is free against
+# the commit budget, and it is what notices a wedge before the next hourly boundary.
 _CONSOLE_UPLOAD_POLL_S = 120.0
 
 _ENDPOINT_CACHE: dict[str, Any] = {}
@@ -602,15 +598,10 @@ def _train_body(input_data: dict) -> dict:
             stop_upload = threading.Event()
 
             def _upload_loop() -> None:
-                # literals, not the module-level upload constants: only this function's SOURCE
-                # ships to the worker, so referencing one by name is a NameError before training.
-                # test_first_console_snapshot_precedes_the_stall_teardown pins these numbers to
-                # those constants so the shipped uploader cannot drift.
-                #
-                # polls every 120s, commits rarely: only on un-uploaded bytes AND either the hourly
-                # interval elapsing or 4 SILENT polls, the quiet snapshot spent once per run and
-                # both watermarks advancing only on success. mirrors bootstrap._console_upload_loop,
-                # whose docstring carries the reasoning for each rule.
+                # literals, not the module-level constants: only this function's SOURCE ships to
+                # the worker, so a name reference is a NameError before training.
+                # test_first_console_snapshot_precedes_the_stall_teardown pins them so this cannot
+                # drift. Mirrors bootstrap._console_upload_loop, whose docstring carries the rules.
                 due_s, since, quiet_polls = 600.0, 0.0, 0
                 uploaded_size, previous_size, quiet_used = -1, -1, False
                 while not stop_upload.wait(120.0):
@@ -621,8 +612,10 @@ def _train_body(input_data: dict) -> dict:
                         size = -1
                     quiet_polls = quiet_polls + 1 if size == previous_size else 0
                     previous_size = size
-                    wedged = quiet_polls >= 4 and not quiet_used
-                    if size == uploaded_size or not (since >= due_s or wedged):
+                    due = since >= due_s
+                    # `not due`: only silence that BOUGHT an upload spends the one-shot latch.
+                    wedged = quiet_polls >= 4 and not quiet_used and not due
+                    if size == uploaded_size or not (due or wedged):
                         continue
                     ok = _upload_console(mode)  # swallows its own errors; False if it did not land
                     uploaded_size = size if ok else uploaded_size

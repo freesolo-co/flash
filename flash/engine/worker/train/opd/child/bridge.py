@@ -35,9 +35,12 @@ _FAILURE_FALLBACK_MAX_CHARS = 8192
 # which an unquoted-only pattern cannot cross, so the value printed verbatim. a runtime-minted
 # credential is in no environment variable, so the value pass cannot catch it either and this shape
 # rule is the only thing standing between it and an artifact the user can fetch.
+# the auth scheme is consumed, not captured: `Authorization: Basic dXNlcjpwYXNz` otherwise matches
+# `Basic` as the value and prints the credential after it verbatim -- redacting the one token in the
+# line that is not secret. every scheme here is a fixed word, so consuming it cannot hide a value.
 _SECRET_DETAIL = re.compile(
     r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
-    r"(['\"]?\s*[:=]\s*)(?:bearer\s+)?(['\"]?)([^\s,;'\"}]+)"
+    r"(['\"]?\s*[:=]\s*)(['\"]?)(?:(?:bearer|basic|digest|token)\s+)?([^\s,;'\"}]+)"
 )
 # component lines of a multiline credential shorter than this are punctuation such as ``}``, not
 # secrets; redacting them would erase innocent text. Matches `bootstrap_secrets._MIN_SECRET_COMPONENT`.
