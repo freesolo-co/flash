@@ -51,7 +51,7 @@ from flash.env_buffers import (
 from flash.env_deflate import (
     _PDF_SIGNATURE,
     _EncryptedDocument,
-    _gzip_original_name,
+    _gzip_metadata,
     _GzipHeaderTooLarge,
     _pdf_stream_payloads,
     _raw_deflate_from,
@@ -655,13 +655,12 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
     )
     if head.startswith(b"\x1f\x8b\x08"):
         try:
-            original_name = _gzip_original_name(source)
+            metadata = _gzip_metadata(source)
         except _GzipHeaderTooLarge:
             raise _Unscannable("contains a gzip header too large to inspect") from None
-        if original_name and (
-            kind := credential_in_name(original_name.decode("latin-1"), deadline=deadline)
-        ):
-            return kind
+        for value in metadata:
+            if kind := credential_in_name(value.decode("latin-1"), deadline=deadline):
+                return kind
     # A raw zlib stream (RFC 1950) is deflate with a 2-byte header instead of gzip's 10, so none of
     # the openers above read it. `decompressobj` with the zlib window size does, and it is the same
     # deflate underneath -- which is why the stream can be expanded rather than merely refused.
@@ -811,7 +810,7 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
 
 
 def _credential_in_ar(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
-    """The kind of credential in any readable member of an ar or newc cpio archive."""
+    """The kind of credential in any readable member of an ar or SVR4 cpio archive."""
     if isinstance(source, bytes):
         head = source[:110]
     else:
@@ -823,7 +822,7 @@ def _credential_in_ar(source: Path | bytes, *, deadline: float, depth: int) -> s
         walker = credential_in_ar
     elif (
         len(head) == 110
-        and head.startswith(b"070701")
+        and head.startswith((b"070701", b"070702"))
         and all(byte in b"0123456789abcdefABCDEF" for byte in head[6:])
     ):
         walker = credential_in_cpio

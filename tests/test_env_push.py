@@ -9339,3 +9339,130 @@ def test_rejoining_skips_both_joins_when_no_quote_can_close_a_seam(monkeypatch):
     welded = f'API_KEY=fslo_{body[:10]}"{body[10:]}"\n'.encode()
     assert f"fslo_{body}".encode() in env_joined._rejoined(welded)
     assert entered == ["_join_adjacent_literals", "_join_shell_assignments"]
+
+
+def test_a_gzip_comment_is_scanned_as_published_metadata(tmp_path):
+    """FCOMMENT is published metadata and can encode opaque content just as FNAME can.
+
+    The header walk advanced past the comment but discarded it, so a harmless gzip carrying base64
+    of an OpenSSL envelope there returned clean while the same text passed directly was refused.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(encoded.decode())
+
+    plain = gzip.compress(b"harmless plaintext\n", mtime=0)
+    commented = plain[:3] + bytes([plain[3] | 0x10]) + plain[4:10] + encoded + b"\0" + plain[10:]
+    assert gzip.decompress(commented) == b"harmless plaintext\n"
+    published = tmp_path / "commented.gz"
+    published.write_bytes(commented)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
+
+
+def test_a_crc_cpio_member_uses_the_newc_member_walk(tmp_path):
+    """SVR4 crc changes only the magic and checksum field, not the member layout.
+
+    Accepting only 070701 skipped a zlib member under 070702 even though the established newc walk
+    reads every field and body identically. All thirteen fields, including checksum, remain hex.
+    """
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    packed = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+
+    def archive(magic: bytes) -> bytes:
+        data = bytearray()
+
+        def add(name: str, body: bytes, inode: int) -> None:
+            checksum = sum(body) & 0xFFFFFFFF if magic == b"070702" else 0
+            fields = (inode, 0o100644, 0, 0, 1, 0, len(body), 0, 0, 0, 0, len(name) + 1, checksum)
+            data.extend(magic + b"".join(f"{value:08x}".encode() for value in fields))
+            data.extend(name.encode() + b"\0")
+            data.extend(b"\0" * (-len(data) % 4))
+            data.extend(body)
+            data.extend(b"\0" * (-len(data) % 4))
+
+        add("payload.zz", packed, 1)
+        add("TRAILER!!!", b"", 2)
+        return bytes(data)
+
+    control = tmp_path / "newc.cpio"
+    control.write_bytes(archive(b"070701"))
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    published = tmp_path / "crc.cpio"
+    published.write_bytes(archive(b"070702"))
+    assert credential_in_file(published) == "a Freesolo API key"
+
+
+def test_narrow_base64_is_joined_only_inside_one_declared_value(tmp_path):
+    """A producer chooses wrapping width, so 32 columns cannot be a security boundary.
+
+    Lowering the global floor would join ubiquitous short lines across prose, csv, and source. A YAML
+    block or continued assignment instead proves equally-indented lines belong to one value, allowing
+    16- and 24-column wrapping without charging unrelated text for the wider scan.
+    """
+    import base64
+
+    from flash.env_secrets import credential_in_file
+
+    encoded = base64.b64encode(f"fslo_{_FAKE_KEY_BODY}".encode()).decode()
+
+    def wrapped(width: int, indent: str) -> str:
+        return ("\n" + indent).join(
+            encoded[at : at + width] for at in range(0, len(encoded), width)
+        )
+
+    control = tmp_path / "control.yaml"
+    control.write_text("secret: |\n  " + wrapped(32, "  ") + "\n")
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    scalar = tmp_path / "scalar.yaml"
+    scalar.write_text("secret: |\n  " + wrapped(16, "  ") + "\n")
+    assert credential_in_file(scalar) == "a Freesolo API key"
+
+    assignment = tmp_path / "assignment.yaml"
+    assignment.write_text("secret: " + wrapped(24, "        ") + "\n")
+    assert credential_in_file(assignment) == "a Freesolo API key"
+
+    ordinary = tmp_path / "ordinary.yaml"
+    ordinary.write_text(
+        "notes: |\n  documentationabc\n  configurationxyz\n  representationqr\n  implementationst\n"
+    )
+    assert credential_in_file(ordinary) is None
+
+
+def test_python_raw_strings_are_not_escape_decoded(tmp_path):
+    """A raw Python string keeps its backslash, so decoding `\\x42` invents a runtime credential.
+
+    Escape decoding must skip only raw spans: ordinary strings still resolve the escape, verbatim
+    credentials inside raw strings still scan, and adjacent raw literals still concatenate.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY
+    escaped = body[:10] + "\\x42" + body[11:]
+    assert body[10] == "B"
+
+    control = tmp_path / "ordinary.py"
+    control.write_text(f'KEY = "fslo_{escaped}"\n')
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    raw = tmp_path / "raw.py"
+    raw.write_text(f'KEY = r"fslo_{escaped}"\n')
+    assert credential_in_file(raw) is None
+
+    verbatim = tmp_path / "verbatim.py"
+    verbatim.write_text(f'KEY = r"fslo_{body}"\n')
+    assert credential_in_file(verbatim) == "a Freesolo API key"
+
+    split = tmp_path / "split.py"
+    split.write_text(f'KEY = r"fslo_{body[:12]}" r"{body[12:]}"\n')
+    assert credential_in_file(split) == "a Freesolo API key"

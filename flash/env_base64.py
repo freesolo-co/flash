@@ -18,6 +18,7 @@ from typing import Protocol
 
 from flash.env_formats import _looks_like_zlib
 from flash.env_patterns import SHORTEST_TOKEN_BYTES, _match
+from flash.env_wrapped import context_unwrapped
 
 
 # What a caller may offer for a second look at decoded bytes: given them, it names a credential or
@@ -343,9 +344,10 @@ def _unwrapped(data: bytes) -> bytes:
     full-width run of base64 characters. Measured on ordinary source: 9 MB/s without the guard,
     back to the pre-existing rate with it.
     """
-    if b"\n" not in data or not _WRAPPED_HINT.search(data):
-        return data
-    return _WRAPPED_BLOCK.sub(lambda match: _WRAPPED_BREAK.sub(b"", match.group(0)), data)
+    joined = data
+    if b"\n" in data and _WRAPPED_HINT.search(data):
+        joined = _WRAPPED_BLOCK.sub(lambda match: _WRAPPED_BREAK.sub(b"", match.group(0)), data)
+    return context_unwrapped(joined, _MIN_BASE64_RUN)
 
 
 # What marks a base64 run as an ASSIGNED value: the run is what something was set to, or the whole

@@ -114,6 +114,13 @@ _ESCAPE_MARKERS = (b"\\u", b"\\U", b"\\x", b"\\N{")
 # python statements, or adjacent top-level lines that the runtime never combines.
 _SHELL_ASSIGNMENT = re.compile(rb"(?<![^\s;|&()])[A-Za-z_][A-Za-z0-9_]*=")
 
+# python keeps escapes literal when a string prefix contains `r`. finding these spans before the
+# adjacent-literal join matters because that join consumes the second prefix; doing it afterwards
+# decoded `\\x42` inside a raw string and invented a credential that python never constructs.
+_RAW_LITERAL_START = re.compile(
+    rb"(?<![A-Za-z0-9_])(?i:(?:r[bf]?|[bf]r))(?P<quote>\"\"\"|'''|\"|')"
+)
+
 
 def _named_ascii(match: re.Match[bytes]) -> bytes:
     """The ASCII text named by a Python `\\N{...}` escape, or the original escape unchanged."""
@@ -122,6 +129,56 @@ def _named_ascii(match: re.Match[bytes]) -> bytes:
         return resolved.encode("ascii")
     except (KeyError, UnicodeDecodeError, UnicodeEncodeError):
         return match.group(0)
+
+
+def _raw_literal_spans(data: bytes) -> list[tuple[int, int]]:
+    """The byte spans of Python string literals whose prefix contains `r`."""
+    spans = []
+    search_at = 0
+    while match := _RAW_LITERAL_START.search(data, search_at):
+        quote = match.group("quote")
+        at = match.end()
+        while True:
+            end = data.find(quote, at)
+            if end < 0:
+                spans.append((match.start(), len(data)))
+                return spans
+            slash = end - 1
+            while slash >= match.end() and data[slash] == 92:
+                slash -= 1
+            if (end - slash - 1) % 2 == 0:
+                literal_end = end + len(quote)
+                spans.append((match.start(), literal_end))
+                search_at = literal_end
+                break
+            at = end + 1
+    return spans
+
+
+def _resolved_escapes(data: bytes) -> bytes:
+    """Resolve supported runtime escapes in one span known not to be a raw string."""
+    resolved = data
+    if any(marker in resolved for marker in _ESCAPE_MARKERS):
+        resolved = _JSON_ESCAPE.sub(lambda point: bytes.fromhex(point.group(1).decode()), resolved)
+        resolved = _NAMED_ESCAPE.sub(_named_ascii, resolved)
+    if b"\\" in resolved:
+        resolved = _OCTAL_ESCAPE.sub(lambda point: bytes([int(point.group(1), 8)]), resolved)
+    return resolved
+
+
+def _decode_runtime_escapes(data: bytes) -> bytes:
+    """Resolve escapes outside Python raw strings while leaving every raw byte scannable."""
+    spans = _raw_literal_spans(data)
+    if not spans:
+        return _resolved_escapes(data)
+    out = bytearray()
+    at = 0
+    for start, end in spans:
+        out += _resolved_escapes(data[at:start])
+        out += data[start:end]
+        at = end
+    out += _resolved_escapes(data[at:])
+    return bytes(out)
 
 
 def _seam_depths(data: bytes, starts: set[int]) -> dict[int, int]:
@@ -245,19 +302,14 @@ def _rejoined(data: bytes) -> bytes:
     joined = data
     if any(marker in joined for marker in _CONTINUATIONS):
         joined = _CONTINUED_LINE.sub(rb"\1", joined)
+    # escape decoding precedes literal joining because the join consumes a following `r` prefix.
+    # keeping the prefix visible prevents a raw `\\x42` from becoming `B`, while the later join still
+    # combines adjacent raw literals that contain a real credential verbatim.
+    if b"\\" in joined:
+        joined = _decode_runtime_escapes(joined)
     quoted = any(quote in joined for quote in _QUOTES)
     if quoted:
         joined = _join_adjacent_literals(joined)
     if quoted and _ASSIGNMENT_SIGN in joined:
         joined = _join_shell_assignments(joined)
-    # Guarded by the same substring test as the continuation, for the same reason: `\u` is absent
-    # from almost every file, and settling that at memchr speed keeps the ordinary scan free of a
-    # substitution pass over every byte.
-    if any(marker in joined for marker in _ESCAPE_MARKERS):
-        joined = _JSON_ESCAPE.sub(lambda point: bytes.fromhex(point.group(1).decode()), joined)
-        joined = _NAMED_ESCAPE.sub(_named_ascii, joined)
-    # Guarded by a bare backslash rather than a two-byte marker, since that is all an octal escape
-    # has. Still a memchr-speed test, and still absent from most files.
-    if b"\\" in joined:
-        joined = _OCTAL_ESCAPE.sub(lambda point: bytes([int(point.group(1), 8)]), joined)
     return joined

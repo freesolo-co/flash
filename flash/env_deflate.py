@@ -316,8 +316,8 @@ class _TooManyStreams(Exception):
 _LATIN1_TEXT = frozenset(range(0x20, 0x7F)) | frozenset(range(0xA0, 0x100))
 
 
-def _gzip_header_parts(probe: bytes) -> tuple[bytes | None, bool]:
-    """The gzip original name and whether its header consumes the available probe.
+def _gzip_header_parts(probe: bytes) -> tuple[bytes | None, bytes | None, bool]:
+    """The gzip name, comment, and whether its header consumes the available probe.
 
     RFC 1952 puts a fixed 10-byte header first, then four optional fields the flag byte announces: an
     extra field of up to 65,535 bytes, a NUL-terminated name, a NUL-terminated comment, and a 2-byte
@@ -336,24 +336,25 @@ def _gzip_header_parts(probe: bytes) -> tuple[bytes | None, bool]:
     stream behind a shell stub was dismissed while its standalone copy exposed the key.
 
     The boolean means only "payload not yet judgeable". It is not a claim that the stream is real,
-    so a candidate reaching it is expanded and judged there rather than accepted here. The name is
-    returned exactly as the header stores it, so published metadata goes through the name scanner too.
+    so a candidate reaching it is expanded and judged there rather than accepted here. Both text
+    fields are returned exactly as stored, so published metadata goes through the name scanner too.
     """
     if len(probe) < 12 or not probe.startswith(b"\x1f\x8b\x08"):
-        return None, False
+        return None, None, False
     flags = probe[3]
     # The two reserved bits must be clear: no real header sets them, and requiring that is most of
     # what keeps a chance magic from looking like a header at all.
     if flags & 0b11100000:
-        return None, False
+        return None, None, False
     at = 10
     name: bytes | None = None
+    comment: bytes | None = None
     # The extra field declares a LENGTH, so it is decided by arithmetic. A chance length is small
     # and lands well inside the probe, which is not the condition this exists for.
     if flags & 0b100:
         at = 12 + int.from_bytes(probe[10:12], "little")
         if at >= len(probe):
-            return name, True
+            return name, comment, True
     # FNAME and FCOMMENT are NUL-terminated and unbounded, so a legal one longer than the probe
     # reaches the end with no terminator -- the same "payload not reached yet" the extra field
     # reports by arithmetic. Excluding them meant a valid stream with an 80 KiB name inflated to
@@ -370,22 +371,24 @@ def _gzip_header_parts(probe: bytes) -> tuple[bytes | None, bool]:
     for present in (0b1000, 0b10000):
         if flags & present:
             if at >= len(probe):
-                return name, True
+                return name, comment, True
             end = probe.find(b"\0", at)
             if end < 0:
                 unterminated = probe[at:]
-                return name, all(byte in _LATIN1_TEXT for byte in unterminated)
+                return name, comment, all(byte in _LATIN1_TEXT for byte in unterminated)
             if present == 0b1000:
                 name = probe[at:end]
+            else:
+                comment = probe[at:end]
             at = end + 1
     if flags & 0b10:
         at += 2
-    return name, len(probe) - at < 2
+    return name, comment, len(probe) - at < 2
 
 
 def _gzip_header_unfinished(probe: bytes) -> bool:
     """Whether a gzip header consumes the probe before two payload bytes are visible."""
-    return _gzip_header_parts(probe)[1]
+    return _gzip_header_parts(probe)[2]
 
 
 class _GzipHeaderTooLarge(Exception):
@@ -395,8 +398,8 @@ class _GzipHeaderTooLarge(Exception):
 _GZIP_HEADER_READ_BYTES = 64 << 10
 
 
-def _gzip_original_name(source: Path | bytes, limit: int = 4 << 20) -> bytes | None:
-    """The exact original filename in a gzip header, or None when it has none."""
+def _gzip_metadata(source: Path | bytes, limit: int = 4 << 20) -> tuple[bytes, ...]:
+    """The exact original filename and comment in a gzip header."""
     source_size = len(source) if isinstance(source, bytes) else source.stat().st_size
     wanted = min(_GZIP_HEADER_READ_BYTES, limit)
     while wanted:
@@ -405,15 +408,15 @@ def _gzip_original_name(source: Path | bytes, limit: int = 4 << 20) -> bytes | N
         else:
             with source.open("rb") as handle:
                 probe = handle.read(wanted)
-        name, unfinished = _gzip_header_parts(probe)
+        name, comment, unfinished = _gzip_header_parts(probe)
         if not unfinished:
-            return name
+            return tuple(part for part in (name, comment) if part is not None)
         if len(probe) >= source_size:
-            return None
+            return ()
         if wanted >= limit:
             raise _GzipHeaderTooLarge
         wanted = min(limit, wanted * 2)
-    return None
+    return ()
 
 
 class _SingleCompressedReader:

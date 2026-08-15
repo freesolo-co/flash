@@ -450,7 +450,7 @@ def credential_in_ar(
     return None
 
 
-_CPIO_NEWC_MAGIC = b"070701"
+_CPIO_NEWC_MAGICS = (b"070701", b"070702")
 _CPIO_HEADER = 110
 _CPIO_HEX_FIELDS = 13
 _CPIO_FILESIZE = 6
@@ -468,11 +468,11 @@ def credential_in_cpio(
     member_limit: int,
     size_limit: int | None = None,
 ) -> str | None:
-    """The kind of credential in a structurally valid newc cpio archive, or None."""
+    """The kind of credential in a structurally valid SVR4 cpio archive, or None."""
     if isinstance(source, Path):
         with source.open("rb") as head:
             probe = head.read(_CPIO_HEADER)
-        if not probe.startswith(_CPIO_NEWC_MAGIC):
+        if not probe.startswith(_CPIO_NEWC_MAGICS):
             return None
         if size_limit is not None and source.stat().st_size > size_limit:
             raise refusal("contains an archive too large to inspect")
@@ -480,11 +480,12 @@ def credential_in_cpio(
     else:
         data = source
         probe = data[:_CPIO_HEADER]
-        if not probe.startswith(_CPIO_NEWC_MAGIC):
+        if not probe.startswith(_CPIO_NEWC_MAGICS):
             return None
-    fields = probe[len(_CPIO_NEWC_MAGIC) : _CPIO_HEADER]
-    # the magic alone is printable text. requiring all 104 field bytes to be ascii hex makes a random
-    # acceptance about 10^-126, so ordinary csv and model data never pay a member walk by chance.
+    fields = probe[6:_CPIO_HEADER]
+    # the magic alone is printable text. requiring all 104 field bytes, including the crc checksum,
+    # to be ascii hex makes random acceptance about 1.0e-125 across both signatures, so ordinary csv
+    # and model data never pay a member walk by chance.
     if len(fields) != _CPIO_HEX_FIELDS * 8 or any(
         byte not in b"0123456789abcdefABCDEF" for byte in fields
     ):
@@ -496,7 +497,7 @@ def credential_in_cpio(
         if at + _CPIO_HEADER > len(data):
             raise refusal("contains an archive member this check cannot read")
         header = data[at : at + _CPIO_HEADER]
-        if header[:6] != _CPIO_NEWC_MAGIC:
+        if header[:6] not in _CPIO_NEWC_MAGICS:
             raise refusal("contains an archive member this check cannot read")
         encoded = header[6:]
         if any(byte not in b"0123456789abcdefABCDEF" for byte in encoded):
