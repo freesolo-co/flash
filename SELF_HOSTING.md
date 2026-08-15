@@ -36,6 +36,28 @@ export RUNPOD_API_KEY=...              # or LAMBDA_API_KEY, or VAST_API_KEY
 flash-server --host 0.0.0.0 --port 8080
 ```
 
+`flash env test` runs a scaffolded environment **locally**, so it needs the `freesolo` SDK in the
+interpreter that loads your `environment.py`. The `[server]` extra above already includes it. The
+bare `pip install freesolo-flash` does not - it is client-only and pulls nothing - so on a machine
+where you author environments without the server extra, validation fails until you add it:
+
+```bash
+pip install freesolo                                     # same interpreter as the CLI
+uv tool install freesolo-flash --with freesolo --force   # existing uv tool: rewrite it with the SDK
+pipx inject freesolo-flash freesolo                      # existing pipx tool
+```
+
+The lower two matter if you installed the CLI with `uv tool` or `pipx`: the `flash` executable then
+lives in its own venv, and a plain `pip install freesolo` lands in your shell's interpreter instead
+
+- `python -c "import freesolo"` works while `flash env test` still fails. Use the line for the
+  manager you installed with; `--force` is what makes `uv tool install` update an existing tool
+  rather than no-op, and pipx has no equivalent of `--with`, so the SDK goes in via `inject`.
+
+(`flash env eval` is not local in this sense. It evaluates a run against a **published** hub
+environment and refuses a generic `github:` ref outright, which is the only kind a standalone plane
+accepts - so installing the SDK does not make it usable self-hosted.)
+
 The `server` extra pulls in `runpod-flash`, which declares its own `flash` console script.
 Whichever distribution installs last wins, so on a plane host the bare `flash` command may launch
 RunPod's CLI instead of this one - it exits 0 and does nothing, which is easy to miss. Use
@@ -51,10 +73,11 @@ the plane itself never terminates TLS. On the same machine, skip the proxy and u
 Then point a client at it:
 
 ```bash
+export FREESOLO_API_KEY="$FREESOLO_INTERNAL_KEY"
 # remote: the https address of your TLS proxy, not the plane's own :8080
-flash login --api-url https://your-plane.example --api-key "$FREESOLO_INTERNAL_KEY"
+flash login --api-url https://your-plane.example
 # same machine: loopback plaintext is fine
-# flash login --api-url http://127.0.0.1:8080 --api-key "$FREESOLO_INTERNAL_KEY"
+# flash login --api-url http://127.0.0.1:8080
 flash train run.toml
 ```
 
@@ -400,8 +423,8 @@ small run and watch it allocate.
 is not set, so the plane is trying to reach a Freesolo backend. Set it to `1`.
 
 **`401` on every request.** In standalone mode only `FREESOLO_INTERNAL_KEY` is accepted.
-Confirm the client is sending that exact value (`flash login --api-key ...`), with no
-trailing newline.
+Confirm `FREESOLO_API_KEY` contains that exact value, with no trailing newline, then run
+`flash login` again.
 
 **Startup says no GPU provider is configured** but you set a key. The value must be
 non-empty and non-whitespace. For RunPod specifically, a value of `","` parses to zero

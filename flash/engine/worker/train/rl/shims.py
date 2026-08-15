@@ -618,6 +618,21 @@ def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
         "        with urllib.request.urlopen(req) as r:\n"
         "            payload = json.loads(r.read().decode())\n"
         "            return float(payload['score'])\n"
+        # HTTPError is a URLError subclass, so it must be handled FIRST or the bridge's own error
+        # text -- the reason the request failed, e.g. "can't start new thread" -- is dropped for a
+        # bare "HTTP Error 503: Service Unavailable" that names no cause.
+        "    except urllib.error.HTTPError as exc:\n"
+        "        detail = ''\n"
+        "        try:\n"
+        "            detail = str(json.loads(exc.read().decode())['error'])\n"
+        "        except Exception:\n"
+        "            detail = ''\n"
+        "        fault = 'could not serve' if exc.code >= 500 else 'rejected'\n"
+        "        if detail:\n"
+        "            raise RuntimeError('flash reward bridge %s the request (HTTP %s): %s'\n"
+        "                               % (fault, exc.code, detail)) from exc\n"
+        "        raise RuntimeError('flash reward bridge %s the request: HTTP %s with no error detail'\n"
+        "                           % (fault, exc.code)) from exc\n"
         "    except urllib.error.URLError as exc:\n"
         "        raise RuntimeError('flash reward bridge request failed: %s' % exc) from exc\n"
         "    except Exception as exc:\n"

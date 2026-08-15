@@ -19,6 +19,7 @@ import subprocess
 from flash.engine.worker.backend_common import (
     CAUSAL_CONV1D_REQUIREMENT,
     FLA_REQUIREMENT,
+    FLASH_QLA_REQUIREMENT,
     TRANSFORMERS_REQUIREMENT,
     VERL_REQUIREMENT_NAME,
     VERL_REQUIREMENT_URL,
@@ -481,6 +482,10 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 # apache-tvm-ffi is pinned to 0.1.11 because 0.1.12
                 # double-registers TVM-FFI and aborts `import tilelang`.
                 FLA_REQUIREMENT,
+                # the flashqla GDN backend fla 0.5.2 dispatches to. same lockstep requirement:
+                # the shim binds it in THIS interpreter, so a wheel present only in the worker's
+                # env would leave the child on the old kernel while the marker still printed.
+                FLASH_QLA_REQUIREMENT,
                 "tilelang==0.1.11",
                 "apache-tvm-ffi==0.1.11",
             ],

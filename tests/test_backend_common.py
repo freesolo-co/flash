@@ -29,6 +29,7 @@ import pytest
 from flash.engine.worker import backend_common as vc
 from flash.engine.worker import rl_train
 from flash.engine.worker.perf.lifecycle import RetriableInfraError
+from flash.engine.worker.verl import child_io as _child_io
 
 # several tests below drive real subprocesses that import flash from a checkout, not from the venv.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -968,6 +969,435 @@ def test_the_armed_finder_patches_the_module_on_a_real_import(tmp_path, monkeypa
         for name in [n for n in sys.modules if n.split(".")[0] == "transformers"]:
             del sys.modules[name]
         sys.modules.update(saved_modules)
+
+
+def _run_flash_qla_shim(tmp_path, *, capability, backends, extra="", env=None):
+    """Execute the rendered flashqla fragment in a child against stub torch/fla, return the run.
+
+    A stub interpreter rather than mocks: the fragment is source text that runs at sitecustomize
+    time, and the thing under test is what it does to a real import system with a real sys.exit.
+    """
+    root = tmp_path / "site"
+    package = root / "transformers" / "models" / "qwen3_5"
+    package.mkdir(parents=True)
+    for parent in (root / "transformers", root / "transformers" / "models", package):
+        (parent / "__init__.py").write_text("")
+    (package / "modeling_qwen3_5.py").write_text(
+        "def chunk_gated_delta_rule(*args, **kwargs):\n    return 'original'\n"
+    )
+    (root / "torch.py").write_text(
+        "class _Cuda:\n"
+        "    @staticmethod\n"
+        f"    def is_available():\n        return {capability is not None!r}\n"
+        "    @staticmethod\n"
+        f"    def get_device_capability():\n        return {capability or (0, 0)!r}\n"
+        "cuda = _Cuda()\n"
+    )
+    fla = root / "fla" / "ops" / "gated_delta_rule" / "backends"
+    fla.mkdir(parents=True)
+    for parent in (root / "fla", root / "fla" / "ops", root / "fla" / "ops" / "gated_delta_rule"):
+        (parent / "__init__.py").write_text("")
+    (fla / "__init__.py").write_text(
+        "class _Backend:\n"
+        "    def __init__(self, backend_type, available, fn):\n"
+        "        self.backend_type = backend_type\n"
+        "        self._available = available\n"
+        "        self.chunk_gated_delta_rule = fn\n"
+        "    def is_available(self):\n        return self._available\n"
+        "\n"
+        "def _flashqla(*args, **kwargs):\n"
+        "    return ('flashqla', args, sorted(kwargs))\n"
+        "\n"
+        "class _Registry:\n"
+        "    def _get_sorted_backends(self):\n"
+        f"        return {backends}\n"
+        "\n"
+        "gdr_registry = _Registry()\n"
+    )
+    site = pathlib.Path(tmp_path, "shimdir")
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(vc.render_flash_qla_shim("qwen3_5") + extra)
+    return subprocess.run(
+        [sys.executable, "-c", ""],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, **(env or {}), "PYTHONPATH": f"{site}{os.pathsep}{root}"},
+    )
+
+
+_FLASH_QLA_AVAILABLE = "[_Backend('flash_qla', True, _flashqla)]"
+
+
+def test_the_flash_qla_shim_binds_the_backend_on_a_real_import(tmp_path):
+    # the whole point of the fragment: the env var alone provably does nothing, because transformers
+    # captures chunk_gated_delta_rule into a module global at import and each GDN layer copies that
+    # object onto self in __init__ -- so fla's @dispatch wrapper, the only reader of FLA_FLASH_QLA,
+    # is never on the call path. assert the module global the layers copy actually changed, driven
+    # through a genuine `import` so the finder and loader are exercised too.
+    probe = textwrap.dedent(
+        """
+        import importlib, sys
+        assert type(sys.meta_path[0]).__name__ == "_FlashQlaFinder", "finder not armed"
+        mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        assert getattr(mod.chunk_gated_delta_rule, "_flash_qla_patched", False) is True, "unpatched"
+        # the shim must step back off meta_path once it fired, or it re-wraps every later import.
+        assert not [f for f in sys.meta_path if type(f).__name__ == "_FlashQlaFinder"]
+        # and the bound call must reach the flashqla backend, not the module's own function.
+        assert mod.chunk_gated_delta_rule(1)[0] == "flashqla"
+        print("BOUND")
+        """
+    )
+    out = _run_flash_qla_shim(
+        tmp_path, capability=(9, 0), backends=_FLASH_QLA_AVAILABLE, extra=probe
+    )
+    assert out.returncode == 0, out.stderr
+    assert "BOUND" in out.stdout
+    assert vc.FLASH_FLASH_QLA_MARKER in out.stdout
+
+
+def test_the_flash_qla_shim_drops_the_kwarg_the_backend_cannot_take(tmp_path):
+    # fla's dispatcher passes cu_seqlens_cpu to backends that accept it; flashqla does not, and a
+    # TypeError here would surface as a dead training run rather than a slower one.
+    probe = textwrap.dedent(
+        """
+        import importlib
+        mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        got = mod.chunk_gated_delta_rule(1, cu_seqlens_cpu=object(), scale=2)
+        assert got[0] == "flashqla"
+        assert "cu_seqlens_cpu" not in got[2], got[2]
+        assert "scale" in got[2], "the shim dropped a kwarg the backend needs"
+        print("DROPPED")
+        """
+    )
+    out = _run_flash_qla_shim(
+        tmp_path, capability=(9, 0), backends=_FLASH_QLA_AVAILABLE, extra=probe
+    )
+    assert out.returncode == 0, out.stderr
+    assert "DROPPED" in out.stdout
+
+
+@pytest.mark.parametrize("capability", [(10, 0), (8, 0), None])
+def test_the_flash_qla_shim_binds_nothing_off_sm90(tmp_path, capability):
+    # sm90 is a CORRECTNESS floor, not a preference. on sm100 the tilelang-based flashqla backward
+    # computes wrong gradients at production shapes (measured dq 1.006 rel err on a B200, training
+    # loss diverging to 14.91 against the control's 13.96 from identical weights) while REPORTING a
+    # 1.047x speedup with a clean A/A null -- fast and wrong, the same failure class as the tilelang
+    # backward this worker already opts out of in perf._force_fla_triton_gdn_on_sm100. note the
+    # existing FLA_TILELANG=0 guard does NOT cover this: flashqla is a separate registry backend
+    # keyed on FLA_FLASH_QLA. a no-op here must also be a CLEAN no-op: the run continues on fla's
+    # own kernel rather than failing, so the fragment still records itself as applied.
+    probe = textwrap.dedent(
+        """
+        import importlib
+        mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        assert getattr(mod.chunk_gated_delta_rule, "_flash_qla_patched", False) is False
+        assert mod.chunk_gated_delta_rule() == "original"
+        print("UNPATCHED")
+        """
+    )
+    out = _run_flash_qla_shim(
+        tmp_path, capability=capability, backends=_FLASH_QLA_AVAILABLE, extra=probe
+    )
+    assert out.returncode == 0, out.stderr
+    assert "UNPATCHED" in out.stdout
+    assert vc.FLASH_FLASH_QLA_MARKER not in out.stdout
+
+
+@pytest.mark.parametrize(
+    "backends",
+    [
+        "[]",  # fla too old to carry the backend at all
+        "[_Backend('flash_qla', False, _flashqla)]",  # present but the wheel is missing
+        "[_Backend('chunk', True, _flashqla)]",  # a different backend must not be mistaken for it
+    ],
+)
+def test_an_unavailable_flash_qla_backend_keeps_training_on_flas_own_kernel(tmp_path, backends):
+    # this fragment must NOT fail closed, unlike every other required fragment. skipping the
+    # boundary-reset shims corrupts training, so those must kill the child; skipping this one only
+    # costs ~5% and leaves the child on exactly the kernel every run before it used.
+    #
+    # it is also the difference between a working deploy and an outage. the worker image is a
+    # MUTABLE tag that presets FLASH_VERL_PYTHON, so resolve_verl_python returns that interpreter
+    # and never runs the provisioning that installs the wheel -- between merge and the image build,
+    # every GDN child reaches this path. a hard exit here would take down all GDN SFT until the
+    # image caught up. assert the child survives AND still records the fragment as applied.
+    probe = textwrap.dedent(
+        """
+        import importlib
+        mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        assert getattr(mod.chunk_gated_delta_rule, "_flash_qla_patched", False) is False
+        assert mod.chunk_gated_delta_rule() == "original", "must stay on fla's own kernel"
+        print("SURVIVED")
+        """
+    )
+    out = _run_flash_qla_shim(tmp_path, capability=(9, 0), backends=backends, extra=probe)
+    assert out.returncode == 0, (out.returncode, out.stderr)
+    assert "SURVIVED" in out.stdout
+    assert "continuing on fla's own kernel" in out.stderr
+    assert vc.FLASH_FLASH_QLA_MARKER not in out.stdout
+
+
+def test_an_fla_without_the_backends_module_does_not_kill_the_child(tmp_path):
+    # THE deploy failure, caught by a live H200 run rather than by any of the tests above. an fla
+    # older than 0.5.2 has no `fla.ops.gated_delta_rule.backends` subpackage AT ALL, so resolving
+    # the backend raises ModuleNotFoundError -- and this resolution happens inside an import loader,
+    # so the exception propagates out of the child's `import transformers...` and kills the run.
+    # that is the state of every worker whose image has not been rebuilt with the new pin yet.
+    # the stubs in the other tests all define the module, so none of them can see this.
+    root = tmp_path / "site"
+    package = root / "transformers" / "models" / "qwen3_5"
+    package.mkdir(parents=True)
+    for parent in (root / "transformers", root / "transformers" / "models", package):
+        (parent / "__init__.py").write_text("")
+    (package / "modeling_qwen3_5.py").write_text(
+        "def chunk_gated_delta_rule(*args, **kwargs):\n    return 'original'\n"
+    )
+    (root / "torch.py").write_text(
+        "class _Cuda:\n"
+        "    @staticmethod\n"
+        "    def is_available():\n        return True\n"
+        "    @staticmethod\n"
+        "    def get_device_capability():\n        return (9, 0)\n"
+        "cuda = _Cuda()\n"
+    )
+    # an OLD fla: importable, but with no backends subpackage under gated_delta_rule.
+    old = root / "fla" / "ops" / "gated_delta_rule"
+    old.mkdir(parents=True)
+    for parent in (root / "fla", root / "fla" / "ops", old):
+        (parent / "__init__.py").write_text("")
+    site = tmp_path / "shimdir"
+    site.mkdir()
+    probe = textwrap.dedent(
+        """
+        import importlib
+        mod = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+        assert mod.chunk_gated_delta_rule() == "original"
+        print("SURVIVED")
+        """
+    )
+    (site / "sitecustomize.py").write_text(vc.render_flash_qla_shim("qwen3_5") + probe)
+    out = subprocess.run(
+        [sys.executable, "-c", ""],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONPATH": f"{site}{os.pathsep}{root}"},
+    )
+    assert out.returncode == 0, (out.returncode, out.stderr)
+    assert "SURVIVED" in out.stdout
+    assert "ModuleNotFoundError" not in out.stderr
+
+
+def test_the_flash_qla_shim_imports_nothing_heavy_at_interpreter_startup(tmp_path):
+    # same multi-card trap as the varlen shim: sitecustomize runs at interpreter startup, and ray
+    # starts each actor's interpreter BEFORE narrowing that actor's CUDA_VISIBLE_DEVICES to its own
+    # card. touching torch here initializes cuda against every gpu, no later env change can rebuild
+    # that device map, and nccl aborts with "Duplicate GPU detected". this fragment probes
+    # torch.cuda.get_device_capability, which makes the deferral load-bearing rather than stylistic.
+    # record import ATTEMPTS, not sys.modules: python swallows a sitecustomize traceback, so a shim
+    # that died early leaves sys.modules as empty as a correct lazy one would.
+    shim = vc.render_flash_qla_shim("qwen3_5")
+    with tempfile.TemporaryDirectory() as shim_dir:
+        recorder = textwrap.dedent(
+            """
+            import sys
+            _flash_seen = []
+
+            class _Recorder:
+                def find_spec(self, fullname, path=None, target=None):
+                    _flash_seen.append(fullname)
+                    return None
+
+            sys.meta_path.insert(0, _Recorder())
+            """
+        )
+        tail = textwrap.dedent(
+            """
+
+            import atexit as _flash_atexit
+            import json as _flash_json
+
+            def _flash_dump(_path=__file__ + ".seen"):
+                with open(_path, "w") as _fh:
+                    _fh.write(_flash_json.dumps(_flash_seen))
+
+            _flash_atexit.register(_flash_dump)
+            """
+        )
+        site = pathlib.Path(shim_dir, "sitecustomize.py")
+        site.write_text(recorder + tail + shim)
+        out = subprocess.run(
+            [sys.executable, "-c", ""],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "PYTHONPATH": shim_dir},
+        )
+        assert out.returncode == 0, out.stderr
+        attempted = json.loads(pathlib.Path(str(site) + ".seen").read_text())
+    assert not [n for n in attempted if n.split(".")[0] in {"torch", "transformers", "fla"}], (
+        f"flashqla shim imported the cuda stack at interpreter startup: {attempted}"
+    )
+
+
+def test_the_flash_qla_shim_patches_a_module_already_imported(tmp_path):
+    # a parent process may have loaded the modeling module before sitecustomize ran, leaving no
+    # import for the finder to intercept. the eager branch is what covers that, and nothing else
+    # exercises it: without it the fragment records itself as applied and patches nothing.
+    probe = textwrap.dedent(
+        """
+        import sys
+        mod = sys.modules["transformers.models.qwen3_5.modeling_qwen3_5"]
+        assert getattr(mod.chunk_gated_delta_rule, "_flash_qla_patched", False) is True
+        assert not [f for f in sys.meta_path if type(f).__name__ == "_FlashQlaFinder"], (
+            "the eager path must not also arm the finder"
+        )
+        print("EAGER")
+        """
+    )
+    pre = "import transformers.models.qwen3_5.modeling_qwen3_5\n"
+    root = tmp_path / "site"
+    out = _run_flash_qla_shim(
+        tmp_path, capability=(9, 0), backends=_FLASH_QLA_AVAILABLE, extra=probe
+    )
+    assert out.returncode == 0, out.stderr
+    # re-run with the module already in sys.modules ahead of the fragment
+    (pathlib.Path(tmp_path, "shimdir") / "sitecustomize.py").write_text(
+        pre + vc.render_flash_qla_shim("qwen3_5") + probe
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", ""],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{pathlib.Path(tmp_path, 'shimdir')}{os.pathsep}{root}",
+        },
+    )
+    assert out.returncode == 0, out.stderr
+    assert "EAGER" in out.stdout
+
+
+def test_the_flash_qla_shim_targets_the_arch_the_gate_verified():
+    # `qwen3_5` and `qwen3_5_moe` are separate modules, so a hardcoded target leaves the MoE
+    # unpatched (the same trap render_gdn_varlen_shim documents). taking the arch also keeps the
+    # finder's lifecycle honest: one target means "patch it, then step off meta_path" is
+    # unambiguous, where a two-target watcher would have to decide when it is done.
+    dense = vc.render_flash_qla_shim("qwen3_5")
+    moe = vc.render_flash_qla_shim("qwen3_5_moe")
+    ast.parse(dense)
+    ast.parse(moe)
+    assert "transformers.models.qwen3_5.modeling_qwen3_5" in dense
+    assert "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe" in moe
+    assert dense != moe
+    # the dense render must not also name the moe module: that is what a two-target shim did.
+    assert "qwen3_5_moe" not in dense
+    # and the gate hands it the SAME arch it hands the boundary shim, so the two cannot disagree
+    source = inspect.getsource(
+        __import__("flash.engine.worker.sft_train_runner", fromlist=["x"])._write_sft_child_shims
+    )
+    assert "render_flash_qla_shim(gdn_reset_arch)" in source
+    assert "render_gdn_varlen_shim(gdn_reset_arch)" in source
+
+
+def test_the_flash_qla_fragment_is_wrapped_fail_closed_for_a_gdn_run():
+    # the fragment must ride the same required-fragment machinery as the boundary resets: rendered
+    # only for a gdn hybrid, wrapped so a failure exits rather than trains unpatched, and named in
+    # expected_shims so verify_applied_shim_markers can catch a sitecustomize that never ran.
+    from flash.engine.worker import sft_train_runner as _sft_runner
+
+    source = inspect.getsource(_sft_runner._write_sft_child_shims)
+    assert '("flashqla-gdn", render_flash_qla_shim(gdn_reset_arch))' in source
+    gdn_at = source.index('("gdn-varlen"')
+    qla_at = source.index('("flashqla-gdn"')
+    gate_at = source.index("if gdn_reset_arch is not None:")
+    assert gate_at < gdn_at < qla_at, (
+        "the flashqla fragment must sit inside the same gdn gate as the boundary resets"
+    )
+    wrapped = vc.wrap_shim_fragment("flashqla-gdn", vc.render_flash_qla_shim("qwen3_5"))
+    assembled = vc.render_shim_marker_prologue("/unused") + wrapped
+    ast.parse(assembled)
+    assert str(vc.SHIM_FRAGMENT_FAILED_EXIT_CODE) in assembled
+
+
+@pytest.mark.parametrize("flashqla_first", [False, True])
+def test_both_gdn_finders_patch_the_same_module_without_recursing(tmp_path, flashqla_first):
+    # a gdn run arms BOTH finders on the SAME modeling module, and each fragment is rendered
+    # independently so neither can name the other's class. two ways to get this wrong, and this
+    # asserts against both at once:
+    #
+    #   delegate to "everything that is not my own class" -> each calls into the other's find_spec
+    #   forever, RecursionError before the model is built, every gdn sft child dead.
+    #
+    #   delegate to "everything that is not a flash finder" -> whichever runs first resolves the
+    #   spec alone, python never consults the second, and that patch silently never applies while
+    #   its marker still records success. that one is WORSE: unpatched boundaries corrupt training
+    #   instead of stopping it.
+    #
+    # so assert both patches landed, not merely that the import survived. parametrized on arming
+    # order because sitecustomize concatenation order is not a contract.
+    root = pathlib.Path(tmp_path, "root")
+    model_dir = root / "transformers" / "models" / "qwen3_5"
+    model_dir.mkdir(parents=True)
+    for parent in (root / "transformers", root / "transformers" / "models", model_dir):
+        (parent / "__init__.py").write_text("")
+    (model_dir / "modeling_qwen3_5.py").write_text(
+        "def chunk_gated_delta_rule(*a, **k):\n    return ('original', a)\n"
+        "class Qwen3_5TextModel:\n    def forward(self, *a, **k):\n        return None\n"
+    )
+    (root / "transformers" / "modeling_flash_attention_utils.py").write_text(
+        "def _is_packed_sequence(*a, **k):\n    return False\n"
+        "def prepare_fa_kwargs_from_position_ids(*a, **k):\n    return ((None, None), (None, None))\n"
+    )
+    (root / "torch.py").write_text(
+        "class _Cuda:\n"
+        "    @staticmethod\n    def is_available():\n        return True\n"
+        "    @staticmethod\n    def get_device_capability():\n        return (9, 0)\n"
+        "cuda = _Cuda()\n"
+    )
+    backends = root / "fla" / "ops" / "gated_delta_rule" / "backends"
+    backends.mkdir(parents=True)
+    for parent in (root / "fla", root / "fla" / "ops", root / "fla" / "ops" / "gated_delta_rule"):
+        (parent / "__init__.py").write_text("")
+    (backends / "__init__.py").write_text(
+        "class _B:\n"
+        "    backend_type = 'flash_qla'\n"
+        "    def is_available(self):\n        return True\n"
+        "    def chunk_gated_delta_rule(self, *a, **k):\n        return ('flashqla', a)\n"
+        "class _R:\n    def _get_sorted_backends(self):\n        return [_B()]\n"
+        "gdr_registry = _R()\n"
+    )
+    fragments = [vc.render_gdn_varlen_shim("qwen3_5"), vc.render_flash_qla_shim("qwen3_5")]
+    if flashqla_first:
+        fragments.reverse()
+    site = pathlib.Path(tmp_path, "shimdir")
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        "".join(fragments)
+        + textwrap.dedent(
+            """
+            import importlib
+            _m = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+            assert getattr(_m.chunk_gated_delta_rule, "_flash_qla_patched", False), "qla dropped"
+            assert getattr(
+                _m.Qwen3_5TextModel.forward, "_flash_gdn_varlen_patched", False
+            ), "varlen dropped"
+            print("BOTH")
+            """
+        )
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", ""],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONPATH": f"{site}{os.pathsep}{root}"},
+    )
+    assert "RecursionError" not in out.stderr, out.stderr
+    assert out.returncode == 0, out.stderr
+    assert "BOTH" in out.stdout
 
 
 def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
@@ -4732,15 +5162,16 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
 # ---------------------- fail-closed sitecustomize fragments (child_io) ----------------------
 
 
-def _compose_wrapped_sitecustomize(tmp_path, *fragments):
-    """write a sitecustomize from the real prologue + wrapper; return (shim_dir, marker_file)."""
+def _compose_wrapped_sitecustomize(tmp_path, *fragments, wrapped_fragments=()):
+    """write a sitecustomize from the real prologue + wrappers; return its paths."""
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir(exist_ok=True)
     marker_file = vc.shim_marker_file(str(shim_dir))
     source = vc.render_shim_marker_prologue(marker_file)
     for name, fragment in fragments:
         source += vc.wrap_shim_fragment(name, fragment)
-    (shim_dir / "sitecustomize.py").write_text(source)
+    source += "".join(wrapped_fragments)
+    (shim_dir / "sitecustomize.py").write_text(source, encoding="utf-8")
     return shim_dir, marker_file
 
 
@@ -4842,3 +5273,306 @@ def test_wrapping_the_real_rendered_fragments_stays_valid_python(tmp_path):
     compile(source, "sitecustomize.py", "exec")
     # and the empty fragment stays empty: a feature that is off has nothing to prove.
     assert vc.wrap_shim_fragment("off-feature", "") == ""
+
+
+def _lora_rollout_server_module(loaded, *, lora_as_adapter=True):
+    """a stub shaped like the pinned verl module the guard patches.
+
+    at freesolo-co/verl@32d6200d, ``vLLMHttpServer.generate`` is an async method whose first
+    positional argument is ``prompt_ids`` and which carries several keyword-only extras, and
+    ``VLLM_LORA_INT_ID`` is a module-level constant the guard reads back rather than hardcoding.
+    """
+    import types as _types
+
+    module = _types.ModuleType("verl.workers.rollout.vllm_rollout.vllm_async_server")
+    module.VLLM_LORA_INT_ID = 123
+
+    class _Engine:
+        def __init__(self, ids):
+            self._ids = set(ids)
+            self.calls = 0
+
+        async def list_loras(self):
+            self.calls += 1
+            return set(self._ids)
+
+        def generate(self, *args, **kwargs):
+            return ("generated", kwargs.get("lora_request"))
+
+    # name matched to verl's own class: the shim looks it up by this exact attribute.
+    class vLLMHttpServer:  # noqa: N801
+        # set to force the request verl hands the engine, independently of what list_loras says.
+        lora_request_override = "unset"
+
+        def __init__(self):
+            self.lora_as_adapter = lora_as_adapter
+            self.engine = _Engine(loaded)
+
+        async def generate(
+            self,
+            prompt_ids,
+            sampling_params,
+            request_id,
+            image_data=None,
+            priority=0,
+            **kwargs,
+        ):
+            # verl's own body at vllm_async_server.py:524-538: it decides lora_request from its
+            # own lookup and hands it to the engine. reproducing that here is what makes these
+            # tests able to fail -- a stub that never consults list_loras cannot catch a guard
+            # that checks a different value than the one generation actually uses.
+            lora_request = None
+            if self.lora_as_adapter and module.VLLM_LORA_INT_ID in await self.engine.list_loras():
+                lora_request = f"lora:{module.VLLM_LORA_INT_ID}"
+            if self.lora_request_override != "unset":
+                lora_request = self.lora_request_override
+            self.engine.generate(
+                prompt=list(prompt_ids),
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+                priority=priority,
+            )
+            return ("generated", list(prompt_ids), request_id, priority)
+
+    module.vLLMHttpServer = vLLMHttpServer
+    return module
+
+
+def _install_lora_rollout_module(module, monkeypatch):
+    import sys as _sys
+
+    for name in (
+        "verl",
+        "verl.workers",
+        "verl.workers.rollout",
+        "verl.workers.rollout.vllm_rollout",
+    ):
+        stub = type(_sys)(name)
+        stub.__path__ = []
+        monkeypatch.setitem(_sys.modules, name, stub)
+    monkeypatch.setitem(_sys.modules, module.__name__, module)
+
+
+def _apply_lora_rollout_guard(module, monkeypatch):
+    """exec the fragment against an already-imported module, the way a ray actor re-import hits it."""
+    _install_lora_rollout_module(module, monkeypatch)
+    exec(compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+
+
+def test_the_lora_rollout_guard_routes_patch_errors_to_the_fail_closed_handler(
+    tmp_path, monkeypatch
+):
+    module = _lora_rollout_server_module({123})
+    del module.vLLMHttpServer
+    _install_lora_rollout_module(module, monkeypatch)
+
+    marker_file = _child_io.shim_marker_file(str(tmp_path))
+    namespace = {}
+    exec(_child_io.render_shim_marker_prologue(marker_file), namespace)
+    failures = []
+
+    def fail_closed(name):
+        failures.append(name)
+        raise RuntimeError("failed closed")
+
+    namespace["_flash_required_shim_failed"] = fail_closed
+    with pytest.raises(RuntimeError, match="failed closed"):
+        exec(_child_io.render_lora_rollout_guard_fragment(), namespace)
+    # the fake raises instead of exiting, so the outer wrapper catches it and reports again.
+    assert failures == [_child_io.LORA_ROLLOUT_GUARD_SHIM] * 2
+
+
+def test_the_lora_rollout_guard_refuses_to_generate_from_the_base_model(monkeypatch):
+    """the defect this guard exists for: verl leaves ``lora_request`` None when the adapter is not
+    in the engine's loaded set and generates from the base model anyway -- no raise, no counter.
+    an opd run then distils a policy it never rolled out, and the loss curve looks fine."""
+    import asyncio
+
+    module = _lora_rollout_server_module(set())
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="refusing to roll out from the base model"):
+        asyncio.run(module.vLLMHttpServer().generate([1, 2, 3], {}, "req-1"))
+
+
+def test_the_lora_rollout_guard_names_the_adapter_in_the_failure(monkeypatch):
+    """the message has to be actionable from the child log alone: which adapter was expected."""
+    import asyncio
+
+    module = _lora_rollout_server_module({7, 9})
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-1"))
+    assert "123" in str(excinfo.value)
+
+
+def test_the_lora_rollout_guard_fails_a_base_model_call_its_own_lookup_would_clear(monkeypatch):
+    """the guard must gate on the request verl actually built, not on a second lookup of its own.
+
+    here ``list_loras`` reports the adapter loaded, but generation still reaches the engine with
+    ``lora_request=None`` -- verl's own lookup disagreed, or the request was built before the
+    adapter landed. a guard that re-queries ``list_loras`` and delegates sees a healthy engine and
+    waves this through, which is exactly the base-model rollout it was written to stop. only a
+    guard reading the outgoing request catches it.
+    """
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+    server = module.vLLMHttpServer()
+    # verl's decision, not the engine's inventory, is what reaches generation.
+    server.lora_request_override = None
+
+    with pytest.raises(RuntimeError, match="refusing to roll out from the base model"):
+        asyncio.run(server.generate([1], {}, "req-no-lora-request"))
+
+
+def test_the_lora_rollout_guard_adds_no_engine_round_trip_per_rollout(monkeypatch):
+    """``list_loras`` is an awaited zeromq utility rpc, not a local read. checking it a second time
+    would double the adapter-list control-plane traffic on every grpo/opd rollout request."""
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+    server = module.vLLMHttpServer()
+
+    asyncio.run(server.generate([1], {}, "req-a"))
+    asyncio.run(server.generate([2], {}, "req-b"))
+
+    # exactly verl's own one lookup per request, with nothing added by the guard.
+    assert server.engine.calls == 2
+
+
+def test_the_lora_rollout_guard_passes_the_call_through_once_the_adapter_is_loaded(monkeypatch):
+    """the guard must preserve verl's healthy-path arguments and return value."""
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    result = asyncio.run(
+        module.vLLMHttpServer().generate([1, 2], {}, "req-9", image_data=None, priority=3)
+    )
+
+    assert result == ("generated", [1, 2], "req-9", 3)
+
+
+def test_the_lora_rollout_guard_stays_out_of_a_merged_lora_rollout(monkeypatch):
+    """``lora_as_adapter`` is false when the adapter is merged into the base weights, and such a
+    rollout legitimately carries no LoRARequest. mirroring verl's own condition keeps the guard
+    from failing a run that is behaving correctly."""
+    import asyncio
+
+    module = _lora_rollout_server_module(set(), lora_as_adapter=False)
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    assert asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-2"))[0] == "generated"
+
+
+def test_the_lora_rollout_guard_does_not_wrap_itself_twice(monkeypatch):
+    """every ray actor imports the same sitecustomize; stacking wrappers would add a
+    ``list_loras`` round trip per layer to every request."""
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+    first = module.vLLMHttpServer.generate
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    assert module.vLLMHttpServer.generate is first
+    assert asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-3"))[0] == "generated"
+
+
+def test_the_lora_rollout_guard_patches_the_module_on_a_real_deferred_import(tmp_path, monkeypatch):
+    """the production path: sitecustomize runs before verl is importable, so the guard arms a
+    meta_path finder and must patch the module object the caller actually receives."""
+    import asyncio
+    import importlib
+    import sys as _sys
+
+    package = tmp_path / "verl" / "workers" / "rollout" / "vllm_rollout"
+    package.mkdir(parents=True)
+    for parent in (
+        tmp_path / "verl",
+        tmp_path / "verl" / "workers",
+        tmp_path / "verl" / "workers" / "rollout",
+        package,
+    ):
+        (parent / "__init__.py").write_text("")
+    (package / "vllm_async_server.py").write_text(
+        textwrap.dedent(
+            """
+            VLLM_LORA_INT_ID = 123
+
+
+            class _Engine:
+                async def list_loras(self):
+                    return set()
+
+                def generate(self, **kwargs):
+                    return "generated"
+
+
+            class vLLMHttpServer:
+                def __init__(self):
+                    self.lora_as_adapter = True
+                    self.engine = _Engine()
+
+                async def generate(self, prompt_ids, sampling_params, request_id, **kwargs):
+                    lora_request = None
+                    if VLLM_LORA_INT_ID in await self.engine.list_loras():
+                        lora_request = "lora"
+                    return self.engine.generate(
+                        prompt=prompt_ids, lora_request=lora_request
+                    )
+            """
+        )
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    target = "verl.workers.rollout.vllm_rollout.vllm_async_server"
+    for name in list(_sys.modules):
+        if name == "verl" or name.startswith("verl."):
+            monkeypatch.delitem(_sys.modules, name, raising=False)
+    # importing the fake tree adds entries monkeypatch never recorded, so undoing its deletions
+    # would leave this tmp_path package shadowing the real verl for every later test in the run.
+    imported = set(_sys.modules)
+    armed = list(_sys.meta_path)
+    monkeypatch.setattr(_sys, "meta_path", armed)
+
+    shim_dir, marker_file = _compose_wrapped_sitecustomize(
+        tmp_path,
+        wrapped_fragments=(_child_io.render_lora_rollout_guard_fragment(),),
+    )
+    source = (shim_dir / "sitecustomize.py").read_text(encoding="utf-8")
+    exec(compile(source, "sitecustomize.py", "exec"), {})
+    assert _child_io.read_applied_shim_markers(marker_file) == set()
+    try:
+        module = importlib.import_module(target)
+
+        assert _child_io.read_applied_shim_markers(marker_file) == {"lora-rollout-guard"}
+        with pytest.raises(RuntimeError, match="refusing to roll out from the base model"):
+            asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-4"))
+        # the finder removes itself once it has fired, so it never sits on later imports.
+        assert not [f for f in _sys.meta_path if type(f).__name__ == "_FlashLoraFinder"]
+    finally:
+        for name in set(_sys.modules) - imported:
+            if name == "verl" or name.startswith("verl."):
+                del _sys.modules[name]
+
+
+def test_the_lora_rollout_guard_imports_nothing_heavy_at_interpreter_startup():
+    """sitecustomize runs before ray narrows the actor's CUDA_VISIBLE_DEVICES. importing vllm or
+    torch here would initialize cuda against every visible gpu and strand each rank on device 0."""
+    import sys as _sys
+
+    before = set(_sys.modules)
+    exec(compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+    heavy = {
+        name
+        for name in set(_sys.modules) - before
+        if name.split(".")[0] in {"torch", "vllm", "transformers", "ray"}
+    }
+
+    assert heavy == set()

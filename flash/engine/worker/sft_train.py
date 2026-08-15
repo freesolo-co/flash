@@ -355,6 +355,7 @@ from flash.engine.worker.backend_common import (  # noqa: E402,F401
     parse_verl_metric,
     parse_wandb_link,
     probe_verl_capabilities,
+    render_flash_qla_shim,
     render_gdn_varlen_shim,
     render_shim_marker_prologue,
     render_wandb_link_shim,

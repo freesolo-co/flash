@@ -316,6 +316,34 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     )
 
 
+def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
+    """Write the line that says everything above belongs to a previous attempt.
+
+    The run log is one append-only file for the whole run, so a retry's output lands directly after
+    the dead attempt's traceback with nothing in between. `flash runs log` tails that file, so while
+    a replacement worker is booting the tail still ends in the OOM stack that caused the retry --
+    an operator checking a run that is currently fine reads a failure. The status line already
+    carries `attempt=` and `(prev attempt)`, but those come from the heartbeat and describe the run,
+    not the bytes; nothing marked the bytes themselves.
+
+    Written for attempt > 0 only. Attempt 0 has nothing above it to disown, and a header on every
+    single-attempt run would be noise on the common path.
+
+    The line names only where attempt N BEGINS. Saying "everything above is attempt N-1" is false
+    from the second retry on: above attempt 2 sit attempts 0 and 1, and the log is also written by
+    the poller and the billing retry path, so no single attempt owns the preceding bytes anyway. A
+    boundary the reader can trust is worth more than an attribution that is right once.
+    """
+    if attempt <= 0:
+        return
+    with contextlib.suppress(Exception):
+        print(
+            f"---- attempt {attempt} starts here; everything above it is from earlier attempts ----",
+            file=ctx.log,
+            flush=True,
+        )
+
+
 def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOutcome:
     from flash.runner import (
         _reserve_attempt,
@@ -346,6 +374,7 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
         expected_next_attempt=expected_next_attempt,
     )
     ctx.current_attempt = attempt
+    _mark_attempt_boundary(ctx, attempt)
     attempt_runtime_secrets = dict(ctx.runtime_secrets or {})
     attempt_runtime_secrets.pop(OPD_RESUME_REVISION_ENV, None)
     if opd_resume_revision is not None:
