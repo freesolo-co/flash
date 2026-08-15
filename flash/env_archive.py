@@ -471,6 +471,10 @@ _CPIO_NEWC_MAGICS = (b"070701", b"070702")
 _CPIO_ODC_MAGIC = b"070707"
 _CPIO_NEWC_HEADER = 110
 _CPIO_ODC_HEADER = 76
+_CPIO_BINARY_HEADER = 26
+_CPIO_BINARY_MAGICS = {b"\xc7q": "little", b"q\xc7": "big"}
+_CPIO_MAX_NAME = 4096
+_CPIO_PROBE_BYTES = _CPIO_BINARY_HEADER + _CPIO_MAX_NAME
 _CPIO_FILESIZE = 6
 _CPIO_NAMESIZE = 11
 _CPIO_ODC_NAMESIZE = slice(59, 65)
@@ -479,8 +483,32 @@ _CPIO_OCTAL = frozenset(b"01234567")
 _CPIO_HEX = frozenset(b"0123456789abcdefABCDEF")
 
 
+def _binary_cpio_order(probe: bytes) -> str | None:
+    """The 16-bit byte order of a structurally plausible binary cpio header."""
+    if len(probe) < _CPIO_BINARY_HEADER or (order := _CPIO_BINARY_MAGICS.get(probe[:2])) is None:
+        return None
+    mode = int.from_bytes(probe[6:8], order)
+    links = int.from_bytes(probe[12:14], order)
+    name_size = int.from_bytes(probe[20:22], order)
+    name_end = _CPIO_BINARY_HEADER + name_size
+    file_type = mode & 0o170000
+    if (
+        file_type not in (0o010000, 0o020000, 0o040000, 0o060000, 0o100000, 0o120000, 0o140000)
+        or not 1 <= links <= 4096
+        or not 1 <= name_size <= _CPIO_MAX_NAME
+        or name_end > len(probe)
+        or probe[name_end - 1] != 0
+    ):
+        return None
+    # anchored random acceptance is at most 2^-33: 16 magic bits, four each from the name and link
+    # bounds, one from the file type, and eight from the required terminal nul before any walk runs.
+    return order
+
+
 def _looks_like_cpio_header(probe: bytes) -> bool:
-    """Whether `probe` carries a complete newc, crc, or portable-ASCII cpio header."""
+    """Whether `probe` carries a complete ascii or legacy binary cpio header."""
+    if _binary_cpio_order(probe) is not None:
+        return True
     if len(probe) >= _CPIO_NEWC_HEADER and probe.startswith(_CPIO_NEWC_MAGICS):
         return all(byte in _CPIO_HEX for byte in probe[6:_CPIO_NEWC_HEADER])
     if len(probe) < _CPIO_ODC_HEADER or not probe.startswith(_CPIO_ODC_MAGIC):
@@ -607,6 +635,49 @@ def _credential_in_odc(
     raise refusal("contains an archive with too many members to inspect")
 
 
+def _credential_in_binary_cpio(
+    data: bytes,
+    *,
+    deadline: float,
+    depth: int,
+    scan: Scanner,
+    refusal: type[Exception],
+    named: Namer,
+    member_limit: int,
+) -> str | None:
+    """Walk the aligned 16-bit fields used by legacy binary cpio archives."""
+    at = 0
+    for _ in range(member_limit):
+        if time.monotonic() > deadline:
+            raise refusal("takes too long to decompress")
+        header = data[at : at + _CPIO_BINARY_HEADER]
+        if (order := _binary_cpio_order(data[at : at + _CPIO_PROBE_BYTES])) is None:
+            raise refusal("contains an archive member this check cannot read")
+        name_size = int.from_bytes(header[20:22], order)
+        size = int.from_bytes(header[22:26], order)
+        name_at = at + _CPIO_BINARY_HEADER
+        name_end = name_at + name_size
+        body_at = (name_end + 1) & ~1
+        body_end = body_at + size
+        next_at = (body_end + 1) & ~1
+        kind, finished = _scan_cpio_member(
+            data,
+            data[name_at : name_end - 1].decode("utf-8", "replace"),
+            body_at,
+            body_end,
+            next_at,
+            deadline,
+            depth,
+            scan,
+            refusal,
+            named,
+        )
+        if kind or finished or next_at >= len(data):
+            return kind
+        at = next_at
+    raise refusal("contains an archive with too many members to inspect")
+
+
 def credential_in_cpio(
     source: Path | bytes,
     *,
@@ -621,7 +692,7 @@ def credential_in_cpio(
     """The kind of credential in a structurally valid cpio archive, or None."""
     if isinstance(source, Path):
         with source.open("rb") as head:
-            probe = head.read(_CPIO_NEWC_HEADER)
+            probe = head.read(_CPIO_PROBE_BYTES)
         if not _looks_like_cpio_header(probe):
             return None
         if size_limit is not None and source.stat().st_size > size_limit:
@@ -629,9 +700,15 @@ def credential_in_cpio(
         data = source.read_bytes()
     else:
         data = source
-        if not _looks_like_cpio_header(data[:_CPIO_NEWC_HEADER]):
+        if not _looks_like_cpio_header(data[:_CPIO_PROBE_BYTES]):
             return None
-    walker = _credential_in_odc if data.startswith(_CPIO_ODC_MAGIC) else _credential_in_newc
+    walker = (
+        _credential_in_binary_cpio
+        if data[:2] in _CPIO_BINARY_MAGICS
+        else _credential_in_odc
+        if data.startswith(_CPIO_ODC_MAGIC)
+        else _credential_in_newc
+    )
     return walker(
         data,
         deadline=deadline,

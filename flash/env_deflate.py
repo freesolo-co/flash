@@ -53,8 +53,13 @@ _FLATE_NAME = b"".join(
     rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for letter in b"FlateDecode"
 )
 _PDF_STREAM = re.compile(rb"/%s\b[\s\S]{0,%d}?\bstream%s" % (_FLATE_NAME, _PDF_GAP, _PDF_EOL))
-_PDF_LONG_DICTIONARY = re.compile(
-    rb"/%s\b[^<>]{0,%d}?>>\s*stream%s" % (_FLATE_NAME, 1 << 16, _PDF_EOL)
+# the caller buffers at most 64 mib of one pdf, so this reaches every dictionary it can approve.
+# a minimum above `_PDF_GAP` finds only streams the ordinary payload walk cannot pair, avoiding the
+# previous count of all compact streams and refusing a declaration wherever it sits in the document.
+_MAX_PDF_DICTIONARY_GAP = 1 << 26
+_PDF_UNREACHED_STREAM = re.compile(
+    rb"/%s\b[^<>]{%d,%d}?>>\s*stream%s"
+    % (_FLATE_NAME, _PDF_GAP + 1, _MAX_PDF_DICTIONARY_GAP, _PDF_EOL)
 )
 _MAX_PDF_STREAMS = 4096
 
@@ -88,6 +93,17 @@ _PDF_SEPARATOR = rb"(?:\s|%[^\r\n]*(?:\r\n|\r|\n))*"
 # An indirect reference needs at least one separator between each token. The lookahead supplies that
 # requirement while `_PDF_SEPARATOR` consumes comments as well as whitespace.
 _PDF_REQUIRED_SEPARATOR = rb"(?=[\s%])" + _PDF_SEPARATOR
+
+# inline images live inside page content rather than object dictionaries. `BI ... ID` introduces
+# their bytes, and `/F /Fl` is the standard abbreviated spelling of `/Filter /FlateDecode`. the
+# object-stream walk never enumerated them, so a zlib blob containing a key was approved as literal
+# pdf bytes. the header reach equals the largest pdf the caller will buffer, so every inline image
+# in a document this scan can approve has its `ID` delimiter considered.
+_PDF_INLINE_IMAGE = re.compile(
+    rb"(?<![A-Za-z0-9])BI(?P<header>[\s\S]{0,%d}?)\bID(?:\r\n|[\x00\t\n\f\r ])"
+    % _MAX_PDF_DICTIONARY_GAP
+)
+_PDF_INLINE_FILTER = re.compile(rb"/(?:F|Filter)%s/(?:Fl|FlateDecode)\b" % _PDF_SEPARATOR)
 # How far back `_dictionary_start` will look for that opening bracket. A document is untrusted
 # input: without a bound, one that never opens a dictionary would be walked from every stream in it
 # back to byte zero. 64 KiB is far beyond any real object dictionary and still linear per stream.
@@ -526,6 +542,25 @@ def _raw_deflate_from(blocks: Iterator[bytes], budget: int) -> bytes | None:
     return plain if plain and inflate.eof and not inflate.unused_data else b""
 
 
+def _pdf_inline_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
+    """Inflated payloads of inline images whose abbreviated filter declares flate."""
+    images = _PDF_INLINE_IMAGE.finditer(data)
+    for found in itertools.islice(images, _MAX_PDF_STREAMS):
+        if not _PDF_INLINE_FILTER.search(found.group("header")):
+            continue
+        inflate = zlib.decompressobj()
+        try:
+            plain = inflate.decompress(data[found.end() :], budget)
+        except zlib.error:
+            continue
+        if inflate.unconsumed_tail:
+            yield None
+        elif inflate.eof:
+            yield plain
+    if next(images, None) is not None:
+        raise _TooManyStreams
+
+
 def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     """What each `/FlateDecode` stream in a PDF inflates to, or None for one over `budget`.
 
@@ -559,11 +594,9 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     # passphrase is not ours to have, so the only honest answer is undecided.
     if _pdf_has_encryption_dictionary(data):
         raise _EncryptedDocument
-    # A dictionary too long for the gap is undecided, not clean. Raised before the walk so a
-    # document carrying one such object refuses whatever its other streams inflate to. Compared
-    # against the gap-bounded pattern rather than searched alone: every stream `_PDF_STREAM` pairs
-    # is also found here, so only a SURPLUS means one sits beyond the bound.
-    if len(_PDF_LONG_DICTIONARY.findall(data)) > len(_PDF_STREAM.findall(data)):
+    # a dictionary too long for the payload walk is undecided, not clean. this searches only gaps
+    # beyond that walk's cap, so one match proves a declared stream was never going to be expanded.
+    if _PDF_UNREACHED_STREAM.search(data):
         raise _UnreachedStream
     # Indirect decode parameters hide whether a predictor must be undone. A predictor-encoded key
     # inflated into differences containing no literal credential, so unresolved parameters are
@@ -596,6 +629,7 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     # other bound here already refuses rather than truncating -- this one returned a verdict.
     if next(streams, None) is not None:
         raise _TooManyStreams
+    yield from _pdf_inline_payloads(data, budget)
 
 
 def _dictionary_start(data: bytes, at: int) -> int:

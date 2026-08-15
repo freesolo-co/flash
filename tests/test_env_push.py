@@ -9657,3 +9657,280 @@ def test_a_broken_base64_container_run_is_reconstructed_at_one_seam(tmp_path):
         published = tmp_path / f"{name}.json"
         published.write_text(f'{{"blob":"{value}"}}\n')
         assert credential_in_file(published) == "a Freesolo API key", name
+
+
+def test_unix_compress_is_refused_when_lzw_cannot_be_expanded(tmp_path):
+    """Unix compress is opaque to the stdlib, so scanning its lzw bytes approved a hidden key."""
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    control = tmp_path / "control.txt"
+    control.write_bytes(key)
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    table = {bytes((byte,)): byte for byte in range(256)}
+    codes: list[int] = []
+    current = b""
+    next_code = 257
+    for byte in key:
+        candidate = current + bytes((byte,))
+        if candidate in table:
+            current = candidate
+            continue
+        codes.append(table[current])
+        table[candidate] = next_code
+        next_code += 1
+        current = candidate[-1:]
+    codes.append(table[current])
+    bits = sum(code << (9 * index) for index, code in enumerate(codes))
+    packed = b"\x1f\x9d\x90" + bits.to_bytes((9 * len(codes) + 7) // 8, "little")
+
+    published = tmp_path / "payload.Z"
+    published.write_bytes(packed)
+    with pytest.raises(_Unscannable, match="Unix compress"):
+        credential_in_file(published)
+
+
+def test_an_assigned_value_cannot_cross_onto_the_next_mapping_key(tmp_path):
+    """Assignment whitespace crossed a newline and adopted an unrelated 40-hex yaml key."""
+    from flash.env_secrets import credential_in_file
+
+    key = "0123456789abcdef0123456789abcdef01234567"
+    control = tmp_path / "control.yaml"
+    control.write_text(f"wandb:\n  WANDB_API_KEY: {key}\n")
+    assert credential_in_file(control) == "a Weights & Biases API key"
+
+    for name, text in (
+        ("nested.yaml", f"wandb:\n  WANDB_API_KEY:\n  {key}: somevalue\n"),
+        ("plain.yaml", f"WANDB_API_KEY:\n{key}: somevalue\n"),
+    ):
+        published = tmp_path / name
+        published.write_text(text)
+        assert credential_in_file(published) is None, name
+
+
+def test_shell_quoted_backslashes_are_not_decoded_as_python_escapes(tmp_path):
+    """Posix shell quotes keep `\\x`, so python escape decoding invented a credential."""
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY
+    escaped = body[:10] + f"\\x{ord(body[10]):02x}" + body[11:]
+    control = tmp_path / "control.sh"
+    control.write_text(f"API_KEY='fslo_{body}'\n")
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    for name, quote in (("single.sh", "'"), ("double.sh", '"')):
+        published = tmp_path / name
+        published.write_text(f"API_KEY={quote}fslo_{escaped}{quote}\n")
+        assert credential_in_file(published) is None, name
+
+
+def test_base64_decoded_raw_deflate_reenters_the_container_scan(tmp_path):
+    """Raw deflate has no magic, so the decoded-container gate discarded its hidden key."""
+    import zlib
+
+    from flash.env_secrets import credential_in_file, credential_in_name
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    raw = compressor.compress(key) + compressor.flush()
+    control = tmp_path / "control.deflate"
+    control.write_bytes(raw)
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    encoded = base64.b64encode(raw)
+    published = tmp_path / "payload.b64"
+    published.write_bytes(encoded + b"\n")
+    assert credential_in_file(published) == "a Freesolo API key"
+    assert credential_in_name(encoded.decode()) == "a Freesolo API key"
+
+
+def test_a_pdf_dictionary_beyond_the_lookback_is_refused(tmp_path):
+    """A flate declaration outside the 64 kib lookback left its stream approved as literal bytes."""
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    packed = zlib.compress((f"fslo_{_FAKE_KEY_BODY}" * 40).encode())
+
+    def document(gap: int) -> bytes:
+        return (
+            b"%PDF-1.4\n4 0 obj\n<< /Filter /FlateDecode /Note ("
+            + b"x" * gap
+            + b") /Length "
+            + str(len(packed)).encode()
+            + b" >>\nstream\n"
+            + packed
+            + b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+        )
+
+    control = tmp_path / "control.pdf"
+    control.write_bytes(document(100))
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    published = tmp_path / "beyond.pdf"
+    published.write_bytes(document(70_000))
+    with pytest.raises(_Unscannable, match="could not locate"):
+        credential_in_file(published)
+
+
+def test_a_flate_pdf_inline_image_is_inspected(tmp_path):
+    """Inline images use `BI ... ID` rather than object dictionaries, so their zlib bytes were skipped."""
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    packed = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+    control = tmp_path / "control.pdf"
+    control.write_bytes(_flate_pdf(b"/Filter /FlateDecode", packed))
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    published = tmp_path / "inline.pdf"
+    published.write_bytes(
+        b"%PDF-1.4\n4 0 obj\n<< /Length 100 >>\nstream\n"
+        b"BI /W 21 /H 1 /CS /G /BPC 8 /F /Fl ID "
+        + packed
+        + b" EI\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+    )
+    assert credential_in_file(published) == "a Freesolo API key"
+
+
+@pytest.mark.wallclock
+def test_broken_base64_reconstruction_honours_the_shared_deadline(tmp_path):
+    """Speculative misses swallowed timeouts, so every remaining seam ran after the budget expired."""
+    import gzip
+    import time
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    rows = []
+    for index in range(120):
+        filler = bytes((index * 7 + offset * 31) % 251 for offset in range(16 << 10))
+        encoded = base64.b64encode(gzip.compress(filler, mtime=0)).decode()
+        cut = len(encoded) // 2
+        rows.append(f"value_{index}: {encoded[:cut]}!{encoded[cut + 1 :]}")
+    published = tmp_path / "broken.yaml"
+    published.write_text("\n".join(rows) + "\n")
+
+    budget = 0.5
+    started = time.monotonic()
+    timed_out = False
+    try:
+        credential_in_file(published, deadline=started + budget)
+    except _Unscannable as exc:
+        timed_out = "too long" in str(exc)
+    elapsed = time.monotonic() - started
+    assert elapsed < budget * 3, f"deadline overran: {elapsed:.3f}s for a {budget:.1f}s budget"
+    assert timed_out, "the shared deadline expired without refusing the unscanned content"
+
+
+def test_a_pdf_nested_in_a_zip_reenters_the_pdf_stream_walk(tmp_path):
+    """The nested predicate omitted `%PDF-`, so a zip member bypassed every PDF stream repair."""
+    import io
+    import zipfile
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    packed = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+    pdf = _flate_pdf(b"/Filter /FlateDecode", packed)
+    control = tmp_path / "control.pdf"
+    control.write_bytes(pdf)
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    nested = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("document.pdf", io.BytesIO(pdf).getvalue())
+    assert credential_in_file(nested) == "a Freesolo API key"
+
+
+def test_every_ascii_cpio_layout_is_dispatched_when_nested(tmp_path):
+    """The nested gate named only newc, leaving crc and odc walkers reachable only at top level."""
+    import io
+    import zipfile
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    payload = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+
+    def newc(magic: bytes) -> bytes:
+        name = b"payload.zz\0"
+        fields = (1, 0o100644, 0, 0, 1, 0, len(payload), 0, 0, 0, 0, len(name), sum(payload))
+        data = bytearray(magic + b"".join(f"{value:08x}".encode() for value in fields))
+        data += name
+        data += b"\0" * (-len(data) % 4)
+        data += payload
+        data += b"\0" * (-len(data) % 4)
+        return bytes(data)
+
+    def odc() -> bytes:
+        name = b"payload.zz\0"
+        fields = (0, 1, 0o100644, 0, 0, 1, 0)
+        header = b"070707" + b"".join(f"{value:06o}".encode() for value in fields)
+        header += f"{0:011o}{len(name):06o}{len(payload):011o}".encode()
+        return header + name + payload
+
+    for label, archive in (("newc", newc(b"070701")), ("crc", newc(b"070702")), ("odc", odc())):
+        control = tmp_path / f"{label}.cpio"
+        control.write_bytes(archive)
+        assert credential_in_file(control) == "a Freesolo API key", label
+
+        nested = tmp_path / f"{label}.zip"
+        with zipfile.ZipFile(nested, "w", zipfile.ZIP_DEFLATED) as zipped:
+            zipped.writestr("inner.cpio", io.BytesIO(archive).getvalue())
+        assert credential_in_file(nested) == "a Freesolo API key", label
+
+
+def test_legacy_binary_cpio_is_walked_in_both_byte_orders(tmp_path):
+    """Binary cpio uses a 16-bit 070707 magic, so the ASCII-only gate declined its members."""
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    payload = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+    control = tmp_path / "payload.zz"
+    control.write_bytes(payload)
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    def archive(order: str) -> bytes:
+        name = b"payload.zz\0"
+        fields = (0o070707, 0, 1, 0o100644, 0, 0, 1, 0)
+        header = b"".join(value.to_bytes(2, order) for value in fields)
+        header += (0).to_bytes(4, order) + len(name).to_bytes(2, order)
+        header += len(payload).to_bytes(4, order)
+        data = bytearray(header + name)
+        data += b"\0" * (-len(data) % 2)
+        data += payload
+        data += b"\0" * (-len(data) % 2)
+        return bytes(data)
+
+    for order in ("little", "big"):
+        published = tmp_path / f"{order}.cpio"
+        published.write_bytes(archive(order))
+        assert credential_in_file(published) == "a Freesolo API key", order
+
+
+def test_an_oversized_nested_ar_is_refused_before_its_buffer_is_dropped(tmp_path, monkeypatch):
+    """The overflow gate omitted ar, so a compressed outer member turned unverifiable into clean."""
+    import zipfile
+
+    from flash import env_secrets
+
+    monkeypatch.setattr(env_secrets, "_MAX_NESTED_BUFFER_BYTES", 1 << 20)
+    payload = b"A" * (2 << 20)
+    name = b"payload.bin"
+    header = name.ljust(16) + b"0".ljust(12) + b"0".ljust(6) + b"0".ljust(6)
+    header += b"100644".ljust(8) + str(len(payload)).encode().ljust(10) + b"`\n"
+    archive = b"!<arch>\n" + header + payload
+
+    control = tmp_path / "control.a"
+    control.write_bytes(archive)
+    with pytest.raises(env_secrets._Unscannable, match="archive too large"):
+        env_secrets.credential_in_file(control)
+
+    nested = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested, "w", zipfile.ZIP_DEFLATED) as zipped:
+        zipped.writestr("inner.a", archive)
+    with pytest.raises(env_secrets._Unscannable, match="archive too large"):
+        env_secrets.credential_in_file(nested)

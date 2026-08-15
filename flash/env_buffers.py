@@ -15,6 +15,7 @@ import zlib
 from collections.abc import Iterator
 from pathlib import Path
 
+from flash.env_archive import _looks_like_cpio_header
 from flash.env_formats import _looks_compressed, _looks_like_tar, _overlay_offset
 from flash.env_patterns import (
     _PAIRED_PATTERNS,
@@ -99,6 +100,16 @@ def _paired_markers_kind(
     return None
 
 
+def _looks_like_container_head(data: bytes) -> bool:
+    """Whether a bounded prefix proves an oversized nested value is a container."""
+    return (
+        _looks_compressed(data)
+        or _looks_like_tar(data)
+        or data.startswith((b"!<arch>\n", b"!<thin>\n", b"%PDF-"))
+        or _looks_like_cpio_header(data)
+    )
+
+
 def _looks_like_container(data: bytes) -> bool:
     """Whether `data` is a container worth reopening, by magic OR by zip structure.
 
@@ -121,14 +132,11 @@ def _looks_like_container(data: bytes) -> bool:
         or _looks_like_tar(data)
         # ar has no nested predicate elsewhere: a top-level archive was walked by its handler, while
         # the same bytes inside a zip were treated as final content and hid a compressed key member.
-        or data.startswith((b"!<arch>\n", b"!<thin>\n"))
-        # newc cpio is printable at its magic, so the 104 declared field bytes must all be hex before
-        # recursion is charged. random input passes that combined structure about once in 10^126.
-        or (
-            len(data) >= 110
-            and data.startswith(b"070701")
-            and all(byte in b"0123456789abcdefABCDEF" for byte in data[6:110])
-        )
+        # pdf object streams need the same dispatch as ar members when either sits one layer in.
+        or data.startswith((b"!<arch>\n", b"!<thin>\n", b"%PDF-"))
+        # use the shared structural gate so crc, odc, and binary cpio cannot become top-level-only
+        # formats. each walker still validates every member boundary before trusting its payload.
+        or _looks_like_cpio_header(data)
         or zipfile.is_zipfile(io.BytesIO(data))
         # A self-extracting SHELL archive, whose stub is a script rather than an executable: none of
         # the tests above sees past it, since each asks what the file BEGINS with and it begins with

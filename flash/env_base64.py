@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import binascii
 import re
+import time
 from collections.abc import Iterator
 from typing import Protocol
 
@@ -29,6 +30,13 @@ from flash.env_wrapped import context_unwrapped
 # the decoded bytes is trustworthy enough to propagate.
 class _Inspector(Protocol):
     def __call__(self, decoded: bytes, *, whole: bool = False) -> str | None: ...
+
+
+def _check_inspector_deadline(inspect: _Inspector) -> None:
+    """Raise through the caller when its shared expansion deadline has expired."""
+    deadline = getattr(inspect, "deadline", None)
+    if deadline is not None and time.monotonic() > deadline:
+        inspect(b"")
 
 
 # A base64 run long enough to hold the shortest credential a pattern admits. The lower bound makes
@@ -205,6 +213,9 @@ def _match_broken_container(
     # separator replaced one encoded character, try each sextet at the one proven seam; wrong gzip
     # candidates usually fail at that point rather than expanding their whole declared payload.
     for missing in (None, *_STANDARD_ALPHABET):
+        # one seam tries 65 decodes. without this shared-budget check, a timeout swallowed by one
+        # speculative miss still paid every remaining decompression before the next seam was reached.
+        _check_inspector_deadline(inspect)
         candidate = first + second if missing is None else first + bytes((missing,)) + second
         try:
             decoded = base64.b64decode(
@@ -259,6 +270,8 @@ def _match_base64(
     joined = _unwrapped(data)
     previous: re.Match[bytes] | None = None
     for run in _BASE64_RUN.finditer(joined):
+        if inspect is not None:
+            _check_inspector_deadline(inspect)
         if (
             inspect is not None
             and previous is not None

@@ -113,6 +113,7 @@ _ESCAPE_MARKERS = (b"\\u", b"\\U", b"\\x", b"\\N{")
 # restricting quote removal to this context joins `KEY=fslo_ab"cd"` without welding quotes in prose,
 # python statements, or adjacent top-level lines that the runtime never combines.
 _SHELL_ASSIGNMENT = re.compile(rb"(?<![^\s;|&()])[A-Za-z_][A-Za-z0-9_]*=")
+_SHELL_WORD_END = frozenset(b" \t\r\n\v\f;|&()")
 
 # at bracket depth zero, a bare command word followed by whitespace introduces shell argv rather
 # than a source expression. preserving seams on that shape stops `printf "a" "b"` from becoming
@@ -164,8 +165,45 @@ def _raw_literal_spans(data: bytes) -> list[tuple[int, int]]:
     return spans
 
 
+def _shell_literal_spans(data: bytes) -> list[tuple[int, int]]:
+    """Quoted spans inside shell assignment words, where `\\x` remains literal text."""
+    spans = []
+    for assignment in _SHELL_ASSIGNMENT.finditer(data):
+        at = assignment.end()
+        while at < len(data) and data[at] not in _SHELL_WORD_END:
+            if data[at] not in (34, 39):
+                at += 2 if data[at] == 92 and at + 1 < len(data) else 1
+                continue
+            quote = data[at]
+            start = at
+            at += 1
+            while at < len(data):
+                if data[at] == quote:
+                    spans.append((start, at + 1))
+                    at += 1
+                    break
+                # single quotes preserve every backslash. double quotes also preserve `\\x`; a
+                # backslash only affects quote finding when it protects the closing double quote.
+                at += 2 if quote == 34 and data[at] == 92 and at + 1 < len(data) else 1
+            else:
+                break
+    return spans
+
+
+def _escape_literal_spans(data: bytes, *, shell: bool) -> list[tuple[int, int]]:
+    """Merged spans whose source grammar keeps supported escapes literal."""
+    protected = (*_raw_literal_spans(data), *(_shell_literal_spans(data) if shell else ()))
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(protected):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def _resolved_escapes(data: bytes) -> bytes:
-    """Resolve supported runtime escapes in one span known not to be a raw string."""
+    """Resolve supported runtime escapes in one span whose grammar interprets them."""
     resolved = data
     if any(marker in resolved for marker in _ESCAPE_MARKERS):
         resolved = _JSON_ESCAPE.sub(lambda point: bytes.fromhex(point.group(1).decode()), resolved)
@@ -175,9 +213,9 @@ def _resolved_escapes(data: bytes) -> bytes:
     return resolved
 
 
-def _decode_runtime_escapes(data: bytes) -> bytes:
-    """Resolve escapes outside Python raw strings while leaving every raw byte scannable."""
-    spans = _raw_literal_spans(data)
+def _decode_runtime_escapes(data: bytes, *, shell: bool) -> bytes:
+    """Resolve escapes outside literals whose runtime preserves their backslashes."""
+    spans = _escape_literal_spans(data, shell=shell)
     if not spans:
         return _resolved_escapes(data)
     out = bytearray()
@@ -303,7 +341,7 @@ def _join_shell_assignments(data: bytes) -> bytes:
     return bytes(out)
 
 
-def _rejoined(data: bytes) -> bytes:
+def _rejoined(data: bytes, *, shell: bool = False) -> bytes:
     """`data` with both kinds of seam closed, or `data` itself when it holds neither.
 
     Returning the input unchanged is what the caller uses to skip the second match entirely, so an
@@ -330,7 +368,7 @@ def _rejoined(data: bytes) -> bytes:
     # keeping the prefix visible prevents a raw `\\x42` from becoming `B`, while the later join still
     # combines adjacent raw literals that contain a real credential verbatim.
     if b"\\" in joined:
-        joined = _decode_runtime_escapes(joined)
+        joined = _decode_runtime_escapes(joined, shell=shell)
     quoted = any(quote in joined for quote in _QUOTES)
     if quoted:
         joined = _join_adjacent_literals(joined)

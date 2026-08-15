@@ -181,6 +181,9 @@ def _json_escapable(text: bytes, *, fold_case: bool = False) -> bytes:
     )
 
 
+# horizontal space surrounds the assignment operator. `\s*` crossed a newline after a null yaml
+# value and adopted an unrelated 40-hex mapping key on the next line, making a harmless config
+# unpublishable. block scalars cross lines explicitly through `_BLOCK_SCALAR` instead.
 _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     (
         "a Weights & Biases API key",
@@ -190,7 +193,7 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
             # loads identically.
             rb"(?i:"
             + _json_escapable(b"wandb_api_key", fold_case=True)
-            + rb")[\"']?\s*[:=]\s*"
+            + rb")[\"']?[ \t]*[:=][ \t]*"
             + _BLOCK_SCALAR
             + _NODE_PROPERTIES
             + _OPEN_QUOTE
@@ -213,7 +216,7 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
             + _json_escapable(b"aws_secret_access_key", fold_case=True)
             + rb"|(?<![A-Za-z0-9_])"
             + _json_escapable(b"secretaccesskey", fold_case=True)
-            + rb")[\"']?\s*[:=]\s*"
+            + rb")[\"']?[ \t]*[:=][ \t]*"
             + _BLOCK_SCALAR
             + _NODE_PROPERTIES
             + _OPEN_QUOTE

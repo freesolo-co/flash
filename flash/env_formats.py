@@ -74,6 +74,9 @@ _LZMA_ALONE_DECLARED_SIZE_CEILING = 1 << 56
 # a format no environment in the hub currently uses (0 of 8944 files) trades a real supply-chain
 # surface for a hypothetical one, and the refusal is honest about what it means: not verified.
 _UNEXPANDABLE_MAGIC = (
+    # unix compress has no stdlib decoder, so approving its opaque lzw body published a key that
+    # `gzip -dc` recovered intact. refusal is the same bounded answer used for every format here.
+    (b"\x1f\x9d", "Unix compress"),
     (b"\x28\xb5\x2f\xfd", "zstd"),
     (b"\x04\x22\x4d\x18", "lz4"),
     # The LZ4 LEGACY frame, a different magic rather than a variant of the one above. It is what

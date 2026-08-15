@@ -44,6 +44,7 @@ from flash.env_buffers import (
     _SCAN_CHUNK_BYTES,
     _blocks_of,
     _looks_like_container,
+    _looks_like_container_head,
     _paired_markers_kind,
     _paired_state,
     _wide_runs,
@@ -67,9 +68,7 @@ from flash.env_formats import (
     OVERLAY_UNPROBED,
     _after_skippable_frames,
     _has_zip_end_record,
-    _looks_compressed,
     _looks_like_lzma_alone,
-    _looks_like_tar,
     _looks_like_textual,
     _looks_like_zlib,
     _overlay_offset,
@@ -196,6 +195,7 @@ def _credential_kind(
     depth: int = 0,
     truncated: bool = False,
     paired: bool = True,
+    shell: bool = False,
 ) -> str | None:
     """The kind of credential `data` contains under any of its plausible text encodings.
 
@@ -217,7 +217,7 @@ def _credential_kind(
     costs nothing on genuine UTF-16/32 and leaves machine code with nothing long enough to match.
     """
     if kind := _decoded_kind(
-        data, deadline=deadline, depth=depth, truncated=truncated, paired=paired
+        data, deadline=deadline, depth=depth, truncated=truncated, paired=paired, shell=shell
     ):
         return kind
     if b"\x00" not in data:
@@ -233,7 +233,12 @@ def _credential_kind(
                 # began mid-stream and could not be expanded from either side. Measured: the same
                 # base64 gzip refused as narrow text returned clean in UTF-16LE.
                 if kind := _decoded_kind(
-                    run, deadline=deadline, depth=depth, truncated=truncated, paired=paired
+                    run,
+                    deadline=deadline,
+                    depth=depth,
+                    truncated=truncated,
+                    paired=paired,
+                    shell=shell,
                 ):
                     return kind
     return None
@@ -246,6 +251,7 @@ def _decoded_kind(
     depth: int = 0,
     truncated: bool = False,
     paired: bool = True,
+    shell: bool = False,
 ) -> str | None:
     """The kind of credential in `data` literally, or inside a base64 run within it."""
     if kind := _match(data, paired=paired) or _match_base64(
@@ -260,7 +266,7 @@ def _decoded_kind(
     #
     # Only tried when the literal pass found nothing, and `_rejoined` returns the input unchanged
     # when no seam is present, so the ordinary file pays two cheap searches and no rematch.
-    joined = _rejoined(data)
+    joined = _rejoined(data, shell=shell)
     return _match(joined, paired=paired) if joined != data else None
 
 
@@ -298,18 +304,19 @@ def _decoded_container(deadline: float | None, depth: int) -> _Inspector | None:
         return None
 
     def inspect(decoded: bytes, *, whole: bool = False) -> str | None:
-        # A format that is recognised but cannot be inspected at all -- an `openssl enc` envelope,
-        # chiefly -- is refused here rather than expanded, because there is nothing to expand. The
-        # container test below cannot stand in for this: an encrypted envelope is not a container,
-        # so it returned None and `openssl enc -aes-256-cbc -a` published a whole Freesolo key
-        # while the SAME ciphertext without `-a` was refused at the anchored check. Encoding the
-        # bytes is not what makes them readable.
-        #
-        # Only for an exact whole-run decode, on the same reasoning that governs the refusal below:
-        # `Salted__` is eight printable characters, and a speculative alignment of a base64-shaped
-        # run inside prose can produce them by chance.
+        if time.monotonic() > deadline:
+            raise _Unscannable("takes too long to decompress")
+        # exact whole-run decodes may refuse opaque formats. speculative alignments cannot: prose
+        # produced `Salted__` by chance, while a real `openssl enc -a` value needs the same refusal as
+        # its binary ciphertext or the encoding alone becomes a credential bypass.
         if whole and (fmt := _unexpandable_format(decoded, anchored=True)):
             raise _Unscannable(_uninspectable_reason(fmt))
+        # raw deflate has no magic. probing only exact decodes avoids an inflate for every speculative
+        # base64 alignment in large csv files and keeps chance decodes from becoming trusted refusals.
+        if whole and (
+            kind := _credential_in_raw_deflate(decoded, deadline=deadline, depth=depth + 1)
+        ):
+            return kind
         # Only bytes that actually look like a container are re-entered; anything else has already
         # been through `_match` and would just be scanned a second time.
         if not _looks_like_container(decoded):
@@ -319,12 +326,13 @@ def _decoded_container(deadline: float | None, depth: int) -> _Inspector | None:
         try:
             return _credential_in_container(decoded, deadline=deadline, depth=depth + 1)
         except _Unscannable:
-            if whole:
+            if whole or time.monotonic() > deadline:
                 raise
             return None
         except _UNREADABLE_ARCHIVE:
             return None
 
+    inspect.deadline = deadline  # type: ignore[attr-defined]
     return inspect
 
 
@@ -344,6 +352,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     bytes looked like a reasonable trade, but a deflated member's bytes hold the credential nowhere
     a pattern can see, so it was a silent bypass reachable by padding an archive past the cap.
     """
+    shell = str(getattr(handle, "name", "")).lower().endswith(".sh")
     carry = b""
     buffered = bytearray()
     tail = b""
@@ -389,7 +398,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
             # tar as well as the compressed magics: a tar's own members are literal, but a
             # COMPRESSED member inside one is not, so an oversized tar that went past the buffer
             # cap is as unverifiable as an oversized gzip and must refuse rather than pass.
-            container_head = _looks_compressed(chunk) or _looks_like_tar(chunk)
+            container_head = _looks_like_container_head(chunk)
         if depth and not overflowed:
             buffered.extend(chunk)
             if len(buffered) > _MAX_NESTED_BUFFER_BYTES:
@@ -441,7 +450,12 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
             # window, which knows neither the depth nor the quote phase the previous window ended
             # on -- right for a whole file, wrong for one window of one.
             if kind := _credential_kind(
-                window, deadline=deadline, depth=depth, truncated=bool(upcoming), paired=False
+                window,
+                deadline=deadline,
+                depth=depth,
+                truncated=bool(upcoming),
+                paired=False,
+                shell=shell,
             ):
                 return kind
         except _RunTooLongToExpand:
@@ -817,7 +831,7 @@ def _credential_in_ar(source: Path | bytes, *, deadline: float, depth: int) -> s
         head = source[:110]
     else:
         with source.open("rb") as handle:
-            head = handle.read(110)
+            head = handle.read(4122)
     # settlement means this handler actually walked an archive. without this decline, every other
     # file returned none here and incorrectly suppressed a later pdf or tar refusal as verified.
     if head.startswith((b"!<arch>\n", b"!<thin>\n")):
