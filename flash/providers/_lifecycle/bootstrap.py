@@ -279,24 +279,37 @@ def _console_upload_loop(
     poll, so the latch is spent only when a stall BOUGHT an upload -- charging it for a commit that
     was happening anyway would disarm detection for a later hang. QUIET_POLLS is sized so that
     (it + 1) * poll stays under poll_job's 1200s training stall, or the box dies before the wedge
-    snapshot commits. Each rule is pinned by a test_instance_console_upload_loop_* case."""
+    snapshot commits.
+
+    A wedge is progress that STOPPED, so the latch arms only after a staged heartbeat has been seen.
+    Startup is quiet by nature -- importing the worker stack on a cold image outruns QUIET_POLLS
+    before the first snapshot is even due -- and counting that as a wedge spends the one-shot latch
+    on a console with nothing in it, then pushes the next commit a full interval out. A real hang
+    after that startup would find the latch gone and the run torn down at 1200s with no console:
+    strictly worse than not detecting wedges at all. The setup grace is 3000s, so a startup that
+    never reaches a heartbeat is the stall classifier's case, not this one.
+
+    An upload failure is printed with ``flush``: it is the only trace of a failed upload, and
+    teardown kills this process outright. Each rule is pinned by a
+    test_instance_console_upload_loop_* case."""
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
     sent = size = -1
     since = quiet_polls = 0.0
-    quiet_used = False
+    quiet_used = progressed = False
     while not stop_upload.wait(poll_s):
         since += poll_s
         size, staged = _console_progress(console, max(size, 0))
+        progressed = progressed or bool(staged)
         quiet_polls = 0.0 if staged else quiet_polls + 1
+        wedged = progressed and quiet_polls >= _CONSOLE_UPLOAD_QUIET_POLLS
         due = since >= due_s
-        wedged = quiet_polls >= _CONSOLE_UPLOAD_QUIET_POLLS and not quiet_used and not due
+        wedged = wedged and not quiet_used and not due
         if size == sent or not (due or wedged):
             continue
         try:
             uploaded = _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
-            # flush: the only trace of a failed upload, and teardown kills this process outright.
             detail = _safe_detail(exc, secrets=_payload_secrets(payload))
             print(f"console upload warn: {detail}", flush=True)
             uploaded = False

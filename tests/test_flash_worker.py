@@ -1150,6 +1150,11 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
         f"quiet_polls >= {_instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS} and not quiet_used"
         in body
     )
+    # the latch arms only after real progress: a cold image is quiet through startup and would
+    # otherwise spend it on an empty console, leaving a later hang with no snapshot before teardown
+    # (test_..._keeps_its_wedge_credit_through_a_slow_startup covers the behavior on the twin loop).
+    assert "progressed = progressed or bool(staged)" in body
+    assert "wedged = progressed and quiet_polls" in body
     assert "uploaded_size = size if ok else uploaded_size" in body
     # the wedge signal is STAGED HEARTBEATS, not console bytes: a stuck worker still logs, so a
     # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
@@ -1354,6 +1359,50 @@ def test_instance_console_upload_loop_does_not_spend_the_latch_on_a_due_snapshot
     after_wedge = [u for u in uploads if u > wedge_at]
     assert after_wedge, "the overlapping scheduled snapshot consumed the real wedge's credit"
     assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
+
+
+def test_instance_console_upload_loop_keeps_its_wedge_credit_through_a_slow_startup(monkeypatch):
+    """A cold image that imports for minutes before its first heartbeat must not spend the latch.
+
+    Startup is silent by nature -- pulling and importing the worker stack outruns QUIET_POLLS (480s)
+    before the first scheduled snapshot (600s) is even due -- so quiet accounting that begins at
+    process start reads it as a wedge. The commit that buys is an empty console: nothing has run
+    yet. Worse, spending the latch there also resets the scheduled deadline to a full interval, so
+    the next commit is ~4080s out. A real hang after startup then finds the latch gone AND the
+    schedule pushed away, and the 1200s stall teardown destroys the box with no console at all --
+    strictly worse than never having had wedge detection.
+
+    So the latch arms only once a staged heartbeat has actually been seen. A startup that never
+    reaches one is the stall classifier's 3000s setup grace, not this loop's case.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
+    # the startup must reach the wedge threshold STRICTLY BEFORE the first snapshot is due, or the
+    # `not due` guard already covers it and a passing test would prove nothing about this fix.
+    startup_polls = quiet_polls
+    assert startup_polls * poll_s < first_s, (
+        "startup must go quiet before the first snapshot is due"
+    )
+
+    healthy_polls = 10
+    wedge_at = startup_polls + healthy_polls
+    cycles = wedge_at + quiet_polls + 8
+    # the console GROWS throughout: banners during startup, ray chatter during the hang. Only the
+    # staged-heartbeat series distinguishes the three phases.
+    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
+    staged = [0] * startup_polls + [1] * healthy_polls
+    staged += [0] * (cycles + 2 - len(staged))
+    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles, staged=staged)
+
+    after_wedge = [u for u in uploads if u > wedge_at]
+    assert after_wedge, "the silent startup consumed the latch the post-startup wedge needed"
+    assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
+    # and the startup must not have moved the scheduled snapshot either: pushing it out to a full
+    # interval is half the damage, and it survives even if the latch itself is later restored.
+    assert uploads[0] * poll_s == first_s, "a quiet startup delayed the first scheduled snapshot"
 
 
 def test_instance_console_upload_loop_detects_a_wedge_that_keeps_logging(monkeypatch):

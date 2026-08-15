@@ -619,7 +619,7 @@ def _train_body(input_data: dict) -> dict:
                 # test_first_console_snapshot_precedes_the_stall_teardown. Mirrors
                 # bootstrap._console_upload_loop, whose docstring carries the rules.
                 due_s, since, quiet_polls = 600.0, 0.0, 0
-                uploaded_size, size, quiet_used = -1, -1, False
+                uploaded_size, size, quiet_used, progressed = -1, -1, False, False
                 while not stop_upload.wait(120.0):
                     since += 120.0
                     try:
@@ -634,10 +634,13 @@ def _train_body(input_data: dict) -> dict:
                             size = hf.tell()
                     except OSError:
                         size, staged = -1, 0
+                    progressed = progressed or bool(staged)
                     quiet_polls = 0 if staged else quiet_polls + 1
                     due = since >= due_s
-                    # `not due`: only a stall that BOUGHT an upload spends the one-shot latch.
-                    wedged = quiet_polls >= 4 and not quiet_used and not due
+                    # `not due`: only a stall that BOUGHT an upload spends the latch. `progressed`:
+                    # a wedge is progress that STOPPED, and startup is quiet, so counting it would
+                    # spend the latch on an empty console and leave a later hang with none.
+                    wedged = progressed and quiet_polls >= 4 and not quiet_used and not due
                     if size == uploaded_size or not (due or wedged):
                         continue
                     ok = _upload_console(mode)  # swallows its own errors; False if it did not land
