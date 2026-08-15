@@ -152,6 +152,12 @@ def make_client(tmp_path, monkeypatch):
 
         def fake_urlopen(req: urllib.request.Request, timeout: float | None = None):
             parsed = urllib.parse.urlsplit(req.full_url)
+            # Only this fixture's control plane is in-process. The shim is installed on urllib
+            # itself, so without a host check it also answers api.github.com -- the submit-time
+            # environment-ref preflight would then read the plane's 404 for an unrouted path as
+            # GitHub saying the environment does not exist, and refuse every run here.
+            if parsed.hostname and parsed.hostname != "testserver":
+                raise urllib.error.URLError(f"offline: refusing live request to {parsed.hostname}")
             path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
             headers = dict(req.header_items())
             resp = test_client.request(req.get_method(), path, content=req.data, headers=headers)
