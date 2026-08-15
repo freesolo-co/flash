@@ -223,11 +223,9 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dic
                 if remaining <= 0:
                     raise TimeoutError(f"{label} exceeded the run wall deadline") from None
                 delay = min(delay, remaining)
-            print(
-                f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
-                f"{_safe_detail(exc, 500, secrets=secrets)}",
-                flush=True,
-            )
+            why = _safe_detail(exc, 500, secrets=secrets)
+            msg = f"{label} transient Hugging Face error; retrying in {delay:.0f}s: {why}"
+            print(msg, flush=True)
             if delay > 0:
                 time.sleep(delay)
     raise AssertionError("unreachable")
@@ -700,10 +698,8 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                         )
                         cf.write(line)
             except BaseException as exc:
-                print(
-                    f"console pump warn: {_safe_detail(exc, secrets=pump_secrets)}",
-                    flush=True,
-                )
+                detail = _safe_detail(exc, secrets=pump_secrets)
+                print(f"console pump warn: {detail}", flush=True)
             finally:
                 pump_done.set()
 
@@ -764,10 +760,8 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         ):
             print("final console upload exceeded its allowance", flush=True)
     except Exception as exc:
-        print(
-            f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
-            flush=True,
-        )
+        detail = _safe_detail(exc, secrets=_payload_secrets(payload))
+        print(f"console upload warn: {detail}", flush=True)
     if timed_out:
         raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
     return proc.returncode

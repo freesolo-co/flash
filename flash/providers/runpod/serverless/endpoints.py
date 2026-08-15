@@ -643,13 +643,13 @@ def _train_body(input_data: dict) -> dict:
                     try:
                         # count STAGED heartbeats, not bytes: a wedged worker still prints ray
                         # warnings, so a size-only rule never fires. reads only new bytes. liveness
-                        # pings carry "stage" too and print every 30s from a daemon, so subtract
-                        # them -- counting them reads a wedge as progress forever.
+                        # pings and "pending" (uncommitted) heartbeats are subtracted: neither is
+                        # progress the stall clock can see. mirrors _console_progress.
                         with open(console, "rb") as hf:
                             hf.seek(max(size, 0))
-                            buf = hf.read()
-                            staged = max(0, buf.count(b'"stage":') - buf.count(b'"liveness":'))
-                            size = hf.tell()
+                            buf, size = hf.read(), hf.tell()
+                        unseen = buf.count(b'"liveness":') + buf.count(b'"pending":')
+                        staged = max(0, buf.count(b'"stage":') - unseen)
                     except OSError:
                         size, staged = -1, 0
                     # a wedge is progress that STOPPED: a heartbeat arms, a spend disarms, progress

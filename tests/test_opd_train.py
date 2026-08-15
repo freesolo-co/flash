@@ -4961,6 +4961,14 @@ def test_child_failure_sanitizer_redacts_a_double_serialized_credential_field():
         (r"{\"api_key\":\"sk-runtime-abc123\"}", "sk-runtime-abc123"),
         (r"{\"access_token\":\"at-runtime-99\"} while calling the teacher", "at-runtime-99"),
         (r"{\'secret\':\'sq-runtime-value\'}", "sq-runtime-value"),
+        # the INTERSECTION of the two shapes above, and the one neither covers: escaped delimiters
+        # AND an escaped quote inside the value. Each shape alone was handled -- the escaped branch
+        # ran to the closing `\"`, and the bare-delimiter branch consumed `\"` as one unit -- but
+        # here the value's own `\\\"` looks exactly like this branch's closer, so the match ended
+        # early and everything after it printed verbatim. Consuming a doubled backslash as one unit
+        # before the delimiter test is what separates the two.
+        (r"{\"password\":\"abc\\\"runtime-nested\"}", "runtime-nested"),
+        (r"{\"api_key\":\"k\\\"sk-runtime-nested-2\"} at step 9", "sk-runtime-nested-2"),
     ):
         detail = _safe_child_failure_detail(ValueError(message))
         assert leak not in detail, f"{message!r} leaked its credential: {detail!r}"

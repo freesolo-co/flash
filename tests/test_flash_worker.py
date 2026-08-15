@@ -1171,8 +1171,11 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
     assert "quiet_polls = 0 if staged else quiet_polls + 1" in body
     # and liveness pings are SUBTRACTED, not counted: they carry "stage" like every other payload
-    # and print every 30s from a daemon, so counting them reads a wedge as progress forever.
-    assert "count(b'\"stage\":') - buf.count(b'\"liveness\":')" in body
+    # and print every 30s from a daemon, so counting them reads a wedge as progress forever. an
+    # UNCOMMITTED heartbeat ("pending") is subtracted for the same reason: the provider's stall
+    # clock reads the heartbeat from HF, so one that never landed there is not progress it can see.
+    assert "unseen = buf.count(b'\"liveness\":') + buf.count(b'\"pending\":')" in body
+    assert "buf.count(b'\"stage\":') - unseen" in body
     assert "max(0, buf.count" in body  # floored: a negative count is truthy and reads as progress
 
 
@@ -1657,6 +1660,15 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     assert b'"stage":' not in ping[cut:]
     assert b'"liveness":' in ping[cut:]
     assert _instance_bootstrap._console_progress(str(solo), cut) == (len(ping), 0)
+
+    # an UNCOMMITTED heartbeat (upload attempted, did not land) is subtracted for the same reason
+    # as a liveness ping: the provider's stall clock reads heartbeat.json from HF, so one that
+    # never reached HF is not progress it can observe. Counting it resets the wedge timer against a
+    # stall clock still anchored to the older committed heartbeat, and the snapshot this whole path
+    # exists to take gets scheduled after the teardown has already killed the box.
+    pend = tmp_path / "console_pending.txt"
+    pend.write_bytes(_hb(step=8, pending=True) * 2)
+    assert _instance_bootstrap._console_progress(str(pend), 0)[1] == 0
 
     assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (-1, 0)
 

@@ -89,7 +89,10 @@ _SECRET_DETAIL = re.compile(
     # a backslash, so `quote` does not match it and `bare` stops dead at that backslash, printing
     # the credential. it ends at the matching ESCAPED quote, which keeps the tail after the field
     # (`{\"password\":\"s\"} while calling`) instead of consuming the rest of the diagnostic.
-    rf"(?:\\(?P<eq>['\"])(?P<escaped>(?:(?!\\(?P=eq))[^\r\n])*)"
+    # a doubled backslash is consumed as ONE unit BEFORE the delimiter test, so an escaped quote
+    # INSIDE the encoded value (`\"abc\\\"tail\"`) is part of the value rather than its closer --
+    # otherwise the match ends early and the tail after it prints verbatim.
+    rf"(?:\\(?P<eq>['\"])(?P<escaped>(?:\\\\.|(?!\\(?P=eq))[^\r\n])*)"
     rf"|(?P<quote>['\"])(?:digest\s+(?P<qdigest>[^\r\n]+)"
     rf"|{_SECRET_SCHEME}(?P<quoted>(?:\\.|(?!(?P=quote))[^\r\n])*))"
     r"|digest\s+(?P<digest>[^\r\n]+)"

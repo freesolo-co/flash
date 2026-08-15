@@ -185,15 +185,18 @@ def _console_progress(console: str, offset: int) -> tuple[int, int]:
     Liveness pings are subtracted, not counted: EVERY payload carries ``"stage"`` and those print
     every 30s from a daemon, so counting the key alone reads a worker wedged inside a liveness block
     as busy forever -- ``poll`` refuses to advance on them for the same reason, and this must agree
-    or the run dies with no console. Both keys sit in one flat json object per line, so the
-    subtraction is exact except where a poll boundary splits a line and leaves the ``"liveness"``
-    half alone here; hence the clamp, since a bare negative is TRUTHY and would read as progress.
-    Only bytes past ``offset`` are read, so a scan costs one poll's output, not a whole console.
-    The read happens before ``tell()`` because the read is what advances it."""
+    or the run dies with no console. ``"pending"`` heartbeats are subtracted for the same reason:
+    their upload did not land, so the provider's stall clock is still anchored to the older
+    committed one, and counting them would reset this timer against a teardown already counting
+    down. The keys sit in one flat json object per line, so the subtraction is exact except where a
+    poll boundary splits a line and leaves the ``"liveness"`` half alone here; hence the clamp,
+    since a bare negative is TRUTHY and would read as progress. Only bytes past ``offset`` are
+    read, so a scan costs one poll's output. The read precedes ``tell()`` because it advances it."""
     try:
         with open(console, "rb") as f:
             f.seek(offset)
             buf = f.read()
-            return f.tell(), max(0, buf.count(b'"stage":') - buf.count(b'"liveness":'))
+            seen = buf.count(b'"stage":') - buf.count(b'"liveness":') - buf.count(b'"pending":')
+            return f.tell(), max(0, seen)
     except OSError:
         return -1, 0
