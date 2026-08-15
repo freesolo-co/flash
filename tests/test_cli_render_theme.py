@@ -671,7 +671,7 @@ def test_heartbeat_is_current_attempt_rejects_malformed_identities() -> None:
     assert is_current({"remote": {"attempt": 2}}, {"attempt": 1}) is False
 
 
-def test_progress_age_distinguishes_real_heartbeat_from_liveness_bound(monkeypatch):
+def test_progress_age_always_adds_to_heartbeat_age(monkeypatch):
     from flash.cli.ui import heartbeat as heartbeat_ui
     from flash.cli.ui import render
 
@@ -692,22 +692,16 @@ def test_progress_age_distinguishes_real_heartbeat_from_liveness_bound(monkeypat
     }
 
     real_out = render.run_status(dict(base, last_heartbeat=heartbeat))
-    long_period_out = render.run_status(
+    liveness_out = render.run_status(dict(base, last_heartbeat={**heartbeat, "liveness": True}))
+    stale_progress_out = render.run_status(
         dict(base, last_heartbeat={**heartbeat, "progress_age_s": 1200.0})
     )
-    liveness_out = render.run_status(dict(base, last_heartbeat={**heartbeat, "liveness": True}))
-
-    assert real_out != long_period_out
-    assert "prior progress interval of 1200.0s" in long_period_out
-    assert real_out != liveness_out
-    assert "the upload is 3010.0s old" in real_out
-    assert "prior progress interval of 20.0s" in real_out
-    assert "last known progress can be as old as 3030.0s" not in real_out
-
-    assert "last known progress can be as old as 3030.0s" in liveness_out
-    assert "prior progress interval of 20.0s" not in liveness_out
 
     for out in (real_out, liveness_out):
+        assert "last known progress can be as old as 3030.0s" in out
+    assert "last known progress can be as old as 4210.0s" in stale_progress_out
+
+    for out in (real_out, liveness_out, stale_progress_out):
         assert "upload throttling no longer explains the gap" in out
         assert "this signal does not show recent progress" in out
         assert "proves recent worker-side progress" not in out
@@ -762,7 +756,9 @@ def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch)
     assert progress({**old_worker, "progress_age_s": 20.0, "liveness": True}) == old_hint
 
 
-@pytest.mark.parametrize("bad_progress_age", [10**400, float("inf"), float("nan"), True])
+@pytest.mark.parametrize(
+    "bad_progress_age", [10**400, float("inf"), float("nan"), -1.0, True, "bad"]
+)
 def test_invalid_progress_age_falls_back_to_legacy_hint(monkeypatch, bad_progress_age):
     from flash.cli.ui import heartbeat
 

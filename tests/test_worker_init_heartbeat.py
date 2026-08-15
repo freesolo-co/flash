@@ -290,8 +290,8 @@ def test_liveness_heartbeat_rechecks_done_after_diagnostics():
     assert "done.is_set()" in between, "must re-check done.is_set() between diagnostics and emit"
 
 
-def test_heartbeat_publishes_progress_age_that_grows_without_progress(monkeypatch):
-    """real heartbeats report the prior progress interval; liveness pings keep aging that interval."""
+def test_heartbeat_publishes_canonical_progress_age(monkeypatch):
+    """real progress has age zero; liveness pings age the latest known progress."""
     import json
 
     import flash.engine.worker as ne
@@ -310,7 +310,7 @@ def test_heartbeat_publishes_progress_age_that_grows_without_progress(monkeypatc
     monkeypatch.setattr(ne, "_HB_LAST_PROGRESS_TS", 900.0)
 
     ne.heartbeat("rl_step", step=1)
-    assert seen[-1]["progress_age_s"] == 100.0
+    assert seen[-1]["progress_age_s"] == 0.0
     assert seen[-1].get("liveness") is None
     assert ne._HB_LAST_PROGRESS_TS == 1000.0
 
@@ -868,7 +868,6 @@ def test_progress_carry_upgrades_ping_after_throttled_real_heartbeat(monkeypatch
     assert uploads[-1]["progress_age_s"] == 901.0, (
         "carried progress keeps the age of the original real heartbeat; the upgrade is not new progress"
     )
-    assert uploads[-1]["progress_carried"] is True
 
     # feed the real carried payload through the cli path. progress predates its ts, so ten seconds
     # after upload the conservative age bound is 10 + 901, not the upload age alone.
@@ -887,7 +886,6 @@ def test_progress_carry_upgrades_ping_after_throttled_real_heartbeat(monkeypatch
         "once carried progress is committed, later pings must stay liveness — a wedged worker "
         "pinging alive must not mask a stall"
     )
-    assert "progress_carried" not in uploads[-1]
 
 
 def test_progress_carry_survives_failed_upload(monkeypatch):
@@ -895,6 +893,8 @@ def test_progress_carry_survives_failed_upload(monkeypatch):
 
     import flash.engine.worker as ne
 
+    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
+    now = {"t": 1000.0}
     uploads: list[dict] = []
     outcome = {"ok": False}
 
@@ -903,21 +903,27 @@ def test_progress_carry_survives_failed_upload(monkeypatch):
             uploads.append(json.load(f))
         return outcome["ok"]
 
+    monkeypatch.setattr(hbmod.time, "time", lambda: now["t"])
     monkeypatch.setattr(ne, "hf_upload_file", _capture)
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
     _reset_hb_state(monkeypatch, ne)
 
-    ne.heartbeat("sft_step", step=9)  # real, upload FAILS -> progress still pending
+    ne.heartbeat("sft_step", step=9)  # real, upload fails, so progress remains pending
     assert uploads[-1].get("liveness") is None
+    assert uploads[-1]["progress_age_s"] == 0.0
 
     outcome["ok"] = True
+    now["t"] = 1015.0
     ne.heartbeat("sft_step", liveness=True, step=9)
     assert uploads[-1].get("liveness") is None, (
         "a failed real upload keeps the latch pending; the next committed ping must carry it"
     )
+    assert uploads[-1]["progress_age_s"] == 15.0
 
+    now["t"] = 1020.0
     ne.heartbeat("sft_step", liveness=True, step=9)
     assert uploads[-1].get("liveness") is True, "settled after the successful carried commit"
+    assert uploads[-1]["progress_age_s"] == 20.0
 
 
 def test_progress_carry_does_not_mark_new_progress(monkeypatch):

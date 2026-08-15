@@ -115,10 +115,9 @@ _QUIET_HEARTBEAT_HINT = (
 # than on 900s -- the incident that motivated this reported 559s and 687s, squarely inside that
 # window, where a 900s gate would stay silent and leave only the dead-end quiet hint.
 _STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
-# progress_age_s is frozen at payload build time, so it is not a present-tense liveness reading by
-# itself. combine it with upload age when progress predates ts, and speak once that conservative bound
-# reaches the throttle without claiming either health or a stall: newer progress may be uncommitted,
-# or the worker may be silent.
+# progress_age_s is the age of latest known progress at payload build time. combine it with upload age
+# for a conservative current bound, and speak once that bound reaches the throttle without claiming
+# either health or a stall: newer progress may be uncommitted, or the worker may be silent.
 _UPLOAD_THROTTLE_S = 900.0
 # only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
 # post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older
@@ -281,28 +280,13 @@ def _stale_step_hint(
             if candidate >= 0 and math.isfinite(candidate):
                 progress_age = candidate
     if progress_age is not None:
-        # liveness and carried payloads both report progress anchored before ts. carried progress
-        # advances the provider stall clock, but the marker makes clear that no new progress happened
-        # at this upload. only an ordinary real heartbeat treats ts itself as the progress point.
-        progress_anchored_before_ts = bool(
-            heartbeat.get("liveness") or heartbeat.get("progress_carried") is True
-        )
-        progress_age_bound_s = heartbeat_age_seconds
-        if progress_anchored_before_ts:
-            progress_age_bound_s += progress_age
+        progress_age_bound_s = heartbeat_age_seconds + progress_age
         if progress_age_bound_s >= _UPLOAD_THROTTLE_S:
-            if progress_anchored_before_ts:
-                comparison = f"the last known progress can be as old as {progress_age_bound_s:.1f}s"
-            else:
-                comparison = (
-                    f"the upload is {heartbeat_age_seconds:.1f}s old versus the worker's prior "
-                    f"progress interval of {progress_age:.1f}s"
-                )
             return (
                 "the step above is the last one UPLOADED; "
-                f"{comparison}. upload throttling no longer explains the gap, but newer progress "
-                "may be uncommitted and a long step may still be running; this signal does not show "
-                "recent progress"
+                f"the last known progress can be as old as {progress_age_bound_s:.1f}s. upload "
+                "throttling no longer explains the gap, but newer progress may be uncommitted and "
+                "a long step may still be running; this signal does not show recent progress"
             )
         # below the 900s hold, throttling still explains the visible lag. fall through to the exact
         # pre-existing reading so new workers never lose guidance in the incident's 300-900s band.

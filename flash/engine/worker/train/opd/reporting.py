@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from flash.engine.worker import opd_train as _opd_train
+from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
+
+if TYPE_CHECKING:
+    from flash.engine.worker.opd_train_runner import (
+        _ChildResult,
+        _OpdRequest,
+        _PromptState,
+        _RuntimeState,
+        _WorkloadState,
+    )
 
 
 def _build_train_note_sections(
-    request: Any,
-    prompt_state: Any,
-    workload: Any,
-    runtime: Any,
-    result: Any,
+    request: _OpdRequest,
+    prompt_state: _PromptState,
+    workload: _WorkloadState,
+    runtime: _RuntimeState,
+    result: _ChildResult,
     download_seconds: float,
 ) -> tuple[
     dict[str, Any],
@@ -31,7 +40,7 @@ def _build_train_note_sections(
         "init_from_adapter": request.spec.train.init_from_adapter or None,
         "teacher_model": knobs.teacher_model,
         "download_seconds": download_seconds,
-        "thinking": _opd_train._w.THINKING,
+        "thinking": _w.THINKING,
         "loss_curve": final_accounting["loss_curve"],
         "mean_coverage": (
             float(final_accounting["coverage_sum"]) / int(final_accounting["aligned_sequences"])
