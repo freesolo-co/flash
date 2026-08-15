@@ -17,10 +17,7 @@ _SECRET_RE = re.compile(
     r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)"
 )
 
-# a multiline secret (a PEM key) reaches diagnostics one component line at a time -- console tails
-# are truncated and child stdout is sanitized per line -- so the whole value never matches. long
-# component lines are registered as needles too; the floor keeps a common fragment such as ``}``
-# from erasing innocent output. Mirrors flash._internal.diagnostics.
+# a multiline secret is split.
 _MIN_SECRET_COMPONENT = 8
 _CONSOLE_SCAN_BYTES = 1_048_576
 
@@ -180,34 +177,45 @@ def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> st
 
 
 def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
-    """Return ``(cursor, committed, any)`` for complete heartbeat lines after ``offset``.
+    """Return ``(cursor, committed, any)`` after draining to the tail captured at call start.
 
-    Reads are capped per poll. A line larger than the cap is skipped in bounded chunks; checking the
-    preceding byte keeps a cursor inside that line from treating its tail as a new record. Ordinary
-    partial lines remain behind the cursor until their newline arrives, so they are judged once.
+    each read is capped. oversized lines are skipped in bounded chunks, while ordinary partial lines
+    remain behind the cursor until their newline arrives so they are judged once.
     """
     try:
         with open(console, "rb") as f:
-            line_start = True
-            if offset:
-                f.seek(offset - 1)
-                line_start = f.read(1) == b"\n"
-            f.seek(offset)
-            buf = f.read(_CONSOLE_SCAN_BYTES)
+            end = f.seek(0, os.SEEK_END)
+            at = min(max(offset, 0), end)
+            f.seek(max(at - 1, 0))
+            start = not at or f.read(1) == b"\n"
+            hits = beats = 0
+            while at < end:
+                f.seek(at)
+                buf = f.read(min(_CONSOLE_SCAN_BYTES, end - at))
+                if not buf:
+                    break
+                if not start:
+                    nl = buf.find(b"\n") + 1
+                    if not nl:
+                        at += len(buf)
+                        continue
+                    at += nl
+                    buf, start = buf[nl:], True
+                    if not buf:
+                        continue
+                cut = buf.rfind(b"\n") + 1
+                if not cut:
+                    if at + len(buf) < end:
+                        at += len(buf)
+                        start = False
+                        continue
+                    break
+                hb = re.findall(rb'(?m)^HEARTBEAT (?!.*"liveness":).*$', buf[:cut])
+                hits += sum(
+                    b'"pending":' not in line and b'"throttled":' not in line for line in hb
+                )
+                beats += len(hb)
+                at += cut
     except OSError:
         return -1, 0, 0
-
-    cursor = offset
-    if not line_start:
-        first_newline = buf.find(b"\n")
-        if first_newline < 0:
-            return cursor + len(buf), 0, 0
-        cursor += first_newline + 1
-        buf = buf[first_newline + 1 :]
-
-    cut = buf.rfind(b"\n") + 1
-    if not cut and len(buf) == _CONSOLE_SCAN_BYTES:
-        return cursor + len(buf), 0, 0
-    hb = re.findall(rb'(?m)^HEARTBEAT (?!.*"liveness":).*$', buf[:cut])
-    committed = sum(b'"pending":' not in line and b'"throttled":' not in line for line in hb)
-    return cursor + cut, committed, len(hb)
+    return at, hits, beats

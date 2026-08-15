@@ -559,43 +559,55 @@ def _train_body(input_data: dict) -> dict:
                 while not stop_upload.wait(120.0):
                     since += 120.0
                     try:
-                        # mirrors _console_progress: bounded reads, whole lines and the same markers.
-                        at = max(size, 0)
+                        # mirrors _console_progress: drain to this poll's tail in bounded chunks.
                         with open(console, "rb") as hf:
-                            line_start = True
-                            if at:
-                                hf.seek(at - 1)
-                                line_start = hf.read(1) == b"\n"
-                            hf.seek(at)
-                            buf = hf.read(1_048_576)
+                            hf.seek(0, os.SEEK_END)
+                            end = hf.tell()
+                            cursor = min(max(size, 0), end)
+                            start = not cursor
+                            if cursor:
+                                hf.seek(cursor - 1)
+                                start = hf.read(1) == b"\n"
+                            staged = beat_count = 0
+                            while cursor < end:
+                                hf.seek(cursor)
+                                buf = hf.read(min(1_048_576, end - cursor))
+                                if not buf:
+                                    break
+                                if not start:
+                                    skip = buf.find(b"\n") + 1
+                                    if not skip:
+                                        cursor += len(buf)
+                                        continue
+                                    cursor += skip
+                                    buf, start = buf[skip:], True
+                                    if not buf:
+                                        continue
+                                cut = buf.rfind(b"\n") + 1
+                                if not cut:
+                                    if cursor + len(buf) < end:
+                                        cursor += len(buf)
+                                        start = False
+                                        continue
+                                    break
+                                pat = rb'(?m)^HEARTBEAT (?!.*"liveness":).*$'
+                                beat_lines = re.findall(pat, buf[:cut])
+                                staged += sum(
+                                    b'"pending":' not in line and b'"throttled":' not in line
+                                    for line in beat_lines
+                                )
+                                beat_count += len(beat_lines)
+                                cursor += cut
+                            size = cursor
                     except OSError:
-                        buf, at, line_start = b"", -1, True
-                    cursor = at
-                    size = cursor
-                    if not line_start:
-                        first_newline = buf.find(b"\n")
-                        if first_newline < 0:
-                            size, buf = cursor + len(buf), b""
-                        else:
-                            cursor += first_newline + 1
-                            buf = buf[first_newline + 1 :]
-                    cut = buf.rfind(b"\n") + 1
-                    if not cut and len(buf) == 1_048_576:
-                        size, buf = cursor + len(buf), b""
-                    elif buf:
-                        buf, size = buf[:cut], cursor + cut
-                    pat = rb'(?m)^HEARTBEAT (?!.*"liveness":).*$'
-                    beats = re.findall(pat, buf)
-                    staged = sum(
-                        b'"pending":' not in line and b'"throttled":' not in line for line in beats
-                    )
+                        size, staged, beat_count = -1, 0, 0
                     had_committed = committed
                     committed = committed or bool(staged)
                     if committed and not had_committed and uploaded_size >= 0:
                         due_s = 3600.0
                     # a wedge is progress that stopped: re-arm on it, spend only on a stall that
                     # bought an upload. two credits per run. uncommitted beats only arm the loop.
-                    progress = staged if committed else len(beats)
+                    progress = staged if committed else beat_count
                     armed = armed or bool(progress)
                     quiet_polls = 0 if progress else quiet_polls + 1
                     due = since >= due_s

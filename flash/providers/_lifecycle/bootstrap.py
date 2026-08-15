@@ -30,8 +30,6 @@ if __package__:
         _safe_detail,
     )
 else:
-    # running as a bare script on the box: launch scripts ship every imported sibling into this
-    # directory, which leads sys.path.
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]

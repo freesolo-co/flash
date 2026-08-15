@@ -1182,8 +1182,8 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # read as progress), and a tail measured from EOF would have lost its prefix and dropped a real
     # heartbeat (a wedge faked the other way). It is also what lets `^` mean what it says.
     assert 'cut = buf.rfind(b"\\n") + 1' in body
-    assert "buf = hf.read(1_048_576)" in body
-    assert 'line_start = hf.read(1) == b"\\n"' in body
+    assert "buf = hf.read(min(1_048_576, end - cursor))" in body
+    assert 'start = hf.read(1) == b"\\n"' in body
     # ONE scan yields both counts: the committed one drops "pending" lines (an uploaded heartbeat
     # that never reached HF), the arming one keeps them. Which drives the timer switches at the
     # first COMMITTED heartbeat. A run whose uploads all fail emits nothing but pending lines: on
@@ -1192,7 +1192,7 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # anchored and counting down, so only committed ones may count.
     assert "b'\"throttled\":' not in line" in body
     assert "committed = committed or bool(staged)" in body
-    assert "progress = staged if committed else len(beats)" in body
+    assert "progress = staged if committed else beat_count" in body
     assert "armed = armed or bool(progress)" in body
     assert "quiet_polls = 0 if progress else quiet_polls + 1" in body
     # a counting rule cannot go negative now that it counts whole matching lines instead of
@@ -1652,12 +1652,13 @@ def test_shipped_upload_loop_decides_exactly_like_the_canonical_one(tmp_path):
     string intact and silently gives the two providers different wedge behavior.
 
     So both real implementations are executed against identical console streams and their upload
-    counts compared. The streams mix committed, pending, throttled and liveness heartbeats with
-    plain noise, because those are exactly the inputs the two must agree on: only committed beats count once
-    one has landed, liveness never counts, and noise grows the file without being progress.
+    schedules compared. The streams mix committed, pending, throttled and liveness heartbeats with
+    plain noise, because those are exactly the inputs the two must agree on: only committed beats
+    count once one has landed, liveness never counts, and noise grows the file without being progress.
     """
     import ast
     import inspect
+    import os
     import random
     import re
     import textwrap
@@ -1701,16 +1702,18 @@ def test_shipped_upload_loop_decides_exactly_like_the_canonical_one(tmp_path):
 
     def _count(runner, plan, results, path):
         calls, outcomes = [], iter(results)
+        stop = _Stop(plan, path)
 
         def _upload(*_args, **_kwargs):
-            calls.append(1)
+            calls.append(stop.i)
             return next(outcomes)
 
-        runner(_Stop(plan, path), _upload, path)
-        return len(calls)
+        runner(stop, _upload, path)
+        return calls
 
     def _shipped(stop, upload, path):
         namespace = {
+            "os": os,
             "re": re,
             "console": path,
             "mode": "train",
@@ -1735,15 +1738,25 @@ def test_shipped_upload_loop_decides_exactly_like_the_canonical_one(tmp_path):
     for trial in range(120):
         plan = [random.choice(list(lines)) for _ in range(random.randint(5, 40))]
         results = [random.random() < 0.8 for _ in range(len(plan) + 5)]
-        counts = []
+        schedules = []
         for index, runner in enumerate((_shipped, _canonical)):
             console = tmp_path / f"console_{trial}_{index}.txt"
             console.write_bytes(b"")
-            counts.append(_count(runner, plan, results, str(console)))
-        assert counts[0] == counts[1], (
-            f"shipped uploader committed {counts[0]}x, canonical {counts[1]}x on "
+            schedules.append(_count(runner, plan, results, str(console)))
+        assert schedules[0] == schedules[1], (
+            f"shipped uploader committed at {schedules[0]}, canonical at {schedules[1]} on "
             f"{''.join(step[0] for step in plan)}"
         )
+
+    lines["chatty"] = b"x" * 2_100_000 + b"\n" + lines["commit"]
+    plan = ["commit"] * 5 + ["chatty"] + ["silent"] * 8
+    results = [True] * 10
+    schedules = []
+    for index, runner in enumerate((_shipped, _canonical)):
+        console = tmp_path / f"console_chatty_{index}.txt"
+        console.write_bytes(b"")
+        schedules.append(_count(runner, plan, results, str(console)))
+    assert schedules[0] == schedules[1]
 
 
 def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
@@ -1862,24 +1875,16 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     part.write_bytes(whole + _hb(step=4)[:20])
     assert _instance_bootstrap._console_progress(str(part), 0) == (len(whole), 1, 1)
 
-    # one hostile line must not allocate or rescan its entire size on every poll. the cursor advances
-    # through capped chunks, recognizes that it is mid-line, then resumes at the next complete record.
+    # one poll drains to its captured tail in bounded chunks, so a chatty console cannot make the
+    # heartbeat cursor fall farther behind on every cycle.
     from flash.providers._lifecycle import bootstrap_secrets
 
     cap = bootstrap_secrets._CONSOLE_SCAN_BYTES
     huge = tmp_path / "console_huge_line.txt"
     huge.write_bytes(b"x" * (2 * cap + 17) + b"\n" + _hb(step=99))
-    cursor = 0
-    observed = 0
-    for _ in range(4):
-        if cursor == huge.stat().st_size:
-            break
-        next_cursor, count, _ = _instance_bootstrap._console_progress(str(huge), cursor)
-        assert next_cursor > cursor
-        assert next_cursor - cursor <= cap
-        cursor, observed = next_cursor, observed + count
+    cursor, observed, any_beats = _instance_bootstrap._console_progress(str(huge), 0)
     assert cursor == huge.stat().st_size
-    assert observed == 1
+    assert (observed, any_beats) == (1, 1)
 
     assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (-1, 0, 0)
 
