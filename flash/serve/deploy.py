@@ -671,9 +671,11 @@ def _wait_revision_ready(
         last_state = str(
             metadata.get("lifecycle_state") or record.get("lifecycle_state") or "registered"
         )
+        # track the LATEST record's failure, not the first one seen: a record that later omits or
+        # clears `failure` has withdrawn that complaint, and keeping the stale string would make the
+        # timeout below prescribe "fix the artifact" for what is now a plain cold-engine timeout.
         failure = metadata.get("failure")
-        if failure:
-            last_failure = str(failure)
+        last_failure = str(failure) if failure else None
         if last_state == "failed" or record.get("status") == "disabled":
             raise ServingError(
                 f"serving failed to load adapter revision {revision}: {failure or 'unknown error'}"
@@ -712,6 +714,14 @@ def _wait_revision_ready(
             "serving reported that failure without failing the revision, so this is unlikely to be "
             "a cold-engine timeout: fix what the loader reported before retrying, because a retry "
             "against a warm engine will hit the same artifact."
+        )
+    elif not observed_record:
+        # nothing was ever read back, so there is no evidence of a loading engine to retry against.
+        # the fault is that the revision never became visible, which a warm engine does not fix.
+        remedy = (
+            "no engine or loader state was ever observed, so this is a registration-visibility "
+            "problem rather than a slow load: check that the revision was registered against this "
+            "serving backend before retrying."
         )
     else:
         remedy = (

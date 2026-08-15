@@ -1045,8 +1045,52 @@ def test_revision_ready_timeout_distinguishes_a_never_visible_record(monkeypatch
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
-    with pytest.raises(d.ServingError, match="never returned the revision record"):
+    with pytest.raises(d.ServingError) as excinfo:
         d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
+
+    message = str(excinfo.value)
+    assert "never returned the revision record" in message
+    # the remedy must match the diagnostic. no engine state was ever read, so the cold-engine retry
+    # advice would contradict the line above it and point at the wrong subsystem.
+    assert "registration-visibility problem" in message
+    assert "succeeds against the now-warm engine" not in message
+
+
+def test_a_cleared_loader_failure_is_not_reported_after_the_timeout(monkeypatch):
+    """A later record that drops `failure` has withdrawn the complaint.
+
+    Retaining the first one makes the timeout prescribe "fix the artifact" for what the final
+    record says is an ordinary cold-engine timeout -- the wrong direction, again.
+    """
+    import flash.serve.deploy as d
+
+    revision = "run-1@final." + "a" * 40
+    clock = [100.0]
+    reads = [0]
+
+    def registered(adapter_id, *, timeout_s=None):
+        clock[0] += 1.0
+        reads[0] += 1
+        metadata: dict = {"lifecycle_state": "queued"}
+        # only the FIRST read carries a complaint; later authoritative records clear it.
+        if reads[0] == 1:
+            metadata["failure"] = "adapter tensors truncated"
+        return (
+            {"subfolder": "sft/run-1/seed0/adapter", "metadata": metadata},
+            types.SimpleNamespace(headers={}),
+        )
+
+    monkeypatch.setattr(d, "_registered_adapter_response", registered)
+    monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+
+    with pytest.raises(d.ServingError) as excinfo:
+        d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
+
+    message = str(excinfo.value)
+    assert reads[0] > 1, "the test needs more than one read for the failure to be cleared"
+    assert "adapter tensors truncated" not in message
+    assert "retrying this deploy is the correct response" in message
 
 
 def test_rejected_adapter_still_fails_distinctly_from_a_timeout(monkeypatch):
