@@ -18,10 +18,7 @@ _SECRET_RE = re.compile(
     r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)"
 )
 
-# a multiline secret (a PEM key) reaches diagnostics one component line at a time -- console tails
-# are truncated and child stdout is sanitized per line -- so the whole value never matches. long
-# component lines are registered as needles too; the floor keeps a common fragment such as ``}``
-# from erasing innocent output. Mirrors flash._internal.diagnostics.
+# long multiline-secret components are redacted individually; short punctuation is ignored.
 _MIN_SECRET_COMPONENT = 8
 _CONSOLE_PROGRESS_READ_LIMIT = 1_048_576
 _CONSOLE_PROGRESS_LINE_LIMIT = 64_000
@@ -189,38 +186,35 @@ def _console_progress(path, state):
     unterminated line still makes a later snapshot eligible. complete heartbeat lines are decoded
     independently; malformed and overlong lines are inert without hiding later valid lines.
     """
-    offset = int(state.get("offset", 0))
-    partial, dropping = state.get("partial", b""), bool(state.get("dropping", False))
     try:
         with open(path, "rb") as handle:
             handle.seek(0, os.SEEK_END)
-            eof = handle.tell()
+            eof, offset = handle.tell(), state["offset"]
             if eof < offset:
-                offset, partial, dropping = 0, b"", False
+                state.update(offset=0, partial=b"", dropping=False)
+                offset = 0
             handle.seek(offset)
             chunk = handle.read(_CONSOLE_PROGRESS_READ_LIMIT)
     except OSError:
         return -1, 0, 0
     state["offset"] = offset + len(chunk)
-    lines = (partial + chunk).split(b"\n")
-    partial = lines.pop()
-    if dropping:
+    lines = (state["partial"] + chunk).split(b"\n")
+    state["partial"] = lines.pop()
+    if state["dropping"]:
         if not lines:
-            state.update(partial=b"", dropping=True)
+            state["partial"] = b""
             return eof, 0, 0
-        dropping, lines = False, lines[1:]
-    if len(partial) > _CONSOLE_PROGRESS_LINE_LIMIT:
-        partial, dropping = b"", True
-    committed = beats = 0
+        state["dropping"], lines = False, lines[1:]
+    if len(state["partial"]) > _CONSOLE_PROGRESS_LINE_LIMIT:
+        state.update(partial=b"", dropping=True)
+    beats = []
     for line in lines:
-        if len(line) > _CONSOLE_PROGRESS_LINE_LIMIT or not line.startswith(b"HEARTBEAT "):
-            continue
-        try:
-            payload = json.loads(line[len(b"HEARTBEAT ") :])
-        except (TypeError, ValueError):
-            continue
-        if isinstance(payload, dict) and not payload.get("liveness"):
-            beats += 1
-            committed += not {"pending", "throttled"} & set(payload)
-    state.update(partial=partial, dropping=dropping)
-    return eof, committed, beats
+        if len(line) <= _CONSOLE_PROGRESS_LINE_LIMIT and line.startswith(b"HEARTBEAT "):
+            try:
+                payload = json.loads(line[len(b"HEARTBEAT ") :])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict) and not payload.get("liveness"):
+                beats.append(payload)
+    committed = sum(not {"pending", "throttled"} & set(beat) for beat in beats)
+    return eof, committed, len(beats)

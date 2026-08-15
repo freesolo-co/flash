@@ -28,8 +28,7 @@ if __package__:
         _safe_detail,
     )
 else:
-    # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
-    # same directory, and the script directory leads sys.path.
+    # bare workers import the shipped sibling modules.
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _console_progress,
@@ -498,7 +497,6 @@ def remote_completion_confirmed(payload: dict) -> bool:
     try:
         return hf_file_exists(payload, "DONE") and hf_file_exists(payload, "metrics.json")
     except Exception as exc:
-        # read errors are infra-shaped and leave completion unconfirmed.
         print(
             f"remote-completion check warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
             flush=True,
@@ -531,7 +529,6 @@ def build_worker_env(payload: dict) -> dict:
     env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
     spec_json = payload.get("job_spec_json")
     if not spec_json and payload.get("job_spec_in_hf"):
-        # Pre-worker fetch; failure is infra-shaped → raise RetriableBootstrapError so poller retries.
         try:
             spec_json = fetch_spec_from_hf(payload)
         except Exception:
@@ -541,7 +538,6 @@ def build_worker_env(payload: dict) -> dict:
             "bootstrap payload carries no job spec: both job_spec_json and the job_spec_in_hf "
             "sentinel are absent/empty — the control plane built an invalid worker payload"
         )
-    # Large specs go via a file to avoid execve "Argument list too long".
     if len(spec_json) > 96_000:
         with open("/tmp/job_spec.json", "w") as f:
             f.write(spec_json)
@@ -551,12 +547,10 @@ def build_worker_env(payload: dict) -> dict:
         env["FLASH_JOB_SPEC_JSON"] = spec_json
     env["PHASE"] = payload["phase"]
     env["SEED"] = str(payload["seed"])
-    # drives the poller's stale-heartbeat rejection across retries.
     attempt = payload.get("attempt")
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise RuntimeError("bootstrap attempt identity is invalid")
     env["ATTEMPT"] = str(attempt)
-    # Override runpod-stamped FLASH_ARM to the real backend from the payload.
     env["FLASH_ARM"] = _arm(payload)
     code_dir = _code_dir(payload)
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
@@ -623,8 +617,7 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     console = f"/tmp/console_{mode}.txt"
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
     worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
-    # cap work from its actual start: the absolute deadline includes boot grace, whose unused
-    # portion must not extend the declared wall-time budget.
+    # unused boot grace cannot extend the declared worker budget.
     budget = payload.get("run_max_wall_seconds")
     if isinstance(budget, (int, float)) and not isinstance(budget, bool):
         budget = float(budget)
@@ -650,14 +643,11 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            # the worker's own output can carry bytes invalid under the container locale; strict
-            # decoding would raise mid-stream and fail a paid run whose training actually ran.
             errors="replace",
         )
         pump_done = threading.Event()
         pump_write_lock = threading.Lock()
         pump_writes_enabled = True
-        # resolved once: the payload does not change, and this runs per child line.
         pump_secrets = _payload_secrets(payload)
 
         def pump():
