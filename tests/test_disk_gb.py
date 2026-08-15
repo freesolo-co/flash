@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 from dataclasses import dataclass, field
+from math import ceil
 
 from tests._helpers.profile import satisfy_sft_profile
 
@@ -65,9 +66,34 @@ def test_every_catalog_algorithm_gets_the_full_bf16_merge_floor():
     from flash.core.catalog import MODELS, resolve_model
 
     for model in MODELS.values():
-        expected = max(model.min_disk_gb, int(model.params_b * 2) + 64)
+        expected = max(model.min_disk_gb, ceil(model.params_b * 2) + 64)
         for algorithm in model.algos:
             assert resolve_model(model.id, algorithm).min_disk_gb == expected
+
+
+def test_public_model_rows_report_the_derived_merge_floor():
+    from flash.core.catalog import MODELS, public_model_rows
+
+    rows = {row["id"]: row for row in public_model_rows()}
+    for model in MODELS.values():
+        expected = max(model.min_disk_gb, ceil(model.params_b * 2) + 64)
+        assert rows[model.id]["min_disk_gb"] == expected
+
+
+def test_fractional_parameter_merge_floor_rounds_up(monkeypatch):
+    from flash.core.catalog import MODELS, ModelInfo, resolve_model
+
+    model = ModelInfo(
+        id="test/fractional-disk",
+        display_name="fractional",
+        params="0.9B",
+        params_b=0.9,
+        algos=("sft",),
+        min_vram_gb=1,
+    )
+    monkeypatch.setitem(MODELS, model.id, model)
+
+    assert resolve_model(model.id, "sft").min_disk_gb == 66
 
 
 def test_moe_merge_floor_uses_total_parameters(monkeypatch):
@@ -127,7 +153,7 @@ def test_submit_applies_derived_model_disk_floor(monkeypatch):
         min_disk_gb=0,
     )
     monkeypatch.setitem(MODELS, model.id, model)
-    expected_floor = int(model.params_b * 2) + 64
+    expected_floor = ceil(model.params_b * 2) + 64
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = JobSpec.from_dict(

@@ -23,6 +23,7 @@ from flash.engine.worker.backend_common import (
 )
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.verl.checkpoints import MergeDiskExhaustedError, MergeDiskHeadroomError
 
 
 def _sft_train():
@@ -113,6 +114,8 @@ class _VerlCheckpointWatcher:
         self._thread.start()
 
     def raise_if_failed(self) -> None:
+        if isinstance(self._error, (MergeDiskHeadroomError, MergeDiskExhaustedError)):
+            raise self._error
         if self._error is not None:
             raise RuntimeError("verl checkpoint watcher failed") from self._error
 

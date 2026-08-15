@@ -92,7 +92,7 @@ def _inherit_warmstart_revision(
     """Adopt a warm-start source's pin BEFORE the spec is sized against it.
 
     Sizing reads the revision: ``resolve_model`` re-derives params/vocab/disk from the pinned
-    commit's geometry, and ``min_disk_gb`` becomes ``params_b * 2 + 64``, which for half of today's
+    commit's geometry, and ``min_disk_gb`` becomes ``ceil(2 * params_b) + 64``, which for half of today's
     catalog is strictly larger than the catalog default. Adopting the pin only inside
     ``_prepare_init_from_adapter`` -- which runs after ``resolve_model``, ``_with_model_disk``, and
     ``_assign_weight_cache_volume`` -- would provision the child as if unpinned while training it

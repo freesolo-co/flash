@@ -9,7 +9,6 @@ Split out of `flash.engine.worker.backend_common` to keep that module under the 
 
 from __future__ import annotations
 
-import contextlib
 import errno
 import json
 import os
@@ -29,7 +28,6 @@ class MergeDiskExhaustedError(RuntimeError):
 # a genuine short write leaves almost no free space; keep the fallback absolute so a normal partial
 # merge is not misclassified merely because its output is large.
 _MERGE_DISK_EXHAUSTED_FREE_BYTES = 64 * 1024 * 1024
-_MERGER_KILL_REAP_SECONDS = 10
 
 # quota exhaustion can leave the underlying filesystem reporting free space, so preserve both errno
 # and text forms emitted by torch and safetensors.
@@ -42,6 +40,7 @@ _DISK_EXHAUSTED_MARKERS = (
     "errno 122",
     "os error 122",
 )
+_SHORT_WRITE_MARKERS = ("unexpected pos",)
 
 # disk size is platform-managed, so checkpoint frequency is the reachable remedy.
 _FEWER_CHECKPOINTS_ADVICE = (
@@ -89,40 +88,20 @@ def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
 
 def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
     """stream merger output and retain the first disk-exhaustion marker."""
-    process = subprocess.Popen(
-        cmd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-        bufsize=1,
-    )
+    from flash.engine.worker import backend_common
+
     exhausted_line = ""
 
-    def kill_and_reap() -> None:
-        if process.poll() is None:
-            with contextlib.suppress(OSError):
-                process.kill()
-        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-            process.wait(timeout=_MERGER_KILL_REAP_SECONDS)
+    def handle_line(line: str) -> None:
+        nonlocal exhausted_line
+        print(line, end="", flush=True)
+        if not exhausted_line and any(marker in line.lower() for marker in _DISK_EXHAUSTED_MARKERS):
+            exhausted_line = line.strip()
 
-    try:
-        for line in process.stdout or ():
-            print(line, end="", flush=True)
-            if not exhausted_line and any(m in line.lower() for m in _DISK_EXHAUSTED_MARKERS):
-                exhausted_line = line.strip()
-        return_code = process.wait(timeout=_MERGER_KILL_REAP_SECONDS)
-    except subprocess.TimeoutExpired as error:
-        kill_and_reap()
-        raise RuntimeError("verl merger stdout closed but the child did not exit") from error
-    except BaseException:
-        kill_and_reap()
-        raise
-    finally:
-        if process.stdout:
-            process.stdout.close()
-
+    merger_env = {**env, "PYTHONUNBUFFERED": "1"}
+    return_code = backend_common._run_streaming_verl_subprocess(
+        cmd, env=merger_env, on_line=handle_line, errors="replace"
+    )
     if return_code != 0:
         raise subprocess.CalledProcessError(return_code, cmd, output=exhausted_line or None)
 
@@ -135,33 +114,47 @@ def _free_bytes(path: str) -> int | None:
         return None
 
 
-def _disk_exhausted_error(error: BaseException) -> bool:
-    """whether an error chain contains direct volume or quota exhaustion evidence."""
+def _error_chain_matches(
+    error: BaseException, *, errnos: tuple[int, ...] = (), markers: tuple[str, ...] = ()
+) -> bool:
+    """whether an error chain contains any requested errno or text marker."""
     seen: set[int] = set()
     current: BaseException | None = error
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, OSError) and current.errno in _DISK_EXHAUSTED_ERRNOS:
+        if isinstance(current, OSError) and current.errno in errnos:
             return True
-        # safetensors carries the underlying errno only in its message.
-        if any(marker in str(current).lower() for marker in _DISK_EXHAUSTED_MARKERS):
-            return True
-        # subprocess errors keep the child's diagnostic in captured output.
-        captured = getattr(current, "output", None) or getattr(current, "stderr", None)
-        if isinstance(captured, bytes):
-            captured = captured.decode("utf-8", "replace")
-        if captured and any(marker in captured.lower() for marker in _DISK_EXHAUSTED_MARKERS):
-            return True
+        for evidence in (
+            current,
+            getattr(current, "output", None),
+            getattr(current, "stderr", None),
+        ):
+            if isinstance(evidence, bytes):
+                evidence = evidence.decode("utf-8", "replace")
+            if evidence is not None and any(marker in str(evidence).lower() for marker in markers):
+                return True
         current = current.__cause__ or current.__context__
     return False
+
+
+def _disk_exhausted_error(error: BaseException) -> bool:
+    """whether an error chain contains direct volume or quota exhaustion evidence."""
+    return _error_chain_matches(
+        error, errnos=_DISK_EXHAUSTED_ERRNOS, markers=_DISK_EXHAUSTED_MARKERS
+    )
 
 
 def raise_for_merge_disk_exhaustion(
     error: BaseException, ckpt_actor_dir: str, merge_out: str, *, merger_succeeded: bool = False
 ) -> None:
-    """classify direct disk evidence or a low-space merge failure before cleanup."""
+    """classify direct disk evidence or a low-space short write before cleanup."""
     direct_evidence = _disk_exhausted_error(error)
+    if not direct_evidence and isinstance(error, OSError):
+        return
     if merger_succeeded and not direct_evidence:
+        return
+    short_write_evidence = _error_chain_matches(error, markers=_SHORT_WRITE_MARKERS)
+    if not direct_evidence and not short_write_evidence:
         return
     free = _free_bytes(merge_out)
     if not direct_evidence and (free is None or free > _MERGE_DISK_EXHAUSTED_FREE_BYTES):

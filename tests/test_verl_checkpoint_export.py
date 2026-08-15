@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import os
 import subprocess
@@ -9,6 +10,20 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+
+
+def _has_libc() -> bool:
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True)
+    except OSError:
+        return False
+    return True
+
+
+_needs_process_teardown = pytest.mark.skipif(
+    not hasattr(os, "fork") or not os.path.isdir("/proc") or not _has_libc(),
+    reason="teardown tests drive real process groups: needs os.fork, /proc and libc",
+)
 
 
 @pytest.fixture
@@ -86,8 +101,80 @@ def test_direct_disk_evidence_wins_even_when_the_volume_looks_roomy(
     assert caught.value.__cause__ is error
 
 
+def test_chained_disk_evidence_wins_over_an_outer_nondisk_oserror(monkeypatch, actor_dir, tmp_path):
+    from flash.engine.worker.verl import checkpoints
+
+    cause = OSError(errno.ENOSPC, "no space left on device")
+    error = PermissionError(errno.EACCES, "permission denied")
+    error.__cause__ = cause
+    monkeypatch.setattr(checkpoints.shutil, "disk_usage", lambda path: _disk_usage(1 << 40))
+
+    with pytest.raises(checkpoints.MergeDiskExhaustedError) as caught:
+        checkpoints.raise_for_merge_disk_exhaustion(
+            error, str(actor_dir), str(tmp_path / "adapter_merge")
+        )
+    assert caught.value.__cause__ is error
+
+
+def _watcher_boundary(kind: str):
+    if kind == "sft":
+        from flash.engine.worker.train.sft.checkpoints import _VerlCheckpointWatcher
+
+        return (
+            object.__new__(_VerlCheckpointWatcher),
+            "raise_if_failed",
+            "verl checkpoint watcher failed",
+        )
+    from flash.engine.worker.train.rl.checkpoints import _VerlResumeUploader
+
+    return object.__new__(_VerlResumeUploader), "raise_if_incomplete", "verl resume uploader failed"
+
+
+@pytest.mark.parametrize("kind", ["sft", "rl"])
+@pytest.mark.parametrize("error_name", ["MergeDiskHeadroomError", "MergeDiskExhaustedError"])
+def test_watcher_boundaries_preserve_merge_disk_errors(kind, error_name):
+    from flash.engine.worker.verl import checkpoints
+
+    watcher, method_name, _ = _watcher_boundary(kind)
+    error_type = getattr(checkpoints, error_name)
+    error = error_type("specific disk diagnosis")
+    watcher._error = error
+
+    with pytest.raises(error_type, match="specific disk diagnosis") as caught:
+        getattr(watcher, method_name)()
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("kind", ["sft", "rl"])
+def test_watcher_boundaries_still_wrap_unrelated_errors(kind):
+    watcher, method_name, wrapper = _watcher_boundary(kind)
+    error = ValueError("unrelated failure")
+    watcher._error = error
+
+    with pytest.raises(RuntimeError, match=wrapper) as caught:
+        getattr(watcher, method_name)()
+    assert caught.value.__cause__ is error
+
+
+def test_stderr_disk_marker_is_not_hidden_by_benign_stdout(monkeypatch, actor_dir, tmp_path):
+    from flash.engine.worker.verl import checkpoints
+
+    error = subprocess.CalledProcessError(
+        1,
+        ["merge"],
+        output="saving tokenizer config\n",
+        stderr="Disk quota exceeded (os error 122)\n",
+    )
+    monkeypatch.setattr(checkpoints.shutil, "disk_usage", lambda path: _disk_usage(1 << 40))
+
+    with pytest.raises(checkpoints.MergeDiskExhaustedError):
+        checkpoints.raise_for_merge_disk_exhaustion(
+            error, str(actor_dir), str(tmp_path / "adapter_merge")
+        )
+
+
 @pytest.mark.parametrize(("free", "disk_error"), [(0, True), (1 << 40, False)])
-def test_free_space_is_only_a_fallback_for_non_disk_errors(
+def test_free_space_only_confirms_a_recognizable_short_write(
     monkeypatch, actor_dir, tmp_path, free, disk_error
 ):
     from flash.engine.worker.verl import checkpoints
@@ -106,6 +193,51 @@ def test_free_space_is_only_a_fallback_for_non_disk_errors(
             )
             is None
         )
+
+
+def test_low_space_does_not_relabel_an_unrelated_child_failure(monkeypatch, actor_dir, tmp_path):
+    from flash.engine.worker.verl import checkpoints
+
+    error = subprocess.CalledProcessError(
+        1, ["merge"], output="full model saved\n", stderr="tokenizer config save failed\n"
+    )
+    monkeypatch.setattr(checkpoints.shutil, "disk_usage", lambda path: _disk_usage(0))
+
+    assert (
+        checkpoints.raise_for_merge_disk_exhaustion(
+            error, str(actor_dir), str(tmp_path / "adapter_merge")
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError(errno.ENOENT, "missing"),
+        PermissionError(errno.EACCES, "unexpected pos 100 vs 88"),
+    ],
+)
+def test_low_space_preserves_non_disk_merger_launch_errors(monkeypatch, actor_dir, tmp_path, error):
+    from flash.engine.worker.verl import checkpoints
+
+    free = {"value": 1 << 40}
+
+    def launch(cmd, env):
+        free["value"] = 0
+        raise error
+
+    monkeypatch.setattr(checkpoints, "_run_merger", launch)
+    monkeypatch.setattr(checkpoints.shutil, "disk_usage", lambda path: _disk_usage(free["value"]))
+
+    with pytest.raises(type(error)) as caught:
+        checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+    assert caught.value is error
 
 
 def test_layout_error_after_success_is_not_reclassified(monkeypatch, actor_dir, tmp_path):
@@ -219,7 +351,44 @@ def test_export_moves_adapter_files_and_cleans_merge_tree(monkeypatch, actor_dir
     assert not merge_out.exists()
 
 
-def test_merger_preserves_invalid_output_first_disk_marker_and_exit_code(monkeypatch, capsys):
+def test_merger_uses_the_shared_streaming_supervisor(monkeypatch):
+    from flash.engine.worker import backend_common
+    from flash.engine.worker.verl import checkpoints
+
+    seen = {}
+
+    def supervise(cmd, *, env, on_line, errors):
+        seen.update(cmd=cmd, env=env, errors=errors)
+        on_line("merged\n")
+        return 0
+
+    monkeypatch.setattr(backend_common, "_run_streaming_verl_subprocess", supervise)
+    checkpoints._run_merger(["merge", "checkpoint"], {"KEEP": "yes"})
+
+    assert seen == {
+        "cmd": ["merge", "checkpoint"],
+        "env": {"KEEP": "yes", "PYTHONUNBUFFERED": "1"},
+        "errors": "replace",
+    }
+
+
+def test_merger_preserves_cancellation_identity(monkeypatch):
+    from flash.engine.worker import backend_common
+    from flash.engine.worker.verl import checkpoints
+
+    cancellation = SystemExit("cancelled")
+
+    def cancel(*args, **kwargs):
+        raise cancellation
+
+    monkeypatch.setattr(backend_common, "_run_streaming_verl_subprocess", cancel)
+    with pytest.raises(SystemExit) as caught:
+        checkpoints._run_merger(["merge"], {})
+    assert caught.value is cancellation
+
+
+@_needs_process_teardown
+def test_merger_preserves_invalid_output_first_disk_marker_and_exit_code(capsys):
     from flash.engine.worker.verl import checkpoints
 
     child = (
@@ -237,19 +406,23 @@ def test_merger_preserves_invalid_output_first_disk_marker_and_exit_code(monkeyp
 
 
 @pytest.mark.wallclock
-def test_merger_output_is_live(monkeypatch, tmp_path):
+@_needs_process_teardown
+def test_merger_output_is_live_without_explicit_child_flush(monkeypatch, tmp_path):
+    from flash.engine.worker import backend_common
     from flash.engine.worker.verl import checkpoints
 
     gate = tmp_path / "continue"
     child = (
         "import pathlib,time\n"
-        "print('merging shard 1', flush=True)\n"
+        "print('merging shard 1')\n"
         f"p = pathlib.Path({str(gate)!r})\n"
-        "while not p.exists():\n"
+        "deadline = time.monotonic() + 1.0\n"
+        "while not p.exists() and time.monotonic() < deadline:\n"
         "    time.sleep(0.01)\n"
+        "raise SystemExit(0 if p.exists() else 9)\n"
     )
     process: subprocess.Popen | None = None
-    real_popen = checkpoints.subprocess.Popen
+    real_popen = backend_common.subprocess.Popen
     seen_alive: list[bool] = []
 
     def popen(*args, **kwargs):
@@ -262,69 +435,7 @@ def test_merger_output_is_live(monkeypatch, tmp_path):
         seen_alive.append(process.poll() is None)
         gate.write_text("go")
 
-    monkeypatch.setattr(checkpoints.subprocess, "Popen", popen)
+    monkeypatch.setattr(backend_common.subprocess, "Popen", popen)
     monkeypatch.setattr(checkpoints, "print", live_print, raising=False)
-    try:
-        checkpoints._run_merger([sys.executable, "-c", child], dict(os.environ))
-        assert seen_alive == [True]
-    finally:
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait(timeout=1)
-
-
-@pytest.mark.wallclock
-def test_cancellation_kills_and_reaps_the_merger(monkeypatch):
-    from flash.engine.worker.verl import checkpoints
-
-    child = "import signal; print('started', flush=True); signal.pause()"
-    process: subprocess.Popen | None = None
-    real_popen = checkpoints.subprocess.Popen
-
-    def popen(*args, **kwargs):
-        nonlocal process
-        process = real_popen(*args, **kwargs)
-        return process
-
-    def cancel(line, **kwargs):
-        raise SystemExit(1)
-
-    monkeypatch.setattr(checkpoints.subprocess, "Popen", popen)
-    monkeypatch.setattr(checkpoints, "print", cancel, raising=False)
-    try:
-        with pytest.raises(SystemExit):
-            checkpoints._run_merger([sys.executable, "-c", child], dict(os.environ))
-        assert process is not None
-        assert process.poll() is not None
-        assert process.returncode is not None
-        assert process.returncode < 0
-    finally:
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait(timeout=1)
-
-
-@pytest.mark.wallclock
-def test_stdout_eof_before_child_exit_is_not_success(monkeypatch):
-    from flash.engine.worker.verl import checkpoints
-
-    child = "import os,signal; os.close(1); os.close(2); signal.pause()"
-    process: subprocess.Popen | None = None
-    real_popen = checkpoints.subprocess.Popen
-
-    def tracking_popen(*args, **kwargs):
-        nonlocal process
-        process = real_popen(*args, **kwargs)
-        return process
-
-    monkeypatch.setattr(checkpoints.subprocess, "Popen", tracking_popen)
-    monkeypatch.setattr(checkpoints, "_MERGER_KILL_REAP_SECONDS", 0.05)
-    try:
-        with pytest.raises(RuntimeError, match="did not exit"):
-            checkpoints._run_merger([sys.executable, "-c", child], dict(os.environ))
-        assert process is not None
-        assert process.poll() is not None
-    finally:
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait(timeout=1)
+    checkpoints._run_merger([sys.executable, "-c", child], dict(os.environ))
+    assert seen_alive == [True]
