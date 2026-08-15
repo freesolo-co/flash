@@ -317,7 +317,9 @@ def capacity_escalation_note(on_last_gpu: bool) -> str:
     )
 
 
-def _health_deadline_in(raw_remaining: float, *, armed: bool) -> float:
+def _health_deadline_in(
+    raw_remaining: float, *, armed: bool, now: float, probe_at: float | None
+) -> float:
     """When a health grace can actually FIRE, not when it nominally runs out.
 
     `_classify_queue_state` evaluates the unhealthy/throttled timers only on the ~90s probe cadence,
@@ -325,15 +327,30 @@ def _health_deadline_in(raw_remaining: float, *, armed: bool) -> float:
     the wall deadline are checked every poll and need no such adjustment, which is why quoting a raw
     health remainder against them overstates how soon the health timer bites.
 
-    This note is itself emitted from inside a probe, and the timers are checked a few lines later in
-    the same pass -- so a grace already spent fires now (0), and otherwise it waits for the first
-    probe boundary at or beyond its deadline. An unarmed timer is one further cadence out: the poll
-    that arms it cannot also expire it.
+    Eligibility is measured from `probe_at`, the clock the CURRENT probe was actually stamped with,
+    not from `now`. Those differ whenever the health request itself was slow: `now` is read after
+    the request returns, so assuming a full cadence from it would push the next probe further out
+    than it really is and could hide a health grace that fires first. A request that outran a whole
+    cadence leaves the next probe due immediately.
+
+    The timers are checked a few lines after this note in the same pass, so a grace already spent
+    fires now (0). An unarmed timer is one further cadence out: the poll that arms it cannot also
+    expire it.
     """
-    probes = math.ceil(max(raw_remaining, 0.0) / HEALTH_PROBE_CADENCE_S)
+    remaining = max(raw_remaining, 0.0)
+    if remaining <= 0.0 and armed:
+        return 0.0
+    # when the next probe is due, relative to `now`; never negative, and 0 when already due.
+    next_probe_in = 0.0 if probe_at is None else max(probe_at + HEALTH_PROBE_CADENCE_S - now, 0.0)
+    # the first probe boundary at or beyond the grace's own deadline
+    if remaining > next_probe_in:
+        extra = math.ceil((remaining - next_probe_in) / HEALTH_PROBE_CADENCE_S)
+        eligible_in = next_probe_in + extra * HEALTH_PROBE_CADENCE_S
+    else:
+        eligible_in = next_probe_in
     if not armed:
-        probes += 1
-    return probes * HEALTH_PROBE_CADENCE_S
+        eligible_in += HEALTH_PROBE_CADENCE_S
+    return eligible_in
 
 
 def queue_wait_note(
@@ -352,6 +369,7 @@ def queue_wait_note(
     absolute_deadline: float | None,
     stall_since: float,
     stall_limit_s: float,
+    probe_at: float | None = None,
 ) -> str:
     """The budget clause on a "still queued" line: how long we have waited of how long we will.
 
@@ -380,13 +398,19 @@ def queue_wait_note(
     if unhealthy:
         waited = 0.0 if unhealthy_since is None else now - unhealthy_since
         remaining = _health_deadline_in(
-            unhealthy_grace_s - waited, armed=unhealthy_since is not None
+            unhealthy_grace_s - waited,
+            armed=unhealthy_since is not None,
+            now=now,
+            probe_at=probe_at,
         )
         candidates.append((remaining, waited, unhealthy_grace_s, "unhealthy", ""))
     if throttled:
         waited = 0.0 if throttled_since is None else now - throttled_since
         remaining = _health_deadline_in(
-            throttled_grace_s - waited, armed=throttled_since is not None
+            throttled_grace_s - waited,
+            armed=throttled_since is not None,
+            now=now,
+            probe_at=probe_at,
         )
         candidates.append((remaining, waited, throttled_grace_s, "throttled", ""))
     # the caller only asks for a note when it has just confirmed no usable or recovering worker, so

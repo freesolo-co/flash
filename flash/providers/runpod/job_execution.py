@@ -435,6 +435,25 @@ def _probe_worker_coming_up_at(context: _PollContext, now: float) -> float | Non
     return now if (usable or workers.get("initializing")) else None
 
 
+def _queue_deadline_already_spent(
+    context: _PollContext, state: _PollState, status: Any, now: float
+) -> bool:
+    """True when the capacity grace is spent, so this poll will return `no_capacity` regardless.
+
+    Read-only and side-effect free, unlike `_classify_queue_state`: it must not consume the health
+    probe budget or arm anything. Deliberately conservative -- the classifier may still re-probe at
+    the boundary and find a worker coming up, in which case the run continues and the heartbeat is
+    read on the next poll. Being wrong here only defers a heartbeat by one iteration; being wrong
+    the other way blocks a capacity escalation behind a network read that cannot change its verdict.
+    """
+    return (
+        status == "IN_QUEUE"
+        and state.queued_timer.since is not None
+        and now - state.queued_timer.since > context.queue_grace_s
+        and not _worker_is_coming_up(state.worker_coming_up_at, now)
+    )
+
+
 def _classify_queue_state(
     context: _PollContext,
     state: _PollState,
@@ -527,6 +546,9 @@ def _classify_queue_state(
                     if context.heartbeat_reader is not None and not state.seen_training_hb
                     else context.stall_after_s
                 ),
+                # when THIS probe was stamped, so health-timer eligibility is measured from the
+                # real cadence rather than assumed from the post-request clock above.
+                probe_at=state.last_health_probe,
             )
             budget = f"; {note}" if note else ""
             context.say(f"queued; workers: {workers}{budget}")
@@ -703,7 +725,13 @@ def poll_job(
         # otherwise be charged against the previous last_progress -- reporting the budget as spent
         # in the same iteration that resets it and keeps polling. Still one reader call, and `now`
         # is read in the same position as before so the clock-read sequence per poll is unchanged.
-        _update_heartbeat(context, state)
+        #
+        # But NOT ahead of a capacity verdict that is already decided: the reader is an HF artifact
+        # download on real runs, and no heartbeat can change "RunPod never gave us a GPU". Blocking
+        # on network I/O there would delay the escalation to the next GPU class for a line that is
+        # never printed on this path -- _classify_queue_state returns no_capacity before it.
+        if not _queue_deadline_already_spent(context, state, status, now):
+            _update_heartbeat(context, state)
         terminal = _classify_queue_state(context, state, status, now)
         if terminal is not None:
             return terminal

@@ -885,6 +885,91 @@ def test_an_armed_health_timer_is_charged_the_probe_gap_it_must_wait_for():
     assert "unhealthy grace" in genuinely_nearer, genuinely_nearer
 
 
+def test_health_eligibility_is_measured_from_the_probe_not_the_formatting_clock():
+    # The note is stamped AFTER the health request, while the probe (and an unarmed timer) is
+    # stamped before it. Assuming a full cadence from the note's clock pushes the next probe further
+    # out than it really is: after a 150s retried request the next probe is already due, so a 240s
+    # unhealthy grace can still fire before a 300s capacity grace with 150s left. Adding a flat 90s
+    # from the post-request clock hid that and selected capacity.
+    # The probe ran 45s ago, so the next one is due in 45s and an unhealthy timer with 45s of raw
+    # grace left fires then. Capacity has 60s left and is checked every poll, so unhealthy really is
+    # first. Assuming a full cadence from the formatting clock puts unhealthy at 90s instead and
+    # wrongly reports capacity -- the deadline the operator would NOT hit.
+    slow_probe = _note(
+        195.0,
+        probe_at=150.0,  # 45s ago: next probe due in 45s
+        unhealthy=True,
+        unhealthy_since=0.0,
+        unhealthy_grace_s=240.0,  # 45s of raw grace left
+        queued_since=0.0,
+        queue_grace_s=255.0,  # 60s left, checked every poll
+    )
+    assert "unhealthy grace" in slow_probe, slow_probe
+
+    # and a probe that has only just run really does push the health timer out: with 30s of raw
+    # unhealthy grace left but the next probe 90s away, the 60s-remaining capacity grace fires
+    # first. Measuring from the probe is what separates this case from the one above.
+    fresh_probe = _note(
+        210.0,
+        probe_at=210.0,
+        unhealthy=True,
+        unhealthy_since=0.0,
+        unhealthy_grace_s=240.0,
+        queued_since=0.0,
+        queue_grace_s=270.0,
+    )
+    assert "capacity grace" in fresh_probe, fresh_probe
+
+
+def test_a_spent_capacity_deadline_is_not_delayed_by_a_blocking_heartbeat_read(monkeypatch):
+    # The heartbeat reader is an HF artifact download on real runs. Reading it before the queue
+    # classifier keeps the queued line honest, but once the capacity grace is already spent this
+    # poll returns no_capacity regardless -- no heartbeat can change "RunPod never gave us a GPU".
+    # Blocking there delays escalation to the next GPU class for a line that is never printed.
+    import io
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api, "endpoint_health_for_fingerprint", lambda eid, _fp, **_kw: {"workers": {}}
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=200.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    # record the queue-timer age at each reader call: the deciding poll is the one whose age has
+    # passed the grace, and the reader must not be called on it.
+    ages = []
+
+    from flash.providers.runpod import job_execution
+
+    real_update = job_execution._update_heartbeat
+
+    def _spy_update(context, state):
+        since = state.queued_timer.since
+        ages.append(None if since is None else jobs.time.time() - since)
+        return real_update(context, state)
+
+    monkeypatch.setattr(job_execution, "_update_heartbeat", _spy_update)
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        log=io.StringIO(),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=3000.0,
+        queue_grace_s=300.0,
+        on_last_gpu=False,
+    )
+    assert res.failure == "no_capacity", res
+    # no reader call may happen once the capacity grace is already spent: that poll returns
+    # no_capacity regardless, so the read is pure latency in front of a GPU-class escalation.
+    spent = [a for a in ages if a is not None and a > 300.0]
+    assert not spent, ages
+
+
 def test_a_recovering_worker_still_reports_the_budgets_that_do_apply():
     # An initializing worker suppresses the capacity and health countdowns -- those timers are not
     # running for it. But the run wall deadline and the setup/no-progress limit still apply and
