@@ -8,17 +8,15 @@ account, and print the environment variable that connects the two.
 
 from __future__ import annotations
 
-import json
 import shlex
 import shutil
 import subprocess
 import sys
-import uuid
 from pathlib import Path
 
 from flash._internal.channel import CLI_NAME
 from flash.cli.ui import render
-from flash.core.catalog import MODELS, get_model
+from flash.core.catalog import MODELS, ModelInfo, get_model
 from flash.serve.backend.generate import (
     DEFAULT_SCALEDOWN_WINDOW,
     app_name_for,
@@ -27,11 +25,18 @@ from flash.serve.backend.generate import (
 )
 from flash.serve.backend.gpus import (
     MODAL_GPUS,
+    Fit,
     cheapest_fitting,
     default_gpu,
     estimate_fit,
     recommend,
 )
+from flash.serve.contract import (
+    REQUIRED_SERVING_CAPABILITIES,
+    ServingHealthError,
+    parse_serving_health,
+)
+from flash.serve.probe import healthz_with_retry, probe_serving_key, redacted_error, request_json
 
 DEFAULT_APP_FILE = "flash_serving_app.py"
 SECRET_NAME = "flash-serving"
@@ -47,44 +52,28 @@ def _err(message: str) -> int:
     return 1
 
 
-def _model_or_error(model_id: str):
+def _require_model(model_id: str) -> ModelInfo:
     try:
-        return get_model(model_id), None
-    except (KeyError, ValueError):
+        return get_model(model_id)
+    except (KeyError, ValueError) as exc:
         known = ", ".join(sorted(MODELS))
-        return None, _err(f"unknown model {model_id!r}. supported: {known}")
+        raise ValueError(f"unknown model {model_id!r}. supported: {known}") from exc
 
 
-def _fit_rows(info, context_len: int = 0) -> list[dict]:
-    return [
-        {
-            "gpu": fit.gpu.name,
-            "vram_gb": fit.gpu.vram_gb,
-            "headroom": fit.headroom,
-            "free_gb": fit.free_gb,
-            "speed": fit.speed,
-            "usd_hr": fit.gpu.usd_hr,
-            "default": fit.is_catalog_default,
-            "fp8_native": fit.fp8_native,
-        }
-        for fit in recommend(info, context_len=context_len)
-    ]
-
-
-def _gpus_tip(info, rows: list[dict], model_id: str) -> str:
+def _gpus_tip(info: ModelInfo, rows: list[Fit], model_id: str) -> str:
     """What the table cannot show in a column, and the honest caveats.
 
     The estimates are arithmetic over the catalog's model geometry, not measurements, and saying so
     is the difference between a useful guide and a number someone budgets against.
     """
-    marked = next((row for row in rows if row["default"]), None)
+    marked = next((fit for fit in rows if fit.is_catalog_default), None)
     lines = []
     if marked is not None:
         lines.append(
-            f"* {marked['gpu']} is what Freesolo runs this model on in production, validated on "
+            f"* {marked.gpu.name} is what Freesolo runs this model on in production, validated on "
             "real hardware. Prefer it unless you have a reason not to."
         )
-    non_native = [row["gpu"] for row in rows if not row["fp8_native"] and row["headroom"] != "no"]
+    non_native = [fit.gpu.name for fit in rows if not fit.fp8_native and fit.fits]
     if non_native:
         lines.append(
             f"{', '.join(non_native)} lack native fp8 tensor cores (compute capability < 8.9), so "
@@ -103,20 +92,18 @@ def _gpus_tip(info, rows: list[dict], model_id: str) -> str:
 
 def cmd_serve_gpus(args) -> int:
     """Show which Modal GPUs can serve a model, with fit, speed, and price."""
-    info, error = _model_or_error(args.model)
-    if info is None:
-        return error
-    rows = _fit_rows(info, context_len=getattr(args, "context_len", 0) or 0)
+    info = _require_model(args.model)
+    rows = recommend(info, context_len=getattr(args, "context_len", 0) or 0)
     tip = _gpus_tip(info, rows, info.id)
     if render.styled():
         print(render.serving_gpus_table(rows, tip))
         return 0
     print(f"{'gpu':<12}{'vram':>6}{'fits':>8}{'spare':>8}{'speed':>10}{'$/hr':>8}")
-    for row in rows:
-        spare = f"{row['free_gb']:.0f}G" if row["headroom"] != "no" else "-"
+    for fit in rows:
+        spare = f"{fit.free_gb:.0f}G" if fit.fits else "-"
         print(
-            f"{row['gpu']:<12}{row['vram_gb']:>5}G{row['headroom']:>8}{spare:>8}"
-            f"{row['speed']:>10}{row['usd_hr']:>8.2f}"
+            f"{fit.gpu.name:<12}{fit.gpu.vram_gb:>5}G{fit.headroom:>8}{spare:>8}"
+            f"{fit.speed:>10}{fit.gpu.usd_hr:>8.2f}"
         )
     print(f"\n{tip}")
     return 0
@@ -173,9 +160,7 @@ def _confirm(prompt: str) -> bool:
 
 def cmd_serve_setup(args) -> int:
     """Generate a Modal serving app for a model and, with consent, deploy it."""
-    info, error = _model_or_error(args.model)
-    if info is None:
-        return error
+    info = _require_model(args.model)
 
     gpu = default_gpu(info)
     if getattr(args, "gpu", None):
@@ -317,42 +302,6 @@ def _control_plane_instructions(url: str) -> str:
     )
 
 
-HEALTHZ_STARTUP_BUDGET_SECONDS = 90.0
-HEALTHZ_RETRY_DELAY_SECONDS = 5.0
-
-
-def _healthz(url: str, budget_s: float = HEALTHZ_STARTUP_BUDGET_SECONDS) -> dict | None:
-    """The app's own /healthz, or None if it cannot be read. Never raises: this is advisory.
-
-    Retried for a bounded startup window rather than asked once. This runs immediately after
-    `modal deploy`, against a web function that has not served a request yet, so the first call
-    routinely meets a cold start or a transport error that has nothing to do with the app's
-    configuration. A single probe answering None is indistinguishable from "the app came up fine",
-    and the caller treats None as "say nothing" -- so a slow cold start silently swallowed the one
-    warning that tells a user their public GPU endpoint accepts unauthenticated writes.
-
-    Bounded because it is still advisory: this is a fixed extra wait on a deploy that has already
-    succeeded, taken only while the answer is unreadable, and never a reason to fail the command.
-    """
-    import time
-    import urllib.request
-
-    deadline = time.monotonic() + max(0.0, float(budget_s))
-    while True:
-        try:
-            with urllib.request.urlopen(f"{url}/healthz", timeout=15) as response:
-                payload = json.load(response)
-        # broad on purpose: a warning must never fail a deploy that already succeeded
-        except Exception:
-            payload = None
-        if isinstance(payload, dict):
-            return payload
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
-        time.sleep(min(HEALTHZ_RETRY_DELAY_SECONDS, remaining))
-
-
 def _warn_if_unauthenticated(url: str, app_file: Path | None = None) -> None:
     """Say so if the deployed app accepts unauthenticated writes.
 
@@ -366,8 +315,14 @@ def _warn_if_unauthenticated(url: str, app_file: Path | None = None) -> None:
     the default: under ``--output`` a hardcoded name would deploy an unrelated file or fail, and
     the public keyless endpoint would stay up after the user did exactly what they were told.
     """
-    payload = _healthz(url)
-    if payload is None or payload.get("requires_key") is not False:
+    payload = healthz_with_retry(url)
+    if payload is None:
+        return
+    try:
+        health = parse_serving_health(payload)
+    except ServingHealthError:
+        return
+    if health.requires_key is not False:
         return
     print(
         "\nwarning: this app has no FLASH_SERVING_KEY, so anyone with the URL can register "
@@ -394,83 +349,9 @@ def _deployed_url(output: str) -> str:
     return ""
 
 
-def _status_request(url: str, headers: dict[str, str], path: str = "/healthz") -> dict:
-    """GET one JSON document with the standard library.
-
-    Not `flash.serve.deploy._serving_request`, which would be the natural reuse: that module
-    imports httpx at module scope, and `[project].dependencies` is empty precisely so the client
-    CLI runs on a bare `pip install freesolo-flash`. Importing it here made `serve status` die with
-    `ModuleNotFoundError: httpx` before any of the error handling below could run -- and this is the
-    command a user reaches for when their backend is not answering, so it is the worst one to
-    require an extra for.
-
-    It still sends the internal key, because the contract permits a backend to authenticate
-    /healthz and an unauthenticated probe would report a working backend as down.
-
-    Which is why redirects are origin-scoped here. urllib re-sends every custom header to the
-    redirect target, and on a standalone plane this header is the credential that controls the
-    plane: one `/healthz` that 302s off-origin -- a misconfigured proxy, or a backend someone else
-    now controls -- hands it over. `flash.serve.deploy` installs an httpx hook for exactly this;
-    the dependency-free path needs its own, so the two agree on what leaves the serving origin.
-    """
-    import urllib.error
-    import urllib.request
-
-    from flash.serve.urls import displayable_url, url_origin
-
-    origin = url_origin(url)
-
-    class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, hdrs, newurl):
-            new = super().redirect_request(req, fp, code, msg, hdrs, newurl)
-            if new is not None and url_origin(newurl) != origin:
-                # Dropped rather than followed-without-the-key: a status probe that silently
-                # reports on some other host's health is worse than one that says it was
-                # redirected somewhere it will not follow.
-                raise urllib.error.HTTPError(
-                    newurl,
-                    code,
-                    f"{displayable_url(url)} redirected to another origin "
-                    f"({displayable_url(newurl)}); refusing to send the serving key there",
-                    hdrs,
-                    fp,
-                )
-            return new
-
-    opener = urllib.request.build_opener(_SameOriginRedirect)
-    request = urllib.request.Request(f"{url}{path}", headers=headers, method="GET")
-    with opener.open(request, timeout=30) as response:
-        return json.load(response)
-
-
-def _redacted(exc: Exception, base: str) -> str:
-    """An exception's message with every credential from ``base`` removed.
-
-    Redacting the url we print is not enough on its own: urllib quotes the url it was handed back
-    into its own errors, so the userinfo arrives inside the exception text.
-
-    Each credential is redacted as its own token rather than by matching the whole url, because
-    urllib reports FRAGMENTS. Parsing `https://user:pw@host` for a port splits on the first colon
-    and raises "nonnumeric port: 'pw@host'" -- a string in which neither the full base nor the full
-    userinfo appears, so replacing those alone leaves the password in the message. Redaction here
-    is exact-substring against values we already hold, so nothing is guessed at and no unrelated
-    text can be caught by accident.
-    """
-    from flash.serve.urls import displayable_url
-
-    text = str(exc)
-    authority = base.split("://", 1)[-1].split("/", 1)[0]
-    userinfo = authority.rsplit("@", 1)[0] if "@" in authority else ""
-    # Longest first: redacting "user" before "user:pw" would leave "(redacted):pw" behind.
-    secrets = [base, base.rstrip("/"), authority, userinfo, *userinfo.split(":")]
-    for secret in sorted({s for s in secrets if s}, key=len, reverse=True):
-        text = text.replace(secret, displayable_url(base) if "://" in secret else "(redacted)")
-    return text
-
 
 def cmd_serve_status(args) -> int:
     """Check the configured serving backend and report what it supports."""
-    # From `flash.serve.urls`, NOT `flash.serve.deploy`: same reason as `_status_request` above.
     from flash.serve.errors import ServingError
     from flash.serve.urls import displayable_url, internal_key_header, serving_base_url
 
@@ -478,168 +359,102 @@ def cmd_serve_status(args) -> int:
         base = serving_base_url()
     except ServingError as exc:
         return _err(str(exc))
-    # Every message and every printed line names the REDACTED url. A base url is user-supplied and
-    # may carry credentials in its authority (https://user:token@host); printing it verbatim leaks
-    # them to the terminal and to whatever captures its output.
     shown = displayable_url(base)
+    headers = internal_key_header()
     try:
-        payload = _status_request(base, internal_key_header())
-    except Exception as exc:  # any transport or decode failure is the same answer to the user
-        # The exception TEXT is redacted too, not just the prefix. urllib quotes the url it was
-        # given, so `https://user:token@host` with a malformed authority comes back as
-        # "nonnumeric port: 'token@host'" -- the credential, printed by the error path that exists
-        # to avoid printing it.
-        return _err(f"serving backend at {shown} did not answer /healthz: {_redacted(exc, base)}")
+        result = request_json(base, headers)
+    except Exception as exc:
+        return _err(
+            f"serving backend at {shown} did not answer /healthz: "
+            f"{redacted_error(exc, base)}"
+        )
+    if result.status_code != 200:
+        detail = result.error or f"HTTP {result.status_code}"
+        return _err(
+            f"serving backend at {shown} did not answer /healthz: "
+            f"{redacted_error(detail, base)}"
+        )
+    try:
+        health = parse_serving_health(result.payload)
+    except ServingHealthError as exc:
+        if exc.code == "non_object":
+            return _err(f"serving backend at {shown} returned a non-object /healthz payload")
+        return _err(
+            f"serving backend at {shown} did not return capabilities as a list of strings"
+        )
 
-    # Diagnosing a malformed backend is exactly this command's job, so a payload that decodes but
-    # is the wrong shape has to become the compatibility error rather than a traceback.
-    if not isinstance(payload, dict):
-        return _err(f"serving backend at {shown} returned a non-object /healthz payload")
-    capabilities = payload.get("capabilities") or []
-    if not isinstance(capabilities, list) or any(not isinstance(c, str) for c in capabilities):
-        return _err(f"serving backend at {shown} did not return capabilities as a list of strings")
-    models = payload.get("base_models") or []
-    if not isinstance(models, list):
-        models = []
     print(f"serving:      {shown}")
-    print(f"base models:  {', '.join(str(m) for m in models) or '-'}")
-    print(f"capabilities: {', '.join(capabilities) or '-'}")
-    required = {"immutable_adapter_revisions", "alias_compare_and_swap"}
-    missing = sorted(required - set(capabilities))
+    print(f"base models:  {', '.join(health.base_models) or '-'}")
+    print(f"capabilities: {', '.join(health.capabilities) or '-'}")
+    missing = sorted(REQUIRED_SERVING_CAPABILITIES - set(health.capabilities))
     if missing:
-        # deploy would fail on this, so say it here rather than at deploy time.
         print(f"\nmissing required capabilities: {', '.join(missing)}", file=sys.stderr)
         return 1
-    # An explicit `ok: false` is the backend declaring itself unhealthy while still answering with
-    # 200 and the right capabilities -- a model still loading, or an engine that failed to start.
-    # Reporting `ready` over that sends the operator to a deploy that cannot work, and this command
-    # exists to tell them the opposite. `is False`, not falsiness: a backend that omits the field
-    # entirely (the contract does not require it) is not making a claim either way.
-    if payload.get("ok") is False:
+    if health.ok is False:
         print(
             "\nthe backend reports itself unhealthy (ok: false). its capabilities are right, so "
             "this is a runtime problem -- check the app's logs before deploying.",
             file=sys.stderr,
         )
         return 1
-    # /healthz is deliberately unauthenticated, so everything above passes with a missing or wrong
-    # key and the command prints `ready` -- then the very next `models deploy` 401s on /adapters.
-    # That is the exact misconfiguration an operator runs this command to diagnose, so the key has
-    # to be exercised against a route that actually checks it.
-    #
-    # A GET of an id that cannot exist: authentication runs before the record read, so a rejected
-    # key is 401/403 and an accepted one is 404. Read-only and side-effect free either way, which
-    # registering something would not be.
-    #
-    # `is not False`, NOT `is True`. `requires_key` is optional by contract, so ABSENCE is the
-    # backend declining to say -- and a protected custom backend that omits it was skipped by the
-    # probe entirely, reported `ready` with a missing or wrong key, and then 401'd on the very next
-    # deploy: exactly the misconfiguration this command exists to catch. Only an explicit `false`
-    # is a backend stating it does not authenticate, and only that may skip the probe.
-    #
-    # The same polarity `_warn_if_unauthenticated` already uses, and the fallback is safe in both
-    # directions: probing an genuinely open backend costs one 404 read of a made-up id, which is
-    # the pass answer anyway. Skipping wrongly costs a failed deploy.
-    if payload.get("requires_key") is not False:
-        return _verify_serving_key(base, shown)
+    if health.requires_key is not False:
+        return _verify_serving_key(base, shown, headers)
     print(f"\nready. deploy a run with: {CLI_NAME} models deploy <run-id>")
     return 0
 
 
-def _verify_serving_key(base: str, shown: str) -> int:
-    """Exercise the configured key against a route that authenticates, and report the outcome.
-
-    Returns the command's exit code: 0 only when the probe answered 404, which is the one response
-    that proves both that the key got past authentication and that the read-back route resolves an
-    unknown id the way the contract requires.
-    """
-    import urllib.error
-
-    from flash.serve.urls import internal_key_header
-
-    probe = f"flash-serve-status-probe-{uuid.uuid4().hex}"
+def _verify_serving_key(base: str, shown: str, headers: dict[str, str]) -> int:
+    """Exercise the configured key and explicitly dispatch the probe's HTTP status."""
     try:
-        _status_request(base, internal_key_header(), f"/adapters/{probe}")
-    except urllib.error.HTTPError as exc:
-        # BOTH rejection codes. The generated app answers 401, but the contract is written for
-        # any backend, and the conformance suite accepts 401 or 403 as a valid rejection -- so
-        # recognizing only 401 here reports `ready` against a backend the suite would pass and
-        # the very next deploy would fail on.
-        if exc.code in (401, 403):
-            print(
-                f"\nthe backend at {shown} rejected the serving key ({exc.code}). set "
-                f"FREESOLO_INTERNAL_KEY to the value of the app's FLASH_SERVING_KEY secret; "
-                f"deploys will fail until it matches.",
-                file=sys.stderr,
-            )
-            return 1
-        # 5xx is the backend failing, not the key being wrong. Either way the operator cannot
-        # deploy, and `ready` would be a false green -- so report it rather than swallow it.
-        if exc.code >= 500:
-            print(
-                f"\nthe backend at {shown} returned {exc.code} when the serving key was "
-                f"checked, so the key could not be verified. check the app's logs before "
-                f"deploying.",
-                file=sys.stderr,
-            )
-            return 1
-        # 404 for this made-up id is the expected answer and the ONLY one that proves the read
-        # -back route works: the key got past authentication and the route resolved the id to
-        # "no such record".
-        #
-        # Any other 4xx is not a pass. A 400/405/422 says the backend did not answer this route
-        # the way the contract requires -- a missing route, a rejected path shape, a handler
-        # that wants query parameters -- and `models deploy` polls this exact route, where
-        # `_registered_adapter_response` treats a non-404 4xx as fatal. Falling through to
-        # `ready` here means the operator is told the backend is good and then loses the deploy
-        # to the same status, after registration has already started.
-        if exc.code != 404:
-            print(
-                f"\nthe backend at {shown} answered {exc.code} for a read-back of an unknown "
-                f"adapter id, where the contract requires 404. `{CLI_NAME} models deploy` polls "
-                f"this route and fails on any non-404 4xx, so deploys will not work against "
-                f"this backend.",
-                file=sys.stderr,
-            )
-            return 1
+        result = probe_serving_key(base, headers)
     except Exception as exc:
-        # The backend answered /healthz a moment ago, so a transport failure here is a real
-        # inconsistency worth surfacing rather than swallowing. Reported without claiming to
-        # know which side is at fault.
         print(
-            f"\ncould not verify the serving key against {shown}: {_redacted(exc, base)}",
+            f"\ncould not verify the serving key against {shown}: "
+            f"{redacted_error(exc, base)}",
             file=sys.stderr,
         )
         return 1
-    else:
-        # Reached only when the read-back RETURNED, which for a `uuid4` id that was never
-        # registered means the backend answered 200 with a record it made up. Every branch
-        # above handles a raising response, and without this one a 200 fell past all of them
-        # to `ready` -- so the one outcome that proves the backend does NOT implement
-        # unknown-record semantics was the outcome reported as success.
-        #
-        # It is not a harmless quirk to tolerate. `models deploy` polls this exact route and
-        # compares the record it gets back against the identity it registered; a backend that
-        # fabricates records answers that poll with a mismatch, which the client reads as an
-        # immutability violation and refuses. Telling the operator `ready` here means the
-        # failure surfaces mid-deploy instead of during the command written to diagnose it.
+
+    code = result.status_code
+    if code in (401, 403):
         print(
-            f"\nthe backend at {shown} answered 200 with a record for an adapter id that was "
-            f"never registered, where the contract requires 404. `{CLI_NAME} models deploy` "
-            f"cross-checks the record it reads back, so a backend that fabricates records "
-            f"fails every deploy.",
+            f"\nthe backend at {shown} rejected the serving key ({code}). set "
+            f"FREESOLO_INTERNAL_KEY to the value of the app's FLASH_SERVING_KEY secret; "
+            f"deploys will fail until it matches.",
             file=sys.stderr,
         )
         return 1
-    print(f"\nready. deploy a run with: {CLI_NAME} models deploy <run-id>")
-    return 0
+    if code >= 500:
+        print(
+            f"\nthe backend at {shown} returned {code} when the serving key was checked, so "
+            f"the key could not be verified. check the app's logs before deploying.",
+            file=sys.stderr,
+        )
+        return 1
+    if code == 404:
+        print(f"\nready. deploy a run with: {CLI_NAME} models deploy <run-id>")
+        return 0
+    if 400 <= code < 500:
+        print(
+            f"\nthe backend at {shown} answered {code} for a read-back of an unknown adapter "
+            f"id, where the contract requires 404. `{CLI_NAME} models deploy` polls this route "
+            f"and fails on any non-404 4xx, so deploys will not work against this backend.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"\nthe backend at {shown} answered {code} with a record for an adapter id that was "
+        f"never registered, where the contract requires 404. `{CLI_NAME} models deploy` "
+        f"cross-checks the record it reads back, so a backend that fabricates records fails "
+        f"every deploy.",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def cmd_serve_teardown(args) -> int:
     """Stop the Modal app so it holds no resources."""
-    info, error = _model_or_error(args.model)
-    if info is None:
-        return error
+    info = _require_model(args.model)
     app = app_name_for(info.id)
     if _modal_cli() is None:
         return _err(f"modal CLI not found. stop the app yourself with: modal app stop {app}")

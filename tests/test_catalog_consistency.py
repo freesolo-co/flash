@@ -64,6 +64,7 @@ def test_serving_capacity_matches_validated_matrix():
     expected = {
         "Qwen/Qwen3.5-0.8B": {
             "gpu": "L4",
+            "quantization": "fp8",
             "serve_model_id": "Freesolo-Co/Qwen3.5-0.8B-FP8",
             "max_loras": 16,
             "max_lora_rank": 128,
@@ -71,6 +72,7 @@ def test_serving_capacity_matches_validated_matrix():
         },
         "Qwen/Qwen3.5-2B": {
             "gpu": "L4",
+            "quantization": "fp8",
             "serve_model_id": "Freesolo-Co/Qwen3.5-2B-FP8",
             "max_loras": 16,
             "max_lora_rank": 128,
@@ -78,6 +80,7 @@ def test_serving_capacity_matches_validated_matrix():
         },
         "Qwen/Qwen3.5-4B": {
             "gpu": "L4",
+            "quantization": "fp8",
             "serve_model_id": "Freesolo-Co/Qwen3.5-4B-FP8",
             "max_loras": 16,
             "max_lora_rank": 128,
@@ -87,6 +90,7 @@ def test_serving_capacity_matches_validated_matrix():
         },
         "Qwen/Qwen3.5-9B": {
             "gpu": "L40S",
+            "quantization": "fp8",
             "serve_model_id": "Freesolo-Co/Qwen3.5-9B-FP8",
             "max_loras": 16,
             "max_lora_rank": 128,
@@ -96,6 +100,7 @@ def test_serving_capacity_matches_validated_matrix():
         },
         "Qwen/Qwen3.6-27B": {
             "gpu": "H100",
+            "quantization": "fp8",
             "serve_model_id": "Freesolo-Co/Qwen3.6-27B-FP8",
             "max_loras": 16,
             "max_lora_rank": 64,

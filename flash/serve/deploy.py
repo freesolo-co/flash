@@ -18,6 +18,14 @@ from flash._internal.logging import get_logger
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.envs.loader import is_commit_sha
 from flash.schema import format_adapter_revision
+from flash.serve.contract import (
+    PREFERRED_SERVING_CAPABILITIES,
+    REQUIRED_SERVING_CAPABILITIES,
+    REVISION_PROVENANCE_CAPABILITY,
+    THINKING_STRUCTURED_OUTPUTS_CAPABILITY,
+    ServingHealthError,
+    parse_serving_health,
+)
 from flash.serve.errors import (  # noqa: F401 -- re-exported: callers import these from here
     ActivationOutcomeUnknown,
     AdapterConfigMissing,
@@ -47,8 +55,6 @@ ACTIVATION_READBACK_DELAY_SECONDS = 2.0
 # smoke-retry fallback when a 503 carries no usable Retry-After: keep the prior 2s default rather
 # than the 0.5s readiness backoff base, so cold-start smoke retries don't hammer serving.
 SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
-THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
-REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 _INTERNAL_KEY_HEADER = "X-Freesolo-Internal-Key"
 # modal 303-redirects a slow request to an async-result poll url on the same origin, once per poll
@@ -460,16 +466,13 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
     # SAFETY-CRITICAL capabilities the deploy correctness contract genuinely depends on: immutable
     # revisions (a revision id always maps to one artifact) and an atomic alias compare-and-swap
     # (the alias flip can't race). These are hard-required.
-    required = {
-        "immutable_adapter_revisions",
-        "alias_compare_and_swap",
-    }
+    required = set(REQUIRED_SERVING_CAPABILITIES)
     # PREFERRED (not required): `revision_provenance` only lets the serving backend echo back the
     # run/checkpoint/hf_revision metadata, which is used ONLY on the rare 5xx-during-registration
     # recovery path (`_matches_revision_identity`). Hard-requiring it blocked EVERY deploy org-wide
     # whenever the serving build lagged on advertising it, even though the happy path never uses it.
     # So its absence is a logged warning, not a deploy-blocking error.
-    preferred = {REVISION_PROVENANCE_CAPABILITY}
+    preferred = PREFERRED_SERVING_CAPABILITIES
     if thinking_structured_outputs:
         # Genuinely required for this run: thinking + structured outputs needs the serving backend's
         # deferred-constraint support (grammar applied after </think>) or served output is invalid.
@@ -482,22 +485,19 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
         raise ServingError(
             f"serving_contract_unsupported: serving health check at {url} did not return valid JSON"
         ) from exc
-    if not isinstance(payload, dict):
+    try:
+        health = parse_serving_health(payload)
+    except ServingHealthError as exc:
+        if exc.code == "non_object":
+            detail = "returned a non-object payload"
+        elif exc.code == "capabilities_not_list":
+            detail = "must return a list field named capabilities"
+        else:
+            detail = "capabilities must be strings"
         raise ServingError(
-            f"serving_contract_unsupported: serving health check at {url} returned a non-object payload"
-        )
-    capabilities = payload.get("capabilities")
-    if not isinstance(capabilities, list):
-        raise ServingError(
-            f"serving_contract_unsupported: serving health check at {url} must return a list field "
-            "named capabilities"
-        )
-    if not all(isinstance(capability, str) for capability in capabilities):
-        raise ServingError(
-            f"serving_contract_unsupported: serving health check at {url} capabilities must be "
-            "strings"
-        )
-    advertised = set(capabilities)
+            f"serving_contract_unsupported: serving health check at {url} {detail}"
+        ) from exc
+    advertised = set(health.capabilities)
     missing = sorted(required - advertised)
     if missing:
         raise ServingError(

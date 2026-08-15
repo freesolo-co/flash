@@ -19,6 +19,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Literal
+
+from flash.core.catalog import ModelInfo
+
+ServingDtype = Literal["fp8", "bf16"]
+Headroom = Literal["ample", "good", "tight", "no"]
+Speed = Literal["fastest", "fast", "ok", "slow"]
 
 # vLLM serves fp8 by ONLINE-quantizing an ordinary bf16 checkpoint at load when the model has no
 # pre-quantized repo, so a self-hoster gets fp8 economics from the public weights.
@@ -85,15 +92,15 @@ class Fit:
     """One card's estimated fit for one model, as rendered in the recommendation table."""
 
     gpu: ModalGpu
-    dtype: str  # the weight dtype this estimate assumes, resolved per model
+    dtype: ServingDtype
     weights_gb: float
     kv_gb: float
     lora_gb: float
     total_gb: float
     budget_gb: float  # what vLLM will actually claim: vram x gpu_memory_utilization
     free_gb: float
-    headroom: str  # "ample" | "good" | "tight" | "no"
-    speed: str  # relative rank: "fastest" | "fast" | "ok" | "slow"
+    headroom: Headroom
+    speed: Speed
     is_catalog_default: bool
     fp8_native: bool
 
@@ -102,28 +109,13 @@ class Fit:
         return self.headroom != "no"
 
 
-def serving_dtype(info) -> str:
-    """The weight dtype this model is actually SERVED at, which is not uniform across the catalog.
-
-    Dense catalog models serve fp8 -- either a pre-quantized checkpoint or, for a self-hoster with
-    no access to one, vLLM online-quantizing the public bf16 weights at load. The 35B-A3B MoE is
-    the exception and serves bf16: its fused-MoE LoRA path will not compile on fp8, which is why
-    its ``serve_model_id`` points back at the base repo rather than an FP8 variant.
-
-    Quoting that model at fp8 would halve its weights on paper and recommend a card it cannot use,
-    so the dtype is DERIVED from the catalog rather than defaulted per call.
-    """
-    serving = getattr(info, "serving", None)
-    serve_model_id = (getattr(serving, "serve_model_id", "") or "").strip()
-    model_id = (getattr(info, "id", "") or "").strip()
-    # serving the base repo itself means there is no quantized checkpoint to load, and no online
-    # quantization either -- production passes quantization=None for exactly this case.
-    if serve_model_id and serve_model_id == model_id:
-        return "bf16"
-    return "fp8"
+def serving_dtype(info: ModelInfo) -> ServingDtype:
+    """Return the catalog's explicit serving weight dtype for ``info``."""
+    serving = info.serving
+    return "fp8" if serving is not None and serving.quantization == "fp8" else "bf16"
 
 
-def _headroom(free_gb: float) -> str:
+def _headroom(free_gb: float) -> Headroom:
     if free_gb < _TIGHT_GB:
         return "no"
     if free_gb < _GOOD_GB:
@@ -133,7 +125,7 @@ def _headroom(free_gb: float) -> str:
     return "ample"
 
 
-def _kv_bytes_per_token(info, kv_dtype: str) -> float:
+def _kv_bytes_per_token(info: ModelInfo, kv_dtype: ServingDtype) -> float:
     """Per-token KV bytes from catalog geometry, or 0.0 when the entry lacks it.
 
     Mirrors the attention term of ``flash/engine/plan/vram.py``'s architecture sizing: 2 (K and V)
@@ -149,7 +141,7 @@ def _kv_bytes_per_token(info, kv_dtype: str) -> float:
     return 2 * kv_heads * head_dim * layers * _BYTES_PER_PARAM.get(kv_dtype, 1.0)
 
 
-def _recurrent_state_gb(info, sequences: int) -> float:
+def _recurrent_state_gb(info: ModelInfo, sequences: int) -> float:
     """Recurrent + convolution state for GDN-hybrid layers, which scales per sequence not per token."""
     linear_layers = int(getattr(info, "num_linear_attention_layers", 0) or 0)
     key_heads = int(getattr(info, "linear_num_key_heads", 0) or 0)
@@ -165,7 +157,7 @@ def _recurrent_state_gb(info, sequences: int) -> float:
     return linear_layers * sequences * state_elements * 2 / 1e9
 
 
-def _lora_pool_gb(max_loras: int, max_lora_rank: int, info) -> float:
+def _lora_pool_gb(max_loras: int, max_lora_rank: int, info: ModelInfo) -> float:
     """GPU LoRA buffers, which vLLM PRE-ALLOCATES at max_loras x max_lora_rank.
 
     Sized from the model's real LoRA target shapes when the catalog has them, so this tracks the
@@ -180,7 +172,7 @@ def _lora_pool_gb(max_loras: int, max_lora_rank: int, info) -> float:
     return max_loras * max_lora_rank * params_per_rank * 2 / 1e9
 
 
-def _speed_rank(gpu: ModalGpu, fastest_bandwidth: int) -> str:
+def _speed_rank(gpu: ModalGpu, fastest_bandwidth: int) -> Speed:
     """Relative decode-speed band, spaced so the CHEAP cards are still distinguishable.
 
     Anchoring linearly on the fastest card is useless in practice: B200 has ~27x L4's bandwidth,
@@ -202,11 +194,11 @@ def _speed_rank(gpu: ModalGpu, fastest_bandwidth: int) -> str:
 
 
 def estimate_fit(
-    info,
+    info: ModelInfo,
     gpu: ModalGpu,
     *,
-    dtype: str = "",
-    kv_dtype: str = "fp8",
+    dtype: ServingDtype | Literal[""] = "",
+    kv_dtype: ServingDtype = "fp8",
     context_len: int = 0,
     max_seqs: int = 0,
     max_loras: int = 0,
@@ -258,7 +250,13 @@ def estimate_fit(
     )
 
 
-def recommend(info, *, dtype: str = "", kv_dtype: str = "fp8", context_len: int = 0) -> list[Fit]:
+def recommend(
+    info: ModelInfo,
+    *,
+    dtype: ServingDtype | Literal[""] = "",
+    kv_dtype: ServingDtype = "fp8",
+    context_len: int = 0,
+) -> list[Fit]:
     """Every Modal card's estimated fit for ``info``, cheapest first."""
     fastest = max(g.bandwidth_gbs for g in MODAL_GPUS)
     return [
@@ -275,7 +273,7 @@ def recommend(info, *, dtype: str = "", kv_dtype: str = "fp8", context_len: int 
     ]
 
 
-def default_gpu(info) -> ModalGpu | None:
+def default_gpu(info: ModelInfo) -> ModalGpu | None:
     """The catalog's production-validated serving card for ``info``, when it names one.
 
     Returns None rather than guessing: a model with no serving entry has no validated choice, and

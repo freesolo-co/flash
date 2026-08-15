@@ -13,7 +13,8 @@ from pathlib import Path
 
 from flash.content.multimodal import _IMAGE_BLOCK_TYPES
 from flash.core.catalog import ModelInfo
-from flash.serve.backend.gpus import MODAL_GPUS_BY_NAME, ModalGpu, default_gpu, serving_dtype
+from flash.serve.backend.gpus import MODAL_GPUS_BY_NAME, ModalGpu, default_gpu
+from flash.serve.contract import ADAPTER_REVISION_PATTERN, REFERENCE_SERVING_CAPABILITIES
 
 # Matches the version the production serving app runs. vLLM's Qwen3 GDN-hybrid support and the
 # multi-LoRA + fp8 path are both version-sensitive, so this is a single pinned constant rather than
@@ -28,7 +29,8 @@ MIN_SCALEDOWN_WINDOW = 2
 MAX_SCALEDOWN_WINDOW = 20 * 60
 
 _TEMPLATE = "modal_app.py.tmpl"
-# Modal app names allow letters, digits and dashes.
+_CONFIG_MARKER = "# flash generated config"
+# modal app names allow letters, digits and dashes.
 _UNSAFE_NAME = re.compile(r"[^a-z0-9-]+")
 
 
@@ -66,32 +68,31 @@ def render_app(
             f"({MIN_SCALEDOWN_WINDOW}-{MAX_SCALEDOWN_WINDOW} seconds)"
         )
 
-    dtype = serving_dtype(info)
     template = resources.files("flash.serve.backend.templates").joinpath(_TEMPLATE).read_text()
-    return template.format(
-        app_name=app_name_for(info.id),
-        base_model=info.id,
-        gpu=card.name,
-        # None, not "bf16": vLLM reads `quantization=None` as "load the checkpoint as it is", which
-        # is what the 35B MoE needs. Passing a dtype string here would request online quantization.
-        quantization='"fp8"' if dtype == "fp8" else "None",
-        kv_cache_dtype="fp8",
-        max_model_len=serving.max_model_len,
-        max_num_seqs=serving.max_num_seqs or 8,
-        max_num_batched_tokens=serving.max_num_batched_tokens or 0,
-        max_loras=serving.max_loras,
-        max_lora_rank=serving.max_lora_rank,
-        gpu_memory_utilization=serving.gpu_memory_utilization or 0.90,
-        vllm_version=VLLM_VERSION,
-        # Substituted, not written into the template, so the generated backend rejects exactly the
-        # block types the renderer accepts. A literal in the template is a second copy that drifts:
-        # `input_image` was already supported here and missing there, so it reached the tokenizer
-        # with no decoded pixels instead of the promised 400.
-        image_block_types=", ".join(f'"{t}"' for t in sorted(_IMAGE_BLOCK_TYPES)),
-        scaledown_window=scaledown_window,
-        secret_name=secret_name,
-        app_file=app_file,
-    )
+    if template.count(_CONFIG_MARKER) != 1:
+        raise RuntimeError(f"{_TEMPLATE} must contain exactly one generated config marker")
+    config = {
+        "APP_NAME": app_name_for(info.id),
+        "BASE_MODEL": info.id,
+        "GPU": card.name,
+        "QUANTIZATION": serving.quantization,
+        "KV_CACHE_DTYPE": "fp8",
+        "MAX_MODEL_LEN": serving.max_model_len,
+        "MAX_NUM_SEQS": serving.max_num_seqs or 8,
+        "MAX_NUM_BATCHED_TOKENS": serving.max_num_batched_tokens or 0,
+        "MAX_LORAS": serving.max_loras,
+        "MAX_LORA_RANK": serving.max_lora_rank,
+        "GPU_MEMORY_UTILIZATION": serving.gpu_memory_utilization or 0.90,
+        "VLLM_VERSION": VLLM_VERSION,
+        "SCALEDOWN_WINDOW_SECONDS": scaledown_window,
+        "SECRET_NAME": secret_name,
+        "DEPLOY_COMMAND": f"modal deploy {app_file}",
+        "IMAGE_BLOCK_TYPES": tuple(sorted(_IMAGE_BLOCK_TYPES)),
+        "ADAPTER_REVISION_PATTERN": ADAPTER_REVISION_PATTERN,
+        "SERVING_CAPABILITIES": REFERENCE_SERVING_CAPABILITIES,
+    }
+    generated_config = "\n".join(f"{name} = {value!r}" for name, value in config.items())
+    return template.replace(_CONFIG_MARKER, generated_config)
 
 
 def write_app(

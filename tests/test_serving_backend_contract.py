@@ -209,7 +209,7 @@ def client(monkeypatch, tmp_path):
                 "failure": "ValueError: adapter rank exceeds max_lora_rank",
             }
             await module._write(current)
-            return {"ok": False, "reclaim": True}
+            return {"ok": False}
         current["status"] = "ready"
         current["metadata"] = {**metadata, "lifecycle_state": "ready"}
         await module._write(current)
@@ -659,18 +659,22 @@ def test_a_registration_for_another_base_model_is_refused(client):
     assert client.post("/adapters", json=body).status_code == 409
 
 
-def test_undeploy_deletes_the_downloaded_adapter(client, monkeypatch, tmp_path):
-    _register_and_ready(client)
+def test_unload_deletes_cache_without_a_resident_request(client, engine_class, monkeypatch, tmp_path):
     module = client.app.state.generated_module
     adapter_dir = tmp_path / module._adapter_digest(REVISION)
     adapter_dir.mkdir()
     (adapter_dir / "adapter.safetensors").write_text("weights")
     monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
-    assert client.delete(f"/adapters/{RUN_ID}").status_code == 200
+    instance = engine_class.__new__(engine_class)
+    instance._loaded = {}
+
+    assert _run_awaitable(engine_class._unload_locked(instance, REVISION)) is True
     assert not adapter_dir.exists()
 
 
-def test_a_redeployed_revision_keeps_its_downloaded_adapter(client, monkeypatch, tmp_path):
+def test_unregister_preserves_cache_for_a_revived_revision(
+    client, engine_class, monkeypatch, tmp_path
+):
     _register_and_ready(client)
     module = client.app.state.generated_module
     adapter_dir = tmp_path / module._adapter_digest(REVISION)
@@ -680,21 +684,62 @@ def test_a_redeployed_revision_keeps_its_downloaded_adapter(client, monkeypatch,
     record = module.adapter_records[module._record_key(REVISION)]
     record["status"] = "registered"
     record["metadata"]["lifecycle_state"] = "registered"
-    _run_awaitable(module._discard_cached_adapter(REVISION))
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._loaded = {}
+
+    result = _run_awaitable(engine_class.unregister(instance, REVISION))
+    assert result == {"ok": True, "evicted": False, "revived": True}
     assert adapter_dir.exists()
 
 
-def test_two_adapters_sharing_one_lora_int_id_are_refused_locally(
+def test_failed_load_deletes_cache_when_no_lora_is_resident(
+    client, engine_class, monkeypatch, tmp_path
+):
+    module = client.app.state.generated_module
+    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
+    lora_request = types.ModuleType("vllm.lora.request")
+    lora_request.LoRARequest = object
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora_request)
+    record = {
+        **REGISTRATION,
+        "status": "registered",
+        "metadata": {**REGISTRATION["metadata"], "settle_attempt": "attempt-1"},
+    }
+    module.adapter_records[module._record_key(REVISION)] = record
+    adapter_dir = tmp_path / module._adapter_digest(REVISION)
+    adapter_dir.mkdir()
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._allocator_lock = asyncio.Lock()
+    instance._next_int_id = 1
+    instance._loaded = {}
+
+    async def fail_path(_record):
+        raise RuntimeError("download failed")
+
+    instance._adapter_path = fail_path
+    result = _run_awaitable(engine_class.settle(instance, record))
+
+    assert result["ok"] is False
+    assert not adapter_dir.exists()
+    current = module.adapter_records[module._record_key(REVISION)]
+    assert current["status"] == "disabled"
+    assert current["metadata"]["lifecycle_state"] == "failed"
+
+
+def test_concurrent_adapter_loads_receive_unique_process_local_ids(
     client, engine_class, monkeypatch
 ):
     module = client.app.state.generated_module
-    monkeypatch.setattr(module, "_lora_int_id", lambda adapter_id: 7)
     lora_request = types.ModuleType("vllm.lora.request")
 
     class _LoRARequest:
         def __init__(self, name, int_id, path):
             self.name = name
-            self.int_id = int_id
+            self.lora_int_id = int_id
             self.path = path
 
     lora_request.LoRARequest = _LoRARequest
@@ -703,45 +748,50 @@ def test_two_adapters_sharing_one_lora_int_id_are_refused_locally(
     monkeypatch.setitem(sys.modules, "vllm.lora.request", lora_request)
     instance = engine_class.__new__(engine_class)
     instance._locks = {}
-    instance._int_locks = {}
+    instance._allocator_lock = asyncio.Lock()
+    instance._next_int_id = 1
     instance._loaded = {}
-    instance._int_ids = {}
+    added = []
+
+    async def add_lora(request):
+        added.append(request)
+        await asyncio.sleep(0)
+
     instance.engine = types.SimpleNamespace(
-        add_lora=lambda request: asyncio.sleep(0),
+        add_lora=add_lora,
         remove_lora=lambda int_id: asyncio.sleep(0),
     )
-
-    async def path(record):
-        return "/tmp/adapter"
-
-    instance._adapter_path = path
+    instance._adapter_path = lambda record: asyncio.sleep(0, result="/tmp/adapter")
     first = dict(REGISTRATION)
     second = _second_registration()
-    module.adapter_records[module._record_key(first["adapter_id"])] = {
-        **first,
-        "status": "registered",
-    }
-    module.adapter_records[module._record_key(second["adapter_id"])] = {
-        **second,
-        "status": "registered",
-    }
-    _run_awaitable(engine_class._lora_request(instance, first))
-    with pytest.raises(RuntimeError, match="lora id collision"):
-        _run_awaitable(engine_class._lora_request(instance, second))
-    assert instance._int_ids == {7: REVISION}
+    for record in (first, second):
+        module.adapter_records[module._record_key(record["adapter_id"])] = {
+            **record,
+            "status": "registered",
+        }
+
+    async def load_both():
+        return await asyncio.gather(
+            engine_class._lora_request(instance, first),
+            engine_class._lora_request(instance, second),
+        )
+
+    loaded = _run_awaitable(load_both())
+    assert [request.lora_int_id for request in loaded] == [1, 2]
+    assert [request.lora_int_id for request in added] == [1, 2]
 
 
-def test_a_failed_mid_load_eviction_keeps_the_resident_adapter_findable(
-    client, engine_class, monkeypatch
+def test_a_failed_mid_load_eviction_keeps_the_resident_adapter_removable(
+    client, engine_class, monkeypatch, tmp_path
 ):
     module = client.app.state.generated_module
-    monkeypatch.setattr(module, "_lora_int_id", lambda adapter_id: 7)
+    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
     lora_request = types.ModuleType("vllm.lora.request")
 
     class _LoRARequest:
         def __init__(self, name, int_id, path):
             self.name = name
-            self.int_id = int_id
+            self.lora_int_id = int_id
             self.path = path
 
     lora_request.LoRARequest = _LoRARequest
@@ -750,9 +800,9 @@ def test_a_failed_mid_load_eviction_keeps_the_resident_adapter_findable(
     monkeypatch.setitem(sys.modules, "vllm.lora.request", lora_request)
     instance = engine_class.__new__(engine_class)
     instance._locks = {}
-    instance._int_locks = {}
+    instance._allocator_lock = asyncio.Lock()
+    instance._next_int_id = 1
     instance._loaded = {}
-    instance._int_ids = {}
 
     async def add_lora(request):
         return None
@@ -779,8 +829,20 @@ def test_a_failed_mid_load_eviction_keeps_the_resident_adapter_findable(
     monkeypatch.setattr(module, "_read", read)
     with pytest.raises(RuntimeError, match="eviction failed"):
         _run_awaitable(engine_class._lora_request(instance, REGISTRATION))
-    assert instance._loaded[REVISION].int_id == 7
-    assert instance._int_ids == {7: REVISION}
+    assert instance._loaded[REVISION].lora_int_id == 1
+    adapter_dir = tmp_path / module._adapter_digest(REVISION)
+    adapter_dir.mkdir()
+
+    removed = []
+
+    async def remove_resident(int_id):
+        removed.append(int_id)
+
+    instance.engine.remove_lora = remove_resident
+    assert _run_awaitable(engine_class._unload_locked(instance, REVISION)) is True
+    assert removed == [1]
+    assert REVISION not in instance._loaded
+    assert not adapter_dir.exists()
 
 
 @pytest.mark.parametrize(
@@ -820,6 +882,12 @@ def test_durable_state_calls_use_the_async_modal_api():
 def test_the_generated_app_has_no_cross_container_coordination_machinery():
     source = render_app(MODELS[BASE_MODEL])
     for removed in (
+        "_lora_int_id",
+        "_int_locks",
+        "_int_ids",
+        "lora id collision",
+        "reclaim_adapter_cache",
+        '"reclaim"',
         "_claim_lora_int_id",
         "_release_lora_int_id",
         "_engine_is_warm",

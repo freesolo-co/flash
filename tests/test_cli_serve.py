@@ -11,7 +11,6 @@ import os
 import shlex
 import subprocess
 import sys
-import time
 import types
 import urllib.error
 from pathlib import Path
@@ -20,6 +19,39 @@ import pytest
 
 from flash.cli.commands import serve as serve_cmd
 from flash.core.catalog import MODELS
+from flash.serve.probe import ProbeResult
+
+_REQUIRED_CAPABILITIES = ["immutable_adapter_revisions", "alias_compare_and_swap"]
+
+
+def _probe_result(payload=None, status_code=200, error=""):
+    return ProbeResult(status_code=status_code, payload=payload, error=error)
+
+
+def _patch_status_probes(monkeypatch, request):
+    def call(url, headers, path):
+        try:
+            payload = request(url, headers, path)
+        except urllib.error.HTTPError as exc:
+            return _probe_result(status_code=exc.code, error=str(exc))
+        return _probe_result(payload)
+
+    monkeypatch.setattr(
+        serve_cmd, "request_json", lambda url, headers: call(url, headers, "/healthz")
+    )
+    monkeypatch.setattr(
+        serve_cmd, "probe_serving_key", lambda url, headers: call(url, headers, "/adapters/probe")
+    )
+
+
+def _health_payload(**overrides):
+    payload = {
+        "ok": True,
+        "base_models": ["Qwen/Qwen3.5-4B"],
+        "capabilities": list(_REQUIRED_CAPABILITIES),
+    }
+    payload.update(overrides)
+    return payload
 
 
 def _args(**kwargs):
@@ -78,7 +110,9 @@ def test_gpus_shows_the_largest_model_fitting_only_the_largest_cards(capsys):
 
 
 def test_unknown_model_is_rejected_with_the_supported_list(capsys):
-    assert serve_cmd.cmd_serve_gpus(_args(model="Llama/Nope", context_len=0)) == 1
+    from flash.cli import main
+
+    assert main(["serve", "gpus", "--model", "Llama/Nope"]) == 1
     assert "Qwen/Qwen3.5-4B" in capsys.readouterr().err
 
 
@@ -93,7 +127,7 @@ def test_setup_dry_run_writes_the_app_without_deploying(tmp_path, capsys, monkey
     assert serve_cmd.cmd_serve_setup(_setup_args(tmp_path)) == 0
     written = tmp_path / "flash_serving_app.py"
     assert written.exists()
-    assert 'BASE_MODEL = "Qwen/Qwen3.5-4B"' in written.read_text()
+    assert "BASE_MODEL = 'Qwen/Qwen3.5-4B'" in written.read_text()
 
 
 def test_setup_does_not_deploy_without_consent(tmp_path, monkeypatch, capsys):
@@ -203,7 +237,7 @@ def test_setup_creates_the_parent_directory_of_a_custom_output(tmp_path):
     destination = tmp_path / "deploy" / "generated" / "serving.py"
     assert serve_cmd.cmd_serve_setup(_setup_args(tmp_path, output=str(destination))) == 0
     assert destination.exists()
-    assert 'BASE_MODEL = "Qwen/Qwen3.5-4B"' in destination.read_text()
+    assert "BASE_MODEL = 'Qwen/Qwen3.5-4B'" in destination.read_text()
 
 
 def test_force_overwrites(tmp_path):
@@ -223,7 +257,7 @@ def test_an_unknown_gpu_is_rejected_before_anything_is_written(tmp_path, capsys)
 
 def test_a_chosen_gpu_is_honored(tmp_path):
     assert serve_cmd.cmd_serve_setup(_setup_args(tmp_path, gpu="H100")) == 0
-    assert 'GPU = "H100"' in (tmp_path / "flash_serving_app.py").read_text()
+    assert "GPU = 'H100'" in (tmp_path / "flash_serving_app.py").read_text()
 
 
 # --- deploy output parsing --------------------------------------------------------------------
@@ -310,8 +344,8 @@ def test_a_valid_non_default_scaledown_window_reaches_the_generated_app(tmp_path
 @pytest.mark.parametrize(
     ("healthz", "warns"),
     [
-        ({"ok": True, "requires_key": False}, True),
-        ({"ok": True, "requires_key": True}, False),
+        (_health_payload(requires_key=False), True),
+        (_health_payload(requires_key=True), False),
         # An older app predating the field, and an unreachable one. Neither is evidence the app is
         # unauthenticated, so neither may cry wolf.
         ({"ok": True}, False),
@@ -330,7 +364,7 @@ def test_a_keyless_deploy_warns_that_anyone_can_spend_the_gpu_budget(
         )
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    monkeypatch.setattr(serve_cmd, "_healthz", lambda url: healthz)
+    monkeypatch.setattr(serve_cmd, "healthz_with_retry", lambda url: healthz)
     assert serve_cmd._deploy(tmp_path / "app.py") == 0
     err = capsys.readouterr().err
     assert ("no FLASH_SERVING_KEY" in err) is warns
@@ -352,7 +386,7 @@ def test_the_keyless_warning_redeploys_the_file_that_was_actually_deployed(
         )
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    monkeypatch.setattr(serve_cmd, "_healthz", lambda url: {"ok": True, "requires_key": False})
+    monkeypatch.setattr(serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False))
     app_file = tmp_path / "serving" / "my_app.py"
     assert serve_cmd._deploy(app_file) == 0
     err = capsys.readouterr().err
@@ -384,7 +418,7 @@ def test_status_sends_the_internal_key_the_way_deploy_does(monkeypatch, capsys):
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "sekrit")
-    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+    _patch_status_probes(monkeypatch, _fake_request)
     assert serve_cmd.cmd_serve_status(_args()) == 0
     assert seen == [("https://acme.modal.run", {"X-Freesolo-Internal-Key": "sekrit"})] * 2, (
         "status did not send the internal key, so an authenticated backend reads as unreachable"
@@ -462,7 +496,7 @@ def test_a_malformed_health_payload_is_diagnosed_not_a_traceback(monkeypatch, ca
     from flash.serve import urls as urls_mod
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
-    monkeypatch.setattr(serve_cmd, "_status_request", lambda url, headers: payload)
+    monkeypatch.setattr(serve_cmd, "request_json", lambda url, headers: _probe_result(payload))
     assert serve_cmd.cmd_serve_status(_args()) == 1
     assert "serving backend at" in capsys.readouterr().err
 
@@ -492,7 +526,7 @@ def test_a_credential_in_the_serving_url_is_never_printed(monkeypatch, capsys, u
         raise ValueError(f"nonnumeric port: {request_url.split('://', 1)[-1]!r}")
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: url)
-    monkeypatch.setattr(serve_cmd, "_status_request", _boom)
+    monkeypatch.setattr(serve_cmd, "request_json", _boom)
     assert serve_cmd.cmd_serve_status(_args()) == 1
     err = capsys.readouterr().err
     assert secret not in err, f"the serving url's credential was printed: {err!r}"
@@ -519,7 +553,6 @@ def test_status_never_sends_the_serving_key_to_another_origin(same_origin):
     """
     import http.server
     import threading
-    import urllib.error
 
     seen: list[dict] = []
 
@@ -569,17 +602,20 @@ def test_status_never_sends_the_serving_key_to_another_origin(same_origin):
         threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         headers = {"X-Freesolo-Internal-Key": "sekrit"}
+        from flash.serve.probe import request_json
+
+        result = request_json(front_url, headers)
         if same_origin:
-            payload = serve_cmd._status_request(front_url, headers)
-            assert payload["ok"] is True, "a same-origin redirect must still be followed"
+            assert result.status_code == 200
+            assert result.payload["ok"] is True, "a same-origin redirect must still be followed"
             assert seen, "the redirect target was never reached"
             assert seen[-1].get("x-freesolo-internal-key") == "sekrit", (
                 "the key was dropped on a same-origin redirect, so modal's async-result poll "
                 "would arrive unauthenticated"
             )
         else:
-            with pytest.raises(urllib.error.HTTPError, match="another origin"):
-                serve_cmd._status_request(front_url, headers)
+            assert result.status_code == 302
+            assert "another origin" in result.error
             assert not any(h.get("x-freesolo-internal-key") for h in seen), (
                 "the serving key was sent to the redirect target, disclosing the standalone "
                 "plane's root credential to whoever controls it"
@@ -597,7 +633,7 @@ def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, ca
     only copy goes into Modal and is unrecoverable, so the app is authenticated against a secret
     nobody holds and every deploy 401s -- with a setup transcript that looked like it worked.
     """
-    monkeypatch.setattr(serve_cmd, "_healthz", lambda url: {"ok": True, "requires_key": False})
+    monkeypatch.setattr(serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False))
     serve_cmd._warn_if_unauthenticated("https://acme--flash-serve-api.modal.run")
     for text in (serve_cmd._setup_instructions(), capsys.readouterr().err):
         assert "export FREESOLO_INTERNAL_KEY=$(" in text
@@ -606,18 +642,9 @@ def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, ca
 
 
 def test_the_key_warning_survives_a_cold_start_on_the_first_probe(monkeypatch):
-    """A slow first request must not silence the one warning about a public GPU endpoint.
+    import flash.serve.probe as probe_mod
 
-    This probe runs immediately after `modal deploy`, against a web function that has not served a
-    request yet, so a cold start or a transient transport error on the first call is ordinary. The
-    caller treats an unreadable answer as "say nothing", so a single attempt made that indequately
-    silent: the deploy looked clean while the app accepted unauthenticated writes.
-    """
     attempts = {"n": 0}
-    monkeypatch.setattr(serve_cmd, "HEALTHZ_RETRY_DELAY_SECONDS", 0.0)
-    monkeypatch.setattr(time, "sleep", lambda _: None)
-
-    import urllib.request
 
     class _Payload:
         def __enter__(self):
@@ -632,29 +659,34 @@ def test_the_key_warning_survives_a_cold_start_on_the_first_probe(monkeypatch):
             raise TimeoutError("cold start")
         return _Payload()
 
-    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
-    monkeypatch.setattr(serve_cmd.json, "load", lambda _: {"ok": True, "requires_key": False})
+    monkeypatch.setattr(probe_mod.urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(probe_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        probe_mod.json,
+        "load",
+        lambda _: _health_payload(requires_key=False),
+    )
 
-    assert serve_cmd._healthz("https://acme--flash-serve-api.modal.run") == {
-        "ok": True,
-        "requires_key": False,
-    }, "the probe gave up while the app was still cold, so no key warning could be printed"
+    assert probe_mod.healthz_with_retry(
+        "https://acme--flash-serve-api.modal.run",
+        retry_delay_s=0.0,
+    ) == _health_payload(requires_key=False)
     assert attempts["n"] == 3, f"the probe did not retry: {attempts['n']} attempt(s)"
 
 
 def test_the_key_probe_gives_up_within_its_budget(monkeypatch):
-    """Retrying must stay bounded: this is advisory, on a deploy that already succeeded."""
+    import flash.serve.probe as probe_mod
+
     attempts = {"n": 0}
-    import urllib.request
 
     def _always_fails(target, timeout=None):
         attempts["n"] += 1
         raise TimeoutError("never comes up")
 
-    monkeypatch.setattr(urllib.request, "urlopen", _always_fails)
-    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(probe_mod.urllib.request, "urlopen", _always_fails)
+    monkeypatch.setattr(probe_mod.time, "sleep", lambda _: None)
 
-    assert serve_cmd._healthz("https://acme.modal.run", budget_s=0.0) is None
+    assert probe_mod.healthz_with_retry("https://acme.modal.run", budget_s=0.0) is None
     assert attempts["n"] == 1, (
         f"a zero budget still made {attempts['n']} attempts; the probe is not bounded by it"
     )
@@ -672,7 +704,7 @@ def test_deploy_instructions_quote_a_path_with_spaces(tmp_path, monkeypatch, cap
     spaced.parent.mkdir()
     spaced.write_text("# generated\n")
 
-    monkeypatch.setattr(serve_cmd, "_healthz", lambda url: {"ok": True, "requires_key": False})
+    monkeypatch.setattr(serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False))
     serve_cmd._warn_if_unauthenticated("https://acme.modal.run", spaced)
     warning = capsys.readouterr().err
     assert f"modal deploy {shlex.quote(str(spaced))}" in warning, (
@@ -696,7 +728,7 @@ def test_the_deploy_output_points_at_the_control_plane_process(tmp_path, monkeyp
         )
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    monkeypatch.setattr(serve_cmd, "_healthz", lambda url: {"ok": True, "requires_key": True})
+    monkeypatch.setattr(serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=True))
     assert serve_cmd._deploy(tmp_path / "app.py") == 0
     out = capsys.readouterr().out
     assert serve_cmd.SERVER_NAME in out, "the output never names the control-plane process"
@@ -825,7 +857,7 @@ def test_status_verifies_the_serving_key_against_an_authenticated_route(
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "wrong")
-    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+    _patch_status_probes(monkeypatch, _fake_request)
 
     code = serve_cmd.cmd_serve_status(_args())
     out = capsys.readouterr()
@@ -866,7 +898,7 @@ def test_status_does_not_report_ready_when_the_key_probe_errors(monkeypatch, cap
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "some-key")
-    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+    _patch_status_probes(monkeypatch, _fake_request)
 
     code = serve_cmd.cmd_serve_status(_args())
     out = capsys.readouterr()
@@ -905,7 +937,7 @@ def test_status_does_not_report_ready_on_a_non_404_read_back(monkeypatch, capsys
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "right")
-    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+    _patch_status_probes(monkeypatch, _fake_request)
 
     code = serve_cmd.cmd_serve_status(_args())
     out = capsys.readouterr()
@@ -942,7 +974,7 @@ def test_status_reports_ready_when_the_serving_key_is_accepted(monkeypatch, caps
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "right")
-    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+    _patch_status_probes(monkeypatch, _fake_request)
 
     assert serve_cmd.cmd_serve_status(_args()) == 0
     assert "ready. deploy a run" in capsys.readouterr().out
@@ -968,7 +1000,7 @@ def test_status_skips_the_key_probe_on_a_backend_without_one(monkeypatch, capsys
         }
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
-    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+    _patch_status_probes(monkeypatch, _fake_request)
     assert serve_cmd.cmd_serve_status(_args()) == 0
     assert asked == ["/healthz"]
     assert "ready. deploy a run" in capsys.readouterr().out
@@ -999,7 +1031,7 @@ def test_status_probes_the_key_when_the_backend_makes_no_claim(monkeypatch, caps
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "wrong")
-    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+    _patch_status_probes(monkeypatch, _fake_request)
 
     code = serve_cmd.cmd_serve_status(_args())
     out = capsys.readouterr()
@@ -1046,7 +1078,7 @@ def test_status_does_not_report_ready_when_the_read_back_fabricates_a_record(mon
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "some-key")
-    monkeypatch.setattr(serve_cmd, "_status_request", _fake_request)
+    _patch_status_probes(monkeypatch, _fake_request)
 
     code = serve_cmd.cmd_serve_status(_args())
     out = capsys.readouterr()

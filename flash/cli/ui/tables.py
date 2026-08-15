@@ -10,6 +10,8 @@ is how every call site and `monkeypatch.setattr(commands.render, ...)` reach the
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from flash._internal.channel import CLI_NAME
 from flash.cli.ui.render import (
     _ACCENT2,
@@ -30,6 +32,9 @@ from flash.cli.ui.render import (
     header,
     run_cost,
 )
+
+if TYPE_CHECKING:
+    from flash.serve.backend.gpus import Fit
 
 
 def models_table(rows: list[dict]) -> str:
@@ -69,7 +74,7 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
     return _safe(f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}")
 
 
-def serving_gpus_table(rows: list[dict], tip: str) -> str:
+def serving_gpus_table(rows: list[Fit], tip: str) -> str:
     """Modal serving GPUs for one model: fit, relative speed, and price.
 
     Headroom is what decides the choice, so it carries the color: green fits comfortably, amber is
@@ -84,17 +89,16 @@ def serving_gpus_table(rows: list[dict], tip: str) -> str:
         "no": _RED,
     }
     body = []
-    for row in rows:
-        fits = row["headroom"] != "no"
-        name = row["gpu"] + (" *" if row["default"] else "")
+    for fit in rows:
+        name = fit.gpu.name + (" *" if fit.is_catalog_default else "")
         body.append(
             [
-                (name, _ACCENT2 if fits else _FAINT),
-                (f"{row['vram_gb']} GB", _GRAY),
-                (row["headroom"], headroom_style.get(row["headroom"], _GRAY)),
-                (f"{row['free_gb']:.0f} GB" if fits else "-", _GRAY),
-                (row["speed"], _GRAY),
-                (f"${row['usd_hr']:.2f}", _TEAL if fits else _FAINT),
+                (name, _ACCENT2 if fit.fits else _FAINT),
+                (f"{fit.gpu.vram_gb} GB", _GRAY),
+                (fit.headroom, headroom_style.get(fit.headroom, _GRAY)),
+                (f"{fit.free_gb:.0f} GB" if fit.fits else "-", _GRAY),
+                (fit.speed, _GRAY),
+                (f"${fit.gpu.usd_hr:.2f}", _TEAL if fit.fits else _FAINT),
             ]
         )
     table = _table(

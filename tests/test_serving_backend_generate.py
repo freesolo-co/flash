@@ -12,6 +12,7 @@ import ast
 import re
 import sys
 import tomllib
+from importlib import resources
 from pathlib import Path
 
 import pytest
@@ -47,26 +48,7 @@ def _constants(source: str) -> dict[str, object]:
 
 
 def _advertised_capabilities(source: str) -> list[str]:
-    """The capability strings /healthz actually returns.
-
-    Found by locating the "capabilities" key in the parsed source, so an explanatory comment naming
-    a capability the backend deliberately withholds is not mistaken for advertising it.
-    """
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Dict):
-            continue
-        for key, value in zip(node.keys, node.values, strict=False):
-            if (
-                isinstance(key, ast.Constant)
-                and key.value == "capabilities"
-                and isinstance(value, ast.List)
-            ):
-                return [
-                    item.value
-                    for item in value.elts
-                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
-                ]
-    raise AssertionError("the generated app advertises no capabilities")
+    return list(_constants(source)["SERVING_CAPABILITIES"])
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS)
@@ -74,27 +56,20 @@ def test_generated_app_is_valid_python(model_id):
     ast.parse(render_app(MODELS[model_id]))
 
 
-@pytest.mark.parametrize("model_id", _MODEL_IDS)
-def test_every_template_placeholder_is_substituted(model_id):
-    """A missed placeholder must not survive as a literal brace in the output.
+def test_raw_resource_is_ordinary_python_with_one_config_marker():
+    raw = resources.files("flash.serve.backend.templates").joinpath("modal_app.py.tmpl").read_text()
+    ast.parse(raw)
+    assert raw.count("# flash generated config") == 1
+    assert "{{" not in raw
+    assert "}}" not in raw
+    assert ".format(" not in raw
 
-    The generated app is full of runtime f-strings, so a leftover `{gpu}` still parses -- it would
-    just deploy with a broken value. Checking that every remaining brace sits inside an f-string
-    catches it here instead of on the GPU.
-    """
+
+@pytest.mark.parametrize("model_id", _MODEL_IDS)
+def test_generated_config_marker_is_fully_replaced(model_id):
     source = render_app(MODELS[model_id])
-    spans = [
-        (node.lineno, node.end_lineno)
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.JoinedStr)
-    ]
-    stray = [
-        (lineno, line.strip())
-        for lineno, line in enumerate(source.splitlines(), 1)
-        if re.search(r"\{[a-z_]+\}", line)
-        and not any(start <= lineno <= end for start, end in spans)
-    ]
-    assert stray == []
+    ast.parse(source)
+    assert "# flash generated config" not in source
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS)
@@ -385,16 +360,8 @@ def test_text_only_guard_rejects_every_image_block_the_renderer_accepts(model_id
     produce. Asserted against the renderer's own set so a fourth block type cannot reintroduce it.
     """
     source = render_app(MODELS[model_id])
-    guard = next(
-        node
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Compare)
-        and isinstance(node.ops[0], ast.In)
-        and isinstance(node.comparators[0], ast.Tuple)
-        and all(isinstance(e, ast.Constant) for e in node.comparators[0].elts)
-        and "image" in {e.value for e in node.comparators[0].elts}
-    )
-    rejected = {e.value for e in guard.comparators[0].elts}
+    rejected = set(_constants(source)["IMAGE_BLOCK_TYPES"])
+    assert 'block.get("type") in IMAGE_BLOCK_TYPES' in source
     assert rejected == set(_IMAGE_BLOCK_TYPES), (
         f"text-only guard rejects {sorted(rejected)} but the renderer decodes "
         f"{sorted(_IMAGE_BLOCK_TYPES)}"

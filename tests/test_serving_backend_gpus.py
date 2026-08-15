@@ -77,11 +77,13 @@ def test_reproduces_the_production_h200_lora_canary():
     assert not estimate_fit(info, h200, max_loras=8, max_lora_rank=64).fits
 
 
-def test_serving_dtype_is_per_model_not_uniform():
-    """Dense models serve fp8; the 35B-A3B MoE serves bf16 because fused-MoE LoRA will not compile
-    on fp8, which is why its serve_model_id points back at its own base repo."""
-    assert serving_dtype(MODELS["Qwen/Qwen3.5-4B"]) == "fp8"
-    assert serving_dtype(MODELS["Qwen/Qwen3.6-35B-A3B"]) == "bf16"
+def test_serving_dtype_uses_explicit_catalog_quantization():
+    dense = MODELS["Qwen/Qwen3.5-4B"]
+    moe = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    assert dense.serving.quantization == "fp8"
+    assert moe.serving.quantization is None
+    assert serving_dtype(dense) == "fp8"
+    assert serving_dtype(moe) == "bf16"
     assert estimate_fit(MODELS["Qwen/Qwen3.6-35B-A3B"], MODAL_GPUS_BY_NAME["H200"]).dtype == "bf16"
 
 
