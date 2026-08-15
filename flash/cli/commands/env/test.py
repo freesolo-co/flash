@@ -340,19 +340,19 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
             break
         env_msgs = env.env_reply(state["messages"], state)
         env_step_pending = False
+        if gold_finished is None and turns >= len(reference_turns):
+            # the gold answer has just run out and its last turn is applied: this is the only
+            # moment the reference can be judged on its own, before junk padding touches the state.
+            gold_finished = _episode_completed(env, state, hard_cap)
         if not env_msgs:
+            break
+        if env.rollout_done(state, max_turns=hard_cap):
             break
         # the env's own reply messages feed the chat template for the next turn in the real
         # rollout, so validate their envelope and accumulated images here too: a malformed reply
         # that would break remotely must fail the episode instead of slipping through on a finite
         # reward. normalize copies so the check cannot replace authoritative rollout messages.
         _validate_multi_turn_reply(env, example, state, env_msgs)
-        if gold_finished is None and turns >= len(reference_turns):
-            # the gold answer has just run out and its last turn is applied: this is the only
-            # moment the reference can be judged on its own, before junk padding touches the state.
-            gold_finished = _episode_completed(env, state, hard_cap)
-        if env.rollout_done(state, max_turns=hard_cap):
-            break
 
     # the driver-side exits above stop before the inter-turn env_reply, so the last replayed turn
     # is still unapplied. a stateful env would then score a board or transcript missing the last

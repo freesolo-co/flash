@@ -242,6 +242,24 @@ class _ImageReplyMultiTurnEnv(_MultiTurnEnv):
         return [reply]
 
 
+class _NaturallyDoneImageReplyMultiTurnEnv(_ImageReplyMultiTurnEnv):
+    max_turns = 4
+
+    def dataset(self):
+        return [
+            {
+                "input": "finish now",
+                "output": [{"role": "assistant", "content": "finished"}],
+            }
+        ]
+
+    def env_reply(self, messages, state):
+        reply = super().env_reply(messages, state)
+        state["done"] = True
+        state["applied"] = True
+        return reply
+
+
 def _environment_dir(tmp_path):
     env_dir = tmp_path / "local-env"
     env_dir.mkdir()
@@ -1511,6 +1529,28 @@ def test_env_test_validates_images_added_by_an_in_loop_env_reply(monkeypatch, tm
     assert "overall: FAIL" in captured.err
     assert env.reply_calls == 1
     assert env.scored_state is None
+    assert env.state["messages"][-1]["content"][0]["type"] == "image_url"
+
+
+def test_env_test_skips_prompt_validation_after_natural_in_loop_termination(
+    monkeypatch, tmp_path, capsys
+):
+    env_dir = _environment_dir(tmp_path)
+    env = _NaturallyDoneImageReplyMultiTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=replay turns=1 reward=0.500000" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "remote image URLs are not supported" not in captured.err
+    assert "env_reply is not well-formed" not in captured.err
+    assert "never finished" not in captured.err
+    assert env.reply_calls == 1
+    assert env.scored_state is env.state
+    assert env.state["done"] is True
+    assert env.state["applied"] is True
+    assert env.state["turn"] == 1 < env.max_turns
     assert env.state["messages"][-1]["content"][0]["type"] == "image_url"
 
 
