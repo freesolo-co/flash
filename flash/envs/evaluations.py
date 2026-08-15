@@ -124,7 +124,11 @@ class EvalSuiteReport:
 
 @runtime_checkable
 class EvalSuite(Protocol):
-    """Authoring contract for one named held-out evaluation suite."""
+    """Authoring contract for one named held-out evaluation suite.
+
+    ``grades_episodes`` defaults to false. Setting it true plays the full episode at one generation
+    per turn; ``score(case, response, state)`` is required to receive the transcript.
+    """
 
     name: str
 
@@ -137,6 +141,8 @@ class BaseEvalSuite:
     """Convenience base with expected-answer substring scoring."""
 
     name = "evaluation"
+    # full-episode play costs one generation per turn; a third `state` scorer argument receives it.
+    grades_episodes = False
 
     def cases(self) -> list[EvalCase]:
         raise NotImplementedError

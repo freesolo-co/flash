@@ -15,6 +15,7 @@ from flash.envs.evaluations import (
     BaseEvalSuite,
     EvalCase,
     EvalResult,
+    EvalSuite,
     EvalSuiteReport,
     has_evaluations,
     load_evaluation_suites,
@@ -281,6 +282,36 @@ def test_base_eval_suite_does_not_pass_empty_expected() -> None:
 
     assert result.passed is False
     assert result.score == 0.0
+
+
+def test_base_eval_suite_defaults_episode_grading_off_through_scope(tmp_path) -> None:
+    assert BaseEvalSuite().grades_episodes is False
+
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "class Suite(BaseEvalSuite):\n"
+        "    name = 'default'\n"
+        "    def cases(self): return []\n"
+        "def load_evaluations(): return [Suite()]\n"
+    )
+
+    # the loader wraps suites in _ScopedSuite, so this assertion exercises attribute forwarding.
+    assert load_evaluation_suites(env_dir)[0].grades_episodes is False
+
+
+def test_eval_suite_runtime_check_keeps_the_published_two_argument_shape() -> None:
+    class Suite:
+        name = "published"
+
+        def cases(self):
+            return []
+
+        def score(self, case, response):
+            return True
+
+    # grades_episodes stays an optional opt-in, not a required runtime protocol member.
+    assert isinstance(Suite(), EvalSuite)
 
 
 def test_normalize_eval_result_accepts_bool_and_float() -> None:
@@ -3414,7 +3445,11 @@ def test_env_eval_drives_every_turn_of_a_multi_turn_environment(
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
     # one generation per turn, and the graded text is the accumulated transcript.
     assert environment.generated == ["a", "b", "c"]
-    assert "case only: PASS" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "case only: PASS" in captured.out
+    assert "each episode will still be played out with one generation per turn" in captured.err
+    assert "only the final turn's text" in captured.err
+    assert "score(case, response, state)" in captured.err
 
 
 def test_env_eval_reports_a_failed_turn_without_losing_the_case(
@@ -3506,7 +3541,9 @@ def test_env_eval_does_not_promote_a_first_action_suite_to_an_episode(
     # one generation, graded as the opening action -- the episode driver never ran.
     assert calls == ["gen"]
     assert environment.generated == []
-    assert "case only: PASS" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "case only: PASS" in captured.out
+    assert "one generation per turn" not in captured.err
 
 
 def test_env_eval_refuses_an_episode_suite_on_a_single_turn_environment(
@@ -3613,7 +3650,7 @@ def test_env_eval_normalizes_images_on_every_episode_turn() -> None:
     } in content
 
 
-def test_env_eval_hands_the_finished_episode_to_a_suite_that_accepts_it() -> None:
+def test_env_eval_hands_the_finished_episode_to_a_suite_that_accepts_it(capsys) -> None:
     """A transcript-grading suite must receive the episode, not just the last turn.
 
     `record_model_turn` overwrites `state["response_text"]` on every turn, so the scalar is the
@@ -3678,9 +3715,10 @@ def test_env_eval_hands_the_finished_episode_to_a_suite_that_accepts_it() -> Non
     assert results[0].error is None
     assert results[0].score == 1.0, results[0].reason
     assert results[0].reason == "saw 1,3,6"
+    assert "one generation per turn" not in capsys.readouterr().err
 
 
-def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes() -> None:
+def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes(capsys) -> None:
     """A suite that takes only (case, response) must not be handed a third argument."""
     import argparse
 
@@ -3711,7 +3749,10 @@ def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes() -> None:
         grades_episodes = True
 
         def cases(self):
-            return [EvalCase(id="c", input="x", expected="b")]
+            return [
+                EvalCase(id="c1", input="x", expected="b"),
+                EvalCase(id="c2", input="x", expected="d"),
+            ]
 
         def score(self, case, response):
             return EvalResult(
@@ -3721,7 +3762,7 @@ def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes() -> None:
                 response=response,
             )
 
-    replies = iter(["a", "b"])
+    replies = iter(["a", "b", "c", "d"])
     original = env_eval._generate_case
     env_eval._generate_case = lambda client, target, messages, args: next(replies)
     try:
@@ -3732,9 +3773,11 @@ def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes() -> None:
     finally:
         env_eval._generate_case = original
 
-    # scored on the last turn, with no TypeError from an unexpected third argument
-    assert results[0].error is None
-    assert results[0].score == 1.0
+    # both cases are scored on their last turn, with no unexpected third argument.
+    assert [result.error for result in results] == [None, None]
+    assert [result.score for result in results] == [1.0, 1.0]
+    warning = capsys.readouterr().err
+    assert warning.count("each episode will still be played out") == 1
 
 
 def test_state_argument_detects_how_the_scorer_takes_state() -> None:

@@ -138,12 +138,13 @@ Given the opening prompt, does the model emit the single integer `step_episode` 
 to advance the game? That is a real held-out check of the action format the episode
 depends on, and it is the honest scope of a single-shot evaluation.
 
-To grade a finished transcript instead, set `grades_episodes = True` on the suite.
-`env eval` then plays each case out against the deployed model -- generating, stepping
-the environment, and repeating to `max_episode_turns` -- and scores the resulting
-transcript. Such a suite needs cases the environment can actually advance (the cases
-below carry no `output`, so `step_episode` has no secret to compare against), and each
-case then costs one generation per turn rather than one in total.
+To grade a finished transcript instead, set `grades_episodes = True` on the suite
+and define `score(self, case, response, state)`. `env eval` then plays each case out
+against the deployed model -- generating, stepping the environment, and repeating to
+`max_episode_turns` -- and passes the resulting transcript in `state`. Such a suite
+needs cases the environment can actually advance (the cases below carry no `output`,
+so `step_episode` has no secret to compare against), and each case then costs one
+generation per turn rather than one in total.
 
 Do NOT grade these by calling `environment.reward(response, example)`: with no episode
 state that call scores an empty transcript, so an unrelated answer can score 1.0 and

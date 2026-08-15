@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import sys
 
 from flash.cli.commands.env.test import _evaluation_example
+from flash.cli.ui import render
 from flash.envs.evaluations import EvalCase, EvalResult
 
 
@@ -220,6 +222,14 @@ def _run_episode_cases(
             )
             for case_id in case_ids
         )
+    if _state_argument(getattr(suite, "score", None)) is None:
+        message = (
+            f"suite {getattr(suite, 'name', 'evaluation')!r} sets grades_episodes = True; "
+            "each episode will still be played out with one generation per turn, but the scorer "
+            "will receive only the final turn's text. Add a third `state` argument to "
+            "`score(case, response, state)` to grade the transcript."
+        )
+        print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
     results = []
     # The adapter defaults to `thinking = False` (flash/envs/adapter.py), and with it off
     # `_scored_turn_text` returns the turn unstripped -- so `state["response_text"]` keeps its
