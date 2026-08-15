@@ -1178,11 +1178,13 @@ group back to episode credit rather than leaving the others centred against a sm
 **One short vector costs the per-turn signal for every episode that shares its example**,
 which is why a mismatch is worth ruling out even though it never fails loudly.
 
-The easiest way to get this wrong is the hard turn cap. The rollout loop breaks out before
-the final `env_reply`, so the last assistant turn is generated and recorded **without** a
-matching `step_episode` call — an environment that appends one reward per `step_episode`
-comes up exactly one short on precisely the episodes that hit the cap. Count the assistant
-entries in `episode.turns`, not the number of steps you took and not the assistant messages
+The hard turn cap is not the exception it looks like. `state["turn"]` is incremented inside
+`env_reply`, _after_ it calls `step_episode`, so on the capped turn the counter is still one
+below the cap when `rollout_done` is checked — the turn gets its `step_episode` call like any
+other, and one reward per `step_episode` is already the right count. Adding a compensating
+reward for a call that was never missing overshoots by one, and a too-long vector lands in the
+same fallback as a too-short one. Count the assistant entries in `episode.turns`, not the
+number of steps you took and not the assistant messages
 in `episode.messages` (those include any few-shot demo the prompt carried in). If your
 `step_episode` returns assistant-role observations, they land in `episode.turns` too and inflate
 this count, so tell them apart by something you control rather than by whether the turn parses.
