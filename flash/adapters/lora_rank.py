@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
-from flash.core.catalog import serving_context_cap, serving_lora_rank_cap
+from flash.core.catalog import lora_expert_count, serving_context_cap, serving_lora_rank_cap
 
 
 class ServingPreflightError(ValueError):
@@ -290,6 +290,7 @@ class DeclaredLoraRanks:
     default: int | None = None
     by_module: Mapping[str, int] = field(default_factory=dict)
     stacked_rank_modules: tuple[str, ...] = ()
+    stacked_rank_multiplier: int | None = None
 
     def __bool__(self) -> bool:
         return self.default is not None or bool(self.by_module)
@@ -325,10 +326,12 @@ def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
             if separator and module:
                 stacked_rank_modules.append(module)
 
+    base_model = str(config.get("base_model_name_or_path") or "").strip()
     return DeclaredLoraRanks(
         default=default,
         by_module=by_module,
         stacked_rank_modules=tuple(stacked_rank_modules),
+        stacked_rank_multiplier=lora_expert_count(base_model),
     )
 
 
@@ -358,9 +361,9 @@ def lora_tensor_rank_disagrees(key: str, shape: Any, declared: DeclaredLoraRanks
     """Return whether a 2-D LoRA weight provably contradicts its configured rank.
 
     Ordinary module weights carry exactly ``r`` on the LoRA axis. A 3-D parameter targeted through
-    PEFT's ``target_parameters`` serializes under its parent module and stacks experts on that axis,
-    so only that module may carry a positive multiple of ``r``. The distinction must be per module:
-    one config may contain both ordinary ``target_modules`` and fused ``target_parameters``.
+    PEFT's ``target_parameters`` serializes under its parent module and stacks every model expert on
+    that axis, so only that module may carry exactly ``r * num_experts``. The distinction must be per
+    module because one config may contain ordinary ``target_modules`` and fused parameters together.
     """
     if not declared:
         return False
@@ -381,7 +384,9 @@ def lora_tensor_rank_disagrees(key: str, shape: Any, declared: DeclaredLoraRanks
         return False
     axis = dims[0] if is_a else dims[1]
     if _module_uses_target_parameters(module_path, declared):
-        return axis % rank != 0
+        multiplier = declared.stacked_rank_multiplier
+        expected = rank * multiplier if multiplier is not None else rank
+        return axis != expected
     return axis != rank
 
 

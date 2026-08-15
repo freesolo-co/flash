@@ -1261,12 +1261,40 @@ def test_export_accepts_fused_moe_experts_when_target_parameters_declares_them(t
             {
                 "r": 32,
                 "lora_alpha": 64,
+                "base_model_name_or_path": "Qwen/Qwen3.6-35B-A3B",
                 "target_parameters": ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
             }
         )
     )
 
     assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+
+@pytest.mark.parametrize("stacked_rank", [64, 4096, 8224])
+def test_export_requires_the_cataloged_expert_count_for_fused_parameters(tmp_path, stacked_rank):
+    """Qwen3.6 35B has 256 routed experts, so an r=32 target-parameter tensor must carry exactly
+    8192 on its stacked rank axis. Divisibility alone accepts every value here even though none can
+    bind to PEFT's r * num_experts layer."""
+    from flash.serve import export
+
+    header = _lora_pair_header(
+        stacked_rank,
+        stacked_rank,
+        prefix="base_model.model.model.layers.0.mlp.experts",
+    )
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 32,
+                "base_model_name_or_path": "Qwen/Qwen3.6-35B-A3B",
+                "target_parameters": ["mlp.experts.gate_up_proj"],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="do not carry the rank configured"):
+        export._normalize_export_adapter_keys(tmp_path)
 
 
 def test_export_limits_the_fused_rank_allowance_to_target_parameter_modules(tmp_path):
@@ -1286,6 +1314,7 @@ def test_export_limits_the_fused_rank_allowance_to_target_parameter_modules(tmp_
         json.dumps(
             {
                 "r": 32,
+                "base_model_name_or_path": "Qwen/Qwen3.6-35B-A3B",
                 "target_modules": ["q_proj"],
                 "target_parameters": ["mlp.experts.gate_up_proj"],
             }
