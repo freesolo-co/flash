@@ -6173,14 +6173,16 @@ def test_the_liveness_fields_hook_carries_reward_observability():
     # and a payload without it publishes a step whose measured pace looks lost rather than merely
     # not re-sent. the reader is shared with publishing_step_timing (which serves the unthrottled
     # checkpoint ping) rather than each closing over the state separately, so both publish one view.
-    assert "**_step_timing()" in hook
-    assert "_step_timing = _rl_step_timing_publisher(state, expected_steps)" in src
+    # held on the step state rather than in a local, so the forced first-metrics upload inside the
+    # stdout loop reads the same reader without it being threaded through every call on the way.
+    assert "**state.step_timing_fields()" in hook
+    assert "state.step_timing_fields = _rl_step_timing_publisher(state, expected_steps)" in src
     # registered through a stand-in rather than directly, because the registration is opened around
     # the whole try/finally -- the uploader drains in that finally publish the final checkpoint, and
     # its unthrottled ping reads the registry. `bind` hands the real reader over once the step state
     # exists, so both publishers still end up on ONE view of the clock.
     assert "publishing_step_timing(_deferred_timing)" in src
-    assert "_deferred_timing.bind(_step_timing)" in src
+    assert "_deferred_timing.bind(state.step_timing_fields)" in src
 
 
 def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains():

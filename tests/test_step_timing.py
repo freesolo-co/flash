@@ -1187,22 +1187,18 @@ def test_the_forced_first_metrics_upload_carries_the_pace_when_it_retries():
     assert len(forced) == 1, f"{len(forced)} forced heartbeats in _ingest_step_metrics"
     # merged as **timing rather than a named field, the way the liveness hook does it.
     merged = [kw for kw in forced[0].keywords if kw.arg is None]
-    assert any("_step_timing" in ast.unparse(kw.value) for kw in merged), (
+    assert any("step_timing_fields" in ast.unparse(kw.value) for kw in merged), (
         "the forced first-metrics upload publishes without the measured pace, so a retry that "
         "commits arms the 900s throttle behind a pace-less snapshot"
     )
 
-    # and the reader really is threaded in from the caller rather than rebuilt here: one reader
-    # shared with the liveness publisher, so the two cannot disagree about what was measured.
-    caller = ast.parse((worker / "rl_train.py").read_text())
-    child_calls = [
-        node
-        for node in ast.walk(caller)
-        if isinstance(node, ast.Call)
-        and getattr(node.func, "id", None) == "_execute_rl_child"
-        and any(kw.arg == "_step_timing" for kw in node.keywords)
-    ]
-    assert child_calls, "the child executor is not given the shared timing reader"
+    # and it is the SAME reader the liveness publisher uses, not a second one built here: the
+    # caller binds `_rl_step_timing_publisher` onto the state the uploader already carries, so
+    # both publishers answer from one clock and cannot disagree about what was measured.
+    caller = " ".join(ast.unparse(ast.parse((worker / "rl_train.py").read_text())).split())
+    assert (
+        "state.step_timing_fields = _rl_step_timing_publisher(state, expected_steps)" in caller
+    ), "the forced upload's timing reader is not bound from the shared publisher"
 
 
 def test_the_child_stream_heartbeat_is_timed_like_the_step_one():

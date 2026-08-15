@@ -86,6 +86,10 @@ class _StepMetricState:
     # blocking upload) are what makes an interval a step, so a second unfiltered record would let the
     # post-run metadata and the live heartbeat publish different answers for the same run.
     step_clock: step_timing.StepClock = field(default_factory=step_timing.StepClock)
+    # the one reader over that clock, shared by every publisher: the liveness hook, the checkpoint
+    # ping and the forced first-metrics upload. it lives beside the clock rather than being threaded
+    # through each call so the publishers cannot end up describing different views of one run.
+    step_timing_fields: Callable[[], dict] | None = None
 
 
 @dataclass
@@ -503,7 +507,6 @@ def _ingest_step_metrics(
     inp,
     state: _StepMetricState,
     _reward_observability: Callable[[], dict],
-    _step_timing: Callable[[], dict] | None = None,
 ) -> None:
     sent_first_metrics = state.sent_first_metrics
     step_metrics = parse_verl_step_metrics(line)
@@ -539,7 +542,7 @@ def _ingest_step_metrics(
                 step=step_metrics["step"],
                 metrics_last=list(state.metrics_last),
                 **_reward_observability(),
-                **(_step_timing() if _step_timing is not None else {}),
+                **(state.step_timing_fields() if state.step_timing_fields else {}),
                 gpu=gpu_diagnostics(include_torch=False),
             )
             state.step_clock.note_if_blocked(time.monotonic() - started)
@@ -574,7 +577,6 @@ def _execute_rl_child(
     state,
     reward_runtime,
     _reward_observability,
-    _step_timing=None,
     files=None,
 ) -> int:
     # claimed before the child exists, so a grandchild it orphans reparents here and can be
@@ -644,7 +646,7 @@ def _execute_rl_child(
                             f"(reward={reward:.3f}): {preview}",
                             flush=True,
                         )
-            _ingest_step_metrics(line, inp, state, _reward_observability, _step_timing)
+            _ingest_step_metrics(line, inp, state, _reward_observability)
         return child_stream.wait_and_classify()
     except BaseException:
         # the stream loop died (upload error, cancel, oom in the parent): a still-running

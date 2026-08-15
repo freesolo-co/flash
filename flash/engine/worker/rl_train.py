@@ -396,16 +396,16 @@ def run_rl_train():
                 """return reward metrics and sampled completions for one heartbeat."""
                 return reward_runtime.observability.heartbeat_fields()
 
-            _step_timing = _rl_step_timing_publisher(state, expected_steps)
+            state.step_timing_fields = _rl_step_timing_publisher(state, expected_steps)
             # fills the stand-in registered above, which outlives this block.
-            _deferred_timing.bind(_step_timing)
+            _deferred_timing.bind(state.step_timing_fields)
             with liveness_heartbeat(
                 "rl_step",
                 progress=_progress,
                 fields=lambda: {
                     "metrics_last": list(metrics_last),
                     **_reward_observability(),
-                    **_step_timing(),
+                    **state.step_timing_fields(),
                 },
                 progress_step=True,
             ):
@@ -417,7 +417,6 @@ def run_rl_train():
                     state=state,
                     reward_runtime=reward_runtime,
                     _reward_observability=_reward_observability,
-                    _step_timing=_step_timing,
                     files=files,
                 )
             _validate_rl_child(
