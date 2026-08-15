@@ -253,6 +253,9 @@ def runconfig_from_spec(spec) -> RunConfig:
         opd_multi_turn=opd_multi_turn,
         opd_max_turns=opd_max_turns,
         provider=g.provider or "auto",
+        # read defensively like disk_gb below: this reads a gpu-shaped object, not always a GpuSpec,
+        # and a caller that predates the preference has no such attribute to offer.
+        providers=getattr(g, "providers", ()) or (),
         gpu_type=g.type,
         model_revision=spec.model_revision,
         disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),

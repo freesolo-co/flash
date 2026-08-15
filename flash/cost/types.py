@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from flash.core.catalog import normalize_algorithm, optimizer_batch_key, samples_on_policy
 from flash.core.spec import parse_positive_int_tuple
 from flash.engine.plan.recipe import RECIPE
-from flash.providers import PROVIDER_NAMES
+from flash.providers import PROVIDER_NAMES, validated_provider_preferences
 from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
 
 
@@ -66,6 +66,8 @@ class RunConfig:
     # (see `test_runconfig_preserves_old_positional_constructor`), so inserting here would shift
     # every later field and silently rebind an old caller's opd flag to this one.
     sft_retained_examples: int | None = None
+    # appended for the same positional-constructor reason as sft_retained_examples above.
+    providers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -77,6 +79,12 @@ class RunConfig:
                 f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
             )
         object.__setattr__(self, "provider", prov)
+        providers = validated_provider_preferences(
+            self.providers, allow_empty=isinstance(self.providers, tuple)
+        )
+        if prov != "auto" and providers:
+            raise ValueError("provider and providers cannot both be set")
+        object.__setattr__(self, "providers", providers)
         exact = ""
         if self.gpu_type:
             exact = canonical_gpu(self.gpu_type)
