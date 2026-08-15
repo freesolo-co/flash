@@ -245,16 +245,19 @@ def test_serving_key_is_compared_in_constant_time(model_id):
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS)
-def test_alias_swap_holds_a_lock(model_id):
-    """`alias_compare_and_swap` is advertised, so the swap has to be genuinely atomic.
+def test_alias_swap_uses_one_api_container_and_a_process_local_lock(model_id):
+    """`alias_compare_and_swap` stays atomic without a distributed lease.
 
-    Reading the current target, checking the caller's expectation, then writing is a lost-update
-    race: two concurrent deploys of one run both observe the same previous revision, both pass the
-    check, and the second silently discards the first.
+    The generated api is pinned to one container, so every activation shares the same per-run
+    asyncio lock. This keeps the client-facing compare-and-swap contract while avoiding lock records
+    in the durable adapter store.
     """
     source = render_app(MODELS[model_id])
-    assert "_run_lock(" in source
-    assert "skip_if_exists=True" in source
+    assert "def _lock_for_run(" in source
+    assert "async with _lock_for_run(run_id):" in source
+    assert "max_containers=1" in source
+    assert "_run_lock" not in source
+    assert "skip_if_exists=True" not in source
 
 
 def test_app_name_is_a_valid_modal_identifier():
