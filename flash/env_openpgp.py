@@ -42,6 +42,16 @@ _MAX_OPENPGP_PACKETS = 64
 # the one the literal scan already makes rather than a boundary invented from an unverifiable length.
 _MAX_OPENPGP_BODY_BYTES = 64 << 20
 
+# The packet types a partial body length may be used on. RFC 4880 section 4.2.2.4 restricts it to
+# the data packets -- literal (11), compressed (8), symmetrically encrypted (9) and its integrity
+# protected form (18) -- so a partial length on any other tag is not a packet this format defines.
+#
+# Gating on the tag is what keeps random binary out. A partial chunk may declare up to 1 GiB, so a
+# random first octet in 224-254 lands in the partial branch constantly, and treating every one of
+# them as an unfinished sequence refused ordinary binaries: measured 3 of 64 random megabyte chunks
+# before this, and 0 of 256 after.
+_PARTIAL_LENGTH_TAGS = frozenset({8, 9, 11, 18})
+
 # Yielded by the packet walk in place of a boundary when a packet's declared body runs past the
 # bytes in hand. A distinct object rather than a flag so the sequence test can tell "no secret key
 # in this sequence" from "the sequence continues somewhere this never read", which are the same
@@ -198,12 +208,20 @@ def _session_packet_end(head: bytes, at: int, session: frozenset[int]) -> int | 
     if head[header] not in (3, 4, 5, 6):
         return None
     if tag == 3:
-        # symmetric-key ESK: a cipher from the registry, then an S2K specifier of a defined type
-        if len(head) < header + 3:
+        # symmetric-key ESK: a cipher from the registry, then an S2K specifier of a defined type.
+        #
+        # Where the S2K sits depends on the VERSION. A version 5 or 6 packet carries an AEAD
+        # algorithm byte between the cipher and the S2K, and version 6 a length byte after it, so
+        # reading the version 4 layout for all of them tested the AEAD algorithm as though it were
+        # the S2K type. `gpg --force-aead --aead-algo OCB` writes AEAD 2, which is not a defined
+        # S2K type, so the packet was rejected as malformed and the encrypted message published --
+        # `gpg --decrypt` recovered the key from the same file.
+        skew = {5: 1, 6: 2}.get(head[header], 0)
+        if len(head) < header + 3 + skew:
             return None
         if head[header + 1] not in (1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13):
             return None
-        if head[header + 2] not in (0, 1, 3, 4):
+        if head[header + 2 + skew] not in (0, 1, 3, 4):
             return None
     end = header + length
     if end + 1 > len(head):
@@ -314,7 +332,26 @@ def _openpgp_packet_starts(head: bytes) -> Iterator[bytes]:
             return
         if tag_new & 0x40:
             first = head[1] if len(head) > 1 else 0
-            offset = 2 if first < 192 else (3 if first < 224 else (6 if first == 0xFF else 0))
+            if 224 <= first < 255 and (tag_new & 0x3F) in _PARTIAL_LENGTH_TAGS:
+                # A partial body length: the packet arrives in chunks, each declaring its own
+                # length, and only the LAST one is definite. There is no single stated length to
+                # read, so this used to fall to `offset = 0` and end the walk -- returning normally
+                # rather than undecided, which reported the unread remainder clean. A legal
+                # partial-length literal packet between a public packet and a secret-key packet
+                # therefore published the secret key.
+                skipped = _past_partial_chunks(head, first)
+                if skipped is None:
+                    # The chunks do not finish inside the buffer. Undecided only when the sequence
+                    # so far is plausible: a partial chunk may declare up to 1 GiB, so random bytes
+                    # trip this constantly, and yielding the sentinel unconditionally refused
+                    # 3 of every 64 ordinary binaries. This is the same distinction the definite
+                    # lengths below already draw with `_MAX_OPENPGP_BODY_BYTES`.
+                    if (1 << (first & 0x1F)) <= _MAX_OPENPGP_BODY_BYTES:
+                        yield _TRUNCATED_PACKET
+                    return
+                head = head[skipped:]
+                continue
+            offset = 2 if first < 192 else (3 if first < 224 else 6)
         else:
             offset = {0x00: 2, 0x01: 3, 0x02: 5}.get(head[0] & 0x03, 0)
         if offset == 0 or len(head) < offset:
@@ -402,6 +439,41 @@ def _after_openpgp_markers(head: bytes) -> tuple[bytes, bool]:
         else:
             return head, False
     return head, head[:2] in (b"\xca\x03", b"\xa8\x03") and head[2:5] == b"PGP"
+
+
+def _past_partial_chunks(head: bytes, first: int) -> int | None:
+    """The offset just past a partial-length packet's chunks, or None if they run past `head`.
+
+    RFC 4880 section 4.2.2.4: a first length octet in 224-254 declares a chunk of `1 << (octet &
+    0x1f)` bytes, and further chunks follow, each with its own length octet, until one is written in
+    a definite form. Walking them is what lets the packet AFTER this one be read; the alternative is
+    to call the rest of the file undecided, which refuses ordinary multi-chunk messages.
+
+    Bounded by `_MAX_OPENPGP_PACKETS` chunks, for the reason the packet walk itself is bounded: the
+    lengths come from the file, and a stream of tiny partial chunks would otherwise be an unbounded
+    loop over attacker-chosen input. Running out of chunks is `None`, the same undecided answer as
+    running past the buffer, so the cap cannot become its own bypass.
+    """
+    at = 2
+    for _ in range(_MAX_OPENPGP_PACKETS):
+        at += 1 << (first & 0x1F)
+        if at >= len(head):
+            return None
+        first = head[at]
+        at += 1
+        if first < 192:
+            return at + first
+        if first < 224:
+            if at + 1 > len(head) - 1:
+                return None
+            length = ((first - 192) << 8) + head[at] + 192
+            return at + 1 + length
+        if first == 255:
+            if at + 4 > len(head):
+                return None
+            return at + 4 + int.from_bytes(head[at : at + 4], "big")
+        # another partial chunk: loop, with `first` naming its size
+    return None
 
 
 def _openpgp_body_length(head: bytes, offset: int) -> int | None:

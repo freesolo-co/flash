@@ -724,13 +724,18 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
                 # SEQUENCE rather than the 1-byte length the others use, so the `\x30.` above does not
                 # cover it: `openssl pkcs8 -topk8 -nocrypt -outform DER` on a real 1024-bit DSA key
                 # produced a file every branch here passed as clean.
-                rb"\x02\x01\x00\x30.\x06(?:\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
+                # Version 1 as well as 0. RFC 5958 renamed PrivateKeyInfo to OneAsymmetricKey and
+                # added an optional public-key field; a structure carrying it declares `v2(1)`
+                # instead of `v1(0)`. A real Ed25519 key written that way -- which is what an
+                # OpenSSH-to-PKCS#8 conversion produces -- published intact, and unlike RSA its
+                # raw scalar holds no nested DER for another branch to catch.
+                rb"\x02\x01[\x00\x01]\x30.\x06(?:\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
                 rb"|\x03\x2b\x65[\x6e-\x71]|\x07\x2a\x86\x48\xce\x3d\x02\x01)"
                 # DSA `1.2.840.10040.4.1` and DH `1.2.840.113549.1.3.1`, each across the three
                 # AlgorithmIdentifier length forms. DH is `dhKeyAgreement`: `openssl genpkey
                 # -paramfile` writes it, `openssl pkey -check` accepts it, and every branch above
                 # passed the resulting DER as clean.
-                rb"|\x02\x01\x00\x30(?:\x82..|\x81.|[\x00-\x7f])\x06"
+                rb"|\x02\x01[\x00\x01]\x30(?:\x82..|\x81.|[\x00-\x7f])\x06"
                 rb"(?:\x07\x2a\x86\x48\xce\x38\x04\x01|\x09\x2a\x86\x48\x86\xf7\x0d\x01\x03\x01)"
                 # PKCS#1 RSAPrivateKey: version 0 then the modulus INTEGER, whose length may be stated
                 # in any of DER's three forms. Requiring `\x02\x82` recognised only 2048-bit and larger

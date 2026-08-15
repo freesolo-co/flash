@@ -7111,7 +7111,7 @@ def test_a_pdf_filter_name_written_with_hex_escapes_is_still_flate(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.env_secrets import _Unscannable, credential_in_file
 
     body = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
     for name, spelling in (
@@ -7130,7 +7130,9 @@ def test_a_pdf_filter_name_written_with_hex_escapes_is_still_flate(tmp_path):
         assert credential_in_file(published) == "a Freesolo API key", name
 
     # resolving escapes must not turn a DIFFERENT filter into Flate, and a name that merely starts
-    # with the same characters is still a different name
+    # with the same characters is still a different name. None of these is read as flate, so each
+    # is a chain this cannot undo -- refused rather than reported clean, which is the same answer
+    # every other uninspectable stream gets.
     for name, spelling in (
         ("dct.pdf", b"/DCTDecode"),
         ("lzw.pdf", b"/LZWDecode"),
@@ -7140,7 +7142,8 @@ def test_a_pdf_filter_name_written_with_hex_escapes_is_still_flate(tmp_path):
     ):
         other = tmp_path / name
         other.write_bytes(_flate_pdf(b"/Filter " + spelling, body))
-        assert credential_in_file(other) != "a Freesolo API key", name
+        with pytest.raises(_Unscannable, match="cannot undo"):
+            credential_in_file(other)
 
 
 def test_a_pdf_predictor_refuses_rather_than_reading_differences(tmp_path):
@@ -7290,3 +7293,213 @@ def test_narrowed_wide_text_keeps_the_truncation_state_of_its_chunk(tmp_path):
         except _Unscannable as refusal:
             verdicts.append(str(refusal))
     assert verdicts[0] == verdicts[1], verdicts
+
+
+def test_a_credential_split_by_any_supported_escape_is_rejoined(tmp_path):
+    """`\\U000000XX` and `\\xXX` name the same character `\\u00XX` does.
+
+    Only the JSON spelling was decoded, so the same key written for TOML or Python published:
+    `tomllib.loads('key="fslo_AbCd\\\\U00000045..."')` and a Python sidecar using `\\x45` both hand
+    the complete credential to whatever reads them, while the raw bytes a pattern sees are split by
+    the escape and match nothing.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY.encode()
+    for name, spelling in (
+        ("json.json", b'{"key":"fslo_\\u0041%s"}' % body),
+        ("toml.toml", b'key="fslo_\\U00000041%s"' % body),
+        ("python.py", b'KEY = "fslo_\\x41%s"' % body),
+    ):
+        published = tmp_path / name
+        published.write_bytes(spelling)
+        assert credential_in_file(published) == "a Freesolo API key", name
+
+
+def test_adjacent_literals_join_across_different_quote_styles(tmp_path):
+    """Python concatenates `'a'"b"` exactly as it concatenates `'a''b'`.
+
+    The seam pattern required the two quotes to MATCH, so a key split across literals written with
+    different delimiters stayed split while the matched spelling was refused. What separates a
+    concatenation from two list elements is the whitespace-only separator, not which quote each
+    side uses.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY.encode()
+    for name, source in (
+        ("matched.py", b"KEY = 'fslo_Ab''%s'" % body),
+        ("mixed.py", b"KEY = 'fslo_Ab'\"%s\"" % body),
+        ("reversed.py", b"KEY = \"fslo_Ab\"'%s'" % body),
+    ):
+        published = tmp_path / name
+        published.write_bytes(source)
+        assert credential_in_file(published) == "a Freesolo API key", name
+
+    # a separator that is not whitespace is two values, not one literal, and must not be welded
+    for name, source in (
+        ("list.py", b'V = ["fslo_Ab", "%s"]' % body),
+        ("dict.py", b'D = {"fslo_Ab": "%s"}' % body),
+        ("csv.csv", b'"fslo_Ab","%s"\n' % body),
+    ):
+        published = tmp_path / name
+        published.write_bytes(source)
+        assert credential_in_file(published) is None, name
+
+
+def test_a_partial_length_packet_does_not_end_the_openpgp_walk(tmp_path):
+    """A partial body length is walkable, and stopping at one hid the packets behind it.
+
+    RFC 4880 4.2.2.4 lets a data packet arrive in chunks, each declaring its own length until a
+    definite one ends it. There is no single stated length to read, so the walk treated it as an
+    unreadable header and returned NORMALLY -- a confident "no key here" about a remainder it never
+    examined. A legal partial-length literal packet between a public packet and a secret-key packet
+    therefore published the secret key.
+    """
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    def packet(tag: int, body: bytes) -> bytes:
+        return bytes([0xC0 | tag, len(body)]) + body
+
+    material = bytes([4]) + b"\x67\x00\x00\x00" + bytes([1]) + os.urandom(70)
+    public, secret = packet(6, material), packet(5, material)
+    # tag 11 (literal data) may carry a partial length: 0xE2 declares a 4-byte chunk, then a
+    # definite chunk ends the packet
+    partial = bytes([0xC0 | 11, 0xE2]) + b"ABCD" + bytes([3]) + b"xyz"
+    for name, data in (
+        ("plain.pgp", public + secret),
+        ("definite.pgp", public + packet(11, b"b\x00\x00\x00\x00\x00hello") + secret),
+        ("partial.pgp", public + partial + secret),
+    ):
+        published = tmp_path / name
+        published.write_bytes(data)
+        assert credential_in_file(published) == "a private key", name
+
+    # ordinary binary must not be refused because a random byte lands in the partial range: the
+    # length is only read that way on the data packets the format allows it on
+    from flash.env_buffers import _SCAN_CHUNK_BYTES
+    from flash.env_openpgp import _openpgp_secret_key_in_sequence
+
+    refused = sum(
+        1
+        for _ in range(64)
+        if _openpgp_secret_key_in_sequence(os.urandom(_SCAN_CHUNK_BYTES), truncated=True) is None
+    )
+    assert refused == 0, f"{refused}/64 random chunks refused over a partial length"
+
+
+def test_a_version_5_session_packet_is_read_with_its_own_layout(tmp_path):
+    """A v5 SKESK carries an AEAD algorithm byte the v4 layout does not have.
+
+    Reading every version with the v4 layout tested that AEAD byte as though it were the S2K type.
+    `gpg --force-aead --aead-algo OCB` writes AEAD 2, which is not a defined S2K type, so the
+    packet failed validation, the message was reported "not encrypted", and ciphertext `gpg
+    --decrypt` reads back as a key published clean.
+    """
+    import os
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    def packet(tag: int, body: bytes) -> bytes:
+        return bytes([0xC0 | tag, len(body)]) + body
+
+    data = packet(18, b"\x01" + os.urandom(64))
+    salt = os.urandom(8)
+    for name, skesk in (
+        ("v4.gpg", packet(3, bytes([4, 9, 3, 8]) + salt + bytes([96]))),
+        ("v5.gpg", packet(3, bytes([5, 9, 2, 3, 8]) + salt + bytes([96]))),
+        ("v6.gpg", packet(3, bytes([6, 9, 2, 0, 3, 8]) + salt + bytes([96]))),
+    ):
+        published = tmp_path / name
+        published.write_bytes(skesk + data)
+        with pytest.raises(_Unscannable, match="encrypted OpenPGP message"):
+            credential_in_file(published)
+
+
+def test_a_one_asymmetric_key_declaring_version_1_is_recognised(tmp_path):
+    """RFC 5958 declares `v2(1)` when the optional public-key field is present.
+
+    The version INTEGER was pinned to 0, so an Ed25519 key carrying its public half -- what a
+    conversion from OpenSSH produces -- matched nothing. Unlike RSA its private scalar holds no
+    nested DER for another branch to catch, so the key published intact.
+    """
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    algorithm = b"\x30\x05\x06\x03\x2b\x65\x70"
+    private = b"\x04\x22\x04\x20" + os.urandom(32)
+    public = b"\x81\x21\x00" + os.urandom(32)
+    for name, body in (
+        ("v0.der", b"\x02\x01\x00" + algorithm + private),
+        ("v1.der", b"\x02\x01\x01" + algorithm + private + public),
+    ):
+        published = tmp_path / name
+        published.write_bytes(b"\x30" + bytes([len(body)]) + body)
+        assert credential_in_file(published) == "a private key", name
+
+
+def test_a_stream_behind_an_unreversible_filter_is_refused(tmp_path):
+    """A PDF stream this cannot decode is undecided, not clean.
+
+    The walk enumerated only streams naming `/FlateDecode`, so a stream declaring any other filter
+    was never looked at: a conforming `/ASCIIHexDecode` payload holding the hex spelling of a key
+    returned clean, while the same key behind flate was caught. Decoding every filter PDF defines
+    is a document parser's job; refusing what cannot be reversed is the bounded answer.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    key = b"fslo_%s" % _FAKE_KEY_BODY.encode()
+    for name, dictionary, body in (
+        ("hex.pdf", b"/Filter /ASCIIHexDecode", key.hex().encode() + b">"),
+        ("lzw.pdf", b"/Filter /LZWDecode", zlib.compress(key)),
+        ("escaped.pdf", b"/#46ilter /ASCIIHexDecode", key.hex().encode() + b">"),
+    ):
+        published = tmp_path / name
+        published.write_bytes(_flate_pdf(dictionary, body))
+        with pytest.raises(_Unscannable, match="cannot undo"):
+            credential_in_file(published)
+
+    # a stream with NO filter is uncompressed, so the ordinary literal pass over the document
+    # already covers it and it must not be refused
+    plain = tmp_path / "plain.pdf"
+    plain.write_bytes(_flate_pdf(b"/Type /XObject", b"harmless text"))
+    assert credential_in_file(plain) is None
+
+
+def test_an_escaped_predictor_key_is_still_a_predictor(tmp_path):
+    """`/#50redictor` names `Predictor` to every reader.
+
+    The key was matched literally, so a predictor written with an escape named nothing here: the
+    stream inflated to horizontal differences and was scanned as though those were content, and a
+    key a conforming decode reconstructs published intact.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    key = b"fslo_%s" % _FAKE_KEY_BODY.encode()
+    differences = bytearray()
+    previous = 0
+    for byte in key:
+        differences.append((byte - previous) & 0xFF)
+        previous = byte
+    body = zlib.compress(bytes(differences))
+    for name, spelling in (("literal.pdf", b"/Predictor"), ("escaped.pdf", b"/#50redictor")):
+        published = tmp_path / name
+        published.write_bytes(
+            _flate_pdf(
+                b"/Filter /FlateDecode /DecodeParms << "
+                + spelling
+                + b" 2 /Colors 1 /BitsPerComponent 8 /Columns "
+                + str(len(key)).encode()
+                + b" >>",
+                body,
+            )
+        )
+        with pytest.raises(_Unscannable, match="cannot undo"):
+            credential_in_file(published)

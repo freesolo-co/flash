@@ -27,7 +27,13 @@ import re
 #
 # At most one newline, so this joins a wrapped literal without welding two lines of a list that
 # happen to sit under each other. Applied only after the ordinary literal pass has found nothing.
-_ADJACENT_LITERALS = re.compile(rb"(?<!\\)([\"'])[ \t]*(?:\r?\n[ \t]*)?\1")
+#
+# The two quotes need not be the SAME character. Python concatenates `'fslo_AbCd'"Ef0123456789"`
+# just as it does a matched pair, and requiring a backreference left that spelling split while the
+# matched one was refused. What separates a concatenation from two list elements is the absence of
+# anything between the quotes, not which quote character each side uses -- `", "` and `', '` are
+# already excluded by the whitespace-only separator, and so is `","`.
+_ADJACENT_LITERALS = re.compile(rb"(?<!\\)[\"'][ \t]*(?:\r?\n[ \t]*)?[\"']")
 
 # A backslash immediately before a newline, which POSIX sh, make, C and YAML all remove to rejoin
 # the line. An EVEN number of preceding backslashes means the backslash is itself escaped and the
@@ -48,7 +54,17 @@ _CONTINUATIONS = (b"\\\n", b"\\\r\n")
 # decide an encoding for characters above 0x7F and would rewrite ordinary prose containing escaped
 # accents, which no pattern here can match anyway -- so the narrow form does the whole job and
 # cannot invent text. The surrogate range cannot appear alone in valid JSON and is excluded with it.
-_JSON_ESCAPE = re.compile(rb"\\u00([0-7][0-9A-Fa-f])")
+#
+# Three spellings of the same character, because the formats an environment publishes are not only
+# JSON. TOML and Python accept `\U000000XX` for the same code point, and Python and most config
+# readers also accept `\xXX` -- `tomllib.loads('key="fslo_AbCd\\U00000045..."')` and a Python
+# sidecar written with `\x45` both hand the complete credential to the runtime, while the raw bytes
+# a pattern reads are split by the escape. All three are anchored to the same ASCII range, so none
+# of them can invent a character outside what these patterns already match.
+_JSON_ESCAPE = re.compile(rb"\\(?:u00|U000000|x)([0-7][0-9A-Fa-f])")
+
+# What those escapes look like as plain substrings, for the guard in `_rejoined`.
+_ESCAPE_MARKERS = (b"\\u", b"\\U", b"\\x")
 
 
 def _rejoined(data: bytes) -> bytes:
@@ -70,6 +86,6 @@ def _rejoined(data: bytes) -> bytes:
     # Guarded by the same substring test as the continuation, for the same reason: `\u` is absent
     # from almost every file, and settling that at memchr speed keeps the ordinary scan free of a
     # substitution pass over every byte.
-    if b"\\u" in joined:
+    if any(marker in joined for marker in _ESCAPE_MARKERS):
         joined = _JSON_ESCAPE.sub(lambda point: bytes.fromhex(point.group(1).decode()), joined)
     return joined

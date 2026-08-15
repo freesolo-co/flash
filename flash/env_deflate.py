@@ -53,6 +53,14 @@ _PDF_LONG_DICTIONARY = re.compile(
 )
 _MAX_PDF_STREAMS = 4096
 
+# EVERY stream keyword, whatever filter its object declares. The walk above is anchored on
+# `/FlateDecode`, so a stream carrying any other filter was never enumerated at all: a conforming
+# `/ASCIIHexDecode` stream holding the hex spelling of a key returned clean, while the same key
+# behind flate was caught. Decoding every filter PDF defines is a document parser's job; refusing a
+# stream whose declared chain this cannot undo is the bounded answer, and it is the same answer the
+# flate path already gives for a chain it cannot reverse.
+_PDF_ANY_STREAM = re.compile(rb"\bstream%s" % _PDF_EOL)
+
 # The filter list of the object the matched stream belongs to. A PDF may pipe a stream through
 # SEVERAL filters -- `/Filter [/ASCII85Decode /FlateDecode]` is what `pdftk` and several writers
 # emit -- and they apply in order, so the bytes after `stream` are ASCII85 text rather than the
@@ -62,7 +70,11 @@ _MAX_PDF_STREAMS = 4096
 # than reading a whole file to find out here.
 _PDF_SIGNATURE = b"%PDF-"
 
-_PDF_FILTERS = re.compile(rb"/Filter\s*(?:/([\w#]+)|\[([^\]]{0,256})\])")
+# The dictionary KEY is spelled escape-tolerantly for the same reason its values are: `/#46ilter`
+# names `Filter` to every reader, and a literal spelling here would leave a chain declared that way
+# invisible -- the stream would then be handed to zlib undecoded, or its unreadable filters missed.
+_FILTER_NAME = b"".join(rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for letter in b"Filter")
+_PDF_FILTERS = re.compile(rb"/%s\s*(?:/([\w#]+)|\[([^\]]{0,256})\])" % _FILTER_NAME)
 _PDF_FILTER_NAME = re.compile(rb"/([\w#]+)")
 
 # `#` followed by two hex digits inside a PDF name stands for that byte, so `/Flate#44ecode` and
@@ -102,11 +114,19 @@ _PDF_ENCRYPT = re.compile(rb"/%s(?:[\s/<>\[\]()%%]|$)" % _ENCRYPT_NAME)
 
 # A `/Filter` whose value is an indirect reference (`2 0 R`) rather than a name or an array of
 # names. Resolving it means following the xref table into another object.
-_PDF_INDIRECT_FILTER = re.compile(rb"/Filter\s+\d+\s+\d+\s+R\b")
+_PDF_INDIRECT_FILTER = re.compile(rb"/%s\s+\d+\s+\d+\s+R\b" % _FILTER_NAME)
 
 # A predictor declared in `/DecodeParms`. Predictor 1 is the identity and needs no undoing; any
 # higher value means the inflated bytes are differences rather than content.
-_PDF_PREDICTOR = re.compile(rb"/Predictor\s*(\d+)")
+#
+# The KEY is spelled escape-tolerantly, like `_PDF_ENCRYPT`. `/#50redictor` is the same name as
+# `/Predictor` to every reader, and matching the literal bytes meant a predictor written that way
+# named nothing here: the stream was inflated and scanned as content while its bytes were still
+# horizontal differences, so a key that a conforming decode reconstructs published intact.
+_PREDICTOR_NAME = b"".join(
+    rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for letter in b"Predictor"
+)
+_PDF_PREDICTOR = re.compile(rb"/%s\s*(\d+)" % _PREDICTOR_NAME)
 
 # How far back from the `stream` keyword the owning object's dictionary is read. The same 512-byte
 # reach `_filter_stages` uses, for the same reason: the dictionary precedes the keyword.
@@ -316,6 +336,10 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     # parsing the xref table; refusing is the bounded answer, and these are rare in practice.
     if _PDF_INDIRECT_FILTER.search(data):
         raise _UnreadableFilterChain
+    # A stream whose filters this cannot undo is refused BEFORE the flate walk, so a document
+    # mixing one readable stream with one unreadable one does not report the readable verdict and
+    # stop. The flate walk below re-reads the same objects; this pass only decides readability.
+    _refuse_unreadable_streams(data)
     streams = _PDF_STREAM.finditer(data)
     for found in itertools.islice(streams, _MAX_PDF_STREAMS):
         before, after = _filter_stages(data, found.start())
@@ -350,6 +374,46 @@ def _object_dictionary(data: bytes, at: int) -> bytes:
     return data[max(0, at - _PDF_DICTIONARY_REACH) : at + _PDF_DICTIONARY_REACH]
 
 
+def _refuse_unreadable_streams(data: bytes) -> None:
+    """Raise when any stream in `data` declares a filter chain this cannot reverse.
+
+    The flate walk enumerates only streams naming `/FlateDecode`, which left every other filter
+    unexamined rather than undecided: a conforming `/ASCIIHexDecode` stream whose payload is the hex
+    spelling of a key returned clean. Reversing each of PDF's filters is a document parser's job, so
+    the bounded answer is to refuse a chain that cannot be undone here -- the same answer the flate
+    path already gives.
+
+    A stream with NO `/Filter` at all is uncompressed, so its literal bytes are scanned by the
+    ordinary pass over the document and need nothing from this.
+    """
+    for found in itertools.islice(_PDF_ANY_STREAM.finditer(data), _MAX_PDF_STREAMS):
+        chain = _declared_filters(data, found.start())
+        if any(name not in (_FLATE_FILTER, _ASCII85_FILTER) for name in chain):
+            raise _UnreadableFilterChain
+
+
+def _declared_filters(data: bytes, at: int) -> list[bytes]:
+    """The filter names the object owning the stream at `at` declares, escapes resolved.
+
+    Searched from well BEFORE `at`, not from it. `_PDF_STREAM` anchors on the filter NAME, so on a
+    chain the match begins in the middle of the array -- at `/FlateDecode]` -- and a slice ending
+    there is cut after the opening bracket, leaving `/Filter [` unmatched and the chain invisible.
+    Reading from behind the whole dictionary is what makes the array visible; the last entry that
+    starts before the stream keyword is the one this object declares.
+    """
+    dictionary = data[max(0, at - 512) : at + 512]
+    names = None
+    for candidate in _PDF_FILTERS.finditer(dictionary):
+        if candidate.start() <= min(at, 512):
+            names = candidate
+    if not names:
+        return []
+    return [
+        _pdf_name(raw)
+        for raw in _PDF_FILTER_NAME.findall(names.group(2) or b"/" + (names.group(1) or b""))
+    ]
+
+
 def _filter_stages(data: bytes, at: int) -> tuple[list[bytes], list[bytes]]:
     """The filters the object at `at` applies before and after its flate stage, in order.
 
@@ -357,22 +421,7 @@ def _filter_stages(data: bytes, at: int) -> tuple[list[bytes], list[bytes]]:
     match rather than forwards: `/Filter` precedes `stream` in the dictionary. Only the entry
     closest behind the match is considered, which is that object's own.
     """
-    # Searched from well BEFORE the match, not from it. `_PDF_STREAM` anchors on the filter NAME,
-    # so on a chain the match begins in the middle of the array -- at `/FlateDecode]` -- and a slice
-    # ending there is cut after the opening bracket, leaving `/Filter [` unmatched and the chain
-    # invisible. Reading from behind the whole dictionary is what makes the array visible; the last
-    # entry that starts before the stream keyword is the one this object declares.
-    dictionary = data[max(0, at - 512) : at + 512]
-    names = None
-    for candidate in _PDF_FILTERS.finditer(dictionary):
-        if candidate.start() <= min(at, 512):
-            names = candidate
-    if not names:
-        return [], []
-    chain = [
-        _pdf_name(raw)
-        for raw in _PDF_FILTER_NAME.findall(names.group(2) or b"/" + (names.group(1) or b""))
-    ]
+    chain = _declared_filters(data, at)
     if _FLATE_FILTER not in chain:
         return [], []
     flate = chain.index(_FLATE_FILTER)
