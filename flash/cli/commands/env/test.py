@@ -268,12 +268,17 @@ def _drive_single_turn(env, example: dict, record: dict, *, force_echo: bool = F
     )
 
 
-def _drive_multi_turn(
-    env, example: dict, record: dict, *, force_echo: bool = False, score: bool = True
-) -> None:
+def _new_multi_turn_replay_state(env, example: dict, record: dict) -> dict:
     state = env.new_rollout_state(example)
     record["prompt"] = _check_messages(state.get("prompt") or state.get("messages"), "prompt")
     _normalize_prompt_images(env, example, record["prompt"])
+    return state
+
+
+def _drive_multi_turn(
+    env, example: dict, record: dict, *, force_echo: bool = False, score: bool = True
+) -> None:
+    state = _new_multi_turn_replay_state(env, example, record)
     completion = _gold_completion(env, example)
     record["completion"] = completion
     reference_turns = _reference_turns(completion)
