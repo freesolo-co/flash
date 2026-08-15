@@ -412,7 +412,7 @@ def export_peft_adapter(
             os.replace(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
     except Exception as error:
         # classify before cleanup frees the merge tree and its low-space evidence.
-        # cancellation remains a BaseException and is never relabelled as disk exhaustion.
+        # cancellation remains a base exception and is never relabelled as disk exhaustion.
         raise_for_merge_disk_exhaustion(
             error, ckpt_actor_dir, merge_out, merger_succeeded=merger_succeeded
         )
