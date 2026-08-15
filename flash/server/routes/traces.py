@@ -208,7 +208,15 @@ def _build_trace_record(
     input_sanitization = _SanitizationFlag()
     output_sanitization = _SanitizationFlag()
     sanitized_output = _sanitize_for_trace(
-        output_payload, context.secrets, response=True, flag=output_sanitization
+        output_payload,
+        context.secrets,
+        response=True,
+        # an upstream failure is known here, so it does not have to be re-derived from the body's
+        # shape further down. the redactor used to infer it from a root `error` member, which a body
+        # that is a bare list of details -- or wraps them under `errors` or `detail` -- never has,
+        # leaving the request json those errors quote unexamined.
+        response_error=error is not None,
+        flag=output_sanitization,
     )
     sanitized_usage = _sanitize_for_trace(usage, context.secrets, response=True)
     sanitized_input = _sanitize_for_trace(context.body, context.secrets, flag=input_sanitization)

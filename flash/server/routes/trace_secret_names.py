@@ -23,6 +23,11 @@ _SECRET_KEY_SUFFIXES = (
     "accesskeyid",
     "secretkey",
     "accesskey",
+    # api-management gateways spell their credential `subscription_key` / `Ocp-Apim-Subscription-Key`.
+    # it ends in `key` but not in any suffix above, so it was persisted verbatim. named as the whole
+    # compound word rather than by relaxing to bare `key`, which `primary_key` and `sort_key` share
+    # while carrying no credential.
+    "subscriptionkey",
     "secret",
     "token",
     "password",
@@ -71,16 +76,18 @@ def _is_secret_key(key: Any, *, allow_token: bool = False) -> bool:
     normalized = _normalize_secret_key(key)
     if normalized in _SECRET_KEY_EXACT:
         return True
-    for candidate in _secret_key_candidates(normalized):
-        if not (allow_token and candidate == "token") and any(
-            candidate.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES
-        ):
+    for end in _secret_key_candidate_ends(normalized):
+        # compared against the bound rather than a sliced copy: the slice is what made a long
+        # stacked-qualifier name cost quadratic memory here.
+        if allow_token and end == len("token") and normalized.startswith("token"):
+            continue
+        if any(normalized.endswith(suffix, 0, end) for suffix in _SECRET_KEY_SUFFIXES):
             return True
     return False
 
 
-def _secret_key_candidates(normalized: str) -> tuple[str, ...]:
-    """The key itself, plus each form left as conventional trailing qualifiers are peeled off.
+def _secret_key_candidate_ends(normalized: str) -> list[int]:
+    """Where the key ends, plus where each form left by peeling a trailing qualifier ends.
 
     The suffix rule needs the sensitive term to END the key, so `password_confirmation` and
     `client_secret_value` fell through and their credentials were persisted unchanged. Only the
@@ -93,17 +100,23 @@ def _secret_key_candidates(normalized: str) -> tuple[str, ...]:
 
     Free-form containment would be wrong here -- `token_count` is a length and `password_policy_url`
     is a link, and redacting either would eat legitimate recorded content.
+
+    An END OFFSET rather than the peeled string: slicing copied the shrinking key once per
+    qualifier and kept every copy, which is quadratic in the key's length. A name built from
+    stacked qualifiers -- well inside the ingress limit -- peaked at gigabytes and stalled the
+    worker persisting the trace. `str.endswith` accepts the bound directly, so the offset carries
+    everything the caller needs.
     """
-    candidates = [normalized]
-    current = normalized
+    ends = [len(normalized)]
+    end = len(normalized)
     while True:
         for qualifier in _SECRET_KEY_QUALIFIERS:
-            if current.endswith(qualifier) and len(current) > len(qualifier):
-                current = current[: -len(qualifier)]
-                candidates.append(current)
+            if end > len(qualifier) and normalized.endswith(qualifier, 0, end):
+                end -= len(qualifier)
+                ends.append(end)
                 break
         else:
-            return tuple(candidates)
+            return ends
 
 
 def _strip_required_anchors(pattern: str) -> str | None:
@@ -141,6 +154,7 @@ def _normalize_exact_quantifiers(pattern: str) -> str:
     index = 0
     quantifiable = False
     in_class = False
+    closing_brace_index: int | None = None
     while index < len(pattern):
         character = pattern[index]
         if character == "\\" and index + 1 < len(pattern):
@@ -154,7 +168,16 @@ def _normalize_exact_quantifiers(pattern: str) -> str:
             index += 1
             continue
         if character == "{" and quantifiable:
-            end = pattern.find("}", index + 1)
+            # the position of the next `}` is remembered rather than searched afresh per brace,
+            # which re-read the whole tail each time: a pattern of stacked `{` -- caller-controlled,
+            # and rejected moments later anyway -- turned post-call sanitization quadratic.
+            # `-1` records that the tail holds NO `}`, which stays true as the scan advances, so it
+            # is sticky; re-searching on it would restore the quadratic scan it exists to prevent.
+            if closing_brace_index is None or (
+                closing_brace_index != -1 and closing_brace_index <= index
+            ):
+                closing_brace_index = pattern.find("}", index + 1)
+            end = closing_brace_index
             if end != -1 and pattern[index + 1 : end] == "1":
                 index = end + 1
                 quantifiable = False

@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import threading
 import time
+import tracemalloc
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, ClassVar
 
@@ -11601,3 +11602,239 @@ def test_ordinary_tool_prose_still_survives_the_separator_check() -> None:
     sanitized = traces._sanitize_for_trace(payload, ())
 
     assert sanitized["messages"][0]["content"] == "the lookup returned no rows"
+
+
+@pytest.mark.parametrize(
+    ("key", "secret"),
+    [
+        ("subscription_key", True),
+        ("Ocp-Apim-Subscription-Key", True),
+        ("subscriptionKey", True),
+        ("subscription_key_value", True),
+        # bare `key` stays excluded: these name a lookup or an ordering, not a credential.
+        ("primary_key", False),
+        ("sort_key", False),
+        ("partition_key", False),
+        ("row_key", False),
+        ("idempotency_key", False),
+        ("public_key", False),
+        ("key", False),
+        ("key_count", False),
+        ("subscription_key_count", False),
+        ("subscription_id", False),
+        ("subscription", False),
+    ],
+    ids=[
+        "snake",
+        "gateway-header",
+        "camel",
+        "qualified",
+        "primary",
+        "sort",
+        "partition",
+        "row",
+        "idempotency",
+        "public",
+        "bare",
+        "count",
+        "subscription-count",
+        "subscription-id",
+        "subscription-alone",
+    ],
+)
+def test_an_api_management_subscription_key_is_a_credential(key: str, secret: bool) -> None:
+    """An api-management gateway spells its credential `subscription_key` or
+    `Ocp-Apim-Subscription-Key`. Both normalize to something ending in `key`, which is
+    deliberately not a suffix on its own -- `primary_key` and `sort_key` share it and carry no
+    credential -- so nothing matched and the gateway credential was persisted verbatim whenever it
+    was not one of `context.secrets`. The whole compound word is classified, leaving the bare
+    suffix excluded."""
+
+    assert trace_secret_names._is_secret_key(key) is secret
+
+
+def test_a_subscription_key_in_a_tool_result_is_redacted() -> None:
+    payload = {
+        "messages": [
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": '{"subscription_key": "THIRDPARTY", "region": "westus"}',
+            }
+        ]
+    }
+
+    sanitized = traces._sanitize_for_trace(payload, ())
+
+    assert "THIRDPARTY" not in json.dumps(sanitized)
+    assert "westus" in json.dumps(sanitized)
+
+
+def test_secret_key_classification_memory_grows_with_the_name_not_its_square() -> None:
+    """Peeling qualifiers by slicing copied the shrinking key once per qualifier and RETAINED every
+    copy, so a name of stacked qualifiers cost quadratic memory: 40,000 characters peaked at 160 MB
+    and 160,000 -- far inside the 8 MiB ingress limit -- at 2.5 GB. This runs on the persistence
+    path AFTER the paid upstream call, so it holds a completed call open and can exhaust the worker.
+
+    Peak allocation rather than elapsed time: the defect IS the retained copies, and a byte count is
+    deterministic where a wall-clock budget would flake on a busy machine. The bound is a generous
+    multiple of the key itself -- the fixed form holds the normalized copy and one offset per
+    qualifier, a few hundred KB here, against 160 MB before.
+    """
+    key = "value" * 8_000
+
+    tracemalloc.start()
+    try:
+        trace_secret_names._is_secret_key(key)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < len(key) * 40
+
+
+def test_peeling_qualifiers_still_names_every_form_it_did() -> None:
+    """The end offsets stand in for the peeled strings, so each one must still bound exactly the
+    form that slicing produced."""
+
+    normalized = trace_secret_names._normalize_secret_key("new_client_secret_plaintext_value")
+    ends = trace_secret_names._secret_key_candidate_ends(normalized)
+
+    assert [normalized[:end] for end in ends] == [
+        "newclientsecretplaintextvalue",
+        "newclientsecretplaintext",
+        "newclientsecret",
+    ]
+
+
+def test_quantifier_normalization_cost_grows_with_the_pattern_not_its_square() -> None:
+    """A fully anchored `patternProperties` expression of stacked unmatched `{` made this re-scan
+    the whole remaining suffix per brace: 1,024,000 braces took 5.4s and the ingress limit permits
+    eight times that. The pattern is caller-controlled and is REJECTED moments later, so the cost
+    buys nothing -- it just occupies a persistence worker.
+
+    Eight times the input costs a linear scan roughly 8x and a quadratic one roughly 64x -- it
+    measured 38x here before the fix. The 16x bar sits well clear of both, so the ratio separates
+    them without asserting a wall-clock budget that would flake on a busy machine.
+    """
+    timings = []
+    for braces in (64_000, 512_000):
+        pattern = "^a" + ("{" * braces) + "$"
+        started = time.perf_counter()
+        trace_secret_names._normalize_exact_quantifiers(pattern)
+        timings.append(time.perf_counter() - started)
+
+    assert timings[1] < timings[0] * 16
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["^passw{1}ord$", "^a{1}b{1}c$", "^a{2}$", "^a{1,2}$", "^a{1$", "^a[{1}]$", "^{1}a$", "^a{}$"],
+    ids=[
+        "credential",
+        "stacked",
+        "repeat",
+        "range",
+        "unclosed",
+        "in-class",
+        "unquantifiable",
+        "empty",
+    ],
+)
+def test_remembering_the_closing_brace_does_not_change_what_a_pattern_spells(pattern: str) -> None:
+    """The memo must be invisible: `-1` is sticky because a tail with no `}` still has none as the
+    scan advances, and a remembered position is re-searched once the scan passes it."""
+
+    def rescanning_every_brace(text: str) -> str:
+        result: list[str] = []
+        index = 0
+        quantifiable = False
+        in_class = False
+        while index < len(text):
+            character = text[index]
+            if character == "\\" and index + 1 < len(text):
+                result.append(text[index : index + 2])
+                index += 2
+                quantifiable = not in_class
+                continue
+            if in_class:
+                result.append(character)
+                in_class = character != "]"
+                index += 1
+                continue
+            if character == "{" and quantifiable:
+                end = text.find("}", index + 1)
+                if end != -1 and text[index + 1 : end] == "1":
+                    index = end + 1
+                    quantifiable = False
+                    continue
+            result.append(character)
+            in_class = character == "["
+            quantifiable = character not in "(|"
+            index += 1
+        return "".join(result)
+
+    assert trace_secret_names._normalize_exact_quantifiers(pattern) == rescanning_every_brace(
+        pattern
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [{"message": 'Invalid metadata: {"password":"THIRDPARTY"}'}],
+        {"errors": [{"message": 'Invalid metadata: {"password":"THIRDPARTY"}'}]},
+        {"detail": 'Invalid metadata: {"password":"THIRDPARTY"}'},
+        {"error": {"message": 'Invalid metadata: {"password":"THIRDPARTY"}'}},
+    ],
+    ids=["bare-list", "errors-wrapper", "detail-wrapper", "error-member"],
+)
+def test_an_upstream_error_body_is_inspected_whatever_shape_it_takes(payload: Any) -> None:
+    """The error context was opened by an exact root `error` MEMBER, so a body that is a bare list
+    of details -- or wraps them under `errors` or `detail` -- carried the quoted request json past
+    the check and a third-party credential reached the raw export. The HTTP status is the reliable
+    signal and `_build_trace_record` already has it, so it seeds the context for the whole body."""
+
+    sanitized = traces._sanitize_for_trace(payload, (), response=True, response_error=True)
+
+    assert "THIRDPARTY" not in json.dumps(sanitized)
+
+
+def test_a_successful_response_is_not_read_as_an_error_body() -> None:
+    """The flag is what opens diagnostic inspection, not the body's shape: an ordinary 200 whose
+    reply happens to quote json is recorded verbatim, because it is the reply the operator is
+    collecting."""
+
+    payload = [{"message": 'Invalid metadata: {"password":"THIRDPARTY"}'}]
+
+    assert traces._sanitize_for_trace(payload, (), response=True) == payload
+
+
+def test_a_200_carrying_an_error_envelope_is_still_inspected() -> None:
+    """Some providers return an error envelope with a 200, so the shape-based detection stays: the
+    status seeds the context, it does not replace it."""
+
+    payload = {"error": {"message": 'Invalid metadata: {"password":"THIRDPARTY"}'}}
+
+    assert "THIRDPARTY" not in json.dumps(traces._sanitize_for_trace(payload, (), response=True))
+
+
+def test_an_upstream_rejection_reaches_the_export_with_its_quoted_request_redacted(
+    trace_api, monkeypatch
+) -> None:
+    """End to end: a 400 whose body is a bare list of details. The caller still sees the provider's
+    rejection verbatim -- it is why their paid call failed -- but the credential it quotes back
+    must not be what the export hands to whoever reads the traces."""
+    body = [{"message": 'Invalid metadata: {"password":"THIRDPARTY"}'}]
+    _StaticAsyncClient.requests = []
+    _StaticAsyncClient.response = httpx.Response(400, json=body)
+    monkeypatch.setattr(traces.httpx, "AsyncClient", _StaticAsyncClient)
+
+    response = trace_api.post("/v1/chat/completions", headers=_HEADERS, json=_REQUEST)
+
+    assert response.status_code == 400
+    assert response.json() == body
+    exported = _raw(trace_api)
+    span = exported["records"][0]["spans"][0]
+    assert span["error"] == "upstream returned status 400"
+    assert "THIRDPARTY" not in json.dumps(span["output_payload"])

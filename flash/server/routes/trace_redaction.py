@@ -41,7 +41,6 @@ from flash.server.routes.trace_schema_shape import (  # noqa: F401
 from flash.server.routes.trace_secret_names import (  # noqa: F401
     _is_secret_key,
     _is_secret_property_pattern,
-    _secret_key_candidates,
     _unwrap_pattern_groups,
 )
 
@@ -851,6 +850,7 @@ def _sanitize_for_trace(
     *,
     response: bool = False,
     payload_root: bool = True,
+    response_error: bool = False,
     flag: _SanitizationFlag | None = None,
 ) -> Any:
     if isinstance(value, str):
@@ -870,6 +870,16 @@ def _sanitize_for_trace(
     # sanitize a FRAGMENT rather than a whole body pass `payload_root=False` for the same reason:
     # arbitrary caller data is not a request root just because it is handed here on its own.
     redacted = _redact_secret_fields(
-        value, payload_root=payload_root and not response, response_root=response, flag=flag
+        value,
+        payload_root=payload_root and not response,
+        response_root=response,
+        # the caller already knows the upstream returned an error status. keying diagnostic
+        # inspection off a root `error` MEMBER only covered the shape that spells it that way: a
+        # body that is a bare list of details, or wraps them under `errors` or `detail`, carried the
+        # same quoted request json past the check, so a third-party credential the caller never
+        # registered reached the raw export. the status is the reliable signal, so it seeds the flag
+        # for the whole body.
+        response_error=response_error,
+        flag=flag,
     )
     return _redact_secret_values(redacted, secrets, flag=flag)
