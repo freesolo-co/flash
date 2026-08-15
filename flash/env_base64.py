@@ -14,6 +14,7 @@ import base64
 import binascii
 import re
 import time
+import zlib
 from collections.abc import Iterator
 from typing import Protocol
 
@@ -165,6 +166,20 @@ _CONTAINER_SNIFF_CHARS = 64
 _CONTAINER_BASE64_FIRST = frozenset(b"HQ/UCGKOSWae")
 
 
+def _visible_zlib_container(decoded: bytes) -> bool:
+    """Whether a bounded decoded prefix proves a zlib stream is present."""
+    if not _looks_like_zlib(decoded):
+        return False
+    if decoded[1] & 0x20:
+        return True
+    try:
+        inflate = zlib.decompressobj()
+        plain = inflate.decompress(decoded, 1)
+    except zlib.error:
+        return False
+    return bool(plain) or inflate.eof
+
+
 class _RunTooLongToExpand(Exception):
     """A base64 run is longer than `_MAX_WHOLE_RUN`, so the container inside it was never expanded.
 
@@ -188,7 +203,7 @@ def _starts_with_container(run: bytes) -> bool:
         decoded = base64.b64decode(head.translate(_URL_SAFE_ALPHABET), validate=True)
     except (ValueError, binascii.Error):
         return False
-    return decoded.startswith(_CONTAINER_MAGIC) or _looks_like_zlib(decoded)
+    return decoded.startswith(_CONTAINER_MAGIC) or _visible_zlib_container(decoded)
 
 
 def _match_broken_container(
@@ -368,7 +383,7 @@ def _decodes_to_container(run: bytes) -> bool:
             decoded = base64.b64decode(aligned.translate(_URL_SAFE_ALPHABET), validate=True)
         except (ValueError, binascii.Error):
             continue
-        if decoded.startswith(_CONTAINER_MAGIC) or _looks_like_zlib(decoded):
+        if decoded.startswith(_CONTAINER_MAGIC) or _visible_zlib_container(decoded):
             return True
     return False
 
@@ -389,10 +404,11 @@ def _inspect_whole(run: bytes, inspect: _Inspector) -> str | None:
     if len(run) <= _BASE64_WINDOW:
         return None
     if len(run) > _MAX_WHOLE_RUN:
-        # Skipping here reported a container nobody could expand as clean. Measured across 8,944
-        # real hub files: the longest base64 run is 11,244 bytes, so no publishable file is near
-        # this bound and refusing costs nothing that a real environment does.
-        raise _RunTooLongToExpand
+        # only a visible container needs whole-run expansion. ordinary oversized base64 remains
+        # covered by the overlapping literal windows and must not be refused merely for its size.
+        if _starts_with_container(run):
+            raise _RunTooLongToExpand
+        return None
     # PADDED to the next multiple of four, not cut back to the previous one. An unpadded encoding
     # is ordinary -- `base64 -w0 | tr -d '='`, a JWT segment, many YAML emitters -- and truncating
     # discards the last one to three characters, which are real bytes at the END of the container:

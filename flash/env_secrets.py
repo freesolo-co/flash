@@ -53,17 +53,20 @@ from flash.env_buffers import (
 from flash.env_deflate import (
     _PDF_SIGNATURE,
     _document_payloads,
+    _DocumentDeadlineExceeded,
     _EncryptedDocument,
     _gzip_metadata,
     _GzipHeaderTooLarge,
-    _raw_deflate_from,
+    _raw_deflate_records_from,
     _scan_framed_stream,
+    _TooManyRawDeflateRecords,
     _TooManyStreams,
     _UnreachedStream,
     _UnreadableFilterChain,
 )
 from flash.env_formats import (
     _MAX_ARCHIVE_MEMBERS,
+    _OVERLAY_PROBE_BYTES,
     _ZIP_TAIL_BYTES,
     OVERLAY_UNPROBED,
     _after_skippable_frames,
@@ -83,13 +86,18 @@ from flash.env_joined import _rejoined
 # file-size limit. `_Unscannable` lives THERE because those walks raise it and this module imports
 # them, so the other direction would be a cycle. Re-exported because every other raise site and
 # every test still reads all three from here.
-from flash.env_keystores import _keystore_undecided, _openpgp_kind, _Unscannable
+from flash.env_keystores import (
+    _decoded_key_kind,
+    _keystore_undecided,
+    _openpgp_kind,
+    _Unscannable,
+)
 from flash.env_names import exact_name_values
 from flash.env_openpgp import (
-    _MAX_OPENPGP_MARKERS,
     _has_age_file_armor,
     _has_age_native_document,
     _has_openpgp_message_armor,
+    _unfinished_openpgp_message_armor,
 )
 from flash.env_patterns import _MAX_BODY, _match, _unfinished_private_key_armor
 from flash.env_policy import _unexpandable_format, _uninspectable_reason
@@ -106,21 +114,6 @@ _SCAN_OVERLAP_BYTES = _MAX_BODY * 4
 # seekable stream carries, and bounded so a chain of crafted frame headers cannot make this walk a
 # cost of its own.
 _SKIPPABLE_SCAN_BYTES = 64 << 10
-# How much of a member's head the OpenPGP secret-key test reads. The test itself needs about a
-# dozen bytes, but a legal marker packet may precede the real one and each consumes five, so a
-# fixed 24 left too few behind four markers to reach the version and algorithm fields.
-_OPENPGP_HEAD_BYTES = 24 + 5 * _MAX_OPENPGP_MARKERS
-
-# How much of a stream is accumulated to walk a key store to its end. The walk is head-anchored, so
-# a store larger than one chunk had its remaining entries unread -- and a private key BEHIND a
-# certificate whose body crossed the boundary published intact.
-#
-# Buffered rather than refused because refusing is a false alarm on exactly the ordinary case: a
-# truststore is mostly certificates, holds no private key at all, and grows past a chunk simply by
-# holding enough of them. The walk itself is cheap whatever the size -- it steps entry to entry by
-# arithmetic and never reads a certificate body -- so the cap only has to sit above any real store.
-_MAX_KEYSTORE_BYTES = 16 << 20
-
 # How many concatenated zlib records are inflated before the stream is refused. A per-record cache
 # or an appended log writes a handful; the bound is what stops a file of many tiny records from
 # becoming an expansion cost of its own, and exceeding it refuses rather than passes.
@@ -198,6 +191,7 @@ def _credential_kind(
     truncated: bool = False,
     paired: bool = True,
     shell: bool = False,
+    literal_syntax: str | None = None,
     rejoin: bool = True,
 ) -> str | None:
     """The kind of credential `data` contains under any of its plausible text encodings.
@@ -226,6 +220,7 @@ def _credential_kind(
         truncated=truncated,
         paired=paired,
         shell=shell,
+        literal_syntax=literal_syntax,
         rejoin=rejoin,
     ):
         return kind
@@ -238,6 +233,7 @@ def _credential_kind(
         depth=depth,
         truncated=truncated,
         shell=shell,
+        literal_syntax=literal_syntax,
         rejoin=rejoin,
     )
 
@@ -250,6 +246,7 @@ def _decoded_kind(
     truncated: bool = False,
     paired: bool = True,
     shell: bool = False,
+    literal_syntax: str | None = None,
     rejoin: bool = True,
 ) -> str | None:
     """The kind of credential in `data` literally, or inside a base64 run within it."""
@@ -267,7 +264,7 @@ def _decoded_kind(
     # when no seam is present, so the ordinary file pays two cheap searches and no rematch.
     if not rejoin:
         return None
-    joined = _rejoined(data, shell=shell)
+    joined = _rejoined(data, shell=shell, literal_syntax=literal_syntax)
     return _match(joined, paired=paired) if joined != data else None
 
 
@@ -307,9 +304,9 @@ def _decoded_container(deadline: float | None, depth: int) -> _Inspector | None:
     def inspect(decoded: bytes, *, whole: bool = False) -> str | None:
         if time.monotonic() > deadline:
             raise _Unscannable("takes too long to decompress")
-        # exact whole-run decodes may refuse opaque formats. speculative alignments cannot: prose
-        # produced `Salted__` by chance, while a real `openssl enc -a` value needs the same refusal as
-        # its binary ciphertext or the encoding alone becomes a credential bypass.
+        # exact decodes receive the same anchored binary checks as standalone files.
+        if whole and (kind := _decoded_key_kind(decoded)):
+            return kind
         if whole and (fmt := _unexpandable_format(decoded, anchored=True)):
             raise _Unscannable(_uninspectable_reason(fmt))
         # raw deflate has no magic. probing only exact decodes avoids an inflate for every speculative
@@ -353,12 +350,18 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     bytes looked like a reasonable trade, but a deflated member's bytes hold the credential nowhere
     a pattern can see, so it was a silent bypass reachable by padding an archive past the cap.
     """
-    shell = str(getattr(handle, "name", "")).lower().endswith(".sh")
+    name = str(getattr(handle, "name", "")).lower()
+    shell = name.endswith(".sh")
+    literal_syntax = (
+        "yaml" if name.endswith((".yaml", ".yml")) else "toml" if name.endswith(".toml") else None
+    )
     carry = b""
     buffered = bytearray()
     tail = b""
     container_head = source_container = False
     overflowed = False
+    overlay_tail = b""
+    overlay_found = False
     seen = _paired_state()
     store_head = bytearray()
     walking_store = True
@@ -397,9 +400,17 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
             # short zstd and LZ4 magics that are not searched for at arbitrary offsets below.
             if fmt := _unexpandable_format(head, anchored=True):
                 raise _Unscannable(_uninspectable_reason(fmt))
+        if depth:
+            overlay_probe = overlay_tail + chunk
+            overlay_found = overlay_found or _overlay_offset(overlay_probe) is not None
+            overlay_tail = overlay_probe[-_OVERLAY_PROBE_BYTES:]
+            if overflowed and overlay_found:
+                raise _Unscannable("contains an appended archive too large to inspect")
         if depth and not overflowed:
             buffered.extend(chunk)
             if len(buffered) > _MAX_NESTED_BUFFER_BYTES:
+                if overlay_found:
+                    raise _Unscannable("contains an appended archive too large to inspect")
                 if container_head:
                     raise _Unscannable("contains an archive too large to inspect")
                 # Not a container by its head, so the literal scan below is complete coverage and
@@ -429,6 +440,8 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         # inside, and treating it as ordinary text published the message intact.
         if _has_openpgp_message_armor(window):
             raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
+        if bool(upcoming) and _unfinished_openpgp_message_armor(window):
+            raise _Unscannable("contains an OpenPGP message armor header too long to read past")
         # search nested age armor or native headers; both require body structure, not documentation.
         if _has_age_file_armor(window) or _has_age_native_document(window):
             raise _Unscannable("contains a age-encrypted file this check cannot read")
@@ -453,6 +466,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
                 truncated=bool(upcoming),
                 paired=False,
                 shell=shell,
+                literal_syntax=literal_syntax,
                 # archive framing is not source syntax, so its raw pass must not join bytes that
                 # belong to separate names, headers, or members. exact metadata and members are
                 # scanned independently by their container walkers.
@@ -587,56 +601,28 @@ def _credential_in_overlay(source: Path | bytes, *, deadline: float, depth: int)
 
 
 def _credential_in_raw_deflate(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
-    """The kind of credential inside a headerless DEFLATE stream (RFC 1951), or None.
+    """Scan complete concatenated RFC 1951 records without reading the source whole.
 
-    Its own handler rather than a branch of the zlib one, because raw deflate has no header at all:
-    the zlib branch is reached by the two-byte RFC 1950 rule, which a headerless stream cannot
-    satisfy, so a `.deflate` sidecar was never expanded and its credential published intact.
-
-    Last by position in the handler list. With nothing to match on the decode IS the recognition,
-    so it runs only once every magic-based handler has declined, and costs one inflate attempt that
-    fails immediately on anything that is not a complete stream.
-
-    Fed in bounded blocks rather than read whole. Every file reaching here is probed, an ordinary
-    model shard included, so reading the source entire to answer "is this deflate" allocated a
-    second copy of a member that may be as large as the uncompressed limit allows -- while the
-    request body and the extracted tar are both still live.
+    With no magic, successful bounded inflation is the format recognition.
     """
-    plain = _raw_deflate_from(_blocks_of(source), _MAX_NESTED_BUFFER_BYTES)
-    if plain is None:
+    try:
+        records = _raw_deflate_records_from(
+            _blocks_of(source), _MAX_NESTED_BUFFER_BYTES, _MAX_ZLIB_RECORDS
+        )
+    except _TooManyRawDeflateRecords:
+        raise _Unscannable("contains more compressed records than this check can inspect") from None
+    if records is None:
         raise _Unscannable("contains a compressed stream too large to inspect")
-    if not plain:
-        return None
-    return _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth)
+    for plain in records:
+        if kind := _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth):
+            return kind
+    return None
 
 
 def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
-    """The kind of credential inside supported document and image streams, or None.
-
-    A PDF keeps its content in `/FlateDecode` streams, whose zlib record starts after the object
-    header rather than at byte zero -- so the head-anchored zlib check never saw it, and the overlay
-    search covers only gzip, bzip2 and xz. A credential in a PDF published intact even though the
-    same zlib record standing alone is detected.
-
-    Anchored on the `%PDF-` signature and the object syntax around each stream, NOT by searching for
-    zlib headers. Searching is what makes this unaffordable: that rule is about eleven bits, so it
-    trips once per 2 KiB of arbitrary data -- measured 44,197 candidates across 310 MB of real
-    binaries, of which 15 inflated. Feeding those through the overlay machinery would exhaust its
-    bound and refuse every large binary. The grammar costs nothing on a non-PDF.
-    """
-    # The signature is read before the file is. Every top-level file reaches this handler after the
-    # other probes decline, so an unconditional `read_bytes` allocated a second whole copy of every
-    # ordinary model shard in the package -- measured 216 MB of RSS for a 200 MiB non-PDF. `%PDF-`
-    # is head-anchored, which is the same rule `_pdf_stream_payloads` applies before it walks, so
-    # reading five bytes first decides it without materializing anything.
-    #
-    # A document that really is a PDF is still bounded. Its grammar is not streamable from here --
-    # the trailer names the encryption dictionary, and an object's filters may sit at any offset --
-    # so deciding it means holding it, and a package may legitimately carry a 256 MiB file. Holding
-    # one whole is a second complete copy while the decoded request and the staged file are both
-    # still live: measured 224 MiB of RSS for a 200 MiB PDF against 26 MiB for the same bytes with
-    # a different first line. Beyond the buffer this scan already allows anywhere else, the honest
-    # answer is the one every other oversized container gets -- undecided, not clean.
+    """Scan structurally declared PDF and PNG payloads under the shared bounds."""
+    # decline non-documents from their head; real documents are buffered only within the same
+    # nested-container cap because their trailer and object dictionaries require random access.
     if isinstance(source, Path):
         with source.open("rb") as handle:
             if not handle.read(8).startswith((_PDF_SIGNATURE, b"\x89PNG\r\n\x1a\n")):
@@ -645,11 +631,13 @@ def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> 
             raise _Unscannable("contains a document too large to inspect")
     raw = source.read_bytes() if isinstance(source, Path) else source
     try:
-        for plain in _document_payloads(raw, _MAX_NESTED_BUFFER_BYTES):
+        for plain in _document_payloads(raw, _MAX_NESTED_BUFFER_BYTES, deadline=deadline):
             if plain is None:
                 raise _Unscannable("contains a compressed stream too large to inspect")
             if kind := _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth):
                 return kind
+    except _DocumentDeadlineExceeded:
+        raise _Unscannable("takes too long to decompress") from None
     except _EncryptedDocument:
         raise _Unscannable("contains an encrypted document this check cannot read") from None
     except _TooManyStreams:
@@ -821,7 +809,7 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
         scan=_scan_member,
         refusal=_Unscannable,
         named=functools.partial(credential_in_name, deadline=deadline),
-        metadata=functools.partial(_credential_kind, deadline=deadline),
+        metadata=_scan_member,
         member_limit=_MAX_ARCHIVE_MEMBERS,
     )
 
@@ -882,6 +870,8 @@ def credential_in_file(path: Path, *, deadline: float | None = None) -> str | No
     Raises `_Unscannable` if an archive is too expensive to finish expanding, which the
     caller turns into a refusal: unverifiable is not the same as clean.
     """
+    if path.name.lower().endswith(".br"):
+        raise _Unscannable("contains a Brotli sidecar this check cannot inspect")
     if deadline is None:
         deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
     with path.open("rb") as handle:
@@ -919,6 +909,8 @@ def credential_in_name(name: str, *, deadline: float | None = None) -> str | Non
     a fresh 60-second budget made the package-wide bound advisory. A caller with no budget of its
     own -- the publish route, checking one name -- gets a fresh one.
     """
+    if name.lower().endswith(".br"):
+        raise _Unscannable("contains a Brotli sidecar this check cannot inspect")
     deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS if deadline is None else deadline
     for value in exact_name_values(name.encode("utf-8", "surrogatepass")):
         if kind := _credential_kind(value, deadline=deadline):

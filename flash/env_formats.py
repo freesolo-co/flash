@@ -78,6 +78,9 @@ _UNEXPANDABLE_MAGIC = (
     # `gzip -dc` recovered intact. refusal is the same bounded answer used for every format here.
     (b"\x1f\x9d", "Unix compress"),
     (b"\x28\xb5\x2f\xfd", "zstd"),
+    # parquet has a head-anchored magic but no stdlib reader. filenames are irrelevant: a renamed
+    # dataset is still opaque, while an ordinary file merely ending in `.parquet` remains clean.
+    (b"PAR1", "Parquet"),
     (b"\x04\x22\x4d\x18", "lz4"),
     # The LZ4 LEGACY frame, a different magic rather than a variant of the one above. It is what
     # `lz4 -l` writes and what the Linux kernel build and several dataset tools still emit, and its
@@ -161,7 +164,14 @@ _MAX_JKS_ENTRIES = 4096
 # Distinct from the unanchored RAR/7-Zip search, which only has to REFUSE. These can be expanded, so
 # the payload is read rather than the publish blocked, and an offset that is wrong costs a failed
 # open rather than a false refusal.
-_OVERLAY_MAGIC = (b"\x1f\x8b\x08", b"BZh", b"\xfd7zXZ\x00")
+_LZMA_ALONE_OVERLAY_LEAD = b"\x5d"
+_OVERLAY_MAGIC = (
+    b"\x1f\x8b\x08",
+    b"BZh",
+    b"\xfd7zXZ\x00",
+    # the default lzma1 properties byte; the structural filter below accepts any dictionary size.
+    _LZMA_ALONE_OVERLAY_LEAD,
+)
 _OVERLAY_PROBE_BYTES = 1 << 16
 
 # How many candidate offsets are probed before the search gives up. Each probe is a decompressor
@@ -398,7 +408,7 @@ def _windows(source: Path | bytes) -> Iterator[tuple[int, bytes]]:
     if isinstance(source, bytes):
         yield 0, source
         return
-    overlap = max(len(magic) for magic in _OVERLAY_MAGIC) - 1
+    overlap = max(max(len(magic) for magic in _OVERLAY_MAGIC), _LZMA_ALONE_HEADER_BYTES) - 1
     try:
         with source.open("rb") as handle:
             at, carry = 0, b""
@@ -447,7 +457,14 @@ def _overlay_offset(source: Path | bytes) -> int | None:
     probed = 0
     for base, window in _windows(source):
         found = sorted(
-            at for magic in _OVERLAY_MAGIC for at in _offsets_of(window, magic) if base + at > 0
+            at
+            for magic in _OVERLAY_MAGIC
+            for at in _offsets_of(window, magic)
+            if base + at > 0
+            and (
+                magic != _LZMA_ALONE_OVERLAY_LEAD
+                or _looks_like_lzma_alone(window[at : at + _LZMA_ALONE_HEADER_BYTES])
+            )
         )
         seen: dict[bytes, int | None] = {}
         for at in found:

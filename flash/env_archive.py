@@ -59,7 +59,7 @@ _UNREADABLE_MEMBER = (
 Scanner = Callable[[IO[bytes], float, int], str | None]
 ContainerScanner = Callable[..., str | None]
 Namer = Callable[[str], str | None]
-MetadataScanner = Callable[[bytes], str | None]
+MetadataScanner = Scanner
 
 
 def _zip_extra_payloads(extra: bytes) -> Iterator[bytes]:
@@ -94,16 +94,18 @@ def _zip_metadata_kind(
     info: zipfile.ZipInfo,
     metadata: MetadataScanner,
     refusal: type[Exception],
+    deadline: float,
+    depth: int,
 ) -> str | None:
     """The credential kind in one entry's central and local metadata, or None."""
-    if info.comment and (kind := metadata(info.comment)):
+    if info.comment and (kind := metadata(io.BytesIO(info.comment), deadline, depth)):
         return kind
     local_extra = _zip_local_extra(source, info)
     if local_extra is None:
         raise refusal("contains an archive member this check cannot read")
     for extra in (info.extra, local_extra if local_extra != info.extra else b""):
         for payload in _zip_extra_payloads(extra):
-            if payload and (kind := metadata(payload)):
+            if payload and (kind := metadata(io.BytesIO(payload), deadline, depth)):
                 return kind
     return None
 
@@ -148,7 +150,7 @@ def credential_in_zip(
     with _open_zip(source, refusal) as archive:
         # archive comments are published metadata just like member names. scanning the exact value is
         # decisive for encoded ciphertext, whose refusal a speculative raw-byte pass suppresses.
-        if archive.comment and (kind := metadata(archive.comment)):
+        if archive.comment and (kind := metadata(io.BytesIO(archive.comment), deadline, depth)):
             return kind
         for count, info in enumerate(archive.infolist(), 1):
             if count > member_limit:
@@ -171,7 +173,7 @@ def credential_in_zip(
             if kind := named(info.filename.rstrip("/")):
                 return kind
             # central and local headers can publish different metadata, so both are inspected.
-            if kind := _zip_metadata_kind(source, info, metadata, refusal):
+            if kind := _zip_metadata_kind(source, info, metadata, refusal, deadline, depth):
                 return kind
             if info.is_dir():
                 continue
@@ -540,7 +542,9 @@ def credential_in_ar(
             return kind
         if not thin:
             try:
-                if kind := scan(io.BytesIO(payload), deadline, depth):
+                member = io.BytesIO(payload)
+                member.name = resolved_name or raw_name.rstrip("/")
+                if kind := scan(member, deadline, depth):
                     return kind
             except _UNREADABLE_MEMBER:
                 unreadable = unreadable or "an archive member this check cannot read"

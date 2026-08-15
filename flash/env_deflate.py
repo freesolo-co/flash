@@ -17,11 +17,13 @@ import io
 import itertools
 import lzma
 import re
+import time
 import zlib
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO
 
+from flash.env_pdf import pdf_dictionary_spans, pdf_inline_images, pdf_tokens
 from flash.env_png import _PNG_SIGNATURE, _png_text_payloads
 
 # Where a PDF keeps its compressed content, and how many of those streams are expanded. The
@@ -82,60 +84,10 @@ _PDF_ANY_STREAM = re.compile(rb"\bstream%s" % _PDF_EOL)
 # than reading a whole file to find out here.
 _PDF_SIGNATURE = b"%PDF-"
 
-# The dictionary KEY is spelled escape-tolerantly for the same reason its values are: `/#46ilter`
-# names `Filter` to every reader, and a literal spelling here would leave a chain declared that way
-# invisible -- the stream would then be handed to zlib undecoded, or its unreadable filters missed.
-_FILTER_NAME = b"".join(rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for letter in b"Filter")
-# A PDF comment runs from `%` to the end of its line and is a legal token separator, so
-# `/Filter%c\n[/ASCII85Decode /FlateDecode]` declares exactly the chain the spaced form does.
-# Accepting whitespace alone left that chain unrecovered: the ASCII85 body went straight to zlib,
-# the decompression error was skipped as "not really a stream", and the key inside published. The
-# encryption-key pattern already treats a comment as a separator; this is the same rule.
+# A PDF comment is a legal token separator. The lexical helper handles comments and escaped names
+# directly; these regex separators remain only for the bounded DecodeParms and Predictor searches.
 _PDF_SEPARATOR = rb"(?:\s|%[^\r\n]*(?:\r\n|\r|\n))*"
-# An indirect reference needs at least one separator between each token. The lookahead supplies that
-# requirement while `_PDF_SEPARATOR` consumes comments as well as whitespace.
 _PDF_REQUIRED_SEPARATOR = rb"(?=[\s%])" + _PDF_SEPARATOR
-
-# inline images live inside page content rather than object dictionaries. `BI ... ID` introduces
-# their bytes, and `/F /Fl` is the standard abbreviated spelling of `/Filter /FlateDecode`. the
-# object-stream walk never enumerated them, so a zlib blob containing a key was approved as literal
-# pdf bytes. the header reach equals the largest pdf the caller will buffer, so every inline image
-# in a document this scan can approve has its `ID` delimiter considered.
-_PDF_INLINE_IMAGE = re.compile(
-    rb"(?<![A-Za-z0-9])BI(?P<header>[\s\S]{0,%d}?)\bID(?:\r\n|[\x00\t\n\f\r ])"
-    % _MAX_PDF_DICTIONARY_GAP
-)
-_PDF_INLINE_FILTER = re.compile(rb"/(?:F|Filter)%s/(?:Fl|FlateDecode)\b" % _PDF_SEPARATOR)
-# How far back `_dictionary_start` will look for that opening bracket. A document is untrusted
-# input: without a bound, one that never opens a dictionary would be walked from every stream in it
-# back to byte zero. 64 KiB is far beyond any real object dictionary and still linear per stream.
-_MAX_DICTIONARY_REACH = 1 << 16
-
-# The two dictionary brackets, matched together so `_dictionary_start` can count depth. `<<` and
-# `>>` are the only tokens that change it; PDF's array brackets are a different pair and do not.
-_PDF_BRACKETS = re.compile(rb"<<|>>")
-
-# The array body is bounded by the dictionary reach rather than a short cap. 256 was enough for the
-# names a real chain chooses, but the body also carries whatever whitespace and comments sit between
-# them: a legal array with a 600-byte gap between `/ASCII85Decode` and `/FlateDecode]` exceeded the
-# cap, so no filters were reported at all and zlib was handed ASCII85 text. `[^\]]` cannot cross the
-# closing bracket, so widening it reads more of ONE array rather than pairing across objects.
-_PDF_FILTERS = re.compile(
-    rb"/%s%s(?:/([\w#]+)|\[([^\]]{0,%d})\])" % (_FILTER_NAME, _PDF_SEPARATOR, _MAX_DICTIONARY_REACH)
-)
-_PDF_FILTER_NAME = re.compile(rb"/([\w#]+)")
-
-# `#` followed by two hex digits inside a PDF name stands for that byte, so `/Flate#44ecode` and
-# `/FlateDecode` are the SAME name to every reader -- the escape is spelling, not content. Matching
-# the literal bytes meant the escaped spelling named no filter this recognised, the stream was left
-# uninflated, and a key inside it published while the plain spelling was caught.
-_PDF_NAME_ESCAPE = re.compile(rb"#([0-9A-Fa-f]{2})")
-
-
-def _pdf_name(raw: bytes) -> bytes:
-    """`raw` with its `#XX` escapes resolved, so a name compares by what it MEANS."""
-    return _PDF_NAME_ESCAPE.sub(lambda hexed: bytes.fromhex(hexed.group(1).decode()), raw)
-
 
 # The one pre-filter this can undo. ASCII85 is the common companion to FlateDecode and is pure
 # syntax, so decoding it needs no parameters. Every other filter is left undone deliberately: a
@@ -143,82 +95,22 @@ def _pdf_name(raw: bytes) -> bytes:
 # through the wrong decoder is not evidence of anything.
 _ASCII85_FILTER = b"ASCII85Decode"
 _FLATE_FILTER = b"FlateDecode"
-
-# the document's encryption dictionary belongs in a classic trailer or a cross-reference stream
-# dictionary. pdf names may use `#xx` escapes, so the lexer below resolves each name before the
-# structural check compares it. scanning the whole document for this name refused harmless page
-# strings and comments that merely contained `/Encrypt`.
-_ENCRYPT_NAME = b"Encrypt"
-
-# pdf lexical delimiters. strings and comments are skipped before names are yielded, so `/Encrypt`
-# in page text is not confused with the trailer key that makes stream bytes unreadable.
-_PDF_WHITESPACE = frozenset(b"\x00\t\n\x0c\r ")
-_PDF_DELIMITERS = frozenset(b"()<>[]{}/%")
-_PDF_TOKEN_END = _PDF_WHITESPACE | _PDF_DELIMITERS
+_INLINE_FILTER_ALIASES = {
+    b"A85": _ASCII85_FILTER,
+    _ASCII85_FILTER: _ASCII85_FILTER,
+    b"Fl": _FLATE_FILTER,
+    _FLATE_FILTER: _FLATE_FILTER,
+}
 
 
-def _pdf_tokens(data: bytes) -> Iterator[bytes]:
-    """Syntactic PDF tokens with literal strings, hex strings, and comments omitted."""
-    at = 0
-    while at < len(data):
-        byte = data[at]
-        if byte in _PDF_WHITESPACE:
-            at += 1
-            continue
-        if byte == ord("%"):
-            end = min(
-                (found for found in (data.find(b"\r", at), data.find(b"\n", at)) if found >= 0),
-                default=len(data),
-            )
-            at = end
-            continue
-        if byte == ord("("):
-            depth = 1
-            at += 1
-            while at < len(data) and depth:
-                if data[at] == ord("\\"):
-                    at += 2
-                    continue
-                depth += data[at] == ord("(")
-                depth -= data[at] == ord(")")
-                at += 1
-            continue
-        if byte == ord("<"):
-            if data[at : at + 2] == b"<<":
-                yield b"<<"
-                at += 2
-            else:
-                end = data.find(b">", at + 1)
-                at = len(data) if end < 0 else end + 1
-            continue
-        if data[at : at + 2] == b">>":
-            yield b">>"
-            at += 2
-            continue
-        if byte == ord("/"):
-            end = at + 1
-            while end < len(data) and data[end] not in _PDF_TOKEN_END:
-                end += 1
-            raw = data[at + 1 : end]
-            yield b"/" + (_pdf_name(raw) if len(raw) <= 64 else b"")
-            at = end
-            continue
-        if byte in _PDF_DELIMITERS:
-            yield bytes((byte,))
-            at += 1
-            continue
-        end = at + 1
-        while end < len(data) and data[end] not in _PDF_TOKEN_END:
-            end += 1
-        yield data[at:end] if end - at <= 64 else b""
-        at = end
-
-
-def _pdf_has_encryption_dictionary(data: bytes) -> bool:
+# the document's encryption dictionary belongs in a classic trailer or a cross-reference stream.
+# lexical names are escape-decoded before comparison, while strings and comments are skipped.
+def _pdf_has_encryption_dictionary(data: bytes, deadline: float | None) -> bool:
     """Whether a trailer or cross-reference stream dictionary declares `/Encrypt`."""
     frames: list[tuple[bool, list[bytes]]] = []
     trailer = False
-    for token in _pdf_tokens(data):
+    check = _document_checker(deadline)
+    for token, _start, _end in pdf_tokens(data, check):
         if token == b"trailer" and not frames:
             trailer = True
             continue
@@ -277,10 +169,6 @@ _PREDICTOR_NAME = b"".join(
 )
 _PDF_PREDICTOR = re.compile(rb"/%s%s(\d+)" % (_PREDICTOR_NAME, _PDF_SEPARATOR))
 
-# How far FORWARD of the filter name the dictionary slice runs. Backwards it runs to the
-# dictionary's own `<<` instead, which is the real boundary rather than a guessed distance.
-_PDF_DICTIONARY_REACH = 512
-
 
 class _UnreadableFilterChain(Exception):
     """A stream is piped through a filter chain this cannot fully undo, so it was never inspected.
@@ -322,6 +210,39 @@ class _TooManyStreams(Exception):
     refusal. The distinction from the over-budget sentinel is what keeps the message honest --
     the document is not too large to inflate, it has too many streams to walk.
     """
+
+
+class _DocumentDeadlineExceeded(Exception):
+    """A bounded document walk exhausted the caller's shared deadline."""
+
+
+def _check_document_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise _DocumentDeadlineExceeded
+
+
+def _document_checker(deadline: float | None) -> Callable[[], None]:
+    """A callback lexical helpers can invoke without owning the deadline policy."""
+
+    def check() -> None:
+        _check_document_deadline(deadline)
+
+    return check
+
+
+class _PdfDictionaryIndex:
+    """One per-document lexical index of PDF dictionary spans."""
+
+    def __init__(self, data: bytes, deadline: float | None):
+        check = _document_checker(deadline)
+        self.spans = pdf_dictionary_spans(data, check)
+
+    def span(self, at: int) -> tuple[int, int]:
+        containing = [span for span in self.spans if span[0] <= at < span[1]]
+        if containing:
+            return max(containing, key=lambda span: span[0])
+        preceding = [span for span in self.spans if span[1] <= at]
+        return max(preceding, key=lambda span: span[1]) if preceding else (at, at)
 
 
 # What a byte of a gzip name or comment may be. RFC 1952 makes both ISO 8859-1 text, so the C1
@@ -562,34 +483,127 @@ def _raw_deflate_from(blocks: Iterator[bytes], budget: int) -> bytes | None:
     return plain if plain and inflate.eof and not inflate.unused_data else b""
 
 
-def _pdf_inline_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
-    """Inflated payloads of inline images whose abbreviated filter declares flate."""
-    images = _PDF_INLINE_IMAGE.finditer(data)
-    for found in itertools.islice(images, _MAX_PDF_STREAMS):
-        if not _PDF_INLINE_FILTER.search(found.group("header")):
+class _TooManyRawDeflateRecords(Exception):
+    """A concatenated raw-DEFLATE sequence exceeds its bounded record count."""
+
+
+def _raw_deflate_records_from(
+    blocks: Iterator[bytes], budget: int, record_limit: int
+) -> list[bytes] | None:
+    """Complete concatenated raw-DEFLATE records under one output and record budget."""
+    records: list[bytes] = []
+    inflate = zlib.decompressobj(-zlib.MAX_WBITS)
+    current = bytearray()
+    total = 0
+    for block in blocks:
+        pending = block
+        while pending:
+            if len(records) >= record_limit:
+                raise _TooManyRawDeflateRecords
+            if total + len(current) >= budget:
+                return None
+            try:
+                current += inflate.decompress(pending, budget - total - len(current))
+            except zlib.error:
+                if records and current:
+                    records.append(bytes(current))
+                return records
+            if inflate.unconsumed_tail:
+                return None
+            if not inflate.eof:
+                break
+            pending = inflate.unused_data
+            records.append(bytes(current))
+            total += len(current)
+            current = bytearray()
+            inflate = zlib.decompressobj(-zlib.MAX_WBITS)
+    if records and current:
+        records.append(bytes(current))
+    return records
+
+
+def _filter_value(tokens: list[bytes], at: int) -> tuple[list[bytes], int]:
+    """Read one direct scalar or array filter value from lexical tokens."""
+    if at >= len(tokens):
+        raise _UnreadableFilterChain
+    if tokens[at].startswith(b"/"):
+        return [tokens[at][1:]], at + 1
+    if tokens[at] != b"[":
+        raise _UnreadableFilterChain
+    names: list[bytes] = []
+    at += 1
+    while at < len(tokens) and tokens[at] != b"]":
+        if not tokens[at].startswith(b"/"):
+            raise _UnreadableFilterChain
+        names.append(tokens[at][1:])
+        at += 1
+    if at >= len(tokens) or not names:
+        raise _UnreadableFilterChain
+    return names, at + 1
+
+
+def _inline_filters(header: bytes, deadline: float | None) -> list[bytes]:
+    """The normalized direct filter chain in one inline-image header."""
+    tokens = [token for token, _start, _end in pdf_tokens(header, _document_checker(deadline))]
+    declared: list[bytes] | None = None
+    for at, token in enumerate(tokens):
+        if token in (b"/F", b"/Filter"):
+            declared, _after = _filter_value(tokens, at + 1)
+    if declared is None:
+        return []
+    if any(name not in _INLINE_FILTER_ALIASES for name in declared):
+        raise _UnreadableFilterChain
+    return [_INLINE_FILTER_ALIASES[name] for name in declared]
+
+
+def _pdf_inline_payloads(
+    data: bytes, budget: int, deadline: float | None
+) -> Iterator[bytes | None]:
+    """Decoded payloads of inline images with supported scalar or array filters."""
+    check = _document_checker(deadline)
+    images = pdf_inline_images(data, check)
+    for count, (header, payload_at) in enumerate(itertools.islice(images, _MAX_PDF_STREAMS)):
+        if count % 128 == 0:
+            _check_document_deadline(deadline)
+        chain = _inline_filters(header, deadline)
+        if not chain:
             continue
-        inflate = zlib.decompressobj()
-        try:
-            plain = inflate.decompress(data[found.end() :], budget)
-        except zlib.error:
-            continue
-        if inflate.unconsumed_tail:
-            yield None
-        elif inflate.eof:
-            yield plain
+        payload = data[payload_at:]
+        if _FLATE_FILTER in chain:
+            flate = chain.index(_FLATE_FILTER)
+            payload = _undo_ascii85(payload, chain[:flate])
+            inflate = zlib.decompressobj()
+            try:
+                plain = inflate.decompress(payload, budget)
+            except zlib.error:
+                continue
+            if inflate.unconsumed_tail:
+                yield None
+                continue
+            if not inflate.eof:
+                continue
+            payload = _undo_ascii85(plain, chain[flate + 1 :])
+        else:
+            payload = _undo_ascii85(payload, chain)
+        yield None if len(payload) > budget else payload
     if next(images, None) is not None:
         raise _TooManyStreams
 
 
-def _document_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
+def _document_payloads(
+    data: bytes, budget: int, *, deadline: float | None = None
+) -> Iterator[bytes | None]:
     """Decoded compressed text from supported document and image containers."""
+    _check_document_deadline(deadline)
     if data.startswith(_PNG_SIGNATURE):
         yield from _png_text_payloads(data, budget, _UnreadablePngText)
         return
-    yield from _pdf_stream_payloads(data, budget)
+    yield from _pdf_stream_payloads(data, budget, deadline=deadline)
 
 
-def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
+def _pdf_stream_payloads(
+    data: bytes, budget: int, *, deadline: float | None = None
+) -> Iterator[bytes | None]:
     """What each `/FlateDecode` stream in a PDF inflates to, or None for one over `budget`.
 
     A PDF keeps its content in compressed streams whose zlib record begins after the object header
@@ -615,34 +629,46 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     """
     if not data.startswith(_PDF_SIGNATURE):
         return
+    _check_document_deadline(deadline)
+    dictionaries = _PdfDictionaryIndex(data, deadline)
     # An encrypted document reverses stream encryption BEFORE the declared filters, so what follows
     # `stream` is ciphertext and zlib rejects it -- which the skip below treats as "not really a
     # stream" and the document passes as clean. That made an encrypted PDF the one container shape
     # this let through, while encrypted zip, OpenSSL and OpenPGP payloads are all refused. The
     # passphrase is not ours to have, so the only honest answer is undecided.
-    if _pdf_has_encryption_dictionary(data):
+    if _pdf_has_encryption_dictionary(data, deadline):
         raise _EncryptedDocument
     # a dictionary too long for the payload walk is undecided, not clean. this searches only gaps
     # beyond that walk's cap, so one match proves a declared stream was never going to be expanded.
-    if _PDF_UNREACHED_STREAM.search(data):
+    _check_document_deadline(deadline)
+    unreached = _PDF_UNREACHED_STREAM.search(data)
+    _check_document_deadline(deadline)
+    if unreached:
         raise _UnreachedStream
     # Indirect decode parameters hide whether a predictor must be undone. A predictor-encoded key
     # inflated into differences containing no literal credential, so unresolved parameters are
     # unreadable rather than evidence that the stream is clean.
-    if _PDF_INDIRECT_DECODE_PARMS.search(data):
+    _check_document_deadline(deadline)
+    indirect_decode_parms = _PDF_INDIRECT_DECODE_PARMS.search(data)
+    _check_document_deadline(deadline)
+    if indirect_decode_parms:
         raise _UnreadableFilterChain
     # A stream whose filters this cannot undo is refused BEFORE the flate walk, so a document
     # mixing one readable stream with one unreadable one does not report the readable verdict and
     # stop. The flate walk below re-reads the same objects; this pass only decides readability.
-    _refuse_unreadable_streams(data)
+    _refuse_unreadable_streams(data, dictionaries, deadline)
     streams = _PDF_STREAM.finditer(data)
-    for found in itertools.islice(streams, _MAX_PDF_STREAMS):
-        before, after = _filter_stages(data, found.start())
+    for count, found in enumerate(itertools.islice(streams, _MAX_PDF_STREAMS)):
+        if count % 128 == 0:
+            _check_document_deadline(deadline)
+        before, after = _filter_stages(data, found.end(), dictionaries, deadline)
         # A predictor is applied to the INFLATED bytes, so what comes out of zlib is horizontal or
         # PNG differences rather than the stream's contents: a key encoded that way inflates
         # successfully while containing none of its own literal bytes. Undoing it needs the colour
         # and column parameters, so the stream is refused rather than reconstructed and guessed at.
-        predictor = _PDF_PREDICTOR.search(_object_dictionary(data, found.start()))
+        _check_document_deadline(deadline)
+        predictor = _PDF_PREDICTOR.search(_object_dictionary(data, found.end(), dictionaries))
+        _check_document_deadline(deadline)
         if predictor and int(predictor.group(1)) > 1:
             raise _UnreadableFilterChain
         body = _undo_ascii85(data[found.end() :], before)
@@ -656,75 +682,26 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
             continue
         decoded = _undo_ascii85(plain, after)
         yield decoded
-        yield from _pdf_inline_payloads(decoded, budget)
+        yield from _pdf_inline_payloads(decoded, budget, deadline)
     # Stopping at the bound silently reported every later stream as clean, so a document with one
     # more stream than the limit published the credential in it. Undecided is not clean, and every
     # other bound here already refuses rather than truncating -- this one returned a verdict.
     if next(streams, None) is not None:
         raise _TooManyStreams
-    yield from _standalone_ascii85_payloads(data, budget)
-    yield from _pdf_inline_payloads(data, budget)
+    yield from _standalone_ascii85_payloads(data, budget, dictionaries, deadline)
+    yield from _pdf_inline_payloads(data, budget, deadline)
+    _check_document_deadline(deadline)
 
 
-def _dictionary_start(data: bytes, at: int) -> int:
-    """Where the dictionary containing `at` opens, or as far back as this is willing to read.
-
-    A dictionary's own `<<` is its boundary, so finding it reads exactly the object rather than a
-    guessed number of bytes around it. Searched backwards from `at` and bounded by
-    `_MAX_DICTIONARY_REACH`: a document is untrusted input, and an unbounded reverse scan over one
-    that never opens a dictionary would walk the whole file for every stream in it.
-
-    Nested dictionaries are why the LAST `<<` is not simply taken: `/DecodeParms << ... >>` opens
-    one INSIDE the object, and starting there would cut off the `/Filter` entry written before it.
-    Depth is counted instead, so the position returned is the outermost open bracket -- the object's
-    own -- and every entry it declares is inside the slice.
-    """
-    floor = max(0, at - _MAX_DICTIONARY_REACH)
-    depth = 0
-    for token in reversed([found.start() for found in _PDF_BRACKETS.finditer(data, floor, at)]):
-        depth += 1 if data[token : token + 2] == b">>" else -1
-        if depth < 0:
-            return token
-    return floor
+def _object_dictionary(data: bytes, at: int, dictionaries: _PdfDictionaryIndex) -> bytes:
+    """The exact indexed dictionary belonging to the stream at `at`."""
+    start, end = dictionaries.span(at)
+    return data[start:end]
 
 
-def _object_dictionary(data: bytes, at: int) -> bytes:
-    """The bytes of the dictionary belonging to the stream whose filter name sits at `at`.
-
-    Read backwards from the match for the same reason `_filter_stages` does: the dictionary
-    precedes the `stream` keyword, and a slice starting at the filter name would miss the
-    `/DecodeParms` entry when that entry is written before `/Filter`.
-
-    Back to the dictionary's OWN opening `<<`, not a fixed number of bytes. The reach was 512 on the
-    reasoning that a real object dictionary is short, which is a convention rather than a rule: a
-    legal `/DecodeParms << /Predictor 2 ... >>` written 600 bytes ahead of `/Filter` fell outside
-    the window, so the predictor named nothing, the stream was inflated, and horizontal differences
-    were scanned as though they were content while a conforming decode reconstructs the key.
-    """
-    return data[_dictionary_start(data, at) : at + _PDF_DICTIONARY_REACH]
-
-
-def _dictionary_has_indirect_reference(data: bytes, at: int, key: bytes) -> bool:
-    """Whether the stream dictionary at `at` directly maps `key` to an object reference."""
-    depth = 0
-    direct: list[bytes] = []
-    for token in _pdf_tokens(data[_dictionary_start(data, at) : at]):
-        if token == b"<<":
-            depth += 1
-        elif token == b">>":
-            depth = max(0, depth - 1)
-        elif depth == 1:
-            direct.append(token)
-    return any(
-        direct[index] == key
-        and direct[index + 1].isdigit()
-        and direct[index + 2].isdigit()
-        and direct[index + 3] == b"R"
-        for index in range(len(direct) - 3)
-    )
-
-
-def _refuse_unreadable_streams(data: bytes) -> None:
+def _refuse_unreadable_streams(
+    data: bytes, dictionaries: _PdfDictionaryIndex, deadline: float | None
+) -> None:
     """Raise when any stream in `data` declares a filter chain this cannot reverse.
 
     The flate walk enumerates only streams naming `/FlateDecode`, which left every other filter
@@ -737,12 +714,10 @@ def _refuse_unreadable_streams(data: bytes) -> None:
     ordinary pass over the document and need nothing from this.
     """
     streams = _PDF_ANY_STREAM.finditer(data)
-    for found in itertools.islice(streams, _MAX_PDF_STREAMS):
-        # an indirect filter cannot be resolved without the xref table. inspect only the owning
-        # dictionary: `/Filter 2 0 R` inside page text is a literal string and changes no stream.
-        if _dictionary_has_indirect_reference(data, found.start(), b"/Filter"):
-            raise _UnreadableFilterChain
-        chain = _declared_filters(data, found.start())
+    for count, found in enumerate(itertools.islice(streams, _MAX_PDF_STREAMS)):
+        if count % 128 == 0:
+            _check_document_deadline(deadline)
+        chain = _declared_filters(data, found.start(), dictionaries, deadline)
         if any(name not in (_FLATE_FILTER, _ASCII85_FILTER) for name in chain):
             raise _UnreadableFilterChain
     # Stopping at the bound treated every stream past it as readable, which is the same fail-open
@@ -751,55 +726,56 @@ def _refuse_unreadable_streams(data: bytes) -> None:
     # only flate streams so it did not reach it either. Undecided is not clean.
     if next(streams, None) is not None:
         raise _TooManyStreams
+    _check_document_deadline(deadline)
 
 
-def _declared_filters(data: bytes, at: int) -> list[bytes]:
-    """The filter names the object owning the stream at `at` declares, escapes resolved.
-
-    Searched from well BEFORE `at`, not from it. `_PDF_STREAM` anchors on the filter NAME, so on a
-    chain the match begins in the middle of the array -- at `/FlateDecode]` -- and a slice ending
-    there is cut after the opening bracket, leaving `/Filter [` unmatched and the chain invisible.
-    Reading from behind the whole dictionary is what makes the array visible; the last entry that
-    starts before the stream keyword is the one this object declares.
-
-    Bounded by the dictionary's own `<<` rather than a fixed 512 bytes, for the same reason
-    `_object_dictionary` is: a legal array may put any amount of whitespace or comment between
-    `/Filter [/ASCII85Decode` and `/FlateDecode]`, and a 600-byte gap put the opening of the
-    declaration outside the window -- so no pre-filter was reported and zlib was handed ASCII85
-    text, which fails to inflate and reads as "not really a stream".
-    """
-    start = _dictionary_start(data, at)
-    dictionary = data[start : at + _PDF_DICTIONARY_REACH]
-    names = None
-    for candidate in _PDF_FILTERS.finditer(dictionary):
-        if candidate.start() <= at - start:
-            names = candidate
-    if not names:
+def _declared_filters(
+    data: bytes, at: int, dictionaries: _PdfDictionaryIndex, deadline: float | None
+) -> list[bytes]:
+    """The direct scalar or array filter chain in the indexed owning dictionary."""
+    dictionary = _object_dictionary(data, at, dictionaries)
+    if not dictionary:
         return []
-    return [
-        _pdf_name(raw)
-        for raw in _PDF_FILTER_NAME.findall(names.group(2) or b"/" + (names.group(1) or b""))
-    ]
+    tokens = [token for token, _start, _end in pdf_tokens(dictionary, _document_checker(deadline))]
+    depth = 0
+    declared: list[bytes] | None = None
+    for index, token in enumerate(tokens):
+        if token == b"<<":
+            depth += 1
+        elif token == b">>":
+            depth = max(0, depth - 1)
+        elif depth == 1 and token == b"/Filter":
+            declared, _after = _filter_value(tokens, index + 1)
+    return declared or []
 
 
-def _filter_stages(data: bytes, at: int) -> tuple[list[bytes], list[bytes]]:
+def _filter_stages(
+    data: bytes, at: int, dictionaries: _PdfDictionaryIndex, deadline: float | None
+) -> tuple[list[bytes], list[bytes]]:
     """The filters the object at `at` applies before and after its flate stage, in order.
 
     The filter list belongs to the object the stream sits in, so it is read backwards from the
     match rather than forwards: `/Filter` precedes `stream` in the dictionary. Only the entry
     closest behind the match is considered, which is that object's own.
     """
-    chain = _declared_filters(data, at)
+    chain = _declared_filters(data, at, dictionaries, deadline)
     if _FLATE_FILTER not in chain:
         return [], []
     flate = chain.index(_FLATE_FILTER)
     return chain[:flate], chain[flate + 1 :]
 
 
-def _standalone_ascii85_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
+def _standalone_ascii85_payloads(
+    data: bytes,
+    budget: int,
+    dictionaries: _PdfDictionaryIndex,
+    deadline: float | None,
+) -> Iterator[bytes | None]:
     """decoded payloads of streams whose complete filter chain is standalone ascii85."""
-    for found in _PDF_ANY_STREAM.finditer(data):
-        if _declared_filters(data, found.start()) != [_ASCII85_FILTER]:
+    for count, found in enumerate(_PDF_ANY_STREAM.finditer(data)):
+        if count % 128 == 0:
+            _check_document_deadline(deadline)
+        if _declared_filters(data, found.start(), dictionaries, deadline) != [_ASCII85_FILTER]:
             continue
         decoded = _undo_ascii85(data[found.end() :], [_ASCII85_FILTER])
         yield None if len(decoded) > budget else decoded

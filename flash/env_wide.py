@@ -17,6 +17,7 @@ def credential_in_wide_runs(
     depth: int,
     truncated: bool,
     shell: bool,
+    literal_syntax: str | None,
     rejoin: bool,
 ) -> str | None:
     """The credential kind in any genuine wide-text run, or None."""
@@ -33,6 +34,7 @@ def credential_in_wide_runs(
                     truncated=truncated,
                     paired=True,
                     shell=shell,
+                    literal_syntax=literal_syntax,
                     rejoin=rejoin,
                 ):
                     return kind

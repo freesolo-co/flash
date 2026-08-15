@@ -11,7 +11,12 @@ one way: this knows about the two formats' structure, nothing about files, packa
 from __future__ import annotations
 
 from flash.env_formats import _KEYSTORE_MAGIC, _jks_private_key_entries
-from flash.env_openpgp import _is_openpgp_encrypted, _openpgp_secret_key_in_sequence
+from flash.env_openpgp import (
+    _is_openpgp_encrypted,
+    _is_openpgp_secret_key,
+    _openpgp_secret_key_in_sequence,
+    _packet_tag,
+)
 
 # How much of a stream is accumulated to walk a key store to its end. The walk is head-anchored, so
 # a store larger than one chunk had its remaining entries unread -- and a private key BEHIND a
@@ -61,6 +66,19 @@ def _keystore_undecided(head: bytes) -> bool | None:
             raise _Unscannable("contains a key store this check cannot finish walking")
         return True
     return None if store else False
+
+
+def _decoded_key_kind(data: bytes) -> str | None:
+    """The key kind in one exact base64 decode, using anchored binary format checks."""
+    store = _keystore_undecided(data)
+    if store is None:
+        return "a key store"
+    if store:
+        raise _Unscannable("contains a key store this check cannot finish walking")
+    secret = _is_openpgp_secret_key(data)
+    if secret is not False or (data and _packet_tag(data[0]) in (6, 10, 14)):
+        return _openpgp_kind(data, truncated=False)
+    return None
 
 
 def _openpgp_kind(chunk: bytes, *, truncated: bool) -> str | None:

@@ -98,6 +98,8 @@ _OPENPGP_MESSAGE_ARMOR = b"-----BEGIN PGP MESSAGE-----"
 _OPENPGP_ARMORED_BODY = re.compile(
     rb"-----BEGIN PGP MESSAGE-----[^\n]*\n(?:[!-9;-~][^\n]*\n)*\s*\n?[A-Za-z0-9+/]{32}"
 )
+_OPENPGP_MESSAGE_LINE = re.compile(rb"(?m)^[ \t]*-----BEGIN PGP MESSAGE-----[ \t]*\r?\n")
+_OPENPGP_ARMOR_HEADER = re.compile(rb"[!-9;-~]+:[ \t][\x20-\x7e]*(?:\r?\n|\Z)")
 
 # age armor is text and is commonly embedded after a yaml scalar header, so byte-zero recognition
 # misses it. the body requirement keeps a readme that merely names the marker publishable, matching
@@ -137,6 +139,22 @@ def _has_openpgp_message_armor(window: bytes) -> bool:
     window has no armor line at all and pays only the fast test.
     """
     return _OPENPGP_MESSAGE_ARMOR in window and _OPENPGP_ARMORED_BODY.search(window) is not None
+
+
+def _unfinished_openpgp_message_armor(window: bytes) -> bool:
+    """Whether a real message armor header is still open at the window boundary."""
+    marker = _OPENPGP_MESSAGE_LINE.search(window)
+    if marker is None:
+        return False
+    remainder = window[marker.end() :]
+    if re.search(rb"\r?\n\r?\n", remainder):
+        return False
+    at = 0
+    saw_header = False
+    while header := _OPENPGP_ARMOR_HEADER.match(remainder, at):
+        saw_header = True
+        at = header.end()
+    return saw_header and at == len(remainder)
 
 
 def _has_age_file_armor(window: bytes) -> bool:
@@ -382,6 +400,7 @@ def _openpgp_packet_starts(head: bytes) -> Iterator[bytes]:
     """
     for _ in range(_MAX_OPENPGP_PACKETS):
         if not head:
+            yield _TRUNCATED_PACKET
             return
         yield head
         tag_new = head[0]

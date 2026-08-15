@@ -207,9 +207,126 @@ def _shell_literal_spans(data: bytes) -> list[tuple[int, int]]:
     return spans
 
 
-def _escape_literal_spans(data: bytes, *, shell: bool) -> list[tuple[int, int]]:
+def _yaml_literal_spans(data: bytes) -> list[tuple[int, int]]:
+    """Complete YAML literal spans outside comments, double quotes, and block scalars."""
+    spans: list[tuple[int, int]] = []
+    at = line_start = 0
+    block_indent: int | None = None
+    block_start: int | None = None
+    while at < len(data):
+        if at == line_start and block_indent is not None:
+            line_end = data.find(b"\n", at)
+            line_end = len(data) if line_end < 0 else line_end + 1
+            content = data[at:line_end].rstrip(b"\r\n")
+            indent = len(content) - len(content.lstrip(b" "))
+            if not content.strip() or indent > block_indent:
+                at = line_start = line_end
+                continue
+            if block_start is not None:
+                spans.append((block_start, at))
+            block_indent = block_start = None
+        byte = data[at]
+        if byte in (10, 13):
+            at += 1
+            line_start = at
+            continue
+        if byte == 35:
+            end = data.find(b"\n", at)
+            at = len(data) if end < 0 else end
+            continue
+        if byte == 34:
+            at += 1
+            while at < len(data):
+                if data[at] == 92 and at + 1 < len(data):
+                    at += 2
+                elif data[at] == 34:
+                    at += 1
+                    break
+                else:
+                    at += 1
+            continue
+        if byte == 39:
+            start = at
+            at += 1
+            while at < len(data):
+                if data[at : at + 2] == b"''":
+                    at += 2
+                elif data[at] == 39:
+                    spans.append((start, at + 1))
+                    at += 1
+                    break
+                else:
+                    at += 1
+            continue
+        if byte in (124, 62):
+            end = data.find(b"\n", at)
+            end = len(data) if end < 0 else end
+            indicator = data[at + 1 : end].split(b"#", 1)[0].strip()
+            if all(char in b"+-123456789" for char in indicator):
+                line = data[line_start:end]
+                block_indent = len(line) - len(line.lstrip(b" "))
+                block_start = min(len(data), end + 1)
+                at = end
+                continue
+        at += 1
+    if block_start is not None:
+        spans.append((block_start, len(data)))
+    return spans
+
+
+def _toml_literal_spans(data: bytes) -> list[tuple[int, int]]:
+    """Complete TOML literal spans outside basic strings and comments."""
+    spans: list[tuple[int, int]] = []
+    at = 0
+    while at < len(data):
+        if data[at] == 35:
+            end = data.find(b"\n", at)
+            at = len(data) if end < 0 else end
+            continue
+        if data[at] == 34:
+            width = 3 if data[at : at + 3] == b'"""' else 1
+            at += width
+            while at < len(data):
+                if data[at] == 92 and at + 1 < len(data):
+                    at += 2
+                elif data[at : at + width] == b'"' * width:
+                    at += width
+                    break
+                elif width == 1 and data[at] in (10, 13):
+                    break
+                else:
+                    at += 1
+            continue
+        if data[at] == 39:
+            start = at
+            width = 3 if data[at : at + 3] == b"'''" else 1
+            at += width
+            end = data.find(b"'" * width, at)
+            if end < 0 or (width == 1 and b"\n" in data[at:end]):
+                continue
+            spans.append((start, end + width))
+            at = end + width
+            continue
+        at += 1
+    return spans
+
+
+def _escape_literal_spans(
+    data: bytes, *, shell: bool, literal_syntax: str | None
+) -> list[tuple[int, int]]:
     """Merged spans whose source grammar keeps supported escapes literal."""
-    protected = (*_raw_literal_spans(data), *(_shell_literal_spans(data) if shell else ()))
+    syntax_spans = (
+        _yaml_literal_spans(data)
+        if literal_syntax == "yaml"
+        else _toml_literal_spans(data)
+        if literal_syntax == "toml"
+        else ()
+    )
+    protected = (
+        *_raw_literal_spans(data),
+        *(_shell_literal_spans(data) if shell else ()),
+        *syntax_spans,
+    )
     merged: list[tuple[int, int]] = []
     for start, end in sorted(protected):
         if merged and start <= merged[-1][1]:
@@ -230,9 +347,9 @@ def _resolved_escapes(data: bytes) -> bytes:
     return resolved
 
 
-def _decode_runtime_escapes(data: bytes, *, shell: bool) -> bytes:
+def _decode_runtime_escapes(data: bytes, *, shell: bool, literal_syntax: str | None) -> bytes:
     """Resolve escapes outside literals whose runtime preserves their backslashes."""
-    spans = _escape_literal_spans(data, shell=shell)
+    spans = _escape_literal_spans(data, shell=shell, literal_syntax=literal_syntax)
     if not spans:
         return _resolved_escapes(data)
     out = bytearray()
@@ -358,7 +475,7 @@ def _join_shell_assignments(data: bytes) -> bytes:
     return bytes(out)
 
 
-def _rejoined(data: bytes, *, shell: bool = False) -> bytes:
+def _rejoined(data: bytes, *, shell: bool = False, literal_syntax: str | None = None) -> bytes:
     """`data` with both kinds of seam closed, or `data` itself when it holds neither.
 
     Returning the input unchanged is what the caller uses to skip the second match entirely, so an
@@ -385,7 +502,7 @@ def _rejoined(data: bytes, *, shell: bool = False) -> bytes:
     # keeping the prefix visible prevents a raw `\\x42` from becoming `B`, while the later join still
     # combines adjacent raw literals that contain a real credential verbatim.
     if b"\\" in joined:
-        joined = _decode_runtime_escapes(joined, shell=shell)
+        joined = _decode_runtime_escapes(joined, shell=shell, literal_syntax=literal_syntax)
     quoted = any(quote in joined for quote in _QUOTES)
     if quoted:
         joined = _join_adjacent_literals(joined)
