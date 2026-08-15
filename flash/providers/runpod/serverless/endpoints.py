@@ -552,13 +552,19 @@ def _train_body(input_data: dict) -> dict:
                 if held:
                     console_upload_lock.release()
             # `not held`: the commit above raced a holder still inside upload_file, whose older bytes
-            # can land after it. acquiring is proof that finished, so one more commit wins. ONE more,
-            # never a retry loop: a permanently wedged holder never frees and this must still return.
-            if final and not held and console_upload_lock.acquire(timeout=120.0):
-                try:
-                    ok = _upload_console_locked(mode, console, tail, True) or ok
-                finally:
-                    console_upload_lock.release()
+            # can land after it. acquiring is proof that finished, so one more commit wins. the wait
+            # is BOUNDED, never a retry loop: a permanently wedged holder never frees and this must
+            # still return. it is split into tries so a holder that needs longer than one timeout is
+            # still caught -- an HF upload recovering after ~240s otherwise lands last and restores
+            # the pre-failure console. the total is what the terminal path can afford to wait; a
+            # holder still running past it is treated as wedged and the unsynchronized commit stands.
+            for _ in range(3) if final and not held else ():
+                if console_upload_lock.acquire(timeout=120.0):
+                    try:
+                        ok = _upload_console_locked(mode, console, tail, True) or ok
+                    finally:
+                        console_upload_lock.release()
+                    break
             return ok
 
         def _upload_console_locked(mode: str, console: str, tail_path: str, final: bool) -> bool:

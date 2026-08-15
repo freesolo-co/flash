@@ -1767,9 +1767,83 @@ def test_serverless_terminal_console_upload_never_yields_to_a_wedged_snapshot():
     # is conditional on the lock coming free, and here it never does. a second commit would mean
     # the re-commit fires blind, doubling every terminal upload on a genuinely wedged holder.
     assert uploaded == ["final"], "the terminal snapshot must not be skipped for a held lock"
-    # bounded wait, so a wedged holder delays the terminal upload rather than suppressing it.
+    # bounded wait, so a wedged holder delays the terminal upload rather than suppressing it. the
+    # TOTAL is what bounds it: the compensating acquire retries, so per-try alone would pass with
+    # an unbounded loop that never returns against a holder that never frees.
     assert timeouts
     assert all(0 < t <= 120.0 for t in timeouts)
+    assert sum(timeouts) <= 600.0, f"the terminal path can wait at most 600s in total: {timeouts}"
+
+
+def test_serverless_terminal_console_upload_recommits_after_two_timeouts(monkeypatch):
+    """A holder slower than a SINGLE compensating wait must still not be the last writer.
+
+    The re-commit exists because a terminal upload forced through without the lock can be overtaken
+    by a periodic request already inside ``upload_file``. One compensating acquire only covers a
+    holder that frees within its timeout: an HF upload recovering after roughly 240s outlives both
+    the original acquire and that one retry, so the terminal path gave up, and the older pre-failure
+    snapshot then landed last -- restoring exactly the console the failure needed to replace.
+
+    So the compensating wait is split into several bounded tries. It must still TERMINATE against a
+    holder that never frees (``..._never_yields_to_a_wedged_snapshot`` pins that, and the total-wait
+    assertion there is what stops this becoming an unbounded loop).
+    """
+    import ast
+    import inspect
+    import textwrap
+    import threading
+    import types
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
+    )
+
+    class _VerySlowHolder:
+        """Times out until ``free_at``, modelling an upload_file that recovers late."""
+
+        def __init__(self, free_at: int, log: list[str]) -> None:
+            self.attempts = 0
+            self.free_at = free_at
+            self.log = log
+
+        def acquire(self, timeout: float) -> bool:
+            self.attempts += 1
+            if self.attempts < self.free_at:
+                return False
+            self.log.append("holder finished")
+            return True
+
+        def release(self) -> None:
+            self.log.append("released")
+
+    def _commit(log: list[str]):
+        # bound as a default so the closure captures THIS iteration's log, not the loop variable.
+        return lambda _m, _c, _t, final, _log=log: (
+            _log.append(f"commit:{'final' if final else 'periodic'}") or True
+        )
+
+    for frees_on in (3, 4):
+        order: list[str] = []
+        namespace: dict = {
+            "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
+            "console_upload_lock": _VerySlowHolder(frees_on, order),
+            "console_teardown": threading.Event(),
+            "_upload_console_locked": _commit(order),
+            "print": lambda *_a, **_k: None,
+        }
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+
+        assert namespace["_upload_console"]("train", final=True) is True
+        commits = [n for n, entry in enumerate(order) if entry.startswith("commit:")]
+        assert len(commits) == 2, (
+            f"holder freeing on acquire {frees_on} lost the re-commit: {order}"
+        )
+        # positions, not values: both commits render identically, so comparing strings would find
+        # the first and hold however the calls were ordered.
+        assert commits[1] > order.index("holder finished"), order
 
 
 def test_serverless_periodic_console_upload_defers_once_teardown_begins():
