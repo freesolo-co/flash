@@ -92,7 +92,15 @@ _SECRET_KEY_FIELD = r"(?:private|secret|signing|encryption|session|access)[-_ ]?
 # visible, which is a header name rather than a secret.
 _SECRET_COOKIE_KEY = r"(?P<cookie>cookie)"
 _SECRET_DETAIL = re.compile(
-    rf"(?i)(?P<key>{_SECRET_AUTH_KEY}|api[-_ ]?key|access[-_ ]?token|token|secret|password|passwd"
+    # `pass(-|_| )?phrase` sits beside `password`/`passwd` rather than being covered by them: no
+    # prefix of one is a prefix of the other, so the existing words never matched it. It is the
+    # standard field name for the phrase unlocking a generated private key, and that phrase is
+    # minted at runtime, so it is in no environment variable and the value pass cannot reach it.
+    # The value stop is deliberately the same as `password`'s: a quoted value redacts whole, an
+    # unquoted one ends at whitespace. Consuming to end of line instead would eat the diagnostic
+    # around it, and a passphrase is a single field rather than a delimited list like a cookie.
+    rf"(?i)(?P<key>{_SECRET_AUTH_KEY}|api[-_ ]?key|access[-_ ]?token|token|secret"
+    rf"|pass(?:[-_ ]?phrase|word|wd)"
     # `credential`/`credentials` is the generic label a library reaches for when the value has no
     # more specific name, and it names the value outright rather than qualifying something else, so
     # unlike `key` it needs no qualifier. plural included: `{"credentials": ...}` is the commoner

@@ -4902,6 +4902,60 @@ def test_child_failure_sanitizer_redacts_a_whole_cookie_header(monkeypatch):
         assert _safe_child_failure_detail(ValueError(message)) == message, message
 
 
+def test_child_failure_sanitizer_redacts_a_key_passphrase(monkeypatch):
+    """``passphrase`` is not covered by ``password``/``passwd``: no prefix of one spells the other.
+
+    It is the standard field name for the phrase unlocking a generated private key, and that phrase
+    is minted at runtime, so it is in no environment variable and the value pass cannot remove it --
+    the shape rule is the only thing in front of it. Separator spellings are covered because a
+    ``pass_phrase``/``pass-phrase`` field is the same credential.
+
+    The value stop matches ``password``'s deliberately: a quoted value redacts whole, an unquoted
+    one ends at whitespace. A passphrase is a single field, not a delimited list like a cookie
+    header, so consuming to end of line would eat the diagnostic around it instead.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message in (
+        'child failed: {"passphrase":"runtimephrase123"}',
+        'child failed: {"passphrase": "runtimephrase123"}',
+        "child failed: passphrase=runtimephrase123",
+        "child failed: passphrase: runtimephrase123",
+        'child failed: {"key_passphrase":"runtimephrase123"}',  # a prefixed spelling
+        'child failed: {"pass_phrase":"runtimephrase123"}',
+        'child failed: {"pass-phrase":"runtimephrase123"}',
+        "child failed: PASSPHRASE=runtimephrase123",  # matched case-insensitively
+        r"child failed: {\"passphrase\":\"runtimephrase123\"}",  # serialized json
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "runtimephrase123" not in redacted, f"leaked: {redacted!r}"
+        assert "<redacted>" in redacted, message
+
+    # a QUOTED passphrase containing spaces redacts whole, the same as a quoted password: the
+    # closing quote ends it, so a multi-word phrase does not survive past the first space.
+    assert (
+        _safe_child_failure_detail(
+            ValueError('child failed: {"passphrase":"runtime private-key phrase"}')
+        )
+        == 'child failed: {"passphrase":"<redacted>"}'
+    )
+
+    # the neighbouring words must keep working: this alternative folded them into one branch.
+    for field in ("password", "passwd"):
+        message = f'child failed: {{"{field}":"runtimephrase123"}}'
+        assert "runtimephrase123" not in _safe_child_failure_detail(ValueError(message)), field
+
+    # the other direction: the word in prose carries no value, and a field describing whether a
+    # passphrase is needed is not the passphrase itself.
+    for message in (
+        "child failed: passphrase prompt was cancelled",
+        "child failed: failed to read passphrase from tty",
+        'child failed: {"passphrase_required": true}',
+    ):
+        assert _safe_child_failure_detail(ValueError(message)) == message, message
+
+
 def test_child_failure_sanitizer_redacts_every_percent_encoding_casing(monkeypatch):
     """A secret's percent-escapes are matched whatever hex casing the exception rendered.
 
