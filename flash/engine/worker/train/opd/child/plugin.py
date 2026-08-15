@@ -23,10 +23,16 @@ from packaging.version import Version
 from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 
 try:
-    from flash_opd_multiturn import build_flash_multi_turn_agent_loop
+    from flash_opd_multiturn import (
+        build_flash_multi_turn_agent_loop,
+        build_flash_replay_buffer,
+    )
     from flash_opd_structured import StructuredOutputReplay, canonical_structured_spec
 except ImportError:
-    from flash.engine.worker.train.opd.child.multiturn import build_flash_multi_turn_agent_loop
+    from flash.engine.worker.train.opd.child.multiturn import (
+        build_flash_multi_turn_agent_loop,
+        build_flash_replay_buffer,
+    )
     from flash.engine.worker.train.opd.child.structured import (
         StructuredOutputReplay,
         canonical_structured_spec,
@@ -582,6 +588,14 @@ def _build_flash_ppo_trainer(PPOTrainer, tq, KVBatchMeta):
         )
 
     class FlashPPOTrainer(PPOTrainer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # verl built a plain ReplayBuffer above and already started its poll thread; close that
+            # one before swapping in the failure-aware buffer, or the discarded thread keeps polling
+            # the transfer queue for the life of the run.
+            self.replay_buffer.close()
+            self.replay_buffer = build_flash_replay_buffer(type(self.replay_buffer))()
+
         def init_workers(self):
             self.use_teacher_policy = False
             super().init_workers()
