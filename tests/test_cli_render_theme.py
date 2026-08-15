@@ -733,6 +733,29 @@ def test_fresh_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch
     assert len([label for label, _ in pairs if label == "progress"]) == 1
 
 
+def test_fresh_opd_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch):
+    from flash.cli.ui import heartbeat
+
+    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    obj = {
+        "state": "running",
+        "last_heartbeat": {
+            "stage": "opd_step",
+            "step": 1,
+            "ts": 1990.0,
+            "liveness": True,
+            "progress_age_s": 1800.0,
+        },
+    }
+
+    pairs = heartbeat._heartbeat_pairs(obj)
+    assert ("worker", "opd_step · step 1 · alive ping") in pairs
+    assert ("heartbeat", "10s ago") in pairs
+    progress = dict(pairs)["progress"]
+    assert "last known progress can be as old as 1810.0s" in progress
+    assert "upload throttling no longer explains the gap" in progress
+
+
 def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
     from flash.cli.ui import heartbeat
 
@@ -885,9 +908,9 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     )
     assert "last one UPLOADED" not in render.run_status(step_zero)
 
-    # opd_step force-commits at the 60s floor, so an old one is a real stall, not reporting lag.
+    # opd_step uses the same upload throttle, so its uploaded step can lag behind training too.
     opd = dict(base, last_heartbeat={"stage": "opd_step", "step": 4, "ts": _time.time() - 1200})
-    assert "last one UPLOADED" not in render.run_status(opd)
+    assert "last one UPLOADED" in render.run_status(opd)
 
     # a heartbeat from a superseded attempt describes a dead worker, not throttled progress.
     superseded = dict(

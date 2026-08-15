@@ -301,6 +301,9 @@ def test_heartbeat_publishes_canonical_progress_age(monkeypatch):
     seen: list[dict] = []
     monkeypatch.setattr(hbmod.time, "time", lambda: now["t"])
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ne, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(ne, "_HB_PROGRESS_SEQ", 0)
+    monkeypatch.setattr(ne, "_HB_PROGRESS_UPLOADED_SEQ", 0)
 
     def _capture(local, *a, **k):
         with open(local) as f:

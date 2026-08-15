@@ -119,10 +119,9 @@ _STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
 # for a conservative current bound, and speak once that bound reaches the throttle without claiming
 # either health or a stall: newer progress may be uncommitted, or the worker may be silent.
 _UPLOAD_THROTTLE_S = 900.0
-# only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
-# post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older
-# than 900s means a long step, failed uploads, or a real stall -- not reporting lag.
-_TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step"})
+# only the stages the worker actually holds on the 900s upload throttle. opd_step emits ordinary
+# post-step and liveness heartbeats, so its uploaded step can lag just like rl_step and sft_step.
+_TRAINING_STEP_STAGES = frozenset({"opd_step", "rl_step", "sft_step"})
 
 # the setup stages that hold a liveness thread on the 240s tight cadence (_HB_SETUP_LIVENESS_INTERVAL_S).
 # these are the ones where age is genuinely informative: the worker pings every 240s while alive, so
