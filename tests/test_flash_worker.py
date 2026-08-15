@@ -1151,15 +1151,24 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
         in body
     )
     assert "uploaded_size = size if ok else uploaded_size" in body
+    # the wedge signal is STAGED HEARTBEATS, not console bytes: a stuck worker still logs, so a
+    # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
+    assert "quiet_polls = 0 if staged else quiet_polls + 1" in body
+    assert "count(b'\"stage\":')" in body
 
 
 def _drive_instance_upload_loop(
-    monkeypatch, sizes: list[int], cycles: int, *, succeed=True
+    monkeypatch, sizes: list[int], cycles: int, *, succeed=True, staged=None
 ) -> tuple[list, list]:
     """Run the real instance loop over a scripted console-size series. Returns (waits, uploads).
 
     ``succeed`` is the upload result, either a bool or a predicate over the attempt number, so a
     test can script an upload that fails the way hf_upload does: swallowed, returning falsy.
+
+    ``staged`` scripts the STAGED-heartbeat count seen at each poll, which is the progress signal
+    the loop keys on. It defaults to "a heartbeat whenever the console grew", the shape of a
+    healthy run, so a frozen console still reads as wedged. A test covering a worker that keeps
+    logging without making progress passes its own series.
     """
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
 
@@ -1172,16 +1181,20 @@ def _drive_instance_upload_loop(
             waits.append(seconds)
             return len(waits) > cycles
 
-    def _size(_console: str) -> int:
+    def _progress(_console: str, _offset: int) -> tuple[int, int]:
         index = min(clock["i"], len(sizes) - 1)
         clock["i"] += 1
-        return sizes[index]
+        if staged is not None:
+            beats = staged[min(index, len(staged) - 1)]
+        else:  # grew since the previous poll -> one staged heartbeat
+            beats = 1 if index == 0 or sizes[index] != sizes[index - 1] else 0
+        return sizes[index], beats
 
     def _upload(_payload, _console, _mode) -> bool:
         uploads.append(clock["i"])
         return succeed(len(uploads)) if callable(succeed) else succeed
 
-    monkeypatch.setattr(_instance_bootstrap, "_console_size", _size)
+    monkeypatch.setattr(_instance_bootstrap, "_console_progress", _progress)
     monkeypatch.setattr(_instance_bootstrap, "_upload_console_snapshot", _upload)
     _instance_bootstrap._console_upload_loop({}, "/tmp/console.txt", "train", 3600.0, _Stop())
     return waits, uploads
@@ -1338,6 +1351,65 @@ def test_instance_console_upload_loop_does_not_spend_the_latch_on_a_due_snapshot
     after_wedge = [u for u in uploads if u > wedge_at]
     assert after_wedge, "the overlapping scheduled snapshot consumed the real wedge's credit"
     assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
+
+
+def test_instance_console_upload_loop_detects_a_wedge_that_keeps_logging(monkeypatch):
+    """A worker stuck after its last staged heartbeat still prints -- and must still be caught.
+
+    Ray warnings, liveness pings and library chatter keep the console GROWING while no real work
+    happens, so a wedge rule keyed on console bytes never fires: every poll sees a new size. The
+    stall classifier does not care about bytes either -- it advances only on a staged heartbeat and
+    tears the run down on that clock. Keying on the same signal is what keeps the two agreeing.
+
+    Measured with a byte-based rule: snapshots at 600s and then 4200s, with teardown near 1800s --
+    no console for the hang at all.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
+    healthy_polls = int(first_s / poll_s) + 1
+    cycles = healthy_polls + quiet_polls + 6
+    # the console never stops growing, so a size-based rule sees progress at every single poll.
+    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
+    # but staged heartbeats stop after the healthy prefix: that is the wedge.
+    staged = [1] * healthy_polls + [0] * (cycles + 2 - healthy_polls)
+    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles, staged=staged)
+
+    after_wedge = [u for u in uploads if u > healthy_polls]
+    assert after_wedge, "a wedged run that keeps logging produced no snapshot"
+    # and it lands inside the 1200s training stall, measured from when progress actually stopped.
+    assert (after_wedge[0] - healthy_polls) * poll_s < 1200.0
+
+
+def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
+    """The wedge signal itself, unmocked: every loop test above patches _console_progress out.
+
+    Two properties, both load-bearing. It must count only STAGED heartbeats -- an unstaged liveness
+    ping carries no ``"stage"`` key and is exactly what a wedged worker keeps emitting, so counting
+    every heartbeat line would report progress for a run making none. And it must count only bytes
+    past ``offset``: a console reaching hundreds of MB is rescanned every poll otherwise, and a
+    heartbeat from the healthy prefix would be recounted forever, so the wedge never registers.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    console = tmp_path / "console_train.txt"
+    staged = b'HEARTBEAT {"stage": "train", "step": 1}\n'
+    unstaged = b'HEARTBEAT {"beat": 7}\nray warning: worker is idle\n'
+    console.write_bytes(staged + unstaged)
+
+    size, beats = _instance_bootstrap._console_progress(str(console), 0)
+    assert (size, beats) == (len(staged) + len(unstaged), 1)
+
+    # the wedge: bytes keep arriving, no staged heartbeat among them.
+    with open(console, "ab") as f:
+        f.write(unstaged * 3)
+    size2, beats2 = _instance_bootstrap._console_progress(str(console), size)
+    assert beats2 == 0, "chatter after the last staged heartbeat must not read as progress"
+    assert size2 == size + len(unstaged) * 3
+
+    assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (-1, 0)
 
 
 def test_instance_console_upload_loop_retries_when_an_upload_fails(monkeypatch):

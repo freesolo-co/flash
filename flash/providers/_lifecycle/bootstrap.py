@@ -41,7 +41,6 @@ CODE_ROOT = "/runcode"
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
 _CONSOLE_UPLOAD_POLL_S = 120.0
-# unchanged polls meaning wedged; (this + 1) * poll must stay under poll_job's 1200s training stall.
 _CONSOLE_UPLOAD_QUIET_POLLS = 4
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
@@ -232,15 +231,11 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dic
 
 
 def hf_upload(
-    payload: dict,
-    local_path: str,
-    repo_subpath: str,
-    *,
-    enforce_deadline: bool = True,
+    payload: dict, local_path: str, repo_subpath: str, *, enforce_deadline: bool = True
 ) -> bool:
-    """Upload one artifact under the run's HF prefix; never raises. True only if it landed: the
-    error is swallowed so it cannot kill the run, but a caller tracking what is stored would read
-    a silent return as success and skip the retry it earned."""
+    """Upload one artifact under the run's HF prefix; never raises. True only if it landed: the error
+    is swallowed so it cannot kill the run, but a caller tracking what is stored would read a silent
+    return as success and skip the retry it earned."""
     try:
         from huggingface_hub import HfApi
 
@@ -269,37 +264,45 @@ def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str 
     return hf_upload(payload, tail_path, f"console_{mode}.txt")
 
 
-def _console_size(console: str) -> int:
-    """Current console size, or -1 if it cannot be read (never yet created, or removed)."""
+def _console_progress(console: str, offset: int) -> tuple[int, int]:
+    """``(size, staged heartbeats after ``offset``)``; size -1 if unreadable. Bytes alone cannot tell
+    a wedge from a noisy one: a worker stuck after its last staged heartbeat keeps printing Ray
+    warnings, so the size grows every poll and a size-only rule never fires. The stall classifier
+    advances only on a STAGED heartbeat, echoed here as ``HEARTBEAT {...}`` with a stage, so counting
+    those tracks the signal that decides teardown. Only bytes past ``offset`` are read, so a scan
+    costs one poll's output, not a console that reaches hundreds of MB."""
     try:
-        return os.path.getsize(console)
+        with open(console, "rb") as f:
+            f.seek(offset)
+            staged = f.read().count(b'"stage":')  # before tell(): the read is what advances it
+            return f.tell(), staged
     except OSError:
-        return -1
+        return -1, 0
 
 
 def _console_upload_loop(
     payload: dict, console: str, mode: str, interval_s: float, stop_upload
 ) -> None:
-    """Snapshot the console until ``stop_upload`` is set, polling cheaply for a wedge.
-
-    Polling is free; committing is not (the heartbeat spends 4 of this repo's 5 commits/hour), and
-    the stall classifier kills a wedged run at 1200s/3000s -- long before an hourly snapshot would
-    capture the hang. So commit only on un-uploaded bytes AND either the interval elapsing or
-    silence sustained over _CONSOLE_UPLOAD_QUIET_POLLS samples; spend that quiet snapshot once per
-    run; and advance it and ``sent`` only on reported success, since hf_upload swallows its
-    exception. ``wedged`` excludes an already-due poll, so the latch is spent only when silence
-    BOUGHT an upload -- charging it for a commit that was happening anyway would disarm wedge
-    detection for a later hang. Each rule is pinned by a test_instance_console_upload_loop_* case."""
+    """Snapshot the console until ``stop_upload`` is set, polling cheaply for a wedge. Polling is
+    free; committing is not (the heartbeat spends 4 of this repo's 5 commits/hour), and the stall
+    classifier kills a wedged run at 1200s/3000s -- long before an hourly snapshot would capture the
+    hang. So commit only on un-uploaded bytes AND either the interval elapsing or
+    _CONSOLE_UPLOAD_QUIET_POLLS samples with no STAGED heartbeat (_console_progress explains why
+    bytes cannot serve); spend that quiet snapshot once per run; and advance it and ``sent`` only on
+    reported success, since hf_upload swallows its exception. ``wedged`` excludes an already-due
+    poll, so the latch is spent only when a stall BOUGHT an upload -- charging it for a commit that
+    was happening anyway would disarm detection for a later hang. QUIET_POLLS is sized so that
+    (it + 1) * poll stays under poll_job's 1200s training stall, or the box dies before the wedge
+    snapshot commits. Each rule is pinned by a test_instance_console_upload_loop_* case."""
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
-    sent = prev = -1
+    sent = size = -1
     since = quiet_polls = 0.0
     quiet_used = False
     while not stop_upload.wait(poll_s):
         since += poll_s
-        size = _console_size(console)
-        quiet_polls = quiet_polls + 1 if size == prev else 0
-        prev = size
+        size, staged = _console_progress(console, max(size, 0))
+        quiet_polls = 0.0 if staged else quiet_polls + 1
         due = since >= due_s
         wedged = quiet_polls >= _CONSOLE_UPLOAD_QUIET_POLLS and not quiet_used and not due
         if size == sent or not (due or wedged):
@@ -682,12 +685,9 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             this process knows the run's secret VALUES, so each echoed child line is sanitized here
             at the source -- the control-plane sanitizer downstream cannot value-redact a runtime
             secret whose name it never sees. Mirrors the runpod serverless handler. The console FILE
-            keeps the raw line; its upload path sanitizes the tail.
-
-            The bound keeps the END of an oversized line: the root cause sits at the end of a native
-            stack or json blob, and the control plane's failure detail reads the provider's instance
-            log rather than the uploaded console, so a prefix cut here loses it everywhere.
-            """
+            keeps the raw line; its upload path sanitizes the tail. The bound keeps the END of an
+            oversized line: the root cause sits at the end of a native stack or json blob, and that
+            failure detail reads the instance log, not the console, so a prefix cut loses it."""
             try:
                 for line in proc.stdout:
                     with pump_write_lock:

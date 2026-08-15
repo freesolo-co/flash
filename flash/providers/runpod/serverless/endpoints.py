@@ -526,12 +526,11 @@ def _train_body(input_data: dict) -> dict:
             Serialized against itself: the periodic uploader is a daemon thread joined with a
             timeout, so a slow snapshot can still run when the final one begins. ``final`` never
             yields -- upload_file takes no timeout, so a wedged periodic snapshot holds the lock
-            forever and skipping the terminal upload leaves pre-failure bytes as the only console.
-            A periodic snapshot that sees ``console_teardown`` therefore drops its commit rather
-            than racing: captured BEFORE the terminal one, landing last, it would erase it.
-
-            Returns whether the tail landed: errors are swallowed, not raised, so a caller tracking
-            what is stored cannot read a normal return as success and skip the retry it earned."""
+            forever and skipping the terminal upload leaves pre-failure bytes as the only console. A
+            periodic snapshot that sees ``console_teardown`` therefore drops its commit rather than
+            racing: captured BEFORE the terminal one, landing last, it would erase it. Returns
+            whether the tail landed: errors are swallowed, not raised, so a caller tracking what is
+            stored cannot read a normal return as success and skip the retry it earned."""
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
                 return False
@@ -570,11 +569,10 @@ def _train_body(input_data: dict) -> dict:
                     tail = raw.decode("utf-8", "replace")
                 else:
                     tail = raw[1:].decode("utf-8", "replace")
-                    # a truncated first line is dropped before sanitizing: a boundary landing
-                    # inside a one-line credential leaves a fragment that full-value redaction no
-                    # longer matches. duplicated rather than imported because only this function's
-                    # SOURCE ships to the worker; bootstrap_secrets._read_console_tail is the
-                    # canonical copy and carries the full reasoning.
+                    # a truncated first line is dropped before sanitizing: a boundary landing inside
+                    # a one-line credential leaves a fragment that full-value redaction no longer
+                    # matches. duplicated rather than imported because only this function's SOURCE
+                    # ships to the worker; bootstrap_secrets._read_console_tail is canonical.
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""
@@ -608,17 +606,21 @@ def _train_body(input_data: dict) -> dict:
                 # test_first_console_snapshot_precedes_the_stall_teardown pins them so this cannot
                 # drift. Mirrors bootstrap._console_upload_loop, whose docstring carries the rules.
                 due_s, since, quiet_polls = 600.0, 0.0, 0
-                uploaded_size, previous_size, quiet_used = -1, -1, False
+                uploaded_size, size, quiet_used = -1, -1, False
                 while not stop_upload.wait(120.0):
                     since += 120.0
                     try:
-                        size = os.path.getsize(console)
+                        # count STAGED heartbeats, not bytes: a wedged worker still prints ray
+                        # warnings, so a size-only rule never fires. reads only new bytes.
+                        with open(console, "rb") as hf:
+                            hf.seek(max(size, 0))
+                            staged = hf.read().count(b'"stage":')
+                            size = hf.tell()
                     except OSError:
-                        size = -1
-                    quiet_polls = quiet_polls + 1 if size == previous_size else 0
-                    previous_size = size
+                        size, staged = -1, 0
+                    quiet_polls = 0 if staged else quiet_polls + 1
                     due = since >= due_s
-                    # `not due`: only silence that BOUGHT an upload spends the one-shot latch.
+                    # `not due`: only a stall that BOUGHT an upload spends the one-shot latch.
                     wedged = quiet_polls >= 4 and not quiet_used and not due
                     if size == uploaded_size or not (due or wedged):
                         continue

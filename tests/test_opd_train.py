@@ -4630,6 +4630,20 @@ def test_child_failure_detail_survives_an_exception_whose_str_raises():
 
     assert _safe_child_failure_detail(ValueError(Unrenderable())) == "<unrenderable message>"
 
+    # BaseException too: KeyboardInterrupt and SystemExit are not Exception subclasses, so an
+    # `except Exception` here would let them abort a function documented as never raising -- and
+    # the caller would never reach its os._exit, restoring the opaque death this path removes.
+    for escaping in (KeyboardInterrupt, SystemExit, BaseException):
+
+        class Hostile:
+            def __init__(self, exc):
+                self._exc = exc
+
+            def __str__(self):
+                raise self._exc("stringification escaped")
+
+        assert _safe_child_failure_detail(ValueError(Hostile(escaping))) == "<unrenderable message>"
+
 
 def test_child_failure_sanitizer_keeps_token_ids_and_redacts_encoded_and_multiline_secrets(
     monkeypatch,

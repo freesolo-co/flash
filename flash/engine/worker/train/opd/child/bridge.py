@@ -307,7 +307,10 @@ def _safe_child_failure_detail(error: Exception) -> str:
     """
     try:
         message = str(error)
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: a __str__ raising KeyboardInterrupt or SystemExit escapes
+        # the narrower clause and aborts this function, which is documented as never raising. the
+        # caller then never reaches its os._exit, restoring the opaque death this path removes.
         message = "<unrenderable message>"
     secrets = {value for name, value in os.environ.items() if value and _secret_env_name(name)}
     for secret in sorted(secrets, key=len, reverse=True):
