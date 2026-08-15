@@ -6789,6 +6789,44 @@ def test_the_arming_heartbeat_is_retried_when_it_does_not_commit(monkeypatch):
     )
 
 
+def test_a_wedged_arming_upload_does_not_block_the_child_launch(monkeypatch):
+    """A hung arming upload must not hold the run at `opd_initializing` forever.
+
+    This call is synchronous and sits between "setup finished" and "the child, which carries the
+    watchdog, starts". `heartbeat` bounds its wait for the upload LOCK, but the commit itself goes
+    through an `HfApi` built with no timeout, so a hung connection blocks its caller indefinitely.
+    Blocking HERE is the worst place to block: the watchdog does not exist yet, so nothing local can
+    condemn the run and it strands until the provider reports the retriable "stalled" -- the
+    retry-and-rebill path this change exists to cut off, reached through the code added to prevent
+    it. The upload cannot be cancelled, so it is abandoned on a daemon thread and the run proceeds.
+    """
+    import flash.engine.worker.opd_train as opd_train
+
+    monkeypatch.setattr(opd_train, "_ARM_HEARTBEAT_BUDGET_S", 0.2)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def wedged_heartbeat(_stage, **_kw):
+        entered.set()
+        release.wait(30)  # HfApi with no timeout
+        return True
+
+    monkeypatch.setattr(opd_train._w, "heartbeat", wedged_heartbeat)
+    monkeypatch.setattr(opd_train._w, "gpu_diagnostics", lambda include_torch=True: {})
+
+    started = time.monotonic()
+    try:
+        opd_train.arm_provider_stall_clock()
+        elapsed = time.monotonic() - started
+        assert entered.is_set(), "the arming heartbeat never ran, so this proves nothing"
+        assert elapsed < 5, (
+            f"the wedged arming upload held the child launch for {elapsed:.1f}s: the run is stuck "
+            "at opd_initializing with no watchdog yet armed, billing until the provider gives up"
+        )
+    finally:
+        release.set()
+
+
 def test_arming_the_watchdog_restarts_the_providers_stall_clock(monkeypatch):
     """The two clocks must start from the same origin, or the provider gives up first.
 
@@ -6972,6 +7010,51 @@ def test_a_pre_training_diagnostic_step_does_not_silence_the_stall_signal():
     # a genuine step line does stop it.
     callbacks.on_line("step:1 - actor/distillation/loss:0.5\n")
     assert callbacks.liveness_fields() == {}
+
+
+def test_a_pre_training_diagnostic_step_does_not_start_the_providers_training_clock():
+    """The same loose scan must not commit a REAL `opd_step` heartbeat either.
+
+    Silencing the worker's own detector is only half of it. `on_step` also emits a non-liveness
+    heartbeat, and `poll.is_training_heartbeat` reads an `opd_step` heartbeat carrying step >= 1 as
+    proof cold start is over: the provider swaps its 3000s setup grace for the 1500s training
+    window, which is 300s TIGHTER than this change's own 1800s deadline. So one pre-training
+    `global_step: 1` hands the provider a retriable "stalled" verdict before the watchdog can fire,
+    and the wedged run is rebilled through its retries -- the exact outcome being fixed here.
+    """
+    import flash.engine.worker.opd_train as opd_train
+    import flash.engine.worker.opd_train_runner as opd_runner
+    from flash.providers._lifecycle.poll import is_training_heartbeat
+
+    watcher = SimpleNamespace(raise_if_failed=lambda: None)
+    progress_state = SimpleNamespace(record_step=lambda *_args: None)
+    callbacks = opd_runner._build_child_callbacks(watcher, progress_state, object(), 0)
+
+    emitted: list = []
+    original = opd_train._w.heartbeat
+    opd_train._w.heartbeat = lambda stage, **kw: emitted.append((stage, kw))
+    try:
+        # verl prints the diagnostic; the loose reader scan matches it and drives on_step.
+        callbacks.on_line("saving checkpoint to /ckpt/global_step: 1\n")
+        callbacks.on_step(1)
+        assert not emitted, (
+            f"a pre-training diagnostic committed a real heartbeat {emitted}: the provider now "
+            "runs its 1500s training window and reports 'stalled' before the 1800s watchdog fires"
+        )
+
+        # a GENUINE optimizer step must still report, or the provider never sees training progress.
+        callbacks.on_line("step:1 - actor/distillation/loss:0.5\n")
+        callbacks.on_step(1)
+        assert emitted, "a real optimizer step published no heartbeat at all"
+        stage, kw = emitted[0]
+        assert stage == "opd_step"
+        assert not kw.get("liveness")
+        assert is_training_heartbeat(stage, kw.get("step")), (
+            "a real step no longer starts the provider's training window, so a run that wedges "
+            "mid-training keeps the loose 3000s setup grace"
+        )
+    finally:
+        opd_train._w.heartbeat = original
 
 
 def test_liveness_progress_is_attempt_local_on_a_resumed_run():

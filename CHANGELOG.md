@@ -45,12 +45,19 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   optimizer steps recognised by the shared verl step parser count as progress, so a pre-training
   diagnostic such as `global_step: 1` no longer switches the detector off for the rest of the run,
   and a resumed attempt reports steps taken by the current child rather than the restored step it
-  started from. Genuinely new output resets the window, so the 600s teacher bridge request and the
+  started from. That same validated parser now also gates the real per-step heartbeat, not just the
+  worker's own detector: a heartbeat carrying a step tells the provider cold start is over and swaps
+  its 3000s setup grace for a 1500s window, 300s tighter than the watchdog's deadline, so one
+  pre-training diagnostic line handed the provider a retriable `stalled` verdict before the watchdog
+  could fire. Genuinely new output resets the window, so the 600s teacher bridge request and the
   warmup-dominated first step are unaffected. A staged heartbeat is emitted as the watchdog arms, so
   the provider's own stall clock restarts alongside the child's: it advances only on staged pings,
   and the whole setup span before the child is held open by liveness pings it does not credit, so
   ~20 minutes of ordinary setup previously left less grace than the watchdog needs and the provider
-  reported the retriable `stalled` first. Detection runs entirely on a thread that never uploads --
+  reported the retriable `stalled` first. That staged heartbeat is bounded and abandoned rather than
+  awaited, because it runs synchronously before the child (and therefore the watchdog) exists and
+  the underlying upload has no timeout: a hung connection there would strand the run in the very
+  state this change exists to end. Detection runs entirely on a thread that never uploads --
   it samples the counter and decides on it -- because the heartbeat upload has no timeout, and a
   detector that only advances between uploads can see neither a child going quiet nor one coming
   back. It takes its first sample before its first sleep, so the earliest heartbeat already carries

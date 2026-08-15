@@ -17,7 +17,6 @@ from typing import Any
 
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
-from flash.engine.worker.io import heartbeat as _heartbeat
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 
@@ -601,8 +600,10 @@ def _build_child_callbacks(
         # the highest step the VALIDATED parser has seen, which is not the same thing as `step`
         # above. `step` is fed by run_verl_training's loose `step:\s*(\d+)` scan, which also matches
         # "global_step: 1" and a path ending in "step: 1" -- lines `verl_step_number` deliberately
-        # refuses. anything gating on "has a real optimizer step landed" must read this one, or a
-        # single pre-training diagnostic line silences the gate for the rest of the run.
+        # refuses. anything gating on "has a real optimizer step landed" must read this one: a
+        # single pre-training diagnostic otherwise silences the worker's own wedge detector for the
+        # rest of the run AND, through the heartbeat `on_step` commits, flips the provider to its
+        # 1500s stall window, 300s tighter than the 1800s watchdog meant to catch the wedge first.
         "validated_step": resume_step,
         "loss": None,
         "truncation_rate": None,
@@ -638,6 +639,11 @@ def _build_child_callbacks(
 
     def on_step(step: int) -> None:
         progress["step"] = step
+        # gated on the VALIDATED step (see `validated_step` above), not the loose scan that called
+        # this. `on_line` sets it for a line before the reader calls `on_step` for that same line,
+        # so this reads the current line's verdict rather than the previous one's.
+        if not steps_this_child():
+            return
         payload = {"step": step}
         if progress["loss"] is not None:
             payload["loss"] = progress["loss"]
@@ -694,14 +700,7 @@ def _build_child_callbacks(
     )
 
 
-# says what was OBSERVED and nothing more. silence localises the failure to the child's progress
-# boundary; it does not prove which component stopped, so this must not read as an oom, a capacity
-# fault or a named ray defect. built once at import so the training call carries no attribute lookup
-# that could fail inside the try whose finally decides whether the run counts as complete.
-_CHILD_STALL_ABORT_REASON = (
-    f"opd child produced no new output for {round(_heartbeat.CHILD_TAIL_STALL_S / 60)} minutes and "
-    "had not completed its first optimizer step; the process group was torn down to release the gpu"
-)
+_CHILD_STALL_ABORT_REASON = _opd_train.CHILD_STALL_ABORT_REASON
 
 
 def _run_child(
