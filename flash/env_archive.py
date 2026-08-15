@@ -113,6 +113,18 @@ def _zip_is_symlink(info: zipfile.ZipInfo) -> bool:
     return info.create_system == 3 and stat.S_ISLNK(info.external_attr >> 16)
 
 
+def _open_zip(source: Path | bytes, refusal: type[Exception]) -> zipfile.ZipFile:
+    """open an identified zip, refusing when its directory cannot be parsed."""
+    candidate = source if isinstance(source, Path) else io.BytesIO(source)
+    identified = _read_at(source, 0, 4) == b"PK\x03\x04" or zipfile.is_zipfile(candidate)
+    try:
+        return zipfile.ZipFile(candidate)
+    except zipfile.BadZipFile:
+        if identified:
+            raise refusal("contains a zip archive this check cannot open") from None
+        raise
+
+
 def credential_in_zip(
     source: Path | bytes,
     *,
@@ -125,13 +137,6 @@ def credential_in_zip(
     member_limit: int,
 ) -> str | None:
     """The kind of credential in any readable member of a zip, or None."""
-    # a leading local header identifies zip member bytes even when the missing end record prevents
-    # `ZipFile` from opening them. only the anchored signature is decisive: the same bytes in ordinary
-    # text are not an archive and must not become a refusal.
-    if _read_at(source, 0, 4) == b"PK\x03\x04" and not zipfile.is_zipfile(
-        source if isinstance(source, Path) else io.BytesIO(source)
-    ):
-        raise refusal("contains a zip archive this check cannot open")
     # The member count is read from the end-of-central-directory record BEFORE `ZipFile` is
     # constructed. `ZipFile.__init__` parses the whole central directory and materializes every
     # `ZipInfo`, so a bound checked after it is charged the cost it exists to avoid -- measured at
@@ -140,7 +145,7 @@ def credential_in_zip(
     if _zip_member_count(source, member_limit) > member_limit:
         raise refusal("contains an archive with too many members to inspect")
     unreadable = ""
-    with zipfile.ZipFile(source if isinstance(source, Path) else io.BytesIO(source)) as archive:
+    with _open_zip(source, refusal) as archive:
         # archive comments are published metadata just like member names. scanning the exact value is
         # decisive for encoded ciphertext, whose refusal a speculative raw-byte pass suppresses.
         if archive.comment and (kind := metadata(archive.comment)):

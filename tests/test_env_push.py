@@ -10339,6 +10339,39 @@ def test_a_zip_local_header_without_its_end_record_is_refused(tmp_path):
     assert credential_in_file(ordinary) is None
 
 
+def test_a_zip_with_an_intact_end_record_and_damaged_member_refuses(tmp_path):
+    """an identified zip whose directory cannot be parsed is unscannable, not clean."""
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    packed = io.BytesIO()
+    with zipfile.ZipFile(packed, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("secret.txt", b"fslo_" + b"a1B2c3D4" * 6)
+    complete = packed.getvalue()
+    member_at = (
+        30 + int.from_bytes(complete[26:28], "little") + int.from_bytes(complete[28:30], "little")
+    )
+    eocd_at = complete.rfind(b"PK\x05\x06")
+
+    damaged = bytearray(complete)
+    del damaged[member_at : member_at + 20]
+    assert bytes(damaged).endswith(complete[eocd_at:]), "fixture must preserve the eocd record"
+    assert zipfile.is_zipfile(io.BytesIO(damaged))
+    with pytest.raises(zipfile.BadZipFile, match="central directory"):
+        zipfile.ZipFile(io.BytesIO(damaged))
+
+    published = tmp_path / "damaged.zip"
+    published.write_bytes(damaged)
+    with pytest.raises(_Unscannable, match="zip archive this check cannot open"):
+        credential_in_file(published)
+
+    # an unanchored signature in ordinary text does not identify a zip
+    ordinary = tmp_path / "ordinary.txt"
+    ordinary.write_bytes(b"ordinary text before PK\x03\x04 and ordinary text after\n")
+    assert credential_in_file(ordinary) is None
+
+
 def test_png_compressed_text_chunks_are_decoded(tmp_path):
     """png ztxt and compressed itxt chunks must not hide their zlib text payloads."""
     import struct
