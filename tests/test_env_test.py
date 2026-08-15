@@ -2658,6 +2658,40 @@ def test_env_test_names_a_cap_shorter_than_the_gold_trajectory(monkeypatch, tmp_
     assert "covers only part of a trajectory" not in captured.err
 
 
+class _OverlongGoldEarlyDoneEnv(_OverlongGoldEnv):
+    """Gold longer than the cap, but the env declares done BEFORE the cap is reached.
+
+    Two turns are replayed, not three. The cap is what the episode was ALLOWED, which is not the
+    same number as what was sent, so a report that quotes the cap as the replayed count overstates
+    the replay and points at a turn that was never scored.
+    """
+
+    def env_reply(self, messages, state):
+        state["turn"] += 1
+        state["done"] = state["turn"] >= 2
+        reply = {"role": "user", "content": "next"}
+        messages.append(reply)
+        return [reply]
+
+
+def test_env_test_counts_the_turns_actually_replayed_not_the_cap(monkeypatch, tmp_path, capsys):
+    """The truncation report must quote what was sent, not what was permitted.
+
+    An environment that terminates before the cap replays fewer turns than the cap allows. Quoting
+    the cap then claims a turn was replayed that never was, and an author reconciling the message
+    against the episode line (`turns=2`) is chasing a discrepancy this command invented.
+    """
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _OverlongGoldEarlyDoneEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "the gold trajectory is 5 turn(s) but the episode is capped at 3" in captured.err
+    assert "only the first 2 were replayed" in captured.err
+    assert "only the first 3 were replayed" not in captured.err
+    assert "turns=2" in captured.out
+
+
 class _FixedLengthEnv(_MultiTurnEnv):
     """A HEALTHY env that ends only by exhausting its budget and never sets `state["done"]`.
 

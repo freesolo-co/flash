@@ -108,10 +108,15 @@ def _warn_on_unfinished_replay(record: dict) -> None:
     if record["gold_exceeds_cap"]:
         # phrased on the DROP, not on "never finished": when the prefix terminated the episode the
         # environment did finish, and saying otherwise would be false.
+        #
+        # the replayed count is `turns`, NOT `turn_cap`. the cap is what the episode was ALLOWED,
+        # and an env that declares done before reaching it replays fewer -- quoting the cap then
+        # overstated the replay (3 of 5 when only 2 were sent) and sent the author looking for a
+        # third turn that was never scored.
         _emit(
             f"replay gold answer truncated: the gold trajectory is {record['reference_turns']} "
             f"turn(s) but the episode is capped at {record['turn_cap']}, so only the first "
-            f"{record['turn_cap']} were replayed and the rest were never scored. this is a "
+            f"{record['turns']} were replayed and the rest were never scored. this is a "
             "cap/dataset mismatch, not an environment fault: raise the turn cap (`max_turns`, or "
             "the row's `max_episode_turns`) to at least the length of the gold trajectory, or "
             "shorten the row"
