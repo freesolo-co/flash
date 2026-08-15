@@ -2,25 +2,43 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Mapping
 from typing import Any
 
-from flash.adapters.lora_rank import declared_lora_ranks
+from flash.adapters.lora_rank import (
+    _rank_for_module,
+    declared_lora_ranks,
+    lora_tensor_rank_disagrees,
+)
 from flash.core.catalog import get_model
 
-_QWEN35_EXPERT_TARGET_PARAMETERS = (
+_QWEN36_MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
+_QWEN36_EXPERT_TARGET_PARAMETERS = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
 )
+_QWEN36_FUSED_TARGET_DIMENSIONS = {
+    "mlp.experts.gate_up_proj": (2048, 1024),
+    "mlp.experts.down_proj": (512, 2048),
+}
+_QWEN36_FUSED_TARGET_RUNGS = {
+    "mlp.experts.down_proj": "",
+    "mlp.experts.gate_up_proj": "base_layer",
+}
 _FUSED_EXPERT_SYNTHETIC_MODULES = frozenset({"experts", "base_layer"})
 _FUSED_EXPERT_WRAPPER_MODULES = ("mlp.experts", "mlp.experts.base_layer")
+_INVALID_FUSED_LOCATION = object()
+
+_LoraTensor = tuple[str, str, str, str, tuple[int, ...]]
+_LoraPair = tuple[tuple[int, ...], tuple[int, ...]]
 
 
 def lora_target_parameters(model_id: str | None) -> list[str] | None:
     """Return direct parameter targets required by the model's fused expert layout."""
-    if model_id == "Qwen/Qwen3.6-35B-A3B":
-        return list(_QWEN35_EXPERT_TARGET_PARAMETERS)
+    if model_id == _QWEN36_MODEL_ID:
+        return list(_QWEN36_EXPERT_TARGET_PARAMETERS)
     return None
 
 
@@ -46,16 +64,17 @@ def validate_fused_expert_adapter_config(config: Mapping[str, Any], model_id: st
         raise ValueError(
             f"adapter for {model_id} must declare exactly the fused expert targets {required}"
         )
+
     rank_pattern = config.get("rank_pattern")
-    if rank_pattern is not None and rank_pattern != {}:
+    _validate_rank_pattern(rank_pattern, model_id)
+    declared = declared_lora_ranks(config)
+    unresolved = [target for target in required if _rank_for_module(target, declared) is None]
+    if unresolved:
         raise ValueError(
-            f"adapter for {model_id} uses unsupported rank_pattern for fused target_parameters"
+            f"adapter for {model_id} has no resolved LoRA rank for fused targets {unresolved}"
         )
 
     modules = config.get("target_modules")
-    if modules is None:
-        # peft uses null for valid direct-parameter-only configs.
-        return
     if isinstance(modules, str):
         if modules != "all-linear":
             raise ValueError(f"adapter for {model_id} string target_modules must be 'all-linear'")
@@ -66,7 +85,7 @@ def validate_fused_expert_adapter_config(config: Mapping[str, Any], model_id: st
         or any(not isinstance(module, str) or not module for module in modules)
     ):
         raise ValueError(
-            f"adapter for {model_id} target_modules must be null, 'all-linear', or a non-empty "
+            f"adapter for {model_id} target_modules must be 'all-linear' or a non-empty "
             "list of non-empty strings"
         )
     synthetic = [module for module in modules if _targets_fused_expert_wrapper(module)]
@@ -74,6 +93,37 @@ def validate_fused_expert_adapter_config(config: Mapping[str, Any], model_id: st
         raise ValueError(
             f"adapter for {model_id} contains invalid synthetic target_modules {sorted(synthetic)}"
         )
+    unresolved = [module for module in modules if _rank_for_module(module, declared) is None]
+    if unresolved:
+        raise ValueError(
+            f"adapter for {model_id} has no resolved LoRA rank for ordinary target_modules "
+            f"{unresolved}"
+        )
+
+
+def _validate_rank_pattern(rank_pattern: Any, model_id: str) -> None:
+    """Validate positive ranks and PEFT's anchored regex pattern syntax."""
+    message = (
+        f"adapter for {model_id} rank_pattern must map valid non-empty string patterns "
+        "to positive integer ranks"
+    )
+    if rank_pattern is None:
+        return
+    if not isinstance(rank_pattern, Mapping):
+        raise ValueError(message)
+    for pattern, rank in rank_pattern.items():
+        if (
+            not isinstance(pattern, str)
+            or not pattern.strip()
+            or not isinstance(rank, int)
+            or isinstance(rank, bool)
+            or rank <= 0
+        ):
+            raise ValueError(message)
+        try:
+            re.compile(rf"(.*\.)?({pattern})$")
+        except re.error as exc:
+            raise ValueError(message) from exc
 
 
 def _targets_fused_expert_wrapper(module: str) -> bool:
@@ -106,73 +156,107 @@ def normalize_verl_fused_expert_export(config: dict[str, Any], model_id: str) ->
 def has_complete_fused_expert_tensors(
     tensors: Mapping[str, tuple[int, ...]], config: Mapping[str, Any], model_id: str
 ) -> bool:
-    """Return whether every fused-expert owner has the exact catalog-backed PEFT factor shapes.
+    """Return whether fused and ordinary LoRA tensors match the declared PEFT topology."""
+    expected = _expected_fused_expert_rungs(config, model_id)
+    if expected is None:
+        return False
+    parsed = [
+        tensor
+        for key, shape in tensors.items()
+        if (tensor := _parse_lora_tensor(key, shape)) is not None
+    ]
+    if len({adapter_name for _, _, adapter_name, _, _ in parsed}) != 1:
+        return False
+    return _has_complete_fused_rungs(parsed, expected, model_id) and _has_ordinary_evidence(
+        parsed, config, expected
+    )
 
-    PEFT serializes each fused target parameter as one 2-D A/B pair under its owning module. Multiple
-    targets on that owner form the nested ``base_layer`` ladder, but PEFT does not promise which target
-    occupies which rung. Each concrete owner must therefore expose the multiset of target-specific
-    pairs derived from the adapter rank, catalog expert count, and catalog target dimensions.
-    """
+
+def _parse_lora_tensor(key: str, shape: tuple[int, ...]) -> _LoraTensor | None:
+    """Parse one canonical PEFT LoRA tensor key."""
+    matches = [
+        (factor, infix) for factor, infix in (("A", ".lora_A."), ("B", ".lora_B.")) if infix in key
+    ]
+    if len(matches) != 1:
+        return None
+    factor, infix = matches[0]
+    module_path, _, leaf = key.partition(infix)
+    leaf_parts = leaf.split(".")
+    if not module_path or len(leaf_parts) != 2:
+        return None
+    adapter_name, parameter = leaf_parts
+    if not adapter_name or parameter != "weight":
+        return None
+    return module_path, factor, adapter_name, key, shape
+
+
+def _expected_fused_expert_rungs(
+    config: Mapping[str, Any], model_id: str
+) -> dict[str, dict[str, _LoraPair]] | None:
+    """Return the exact target-specific PEFT rung geometry for each fused owner."""
     targets = lora_target_parameters(model_id)
-    expected_pairs = _expected_fused_expert_pairs(config, model_id, len(targets or ()))
-    if not targets or expected_pairs is None:
-        return False
+    if model_id != _QWEN36_MODEL_ID or not targets:
+        return None
     model = get_model(model_id)
-    required_per_owner: dict[str, int] = {}
+    experts = model.lora_expert_count
+    if experts <= 0 or model.num_layers <= 0:
+        return None
+    fused_count = model.num_layers * experts
+    catalog_dimensions = Counter(
+        (input_dim, output_dim)
+        for input_dim, output_dim, count in model.lora_target_shapes
+        if count == fused_count
+    )
+    if catalog_dimensions != Counter(_QWEN36_FUSED_TARGET_DIMENSIONS.values()):
+        return None
+
+    declared = declared_lora_ranks(config)
+    expected: dict[str, dict[str, _LoraPair]] = {}
     for target in targets:
-        if "." in target:
-            owner = target.rsplit(".", 1)[0]
-            required_per_owner[owner] = required_per_owner.get(owner, 0) + 1
-    if not required_per_owner:
-        return False
-    adapter_namespace: str | None = None
-    for owner, needed in required_per_owner.items():
-        ladder = tuple(".".join(["base_layer"] * depth) for depth in range(needed))
+        rank = _rank_for_module(target, declared)
+        dimensions = _QWEN36_FUSED_TARGET_DIMENSIONS.get(target)
+        rung = _QWEN36_FUSED_TARGET_RUNGS.get(target)
+        owner, separator, _ = target.rpartition(".")
+        if rank is None or dimensions is None or rung is None or not separator or not owner:
+            return None
+        input_dim, output_dim = dimensions
+        stacked_rank = rank * experts
+        expected.setdefault(owner, {})[rung] = (
+            (stacked_rank, input_dim),
+            (output_dim, stacked_rank),
+        )
+    return expected
+
+
+def _has_complete_fused_rungs(
+    tensors: list[_LoraTensor], expected: Mapping[str, Mapping[str, _LoraPair]], model_id: str
+) -> bool:
+    """Validate every concrete fused owner, rung, namespace, and factor shape."""
+    model = get_model(model_id)
+    for owner, expected_rungs in expected.items():
         factors: dict[str, dict[str, dict[str, dict[str, tuple[int, ...]]]]] = {}
-        for key, shape in tensors.items():
-            if ".lora_" not in key:
-                continue
-            path, _, tail = key.partition(".lora_")
-            leaf = tail.split(".")
-            if len(leaf) != 3:
-                continue
-            factor, adapter_name, parameter = leaf
-            if factor not in {"A", "B"} or not adapter_name or parameter != "weight":
-                continue
-            marker = f".{owner}."
-            if path.endswith(f".{owner}"):
-                instance, suffix = path[: -len(owner) - 1], ""
-            elif marker in path:
-                instance, suffix = path.rsplit(marker, 1)
-            else:
-                continue
-            if suffix not in ladder:
-                continue
-            layer_prefix = _layer_prefix(instance)
-            if layer_prefix is None or instance != layer_prefix:
+        for module_path, factor, adapter_name, _key, shape in tensors:
+            location = _fused_tensor_location(module_path, owner, frozenset(expected_rungs))
+            if location is _INVALID_FUSED_LOCATION:
                 return False
-            full_instance = f"{instance}.{owner}"
-            namespace_factors = factors.setdefault(full_instance, {}).setdefault(suffix, {})
-            namespace_factors.setdefault(adapter_name, {})[factor] = shape
+            if location is None:
+                continue
+            instance, rung = location
+            factors.setdefault(instance, {}).setdefault(rung, {}).setdefault(adapter_name, {})[
+                factor
+            ] = shape
         if not factors:
             return False
-        for seen in factors.values():
-            observed = Counter()
-            for rung in ladder:
-                namespaces = seen.get(rung, {})
+        for seen_rungs in factors.values():
+            if set(seen_rungs) != set(expected_rungs):
+                return False
+            for rung, expected_pair in expected_rungs.items():
+                namespaces = seen_rungs[rung]
                 if len(namespaces) != 1:
                     return False
-                namespace, namespace_factors = next(iter(namespaces.items()))
-                if adapter_namespace is None:
-                    adapter_namespace = namespace
-                elif namespace != adapter_namespace:
+                seen_factors = next(iter(namespaces.values()))
+                if _lora_pair_shapes(seen_factors) != expected_pair:
                     return False
-                pair = _lora_pair_shapes(namespace_factors)
-                if pair is None:
-                    return False
-                observed[pair] += 1
-            if observed != expected_pairs:
-                return False
         expert_layers = {
             prefix
             for instance in factors
@@ -189,44 +273,89 @@ def has_complete_fused_expert_tensors(
     return True
 
 
-def _expected_fused_expert_pairs(
-    config: Mapping[str, Any], model_id: str, target_count: int
-) -> Counter[tuple[tuple[int, ...], tuple[int, ...]]] | None:
-    """Return the exact unordered factor pairs PEFT must serialize for one fused owner."""
-    rank_pattern = config.get("rank_pattern")
-    if rank_pattern is not None and rank_pattern != {}:
-        return None
-    rank = declared_lora_ranks(config).default
-    model = get_model(model_id)
-    experts = model.lora_expert_count
-    if rank is None or experts <= 0 or model.num_layers <= 0:
-        return None
-    fused_count = model.num_layers * experts
-    dimensions = [
-        (input_dim, output_dim)
-        for input_dim, output_dim, count in model.lora_target_shapes
-        if count == fused_count
-    ]
-    if len(dimensions) != target_count:
-        return None
-    stacked_rank = rank * experts
-    return Counter(
-        (
-            ((stacked_rank, input_dim), (output_dim, stacked_rank))
-            for input_dim, output_dim in dimensions
-        )
+def _fused_tensor_location(
+    module_path: str, owner: str, rungs: frozenset[str]
+) -> tuple[str, str] | object | None:
+    """Locate one tensor on an exact concrete fused owner rung."""
+    if module_path.endswith(f".{owner}"):
+        instance, rung = module_path[: -len(owner) - 1], ""
+    else:
+        marker = f".{owner}."
+        if marker not in module_path:
+            return None
+        instance, rung = module_path.rsplit(marker, 1)
+    if rung not in rungs:
+        return _INVALID_FUSED_LOCATION
+    layer_prefix = _layer_prefix(instance)
+    if layer_prefix is None or instance != layer_prefix:
+        return _INVALID_FUSED_LOCATION
+    return f"{instance}.{owner}", rung
+
+
+def _has_ordinary_evidence(
+    tensors: list[_LoraTensor],
+    config: Mapping[str, Any],
+    fused_rungs: Mapping[str, Mapping[str, _LoraPair]],
+) -> bool:
+    """Validate concrete ordinary target evidence with per-module ranks and namespaces."""
+    modules = config.get("target_modules")
+    all_linear = modules == "all-linear"
+    targets = () if all_linear else tuple(modules) if isinstance(modules, list) else ()
+    groups: dict[str, dict[str, dict[str, tuple[str, tuple[int, ...]]]]] = {}
+    evidence: set[str] = set()
+    for module_path, factor, adapter_name, key, shape in tensors:
+        if _is_fused_rung(module_path, fused_rungs):
+            continue
+        matched = tuple(target for target in targets if _anchored_suffix_match(module_path, target))
+        if not all_linear and not matched:
+            continue
+        evidence.update(matched)
+        groups.setdefault(module_path, {}).setdefault(adapter_name, {})[factor] = (key, shape)
+    if not groups or (not all_linear and evidence != set(targets)):
+        return False
+
+    declared = declared_lora_ranks(config)
+    for module_path, namespaces in groups.items():
+        if len(namespaces) != 1 or _rank_for_module(module_path, declared) is None:
+            return False
+        factors = next(iter(namespaces.values()))
+        if set(factors) != {"A", "B"}:
+            return False
+        for key, shape in factors.values():
+            if not _is_positive_2d(shape) or lora_tensor_rank_disagrees(key, shape, declared):
+                return False
+    return True
+
+
+def _is_fused_rung(module_path: str, fused_rungs: Mapping[str, Mapping[str, _LoraPair]]) -> bool:
+    """Return whether a module path is one of the exact fused wrapper rungs."""
+    return any(
+        _fused_tensor_location(module_path, owner, frozenset(rungs))
+        not in (None, _INVALID_FUSED_LOCATION)
+        for owner, rungs in fused_rungs.items()
     )
 
 
-def _lora_pair_shapes(
-    factors: Mapping[str, tuple[int, ...]],
-) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
-    """Return one complete 2-D A/B shape pair without claiming model compatibility."""
-    if not {"A", "B"} <= factors.keys():
+def _anchored_suffix_match(module_path: str, target: str) -> bool:
+    """Mirror PEFT list-target matching without accepting partial segment suffixes."""
+    return module_path == target or module_path.endswith(f".{target}")
+
+
+def _is_positive_2d(shape: tuple[int, ...]) -> bool:
+    """Return whether a tensor shape is positive, integral, and two-dimensional."""
+    return len(shape) == 2 and all(
+        isinstance(dimension, int) and not isinstance(dimension, bool) and dimension > 0
+        for dimension in shape
+    )
+
+
+def _lora_pair_shapes(factors: Mapping[str, tuple[int, ...]]) -> _LoraPair | None:
+    """Return one complete positive 2-D A/B shape pair."""
+    if set(factors) != {"A", "B"}:
         return None
     shape_a = factors["A"]
     shape_b = factors["B"]
-    if len(shape_a) != 2 or len(shape_b) != 2:
+    if not _is_positive_2d(shape_a) or not _is_positive_2d(shape_b):
         return None
     return shape_a, shape_b
 

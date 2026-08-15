@@ -324,7 +324,8 @@ def test_fused_expert_config_accepts_exact_target_order_variants(targets):
     from flash.adapters.fused_experts import validate_fused_expert_adapter_config
 
     validate_fused_expert_adapter_config(
-        {"target_parameters": targets, "target_modules": ["q_proj"]}, _FUSED_MODEL
+        {"r": 16, "target_parameters": targets, "target_modules": ["q_proj"]},
+        _FUSED_MODEL,
     )
 
 
@@ -344,7 +345,7 @@ def test_fused_expert_config_accepts_exact_target_order_variants(targets):
 def test_fused_expert_config_rejects_noncanonical_target_parameters(targets):
     from flash.adapters.fused_experts import validate_fused_expert_adapter_config
 
-    config = {"target_modules": ["q_proj"]}
+    config = {"r": 16, "target_modules": ["q_proj"]}
     if targets is not _MISSING:
         config["target_parameters"] = targets
     with pytest.raises(ValueError, match=r"target_parameters|fused expert targets"):
@@ -354,8 +355,6 @@ def test_fused_expert_config_rejects_noncanonical_target_parameters(targets):
 @pytest.mark.parametrize(
     "modules",
     [
-        pytest.param(_MISSING, id="missing"),
-        pytest.param(None, id="null"),
         pytest.param("all-linear", id="string"),
         pytest.param(["q_proj", "v_proj"], id="list"),
     ],
@@ -363,10 +362,31 @@ def test_fused_expert_config_rejects_noncanonical_target_parameters(targets):
 def test_fused_expert_config_accepts_supported_target_module_shapes(modules):
     from flash.adapters.fused_experts import validate_fused_expert_adapter_config
 
-    config = {"target_parameters": list(_FUSED_TARGETS)}
+    validate_fused_expert_adapter_config(
+        {
+            "r": 16,
+            "target_parameters": list(_FUSED_TARGETS),
+            "target_modules": modules,
+        },
+        _FUSED_MODEL,
+    )
+
+
+@pytest.mark.parametrize(
+    "modules",
+    [
+        pytest.param(_MISSING, id="missing"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_fused_expert_config_rejects_missing_ordinary_targets(modules):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    config = {"r": 16, "target_parameters": list(_FUSED_TARGETS)}
     if modules is not _MISSING:
         config["target_modules"] = modules
-    validate_fused_expert_adapter_config(config, _FUSED_MODEL)
+    with pytest.raises(ValueError, match="target_modules"):
+        validate_fused_expert_adapter_config(config, _FUSED_MODEL)
 
 
 @pytest.mark.parametrize(
@@ -394,21 +414,115 @@ def test_fused_expert_config_rejects_synthetic_or_malformed_target_modules(modul
 
     with pytest.raises(ValueError, match="target_modules"):
         validate_fused_expert_adapter_config(
-            {"target_parameters": list(_FUSED_TARGETS), "target_modules": modules},
+            {
+                "r": 16,
+                "target_parameters": list(_FUSED_TARGETS),
+                "target_modules": modules,
+            },
             _FUSED_MODEL,
         )
 
 
-@pytest.mark.parametrize("rank_pattern", [{"mlp.experts": 16}, [], "mlp.experts"])
-def test_fused_expert_config_rejects_unsupported_rank_patterns(rank_pattern):
+def test_fused_expert_config_accepts_per_target_rank_patterns_and_scalar_fallback():
     from flash.adapters.fused_experts import validate_fused_expert_adapter_config
 
-    with pytest.raises(ValueError, match="unsupported rank_pattern"):
+    validate_fused_expert_adapter_config(
+        {
+            "r": 16,
+            "target_parameters": list(_FUSED_TARGETS),
+            "target_modules": ["q_proj"],
+            "rank_pattern": {"mlp.experts.gate_up_proj": 8},
+        },
+        _FUSED_MODEL,
+    )
+
+
+def test_fused_expert_config_accepts_overrides_for_every_declared_target():
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    validate_fused_expert_adapter_config(
+        {
+            "target_parameters": list(_FUSED_TARGETS),
+            "target_modules": ["q_proj", "v_proj"],
+            "rank_pattern": {
+                "mlp.experts.gate_up_proj": 8,
+                "mlp.experts.down_proj": 4,
+                "q_proj": 16,
+                "v_proj": 8,
+            },
+        },
+        _FUSED_MODEL,
+    )
+
+
+@pytest.mark.parametrize(
+    "rank_pattern",
+    [
+        pytest.param([], id="list"),
+        pytest.param("mlp.experts", id="string"),
+        pytest.param({"": 16}, id="empty-pattern"),
+        pytest.param({"mlp.experts": 0}, id="zero-rank"),
+        pytest.param({"mlp.experts": -1}, id="negative-rank"),
+        pytest.param({"mlp.experts": True}, id="bool-rank"),
+        pytest.param({"mlp.experts": 1.5}, id="float-rank"),
+    ],
+)
+def test_fused_expert_config_rejects_malformed_rank_patterns(rank_pattern):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match="rank_pattern"):
+        validate_fused_expert_adapter_config(
+            {
+                "r": 16,
+                "target_parameters": list(_FUSED_TARGETS),
+                "target_modules": ["q_proj"],
+                "rank_pattern": rank_pattern,
+            },
+            _FUSED_MODEL,
+        )
+
+
+def test_fused_expert_config_rejects_malformed_rank_pattern_regex():
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match="rank_pattern"):
+        validate_fused_expert_adapter_config(
+            {
+                "r": 16,
+                "target_parameters": list(_FUSED_TARGETS),
+                "target_modules": ["q_proj"],
+                "rank_pattern": {"[": 8},
+            },
+            _FUSED_MODEL,
+        )
+
+
+def test_fused_expert_config_rejects_unresolved_fused_target_rank():
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match="no resolved LoRA rank"):
         validate_fused_expert_adapter_config(
             {
                 "target_parameters": list(_FUSED_TARGETS),
                 "target_modules": ["q_proj"],
-                "rank_pattern": rank_pattern,
+                "rank_pattern": {"mlp.experts.gate_up_proj": 8},
+            },
+            _FUSED_MODEL,
+        )
+
+
+def test_fused_expert_config_rejects_unresolved_ordinary_target_rank():
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match="ordinary target_modules"):
+        validate_fused_expert_adapter_config(
+            {
+                "target_parameters": list(_FUSED_TARGETS),
+                "target_modules": ["q_proj"],
+                "rank_pattern": {
+                    "mlp.experts.gate_up_proj": 8,
+                    "mlp.experts.down_proj": 4,
+                },
             },
             _FUSED_MODEL,
         )

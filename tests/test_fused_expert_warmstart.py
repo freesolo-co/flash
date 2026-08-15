@@ -14,8 +14,8 @@ _TARGETS = [
     "mlp.experts.down_proj",
 ]
 _EXPECTED_PAIRS = (
-    ((8192, 2048), (1024, 8192)),
     ((8192, 512), (2048, 8192)),
+    ((8192, 2048), (1024, 8192)),
 )
 
 
@@ -37,12 +37,22 @@ def _wrapper_tensors(prefix, pair, factor_leaves=("default.weight", "default.wei
     }
 
 
+def _ordinary_tensors(
+    target="q_proj",
+    pair=((32, 2048), (2048, 32)),
+    factor_leaves=("default.weight", "default.weight"),
+):
+    prefix = f"base_model.model.layers.0.self_attn.{target}"
+    return _wrapper_tensors(prefix, pair, factor_leaves)
+
+
 def _complete_expert_tensors(
     *,
     owner_segment="mlp.experts",
     pairs=_EXPECTED_PAIRS,
     swap_rungs=False,
     factor_leaves=("default.weight", "default.weight"),
+    include_ordinary=True,
 ):
     tensors = {}
     for layer in range(40):
@@ -50,6 +60,8 @@ def _complete_expert_tensors(
         first, second = reversed(pairs) if swap_rungs and layer % 2 else pairs
         tensors.update(_wrapper_tensors(owner, first, factor_leaves))
         tensors.update(_wrapper_tensors(f"{owner}.base_layer", second, factor_leaves))
+    if include_ordinary:
+        tensors.update(_ordinary_tensors(factor_leaves=factor_leaves))
     return tensors
 
 
@@ -89,10 +101,12 @@ def _valid_config(**overrides):
 def _patch_export_metadata(monkeypatch):
     import flash.engine.worker.verl.checkpoints as checkpoints
 
+    tensors = _complete_expert_tensors()
+    tensors.update(_ordinary_tensors(target="v_proj"))
     monkeypatch.setattr(
         checkpoints,
         "_read_adapter_tensor_metadata",
-        lambda _path: _complete_expert_tensors(),
+        lambda _path: tensors,
     )
     return checkpoints.stamp_adapter_dir_provenance
 
@@ -328,13 +342,17 @@ def test_export_rejects_structurally_compatible_wrong_shapes(monkeypatch, tmp_pa
     assert config_path.read_bytes() == before
 
 
-def test_tensor_analyzer_accepts_exact_catalog_shapes_and_unordered_rungs():
+def test_tensor_analyzer_accepts_canonical_qwen36_rung_geometry():
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
-    config = _valid_config()
-    assert has_complete_fused_expert_tensors(_complete_expert_tensors(), config, _MODEL_ID)
-    assert has_complete_fused_expert_tensors(
-        _complete_expert_tensors(swap_rungs=True), config, _MODEL_ID
+    assert has_complete_fused_expert_tensors(_complete_expert_tensors(), _valid_config(), _MODEL_ID)
+
+
+def test_tensor_analyzer_rejects_swapped_qwen36_rungs():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    assert not has_complete_fused_expert_tensors(
+        _complete_expert_tensors(swap_rungs=True), _valid_config(), _MODEL_ID
     )
 
 
@@ -439,6 +457,164 @@ def test_tensor_analyzer_requires_the_nested_peft_wrapper_ladder():
         tensors.update(_wrapper_tensors(f"{owner}.foo", _EXPECTED_PAIRS[0]))
         tensors.update(_wrapper_tensors(f"{owner}.bar", _EXPECTED_PAIRS[1]))
     assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+
+
+def _expert_namespace_mismatch(rung):
+    tensors = _complete_expert_tensors()
+    suffix = "" if rung == "outer" else ".base_layer"
+    prefix = f"base_model.model.layers.0.mlp.experts{suffix}"
+    default_key = f"{prefix}.lora_B.default.weight"
+    tensors[f"{prefix}.lora_B.other.weight"] = tensors.pop(default_key)
+    return tensors
+
+
+@pytest.mark.parametrize("boundary", ["export", "warmstart"])
+@pytest.mark.parametrize("rung", ["outer", "nested"])
+def test_boundaries_reject_cross_namespace_fused_pairs(monkeypatch, tmp_path, boundary, rung):
+    tensors = _expert_namespace_mismatch(rung)
+    if boundary == "export":
+        import flash.engine.worker.verl.checkpoints as checkpoints
+
+        monkeypatch.setattr(checkpoints, "_read_adapter_tensor_metadata", lambda _path: tensors)
+        config = {
+            "peft_type": "LORA",
+            "r": 32,
+            "target_modules": ["q_proj", "experts", "base_layer"],
+            "target_parameters": None,
+        }
+
+        def validate():
+            checkpoints.stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+
+        expected_error = RuntimeError
+    else:
+        import flash.engine.worker.model.adapter as adapter
+
+        worker = _import_worker(monkeypatch)
+        monkeypatch.setattr(adapter, "_read_adapter_tensor_metadata", lambda _path: tensors)
+        config = _valid_config()
+
+        def validate():
+            worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path))
+
+        expected_error = ValueError
+
+    _write_expert_adapter(tmp_path, config=config)
+    before = (tmp_path / "adapter_config.json").read_bytes()
+    with pytest.raises(expected_error, match="complete fused expert LoRA weights"):
+        validate()
+    assert (tmp_path / "adapter_config.json").read_bytes() == before
+
+
+def test_tensor_analyzer_requires_each_declared_ordinary_target():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    config = _valid_config(target_modules=["q_proj", "v_proj"])
+    assert not has_complete_fused_expert_tensors(_complete_expert_tensors(), config, _MODEL_ID)
+
+
+def test_tensor_analyzer_uses_anchored_ordinary_target_suffixes():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    config = _valid_config(target_modules=["proj"])
+    assert not has_complete_fused_expert_tensors(_complete_expert_tensors(), config, _MODEL_ID)
+
+
+def test_tensor_analyzer_requires_ordinary_evidence_for_all_linear():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    config = _valid_config(target_modules="all-linear")
+    assert not has_complete_fused_expert_tensors(
+        _complete_expert_tensors(include_ordinary=False), config, _MODEL_ID
+    )
+
+
+def test_tensor_analyzer_rejects_unrecognized_fused_descendant_as_all_linear_evidence():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _complete_expert_tensors(include_ordinary=False)
+    tensors.update(
+        _wrapper_tensors(
+            "base_model.model.layers.0.mlp.experts.base_layer.base_layer",
+            ((32, 2048), (2048, 32)),
+        )
+    )
+    assert not has_complete_fused_expert_tensors(
+        tensors, _valid_config(target_modules="all-linear"), _MODEL_ID
+    )
+
+
+def test_tensor_analyzer_rejects_cross_namespace_ordinary_pair():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _complete_expert_tensors(include_ordinary=False)
+    prefix = "base_model.model.layers.0.self_attn.q_proj"
+    tensors.update(
+        _wrapper_tensors(
+            prefix,
+            ((32, 2048), (2048, 32)),
+            factor_leaves=("default.weight", "other.weight"),
+        )
+    )
+    assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+
+
+def test_tensor_analyzer_rejects_extra_ordinary_namespace():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _complete_expert_tensors()
+    prefix = "base_model.model.layers.0.self_attn.q_proj"
+    tensors.update(
+        _wrapper_tensors(
+            prefix,
+            ((32, 2048), (2048, 32)),
+            factor_leaves=("other.weight", "other.weight"),
+        )
+    )
+    assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+
+
+def test_tensor_analyzer_rejects_ordinary_rank_mismatch():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _complete_expert_tensors(include_ordinary=False)
+    tensors.update(_ordinary_tensors(pair=((16, 2048), (2048, 16))))
+    assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+
+
+def test_tensor_analyzer_accepts_per_target_fused_rank_overrides():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    config = _valid_config(
+        rank_pattern={
+            "mlp.experts.gate_up_proj": 16,
+            "mlp.experts.down_proj": 8,
+        }
+    )
+    pairs = (
+        ((2048, 512), (2048, 2048)),
+        ((4096, 2048), (1024, 4096)),
+    )
+    assert has_complete_fused_expert_tensors(
+        _complete_expert_tensors(pairs=pairs), config, _MODEL_ID
+    )
+
+
+def test_tensor_analyzer_accepts_ordinary_override_with_fused_scalar_fallback():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _complete_expert_tensors(include_ordinary=False)
+    tensors.update(_ordinary_tensors(pair=((16, 2048), (2048, 16))))
+    assert has_complete_fused_expert_tensors(
+        tensors, _valid_config(rank_pattern={"q_proj": 16}), _MODEL_ID
+    )
+
+
+def test_tensor_analyzer_rejects_scalar_shapes_when_fused_override_applies():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    config = _valid_config(rank_pattern={"mlp.experts.gate_up_proj": 16})
+    assert not has_complete_fused_expert_tensors(_complete_expert_tensors(), config, _MODEL_ID)
 
 
 @pytest.mark.parametrize(
