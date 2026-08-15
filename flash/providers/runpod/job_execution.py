@@ -691,10 +691,15 @@ def poll_job(
         if terminal is not None:
             return terminal
         now = _jobs.time.time()
+        # before the queue classifier, not after: its queued line reports the no-progress deadline
+        # among the budgets it may quote, and a heartbeat that became visible this iteration would
+        # otherwise be charged against the previous last_progress -- reporting the budget as spent
+        # in the same iteration that resets it and keeps polling. Still one reader call, and `now`
+        # is read in the same position as before so the clock-read sequence per poll is unchanged.
+        _update_heartbeat(context, state)
         terminal = _classify_queue_state(context, state, status, now)
         if terminal is not None:
             return terminal
-        _update_heartbeat(context, state)
         terminal = _classify_stall(context, state, status)
         if terminal is not None:
             return terminal

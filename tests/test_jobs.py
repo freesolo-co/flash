@@ -837,6 +837,92 @@ def test_capacity_is_still_reported_in_the_window_where_its_timer_is_rearming():
     assert "no-progress" not in rearming, rearming
 
 
+def test_an_unarmed_health_timer_never_displaces_the_capacity_deadline():
+    # The unhealthy/throttled timers arm one poll late and are then only re-checked on the ~90s
+    # health cadence, while the capacity timer is driven EVERY poll. So an unarmed health timer
+    # whose grace merely ties the capacity one cannot fire first, and quoting it would name a
+    # deadline the run never reaches. Treating an unarmed timer as zero elapsed made it win the
+    # min() on the tie -- the same false remaining-time, arriving through the arming gap.
+    tie = _note(0.0, throttled=True, throttled_since=None, throttled_grace_s=900.0)
+    assert "capacity grace" in tie, tie
+    assert "throttled" not in tie, tie
+
+    unhealthy_tie = _note(0.0, unhealthy=True, unhealthy_since=None, unhealthy_grace_s=900.0)
+    assert "capacity grace" in unhealthy_tie, unhealthy_tie
+    assert "unhealthy" not in unhealthy_tie, unhealthy_tie
+
+    # but the handicap is one health cadence, NOT a veto: an unarmed timer whose grace is genuinely
+    # shorter still fires first and is still the honest number to report. Dropping unarmed timers
+    # outright would hide the 240s unhealthy grace behind a 900s capacity one.
+    from flash.providers.runpod.jobs import HEALTH_ARM_PENALTY_S
+
+    shorter = _note(0.0, unhealthy=True, unhealthy_since=None, unhealthy_grace_s=240.0)
+    assert "unhealthy grace" in shorter, shorter
+    assert HEALTH_ARM_PENALTY_S == 90.0
+
+    # once armed, a genuinely nearer health deadline is still the one reported.
+    armed = _note(60.0, throttled=True, throttled_since=0.0, throttled_grace_s=300.0)
+    assert "throttled grace" in armed, armed
+
+
+def test_the_elapsed_figure_is_never_negative():
+    # last_progress is stamped by _update_heartbeat from its OWN clock read, so it can land a tick
+    # after the `now` the note is given. "waited -20s of 60s" reads as a bug rather than as a fresh
+    # timer, and it is the operator-facing string this whole change exists to make trustworthy.
+    fresh = _note(0.0, stall_since=20.0, stall_limit_s=60.0)
+    assert "waited 0s of 60s no-progress limit" in fresh, fresh
+
+
+def test_the_queued_line_reports_progress_that_landed_in_this_same_iteration(monkeypatch):
+    # _update_heartbeat used to run one step AFTER the queued line, so a heartbeat that became
+    # visible during this iteration was charged against the previous last_progress: the note could
+    # report the no-progress budget as exhausted, and _update_heartbeat would then reset
+    # last_progress and _classify_stall would keep polling -- a "wedged" line for a live run.
+    import io
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api, "endpoint_health_for_fingerprint", lambda eid, _fp, **_kw: {"workers": {}}
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=20.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    # a heartbeat whose ts advances on every read: progress is landing continuously, so the
+    # no-progress budget must never be reported as spent.
+    hb = itertools.count(start=1)
+    log = io.StringIO()
+    jobs.poll_job(
+        _runpod_handle(jobs),
+        log=log,
+        interval_s=0,
+        heartbeat_reader=lambda *a, **k: {
+            "stage": "train",
+            "step": next(hb),
+            "ts": float(next(hb)),
+            "attempt": 0,
+        },
+        setup_grace_s=3000.0,
+        stall_after_s=200.0,
+        queue_grace_s=900.0,
+        on_last_gpu=True,
+    )
+    queued = [ln for ln in log.getvalue().splitlines() if "queued; workers:" in ln]
+    assert queued, log.getvalue()
+    # quoting the no-progress limit is right here -- it IS the nearest deadline. What must never
+    # happen is reporting it as SPENT: progress lands every poll, so the elapsed figure has to be
+    # the fresh one (one 20s clock tick), not the whole wait charged against a stale last_progress.
+    progress = [ln for ln in queued if "no-progress" in ln]
+    assert progress, queued
+    # one clock tick of elapsed at most: the heartbeat that landed this iteration is what the note
+    # charges against. Before the fix the whole preceding wait was charged (40s and climbing), which
+    # is how a live run got told its no-progress budget was nearly spent.
+    assert all("waited 0s of 200s" in ln for ln in progress), progress
+
+
 def test_longer_capacity_explanation_is_gated_on_the_grace_actually_in_force():
     # poll_job exposes on_last_gpu and queue_grace_s independently and never ties the flag to
     # LAST_GPU_CAPACITY_GRACE_S, so a caller can set on_last_gpu while overriding the grace DOWN.

@@ -92,6 +92,12 @@ LAST_GPU_CAPACITY_GRACE_S = 900.0
 # observation nobody can still confirm.
 WORKER_COMING_UP_TTL_S = 300.0
 
+# the handicap `queue_wait_note` charges an unarmed unhealthy/throttled timer when deciding which
+# deadline to report. Such a timer arms on the NEXT poll and is then only re-checked on the 90s
+# health cadence, while the capacity timer is driven every poll -- so on an equal grace the capacity
+# timer terminates the wait first. One health cadence is the tightest bound on that lateness.
+HEALTH_ARM_PENALTY_S = 90.0
+
 TERMINAL_OK = {"COMPLETED"}
 # CANCELLED/TIMED_OUT = provider-killed (retriable); FAILED = worker died on its own (fails fast).
 PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
@@ -343,15 +349,23 @@ def queue_wait_note(
 
     The no-progress limit always applies, so there is always at least one deadline to report.
     """
-    # (remaining, waited, budget, label, clause). a not-yet-armed timer has charged no time: this
-    # poll is the one that arms it, and the arming happens after this line is printed.
+    # (remaining, waited, budget, label, clause). An unarmed health timer (`since is None`) has
+    # charged no time AND arms only on the next poll, after which it is checked on the ~90s health
+    # cadence while the capacity timer is driven every poll. So it needs a strictly shorter grace to
+    # fire first -- on a tie the capacity timer gets there first, and quoting the health grace would
+    # name a deadline the run never reaches. HEALTH_ARM_PENALTY_S expresses that one-poll handicap;
+    # a genuinely shorter grace still wins and is still reported.
     candidates = []
     if unhealthy:
-        waited = 0.0 if unhealthy_since is None else now - unhealthy_since
-        candidates.append((unhealthy_grace_s - waited, waited, unhealthy_grace_s, "unhealthy", ""))
+        armed = unhealthy_since is not None
+        waited = now - unhealthy_since if armed else 0.0
+        remaining = unhealthy_grace_s - waited + (0.0 if armed else HEALTH_ARM_PENALTY_S)
+        candidates.append((remaining, waited, unhealthy_grace_s, "unhealthy", ""))
     if throttled:
-        waited = 0.0 if throttled_since is None else now - throttled_since
-        candidates.append((throttled_grace_s - waited, waited, throttled_grace_s, "throttled", ""))
+        armed = throttled_since is not None
+        waited = now - throttled_since if armed else 0.0
+        remaining = throttled_grace_s - waited + (0.0 if armed else HEALTH_ARM_PENALTY_S)
+        candidates.append((remaining, waited, throttled_grace_s, "throttled", ""))
     # the caller only asks for a note when it has just confirmed no usable or recovering worker, so
     # the capacity timer is either running or about to re-arm on the next poll. a cleared `since`
     # therefore means zero elapsed, not "not applicable": _classify_queue_state clears it via the
@@ -388,10 +402,10 @@ def queue_wait_note(
     if label == "run wall":
         return f"{int(max(budget, 0.0))}s left of the run wall deadline"
     unit = "limit" if label == "no-progress" else "grace"
-    # never quote more elapsed than the budget: this line is printed before the timer is checked,
-    # so the poll that fails would otherwise read "waited 360s of 240s". at the cap it says what
-    # the operator needs -- the budget is spent -- and the failure detail carries the exact figure.
-    return f"waited {int(min(waited, budget))}s of {int(budget)}s {label} {unit}{clause}"
+    # clamped at both ends: never more elapsed than the budget (this line prints before the timer
+    # is checked, so it would otherwise read "waited 360s of 240s"), and never negative -- a timer
+    # stamped a moment after `now` was read would print "waited -20s", which reads as a bug.
+    return f"waited {int(min(max(waited, 0.0), budget))}s of {int(budget)}s {label} {unit}{clause}"
 
 
 def submit_run(

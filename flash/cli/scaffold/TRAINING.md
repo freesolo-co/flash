@@ -343,8 +343,13 @@ subset instead of erroring. Re-check it whenever the dataset or the params chang
 
 GPU allocation and HF artifacts are **managed by default**: leave `[gpu] type` unset to
 let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains
-platform-managed. For controlled experiments, `[gpu] provider` restricts allocation to one
-provider and `[gpu] type` pins one exact active validated GPU class. Run artifacts are stored in a
+platform-managed. `[gpu] providers` takes an ordered list of provider names and prefers them in
+that order: the preference ranks ahead of cost, so a preferred provider wins even when a cheaper
+one is offered, but providers you did not name stay eligible behind them, so a preference never
+costs you failover. `[gpu] provider` instead hard-pins allocation to one provider, which does
+remove that failover, and cannot be combined with `providers`. An unknown name is rejected at parse
+time and the error lists the names your plane accepts. `[gpu] type` pins one exact active
+validated GPU class. Run artifacts are stored in a
 private environment-scoped repo with content-addressed Flash code snapshots. Set `seed` only at the
 top level. Compose or tweak configs without editing files: `--config extra.toml` (deep-merge) and
 `--set key=value` (e.g. `--set train.epochs=3`). `--gpus N` is
@@ -1366,8 +1371,11 @@ Set a count only when you want to pin the maximum:
 [gpu]
 type = "B200"
 count = 4
-# provider is optional: allocation compares fitting shapes across every configured provider.
 ```
+
+Add `providers = [...]` to that table to rank providers by preference ahead of cost; providers you
+leave out still follow as failover candidates. An unknown name is rejected at parse time, and the
+error names the accepted set.
 
 `flash train configs/grpo.toml --gpus 4` sets the same key from the command line. The flag is exactly
 `--set gpu.count=4`, and the same 1..8 bound rejects a bad value.
