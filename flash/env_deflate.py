@@ -169,14 +169,10 @@ _PDF_INDIRECT_DECODE_PARMS = re.compile(
 # `/Predictor` to every reader, and matching the literal bytes meant a predictor written that way
 # named nothing here: the stream was inflated and scanned as content while its bytes were still
 # horizontal differences, so a key that a conforming decode reconstructs published intact.
-#
-# its value is separated with the same grammar as every other PDF token. `%comment\n` is as legal
-# there as a space: `/Predictor%comment\n12` reconstructed a key from PNG-Up differences while the
-# whitespace spelling was refused, because `\s*` left the predictor undeclared here.
 _PREDICTOR_NAME = b"".join(
     rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for letter in b"Predictor"
 )
-_PDF_PREDICTOR = re.compile(rb"/%s%s(\d+)" % (_PREDICTOR_NAME, _PDF_SEPARATOR))
+_PDF_PREDICTOR = re.compile(rb"/%s\s*(\d+)" % _PREDICTOR_NAME)
 
 # How far FORWARD of the filter name the dictionary slice runs. Backwards it runs to the
 # dictionary's own `<<` instead, which is the real boundary rather than a guessed distance.
@@ -227,25 +223,23 @@ _LATIN1_TEXT = frozenset(range(0x20, 0x7F)) | frozenset(range(0xA0, 0x100))
 
 
 def _gzip_header_unfinished(probe: bytes) -> bool:
-    """Whether a gzip header consumes the probe before enough payload is visible to judge it.
+    """Whether a gzip header declares OPTIONAL FIELDS that run past all of `probe`.
 
-    RFC 1952 puts a fixed 10-byte header first, then four optional fields the flag byte announces: an
-    extra field of up to 65,535 bytes, a NUL-terminated name, a NUL-terminated comment, and a 2-byte
-    header CRC. A maximum-size extra field alone is longer than the 64 KiB probe the overlay search
-    reads, so the deflate bits never came into view and a perfectly valid stream inflated to nothing
-    -- which the caller read as "not a stream" and passed over. Undecided is not clean, and here the
-    honest answer is that the payload has not been reached yet.
+    RFC 1952 puts a fixed 10-byte header first, then up to three optional fields the flag byte
+    announces: an extra field of up to 65,535 bytes, a NUL-terminated name, a NUL-terminated
+    comment, and a 2-byte header CRC. A maximum-size extra field alone is longer than the 64 KiB
+    probe the overlay search reads, so the deflate bits never came into view and a perfectly valid
+    stream inflated to nothing -- which the caller read as "not a stream" and passed over. Undecided
+    is not clean, and here the honest answer is that the payload has not been reached yet.
 
-    The test is that the DECLARED fields consume the bytes available, never merely that a short probe
-    ran out. Those are different questions, and answering the second accepted 1,638 of 2,000 random
-    bodies behind a chance gzip magic: a 64-byte scrap ends inside its own fixed header, so everything
-    looked unfinished. The flags and lengths have to claim the boundary.
+    The test is that the DECLARED header outruns the bytes available, never merely that the walk
+    reached the end of them. Those are different questions on a short probe, and answering the
+    second accepted 1,638 of 2,000 random bodies behind a chance gzip magic: a 64-byte scrap ends
+    inside its own fixed header, so everything looked unfinished. The caller's false-positive
+    budget is what that would have spent -- every chance magic in a model shard becoming a
+    candidate to expand -- so the flags have to claim the length, not the probe merely lack it.
 
-    Two payload bytes are required because one cannot complete even an empty fixed-Huffman deflate
-    block. A 65,523-byte FEXTRA left only one byte in the probe; with or without FHCRC, the valid
-    stream behind a shell stub was dismissed while its standalone copy exposed the key.
-
-    True means only "payload not yet judgeable". It is not a claim that the stream is real, so a
+    True means only "header still in progress". It is not a claim that the stream is real, so a
     candidate reaching it is expanded and judged there rather than accepted here.
     """
     if len(probe) < 12 or not probe.startswith(b"\x1f\x8b\x08"):
@@ -260,7 +254,7 @@ def _gzip_header_unfinished(probe: bytes) -> bool:
     # and lands well inside the probe, which is not the condition this exists for.
     if flags & 0b100:
         at = 12 + int.from_bytes(probe[10:12], "little")
-        if at >= len(probe):
+        if at > len(probe):
             return True
     # FNAME and FCOMMENT are NUL-terminated and unbounded, so a legal one longer than the probe
     # reaches the end with no terminator -- the same "payload not reached yet" the extra field
@@ -277,16 +271,12 @@ def _gzip_header_unfinished(probe: bytes) -> bool:
     # expansion attempt which then judges the candidate on what it actually inflates to.
     for present in (0b1000, 0b10000):
         if flags & present:
-            if at >= len(probe):
-                return True
             end = probe.find(b"\0", at)
             if end < 0:
                 unterminated = probe[at:]
-                return all(byte in _LATIN1_TEXT for byte in unterminated)
+                return bool(unterminated) and all(byte in _LATIN1_TEXT for byte in unterminated)
             at = end + 1
-    if flags & 0b10:
-        at += 2
-    return len(probe) - at < 2
+    return False
 
 
 def _raw_deflate_payload(data: bytes, budget: int) -> bytes | None:

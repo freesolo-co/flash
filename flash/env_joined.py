@@ -14,7 +14,6 @@ knows about bytes, nothing about files, packages or the scan.
 from __future__ import annotations
 
 import re
-import unicodedata
 
 # The seam between two adjacent string literals: a closing quote, whitespace that may cross one
 # line break, then an opening quote of the SAME kind. Removing it welds the pair into the single
@@ -92,25 +91,10 @@ _JSON_ESCAPE = re.compile(rb"\\(?:u00|U000000|x)([0-7][0-9A-Fa-f])")
 # still leaves a long unbroken run on one side for the ordinary pass to match.
 _OCTAL_ESCAPE = re.compile(rb"\\([0-1][0-7][0-7])")
 
-# python also accepts a Unicode character NAME. `fslo_AbCd\N{LATIN CAPITAL LETTER E}f...` is the
-# same string as its plain spelling, but the raw bytes split the shortest accepted key into runs too
-# short to match. Only ASCII results are rejoined because credential bodies are ASCII; an unknown
-# name, a non-ASCII result or a malformed name stays byte-for-byte untouched.
-_NAMED_ESCAPE = re.compile(rb"\\N\{([^{}\r\n]+)\}")
-
 # What those escapes look like as plain substrings, for the guard in `_rejoined`. The octal form
 # has no distinctive prefix -- a backslash alone is its marker -- so it is guarded by the same
 # `\\` test rather than a letter.
-_ESCAPE_MARKERS = (b"\\u", b"\\U", b"\\x", b"\\N{")
-
-
-def _named_ascii(match: re.Match[bytes]) -> bytes:
-    """The ASCII text named by a Python `\\N{...}` escape, or the original escape unchanged."""
-    try:
-        resolved = unicodedata.lookup(match.group(1).decode("ascii"))
-        return resolved.encode("ascii")
-    except (KeyError, UnicodeDecodeError, UnicodeEncodeError):
-        return match.group(0)
+_ESCAPE_MARKERS = (b"\\u", b"\\U", b"\\x")
 
 
 def _rejoined(data: bytes) -> bytes:
@@ -134,7 +118,6 @@ def _rejoined(data: bytes) -> bytes:
     # substitution pass over every byte.
     if any(marker in joined for marker in _ESCAPE_MARKERS):
         joined = _JSON_ESCAPE.sub(lambda point: bytes.fromhex(point.group(1).decode()), joined)
-        joined = _NAMED_ESCAPE.sub(_named_ascii, joined)
     # Guarded by a bare backslash rather than a two-byte marker, since that is all an octal escape
     # has. Still a memchr-speed test, and still absent from most files.
     if b"\\" in joined:

@@ -58,6 +58,13 @@ _COMPRESSED_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7z
 # caller still requires the candidate to produce decompressed output before recognising it.
 _LZMA_ALONE_HEADER_BYTES = 13
 
+# The size an lzma-alone stream declares when the encoder did not know it: all bits set. Any other
+# value is a real length, and one larger than a package may be is not a stream inside a package.
+_LZMA_ALONE_UNKNOWN_SIZE = (1 << 64) - 1
+
+# The largest file a package may carry, which bounds the length an lzma-alone header may declare.
+_MAX_PACKAGE_BYTES = 256 << 20
+
 # Containers this scan can RECOGNISE but not expand, because the stdlib has no decompressor for
 # them. A `.jsonl.zst` -- the ordinary way a dataset shard ships -- holds its credential nowhere a
 # pattern can see, exactly like a gzip, so treating it as final content was a silent bypass.
@@ -208,7 +215,17 @@ def _after_skippable_frames(head: bytes) -> tuple[bytes, bool]:
 
 
 def _looks_like_lzma_alone(head: bytes) -> bool:
-    """Whether `head` has the structural properties of an lzma-alone stream."""
+    """Whether `head` has the structural properties of an lzma-alone stream.
+
+    The uncompressed-size field is what keeps this cheap. The properties byte and the dictionary
+    size between them accept 35.6% of the bytes in an ordinary CSV, and every acceptance costs a
+    decompression probe: widening the dictionary field alone took an 87 MB spreadsheet from a 57
+    second scan to the 60 second budget, so a file that had always published was refused for
+    "takes too long to decompress". The size field is either the unknown marker or a real length,
+    and a real length above the 256 MiB package limit cannot be a stream this package carries --
+    which rejects almost all of that chance traffic without narrowing what a genuine `.lzma` file
+    may declare.
+    """
     if len(head) < _LZMA_ALONE_HEADER_BYTES:
         return False
     properties = head[0]
@@ -216,7 +233,13 @@ def _looks_like_lzma_alone(head: bytes) -> bool:
         return False
     lc = properties % 9
     lp = (properties // 9) % 5
-    return lc + lp <= 4
+    if lc + lp > 4:
+        return False
+    # The dictionary field itself stays unrestricted: liblzma accepts every 32-bit value and rounds
+    # a small one up, so a stream declaring 4,095 decodes perfectly and rejecting it published the
+    # key it holds.
+    declared = int.from_bytes(head[5:_LZMA_ALONE_HEADER_BYTES], "little")
+    return declared == _LZMA_ALONE_UNKNOWN_SIZE or declared <= _MAX_PACKAGE_BYTES
 
 
 def _looks_compressed(head: bytes) -> bool:

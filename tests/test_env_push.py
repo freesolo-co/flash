@@ -8867,3 +8867,37 @@ def test_an_archive_name_scan_inherits_the_package_deadline(tmp_path):
     bound = functools.partial(env_secrets.credential_in_name, deadline=1e18)
     assert bound.keywords["deadline"] == 1e18
     assert bound(f"cache-fslo_{_FAKE_KEY_BODY}.json") == "a Freesolo API key"
+
+
+def test_recognising_lzma_alone_does_not_probe_a_third_of_a_spreadsheet(tmp_path):
+    """The lzma-alone header is structural, so a loose one turns ordinary bytes into candidates.
+
+    Dropping every dictionary restriction to accept the noncanonical sizes a decoder really takes
+    left the properties byte as the only test, and that accepts 35.6% of the bytes in a CSV. Each
+    acceptance costs a decompression probe, which took an 87 MB spreadsheet from a 57 second scan
+    to the 60 second budget -- a file that had always published was refused for taking too long.
+    The declared uncompressed size is what separates them: a real length larger than a package may
+    be is not a stream inside a package.
+    """
+    from flash.env_formats import _looks_like_lzma_alone
+
+    def _header(properties: int, dictionary: int, declared: int) -> bytes:
+        return (
+            bytes([properties]) + dictionary.to_bytes(4, "little") + declared.to_bytes(8, "little")
+        )
+
+    # the unknown-size marker and a plausible length are both accepted
+    assert _looks_like_lzma_alone(_header(0x5D, 4095, (1 << 64) - 1))
+    assert _looks_like_lzma_alone(_header(0x5D, 1 << 23, 4096))
+
+    # a declared length no package can hold is not a stream this package carries
+    assert not _looks_like_lzma_alone(_header(0x5D, 1 << 23, 1 << 40))
+
+    # the bound has to actually thin the chance traffic, not merely exist
+    accepted = sum(
+        1
+        for properties in range(256)
+        for declared in (0x0123456789ABCDEF, 0xFEDCBA9876543210)
+        if _looks_like_lzma_alone(_header(properties, 1 << 23, declared))
+    )
+    assert accepted == 0, "arbitrary size fields still pass, so the probe cost returns"

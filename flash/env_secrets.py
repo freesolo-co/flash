@@ -20,7 +20,6 @@ free of any import from it so the dependency runs one way.
 from __future__ import annotations
 
 import bz2
-import functools
 import gzip
 import io
 import lzma
@@ -766,7 +765,7 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
         depth=depth,
         scan=_scan_member,
         refusal=_Unscannable,
-        named=functools.partial(credential_in_name, deadline=deadline),
+        named=credential_in_name,
         member_limit=_MAX_ARCHIVE_MEMBERS,
     )
 
@@ -788,7 +787,7 @@ def _credential_in_ar(source: Path | bytes, *, deadline: float, depth: int) -> s
         depth=depth,
         scan=_scan_member,
         refusal=_Unscannable,
-        named=functools.partial(credential_in_name, deadline=deadline),
+        named=credential_in_name,
         member_limit=_MAX_ARCHIVE_MEMBERS,
         size_limit=_MAX_NESTED_BUFFER_BYTES,
     )
@@ -802,7 +801,7 @@ def _credential_in_tar(source: Path | bytes, *, deadline: float, depth: int) -> 
         depth=depth,
         scan=_scan_member,
         refusal=_Unscannable,
-        named=functools.partial(credential_in_name, deadline=deadline),
+        named=credential_in_name,
         member_limit=_MAX_ARCHIVE_MEMBERS,
     )
 
