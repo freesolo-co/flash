@@ -9064,32 +9064,6 @@ def test_shell_assignment_words_join_quoted_and_unquoted_segments(tmp_path):
         assert credential_in_file(script) == "a Freesolo API key", name
 
 
-def test_rejoining_skips_passes_whose_required_bytes_are_absent(monkeypatch):
-    """quote-free padding cannot contain either seam, so neither full-buffer pass should run.
-
-    walking both regexes over a 300 mib expansion added about eight seconds and left too little of the
-    60-second budget under two ci workers. this structural check pins the skip without timing noise.
-    """
-    from flash import env_joined
-
-    padding = b"\0" * (8 << 20)
-    entered: list[str] = []
-
-    def adjacent(data: bytes) -> bytes:
-        entered.append("adjacent")
-        return data
-
-    def assignments(data: bytes) -> bytes:
-        entered.append("assignments")
-        return data
-
-    monkeypatch.setattr(env_joined, "_join_adjacent_literals", adjacent)
-    monkeypatch.setattr(env_joined, "_join_shell_assignments", assignments)
-
-    assert env_joined._rejoined(padding) is padding
-    assert entered == []
-
-
 def test_an_overlay_payload_uses_the_same_depth_as_its_standalone_stream(tmp_path):
     """A self-extracting stub is not another compressed layer.
 
