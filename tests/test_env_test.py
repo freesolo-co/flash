@@ -2692,6 +2692,33 @@ def test_env_test_counts_the_turns_actually_replayed_not_the_cap(monkeypatch, tm
     assert "turns=2" in captured.out
 
 
+class _OverlongGoldZeroRewardEnv(_OverlongGoldEnv):
+    """Gold longer than the cap AND a grader that recognizes nothing."""
+
+    def reward(self, completion, example, state=None):
+        self.scored_state = state
+        return 0.0
+
+
+def test_env_test_still_blocks_a_zero_grader_behind_a_truncated_replay(
+    monkeypatch, tmp_path, capsys
+):
+    """A cap/dataset mismatch explains the truncation, not the zero.
+
+    The two findings are independent, so the advisory truncation report must not stand in for the
+    blocking gate: a grader that scores its own reference zero is still broken whether or not the
+    row outran the cap, and swallowing the gate here would turn a FAIL into a PASS.
+    """
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _OverlongGoldZeroRewardEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    captured = capsys.readouterr()
+    assert "cap/dataset mismatch, not an environment fault" in captured.err
+    assert "cannot recognize its own reference answers" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
 class _FixedLengthEnv(_MultiTurnEnv):
     """A HEALTHY env that ends only by exhausting its budget and never sets `state["done"]`.
 
