@@ -1283,24 +1283,27 @@ FINAL_ACTION = re.compile(r"<move>(.*?)</move>\s*\Z", re.DOTALL)
 
 
 class MyEnv(EnvironmentMultiTurn):
-    # set this to match the `thinking` in your run config. your env is not handed the
-    # flag Flash derives from the rendered template, and it cannot derive it itself.
-    THINKING = True
+    # whether YOUR model's chat template pre-opens the reasoning block. this is not the
+    # same as `thinking = true`: Flash derives its own flag as (thinking AND the rendered
+    # prompt ends inside <think>), and does not pass it to your hook. render one prompt
+    # with your model's tokenizer to check, and keep this in step with the model you run.
+    PROMPT_OPENS_THINKING = True
 
     def _answer_of(self, content: str) -> str:
         """The committed answer, with any reasoning span removed.
 
-        Mirrors how Flash splits a turn for grading: the LAST </think> wins, and text
-        before an unclosed <think> is still an answer. Under THINKING a turn with no tag
-        at all is "" rather than the raw text, because a pre-opening template can leave a
-        real reasoning turn tagless and Flash grades that turn as an empty answer --
-        accepting a trailing action from it would advance state the scorer never credited.
+        Mirrors how Flash splits a turn for grading, including the flag: the LAST </think>
+        wins, text before an unclosed <think> is still an answer, and a wholly tagless turn
+        is "" only when the template pre-opened the block -- there it is unfinished
+        reasoning that Flash also grades as empty, so accepting an action from it would
+        advance state the scorer never credited. Under a template that does NOT pre-open,
+        the same turn is a genuine tagless answer and Flash grades it as one.
         """
         if "</think>" in content:
             return content.rsplit("</think>", 1)[1]
         if "<think>" in content:
             return content.split("<think>", 1)[0]
-        return "" if self.THINKING else content
+        return "" if self.PROMPT_OPENS_THINKING else content
 
     def _action_of(self, content: str, state) -> Move | None:
         """The action in a turn, or None if it carries none this state can use.
@@ -1376,13 +1379,19 @@ empty answer. Apply the trailing action and your state advances on a turn the sc
 graded as saying nothing: the board moves, the reward does not, and the episode continues from
 a position the reward never credited.
 
-With `thinking` on, therefore, require a visible `</think>` before you accept any action —
-that is what `_answer_of` returning `""` for a tagless turn under `THINKING` buys you. Mirror
-your run config in that constant, since the hook cannot see it. It costs you the turn
-where a model skipped reasoning entirely, which under a pre-opening template cannot be told
-from unfinished reasoning anyway. Prefer that trade: an unparsed turn takes the error-observation
+Under a pre-opening template, therefore, require a visible `</think>` before you accept any
+action — that is what `_answer_of` returning `""` for a tagless turn buys you. It costs you the
+turn where a model skipped reasoning entirely, which under such a template cannot be told from
+unfinished reasoning anyway. Prefer that trade: an unparsed turn takes the error-observation
 path and the model can correct itself, while a wrongly-applied one desynchronises state from
 reward for the rest of the episode.
+
+Gate that on the template, not on `thinking`. Flash's own flag is `thinking` **and** "the
+rendered prompt ends inside `<think>`" (`flash/engine/worker/train/rl/inputs.py`), so under
+`thinking = true` with a template that does not pre-open, a tagless `<move>...</move>` is a
+valid answer that Flash grades as one — rejecting it there desynchronises state from reward in
+the opposite direction. Render one prompt with your model's tokenizer to see which case you are
+in, and set `PROMPT_OPENS_THINKING` to match the model you actually run.
 
 What the parser above does instead is require the action to be the **last** thing in the turn.
 That is why `FINAL_ACTION` is anchored: reasoning that was still weighing options usually runs
