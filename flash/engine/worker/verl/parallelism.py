@@ -6,8 +6,6 @@ catalog rather than of any one trainer.
 
 from __future__ import annotations
 
-from typing import Any
-
 # Ulysses sequence-parallel width for EVERY algorithm (sft, grpo, opd): off, always.
 #
 # Every catalog model is a Qwen3.5/3.6 GatedDeltaNet hybrid: linear attention plus a causal conv on
@@ -27,11 +25,6 @@ from typing import Any
 # parallelism splits attention heads rather than the sequence, so it has no recurrent-state problem
 # (and is why the allocator's head-divisibility cap is still load-bearing).
 ULYSSES_SEQUENCE_PARALLEL_SIZE = 1
-
-
-def spec_gpu_type(spec: Any) -> str:
-    """The selected card class, or empty when the spec has no resolved GPU."""
-    return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
 
 
 def resolve_reshard_after_forward(

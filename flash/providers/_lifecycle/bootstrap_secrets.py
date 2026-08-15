@@ -19,7 +19,6 @@ _SECRET_RE = re.compile(
 
 # a multiline secret is split.
 _MIN_SECRET_COMPONENT = 8
-_CONSOLE_SCAN_BYTES = 1_048_576
 
 
 def _bounded_pattern(needle: str) -> str:
@@ -174,48 +173,3 @@ def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> st
         return tail
     cut = tail.find("\n")
     return tail[cut + 1 :] if cut >= 0 else ""
-
-
-def _console_progress(console: str, offset: int) -> tuple[int, int, int, int]:
-    """Return ``(scan_cursor, observed_eof, committed, any)`` at the captured tail.
-
-    reads are capped. oversized lines skip in chunks; partial lines remain behind the cursor until
-    newline so they are judged once, while observed eof still exposes them to snapshot uploads.
-    """
-    try:
-        with open(console, "rb") as f:
-            end = f.seek(0, os.SEEK_END)
-            at = min(max(offset, 0), end)
-            f.seek(max(at - 1, 0))
-            start = not at or f.read(1) == b"\n"
-            hits = beats = 0
-            while at < end:
-                f.seek(at)
-                buf = f.read(min(_CONSOLE_SCAN_BYTES, end - at))
-                if not buf:
-                    break
-                if not start:
-                    nl = buf.find(b"\n") + 1
-                    if not nl:
-                        at += len(buf)
-                        continue
-                    at += nl
-                    buf, start = buf[nl:], True
-                    if not buf:
-                        continue
-                cut = buf.rfind(b"\n") + 1
-                if not cut:
-                    if at + len(buf) < end:
-                        at += len(buf)
-                        start = False
-                        continue
-                    break
-                hb = re.findall(rb'(?m)^HEARTBEAT (?!.*"liveness":).*$', buf[:cut])
-                hits += sum(
-                    b'"pending":' not in line and b'"throttled":' not in line for line in hb
-                )
-                beats += len(hb)
-                at += cut
-    except OSError:
-        return -1, -1, 0, 0
-    return at, end, hits, beats

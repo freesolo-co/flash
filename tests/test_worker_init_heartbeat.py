@@ -401,40 +401,59 @@ def test_heartbeat_console_marks_only_an_attempted_upload_that_failed(monkeypatc
     assert throttled["step"] == 3, "the throttled heartbeat still reaches the console"
 
 
-def test_heartbeat_suppressed_behind_a_failed_upload_is_pending(monkeypatch):
-    """A provisional throttle claim must not make a concurrent heartbeat look committed."""
-    import json
+def test_waiting_heartbeat_rechecks_after_success_and_skips_duplicate(monkeypatch):
     import threading
 
     import flash.engine.worker as worker
 
     hbmod = sys.modules[worker.heartbeat.__module__]
-    lines: list[str] = []
-    started = threading.Event()
-    release = threading.Event()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    waiting = threading.Event()
+    attempts: list[int] = []
+    results: list[bool] = []
+
+    class _ObservedLock:
+        def __init__(self):
+            self.lock = threading.Lock()
+
+        def acquire(self, *args, **kwargs):
+            if self.lock.locked():
+                waiting.set()
+            return self.lock.acquire(*args, **kwargs)
+
+        def release(self):
+            self.lock.release()
 
     def _upload(*_args, **_kwargs):
-        started.set()
-        assert release.wait(5.0)
-        return False
+        attempts.append(1)
+        first_started.set()
+        assert release_first.wait(5.0)
+        return True
 
-    monkeypatch.setattr("builtins.print", lambda *a, **_k: lines.append(" ".join(map(str, a))))
+    monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK", _ObservedLock())
     monkeypatch.setattr(worker, "hf_upload_file", _upload)
     monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 0.0)
-    monkeypatch.setattr(hbmod, "_HB_CLAIM_SEQ", 0)
-    monkeypatch.setattr(hbmod, "_HB_COMMITTED_CLAIM_SEQ", 0)
-    monkeypatch.setattr(hbmod, "_HB_THROTTLE_CLAIM", 0)
+    monkeypatch.setattr(worker, "_HB_LAST_COMMITTED_STEP", 0)
+    monkeypatch.setattr(worker, "_HB_LAST_FORCED_UPLOAD", 0.0)
+    monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
 
-    first = threading.Thread(target=worker.heartbeat, args=("rl_step",), kwargs={"step": 1})
+    first = threading.Thread(target=lambda: results.append(worker.heartbeat("rl_step", step=1)))
+    second = threading.Thread(target=lambda: results.append(worker.heartbeat("rl_step", step=2)))
     first.start()
-    assert started.wait(5.0)
-    worker.heartbeat("rl_step", step=2)
-    second = json.loads(next(line[10:] for line in lines if '"step": 2' in line))
-    assert second["pending"] is True
-    release.set()
+    assert first_started.wait(5.0)
+    second.start()
+    assert waiting.wait(5.0)
+    release_first.set()
     first.join(timeout=5.0)
+    second.join(timeout=5.0)
+
     assert not first.is_alive()
+    assert not second.is_alive()
+    assert attempts == [1]
+    assert sorted(results) == [False, True]
+    assert worker._HB_LAST_COMMITTED_STEP == 1
 
 
 def test_heartbeat_console_summarizes_metric_backlog():

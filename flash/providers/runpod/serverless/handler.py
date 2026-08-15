@@ -1,36 +1,17 @@
-"""The RunPod serverless worker handler.
-
-Split from ``endpoints`` so the endpoint lifecycle stays scannable: this module is 100% the one
-function RunPod executes, and that function is exempt from the function-size gate because only its
-SOURCE ships (``build_function_input`` -> ``get_function_source``). Keeping it alone here means the
-exemption covers a file whose entire purpose is that transport boundary, and the lifecycle code no
-longer shares a size budget with it.
-
-Every name ``_train_body`` uses must be imported INSIDE its body: module-level imports here are out
-of scope on the worker. ``test_train_body_imports_every_name_it_uses`` pins that from the other side.
-The console-upload constants below are read by the tests that pin the shipped literals against
-drift; the handler itself inlines the numbers for the same reason.
-"""
+"""The source-shipped RunPod serverless worker handler."""
 
 from __future__ import annotations
 
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-# an interval-only uploader can never fire for a wedged run: teardown comes at 1200s (training stall)
-# or 3000s (setup grace), both under the hour. one early snapshot, then the hourly cadence -- one
-# extra commit per RUN, not per hour, so the repo's rate budget is unchanged.
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
-# how often the uploader LOOKS at the console, not how often it commits: reading is free against the
-# commit budget, and it is what notices a wedge before the next hourly boundary.
 _CONSOLE_UPLOAD_POLL_S = 120.0
 
 
 def _train_body(input_data: dict) -> dict:
-    """Runs ON the RunPod GPU worker: fetch code, train, return metrics.
-
-    All imports must be inside the function body — this handler is serialized standalone.
-    """
+    """Run on the RunPod GPU worker: fetch the exact code snapshot, train, and return metrics."""
     import collections
     import contextlib
+    import importlib.util
     import json
     import math
     import os
@@ -46,24 +27,10 @@ def _train_body(input_data: dict) -> dict:
     from huggingface_hub import snapshot_download
 
     def _needles(secrets=None):
-        """The (plain, bounded) credential needle sets for os.environ plus ``secrets``.
-
-        a value at or above the floor is a plain needle, replaced as a substring; a SHORTER one is
-        bounded, matched only where it is not adjacent to a word character. short values used to be
-        dropped outright, which leaked them verbatim -- [environment] secrets accepts any name and
-        any value. plain replacement is not the alternative: a 3-char needle corrupts every
-        diagnostic that merely contains those letters (the value "ati" rewrites "authentication").
-
-        a multiline secret (a PEM key) never appears whole in any single call: the child's stdout is
-        sanitized one line at a time, so only a component line is ever seen. component lines keep
-        the floor as a hard skip -- a short one is punctuation such as "}", not a credential.
-        Mirrors flash.providers._lifecycle.bootstrap_secrets._needles.
-        """
+        """Return credential needles from the process environment and supplied mapping."""
         import urllib.parse
 
         mapping = {**os.environ, **(secrets or {})}
-        # declared runtime secrets can carry any name, so the control plane lists them in
-        # FLASH_SECRET_ENV_KEYS; the name-shape rule stays as the fail-closed fallback.
         declared = {
             name.strip().upper()
             for name in str(mapping.get("FLASH_SECRET_ENV_KEYS") or "").split(",")
@@ -92,18 +59,9 @@ def _train_body(input_data: dict) -> dict:
             f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
         )
         plain, bounded = _needles(secrets)
-        # longest-first so one secret containing another cannot leave a suffix of the longer
-        # one behind; encoded forms cover the percent-encoded urls http and git errors print.
         for needle in sorted(plain, key=len, reverse=True):
             text = text.replace(needle, "<redacted>")
         for needle in sorted(bounded, key=len, reverse=True):
-            # the word guard is applied per EDGE, and only where the needle's own edge is a word
-            # character. a value with a punctuation edge already separates itself from neighbouring
-            # text, and demanding a non-word character beyond it asks the wrong question: "/a"
-            # inside "https://host/a/repo" is preceded by the "t" of "host", so an unconditional
-            # left guard fails and the secret prints verbatim. "ati" keeps both guards and so still
-            # cannot rewrite "authentication".
-            # Mirrors flash.providers._lifecycle.bootstrap_secrets._bounded_pattern.
             left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""
             right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
             text = re.sub(f"{left}{re.escape(needle)}{right}", "<redacted>", text)
@@ -116,15 +74,11 @@ def _train_body(input_data: dict) -> dict:
         )
         return text[:limit]
 
-    if input_data.get("mode") == "preload":
-        overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
+    def _preload() -> dict:
+        overrides = {key: str(value) for key, value in (input_data.get("env") or {}).items()}
         os.environ.update(overrides)
-        tok = overrides.get("HF_TOKEN")
-        # CRITICAL: huggingface_hub froze HF_HUB_CACHE at import time, so pass cache_dir
-        # explicitly; os.environ update above is ignored by snapshot_download.
+        token = overrides.get("HF_TOKEN")
         hf_home = overrides.get("HF_HOME")
-        # Refuse a preload not rooted at /runpod-volume — HF_HOME elsewhere means nothing
-        # gets persisted to the volume (phantom warm).
         if not hf_home or not hf_home.startswith("/runpod-volume"):
             return {
                 "preloaded": [],
@@ -142,7 +96,6 @@ def _train_body(input_data: dict) -> dict:
                 "hf_home": hf_home,
             }
         cache_dir = os.path.join(hf_home, "hub")
-        # Inlined (handler is baked standalone); keep in sync with worker prefetch exclusions.
         ignore_patterns = ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
         done, already, failed = [], [], {}
         for repo_id in input_data.get("models") or []:
@@ -150,7 +103,7 @@ def _train_body(input_data: dict) -> dict:
                 try:
                     snapshot_download(
                         repo_id=repo_id,
-                        token=tok,
+                        token=token,
                         cache_dir=cache_dir,
                         ignore_patterns=ignore_patterns,
                         local_files_only=True,
@@ -160,7 +113,10 @@ def _train_body(input_data: dict) -> dict:
                 except Exception:
                     pass
                 snapshot_download(
-                    repo_id=repo_id, token=tok, cache_dir=cache_dir, ignore_patterns=ignore_patterns
+                    repo_id=repo_id,
+                    token=token,
+                    cache_dir=cache_dir,
+                    ignore_patterns=ignore_patterns,
                 )
                 done.append(repo_id)
             except Exception as exc:
@@ -172,13 +128,6 @@ def _train_body(input_data: dict) -> dict:
             "hf_home": os.environ.get("HF_HOME"),
         }
 
-    raw_deadline = input_data.get("deadline_at")
-    if isinstance(raw_deadline, bool) or not isinstance(raw_deadline, (int, float)):
-        raise RuntimeError("run wall deadline is invalid")
-    deadline_at = float(raw_deadline)
-    if not math.isfinite(deadline_at) or deadline_at <= 0:
-        raise RuntimeError("run wall deadline is invalid")
-
     def _require_deadline_allowance() -> float:
         now = time.time()
         if not math.isfinite(now) or now <= 0:
@@ -188,286 +137,260 @@ def _train_body(input_data: dict) -> dict:
             raise TimeoutError("run wall deadline exceeded")
         return remaining_seconds
 
-    try:
-        remaining = _require_deadline_allowance()
-    except TimeoutError:
-        raise RuntimeError("run wall deadline exceeded before bootstrap") from None
-
     def _deadline_exit() -> None:
         print("run wall deadline exceeded; terminating worker", flush=True)
         os._exit(124)
 
-    deadline_timer = threading.Timer(remaining, _deadline_exit)
-    deadline_timer.daemon = True
-    deadline_timer.start()
-
-    try:
-        overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
-        overrides["FLASH_RUN_DEADLINE_AT"] = str(deadline_at)
-
-        def _extra_pip_env() -> tuple[dict[str, str], str | None]:
-            env = dict(os.environ)
-            env.update(overrides)
-            env["GIT_TERMINAL_PROMPT"] = "0"
-            askpass = None
-            if env.get("GITHUB_TOKEN"):
-                fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(
-                        "#!/bin/sh\n"
-                        'case "$1" in\n'
-                        '*Username*) printf "%s\\n" "x-access-token" ;;\n'
-                        '*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
-                        "esac\n"
-                    )
-                os.chmod(askpass, 0o700)
-                env["GIT_ASKPASS"] = askpass
-            return env, askpass
-
-        extra_pip = input_data.get("extra_pip") or []
-        if extra_pip:
-            # Network/index-shaped pip failures. A resolution failure ("no matching distribution",
-            # an unsatisfiable pin) reaches the index fine and carries NONE of these, so a bad
-            # package spec still fails fast; only a PyPI blip retries (as the instance bootstrap).
-            pip_transient_re = re.compile(
-                r"(?i)connection (?:broken|reset|aborted|refused|timed out)|read timed out"
-                r"|temporary failure in name resolution|failed to establish a new connection"
-                r"|network is unreachable|remote end closed connection|incompleteread|proxyerror"
-                r"|newconnectionerror|maxretryerror|ssleoferror|service unavailable|bad gateway"
-                r"|gateway time-?out|too many requests|retrying \(retry\("
-                r"|\b(?:429|5\d\d) (?:client|server) error"
-                # a VCS pin fails through git, not urllib, so its blips carry git's own phrasing
-                # and none of the shapes above: git says "could not resolve host" where urllib
-                # says "temporary failure in name resolution", and reports an http status as
-                # "returned error: NNN". On the status form, only 429/5xx: a 404 or 403 is a bad
-                # pin or a missing token and must still fail fast rather than burn three backoffs.
-                r"|returned error: (?:429|5\d\d)|could not resolve (?:host|proxy)"
-            )
-            # Build/resolution failures, which name the cause and outrank a transient warning pip
-            # already recovered from in the same tail; without that precedence one early "Retrying
-            # (Retry(" makes a deterministic failure look retriable and this ladder repeats it for
-            # nothing. Kept identical to the instance bootstrap's _PIP_TERMINAL_RE: the two
-            # classifiers must agree on what is retriable, including excluding the bare
-            # subprocess-exited-with-error marker a network-interrupted VCS `git clone` also prints.
-            pip_terminal_re = re.compile(
-                r"(?i)failed building wheel|metadata-generation-failed|could not build wheels"
-                r"|no matching distribution|could not find a version|resolutionimpossible"
-                r"|invalid requirement"
-            )
-            # The subset pip can print having downloaded NOTHING: an unreachable index yields no
-            # candidate versions, so it finishes with exactly the footer a typo'd name produces.
-            # When that footer is the only terminal evidence and the tail also carries a transient
-            # marker, the network explains it and the run retries. Mirrors the bootstrap's
-            # _PIP_NO_CANDIDATE_RE / _is_terminal.
-            pip_no_candidate_re = re.compile(
-                r"(?i)no matching distribution|could not find a version"
-            )
-
-            def _pip_is_terminal(output: str) -> bool:
-                if not pip_terminal_re.search(output):
-                    return not pip_transient_re.search(output)
-                if not pip_transient_re.search(output):
-                    return True
-                # a build or resolver failure surviving the footer strip proves pip held real
-                # content, so it stays deterministic; nothing left means the outage explains it.
-                return bool(pip_terminal_re.search(pip_no_candidate_re.sub("", output)))
-
-            pip_retry_delays = (3.0, 9.0, 27.0)
-            # held back from a deadline-clamped backoff so the retry it precedes has wall to run in
-            _PIP_RETRY_RESERVE_S = 1.0
-            extra_env, askpass = _extra_pip_env()
-            args = [sys.executable, "-m", "pip", "install", *extra_pip]
-            try:
-                for pip_attempt in range(len(pip_retry_delays) + 1):
-                    _require_deadline_allowance()
-                    tail = collections.deque(maxlen=400)
-                    # errors="replace": a build or VCS child can emit bytes invalid under the
-                    # container's locale, and strict decoding raises mid-stream, failing a paid
-                    # run whose install actually succeeded.
-                    pip_proc = subprocess.Popen(
-                        args,
-                        env=extra_env,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        errors="replace",
-                    )
-                    try:
-                        with pip_proc.stdout:  # tee so a long install streams into the console
-                            for line in pip_proc.stdout:
-                                tail.append(line)
-                                # best-effort: a closed console must not end the drain, or pip is
-                                # left running while the askpass helper below is deleted and the
-                                # console error is reported in place of pip's own exit status.
-                                with contextlib.suppress(OSError, ValueError):
-                                    print(line, end="", flush=True)
-                        rc = pip_proc.wait()
-                    except BaseException:  # never orphan a running pip on a paid box
-                        pip_proc.kill()
-                        pip_proc.wait()
-                        raise
-                    if rc == 0:
-                        break
-                    pip_output = "".join(tail)
-                    if _pip_is_terminal(pip_output):
-                        raise RuntimeError(f"extra_pip install failed: pip exited {rc}")
-                    if pip_attempt >= len(pip_retry_delays):
-                        raise RuntimeError(
-                            f"extra_pip install could not reach the package index after "
-                            f"{pip_attempt + 1} attempts (pip exited {rc})"
-                        )
-                    # reserve a slice for the attempt this backoff precedes: clamping to the
-                    # remaining wall alone sleeps the whole window, so the retry just announced
-                    # never issues and the next pass only fails the deadline precheck.
-                    delay = max(
-                        0.0,
-                        min(
-                            pip_retry_delays[pip_attempt],
-                            _require_deadline_allowance() - _PIP_RETRY_RESERVE_S,
-                        ),
-                    )
-                    # best-effort like the tee above: a console that closed between attempts must
-                    # not end the install with a terminal console error, losing the retry this
-                    # line only announces.
-                    with contextlib.suppress(OSError, ValueError):
-                        print(
-                            f"extra_pip install hit a transient index error; "
-                            f"retrying in {delay:.0f}s",
-                            flush=True,
-                        )
-                    if delay > 0:
-                        time.sleep(delay)
-            finally:
-                if askpass:
-                    with contextlib.suppress(OSError):
-                        os.remove(askpass)
-
-        def _code_prefix() -> str:
-            raw = input_data.get("code_prefix")
-            if not isinstance(raw, str) or not raw.strip():
-                raise ValueError("missing code_prefix")
-            prefix = raw.strip().strip("/")
-            parts = prefix.split("/")
-            digest = parts[1] if len(parts) == 3 else ""
-            if (
-                len(parts) != 3
-                or parts[0] != "code"
-                or parts[2] != "flash"
-                or len(digest) != 32
-                or any(c not in "0123456789abcdef" for c in digest)
-            ):
-                raise ValueError(f"invalid code_prefix: {prefix!r}")
-            return prefix
-
-        def _hf_status_code(exc: BaseException) -> int | None:
-            response = getattr(exc, "response", None)
-            code = getattr(response, "status_code", None)
-            try:
-                return int(code)
-            except (TypeError, ValueError):
-                return None
-
-        def _hf_retry_after(exc: BaseException) -> float | None:
-            response = getattr(exc, "response", None)
-            headers = getattr(response, "headers", None) or {}
-            value = headers.get("retry-after") if hasattr(headers, "get") else None
-            if not value and hasattr(headers, "items"):
-                for key, candidate in headers.items():
-                    if str(key).lower() == "retry-after":
-                        value = candidate
-                        break
-            if not value:
-                return None
-            try:
-                seconds = float(value)
-            except (TypeError, ValueError):
-                try:
-                    retry_at = parsedate_to_datetime(str(value))
-                    if retry_at.tzinfo is None:
-                        retry_at = retry_at.replace(tzinfo=UTC)
-                    seconds = (retry_at - datetime.now(UTC)).total_seconds()
-                except (TypeError, ValueError):
-                    return None
-            return min(60.0, max(0.0, seconds))
-
-        def _hf_call(call, label: str):
-            retry_delays = (1.0, 3.0, 8.0, 20.0, 60.0)
-            transient_status_codes = {429, 500, 502, 503, 504}
-            for attempt in range(len(retry_delays) + 1):
-                _require_deadline_allowance()
-                try:
-                    return call()
-                except Exception as exc:
-                    if _hf_status_code(exc) not in transient_status_codes or attempt >= len(
-                        retry_delays
-                    ):
-                        raise
-                    retry_after = _hf_retry_after(exc)
-                    delay = retry_after if retry_after is not None else retry_delays[attempt]
-                    try:
-                        delay = min(delay, _require_deadline_allowance())
-                    except TimeoutError:
-                        raise exc from None
-                    print(
-                        f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
-                        f"{_safe_detail(exc, overrides, 500)}",
-                        flush=True,
-                    )
-                    time.sleep(delay)
-                    try:
-                        _require_deadline_allowance()
-                    except TimeoutError:
-                        raise exc from None
-            raise AssertionError("unreachable")
-
-        def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
-            from huggingface_hub import HfApi, hf_hub_download
-
-            api = HfApi(token=token)
-            files = [
-                entry.path
-                for entry in _hf_call(
-                    lambda: list(
-                        api.list_repo_tree(
-                            repo_id=repo_id,
-                            repo_type="dataset",
-                            path_in_repo=prefix,
-                            recursive=True,
-                            token=token,
-                        )
-                    ),
-                    f"list flash code under {repo_id}:{prefix}",
-                )
-                if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
-            ]
-            if not files:
-                raise RuntimeError(f"no flash code files found under {repo_id}:{prefix}")
-            for filename in files:
-                _hf_call(
-                    lambda filename=filename: hf_hub_download(
-                        repo_id=repo_id,
-                        repo_type="dataset",
-                        filename=filename,
-                        local_dir="/runcode",
-                        token=token,
-                    ),
-                    f"download flash code file {repo_id}:{filename}",
-                )
-
-        code_prefix = _code_prefix()
-        _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
-        code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
-
+    def _extra_pip_env(overrides: dict[str, str]) -> tuple[dict[str, str], str | None]:
         env = dict(os.environ)
         env.update(overrides)
-        # inlined: handler is baked standalone (flash not importable); mirrors the worker cache cleanup.
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        askpass = None
+        if env.get("GITHUB_TOKEN"):
+            fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "#!/bin/sh\n"
+                    'case "$1" in\n'
+                    '*Username*) printf "%s\\n" "x-access-token" ;;\n'
+                    '*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
+                    "esac\n"
+                )
+            os.chmod(askpass, 0o700)
+            env["GIT_ASKPASS"] = askpass
+        return env, askpass
+
+    def _install_extra_pip(overrides: dict[str, str]) -> None:
+        extra_pip = input_data.get("extra_pip") or []
+        if not extra_pip:
+            return
+        transient = re.compile(
+            r"(?i)connection (?:broken|reset|aborted|refused|timed out)|read timed out"
+            r"|temporary failure in name resolution|failed to establish a new connection"
+            r"|network is unreachable|remote end closed connection|incompleteread|proxyerror"
+            r"|newconnectionerror|maxretryerror|ssleoferror|service unavailable|bad gateway"
+            r"|gateway time-?out|too many requests|retrying \(retry\("
+            r"|\b(?:429|5\d\d) (?:client|server) error"
+            r"|returned error: (?:429|5\d\d)|could not resolve (?:host|proxy)"
+        )
+        terminal = re.compile(
+            r"(?i)failed building wheel|metadata-generation-failed|could not build wheels"
+            r"|no matching distribution|could not find a version|resolutionimpossible"
+            r"|invalid requirement"
+        )
+        no_candidate = re.compile(r"(?i)no matching distribution|could not find a version")
+
+        def _is_terminal(output: str) -> bool:
+            if not terminal.search(output):
+                return not transient.search(output)
+            if not transient.search(output):
+                return True
+            return bool(terminal.search(no_candidate.sub("", output)))
+
+        retry_delays = (3.0, 9.0, 27.0)
+        extra_env, askpass = _extra_pip_env(overrides)
+        args = [sys.executable, "-m", "pip", "install", *extra_pip]
+        try:
+            for attempt in range(len(retry_delays) + 1):
+                _require_deadline_allowance()
+                tail = collections.deque(maxlen=400)
+                process = subprocess.Popen(
+                    args,
+                    env=extra_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                )
+                try:
+                    with process.stdout:
+                        for line in process.stdout:
+                            tail.append(line)
+                            with contextlib.suppress(OSError, ValueError):
+                                print(line, end="", flush=True)
+                    returncode = process.wait()
+                except BaseException:
+                    process.kill()
+                    process.wait()
+                    raise
+                if returncode == 0:
+                    break
+                output = "".join(tail)
+                if _is_terminal(output):
+                    raise RuntimeError(f"extra_pip install failed: pip exited {returncode}")
+                if attempt >= len(retry_delays):
+                    raise RuntimeError(
+                        "extra_pip install could not reach the package index after "
+                        f"{attempt + 1} attempts (pip exited {returncode})"
+                    )
+                delay = max(
+                    0.0,
+                    min(retry_delays[attempt], _require_deadline_allowance() - 1.0),
+                )
+                with contextlib.suppress(OSError, ValueError):
+                    print(
+                        f"extra_pip install hit a transient index error; retrying in {delay:.0f}s",
+                        flush=True,
+                    )
+                if delay > 0:
+                    time.sleep(delay)
+        finally:
+            if askpass:
+                with contextlib.suppress(OSError):
+                    os.remove(askpass)
+
+    def _code_prefix() -> str:
+        raw = input_data.get("code_prefix")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("missing code_prefix")
+        prefix = raw.strip().strip("/")
+        parts = prefix.split("/")
+        digest = parts[1] if len(parts) == 3 else ""
+        if (
+            len(parts) != 3
+            or parts[0] != "code"
+            or parts[2] != "flash"
+            or len(digest) != 32
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            raise ValueError(f"invalid code_prefix: {prefix!r}")
+        return prefix
+
+    def _hf_status_code(exc: BaseException) -> int | None:
+        response = getattr(exc, "response", None)
+        code = getattr(response, "status_code", None)
+        try:
+            return int(code)
+        except (TypeError, ValueError):
+            return None
+
+    def _hf_retry_after(exc: BaseException) -> float | None:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None) or {}
+        value = headers.get("retry-after") if hasattr(headers, "get") else None
+        if not value and hasattr(headers, "items"):
+            for key, candidate in headers.items():
+                if str(key).lower() == "retry-after":
+                    value = candidate
+                    break
+        if not value:
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(str(value))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                seconds = (retry_at - datetime.now(UTC)).total_seconds()
+            except (TypeError, ValueError):
+                return None
+        return min(60.0, max(0.0, seconds))
+
+    def _hf_call(call, label: str, overrides: dict[str, str]):
+        retry_delays = (1.0, 3.0, 8.0, 20.0, 60.0)
+        transient_status_codes = {429, 500, 502, 503, 504}
+        for attempt in range(len(retry_delays) + 1):
+            _require_deadline_allowance()
+            try:
+                return call()
+            except Exception as exc:
+                if _hf_status_code(exc) not in transient_status_codes or attempt >= len(
+                    retry_delays
+                ):
+                    raise
+                retry_after = _hf_retry_after(exc)
+                delay = retry_after if retry_after is not None else retry_delays[attempt]
+                try:
+                    delay = min(delay, _require_deadline_allowance())
+                except TimeoutError:
+                    raise exc from None
+                print(
+                    f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
+                    f"{_safe_detail(exc, overrides, 500)}",
+                    flush=True,
+                )
+                time.sleep(delay)
+                try:
+                    _require_deadline_allowance()
+                except TimeoutError:
+                    raise exc from None
+        raise AssertionError("unreachable")
+
+    def _download_code_prefix(
+        repo_id: str,
+        prefix: str,
+        token: str | None,
+        overrides: dict[str, str],
+    ) -> None:
+        from huggingface_hub import HfApi, hf_hub_download
+
+        api = HfApi(token=token)
+        files = [
+            entry.path
+            for entry in _hf_call(
+                lambda: list(
+                    api.list_repo_tree(
+                        repo_id=repo_id,
+                        repo_type="dataset",
+                        path_in_repo=prefix,
+                        recursive=True,
+                        token=token,
+                    )
+                ),
+                f"list flash code under {repo_id}:{prefix}",
+                overrides,
+            )
+            if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
+        ]
+        if not files:
+            raise RuntimeError(f"no flash code files found under {repo_id}:{prefix}")
+        for filename in files:
+            _hf_call(
+                lambda filename=filename: hf_hub_download(
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    filename=filename,
+                    local_dir="/runcode",
+                    token=token,
+                ),
+                f"download flash code file {repo_id}:{filename}",
+                overrides,
+            )
+
+    def _load_exact_module(code_dir: str, relative_path: str, name: str):
+        path = os.path.join(code_dir, relative_path)
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"could not load downloaded module: {relative_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _prepare_code_and_env(overrides: dict[str, str]):
+        prefix = _code_prefix()
+        _download_code_prefix(input_data["hf_repo"], prefix, overrides.get("HF_TOKEN"), overrides)
+        code_dir = os.path.join("/runcode", os.path.dirname(prefix) or ".")
+        console_module = _load_exact_module(
+            code_dir,
+            "flash/providers/_lifecycle/bootstrap_console.py",
+            "_flash_downloaded_bootstrap_console",
+        )
+        artifact_module = _load_exact_module(
+            code_dir,
+            "flash/adapters/artifacts.py",
+            "_flash_downloaded_artifacts",
+        )
+        env = dict(os.environ)
+        env.update(overrides)
         if not os.path.isdir("/runpod-volume"):
-            for _k in [k for k, v in env.items() if str(v).startswith("/runpod-volume")]:
-                env.pop(_k, None)
-        # Pass spec via file to avoid ~128 KiB per-env-string exec limit.
+            for key in [
+                key for key, value in env.items() if str(value).startswith("/runpod-volume")
+            ]:
+                env.pop(key, None)
         spec_path = "/tmp/job_spec.json"
-        with open(spec_path, "w") as sf:
-            sf.write(input_data["job_spec_json"])
+        with open(spec_path, "w") as handle:
+            handle.write(input_data["job_spec_json"])
         env["FLASH_JOB_SPEC_PATH"] = spec_path
         env.pop("FLASH_JOB_SPEC_JSON", None)
         env["PHASE"] = input_data["phase"]
@@ -475,14 +398,81 @@ def _train_body(input_data: dict) -> dict:
         env["PYTHONPATH"] = code_dir + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
+        return code_dir, env, console_module, artifact_module.attempt_scoped_artifact_name
 
-        # periodic and terminal snapshots use different repo paths. this removes last-writer races:
-        # an hf request already in flight cannot be cancelled or bounded, but it can only overwrite
-        # the live snapshot, never the canonical terminal artifact.
+    def _read_console_tail(console: str) -> str:
+        with open(console, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            start = max(0, handle.tell() - 64_000)
+            handle.seek(max(0, start - 1))
+            raw = handle.read()
+        if start == 0:
+            return raw.decode("utf-8", "replace")
+        tail = raw[1:].decode("utf-8", "replace")
+        if raw[:1] == b"\n":
+            return tail
+        cut = tail.find("\n")
+        return tail[cut + 1 :] if cut >= 0 else ""
+
+    if input_data.get("mode") == "preload":
+        return _preload()
+
+    raw_deadline = input_data.get("deadline_at")
+    if isinstance(raw_deadline, bool) or not isinstance(raw_deadline, (int, float)):
+        raise RuntimeError("run wall deadline is invalid")
+    deadline_at = float(raw_deadline)
+    if not math.isfinite(deadline_at) or deadline_at <= 0:
+        raise RuntimeError("run wall deadline is invalid")
+    try:
+        remaining = _require_deadline_allowance()
+    except TimeoutError:
+        raise RuntimeError("run wall deadline exceeded before bootstrap") from None
+    deadline_timer = threading.Timer(remaining, _deadline_exit)
+    deadline_timer.daemon = True
+    deadline_timer.start()
+
+    try:
+        overrides = {key: str(value) for key, value in (input_data.get("env") or {}).items()}
+        overrides["FLASH_RUN_DEADLINE_AT"] = str(deadline_at)
+        _install_extra_pip(overrides)
+        code_dir, env, console_module, attempt_scoped_artifact_name = _prepare_code_and_env(
+            overrides
+        )
         console_teardown = threading.Event()
 
+        def _commit_console_snapshot(mode: str, console: str, tail_path: str, final: bool) -> bool:
+            try:
+                from huggingface_hub import HfApi
+
+                _require_deadline_allowance()
+                spec = json.loads(input_data["job_spec_json"])
+                phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
+                prefix = f"{phase_ns}/{spec['run_id']}"
+                tail = _read_console_tail(console)
+                with open(tail_path, "w", encoding="utf-8", errors="replace") as handle:
+                    handle.write(_safe_detail(tail, env, 64_000))
+                _require_deadline_allowance()
+                if not final and console_teardown.is_set():
+                    print(f"console upload dropped for {mode}; terminal snapshot has begun")
+                    return False
+                attempt = int(env.get("ATTEMPT") or 0)
+                artifact = (
+                    f"console_{mode}.txt"
+                    if final
+                    else attempt_scoped_artifact_name("console", mode, attempt)
+                )
+                HfApi(token=env.get("HF_TOKEN")).upload_file(
+                    path_or_fileobj=tail_path,
+                    path_in_repo=f"{prefix}/{artifact}",
+                    repo_id=input_data["hf_repo"],
+                    repo_type="dataset",
+                )
+                return True
+            except Exception as exc:
+                print("console upload warn:", _safe_detail(exc, env))
+                return False
+
         def _upload_console(mode: str, final: bool = False) -> bool:
-            """Upload a live or terminal console tail; return true only when it lands."""
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
                 return False
@@ -493,142 +483,17 @@ def _train_body(input_data: dict) -> dict:
             suffix = ".final.tail" if final else ".live.tail"
             return _commit_console_snapshot(mode, console, console + suffix, final)
 
-        def _commit_console_snapshot(mode: str, console: str, tail_path: str, final: bool) -> bool:
-            try:
-                from huggingface_hub import HfApi
-
-                _require_deadline_allowance()
-                spec = json.loads(input_data["job_spec_json"])
-                phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
-                prefix = f"{phase_ns}/{spec['run_id']}"
-                # keep the newest bytes only; the uploaded tail's end is never truncated.
-                tail_bytes = 64_000
-                with open(console, "rb") as f:
-                    f.seek(0, os.SEEK_END)
-                    start = max(0, f.tell() - tail_bytes)
-                    # over-read one byte so a boundary landing exactly after a newline is
-                    # recognized as starting a complete line rather than assumed partial.
-                    f.seek(max(0, start - 1))
-                    raw = f.read()
-                if start == 0:
-                    tail = raw.decode("utf-8", "replace")
-                else:
-                    tail = raw[1:].decode("utf-8", "replace")
-                    # a truncated first line is dropped before sanitizing: a boundary landing inside
-                    # a one-line credential leaves a fragment full-value redaction no longer matches.
-                    # duplicated, not imported: only this function's source ships to the worker.
-                    # bootstrap_secrets._read_console_tail is canonical.
-                    if raw[:1] != b"\n":
-                        cut = tail.find("\n")
-                        tail = tail[cut + 1 :] if cut >= 0 else ""
-                with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
-                    f.write(_safe_detail(tail, env, 64_000))
-                _require_deadline_allowance()
-                if not final and console_teardown.is_set():
-                    print(f"console upload dropped for {mode}; terminal snapshot has begun")
-                    return False
-                attempt = int(env.get("ATTEMPT") or 0)
-                if attempt < 0 or attempt > (1 << 63) - 1:
-                    raise ValueError("attempt must be a bounded nonnegative integer")
-                artifact = (
-                    f"console_{mode}.txt" if final else f"console_{mode}_attempt{attempt}.txt"
-                )
-                HfApi(token=env.get("HF_TOKEN")).upload_file(
-                    path_or_fileobj=tail_path,
-                    path_in_repo=f"{prefix}/{artifact}",
-                    repo_id=input_data["hf_repo"],
-                    repo_type="dataset",
-                )
-                return True
-            except Exception as e:
-                print("console upload warn:", _safe_detail(e, env))
-                return False
-
         def run_mode(mode: str, check: bool) -> int:
-            """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
+            """Run the worker subprocess, stream its console, and upload live and terminal tails."""
             console = f"/tmp/console_{mode}.txt"
             stop_upload = threading.Event()
 
-            def _upload_loop() -> None:
-                # literals, not the module-level constants: only this function's SOURCE ships to the
-                # worker, so a name reference is a NameError before training. Mirrors
-                # bootstrap._console_upload_loop, whose docstring has the rules; pinned against
-                # drift by test_first_console_snapshot_precedes_the_stall_teardown.
-                due_s, since, quiet_polls = 600.0, 0.0, 0
-                sent = cursor = eof = -1
-                quiet_spent, armed, committed = 0, False, False
-                while not stop_upload.wait(120.0):
-                    since += 120.0
-                    try:
-                        # mirrors _console_progress: drain to this poll's tail in bounded chunks.
-                        with open(console, "rb") as hf:
-                            hf.seek(0, os.SEEK_END)
-                            end = hf.tell()
-                            cursor = min(max(cursor, 0), end)
-                            start = not cursor
-                            if cursor:
-                                hf.seek(cursor - 1)
-                                start = hf.read(1) == b"\n"
-                            staged = beat_count = 0
-                            while cursor < end:
-                                hf.seek(cursor)
-                                buf = hf.read(min(1_048_576, end - cursor))
-                                if not buf:
-                                    break
-                                if not start:
-                                    skip = buf.find(b"\n") + 1
-                                    if not skip:
-                                        cursor += len(buf)
-                                        continue
-                                    cursor += skip
-                                    buf, start = buf[skip:], True
-                                    if not buf:
-                                        continue
-                                cut = buf.rfind(b"\n") + 1
-                                if not cut:
-                                    if cursor + len(buf) < end:
-                                        cursor += len(buf)
-                                        start = False
-                                        continue
-                                    break
-                                pat = rb'(?m)^HEARTBEAT (?!.*"liveness":).*$'
-                                beat_lines = re.findall(pat, buf[:cut])
-                                staged += sum(
-                                    b'"pending":' not in line and b'"throttled":' not in line
-                                    for line in beat_lines
-                                )
-                                beat_count += len(beat_lines)
-                                cursor += cut
-                            eof = end
-                    except OSError:
-                        cursor, eof, staged, beat_count = -1, -1, 0, 0
-                    had_committed = committed
-                    committed = committed or bool(staged)
-                    if committed and not had_committed and sent >= 0:
-                        due_s = 3600.0
-                    # a wedge is progress that stopped: re-arm on it, spend only on a stall that
-                    # bought an upload. two credits per run. uncommitted beats only arm the loop.
-                    progress = staged if committed else beat_count
-                    armed = armed or bool(progress)
-                    quiet_polls = 0 if progress else quiet_polls + 1
-                    due = since >= due_s
-                    cap = armed and quiet_polls >= 4
-                    wedged = cap and quiet_spent < 2 and not due
-                    if eof == sent or not (due or wedged):
-                        continue
-                    ok = _upload_console(mode)  # swallows its own errors; false if it did not land
-                    # only a landed upload changes the watermark, deadline, latch, quiet count, or
-                    # credits. resetting any of them on a swallowed failure can suppress the retry.
-                    if ok:
-                        quiet_spent += 1 if cap and not due else 0
-                        if cap:
-                            armed, quiet_polls = False, 0
-                        sent = eof
-                        since, due_s = 0.0, 3600.0 if committed else 1800.0
+            def _upload_live() -> bool:
+                return _upload_console(mode)
 
-            with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
+            with open(console, "w", buffering=1) as console_file:
                 _require_deadline_allowance()
-                proc = subprocess.Popen(
+                process = subprocess.Popen(
                     [sys.executable, "-m", "flash.engine.worker_entrypoint"],
                     cwd=code_dir,
                     env={**env, "RUN_MODE": mode},
@@ -637,33 +502,32 @@ def _train_body(input_data: dict) -> dict:
                     text=True,
                     errors="replace",
                 )
-                uploader = threading.Thread(target=_upload_loop, daemon=True)
+                uploader = threading.Thread(
+                    target=console_module._run_console_upload_loop,
+                    args=(console, 3600.0, stop_upload),
+                    kwargs={"upload": _upload_live},
+                    daemon=True,
+                )
                 uploader.start()
                 try:
-                    for line in proc.stdout:
-                        # the handler's own stdout is captured by runpod and surfaced in provider
-                        # status, where only this process knows the run's worker-env secret values,
-                        # so each echoed child line is sanitized here at the source. the console
-                        # file keeps the raw line; its upload path sanitizes the selected tail.
+                    for line in process.stdout:
                         print(_safe_detail(line, env, 100_000), end="")
-                        cf.write(line)
-                    proc.wait()
+                        console_file.write(line)
+                    process.wait()
                 finally:
                     stop_upload.set()
                     uploader.join(timeout=10)
             _upload_console(mode, final=True)
-            if proc.returncode != 0 and check:
+            if process.returncode != 0 and check:
                 raise RuntimeError(
-                    f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
+                    f"worker mode '{mode}' exited {process.returncode}; see console_{mode}.txt "
                     f"and error_{mode}_attempt*.txt in the HF dataset repo"
                 )
-            return proc.returncode
+            return process.returncode
 
-        # Clear stale metrics from a previous seed so a crash can't report wrong numbers.
         for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stale)
-        # check=False: RL's colocated vLLM can segfault at interpreter exit after saving — not a failure.
         run_mode(input_data["phase"], check=False)
         if not os.path.exists("/tmp/metrics.json"):
             phase = input_data["phase"]
@@ -671,9 +535,9 @@ def _train_body(input_data: dict) -> dict:
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
                 f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
-                f"dataset repo for the full traceback"
+                "dataset repo for the full traceback"
             )
-        with open("/tmp/metrics.json") as f:
-            return json.load(f)
+        with open("/tmp/metrics.json") as handle:
+            return json.load(handle)
     finally:
         deadline_timer.cancel()

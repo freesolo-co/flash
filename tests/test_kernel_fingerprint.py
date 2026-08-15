@@ -97,7 +97,7 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
         "causal_conv1d",
         "pip_base",
         "dockerfile_sha256",
-        "endpoints_sha256",
+        "handler_sha256",
         "make_rp_handler_sha256",
     ):
         assert base_partial[key], f"base input {key} not populated"

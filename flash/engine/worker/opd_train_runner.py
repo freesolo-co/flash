@@ -33,8 +33,12 @@ from flash.engine.worker.verl.child_io import (
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
     resolve_reshard_after_forward,
-    spec_gpu_type,
 )
+
+
+def _spec_gpu_type(spec: Any) -> str:
+    """The selected card class, or empty when the spec has no resolved GPU."""
+    return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
 
 
 def _prepare_request(spec: Any) -> _OpdRequest:
@@ -504,7 +508,7 @@ def _build_base_config(
         "reshard_after_forward": resolve_reshard_after_forward(
             model_id=request.model_id,
             algorithm="opd",
-            gpu_type=spec_gpu_type(getattr(request, "spec", None)),
+            gpu_type=_spec_gpu_type(getattr(request, "spec", None)),
             n_gpus=int(runtime.gpu_count),
             train=getattr(getattr(request, "spec", None), "train", None),
             thinking=bool(_opd_train._w.THINKING),

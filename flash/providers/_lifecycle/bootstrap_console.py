@@ -1,12 +1,15 @@
-"""Console upload cadence shared by instance bootstrap callers.
+"""console scanning and upload cadence shared by instance bootstrap callers.
 
-This module owns only the wedge state machine. The caller owns file reads, artifact uploads and
-credential-safe error rendering, passed as callbacks so this leaf stays independent of the
-bootstrap and remains importable when shipped next to it as a bare module on a rented box.
+this module owns console reads, scanning, and the wedge state machine. callers provide artifact
+upload callbacks, keeping the module importable when shipped bare on a rented box.
 """
 
 from __future__ import annotations
 
+import os
+import re
+
+_CONSOLE_SCAN_BYTES = 1_048_576
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
 _CONSOLE_UPLOAD_POLL_S = 120.0
@@ -14,9 +17,52 @@ _CONSOLE_UPLOAD_QUIET_POLLS = 4
 _CONSOLE_UPLOAD_CREDITS = 2
 
 
-def _run_console_upload_loop(
-    console: str, interval_s: float, stop_upload, *, progress, upload
-) -> None:
+def _console_progress(console: str, offset: int) -> tuple[int, int, int, int]:
+    """Return ``(scan_cursor, observed_eof, committed, any)`` at the captured tail.
+
+    reads are capped. oversized lines skip in chunks; partial lines remain behind the cursor until
+    newline so they are judged once, while observed eof still exposes them to snapshot uploads.
+    """
+    try:
+        with open(console, "rb") as handle:
+            end = handle.seek(0, os.SEEK_END)
+            at = min(max(offset, 0), end)
+            handle.seek(max(at - 1, 0))
+            start = not at or handle.read(1) == b"\n"
+            hits = beats = 0
+            while at < end:
+                handle.seek(at)
+                buf = handle.read(min(_CONSOLE_SCAN_BYTES, end - at))
+                if not buf:
+                    break
+                if not start:
+                    newline = buf.find(b"\n") + 1
+                    if not newline:
+                        at += len(buf)
+                        continue
+                    at += newline
+                    buf, start = buf[newline:], True
+                    if not buf:
+                        continue
+                cut = buf.rfind(b"\n") + 1
+                if not cut:
+                    if at + len(buf) < end:
+                        at += len(buf)
+                        start = False
+                        continue
+                    break
+                heartbeats = re.findall(rb'(?m)^HEARTBEAT (?!.*"liveness":).*$', buf[:cut])
+                hits += sum(
+                    b'"pending":' not in line and b'"throttled":' not in line for line in heartbeats
+                )
+                beats += len(heartbeats)
+                at += cut
+    except OSError:
+        return -1, -1, 0, 0
+    return at, end, hits, beats
+
+
+def _run_console_upload_loop(console: str, interval_s: float, stop_upload, *, upload) -> None:
     """Poll ``console`` and upload on schedule or after sustained loss of progress.
 
     Polling is free; committing is not. Heartbeats spend 4/hour and the steady console cadence uses
@@ -40,7 +86,7 @@ def _run_console_upload_loop(
     since, quiet, armed, spent, ever = 0.0, 0.0, False, 0, False
     while not stop_upload.wait(poll_s):
         since += poll_s
-        cursor, eof, staged, beats = progress(console, max(cursor, 0))
+        cursor, eof, staged, beats = _console_progress(console, max(cursor, 0))
         had_committed = ever
         ever = ever or bool(staged)
         if ever and not had_committed and sent >= 0:

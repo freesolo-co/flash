@@ -27,7 +27,6 @@ from flash.providers.runpod.gpus import flash_gpu
 # re-exported: callers and tests reach these as `endpoints.<name>` and through the package. The
 # console constants stay importable from here because they describe the handler's upload cadence,
 # which this module's endpoint lifecycle is what tears down.
-from flash.providers.runpod.serverless.backoff import _patch_runpod_backoff
 from flash.providers.runpod.serverless.handler import (  # noqa: F401
     _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S,
     _CONSOLE_UPLOAD_INTERVAL_S,
@@ -39,6 +38,47 @@ from flash.providers.runpod.serverless.handler import (  # noqa: F401
 FLASH_SDK_LOCK = threading.Lock()
 
 _ENDPOINT_CACHE: dict[str, Any] = {}
+
+
+def _patch_runpod_backoff() -> None:
+    """Cap the backoff exponent before the power to prevent overflow on long runs."""
+    try:
+        import math
+        import random
+
+        from runpod_flash.core.utils import backoff as runpod_backoff
+
+        if getattr(runpod_backoff, "_flash_backoff_patched", False):
+            return
+
+        def _safe_get_backoff_delay(
+            attempt,
+            base=0.1,
+            max_seconds=10.0,
+            jitter=0.2,
+            strategy=runpod_backoff.BackoffStrategy.EXPONENTIAL,
+        ):
+            capped_attempt = min(int(attempt), 30)
+            if strategy == runpod_backoff.BackoffStrategy.EXPONENTIAL:
+                delay = base * (2**capped_attempt)
+            elif strategy == runpod_backoff.BackoffStrategy.LINEAR:
+                delay = base + (attempt * base)
+            elif strategy == runpod_backoff.BackoffStrategy.LOGARITHMIC:
+                delay = base * math.log2(attempt + 2)
+            else:
+                raise ValueError(f"Unsupported backoff strategy: {strategy}")
+            return min(delay, max_seconds) * random.uniform(1 - jitter, 1 + jitter)
+
+        runpod_backoff.get_backoff_delay = _safe_get_backoff_delay
+        runpod_backoff._flash_backoff_patched = True
+        try:
+            from runpod_flash.core.resources import serverless
+
+            serverless.get_backoff_delay = _safe_get_backoff_delay
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("runpod backoff patch skipped: %s", exc)
 
 
 def _reset_flash_resource_manager(rm_module) -> None:

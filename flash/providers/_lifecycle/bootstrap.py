@@ -24,7 +24,6 @@ if __package__:
     from flash.providers._lifecycle import bootstrap_console as _bootstrap_console
     from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
-        _console_progress,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
@@ -33,7 +32,6 @@ else:
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
-        _console_progress,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
@@ -44,7 +42,6 @@ _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = _bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAP
 _CONSOLE_UPLOAD_INTERVAL_S = _bootstrap_console._CONSOLE_UPLOAD_INTERVAL_S
 _CONSOLE_UPLOAD_POLL_S = _bootstrap_console._CONSOLE_UPLOAD_POLL_S
 _CONSOLE_UPLOAD_QUIET_POLLS = _bootstrap_console._CONSOLE_UPLOAD_QUIET_POLLS
-_run_console_upload_loop = _bootstrap_console._run_console_upload_loop
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
@@ -278,11 +275,10 @@ def _console_upload_loop(
             print(f"console upload warn: {detail}", flush=True)
             return False
 
-    _run_console_upload_loop(
+    _bootstrap_console._run_console_upload_loop(
         console,
         interval_s,
         stop_upload,
-        progress=_console_progress,
         upload=upload,
     )
 

@@ -31,14 +31,12 @@ _USER_DATA_BUDGET = _USER_DATA_CAP - _USER_DATA_MARGIN
 # Fast path only: above this, the spec is spilled to HF without first rendering a payload that
 # cannot fit. What is left of the ~64,000-byte cap after the fixed framing -- this module's template
 # plus every source it heredocs in (bootstrap.py, bootstrap_secrets.py, bootstrap_pip.py) -- is
-# ~5,800 bytes, and base64 + json escaping inflate the spec ~1.35x on the way in. Shrink this again
-# whenever those sources grow; docstrings are stripped on the way in, so only code and COMMENTS
+# ~5,800 bytes, and base64 + json escaping inflate the spec ~1.35x on the way in. shrink this again
+# whenever those sources grow; docstrings are stripped on the way in, so only code and comments
 # count, and prose belongs in a docstring rather than a comment for exactly that reason.
-# test_build_user_data_spills_large_spec_out_of_cloud_init pins the worst inline case against the
-# cap so the two cannot drift apart silently. Sized for a REAL payload, which carries ~760 bytes of
-# env, deadline, and cache fields that the test's minimal one does not: at 4_000 the worst case
-# cleared the test but a production launch would re-render and force-spill anyway.
-_SPEC_SPILL_THRESHOLD = 3_000
+# the threshold regression builds the real payload shape, including deadlines, cache fields, code
+# identity, environment, and attempt identity, then pins the worst inline case below 62,000 bytes.
+_SPEC_SPILL_THRESHOLD = 2_000
 
 
 def run_label_prefix(run_id: str) -> str:

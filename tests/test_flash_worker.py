@@ -947,6 +947,16 @@ def test_train_body_uploads_console_on_missing_metrics(
     from flash.providers.runpod.serverless import endpoints
 
     code_prefix = "code/0123456789abcdef0123456789abcdef/flash"
+    run_code = tmp_path / "runcode"
+    real_join = os.path.join
+
+    def mapped_join(*parts):
+        joined = real_join(*parts)
+        if joined == "/runcode" or joined.startswith("/runcode/"):
+            return str(run_code) + joined.removeprefix("/runcode")
+        return joined
+
+    monkeypatch.setattr(os.path, "join", mapped_join)
     list_calls = []
     download_calls = []
     monkeypatch.setattr(
@@ -968,6 +978,10 @@ def test_train_body_uploads_console_on_missing_metrics(
             return [
                 types.SimpleNamespace(path=f"{code_prefix}/__init__.py", size=0),
                 types.SimpleNamespace(path=f"{code_prefix}/engine/worker.py", size=10),
+                types.SimpleNamespace(
+                    path=f"{code_prefix}/providers/_lifecycle/bootstrap_console.py", size=10
+                ),
+                types.SimpleNamespace(path=f"{code_prefix}/adapters/artifacts.py", size=10),
                 types.SimpleNamespace(path=f"{code_prefix}/engine", tree_id="folder"),
             ]
 
@@ -986,15 +1000,30 @@ def test_train_body_uploads_console_on_missing_metrics(
         response = _Response()
 
     def fake_hf_hub_download(*, filename, local_dir, **kw):
+        from pathlib import Path
+
         download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
-        return os.path.join(local_dir, filename)
+        target = run_code / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        relative = filename.removeprefix(code_prefix + "/")
+        sources = {
+            "providers/_lifecycle/bootstrap_console.py": (
+                Path(__file__).resolve().parents[1]
+                / "flash/providers/_lifecycle/bootstrap_console.py"
+            ),
+            "adapters/artifacts.py": (
+                Path(__file__).resolve().parents[1] / "flash/adapters/artifacts.py"
+            ),
+        }
+        target.write_text(sources[relative].read_text() if relative in sources else "")
+        return str(target)
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
 
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
-            assert k["cwd"] == "/runcode/code/0123456789abcdef0123456789abcdef"
+            assert k["cwd"] == str(run_code / "code/0123456789abcdef0123456789abcdef")
             self.stdout = iter(console_lines)
             self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
 
@@ -1047,11 +1076,20 @@ def test_train_body_uploads_console_on_missing_metrics(
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",
             f"{code_prefix}/engine/worker.py",
+            f"{code_prefix}/providers/_lifecycle/bootstrap_console.py",
+            f"{code_prefix}/adapters/artifacts.py",
         ]
     finally:
         # _train_body writes the hardcoded /tmp/console_sft.txt(.tail); remove them so this test
         # doesn't leak state across tests (flaky under isolated/parallel runners).
-        for _p in ("/tmp/console_sft.txt", "/tmp/console_sft.txt.tail"):
+        import shutil
+
+        shutil.rmtree(run_code, ignore_errors=True)
+        for _p in (
+            "/tmp/console_sft.txt",
+            "/tmp/console_sft.txt.live.tail",
+            "/tmp/console_sft.txt.final.tail",
+        ):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(_p)
 
@@ -1135,73 +1173,6 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     ):
         assert 2 * poll_s < training_stall_s
 
-    # _train_body ships as SOURCE to the worker, so it inlines these numbers rather than
-    # referencing the constants (test_train_body_imports_every_name_it_uses enforces that). pin the
-    # literals here so the shipped uploader cannot drift away from the deadlines above.
-    body = inspect.getsource(endpoints._train_body)
-    assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_POLL_S})" in body
-    assert f"due_s, since, quiet_polls = {endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S}" in body
-    # a credit is spent only by captured silence that bought a landed, non-scheduled upload.
-    assert "quiet_spent += 1 if cap and not due else 0" in body
-    # the deadline advances only on a landed upload: resetting on a swallowed failure books a
-    # snapshot that reached no repo and puts the retry an interval out, past the stall teardown.
-    assert "since, due_s = 0.0, 3600.0 if committed else 1800.0" in body
-    assert "if ok:" in body
-    # sustained captured silence is computed independently of due so a scheduled upload clears the
-    # latch and quiet count, while only the emergency path is bounded by credits and charges one.
-    assert "cap = armed and quiet_polls" in body
-    assert "wedged = cap and quiet_spent" in body
-    assert "if cap:" in body
-    assert "armed, quiet_polls = False, 0" in body
-    # the shipped loop inlines the credit cap; the instance loop reads it from the constant, and
-    # they must agree or one provider detects a second wedge and the other does not.
-    assert f"quiet_spent < {_instance_bootstrap._CONSOLE_UPLOAD_CREDITS}" in body
-    # the sustained-silence threshold and the success-gated watermark, which keep a sparsely
-    # logging run inside the shared repo's commit budget and retry a swallowed upload failure.
-    assert f"quiet_polls >= {_instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS}" in body
-    # the latch arms only after real progress: a cold image is quiet through startup and would
-    # otherwise spend it on an empty console, leaving a later hang with no snapshot before teardown
-    # (test_..._keeps_its_wedge_credit_through_a_slow_startup covers the behavior on the twin loop).
-    assert "cap = armed and quiet_polls" in body
-    assert "sent = cursor = eof = -1" in body
-    assert "sent = eof" in body
-    # the wedge signal is STAGED HEARTBEATS, not console bytes: a stuck worker still logs, so a
-    # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
-    assert "quiet_polls = 0 if progress else quiet_polls + 1" in body
-    # the count is ANCHORED at the start of a heartbeat line rather than scanning for a bare
-    # "stage" key: any third-party line carrying it (a structured log from ray, verl or a library)
-    # would otherwise read as progress, and those keep printing from a wedged worker -- so the
-    # wedge this loop exists to catch would never be detected at all. Liveness pings are excluded
-    # in the expression itself: they print every 30s from a daemon whether or not the training loop
-    # is alive, so they are never progress the provider's stall clock can see.
-    assert "rb'(?m)^HEARTBEAT (?!.*\"liveness\":).*$'" in body
-    # and the scan is bounded to WHOLE lines: the offset stops at the last newline, never at EOF.
-    # Both halves of a line split by a poll boundary must be inert alone or the split decides the
-    # run -- the head carries the prefix but not yet the "liveness" that disqualifies it (a wedge
-    # read as progress), and a tail measured from EOF would have lost its prefix and dropped a real
-    # heartbeat (a wedge faked the other way). It is also what lets `^` mean what it says.
-    assert 'cut = buf.rfind(b"\\n") + 1' in body
-    assert "buf = hf.read(min(1_048_576, end - cursor))" in body
-    assert 'start = hf.read(1) == b"\\n"' in body
-    # the parser cursor remains line-aligned, while observed eof carries unterminated diagnostics to
-    # the uploader and the sent watermark changes only after success.
-    assert "eof = end" in body
-    assert "if eof == sent" in body
-    # ONE scan yields both counts: the committed one drops "pending" lines (an uploaded heartbeat
-    # that never reached HF), the arming one keeps them. Which drives the timer switches at the
-    # first COMMITTED heartbeat. A run whose uploads all fail emits nothing but pending lines: on
-    # the committed count it never arms, buys no wedge snapshot, and the next scheduled upload is
-    # an interval out, past the setup teardown. After a commit exists the provider's stall clock is
-    # anchored and counting down, so only committed ones may count.
-    assert "b'\"throttled\":' not in line" in body
-    assert "committed = committed or bool(staged)" in body
-    assert "progress = staged if committed else beat_count" in body
-    assert "armed = armed or bool(progress)" in body
-    assert "quiet_polls = 0 if progress else quiet_polls + 1" in body
-    # a counting rule cannot go negative now that it counts whole matching lines instead of
-    # subtracting key occurrences, so the old floor is gone rather than silently dropped.
-    assert "max(0, buf.count" not in body
-
 
 def _drive_instance_upload_loop(
     monkeypatch,
@@ -1233,6 +1204,7 @@ def _drive_instance_upload_loop(
     at the preceding newline while the observed eof advances and remains eligible for upload.
     """
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers._lifecycle import bootstrap_console as _bootstrap_console
 
     waits: list[float] = []
     uploads: list[int] = []
@@ -1258,7 +1230,7 @@ def _drive_instance_upload_loop(
         uploads.append(clock["i"])
         return succeed(len(uploads)) if callable(succeed) else succeed
 
-    monkeypatch.setattr(_instance_bootstrap, "_console_progress", _progress)
+    monkeypatch.setattr(_bootstrap_console, "_console_progress", _progress)
     monkeypatch.setattr(_instance_bootstrap, "_upload_console_snapshot", _upload)
     _instance_bootstrap._console_upload_loop({}, "/tmp/console.txt", "train", 3600.0, _Stop())
     return waits, uploads
@@ -1692,138 +1664,139 @@ def test_instance_console_upload_loop_detects_a_wedge_that_keeps_logging(monkeyp
     assert (after_wedge[0] - healthy_polls) * poll_s < 1200.0
 
 
-def test_shipped_upload_loop_decides_exactly_like_the_canonical_one(tmp_path):
-    """The two console uploaders must make the SAME commit decisions on the same console.
-
-    There are two copies of this algorithm by necessity, not by choice: `bootstrap._console_upload_loop`
-    runs on an instance box, while `handler._train_body._upload_loop` is hand-inlined because only
-    `_train_body`'s SOURCE ships to the RunPod worker, where a module-level name is a NameError.
-    Every other guard on that pair is a literal-string assertion or a comment saying "mirrors
-    bootstrap" -- neither of which can catch a change to the LOGIC. Reordering a condition, dropping
-    a `not due`, or letting one copy count a `pending` heartbeat the other ignores keeps every
-    string intact and silently gives the two providers different wedge behavior.
-
-    So both real implementations are executed against identical console streams and their upload
-    schedules compared. The streams mix committed, pending, throttled and liveness heartbeats with
-    plain noise, because those are exactly the inputs the two must agree on: only committed beats
-    count once one has landed, liveness never counts, and noise grows the file without being progress.
-    """
+def test_generated_worker_loads_console_runtime_from_downloaded_code(tmp_path, monkeypatch):
     import ast
-    import inspect
+    import contextlib
+    import hashlib
+    import json
     import os
-    import random
     import re
-    import textwrap
+    import shutil
+    import subprocess
+    import sys
+    import types
+    from pathlib import Path
 
-    from flash.providers._lifecycle import bootstrap as instance_bootstrap
-    from flash.providers.runpod.serverless import handler
+    import huggingface_hub
 
-    source = inspect.getsource(handler)
-    loop_src = next(
-        ast.get_source_segment(source, node)
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.FunctionDef) and node.name == "_upload_loop"
+    root = Path(__file__).resolve().parents[1]
+    dockerfile = (root / "Dockerfile.worker").read_text()
+    copy = re.search(
+        r"COPY (flash/providers/runpod/serverless/handler\.py) "
+        r"(docker/make_rp_handler\.py) /tmp/rpgen/",
+        dockerfile,
     )
+    assert copy, "worker image must copy the handler source and generator together"
+    assert "make_rp_handler.py /tmp/rpgen/handler.py /rp_handler.py" in dockerfile
+    generated = tmp_path / "rp_handler.py"
+    subprocess.run(
+        [sys.executable, str(root / copy.group(2)), str(root / copy.group(1)), str(generated)],
+        check=True,
+    )
+    generated_source = generated.read_text()
+    function = next(
+        node
+        for node in ast.parse(generated_source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_train_body"
+    )
+    namespace: dict = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(generated), "exec"), namespace)
 
-    lines = {
-        "commit": b'HEARTBEAT {"stage":"step","step":1}\n',
-        "pending": b'HEARTBEAT {"stage":"step","pending":true}\n',
-        "throttled": b'HEARTBEAT {"stage":"step","throttled":true}\n',
-        "liveness": b'HEARTBEAT {"stage":"step","liveness":true}\n',
-        "noise": b"(raylet) still waiting for resources\n",
-        "silent": b"",
+    run_code = tmp_path / "runcode"
+    real_join = os.path.join
+
+    def mapped_join(*parts):
+        joined = real_join(*parts)
+        if joined == "/runcode" or joined.startswith("/runcode/"):
+            return str(run_code) + joined.removeprefix("/runcode")
+        return joined
+
+    monkeypatch.setattr(os.path, "join", mapped_join)
+    digest = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:32]
+    code_prefix = f"code/{digest}/flash"
+    code_dir = run_code / "code" / digest
+    console_origin = tmp_path / "console_origin.txt"
+    artifact_origin = tmp_path / "artifact_origin.txt"
+    loop_call = tmp_path / "loop_call.txt"
+    uploads: list[str] = []
+    module_sources = {
+        "providers/_lifecycle/bootstrap_console.py": (
+            "import json\nfrom pathlib import Path\n"
+            f"Path({str(console_origin)!r}).write_text(__file__)\n"
+            "def _run_console_upload_loop(console, interval_s, stop_upload, *, upload):\n"
+            f"    Path({str(loop_call)!r}).write_text(json.dumps([__file__, interval_s]))\n"
+            "    upload()\n"
+        ),
+        "adapters/artifacts.py": (
+            "from pathlib import Path\n"
+            f"Path({str(artifact_origin)!r}).write_text(__file__)\n"
+            "def attempt_scoped_artifact_name(kind, phase, attempt):\n"
+            "    return f'exact-{kind}-{phase}-attempt{attempt}.txt'\n"
+        ),
     }
 
-    class _Stop:
-        """A stop event that appends one poll's console output before releasing the loop.
+    class _Api:
+        def __init__(self, token=None):
+            pass
 
-        The console has to grow BETWEEN polls, not before the run, or every poll would read the
-        whole stream at once and the wedge timer would never see silence.
-        """
+        def list_repo_tree(self, **_kwargs):
+            return [
+                types.SimpleNamespace(path=f"{code_prefix}/{relative}", size=1)
+                for relative in module_sources
+            ]
 
-        def __init__(self, plan, path):
-            self.plan, self.path, self.i = plan, path, 0
+        def upload_file(self, *, path_in_repo, **_kwargs):
+            uploads.append(path_in_repo)
 
-        def wait(self, _seconds):
-            if self.i >= len(self.plan):
-                return True
-            with open(self.path, "ab") as handle:
-                handle.write(lines[self.plan[self.i]])
-            self.i += 1
-            return False
+    def _download(*, filename, local_dir, **_kwargs):
+        relative = filename.removeprefix(code_prefix + "/")
+        target = run_code / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(module_sources[relative])
+        return str(target)
 
-    def _count(runner, plan, results, path):
-        calls, outcomes = [], iter(results)
-        stop = _Stop(plan, path)
+    class _Process:
+        def __init__(self, *_args, **kwargs):
+            assert Path(kwargs["cwd"]) == code_dir
+            self.stdout = iter(["worker started\n"])
+            self.returncode = 0
 
-        def _upload(*_args, **_kwargs):
-            calls.append(stop.i)
-            return next(outcomes)
+        def wait(self):
+            return self.returncode
 
-        runner(stop, _upload, path)
-        return calls
-
-    def _shipped(stop, upload, path):
-        namespace = {
-            "os": os,
-            "re": re,
-            "console": path,
-            "mode": "train",
-            "stop_upload": stop,
-            "_upload_console": upload,
-        }
-        # exec is the point: this is the same source text the RunPod worker executes.
-        exec(textwrap.dedent(loop_src), namespace)
-        namespace["_upload_loop"]()
-
-    def _canonical(stop, upload, path):
-        original = instance_bootstrap._upload_console_snapshot
-        instance_bootstrap._upload_console_snapshot = lambda *a, **k: upload()
-        try:
-            instance_bootstrap._console_upload_loop(
-                {"hf_repo": "org/repo", "env": {}}, path, "train", 3600.0, stop
-            )
-        finally:
-            instance_bootstrap._upload_console_snapshot = original
-
-    random.seed(20260815)
-    for trial in range(120):
-        plan = [random.choice(list(lines)) for _ in range(random.randint(5, 40))]
-        results = [random.random() < 0.8 for _ in range(len(plan) + 5)]
-        schedules = []
-        for index, runner in enumerate((_shipped, _canonical)):
-            console = tmp_path / f"console_{trial}_{index}.txt"
-            console.write_bytes(b"")
-            schedules.append(_count(runner, plan, results, str(console)))
-        assert schedules[0] == schedules[1], (
-            f"shipped uploader committed at {schedules[0]}, canonical at {schedules[1]} on "
-            f"{''.join(step[0] for step in plan)}"
+    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _download)
+    monkeypatch.setattr(subprocess, "Popen", _Process)
+    input_data = {
+        "phase": "sft",
+        "seed": 0,
+        "hf_repo": "owner/runs",
+        "job_spec_json": '{"algorithm":"sft","run_id":"generated-run"}',
+        "env": {"HF_TOKEN": "token", "ATTEMPT": "2"},
+        "code_prefix": code_prefix,
+        **_run_deadline_fields(),
+    }
+    try:
+        with pytest.raises(RuntimeError, match=r"produced no /tmp/metrics\.json"):
+            namespace["_train_body"](input_data)
+        assert Path(console_origin.read_text()) == (
+            code_dir / "flash/providers/_lifecycle/bootstrap_console.py"
         )
-
-    deterministic = {
-        # sustained silence overlaps the scheduled poll. the next noise line must not cause a
-        # redundant emergency upload, but later progress and a real wedge must still upload.
-        "overlap": (["commit"] + ["silent"] * 4 + ["noise", "commit"] + ["silent"] * 4, [5, 11]),
-    }
-    lines["partial"] = b"unterminated diagnostic bytes"
-    deterministic["unterminated"] = (["commit"] * 5 + ["partial"] + ["silent"] * 3, [5, 9])
-    for name, (plan, expected) in deterministic.items():
-        schedules = []
-        for index, runner in enumerate((_shipped, _canonical)):
-            console = tmp_path / f"console_{name}_{index}.txt"
-            console.write_bytes(b"")
-            schedules.append(_count(runner, plan, [True] * 10, str(console)))
-        assert schedules == [expected, expected], f"{name} schedules differed: {schedules}"
-
-    lines["chatty"] = b"x" * 2_100_000 + b"\n" + lines["commit"]
-    plan = ["commit"] * 5 + ["chatty"] + ["silent"] * 8
-    results = [True] * 10
-    schedules = []
-    for index, runner in enumerate((_shipped, _canonical)):
-        console = tmp_path / f"console_chatty_{index}.txt"
-        console.write_bytes(b"")
-        schedules.append(_count(runner, plan, results, str(console)))
-    assert schedules[0] == schedules[1]
+        assert Path(artifact_origin.read_text()) == code_dir / "flash/adapters/artifacts.py"
+        called_from, interval_s = json.loads(loop_call.read_text())
+        assert Path(called_from) == code_dir / "flash/providers/_lifecycle/bootstrap_console.py"
+        assert interval_s == 3600.0
+        assert "sft/generated-run/exact-console-sft-attempt2.txt" in uploads
+        assert "sft/generated-run/console_sft.txt" in uploads
+    finally:
+        shutil.rmtree(code_dir, ignore_errors=True)
+        for target in (
+            "/tmp/console_sft.txt",
+            "/tmp/console_sft.txt.live.tail",
+            "/tmp/console_sft.txt.final.tail",
+        ):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(target)
 
 
 def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
@@ -1841,7 +1814,7 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     """
     import json
 
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers._lifecycle import bootstrap_console as _bootstrap_console
 
     def _hb(**kw) -> bytes:
         # the real console line: heartbeat.py prints "HEARTBEAT " + json.dumps(payload).
@@ -1853,7 +1826,7 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     pings = _hb(liveness=True) + b"ray warning: worker is idle\n"
     console.write_bytes(progress + pings)
 
-    cursor, observed_eof, beats, _any = _instance_bootstrap._console_progress(str(console), 0)
+    cursor, observed_eof, beats, _any = _bootstrap_console._console_progress(str(console), 0)
     assert (cursor, observed_eof, beats) == (
         len(progress) + len(pings),
         len(progress) + len(pings),
@@ -1863,7 +1836,7 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     # the wedge: heartbeats keep arriving, but every one is a liveness ping.
     with open(console, "ab") as f:
         f.write(pings * 3)
-    cursor2, eof2, beats2, _any2 = _instance_bootstrap._console_progress(str(console), cursor)
+    cursor2, eof2, beats2, _any2 = _bootstrap_console._console_progress(str(console), cursor)
     assert beats2 == 0, "liveness pings after the last real heartbeat must not read as progress"
     assert (cursor2, eof2) == (cursor + len(pings) * 3, observed_eof + len(pings) * 3)
 
@@ -1877,7 +1850,7 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     cut = ping.index(b'"liveness":') - 5  # past "stage", before "liveness"
     assert b'"stage":' not in ping[cut:]
     assert b'"liveness":' in ping[cut:]
-    assert _instance_bootstrap._console_progress(str(solo), cut) == (
+    assert _bootstrap_console._console_progress(str(solo), cut) == (
         len(ping),
         len(ping),
         0,
@@ -1891,22 +1864,22 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     # exists to take gets scheduled after the teardown has already killed the box.
     pend = tmp_path / "console_pending.txt"
     pend.write_bytes(_hb(step=8, pending=True) * 2)
-    assert _instance_bootstrap._console_progress(str(pend), 0)[2] == 0
+    assert _bootstrap_console._console_progress(str(pend), 0)[2] == 0
     # but it does count toward arming, the fourth value: the line exists because a heartbeat was
     # produced, so the training loop was reached. If arming used the progress count instead, a run
     # whose heartbeat uploads all fail would never arm and could never buy a wedge snapshot -- the
     # next scheduled one is an interval out, past the setup teardown, so the console is lost.
-    assert _instance_bootstrap._console_progress(str(pend), 0)[3] == 2
+    assert _bootstrap_console._console_progress(str(pend), 0)[3] == 2
 
     throttled = tmp_path / "console_throttled.txt"
     throttled.write_bytes(_hb(step=9, throttled=True))
-    assert _instance_bootstrap._console_progress(str(throttled), 0)[2:] == (0, 1)
+    assert _bootstrap_console._console_progress(str(throttled), 0)[2:] == (0, 1)
 
     # a liveness ping arms nothing: it prints from a daemon whether or not the training loop is
     # alive, so unlike a pending heartbeat it is not evidence the run ever reached the loop.
     lv_only = tmp_path / "console_liveness_only.txt"
     lv_only.write_bytes(_hb(liveness=True) * 3)
-    assert _instance_bootstrap._console_progress(str(lv_only), 0)[2:] == (0, 0)
+    assert _bootstrap_console._console_progress(str(lv_only), 0)[2:] == (0, 0)
 
     # a THIRD-PARTY line carrying "stage" is not a heartbeat and must not read as progress. ray,
     # verl and any library are free to emit structured json, and a wedged worker keeps emitting it
@@ -1914,7 +1887,7 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     # `HEARTBEAT ` prefix names the producer instead of inferring it from a shared key.
     foreign = tmp_path / "console_foreign.txt"
     foreign.write_bytes(b'(raylet) {"ts":"t","level":"WARN","stage":"rollout","msg":"idle"}\n' * 5)
-    assert _instance_bootstrap._console_progress(str(foreign), 0)[2] == 0
+    assert _bootstrap_console._console_progress(str(foreign), 0)[2] == 0
 
     # a line split by the poll boundary is counted EXACTLY ONCE, in whichever chunk carries its
     # `HEARTBEAT` prefix. The old subtraction could see the tail half alone, count its "stage" and
@@ -1923,15 +1896,15 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     split = tmp_path / "console_split_beat.txt"
     beat = _hb(step=11)
     split.write_bytes(beat[:20])
-    head_cursor, _head_eof, head_beats, _ = _instance_bootstrap._console_progress(str(split), 0)
+    head_cursor, _head_eof, head_beats, _ = _bootstrap_console._console_progress(str(split), 0)
     with open(split, "ab") as f:
         f.write(beat[20:])
-    tail_cursor, tail_eof, tail_beats, _ = _instance_bootstrap._console_progress(
+    tail_cursor, tail_eof, tail_beats, _ = _bootstrap_console._console_progress(
         str(split), head_cursor
     )
     assert head_beats + tail_beats == 1, "a split heartbeat is counted once, not zero or twice"
     assert (tail_cursor, tail_eof) == (len(beat), len(beat))
-    assert _instance_bootstrap._console_progress(str(split), tail_cursor)[2] == 0, "no recount"
+    assert _bootstrap_console._console_progress(str(split), tail_cursor)[2] == 0, "no recount"
 
     # and the tail half of a split LIVENESS ping is never counted: the old rule saw its "stage"
     # without the "liveness" that disqualified it, so a wedge read as progress forever.
@@ -1939,10 +1912,10 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     ping = _hb(step=12, liveness=True)
     cut = ping.index(b'"liveness":') - 5
     lv_split.write_bytes(ping[:cut])
-    lv_head = _instance_bootstrap._console_progress(str(lv_split), 0)
+    lv_head = _bootstrap_console._console_progress(str(lv_split), 0)
     with open(lv_split, "ab") as f:
         f.write(ping[cut:])
-    lv_tail = _instance_bootstrap._console_progress(str(lv_split), lv_head[0])
+    lv_tail = _bootstrap_console._console_progress(str(lv_split), lv_head[0])
     assert lv_head[2] + lv_tail[2] == 0, "a split liveness ping must never read as progress"
 
     # the scan cursor stops at the last newline while observed eof exposes unterminated bytes to the
@@ -1951,26 +1924,24 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     whole = _hb(step=3)
     partial = _hb(step=4)
     part.write_bytes(whole + partial[:20])
-    first = _instance_bootstrap._console_progress(str(part), 0)
+    first = _bootstrap_console._console_progress(str(part), 0)
     assert first == (len(whole), len(whole) + 20, 1, 1)
     with open(part, "ab") as f:
         f.write(partial[20:])
-    completed = _instance_bootstrap._console_progress(str(part), first[0])
+    completed = _bootstrap_console._console_progress(str(part), first[0])
     assert completed == (len(whole) + len(partial), len(whole) + len(partial), 1, 1)
-    assert _instance_bootstrap._console_progress(str(part), completed[0])[2:] == (0, 0)
+    assert _bootstrap_console._console_progress(str(part), completed[0])[2:] == (0, 0)
 
     # one poll drains to its captured tail in bounded chunks, so a chatty console cannot make the
     # heartbeat cursor fall farther behind on every cycle.
-    from flash.providers._lifecycle import bootstrap_secrets
-
-    cap = bootstrap_secrets._CONSOLE_SCAN_BYTES
+    cap = _bootstrap_console._CONSOLE_SCAN_BYTES
     huge = tmp_path / "console_huge_line.txt"
     huge.write_bytes(b"x" * (2 * cap + 17) + b"\n" + _hb(step=99))
-    cursor, eof, observed, any_beats = _instance_bootstrap._console_progress(str(huge), 0)
+    cursor, eof, observed, any_beats = _bootstrap_console._console_progress(str(huge), 0)
     assert (cursor, eof) == (huge.stat().st_size, huge.stat().st_size)
     assert (observed, any_beats) == (1, 1)
 
-    assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (
+    assert _bootstrap_console._console_progress(str(tmp_path / "absent.txt"), 0) == (
         -1,
         -1,
         0,
@@ -2203,6 +2174,7 @@ def test_serverless_live_and_terminal_console_snapshots_use_distinct_repo_paths(
     import os
     import textwrap
     import threading
+    from pathlib import Path
 
     from flash.providers.runpod.serverless import endpoints
 
@@ -2237,7 +2209,11 @@ def test_serverless_live_and_terminal_console_snapshots_use_distinct_repo_paths(
         "env": {"ATTEMPT": "2"},
         "console_teardown": teardown,
         "_require_deadline_allowance": lambda: None,
+        "_read_console_tail": lambda path: Path(path).read_text(),
         "_safe_detail": lambda text, _env, _limit=0: text,
+        "attempt_scoped_artifact_name": lambda kind, phase, attempt: (
+            f"{kind}_{phase}_attempt{attempt}.txt"
+        ),
         "print": lambda *_args, **_kw: None,
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
