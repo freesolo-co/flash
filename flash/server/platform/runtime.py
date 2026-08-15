@@ -710,12 +710,9 @@ def _classify_recoverable_runs(
                 # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
                 # persisted status without parsing the spec. Terminate by that reconstructed
                 # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
-                with contextlib.suppress(Exception):
-                    gpu_type = (status.spec.get("gpu") or {}).get("type")
-                    if gpu_type:
-                        from flash.providers.runpod.serverless import terminate_endpoint
+                from flash.providers.runpod import terminate_persisted_endpoints
 
-                        terminate_endpoint(gpu_type, status.run_id)
+                terminate_persisted_endpoints(status.spec, status.run_id)
                 continue
             # reap run-scoped resources from the parseable public spec before touching the private
             # warm-start snapshot. source drift or snapshot tampering must not strand an endpoint.
