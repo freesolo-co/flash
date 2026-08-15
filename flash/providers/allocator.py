@@ -7,7 +7,12 @@ from dataclasses import replace
 from typing import NoReturn
 
 from flash._internal.logging import get_logger
-from flash.providers import PROVIDER_NAMES, available_providers, get_provider
+from flash.providers import (
+    PROVIDER_NAMES,
+    available_providers,
+    get_provider,
+    validated_provider_preferences,
+)
 from flash.providers.base import (
     GPU_INFO,
     MAX_COMBINATION_CARDS,
@@ -759,6 +764,7 @@ def allocate(
     disk_gb: float = 0.0,
     max_wall_seconds: float = 0.0,
     provider: str = "",
+    providers: tuple[str, ...] = (),
     gpu_type: str = "",
     model_revision: str = "",
     max_gpu_count: int | None = None,
@@ -790,6 +796,14 @@ def allocate(
         raise UnsupportedGpuError(
             f"unknown provider {provider!r}; known providers: {', '.join(PROVIDER_NAMES)}"
         )
+    try:
+        providers = validated_provider_preferences(
+            providers, allow_empty=isinstance(providers, tuple)
+        )
+    except (TypeError, ValueError) as exc:
+        raise UnsupportedGpuError(str(exc)) from exc
+    if provider and providers:
+        raise UnsupportedGpuError("provider and providers cannot both be set")
     available = available_providers()
     # kept across the narrowing below so a rejection can ask what dropping the pin would restore.
     unpinned = None
@@ -878,23 +892,41 @@ def allocate(
     cost_per_step = _step_cost_ranker(
         model_id, algorithm, train, thinking, model_revision, overrides
     )
-    return _cheapest_allocation(candidates, need=need, cost_per_step=cost_per_step)
+    provider_rank = {name: rank for rank, name in enumerate(providers)}
+    return _cheapest_allocation(
+        candidates,
+        need=need,
+        cost_per_step=cost_per_step,
+        provider_rank=provider_rank,
+    )
 
 
-def _cheapest_allocation(candidates, *, need: float, cost_per_step) -> Allocation:
+def _cheapest_allocation(
+    candidates, *, need: float, cost_per_step, provider_rank: dict[str, int]
+) -> Allocation:
     """The cheapest-JOB shape from a non-empty fitting set, plus the full ranking behind it.
 
     Cheapest job, not cheapest rental: rank on the dollars one step costs on each candidate (rate x
     how long that hardware takes), so a faster card wins whenever it finishes enough sooner to pay
-    for itself. Ties prefer fewer cards (less inter-card overhead), then combined VRAM, then class
-    name. Sorting is stable, so provider and provider-local order apply only when all key fields
-    match. A run the cost model cannot price (``cost_per_step`` is ``None``) falls back to total
+    for itself. An authored provider preference ranks ahead of every cost key; unnamed providers
+    share the final rank, so they remain eligible and retain their relative cost order. Within one
+    provider rank, ties prefer fewer cards (less inter-card overhead), then combined VRAM, then class
+    name. Sorting is stable, so provider and provider-local order apply only when every explicit key
+    matches. A run the cost model cannot price (``cost_per_step`` is ``None``) falls back to total
     $/hr.
     """
     primary = cost_per_step if cost_per_step is not None else (lambda c: c.total_hourly_usd)
+    unnamed_rank = len(provider_rank)
     ranked = sorted(
         candidates,
-        key=lambda c: (primary(c), c.total_hourly_usd, c.gpu_count, c.total_vram_gb, c.gpu),
+        key=lambda c: (
+            provider_rank.get(c.provider, unnamed_rank),
+            primary(c),
+            c.total_hourly_usd,
+            c.gpu_count,
+            c.total_vram_gb,
+            c.gpu,
+        ),
     )
     best = ranked[0]
     return Allocation(
