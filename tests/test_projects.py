@@ -375,18 +375,59 @@ def test_standalone_refuses_to_resolve_a_publish_slug(monkeypatch) -> None:
     assert "flash login" not in excinfo.value.detail
 
 
-def test_validation_without_a_slug_is_an_upstream_fault(monkeypatch) -> None:
-    """A managed validation response that omits the slug is a backend contract violation.
+def test_a_slug_is_derived_from_the_project_name(monkeypatch) -> None:
+    """The project directory stores no slug column, so the name is what resolves the destination.
 
-    Distinct from the standalone case: that one is a permanent property of the deployment (501),
-    this one is a transient upstream fault (502). Both used to return "" and be reported as the
-    caller's key being stale.
+    This is the shape EVERY managed deployment returns: `platform.projects` has `id, name,
+    description, created_at` and nothing else, so requiring an explicit `projectSlug` made publish
+    impossible for every project in every org rather than for an unlucky one.
+    """
+    project_id = "11111111-1111-4111-8111-111111111111"
+
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
+    monkeypatch.setattr(
+        "flash.server.domain.projects.urllib.request.urlopen",
+        lambda _req, timeout=None: _Response(
+            {"id": project_id, "name": "Alphabet Sort v2", "description": None}
+        ),
+    )
+
+    assert require_project_access_slug(
+        project_id=project_id,
+        key={"auth_kind": "freesolo_api_key", "org_id": "org-one"},
+        authorization="Bearer fslo-user",
+    ) == (project_id, "alphabet-sort-v2")
+
+
+def test_an_explicit_slug_outranks_the_derived_one(monkeypatch) -> None:
+    """Deriving is the fallback, not the rule: a backend that sends a slug stays authoritative."""
+    project_id = "11111111-1111-4111-8111-111111111111"
+
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
+    monkeypatch.setattr(
+        "flash.server.domain.projects.urllib.request.urlopen",
+        lambda _req, timeout=None: _Response(
+            {"project": {"id": project_id, "slug": "checkout-bot", "name": "Something Else"}}
+        ),
+    )
+
+    assert require_project_access_slug(
+        project_id=project_id,
+        key={"auth_kind": "freesolo_api_key", "org_id": "org-one"},
+        authorization="Bearer fslo-user",
+    ) == (project_id, "checkout-bot")
+
+
+def test_an_unnormalizable_project_name_is_the_callers_to_fix(monkeypatch) -> None:
+    """A name with no usable character is a 400 the caller can act on, not an opaque 502.
+
+    Distinct from the standalone case (501, a permanent property of the deployment): renaming the
+    project fixes this one, so the message has to say that rather than blame the backend.
     """
     project_id = "11111111-1111-4111-8111-111111111111"
 
     def urlopen(_req, timeout=None):
-        # no projectSlug / slug anywhere in the body
-        return _Response({"project": {"id": project_id, "orgId": "org-one"}})
+        return _Response({"project": {"id": project_id, "orgId": "org-one", "name": "!!!"}})
 
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
     monkeypatch.setattr("flash.server.domain.projects.urllib.request.urlopen", urlopen)
@@ -396,8 +437,8 @@ def test_validation_without_a_slug_is_an_upstream_fault(monkeypatch) -> None:
         require_project_access_slug(
             project_id=project_id, key=key, authorization="Bearer fslo-user"
         )
-    assert excinfo.value.status_code == 502
-    assert "returned no slug" in excinfo.value.detail
+    assert excinfo.value.status_code == 400
+    assert "rename the project" in excinfo.value.detail
 
     # the id-only entry point is unaffected: it never promised a slug.
     assert (

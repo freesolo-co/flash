@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
-import math
 import queue
 import tempfile
 import threading
@@ -12,6 +10,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from flash._internal.channel import CLI_NAME
+from flash.cli.commands.env.eval_args import (
+    _MAX_CONCURRENCY,
+    bounded_concurrency,
+    finite_float,
+    positive_int,
+)
 from flash.cli.commands.env.push import _err
 from flash.cli.commands.env.test import _env_params, _evaluation_example
 from flash.cli.ui import render
@@ -24,36 +28,6 @@ from flash.envs.evaluations import (
     normalize_eval_result,
     validate_evaluation_cases,
 )
-
-_MAX_CONCURRENCY = 32
-
-
-def positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 1:
-        raise argparse.ArgumentTypeError("must be at least 1")
-    return parsed
-
-
-def finite_float(value: str) -> float:
-    """A temperature the chat route will accept.
-
-    Reject non-finite or negative values before they become one paid rejection per case.
-    The nonnegative floor matches `flash/schema/__init__.py`.
-    """
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise argparse.ArgumentTypeError(f"must be a finite number, got {value}")
-    if parsed < 0.0:
-        raise argparse.ArgumentTypeError(f"must be at least 0.0, got {value}")
-    return parsed
-
-
-def bounded_concurrency(value: str) -> int:
-    parsed = positive_int(value)
-    if parsed > _MAX_CONCURRENCY:
-        raise argparse.ArgumentTypeError(f"must be at most {_MAX_CONCURRENCY}")
-    return parsed
 
 
 def _generation_error(case_id: str, message: str) -> EvalResult:
@@ -159,13 +133,17 @@ def _scored_response(response: str, *, thinking: bool) -> str:
     """The response as a scorer should see it, matching what training grades.
 
     Strip reasoning only for `thinking` runs; raw reasoning mis-grades them, while unconditional
-    stripping can truncate non-thinking answers that mention `<think>`.
+    stripping can truncate non-thinking answers that mention `<think>`. An already-structured value
+    passes through: re-deriving it from its own answer-only string destroys the raw and thinking
+    views only its producer had the generation to build.
     """
     if not thinking:
         return response
     from flash.content.thinking import strip_think, thinking_text
     from flash.envs.adapter import _ScoredResponseText
 
+    if isinstance(response, _ScoredResponseText):
+        return response
     answer = strip_think(response)
     return _ScoredResponseText(
         answer if isinstance(answer, str) else response,
@@ -194,22 +172,28 @@ def _score_case(
     `state_keyword` says which way that suite's signature can take it -- `**kwargs` and
     keyword-only scorers reject a third positional, `*args` scorers reject the keyword -- so the
     caller decides, having read the signature.
+
+    The scorer grades the stripped answer; the RESULT records the raw generation. Stripping for the
+    scorer must not shorten what is recorded, on the error path least of all -- a failed case is
+    when the reasoning that explains it matters most.
     """
+    recorded_response = response
     try:
         scored_text = _scored_response(response, thinking=thinking)
+        recorded_response = getattr(scored_text, "raw", response)
         if state is None:
             scored = suite.score(case, scored_text)
         elif state_keyword:
             scored = suite.score(case, scored_text, state=state)
         else:
             scored = suite.score(case, scored_text, state)
-        return normalize_eval_result(case, response, scored, case_id=case_id)
+        return normalize_eval_result(case, recorded_response, scored, case_id=case_id)
     except (Exception, SystemExit) as exc:
         return EvalResult(
             case_id=case_id,
             passed=False,
             score=0.0,
-            response=response,
+            response=recorded_response,
             error=f"scoring failed: {str(exc) or exc.__class__.__name__}",
         )
 
@@ -992,4 +976,11 @@ def cmd_env_eval(args) -> int:
         )
 
 
-__all__ = ["_MAX_CONCURRENCY", "bounded_concurrency", "cmd_env_eval", "positive_int"]
+# re-exported from eval_args so `flash.cli` keeps importing the eval flag validators from here.
+__all__ = [
+    "_MAX_CONCURRENCY",
+    "bounded_concurrency",
+    "cmd_env_eval",
+    "finite_float",
+    "positive_int",
+]

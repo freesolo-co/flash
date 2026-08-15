@@ -49,9 +49,9 @@ def loadable_adapter_weight_files(filenames) -> list[str]:
     exists to prevent, arriving one level up at the set instead of at the name.
 
     A partial shard set is rejected for the same reason: the index names the complete set, so a
-    listing missing one of its members cannot be loaded either. Shards the index would not name are
-    left out rather than treated as fatal -- a retry uploads over the previous attempt without
-    deleting what it no longer writes, so a stale shard beside a complete live set is expected.
+    listing missing one of its members cannot be loaded either. Residue carrying a second shard total
+    also fails closed. Filenames cannot reveal which total the index references, and guessing risks
+    binding stale weights; cleaning the residue or re-uploading makes the representation decidable.
 
     Returned in peft's own precedence order, so the caller that reads tensor keys reads exactly the
     files the serving engine will.
@@ -62,7 +62,7 @@ def loadable_adapter_weight_files(filenames) -> list[str]:
         if single in names:
             return [single]
         referenced = _index_shard_names(names, suffix)
-        if referenced and referenced <= names:
+        if referenced:
             return sorted(referenced)
     return []
 
@@ -81,25 +81,39 @@ def _index_shard_names(names: set[str], suffix: str) -> set[str]:
     parse json to answer "is this set complete". The exporter, which already has the files locally,
     still reads the real ``weight_map`` -- that is the authority on which shards are live.
 
-    Empty when no index is present, or when the shard names do not agree on a single total.
+    Empty when no index is present, the sole candidate shard set is incomplete, or more than one
+    candidate total appears. The last case is genuinely undecidable from filenames alone: the index
+    names exactly one set but the listing cannot say which, so rejecting loudly is safer than silently
+    serving stale weights.
     """
     if f"adapter_model{suffix}.index.json" not in names:
         return set()
     totals = set()
+    oversized_total = False
     for name in names:
         if not name.startswith(ADAPTER_SHARD_PREFIX) or not name.endswith(suffix):
             continue
         stem = name[len(ADAPTER_SHARD_PREFIX) : -len(suffix)]
         shard, sep, total = stem.partition("-of-")
-        if sep and shard.isdigit() and total.isdigit() and int(total) > 0:
-            totals.add((total, len(shard)))
-    if len(totals) != 1:
+        if not (sep and shard.isdigit() and total.isdigit()):
+            continue
+        parsed_total = int(total)
+        if parsed_total <= 0:
+            continue
+        if parsed_total > len(names):
+            # this total cannot be complete, but it still proves the listing contains residue from a
+            # different save. keep that ambiguity evidence without materializing an unbounded set.
+            oversized_total = True
+            continue
+        totals.add((total, len(shard)))
+    if oversized_total or len(totals) != 1:
         return set()
-    total, width = totals.pop()
-    return {
+    total, width = next(iter(totals))
+    candidate = {
         f"{ADAPTER_SHARD_PREFIX}{index:0{width}d}-of-{total}{suffix}"
         for index in range(1, int(total) + 1)
     }
+    return candidate if candidate <= names else set()
 
 
 # The largest attempt identity any artifact name may carry. An attempt number reaches a filename and
