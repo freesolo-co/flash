@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import importlib.util
 import io
 import json
@@ -3531,6 +3532,112 @@ def test_a_layout_error_after_a_successful_merge_is_not_called_a_full_disk(monke
 
     assert "adapter_config.json" in str(caught.value)
     assert not isinstance(caught.value, verl_checkpoints.MergeDiskExhaustedError)
+
+
+def test_a_placement_failure_after_a_successful_merge_is_not_called_a_full_disk(
+    monkeypatch, tmp_path
+):
+    """the layout check is not the only thing that runs after the merger exits 0.
+
+    `os.listdir` and the per-file `os.replace` that move the adapter into place sit inside the same
+    `try`, and they can fail for reasons of their own -- a stale protected destination raising
+    `EACCES`, for one. Every one of those follows a COMPLETED full-model write, which is exactly
+    what leaves the volume near its limit, so a carve-out keyed to the layout error's TYPE still
+    relabels them a full disk. The suppression has to be keyed to the merger having succeeded.
+    """
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "global_step_350"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+
+    free = {"value": 1 << 40}
+
+    def successful_merge(cmd, env):
+        lora_dir = tmp_path / "adapter_merge" / "lora_adapter"
+        lora_dir.mkdir(parents=True)
+        (lora_dir / "adapter_config.json").write_text("{}")
+        free["value"] = 1024  # the completed full-model write is why the disk is now tight
+
+    denied = PermissionError(errno.EACCES, "Permission denied")
+
+    def refuse_to_place(src, dst):
+        raise denied
+
+    monkeypatch.setattr(verl_checkpoints, "_run_merger", successful_merge)
+    monkeypatch.setattr(verl_checkpoints.os, "replace", refuse_to_place)
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=0, free=free["value"]),
+    )
+
+    with pytest.raises(PermissionError) as caught:
+        verl_checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+
+    assert caught.value is denied
+    assert not isinstance(caught.value, verl_checkpoints.MergeDiskExhaustedError)
+
+
+def test_a_quota_exhaustion_counts_as_a_full_disk(monkeypatch, tmp_path):
+    """EDQUOT means the write could not get another byte, same as ENOSPC.
+
+    On a project- or user-quota-backed volume the allocation runs out while the underlying
+    filesystem still reports gigabytes free, so the free-space sample cannot catch it and the
+    reported text or errno is the only evidence there is. Recognising only ENOSPC discards that one
+    diagnostic and lets the original serialization error escape -- the exact misdiagnosis this
+    module exists to prevent, in the one case where the disk cannot be asked for a second opinion.
+    """
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    actor_dir = tmp_path / "global_step_350"
+    (actor_dir / "huggingface").mkdir(parents=True)
+    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+
+    # roomy on purpose: only the quota evidence can pass this.
+    monkeypatch.setattr(
+        verl_checkpoints.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
+    )
+
+    # both shapes a quota failure arrives in: a real errno, and text-only from a writer that
+    # raises no OSError at all (safetensors).
+    for error in (
+        OSError(errno.EDQUOT, "Disk quota exceeded"),
+        RuntimeError("Error while serializing: I/O error: Disk quota exceeded (os error 122)"),
+    ):
+        with pytest.raises(verl_checkpoints.MergeDiskExhaustedError):
+            verl_checkpoints.raise_for_merge_disk_exhaustion(
+                error, str(actor_dir), str(tmp_path / "m_merge")
+            )
+
+
+def test_undecodable_merger_output_does_not_kill_a_healthy_merge(tmp_path):
+    """a stray non-utf-8 byte in the child's log must not abort the export.
+
+    Capturing the output means it is decoded in THIS process, which `text=True` alone does
+    strictly: one invalid byte from the merger or a native dependency raises `UnicodeDecodeError`
+    inside the streaming loop, and the `BaseException` handler there kills a merge that was
+    otherwise fine. The previous inherited-stderr implementation never decoded, so this failure mode
+    is one the capture introduced.
+    """
+    import sys
+
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    # writes a raw invalid utf-8 byte to stdout, then exits 0.
+    child = (
+        "import sys; sys.stdout.buffer.write(b'starting\\n\\xff\\xfe bad bytes\\n'); "
+        "sys.stdout.buffer.write(b'done\\n'); sys.stdout.flush()"
+    )
+
+    verl_checkpoints._run_merger([sys.executable, "-c", child], dict(os.environ))
 
 
 def test_the_mergers_own_enospc_survives_the_subprocess_boundary(monkeypatch, tmp_path):

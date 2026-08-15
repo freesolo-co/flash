@@ -29,10 +29,13 @@ class MergeDiskExhaustedError(RuntimeError):
 class MergerOutputLayoutError(RuntimeError):
     """the merger exited successfully but did not put the adapter where flash reads it.
 
-    Its own type so the disk classifier can tell it apart from a write that failed. It is raised
-    only AFTER the merger exited 0, which means the full-model write completed -- and that write
-    routinely finishes with the volume near its limit, so a free-space check alone would read this
-    as exhaustion and replace an actionable layout message with a wrong one.
+    Its own type so this stays distinguishable from a merge that failed. It is raised only AFTER the
+    merger exited 0, which means the full-model write completed -- and that write routinely finishes
+    with the volume near its limit, so a free-space check would read this as exhaustion and replace
+    an actionable layout message with a wrong one. That protection is not keyed to this type: the
+    classifier suppresses its free-space sample for EVERY failure after a successful merge (see
+    ``raise_for_merge_disk_exhaustion``), since a placement error raised beside this one is just as
+    badly served by being called a full disk.
     """
 
 
@@ -48,10 +51,23 @@ _MERGE_DISK_EXHAUSTED_FREE_BYTES = 64 * 1024 * 1024
 # the kernel finishing the teardown; it exists so a cancel can never block indefinitely here.
 _MERGER_KILL_REAP_SECONDS = 10
 
-# ENOSPC as it reaches this process in text form. the merger is a subprocess, so its safetensors
-# and torch errors arrive as printed output rather than as exceptions -- but a failure raised in
-# THIS process (an os.replace of the merged files, say) still carries the string or the errno.
-_ENOSPC_MARKERS = ("no space left on device", "errno 28", "os error 28")
+# a filesystem that cannot accept another byte, as it reaches this process in text form. the merger
+# is a subprocess, so its safetensors and torch errors arrive as printed output rather than as
+# exceptions -- but a failure raised in THIS process (an os.replace of the merged files, say) still
+# carries the string or the errno.
+#
+# EDQUOT (122, "Disk quota exceeded") as well as ENOSPC (28): on a project- or user-quota-backed
+# volume the allocation runs out while the underlying filesystem still reports free space, so the
+# free-space sample cannot catch that form and the reported text is the only evidence there is.
+_DISK_EXHAUSTED_ERRNOS = (errno.ENOSPC, errno.EDQUOT)
+_DISK_EXHAUSTED_MARKERS = (
+    "no space left on device",
+    "errno 28",
+    "os error 28",
+    "disk quota exceeded",
+    "errno 122",
+    "os error 122",
+)
 
 # the one remedy a config can actually reach, and it has to name both schedules. `train.save_every`
 # is only consulted when `train.save_at_steps` is empty: with exact steps set, `save_freq` comes from
@@ -167,16 +183,27 @@ def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
     exact disk this module exists to protect.
     """
     process = subprocess.Popen(
-        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        # replace, not strict: decoding happens in THIS process only because the output is now
+        # captured, so a non-utf-8 byte from the merger or a native dependency would raise
+        # UnicodeDecodeError here and the handler below would kill an otherwise healthy merge --
+        # a failure mode the previous inherited-stderr implementation could not have. arbitrary
+        # diagnostic bytes must never be able to abort a checkpoint export.
+        errors="replace",
+        bufsize=1,
     )
-    enospc_line = ""
+    exhausted_line = ""
     # deliberately NOT `with process:` -- its __exit__ runs before any handler here and calls an
     # unbounded wait(), so the kill below would not be reached until the child exited on its own.
     try:
         for line in process.stdout or ():
             print(line, end="", flush=True)
-            if not enospc_line and any(m in line.lower() for m in _ENOSPC_MARKERS):
-                enospc_line = line.strip()
+            if not exhausted_line and any(m in line.lower() for m in _DISK_EXHAUSTED_MARKERS):
+                exhausted_line = line.strip()
     except BaseException:
         process.kill()
         raise
@@ -188,7 +215,7 @@ def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(timeout=_MERGER_KILL_REAP_SECONDS)
     if process.returncode:
-        raise subprocess.CalledProcessError(process.returncode, cmd, output=enospc_line or None)
+        raise subprocess.CalledProcessError(process.returncode, cmd, output=exhausted_line or None)
 
 
 def _free_bytes(path: str) -> int | None:
@@ -199,32 +226,36 @@ def _free_bytes(path: str) -> int | None:
         return None
 
 
-def _enospc_error(error: BaseException) -> bool:
-    """whether ``error`` (or anything it wraps) is a full disk reported in this process."""
+def _disk_exhausted_error(error: BaseException) -> bool:
+    """whether ``error`` (or anything it wraps) is an exhausted filesystem reported in this process.
+
+    Exhausted covers a quota as well as a full volume: both mean the write could not get another
+    byte, and both surface here in exactly the same shapes.
+    """
     seen: set[int] = set()
     current: BaseException | None = error
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, OSError) and current.errno == errno.ENOSPC:
+        if isinstance(current, OSError) and current.errno in _DISK_EXHAUSTED_ERRNOS:
             return True
         # safetensors' SafetensorError is not an OSError and carries no errno: it renders the
         # underlying failure only in its message ("I/O error: No space left on device (os error
         # 28)"), so the text is the sole evidence for that writer.
-        if any(marker in str(current).lower() for marker in _ENOSPC_MARKERS):
+        if any(marker in str(current).lower() for marker in _DISK_EXHAUSTED_MARKERS):
             return True
         # a subprocess failure renders as "Command ... returned non-zero exit status N", which never
         # contains the child's own message: the captured output has to be read as well.
         captured = getattr(current, "output", None) or getattr(current, "stderr", None)
         if isinstance(captured, bytes):
             captured = captured.decode("utf-8", "replace")
-        if captured and any(marker in captured.lower() for marker in _ENOSPC_MARKERS):
+        if captured and any(marker in captured.lower() for marker in _DISK_EXHAUSTED_MARKERS):
             return True
         current = current.__cause__ or current.__context__
     return False
 
 
 def raise_for_merge_disk_exhaustion(
-    error: BaseException, ckpt_actor_dir: str, merge_out: str
+    error: BaseException, ckpt_actor_dir: str, merge_out: str, *, merger_succeeded: bool = False
 ) -> None:
     """Re-raise a merge failure as a disk-exhaustion error when a full disk is what killed it.
 
@@ -252,14 +283,22 @@ def raise_for_merge_disk_exhaustion(
     Deliberately not raised when the disk has room: a merge can fail for reasons that have nothing
     to do with space (a layout change, an OOM in the child), and relabelling those as a full disk
     would send the next diagnosis somewhere just as wrong as the one this exists to prevent.
+
+    ``merger_succeeded`` disables the free-space sample entirely. Once the child has exited 0 its
+    full-model write COMPLETED, so nothing was short-written and a tight disk is merely the expected
+    aftermath of that write rather than evidence about whatever failed next. Everything after that
+    point -- the layout check, the ``os.listdir``, the ``os.replace`` of each adapter file -- can
+    fail for its own reasons (a stale protected destination raising ``EACCES``, say), and each would
+    otherwise be relabelled a full disk purely because the merge it followed left the volume near
+    its limit. An exhaustion the error reports ITSELF still counts: that is direct evidence, not an
+    inference from a sample.
     """
-    if isinstance(error, MergerOutputLayoutError) and not _enospc_error(error):
-        # the merger exited 0, so nothing was short-written; the full-model write it just completed
-        # is simply why the disk is now tight. sampling free space here would swap an actionable
-        # layout error for a disk error that is not what happened.
+    if merger_succeeded and not _disk_exhausted_error(error):
         return
     free = _free_bytes(merge_out)
-    if not _enospc_error(error) and (free is None or free > _MERGE_DISK_EXHAUSTED_FREE_BYTES):
+    if not _disk_exhausted_error(error) and (
+        free is None or free > _MERGE_DISK_EXHAUSTED_FREE_BYTES
+    ):
         return
     free_text = "unknown" if free is None else f"{free / 1e9:.2f} GB"
     raise MergeDiskExhaustedError(
@@ -481,6 +520,10 @@ def export_peft_adapter(
     # it holds the full merged model -- the largest transient on the disk -- so leaving it behind
     # when the merger dies or writes an unexpected layout would strand tens of gb on the exact
     # disk this guard exists to protect, and the next save would inherit less room than this one.
+    # set the instant the child exits 0, and read by the classifier below: every failure after this
+    # point follows a COMPLETED full-model write, so the disk being tight says nothing about what
+    # went wrong. see raise_for_merge_disk_exhaustion.
+    merger_succeeded = False
     try:
         _run_merger(
             [
@@ -497,6 +540,7 @@ def export_peft_adapter(
             ],
             merge_env,
         )
+        merger_succeeded = True
         lora_dir = os.path.join(merge_out, "lora_adapter")
         if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
             raise MergerOutputLayoutError(
@@ -519,7 +563,9 @@ def export_peft_adapter(
         # on a disk that happens to be tight is still a cancel, and relabelling it as a full disk
         # would both misreport it and strip the semantics every cancel path depends on. the
         # `finally` below still frees the merge tree for those.
-        raise_for_merge_disk_exhaustion(error, ckpt_actor_dir, merge_out)
+        raise_for_merge_disk_exhaustion(
+            error, ckpt_actor_dir, merge_out, merger_succeeded=merger_succeeded
+        )
         raise
     finally:
         shutil.rmtree(merge_out, ignore_errors=True)
