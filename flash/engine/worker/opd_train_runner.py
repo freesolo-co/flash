@@ -16,7 +16,10 @@ from typing import Any
 
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
-from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
+from flash.engine.worker.verl.parallelism import (
+    ULYSSES_SEQUENCE_PARALLEL_SIZE,
+    resolve_reshard_after_forward,
+)
 
 # the one fragment opd wraps fail-closed and verifies. named here because both the writer and the
 # post-run verification need it.
@@ -543,6 +546,16 @@ def _write_child_shims(
     return entry_path, reward_path
 
 
+def _spec_gpu_type(spec: Any) -> str:
+    """The card class the run landed on, from the spec the caller passed.
+
+    Absent spec or absent gpu table answers "", which the zero-2 gate reads as "unknown hardware"
+    and falls closed to zero-3 on. Guessing a card here would price the gate off hardware the run
+    may not have.
+    """
+    return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
+
+
 def _build_base_config(
     request: _OpdRequest,
     prompt_state: _PromptState,
@@ -570,6 +583,22 @@ def _build_base_config(
         "n_gpus_per_node": runtime.gpu_count,
         # opd shards by DATA -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why.
         "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
+        # zero-2 vs zero-3, decided by the allocator's own fit model so the worker cannot spend
+        # memory the shape was not admitted with. the spec carries the SELECTED class and count
+        # (`_spec_with_gpu`), so this asks about the hardware the run actually landed on.
+        # read it off `request.spec` like every other spec lookup here: the caller may pass a spec
+        # that is NOT the process-global JOB_SPEC (`opd_train.py`: `spec or _w.JOB_SPEC`), and
+        # sizing the gate off different hardware than the run uses is the exact allocator/worker
+        # divergence this gate exists to prevent.
+        "reshard_after_forward": resolve_reshard_after_forward(
+            model_id=request.model_id,
+            algorithm="opd",
+            gpu_type=_spec_gpu_type(getattr(request, "spec", None)),
+            n_gpus=int(runtime.gpu_count),
+            train=getattr(getattr(request, "spec", None), "train", None),
+            thinking=bool(_opd_train._w.THINKING),
+            model_revision=str(getattr(request, "model_revision", "") or ""),
+        ),
         "seed": _opd_train._w.backend_seed(_opd_train._w.SEED),
         "project_name": runtime.project_name,
         "experiment_name": runtime.experiment_name,
@@ -716,11 +745,12 @@ def _run_child(
                 )
                 training_completed = return_code == 0
     finally:
-        watcher.stop(require_complete=training_completed)
-        # stopped here rather than after the block: the sampler polls nvidia-smi on a thread of
-        # its own, the first-step marker check can raise straight out of run_verl_training, and
-        # this worker outlives the run -- a missed stop leaks that polling for the whole process.
-        peak_gpu_gb = gpu_sampler.stop_gb()
+        try:
+            watcher.stop(require_complete=training_completed)
+        finally:
+            # the sampler polls nvidia-smi on a thread of its own. stop it even when either the
+            # child callback or watcher cleanup raises, because this worker outlives the run.
+            peak_gpu_gb = gpu_sampler.stop_gb()
     truncation_window = None
     if return_code != 0:
         truncation_window = progress_state.truncation_window(

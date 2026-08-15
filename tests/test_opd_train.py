@@ -5262,10 +5262,15 @@ def test_no_signal_failure_does_not_blame_cap_without_dominant_truncation():
     assert str(parent_error.value) == "verl OPD subprocess exited with status 1"
 
 
-def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch, tmp_path):
+def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler(
+    monkeypatch, tmp_path
+):
     from contextlib import nullcontext
 
     import flash.engine.worker.opd_train_runner as opd_runner
+
+    watcher_failure = {"enabled": False}
+    sampler_stops = []
 
     class ProgressState:
         def __init__(self, _resume_state):
@@ -5286,12 +5291,15 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch, tmp_pa
 
         def stop(self, *, require_complete):
             assert require_complete is True
+            if watcher_failure["enabled"]:
+                raise RuntimeError("watcher cleanup failed")
 
     class GpuSampler:
         def start(self):
             return self
 
         def stop_gb(self):
+            sampler_stops.append(True)
             return 0.0
 
     callbacks = SimpleNamespace(
@@ -5331,23 +5339,32 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(opd_runner, "_validate_checkpoint_progress", lambda *_args: None)
 
-    result = opd_runner._run_child(
-        SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
-        object(),
-        SimpleNamespace(update_horizon=1, local_dir="/unused", shim_dir=str(tmp_path)),
-        SimpleNamespace(
-            resume_state=None,
-            resume_step=0,
-            python_bin="python",
-            entry_path="entry.py",
-            bridge=object(),
-        ),
-        {},
-        (),
-    )
+    def run_child():
+        return opd_runner._run_child(
+            SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
+            object(),
+            SimpleNamespace(update_horizon=1, local_dir="/unused", shim_dir=str(tmp_path)),
+            SimpleNamespace(
+                resume_state=None,
+                resume_step=0,
+                python_bin="python",
+                entry_path="entry.py",
+                bridge=object(),
+            ),
+            {},
+            (),
+        )
+
+    result = run_child()
 
     assert reconciled == [None]
     assert result.final_accounting["loss_curve"] == [0.5]
+    assert sampler_stops == [True]
+
+    watcher_failure["enabled"] = True
+    with pytest.raises(RuntimeError, match="watcher cleanup failed"):
+        run_child()
+    assert sampler_stops == [True, True]
 
 
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
@@ -5540,6 +5557,75 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
     )
     assert overrides["actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size"] == "1"
     assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == str(gpu_count)
+
+
+def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
+    """The gate must size off `request.spec`, never the process-global JOB_SPEC.
+
+    `opd_train` resolves its spec as `spec or _w.JOB_SPEC`, so a caller that passes one gets a run
+    whose hardware is NOT what JOB_SPEC describes. Sizing the gate off the global there would let it
+    enable ZeRO-2 against a card the run never landed on -- the allocator/worker divergence the gate
+    exists to prevent. Pinned with the two disagreeing so reading the wrong one cannot pass.
+    """
+    from flash.engine.worker import opd_train as _opd_train
+    from flash.engine.worker import opd_train_runner as _runner
+
+    # the global says a card with room to spare; the passed spec says a card without it.
+    monkeypatch.setattr(
+        _opd_train._w,
+        "JOB_SPEC",
+        SimpleNamespace(gpu=SimpleNamespace(type="B200"), train=SimpleNamespace()),
+        raising=False,
+    )
+
+    def _build(spec):
+        return _runner._build_base_config(
+            request=SimpleNamespace(
+                multi_turn=False,
+                structured_outputs=None,
+                model_id="Qwen/Qwen3.5-4B",
+                model_revision="",
+                spec=spec,
+                knobs=SimpleNamespace(
+                    max_completion=512,
+                    learning_rate=1e-5,
+                    group_size=2,
+                    kl_coef=0.5,
+                    temperature=1.0,
+                    top_p=1.0,
+                ),
+            ),
+            prompt_state=SimpleNamespace(max_model_len=1536, prompt_budget=1024),
+            workload=SimpleNamespace(
+                prompts_per_step=8,
+                update_horizon=10,
+                local_dir="/w/checkpoints",
+                train_file="/w/train.parquet",
+                val_file="/w/val.parquet",
+                lora_rank=32,
+                lora_alpha=64,
+                target_modules="all-linear",
+                warmstart_adapter=None,
+            ),
+            runtime=SimpleNamespace(
+                model_path="/models/student",
+                gpu_count=2,
+                save_freq=20,
+                project_name="flash",
+                experiment_name="opd-test",
+                reward_path="/w/shim/flash_opd_reward.py",
+                bridge=SimpleNamespace(url="http://127.0.0.1:1234", token="token"),
+            ),
+            eos_token_ids=(151645,),
+        )
+
+    # a spec whose card cannot hold the retained copy must stay on zero-3 even though the global
+    # would have admitted it. reading JOB_SPEC here returns the B200 answer and fails.
+    tight = SimpleNamespace(gpu=SimpleNamespace(type="RTX 4090"), train=SimpleNamespace())
+    assert _build(tight)["reshard_after_forward"] is True
+
+    # and with no spec at all the gate falls closed rather than silently reaching for the global.
+    assert _build(None)["reshard_after_forward"] is True
 
 
 def test_rl_width_never_exceeds_the_sequences_one_step_holds():
