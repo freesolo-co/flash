@@ -238,6 +238,7 @@ def _format_heartbeat(hb: dict) -> str:
         ("frac_reward_zero_std", 3),
         ("mean_completion_tokens", 3),
         ("truncation_rate", 3),
+        ("discarded_rollouts", 0),
         ("max_completion_tokens", 0),
         ("learning_rate", 8),
         ("setup_seconds", 1),

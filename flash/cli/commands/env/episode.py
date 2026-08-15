@@ -14,7 +14,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 
-from flash.cli.commands.env.test import _evaluation_example
+from flash.cli.commands.env.test_evaluations import _evaluation_example
 from flash.envs.evaluations import EvalCase, EvalResult
 
 
