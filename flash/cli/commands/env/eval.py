@@ -162,6 +162,7 @@ def _score_case(
     thinking: bool = False,
     state=None,
     state_keyword: bool = False,
+    scorer=None,
 ) -> EvalResult:
     """Grade one response on the caller's thread.
 
@@ -172,7 +173,8 @@ def _score_case(
     `episode._score_episode_case`); single-turn scoring keeps the two-argument contract.
     `state_keyword` says which way that suite's signature can take it -- `**kwargs` and
     keyword-only scorers reject a third positional, `*args` scorers reject the keyword -- so the
-    caller decides, having read the signature.
+    caller decides, having read the signature. Episode scoring also passes the exact callable it
+    inspected, so a descriptor cannot change shape between capability detection and invocation.
 
     The scorer grades the stripped answer; the RESULT records the raw generation. Stripping for the
     scorer must not shorten what is recorded, on the error path least of all -- a failed case is
@@ -182,12 +184,13 @@ def _score_case(
     try:
         scored_text = _scored_response(response, thinking=thinking)
         recorded_response = getattr(scored_text, "raw", response)
+        score = suite.score if scorer is None else scorer
         if state is None:
-            scored = suite.score(case, scored_text)
+            scored = score(case, scored_text)
         elif state_keyword:
-            scored = suite.score(case, scored_text, state=state)
+            scored = score(case, scored_text, state=state)
         else:
-            scored = suite.score(case, scored_text, state)
+            scored = score(case, scored_text, state)
         return normalize_eval_result(case, recorded_response, scored, case_id=case_id)
     except (Exception, SystemExit) as exc:
         return EvalResult(

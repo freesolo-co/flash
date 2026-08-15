@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from math import ceil
 from typing import Any, Literal
 
 ALGORITHMS = ("sft", "grpo", "opd")
@@ -629,6 +630,10 @@ def resolve_vocab_size(model_id: str, revision: str = "") -> int:
     return vocab_size_for(model_id)
 
 
+def _with_merge_disk_floor(info: ModelInfo) -> ModelInfo:
+    return replace(info, min_disk_gb=max(info.min_disk_gb, ceil(info.params_b * 2) + 64))
+
+
 def resolve_model(model_id: str, algorithm: str, model_revision: str = "") -> ModelInfo:
     """Resolve a curated model, validated for ``algorithm``; anything uncataloged is rejected.
 
@@ -650,9 +655,8 @@ def resolve_model(model_id: str, algorithm: str, model_revision: str = "") -> Mo
             params_b=params_b,
             params=f"{params_b:.1f}B",
             vocab_size=vocab_size,
-            min_disk_gb=max(info.min_disk_gb, int(params_b * 2) + 64),
         )
-    return info
+    return _with_merge_disk_floor(info)
 
 
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
@@ -667,4 +671,4 @@ def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
 
 
 def public_model_rows() -> list[dict[str, Any]]:
-    return [m.to_dict() for m in list_models()]
+    return [_with_merge_disk_floor(model).to_dict() for model in list_models()]

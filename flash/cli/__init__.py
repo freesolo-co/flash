@@ -749,11 +749,11 @@ def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
         "--wait",
         nargs="?",
         type=_wait_seconds,
-        const=1800.0,
+        const=2400.0,
         default=None,
         metavar="SECONDS",
         help=(
-            "block until the requested revision is ready or failed (default timeout 1800s). "
+            "block until the requested revision is ready or failed (default timeout 2400s). "
             "without it, deploy returns while the revision is still queued"
         ),
     )
