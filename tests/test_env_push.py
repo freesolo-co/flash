@@ -1814,17 +1814,18 @@ def test_push_refuses_a_credential_packed_inside_an_archive(monkeypatch, tmp_pat
     assert "bundle.bin" in capsys.readouterr().err
 
 
-def test_credential_scan_survives_a_container_it_cannot_open(tmp_path):
-    """An archive that will not open falls back to its literal bytes rather than erroring.
+def test_credential_scan_refuses_an_identified_zip_it_cannot_open(tmp_path):
+    """A leading local header identifies unread compressed ZIP member bytes.
 
-    A truncated or unsupported container is ordinary in a dataset directory, and refusing to
-    publish one -- or crashing on it -- would be a worse bug than the hole being closed.
+    Falling back to the archive's literal bytes cannot inspect those members, so a ZIP that cannot
+    open is undecided and must refuse rather than report clean.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.env_secrets import _Unscannable, credential_in_file
 
     truncated = tmp_path / "broken.zip"
     truncated.write_bytes(b"PK\x03\x04" + b"\x00" * 8)
-    assert credential_in_file(truncated) is None
+    with pytest.raises(_Unscannable, match="zip archive this check cannot open"):
+        credential_in_file(truncated)
 
     # the literal scan of the container's own bytes still applies when expansion yields nothing
     stored = tmp_path / "stored.gz"
@@ -10306,5 +10307,126 @@ def test_zip_symlink_targets_are_scanned_like_names(tmp_path):
         info.create_system = 3
         info.external_attr = (stat.S_IFLNK | 0o777) << 16
         archive.writestr(info, target.encode())
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
+
+
+def test_a_zip_local_header_without_its_end_record_is_refused(tmp_path):
+    """a zip missing its end record must not pass as ordinary opaque bytes."""
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    packed = io.BytesIO()
+    with zipfile.ZipFile(packed, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("secret.txt", f"fslo_{_FAKE_KEY_BODY}")
+    complete = packed.getvalue()
+    assert complete[-22:-18] == b"PK\x05\x06", "fixture must end with the eocd record"
+
+    control = tmp_path / "complete.zip"
+    control.write_bytes(complete)
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    truncated = complete[:-22]
+    assert truncated.startswith(b"PK\x03\x04")
+    published = tmp_path / "missing-eocd.zip"
+    published.write_bytes(truncated)
+    with pytest.raises(_Unscannable, match="zip archive this check cannot open"):
+        credential_in_file(published)
+
+    ordinary = tmp_path / "ordinary.txt"
+    ordinary.write_bytes(b"ordinary text before PK\x03\x04 and ordinary text after\n")
+    assert credential_in_file(ordinary) is None
+
+
+def test_png_compressed_text_chunks_are_decoded(tmp_path):
+    """png ztxt and compressed itxt chunks must not hide their zlib text payloads."""
+    import struct
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            len(payload).to_bytes(4, "big")
+            + kind
+            + payload
+            + zlib.crc32(kind + payload).to_bytes(4, "big")
+        )
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    idat = zlib.compress(b"\x00\xff\xff\xff")
+    payloads = {
+        "ztxt": (b"zTXt", b"Comment\x00\x00" + zlib.compress(key)),
+        "itxt": (b"iTXt", b"Comment\x00\x01\x00\x00\x00" + zlib.compress(key)),
+    }
+    for label, (kind, payload) in payloads.items():
+        image = (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(kind, payload)
+            + chunk(b"IDAT", idat)
+            + chunk(b"IEND", b"")
+        )
+        at, chunks = 8, []
+        while at < len(image):
+            size = int.from_bytes(image[at : at + 4], "big")
+            chunk_kind = image[at + 4 : at + 8]
+            chunk_payload = image[at + 8 : at + 8 + size]
+            checksum = image[at + 8 + size : at + 12 + size]
+            assert zlib.crc32(chunk_kind + chunk_payload).to_bytes(4, "big") == checksum
+            chunks.append(chunk_kind)
+            at += 12 + size
+        assert chunks == [b"IHDR", kind, b"IDAT", b"IEND"]
+
+        published = tmp_path / f"{label}.png"
+        published.write_bytes(image)
+        assert credential_in_file(published) == "a Freesolo API key", label
+
+    clean = tmp_path / "clean.png"
+    clean.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"zTXt", b"Comment\x00\x00" + zlib.compress(b"harmless comment"))
+        + chunk(b"IDAT", idat)
+        + chunk(b"IEND", b"")
+    )
+    assert credential_in_file(clean) is None
+
+
+def test_cpio_symlink_targets_are_scanned_like_names(tmp_path):
+    """a cpio symlink body is a published target path, not only generic content."""
+    import shutil
+    import subprocess
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    if shutil.which("cpio") is None:
+        pytest.skip("cpio is not installed")
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    target = f"dir/{encoded.decode()}"
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(target)
+
+    work = tmp_path / "cpio"
+    work.mkdir()
+    (work / "link").symlink_to(target)
+    built = subprocess.run(
+        ["cpio", "-o", "-H", "newc"],
+        input=b"link\n",
+        cwd=work,
+        check=True,
+        capture_output=True,
+    )
+    listing = subprocess.run(
+        ["cpio", "-itv"], input=built.stdout, check=True, capture_output=True
+    ).stdout.decode()
+    assert f"link -> {target}" in listing
+
+    published = tmp_path / "linked.cpio"
+    published.write_bytes(built.stdout)
     with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
         credential_in_file(published)

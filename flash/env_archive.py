@@ -125,6 +125,13 @@ def credential_in_zip(
     member_limit: int,
 ) -> str | None:
     """The kind of credential in any readable member of a zip, or None."""
+    # a leading local header identifies zip member bytes even when the missing end record prevents
+    # `ZipFile` from opening them. only the anchored signature is decisive: the same bytes in ordinary
+    # text are not an archive and must not become a refusal.
+    if _read_at(source, 0, 4) == b"PK\x03\x04" and not zipfile.is_zipfile(
+        source if isinstance(source, Path) else io.BytesIO(source)
+    ):
+        raise refusal("contains a zip archive this check cannot open")
     # The member count is read from the end-of-central-directory record BEFORE `ZipFile` is
     # constructed. `ZipFile.__init__` parses the whole central directory and materializes every
     # `ZipInfo`, so a bound checked after it is charged the cost it exists to avoid -- measured at
@@ -552,8 +559,10 @@ _CPIO_BINARY_HEADER = 26
 _CPIO_BINARY_MAGICS = {b"\xc7q": "little", b"q\xc7": "big"}
 _CPIO_MAX_NAME = 4096
 _CPIO_PROBE_BYTES = _CPIO_BINARY_HEADER + _CPIO_MAX_NAME
+_CPIO_MODE = 1
 _CPIO_FILESIZE = 6
 _CPIO_NAMESIZE = 11
+_CPIO_ODC_MODE = slice(18, 24)
 _CPIO_ODC_NAMESIZE = slice(59, 65)
 _CPIO_ODC_FILESIZE = slice(65, 76)
 _CPIO_OCTAL = frozenset(b"01234567")
@@ -598,6 +607,7 @@ def _looks_like_cpio_header(probe: bytes) -> bool:
 def _scan_cpio_member(
     data: bytes,
     name: str,
+    mode: int,
     body_at: int,
     body_end: int,
     next_at: int,
@@ -615,7 +625,10 @@ def _scan_cpio_member(
     if name == "TRAILER!!!":
         tail = data[next_at:].lstrip(b"\0")
         return (scan(io.BytesIO(tail), deadline, depth) if tail else None), True
-    return scan(io.BytesIO(data[body_at:body_end]), deadline, depth), False
+    body = data[body_at:body_end]
+    if stat.S_ISLNK(mode) and (kind := named(body.decode("utf-8", "replace"))):
+        return kind, False
+    return scan(io.BytesIO(body), deadline, depth), False
 
 
 def _credential_in_newc(
@@ -651,6 +664,7 @@ def _credential_in_newc(
         kind, finished = _scan_cpio_member(
             data,
             data[name_at : name_end - 1].decode("utf-8", "replace"),
+            values[_CPIO_MODE],
             body_at,
             body_end,
             next_at,
@@ -697,6 +711,7 @@ def _credential_in_odc(
         kind, finished = _scan_cpio_member(
             data,
             data[name_at : name_end - 1].decode("utf-8", "replace"),
+            int(header[_CPIO_ODC_MODE], 8),
             body_at,
             body_end,
             body_end,
@@ -743,6 +758,7 @@ def _credential_in_binary_cpio(
         kind, finished = _scan_cpio_member(
             data,
             data[name_at : name_end - 1].decode("utf-8", "replace"),
+            int.from_bytes(header[6:8], order),
             body_at,
             body_end,
             next_at,

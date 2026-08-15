@@ -22,6 +22,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO
 
+from flash.env_png import _PNG_SIGNATURE, _png_text_payloads
+
 # Where a PDF keeps its compressed content, and how many of those streams are expanded. The
 # `/FlateDecode` filter names the encoding, and the `stream` keyword with its mandatory newline
 # marks where the zlib record begins.
@@ -287,6 +289,10 @@ class _UnreadableFilterChain(Exception):
     an unreadable filter are exactly as unverified as an archive that would not expand, and calling
     them clean is the fail-open this scan exists to close.
     """
+
+
+class _UnreadablePngText(_UnreadableFilterChain):
+    """A PNG text chunk declares content that could not be completely decoded."""
 
 
 class _UnreachedStream(Exception):
@@ -573,6 +579,14 @@ def _pdf_inline_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
             yield plain
     if next(images, None) is not None:
         raise _TooManyStreams
+
+
+def _document_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
+    """Decoded compressed text from supported document and image containers."""
+    if data.startswith(_PNG_SIGNATURE):
+        yield from _png_text_payloads(data, budget, _UnreadablePngText)
+        return
+    yield from _pdf_stream_payloads(data, budget)
 
 
 def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:

@@ -52,10 +52,10 @@ from flash.env_buffers import (
 )
 from flash.env_deflate import (
     _PDF_SIGNATURE,
+    _document_payloads,
     _EncryptedDocument,
     _gzip_metadata,
     _GzipHeaderTooLarge,
-    _pdf_stream_payloads,
     _raw_deflate_from,
     _scan_framed_stream,
     _TooManyStreams,
@@ -611,7 +611,7 @@ def _credential_in_raw_deflate(source: Path | bytes, *, deadline: float, depth: 
 
 
 def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
-    """The kind of credential inside a PDF's compressed streams, or None.
+    """The kind of credential inside supported document and image streams, or None.
 
     A PDF keeps its content in `/FlateDecode` streams, whose zlib record starts after the object
     header rather than at byte zero -- so the head-anchored zlib check never saw it, and the overlay
@@ -639,13 +639,13 @@ def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> 
     # answer is the one every other oversized container gets -- undecided, not clean.
     if isinstance(source, Path):
         with source.open("rb") as handle:
-            if handle.read(len(_PDF_SIGNATURE)) != _PDF_SIGNATURE:
+            if not handle.read(8).startswith((_PDF_SIGNATURE, b"\x89PNG\r\n\x1a\n")):
                 return None
         if source.stat().st_size > _MAX_NESTED_BUFFER_BYTES:
             raise _Unscannable("contains a document too large to inspect")
     raw = source.read_bytes() if isinstance(source, Path) else source
     try:
-        for plain in _pdf_stream_payloads(raw, _MAX_NESTED_BUFFER_BYTES):
+        for plain in _document_payloads(raw, _MAX_NESTED_BUFFER_BYTES):
             if plain is None:
                 raise _Unscannable("contains a compressed stream too large to inspect")
             if kind := _scan_stream(io.BytesIO(plain), deadline=deadline, depth=depth):
