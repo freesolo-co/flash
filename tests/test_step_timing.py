@@ -1169,6 +1169,62 @@ def test_a_call_that_blocks_for_several_steps_is_caught_on_a_sub_second_run():
     assert not ordinary._segments, "2ms of call overhead broke a 92s span"
 
 
+def test_a_deferred_block_is_judged_before_the_drain_reads_its_own_line():
+    """RL measures the forced upload ONCE, so the drain gets no second chance to arm.
+
+    This is the production call pattern and it is what ``_replay`` cannot express: every helper
+    timeline calls ``note_if_blocked`` on each line, which re-arms the drain all the way through a
+    burst and hides the ordering this test pins. RL calls it only while ``sent_first_metrics`` is
+    false -- the successful upload sets that flag -- so the queued lines behind it arrive with no
+    further measurement at all.
+
+    Two orderings failed here. Resolving the deferred block AFTER ``_draining`` was consulted armed
+    the drain one line late: the resolving line had already been recorded as a segment head, so it
+    and the next queued arrival bounded a pipe-speed interval, which then became the "measured pace"
+    the rest of the drain sized its gaps against -- and every real 0.1s wait cleared that tiny
+    threshold, ending the drain and admitting the burst. And with no pace yet the drain's own floor
+    was the absolute 1.0s, a claim about what a STEP costs applied to an ARRIVAL gap, so on a
+    sub-second run nothing could end the drain on evidence and only the line count could -- which
+    ends it mid-burst. The burst's own arrival speed is the scale-free yardstick for both.
+    """
+    real, block, pipe = 0.1, 0.9, 0.001
+
+    def run(queued: int) -> step_timing.StepClock:
+        clock = step_timing.StepClock()
+        t, step = 0.0, 0
+        # the first metrics line, then the forced upload -- measured once, exactly as RL does it.
+        clock.record(t, step)
+        step += 1
+        clock.note_if_blocked(block)
+        t += block
+        # everything the child completed while the reader was blocked, read back at pipe speed and
+        # NOT accompanied by any further note_if_blocked call.
+        for _ in range(queued):
+            clock.record(t, step)
+            step += 1
+            t += pipe
+        for _ in range(40):
+            t += real
+            clock.record(t, step)
+            step += 1
+        return clock
+
+    # 9 is the burst the finding described; 100 crosses _MAX_DRAINED_LINES, which must not cut the
+    # drain short while the gap test can still decide.
+    for queued in (2, 5, 9, 30, 100):
+        clock = run(queued)
+        assert clock.step_seconds() == pytest.approx(real, abs=0.02), (
+            f"a {block}s upload queuing {queued} lines published {clock.step_seconds()}s "
+            f"against a true {real}s"
+        )
+        assert not [gap for gap in clock.intervals() if gap < real / 2], (
+            f"a {block}s upload queuing {queued} lines left pipe-speed intervals in the window"
+        )
+
+    # the drain must still END on a run this shape, not silence it for the rest of its life.
+    assert not run(9)._draining_backlog, "the drain never terminated"
+
+
 def test_the_forced_first_metrics_upload_carries_the_pace_when_it_retries():
     """That upload RETRIES, so it can commit at a step where a pace already exists.
 

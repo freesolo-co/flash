@@ -44,6 +44,12 @@ import statistics
 # block -- a failed upload, or a 30s wait on the upload lock -- are orders of magnitude above this.
 _BLOCKING_CALL_THRESHOLD_S = 1.0
 
+# how much slower than the observed pipe speed an arrival must be to count as one the reader waited
+# for, when no step pace has been measured yet. pipe reads and real steps sit orders of magnitude
+# apart (~0.001s against 0.1s and up), so a wide multiple separates them without needing to know the
+# run's scale, and it stays below the absolute floor that applies once a pace exists.
+_PIPE_GAP_MULTIPLE = 20.0
+
 
 def step_intervals(step_line_times: list[float]) -> list[float]:
     """Wall-clock length of each COMPLETED step, from the times its step lines arrived.
@@ -97,6 +103,8 @@ class StepClock:
         # back-to-back arrivals are discarded as pipe backlog (see _draining).
         self._draining_backlog = False
         self._drained = 0
+        # the pipe speed this drain is arriving at, learned from its own gaps (see _draining).
+        self._drain_pipe_s: float | None = None
         self._last_arrival: float | None = None
         # blocking time inside the current span that could not be judged when it happened, because
         # no pace was measured yet. resolved at the next step line (see _resolve_unjudged_block).
@@ -126,6 +134,7 @@ class StepClock:
         self._break_after_last = True
         self._draining_backlog = True
         self._drained = 0
+        self._drain_pipe_s = None
         # a replay's baseline is the pre-block instant, so carrying it across would start the next
         # segment before the block and measure the very upload this call exists to exclude -- a
         # 900s stall behind a repeated step published 496s/step against a true 92s.
@@ -216,13 +225,24 @@ class StepClock:
         ``step`` is optional because a caller that cannot identify the step is better off timing
         every line than timing none; only a caller that KNOWS a number repeated can skip it.
         """
+        if self._unjudged_block_s:
+            if self._draining_backlog:
+                # this burst is already being excluded, so a sub-threshold call inside it is
+                # ordinary overhead. judging it anyway would compare it against a PIPE-SPEED span,
+                # which it always wins, re-arming the drain on every queued line and resetting the
+                # evidence that ends it -- the drain would never terminate and the run would
+                # publish nothing at all.
+                self._unjudged_block_s = 0.0
+            elif self._times:
+                # a block held from before any pace existed. the span it landed in ends HERE, so it
+                # can finally be judged -- and it must happen before _draining is consulted, so a
+                # confirmed block makes THIS line the head of its drain. judging it afterwards was
+                # one line too late: the drain was armed behind a line already recorded as a segment
+                # head, so that head and the next queued arrival bounded a pipe-speed interval, and
+                # that interval then became the pace the rest of the drain was sized against.
+                self._resolve_unjudged_block(float(now) - self._times[-1])
         if self._draining(now):
             return
-        if self._unjudged_block_s and self._times:
-            # a block held from before any pace existed. the span it landed in ends HERE, so it can
-            # finally be judged -- and it must happen before this line is recorded, so a confirmed
-            # block closes the contaminated span instead of extending it.
-            self._resolve_unjudged_block(float(now) - self._times[-1])
         if step is not None:
             if self._last_step is not None and int(step) == self._last_step:
                 # the span up to here is not a step, but this timestamp is where the next one starts.
@@ -283,19 +303,45 @@ class StepClock:
             # (it opens the new segment) and the question is deferred to the line after it.
             self._drained = 1
             return False
+        gap = float(now) - previous
         measured = steady_state_step_seconds(self.intervals())
-        floor = (
-            _BLOCKING_CALL_THRESHOLD_S
-            if measured is None
-            else min(_BLOCKING_CALL_THRESHOLD_S, measured / 2)
-        )
-        if float(now) - previous >= floor:
+        if measured is not None:
+            floor = min(_BLOCKING_CALL_THRESHOLD_S, measured / 2)
+        elif self._drain_pipe_s is not None:
+            # no pace yet, so the burst supplies its own yardstick. the drain's first confirmed
+            # back-to-back gap IS this pipe's read speed, and a line the reader genuinely waited for
+            # arrives orders of magnitude later than that. sizing against it keeps the test
+            # scale-free where the absolute floor could not be: 1.0s is a claim about what a STEP
+            # costs, and applying it to an ARRIVAL gap silently asserts every run is slower than a
+            # second. on a 0.1s workload that made every real wait look like more backlog, so only
+            # the line count could end the drain -- and the count ends it mid-burst, admitting the
+            # rest at pipe speed. the multiple is wide because the two populations are far apart.
+            floor = min(_BLOCKING_CALL_THRESHOLD_S, self._drain_pipe_s * _PIPE_GAP_MULTIPLE)
+        else:
+            floor = _BLOCKING_CALL_THRESHOLD_S
+        if gap >= floor:
             # the reader waited for this one, so the backlog is gone and normal timing resumes.
             self._draining_backlog = False
             return False
-        if measured is None and self._drained >= self._MAX_DRAINED_LINES:
-            # no pace was ever measured, so no gap test can end this drain -- the count is the only
-            # terminator left, and a bounded skew beats publishing nothing for the rest of the run.
+        if self._drain_pipe_s is None or gap < self._drain_pipe_s:
+            # the fastest confirmed arrival is the cleanest read of the pipe speed: a queued line
+            # delayed by scheduler noise only ever reads slower than the pipe, never faster.
+            self._drain_pipe_s = gap
+        if (
+            measured is None
+            and self._drain_pipe_s * _PIPE_GAP_MULTIPLE >= _BLOCKING_CALL_THRESHOLD_S
+            and self._drained >= self._MAX_DRAINED_LINES
+        ):
+            # neither test can end this drain: no pace was ever measured, and the arrivals are too
+            # slow for their own gap to separate a pipe read from a real step -- a 0.2s "burst" is
+            # indistinguishable from a 0.2s workload. the count is the only terminator left, and a
+            # bounded skew beats publishing nothing for the rest of the run.
+            #
+            # it must NOT fire when the gap test can decide. a drain reading at 0.001s can be ended
+            # by evidence, and cutting it at 64 instead admits the rest of the burst as ordinary
+            # intervals -- the same collapse the bound was added to prevent, reintroduced by its own
+            # terminator. a 0.9s upload on a 0.1s workload queues past the count long before the
+            # first real wait arrives.
             self._draining_backlog = False
             return False
         if self._drained == 1:
