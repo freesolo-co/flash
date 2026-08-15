@@ -23,6 +23,7 @@ from flash.server.routes.trace_schema_identity import (
 from flash.server.routes.trace_schema_shape import (
     _JSON_SCHEMA_SECRET_LITERAL_KEYWORDS,
     _SECRET_DECLARING_PROPERTY_MAPS,
+    _declares_secret_format,
     _is_schema_definition,
 )
 from flash.server.routes.trace_secret_names import (
@@ -118,6 +119,12 @@ def _collect_secret_properties(
                     if map_keyword == "patternProperties"
                     else _is_secret_key(key)
                 )
+                # a property may declare a credential by FORMAT instead of by name. the redaction
+                # walk already marks literals written directly on such a property, but judging the
+                # reference by name alone meant a neutral `login_value` combining
+                # `format: "password"` with a `$ref` never had its target collected, so the
+                # referenced definition kept its `default`, `const` and `enum` verbatim.
+                secret_declaration = secret_declaration or _declares_secret_format(schema)
                 if secret_declaration and _is_schema_definition(schema):
                     refs.update(
                         _collect_refs(

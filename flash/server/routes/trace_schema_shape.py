@@ -172,6 +172,23 @@ _SECRET_DECLARING_PROPERTY_MAPS = (
     "dependentSchemas",
     "dependencies",
 )
+
+
+def _declares_secret_format(item: Any) -> bool:
+    """Whether a schema node declares, by `format`, that it holds a credential.
+
+    Only `password` is treated this way. It is the one format keyword whose whole purpose is to say
+    the value is a secret; `email`, `uri` and the rest describe a syntax, and treating those as
+    credentials would blank ordinary annotations.
+
+    Kept here rather than beside the redaction walk because the reference collector needs the same
+    answer: a property that declares a credential by format rather than by name refers to its
+    definition exactly as a secret-NAMED property does, and judging the reference by name alone
+    left that target's literals verbatim.
+    """
+    return isinstance(item, dict) and item.get("format") == "password"
+
+
 _NESTED_SCHEMA_HOST_KEYS = frozenset({"function", "json_schema"})
 _SCHEMA_HOST_KEYS = _ROOT_SCHEMA_HOST_KEYS | _NESTED_SCHEMA_HOST_KEYS
 _JSON_SCHEMA_TYPES = frozenset(

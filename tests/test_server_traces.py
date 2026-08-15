@@ -12180,3 +12180,133 @@ def test_a_root_identifier_does_not_blank_ordinary_schema_annotations() -> None:
 
     assert stored["$defs"]["city"]["default"] == "Boston"
     assert stored["$id"] == "note"
+
+
+@pytest.mark.parametrize("count", ["1", "01", "001"])
+def test_an_exact_quantifier_repeating_once_is_read_numerically(count: str) -> None:
+    """ECMAScript reads a brace body as a NUMBER, so `{01}` repeats exactly once just as `{1}`
+    does. Comparing the raw text against `"1"` refused the padded spellings, so an anchored
+    `^passw{01}ord$` -- which matches only `password` -- was classified as a metacharacter-bearing
+    non-secret pattern and the credential-bearing literals beneath that `patternProperties` entry
+    stayed verbatim in the raw export.
+    """
+    assert trace_secret_names._is_secret_property_pattern(f"^passw{{{count}}}ord$") is True
+
+
+@pytest.mark.parametrize("count", ["2", "02", "0", "00", "1,2", "1,", ""])
+def test_only_a_count_of_one_collapses_an_exact_quantifier(count: str) -> None:
+    """Control: any other count spells a different name and a RANGE matches several names at once.
+    Both stay rejected, so the brace remains a metacharacter and nothing is judged secret -- the
+    direction that preserves an ordinary schema's annotations.
+    """
+    assert trace_secret_names._is_secret_property_pattern(f"^passw{{{count}}}ord$") is False
+
+
+def test_a_padded_exact_quantifier_redacts_the_pattern_entrys_literals() -> None:
+    """End to end: the padded spelling now marks the entry's schema secret, so its `default` is
+    redacted rather than persisted."""
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "patternProperties": {
+                            "^passw{01}ord$": {"type": "string", "default": "QUANTLEAK"}
+                        },
+                    },
+                },
+            }
+        ]
+    }
+
+    stored = traces._sanitize_for_trace(payload, ())
+
+    assert "QUANTLEAK" not in json.dumps(stored)
+
+
+@pytest.mark.parametrize(
+    "name", ["client_assertion", "clientAssertion", "oauth_client_assertion", "CLIENT_ASSERTION"]
+)
+def test_an_oauth_client_assertion_is_a_credential(name: str) -> None:
+    """OAuth client authentication sends a signed JWT under `client_assertion` (rfc 7523). It is a
+    bearer credential, but it ends in none of the existing suffixes, so a third party's assertion --
+    never in `context.secrets` -- was persisted verbatim and exposed through raw export.
+    """
+    stored = traces._sanitize_for_trace({"model": "x", name: "ASSERTLEAK"}, ())
+
+    assert stored[name] == "[redacted]"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["assertion", "assertions", "assertion_count", "test_assertion", "client_assertion_type"],
+)
+def test_an_ordinary_assertion_field_is_not_a_credential(name: str) -> None:
+    """Control: the WHOLE compound word is matched, never bare `assertion`, which is an ordinary
+    word for a claim or a test expectation. `client_assertion_type` names the assertion's format
+    rather than the assertion, so it keeps its recorded value too.
+    """
+    stored = traces._sanitize_for_trace({"model": "x", name: "KEEPME"}, ())
+
+    assert stored[name] == "KEEPME"
+
+
+def test_a_password_formatted_property_has_its_reference_followed() -> None:
+    """A property may declare a credential by FORMAT instead of by name. The redaction walk already
+    marked literals written directly on such a property, but the reference collector judged the
+    property by name alone, so a neutral `login_value` combining `format: "password"` with a `$ref`
+    never had its target collected and the referenced definition kept its literals verbatim.
+    """
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "login_value": {"format": "password", "$ref": "#/$defs/cred"}
+                        },
+                        "$defs": {
+                            "cred": {"type": "string", "default": "REFLEAK", "const": "REFLEAK2"}
+                        },
+                    },
+                },
+            }
+        ]
+    }
+
+    stored = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"]
+
+    assert "REFLEAK" not in json.dumps(stored)
+    assert stored["$defs"]["cred"]["default"] == "[redacted]"
+
+
+def test_a_neutral_property_without_the_password_format_keeps_its_target() -> None:
+    """Control: it is the `format` declaration that marks the property, not the reference. The same
+    payload without it leaves the referenced definition's annotations intact, so ordinary recorded
+    content is preserved.
+    """
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"login_value": {"$ref": "#/$defs/cred"}},
+                        "$defs": {"cred": {"type": "string", "default": "KEEPME"}},
+                    },
+                },
+            }
+        ]
+    }
+
+    stored = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"]
+
+    assert stored["$defs"]["cred"]["default"] == "KEEPME"

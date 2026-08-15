@@ -28,6 +28,12 @@ _SECRET_KEY_SUFFIXES = (
     # compound word rather than by relaxing to bare `key`, which `primary_key` and `sort_key` share
     # while carrying no credential.
     "subscriptionkey",
+    # oauth client authentication sends a signed JWT under `client_assertion` (rfc 7523). it is a
+    # bearer credential, but it ends in none of the terms above, so a third party's assertion was
+    # persisted verbatim. named as the whole compound word: bare `assertion` is an ordinary word
+    # for a claim or a test expectation and carries no credential, so broadening to it would blank
+    # legitimate recorded content.
+    "clientassertion",
     "secret",
     "token",
     "password",
@@ -137,6 +143,23 @@ def _strip_required_anchors(pattern: str) -> str | None:
     return body
 
 
+def _repeats_exactly_once(count: str) -> bool:
+    """Whether a brace body spells the exact repetition count one.
+
+    ECMAScript reads the body as a NUMBER, so `{01}` and `{001}` repeat exactly once just as `{1}`
+    does. Comparing the raw text against `"1"` refused those spellings, and an anchored
+    `^passw{01}ord$` -- which matches only `password` -- was classified as a metacharacter-bearing
+    non-secret pattern, so the credential-bearing literals beneath that `patternProperties` entry
+    stayed verbatim in the raw export.
+
+    A RANGE (`{1,2}`, `{1,}`) matches several names at once and any other count spells a different
+    name, so both remain rejected: the comma and the differing digits fail this test, the brace
+    stays a metacharacter, and nothing is judged secret -- the direction that preserves an ordinary
+    schema's annotations.
+    """
+    return count.isdigit() and count.lstrip("0") == "1"
+
+
 def _normalize_exact_quantifiers(pattern: str) -> str:
     """Remove `{1}` repetitions, which name exactly what the element they follow already named.
 
@@ -178,7 +201,7 @@ def _normalize_exact_quantifiers(pattern: str) -> str:
             ):
                 closing_brace_index = pattern.find("}", index + 1)
             end = closing_brace_index
-            if end != -1 and pattern[index + 1 : end] == "1":
+            if end != -1 and _repeats_exactly_once(pattern[index + 1 : end]):
                 index = end + 1
                 quantifiable = False
                 continue

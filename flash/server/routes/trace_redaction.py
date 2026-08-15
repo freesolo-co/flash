@@ -31,6 +31,7 @@ from flash.server.routes.trace_schema_shape import (  # noqa: F401
     _SCHEMA_HOST_KEYS,
     _SECRET_DECLARING_PROPERTY_MAPS,
     _TEXT_CONTENT_PART_TYPES,
+    _declares_secret_format,
     _has_schema_context,
     _has_schema_wrapper_evidence,
     _is_property_name_list,
@@ -360,16 +361,6 @@ def _child_secret_schema_flags(
         secret_schema_definition or referenced_secret_definition,
         secret_schema_property or declares_secret_property,
     )
-
-
-def _declares_secret_format(item: Any) -> bool:
-    """Whether a schema node declares, by `format`, that it holds a credential.
-
-    Only `password` is treated this way. It is the one format keyword whose whole purpose is to say
-    the value is a secret; `email`, `uri` and the rest describe a syntax, and treating those as
-    credentials would blank ordinary annotations.
-    """
-    return isinstance(item, dict) and item.get("format") == "password"
 
 
 def _redact_secret_child(
