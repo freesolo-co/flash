@@ -710,11 +710,10 @@ def _classify_recoverable_runs(
                 # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
                 # persisted status without parsing the spec. Terminate by that reconstructed
                 # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
-                with contextlib.suppress(Exception):
-                    # every acceptable class: allocation may have rented a fallback, and naming only
-                    # the head would leave that endpoint running. matching by name, so a class that
-                    # was never rented matches nothing.
-                    for gpu_type in persisted_gpu_types(status.spec):
+                # every acceptable class: allocation may have rented a fallback. isolate each name
+                # so one malformed entry cannot prevent cleanup of the remaining valid classes.
+                for gpu_type in persisted_gpu_types(status.spec):
+                    with contextlib.suppress(Exception):
                         from flash.providers.runpod.serverless import terminate_endpoint
 
                         terminate_endpoint(gpu_type, status.run_id)

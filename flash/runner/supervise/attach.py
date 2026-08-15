@@ -554,12 +554,12 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     if not resource_deleted:
         _record_cleanup_remote(run_id, persisted_remote)
     _compare_and_fail_remote(run_id, persisted_remote, detail)
-    with contextlib.suppress(Exception):
-        # every acceptable class, not just the head: allocation may have rented a fallback, and the
-        # endpoint name is reconstructed from the class rather than read back, so naming only the
-        # head leaves a fallback endpoint running. `terminate_endpoint` is best-effort and matches
-        # by name, so a class that was never rented simply matches nothing.
-        for gpu_type in persisted_gpu_types(status.spec):
+    # every acceptable class, not just the head: allocation may have rented a fallback, and the
+    # endpoint name is reconstructed from the class rather than read back, so naming only the head
+    # leaves a fallback endpoint running. isolate each name so one malformed entry cannot prevent
+    # cleanup of the remaining valid classes.
+    for gpu_type in persisted_gpu_types(status.spec):
+        with contextlib.suppress(Exception):
             from flash.providers.runpod.serverless import terminate_endpoint
 
             terminate_endpoint(gpu_type, run_id)

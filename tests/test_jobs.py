@@ -4798,26 +4798,35 @@ def test_attach_unparseable_spec_fails_closed_and_tears_down(monkeypatch):
         # writer the same way an older plane's leftover file would have arrived.
         raw = orch._load_status_json("bad")
         raw["spec"] = {**raw["spec"], "environment": {"path": "/legacy/local/env"}}
+        raw["spec"]["gpu"]["type"] = ["not-a-gpu", "RTX 5090"]
         with open(orch.runs_file_path("bad", ".json"), "w") as file:
             json.dump(raw, file)
 
         torn_down = []
+        attempted = []
         terminated = []
         monkeypatch.setattr(
             lifecycle,
             "_strict_teardown_handle",
             lambda handle, rid: torn_down.append((handle.data.get("endpoint_id"), rid)) or True,
         )
-        monkeypatch.setattr(
-            flash_train, "terminate_endpoint", lambda gpu, rid: terminated.append((gpu, rid))
-        )
+
+        def fake_terminate(gpu, rid):
+            attempted.append((gpu, rid))
+            if gpu == "not-a-gpu":
+                raise ValueError("malformed gpu")
+            terminated.append((gpu, rid))
+
+        monkeypatch.setattr(flash_train, "terminate_endpoint", fake_terminate)
 
         status = orch.attach_run("bad", log_stream=sys.stderr)
 
         assert status.state == "failed"
         assert "spec is malformed" in (status.error or "")
-        # the exact endpoint the handle names, plus the rN retry endpoints it cannot name.
+        # the exact endpoint the handle names, plus the rN retry endpoints it cannot name. a
+        # malformed first class must not prevent cleanup from reaching the valid fallback.
         assert torn_down == [("epBad", "bad")]
+        assert attempted == [("not-a-gpu", "bad"), ("RTX 5090", "bad")]
         assert terminated == [("RTX 5090", "bad")]
 
 
