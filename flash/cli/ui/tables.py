@@ -32,6 +32,7 @@ from flash.cli.ui.render import (
     header,
     run_cost,
 )
+from flash.core.spec import persisted_gpu_types
 
 if TYPE_CHECKING:
     from flash.serve.backend.gpus import Fit
@@ -111,7 +112,8 @@ def serving_gpus_table(rows: list[Fit], tip: str) -> str:
 
 def gpu_label(spec: dict, remote: dict) -> str:
     """Human-facing GPU label. Provider metadata stays internal."""
-    return remote.get("allocated_gpu") or (spec.get("gpu") or {}).get("type", "")
+    authored = " | ".join(persisted_gpu_types(spec))
+    return remote.get("allocated_gpu") or authored
 
 
 def runs_table(runs: list[dict]) -> str:

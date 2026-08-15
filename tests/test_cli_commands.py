@@ -140,12 +140,25 @@ class _FakeClient:
             }
         ]
 
-    def deployment_for(self, run_id: str) -> dict | None:
+    def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
         self.calls.append(("deployment_for", run_id))
         for entry in self.deployments():
             deployment = entry.get("deployment") or {}
             if entry.get("run_id") == run_id.split("/", 1)[0]:
                 return {**deployment, "run_id": entry["run_id"]}
+        return None
+
+    def deployed_checkpoint(
+        self,
+        run_id: str,
+        timeout: float | None = None,
+        *,
+        body_deadline: float | None = None,
+    ) -> dict | None:
+        # the real client reads the run-scoped route, NOT the listing: routing this through
+        # `deployments` would let the pre-deploy warning's read land in the rollback-lookup
+        # assertions of the `--wait` tests, which instrument that method.
+        self.calls.append(("deployed_checkpoint", run_id))
         return None
 
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:

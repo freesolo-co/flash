@@ -7,7 +7,7 @@ import urllib.request
 from datetime import UTC, datetime
 from typing import Any
 
-from flash.core.spec import require_project_id
+from flash.core.spec import attributed_gpu_type, require_project_id
 from flash.server.platform.internal_client import org_id_of, post_internal_json
 
 _LOG = logging.getLogger("flash.server.runs")
@@ -74,7 +74,6 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         project_id = require_project_id(spec.get("project"))
     except (TypeError, ValueError):
         return False
-    gpu = spec.get("gpu") if isinstance(spec.get("gpu"), dict) else {}
     body = {
         "orgId": org_id,
         "runId": status.run_id,
@@ -86,7 +85,7 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "model": spec.get("model") if isinstance(spec.get("model"), str) else None,
         "algorithm": spec.get("algorithm") if isinstance(spec.get("algorithm"), str) else None,
         "phase": spec.get("phase") if isinstance(spec.get("phase"), str) else None,
-        "gpuType": gpu.get("type") if isinstance(gpu.get("type"), str) else None,
+        "gpuType": attributed_gpu_type(status) or None,
         "costUsd": status.cost_usd,
         "realizedCostUsd": status.realized_cost_usd,
         "adapterRef": status.to_dict().get("adapter_ref"),
