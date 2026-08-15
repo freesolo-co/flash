@@ -1074,6 +1074,62 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     assert body["model"] == "Qwen/Qwen3.5-4B"
 
 
+def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
+    from flash.runner import RunStatus
+    from flash.server.domain import run_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    seen: dict[str, object] = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = req.data
+        return _Resp()
+
+    monkeypatch.setattr(run_registry.urllib.request, "urlopen", fake_urlopen)
+
+    spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "sft",
+        "environment": {"id": "acme/checkout-bot/my-env"},
+        "project": "11111111-1111-4111-8111-111111111111",
+        "gpu": {"type": ["A100 PCIe", "A100 SXM"]},
+    }
+    context = {"org_id": "org-1", "user_id": "user-1", "api_key_id": "key-1"}
+
+    # terminal persistence clears the remote, so the effective worker spec retains the selected class.
+    run_registry.record_training_run(
+        status=RunStatus(
+            run_id="flash-1",
+            state="cancelled",
+            spec=spec,
+            effective_preparation={"worker_spec": {"gpu": {"type": "A100 SXM"}}},
+            platform_context=context,
+        )
+    )
+    assert json.loads(seen["body"])["gpuType"] == "A100 SXM"
+
+    # before allocation, the authored head remains the best available attribution.
+    run_registry.record_training_run(
+        status=RunStatus(
+            run_id="flash-1",
+            state="queued",
+            spec=spec,
+            platform_context=context,
+        )
+    )
+    assert json.loads(seen["body"])["gpuType"] == "A100 PCIe"
+
+
 def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
     from flash import runner
     from flash.core.spec import JobSpec

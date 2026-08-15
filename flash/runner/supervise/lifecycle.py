@@ -139,12 +139,14 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
     if spec.gpu.type == gpu_type and gpu_count_of(spec) == count:
         return spec
     d = spec.to_internal_dict()
-    d["gpu"] = {**d["gpu"], "type": gpu_type, "count": count}
-    # the auto marker is deliberately NOT cleared here. it records that the author omitted
-    # gpu.count, which stays true once a shape is resolved onto the spec, and it is the only
-    # surviving record of that: the public halves of an auto-sized and an authored single-card run
-    # are byte-identical. clearing it made a recovered auto-sized run re-allocate hard-pinned to one
-    # card. consumers that mean "auto-size now" check for an unresolved shape alongside the marker.
+    acceptable = spec.gpu.acceptable_types
+    gpu = {**d["gpu"], "type": gpu_type, "count": count}
+    if acceptable:
+        gpu["type_fallbacks"] = tuple(name for name in acceptable if name != gpu_type)
+    else:
+        gpu.pop("type_fallbacks", None)
+    d["gpu"] = gpu
+    # the auto marker records that gpu.count was omitted and survives shape resolution.
     return JobSpec.from_dict(d)
 
 
