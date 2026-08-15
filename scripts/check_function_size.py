@@ -38,7 +38,9 @@ SOURCE_SHIPPED = {
     # `build_function_input` sends this through `get_function_source` as `function_code`, and the
     # RunPod worker executes that string on its own. `tests/test_flash_worker.py` pins the same
     # contract from the other side: every name it uses must be imported inside its own body.
-    "flash/providers/runpod/serverless/endpoints.py::_train_body",
+    # It sits alone in `handler.py` so this exemption covers a file that is only the transport
+    # boundary, rather than one it shares with the endpoint lifecycle.
+    "flash/providers/runpod/serverless/handler.py::_train_body",
 }
 
 

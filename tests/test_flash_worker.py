@@ -1638,6 +1638,110 @@ def test_instance_console_upload_loop_detects_a_wedge_that_keeps_logging(monkeyp
     assert (after_wedge[0] - healthy_polls) * poll_s < 1200.0
 
 
+def test_shipped_upload_loop_decides_exactly_like_the_canonical_one(tmp_path):
+    """The two console uploaders must make the SAME commit decisions on the same console.
+
+    There are two copies of this algorithm by necessity, not by choice: `bootstrap._console_upload_loop`
+    runs on an instance box, while `handler._train_body._upload_loop` is hand-inlined because only
+    `_train_body`'s SOURCE ships to the RunPod worker, where a module-level name is a NameError.
+    Every other guard on that pair is a literal-string assertion or a comment saying "mirrors
+    bootstrap" -- neither of which can catch a change to the LOGIC. Reordering a condition, dropping
+    a `not due`, or letting one copy count a `pending` heartbeat the other ignores keeps every
+    string intact and silently gives the two providers different wedge behavior.
+
+    So both real implementations are executed against identical console streams and their upload
+    counts compared. The streams mix committed, pending and liveness heartbeats with plain noise,
+    because those are exactly the inputs the two must agree on: only committed heartbeats count once
+    one has landed, liveness never counts, and noise grows the file without being progress.
+    """
+    import ast
+    import inspect
+    import random
+    import re
+    import textwrap
+
+    from flash.providers._lifecycle import bootstrap as instance_bootstrap
+    from flash.providers.runpod.serverless import handler
+
+    source = inspect.getsource(handler)
+    loop_src = next(
+        ast.get_source_segment(source, node)
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "_upload_loop"
+    )
+
+    lines = {
+        "commit": b'HEARTBEAT {"stage":"step","step":1}\n',
+        "pending": b'HEARTBEAT {"stage":"step","pending":true}\n',
+        "liveness": b'HEARTBEAT {"stage":"step","liveness":true}\n',
+        "noise": b"(raylet) still waiting for resources\n",
+        "silent": b"",
+    }
+
+    class _Stop:
+        """A stop event that appends one poll's console output before releasing the loop.
+
+        The console has to grow BETWEEN polls, not before the run, or every poll would read the
+        whole stream at once and the wedge timer would never see silence.
+        """
+
+        def __init__(self, plan, path):
+            self.plan, self.path, self.i = plan, path, 0
+
+        def wait(self, _seconds):
+            if self.i >= len(self.plan):
+                return True
+            with open(self.path, "ab") as handle:
+                handle.write(lines[self.plan[self.i]])
+            self.i += 1
+            return False
+
+    def _count(runner, plan, results, path):
+        calls, outcomes = [], iter(results)
+
+        def _upload(*_args, **_kwargs):
+            calls.append(1)
+            return next(outcomes)
+
+        runner(_Stop(plan, path), _upload, path)
+        return len(calls)
+
+    def _shipped(stop, upload, path):
+        namespace = {
+            "re": re,
+            "console": path,
+            "mode": "train",
+            "stop_upload": stop,
+            "_upload_console": upload,
+        }
+        exec(textwrap.dedent(loop_src), namespace)  # noqa: S102 - the shipped source is the subject
+        namespace["_upload_loop"]()
+
+    def _canonical(stop, upload, path):
+        original = instance_bootstrap._upload_console_snapshot
+        instance_bootstrap._upload_console_snapshot = lambda *a, **k: upload()
+        try:
+            instance_bootstrap._console_upload_loop(
+                {"hf_repo": "org/repo", "env": {}}, path, "train", 3600.0, stop
+            )
+        finally:
+            instance_bootstrap._upload_console_snapshot = original
+
+    random.seed(20260815)
+    for trial in range(120):
+        plan = [random.choice(list(lines)) for _ in range(random.randint(5, 40))]
+        results = [random.random() < 0.8 for _ in range(len(plan) + 5)]
+        counts = []
+        for index, runner in enumerate((_shipped, _canonical)):
+            console = tmp_path / f"console_{trial}_{index}.txt"
+            console.write_bytes(b"")
+            counts.append(_count(runner, plan, results, str(console)))
+        assert counts[0] == counts[1], (
+            f"shipped uploader committed {counts[0]}x, canonical {counts[1]}x on "
+            f"{''.join(step[0] for step in plan)}"
+        )
+
+
 def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     """The wedge signal itself, unmocked: every loop test above patches _console_progress out.
 
