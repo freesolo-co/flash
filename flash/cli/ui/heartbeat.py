@@ -13,6 +13,7 @@ CLI tests reach them.
 
 from __future__ import annotations
 
+import math
 import time
 
 from flash.cli.ui.render import _dim
@@ -114,10 +115,13 @@ _QUIET_HEARTBEAT_HINT = (
 # than on 900s -- the incident that motivated this reported 559s and 687s, squarely inside that
 # window, where a 900s gate would stay silent and leave only the dead-end quiet hint.
 _STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
-# only the stages the worker actually holds on the 900s upload throttle. opd_step is excluded: its
-# post-update ping is force=True, so it re-commits at the 60s forced floor and an opd_step older
-# than 900s means a long step, failed uploads, or a real stall -- not reporting lag.
-_TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step"})
+# progress_age_s is the age of latest known progress at payload build time. combine it with upload age
+# for a conservative current bound, and speak once that bound reaches the throttle without claiming
+# either health or a stall: newer progress may be uncommitted, or the worker may be silent.
+_UPLOAD_THROTTLE_S = 900.0
+# only the stages the worker actually holds on the 900s upload throttle. opd_step emits ordinary
+# post-step and liveness heartbeats, so its uploaded step can lag just like rl_step and sft_step.
+_TRAINING_STEP_STAGES = frozenset({"opd_step", "rl_step", "sft_step"})
 
 # the setup stages that hold a liveness thread on the 240s tight cadence (_HB_SETUP_LIVENESS_INTERVAL_S).
 # these are the ones where age is genuinely informative: the worker pings every 240s while alive, so
@@ -255,8 +259,6 @@ def _stale_step_hint(
     # throttled progress hides that the replacement has published nothing.
     if not current_attempt:
         return None
-    if heartbeat_age_seconds <= _STALE_STEP_AFTER_S:
-        return None
     if str(heartbeat.get("stage") or "") not in _TRAINING_STEP_STAGES:
         return None
     # step 0 is the cold, still-running first step: no optimizer update has landed, so there is no
@@ -266,9 +268,32 @@ def _stale_step_hint(
 
     if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
         return None
-    # do not suggest `runs log -f`: it shows control-plane logs, and worker output arrives only after
-    # termination (flash/cli/commands/__init__.py cmd_log) on a 3600s upload interval. use heartbeat age against
-    # the 900s throttle, with w&b as the optional live signal.
+    progress_age_s = heartbeat.get("progress_age_s")
+    progress_age: float | None = None
+    if not isinstance(progress_age_s, bool):
+        try:
+            candidate = float(progress_age_s)
+        except (OverflowError, TypeError, ValueError):
+            pass
+        else:
+            if candidate >= 0 and math.isfinite(candidate):
+                progress_age = candidate
+    if progress_age is not None:
+        progress_age_bound_s = heartbeat_age_seconds + progress_age
+        if progress_age_bound_s >= _UPLOAD_THROTTLE_S:
+            return (
+                "the step above is the last one UPLOADED; "
+                f"the last known progress can be as old as {progress_age_bound_s:.1f}s. upload "
+                "throttling no longer explains the gap, but newer progress may be uncommitted and "
+                "a long step may still be running; this signal does not show recent progress"
+            )
+        # below the 900s hold, throttling still explains the visible lag. fall through to the exact
+        # pre-existing reading so new workers never lose guidance in the incident's 300-900s band.
+    if heartbeat_age_seconds <= _STALE_STEP_AFTER_S:
+        return None
+    # old workers do not publish progress_age_s. keep their existing throttle-only reading exactly so
+    # content-addressed in-flight runs do not change interpretation when the CLI upgrades. invalid
+    # progress ages use the same fallback because they provide no trustworthy worker-side reading.
     return (
         "the step above is the last one UPLOADED, not necessarily the one training is on; "
         "a throttled worker can hold it for many minutes while the trainer advances normally. "
