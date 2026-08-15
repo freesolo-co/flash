@@ -64,7 +64,8 @@ def _capacity_refusal_key(
 _EXHAUSTED_CAPACITY_ACTION = (
     "not retrying: the GPU class this retry would return to has already refused capacity twice, "
     "and no better class is left to fail over to, so re-queueing would fail the same way. Widen "
-    "the search -- drop the gpu.type pin, or drop gpu.provider"
+    'the search -- drop the gpu.type pin, name alternatives (type = ["A100 PCIe", "A100 SXM"]), '
+    "or drop gpu.provider"
 )
 
 

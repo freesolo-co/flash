@@ -133,6 +133,19 @@ def prepare_job(
         owner_key_id=owner_key_id,
         token=os.environ.get("HF_TOKEN"),
     )
+    # these read-only gates belong to preparation: every submit path passes here exactly once, and
+    # callers receive the pinned worker spec before quoting, affordability, persistence, or allocation.
+    worker_spec, environment_ref_deferred = _runner().preflight_validate_environment_ref(
+        worker_spec
+    )
+    from flash.content.multimodal import preflight_validate_image_opd
+    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+
+    preflight_validate_image_opd(
+        worker_spec,
+        scan_packaged_environment=not environment_ref_deferred,
+    )
+    preflight_validate_managed_teacher(worker_spec)
     from flash.cost.spec import estimate_for_spec
 
     estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
@@ -235,11 +248,6 @@ def submit_job(
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
-    from flash.content.multimodal import preflight_validate_image_opd
-    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
-
-    preflight_validate_image_opd(worker_spec)
-    preflight_validate_managed_teacher(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     if not dry_run:
