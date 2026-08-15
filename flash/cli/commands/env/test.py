@@ -280,23 +280,15 @@ def _validate_multi_turn_reply(env, example: dict, state: dict, messages: object
     _normalize_prompt_images(env, example, [dict(message) for message in state["messages"]])
 
 
-def _drive_multi_turn(
-    env,
-    example: dict,
-    record: dict,
-    *,
-    force_echo: bool = False,
-    score: bool = True,
-    replay_gold: bool = True,
-) -> None:
+def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = False) -> None:
     state = _new_multi_turn_replay_state(env, example, record)
-    completion = _gold_completion(env, example) if replay_gold else []
+    completion = _gold_completion(env, example)
     record["completion"] = completion
     reference_turns = _reference_turns(completion)
-    policy = "echo" if force_echo or not replay_gold else _resolve_policy(reference_turns)
+    policy = "echo" if force_echo else _resolve_policy(reference_turns)
     record["policy"] = policy
-    record["gold_without_replayable_text"] = (
-        replay_gold and not force_echo and _gold_lacks_replayable_text(completion, reference_turns)
+    record["gold_without_replayable_text"] = not force_echo and _gold_lacks_replayable_text(
+        completion, reference_turns
     )
     record["thinking_markup"] = _carries_thinking_markup(reference_turns)
     # mirror the worker turn loop (flash/engine/worker/train/rl/child/multiturn.py): drive one model
@@ -422,10 +414,9 @@ def _drive_multi_turn(
     record["gold_exceeds_cap"] = policy == "replay" and len(reference_turns) > hard_cap
     record["turn_cap"] = hard_cap
     record["reference_turns"] = len(reference_turns)
-    if score:
-        record["reward"], record["scorer_error"], record["scored_text"] = _score_with_error(
-            env, "", example, state
-        )
+    record["reward"], record["scorer_error"], record["scored_text"] = _score_with_error(
+        env, "", example, state
+    )
     record["state"] = state
 
 

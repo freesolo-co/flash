@@ -320,7 +320,7 @@ def test_env_test_validates_evaluation_sidecar_offline(monkeypatch, tmp_path, ca
     assert "overall: PASS" in output
 
 
-def test_env_test_validates_episode_suite_with_finished_state(monkeypatch, tmp_path, capsys):
+def test_env_test_validates_episode_suite_with_rollout_state(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import EvalCase\n"
@@ -334,7 +334,7 @@ def test_env_test_validates_episode_suite_with_finished_state(monkeypatch, tmp_p
         "        ])]\n"
         "    def score(self, case, response, state):\n"
         "        turns = [m['content'] for m in state['messages'] if m['role'] == 'assistant']\n"
-        "        return response == 'second' and turns == ['first', 'second']\n"
+        "        return response == 'test' and turns == ['test']\n"
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
@@ -351,7 +351,7 @@ def test_env_test_validates_episode_suite_with_finished_state(monkeypatch, tmp_p
     _patch_loader(monkeypatch, env)
 
     assert cmd_env_test(_args(env_dir)) == 0
-    assert env.starts == 2  # one dataset episode and one held-out episode
+    assert env.starts == 2  # one dataset episode and one held-out scorer state
     captured = capsys.readouterr()
     assert "evaluation suite episode: 1/1 cases passed contract checks" in captured.out
     assert "one generation per turn" not in captured.err
@@ -379,10 +379,25 @@ def test_env_test_episode_suite_does_not_require_sft_gold(
     )
 
     class _NoEvaluationGoldEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "1"},
+                        {"role": "assistant", "content": "2"},
+                    ],
+                }
+            ]
+
         def sft_completion(self, example):
             if example["input"] == "held out":
                 raise AssertionError("evaluation case requested an sft target")
             return super().sft_completion(example)
+
+        def env_reply(self, messages, state):
+            int(state["response_text"])
+            return super().env_reply(messages, state)
 
     _patch_loader(monkeypatch, _NoEvaluationGoldEnv())
 

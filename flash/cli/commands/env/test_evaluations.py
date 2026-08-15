@@ -77,24 +77,19 @@ def _evaluation_response(env, case) -> tuple[str, str]:
 
 
 def _episode_evaluation_response(env, case) -> tuple[str, dict]:
-    """Replay one held-out episode without re-running the environment's reward."""
+    """Build one synthetic model turn to validate a state-aware scorer offline."""
     # imported here rather than at module scope: `test.py` imports this module.
-    from flash.cli.commands.env.test import _drive_multi_turn, _new_record
-
-    record = _new_record()
-    _drive_multi_turn(
-        env,
-        _evaluation_example(case),
-        record,
-        score=False,
-        replay_gold=False,
+    from flash.cli.commands.env.test import (
+        _ECHO_RESPONSE,
+        _new_multi_turn_replay_state,
+        _new_record,
     )
-    state = record["state"]
-    response = state.get("response_text")
-    if not isinstance(response, str):
-        turns = record["responses"]
-        response = str(turns[-1]) if turns else ""
-    return response, state
+
+    example = _evaluation_example(case)
+    record = _new_record()
+    state = _new_multi_turn_replay_state(env, example, record)
+    env.record_model_turn(state, _ECHO_RESPONSE)
+    return _ECHO_RESPONSE, state
 
 
 def _call_evaluation_scorer(scorer, case, response: str, state: dict, state_style: str | None):
