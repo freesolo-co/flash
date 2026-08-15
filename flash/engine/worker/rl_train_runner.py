@@ -545,7 +545,8 @@ def _ingest_step_metrics(
                 **(state.step_timing_fields() if state.step_timing_fields else {}),
                 gpu=gpu_diagnostics(include_torch=False),
             )
-            state.step_clock.note_if_blocked(time.monotonic() - started)
+            ended = time.monotonic()
+            state.step_clock.note_if_blocked(ended - started, ended)
             state.sent_first_metrics = sent_first_metrics
         # per-step series for train_meta observability parity. these live on the same
         # line as everything else: verl's only console metric sink is LocalLogger,

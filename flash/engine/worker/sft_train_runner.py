@@ -766,7 +766,8 @@ class _SftProgressCallbacks:
             **{key: value for key, value in payload.items() if value is not None},
             **self.step_timing_fields(),
         )
-        self.progress.step_clock.note_if_blocked(time.monotonic() - started)
+        ended = time.monotonic()
+        self.progress.step_clock.note_if_blocked(ended - started, ended)
 
     def step_timing_fields(self) -> dict[str, float | bool]:
         """Steady-state step timing for one heartbeat; empty until a whole step has been measured.
@@ -801,7 +802,8 @@ class _SftProgressCallbacks:
             step=int(self.progress.values["step"] or 0),
             **self.step_timing_fields(),
         )
-        self.progress.step_clock.note_if_blocked(time.monotonic() - started)
+        ended = time.monotonic()
+        self.progress.step_clock.note_if_blocked(ended - started, ended)
 
 
 def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_line) -> int:

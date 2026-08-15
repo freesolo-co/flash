@@ -645,7 +645,8 @@ def _build_child_callbacks(
         # and a 30s wait on the upload lock both block and both report "not committed".
         started = time.monotonic()
         _opd_train._w.heartbeat("opd_step", **payload, **step_timing_fields())
-        step_clock.note_if_blocked(time.monotonic() - started)
+        ended = time.monotonic()
+        step_clock.note_if_blocked(ended - started, ended)
 
     def child_heartbeat() -> None:
         # see liveness_fields below: an upload replaces the published snapshot, so every ping that
@@ -661,7 +662,8 @@ def _build_child_callbacks(
             step=int(progress["step"] or 0),
             **step_timing_fields(),
         )
-        step_clock.note_if_blocked(time.monotonic() - started)
+        ended = time.monotonic()
+        step_clock.note_if_blocked(ended - started, ended)
 
     child_tail = _opd_train.ChildOutputTail()
     # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside

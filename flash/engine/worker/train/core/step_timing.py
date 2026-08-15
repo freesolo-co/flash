@@ -114,6 +114,9 @@ class StepClock:
         # blocking time inside the current span that could not be judged when it happened, because
         # no pace was measured yet. resolved at the next step line (see _resolve_unjudged_block).
         self._unjudged_block_s = 0.0
+        # when that call returned, so the next arrival can be measured from the call's END rather
+        # than from the previous step line, which loses where in the step the call sat.
+        self._unjudged_ended_at: float | None = None
 
     def note_blocking_work(self) -> None:
         """Declare that the caller is about to block, so the span in progress is not a step.
@@ -145,8 +148,12 @@ class StepClock:
         # 900s stall behind a repeated step published 496s/step against a true 92s.
         self._pending_baseline = None
 
-    def note_if_blocked(self, elapsed_s: float) -> None:
+    def note_if_blocked(self, elapsed_s: float, ended_at: float | None = None) -> None:
         """Break the span when a call took long enough to have blocked the reader.
+
+        ``ended_at`` is when the call returned, on the same ``time.monotonic()`` base as ``record``.
+        Callers pass it because a duration alone loses WHERE in the step the call sat, and that is
+        what decides whether the next line was buffered (see ``_resolve_unjudged_block``).
 
         Measured rather than inferred from a success flag. A heartbeat that returns "not committed"
         may have skipped instantly under the throttle OR waited out a 30s upload lock and failed, and
@@ -196,8 +203,16 @@ class StepClock:
             # mid-step on a 92s run delayed nothing, and charging it a segment cost the only
             # interval a short run had. the next arrival is the evidence either way.
             self._unjudged_block_s += float(elapsed_s)
+            if ended_at is not None:
+                # when the call ENDED, not just how long it ran. the two are not interchangeable: a
+                # call occupying the tail of a step (0.09s to 0.99s of a 0.1s step) buffers output
+                # just as surely as one covering the whole span, but a span measured from the
+                # previous step line reads 0.991s against a 0.9s call and concludes nothing was
+                # held back. span minus duration cannot recover this -- it conflates time before
+                # the call started with time after it ended -- so the instant itself is required.
+                self._unjudged_ended_at = float(ended_at)
 
-    def _resolve_unjudged_block(self, span_s: float) -> None:
+    def _resolve_unjudged_block(self, span_s: float, now: float | None = None) -> None:
         """Judge a deferred block now that the span containing it is known.
 
         The question is whether the call held this line BACK, and the span it landed in answers it.
@@ -217,7 +232,20 @@ class StepClock:
         been had the pace been known in time.
         """
         pending, self._unjudged_block_s = self._unjudged_block_s, 0.0
-        if pending > 0 and span_s > 0 and span_s <= pending * _BLOCK_ARRIVAL_SLACK:
+        ended_at, self._unjudged_ended_at = self._unjudged_ended_at, None
+        if pending <= 0:
+            return
+        if ended_at is not None and now is not None:
+            # measure from when the call RETURNED. a line already queued is read essentially at that
+            # instant, so a gap far below the call's own length is buffered output whatever the call
+            # cost. this is the phase the duration alone cannot carry: a 0.9s call sitting at the
+            # END of a 0.1s step buffers nine lines, but the span from the previous step line reads
+            # 0.991s and looked like the reader had waited -- so the drain never armed and the burst
+            # published 0.001s against a true 0.1s.
+            if float(now) - ended_at <= pending * (_BLOCK_ARRIVAL_SLACK - 1.0):
+                self.note_blocking_work()
+            return
+        if span_s > 0 and span_s <= pending * _BLOCK_ARRIVAL_SLACK:
             self.note_blocking_work()
 
     def record(self, now: float, step: int | None = None) -> None:
@@ -264,7 +292,7 @@ class StepClock:
                 # one line too late: the drain was armed behind a line already recorded as a segment
                 # head, so that head and the next queued arrival bounded a pipe-speed interval, and
                 # that interval then became the pace the rest of the drain was sized against.
-                self._resolve_unjudged_block(float(now) - self._times[-1])
+                self._resolve_unjudged_block(float(now) - self._times[-1], float(now))
         if self._draining(now):
             return
         if step is not None:

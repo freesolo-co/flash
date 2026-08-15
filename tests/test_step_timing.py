@@ -654,26 +654,65 @@ def test_every_step_timestamp_comes_from_a_clock_that_cannot_jump():
     worker_dir = Path(flash.__file__).parent / "engine" / "worker"
     checked = 0
     for name in runners:
-        path = worker_dir / name
-        for node in ast.walk(ast.parse(path.read_text())):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-                continue
-            if node.func.attr not in {"record", "note_if_blocked"} or not node.args:
-                continue
-            # the receiver has to be the step clock: `.record(` alone also matches unrelated calls.
-            receiver = node.func.value
-            named = (
-                receiver.attr
-                if isinstance(receiver, ast.Attribute)
-                else getattr(receiver, "id", "")
-            )
-            if named != "step_clock":
-                continue
-            timestamp = ast.dump(node.args[0])
-            assert "monotonic" in timestamp, (
-                f"{name}:{node.lineno} times a step off a clock that can jump: {timestamp}"
-            )
-            checked += 1
+        tree = ast.parse((worker_dir / name).read_text())
+        # what each function assigns, so a Name argument can be resolved back to its source.
+        # SCOPED PER FUNCTION, never file-wide: the runners bind `ended` in more than one callback,
+        # and a module-level map keyed by bare name lets one site's `ended = time.monotonic()`
+        # vouch for another site that assigned `time.time()`. sabotaging one site and watching the
+        # file-wide version still pass is how that was found.
+        by_scope = {
+            scope: {
+                target.id: ast.dump(stmt.value)
+                for stmt in ast.walk(scope)
+                if isinstance(stmt, ast.Assign)
+                for target in stmt.targets
+                if isinstance(target, ast.Name)
+            }
+            for scope in ast.walk(tree)
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        # a nested callback is walked by its own scope AND its parent's, so visit each call under
+        # the INNERMOST function that contains it -- the one whose locals actually bind its names.
+        innermost = {}
+        for scope in by_scope:
+            for node in ast.walk(scope):
+                if isinstance(node, ast.Call):
+                    innermost[id(node)] = scope
+        for scope, assigned in by_scope.items():
+            for node in ast.walk(scope):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    continue
+                if innermost.get(id(node)) is not scope:
+                    continue
+                if node.func.attr not in {"record", "note_if_blocked"} or not node.args:
+                    continue
+                # the receiver has to be the step clock: `.record(` alone also matches unrelated
+                # calls.
+                receiver = node.func.value
+                named = (
+                    receiver.attr
+                    if isinstance(receiver, ast.Attribute)
+                    else getattr(receiver, "id", "")
+                )
+                if named != "step_clock":
+                    continue
+                # the TIME arguments only. record's second argument is a step NUMBER, while
+                # note_if_blocked takes a duration AND the instant the call ended -- both read
+                # against a recorded arrival, so a wall clock in either corrupts the comparison.
+                timed = node.args if node.func.attr == "note_if_blocked" else node.args[:1]
+                for arg in timed:
+                    # substitute each Name for what this scope assigned it, so a bare `ended` and a
+                    # derived `ended - started` both resolve to their monotonic source. a name that
+                    # resolves to nothing contributes nothing and fails the assertion.
+                    timestamp = ast.dump(arg)
+                    for referenced in {
+                        inner.id for inner in ast.walk(arg) if isinstance(inner, ast.Name)
+                    }:
+                        timestamp += " " + assigned.get(referenced, "")
+                    assert "monotonic" in timestamp, (
+                        f"{name}:{node.lineno} times a step off a clock that can jump: {timestamp}"
+                    )
+                checked += 1
     # every trainer records, SFT and OPD each time TWO uploads (the one on the step line and the one
     # the child stream fires from a non-step line), and RL times its forced first-metrics ping. a
     # passing assertion loop that visited nothing would be the failure this guards against.
@@ -1348,6 +1387,57 @@ def test_a_call_before_the_first_step_line_is_not_charged_to_a_later_step():
     assert len(clock.intervals()) == 39
 
 
+def test_a_call_at_the_end_of_a_step_still_shows_its_output_was_buffered():
+    """WHERE in the step the call sat decides this, and a duration alone does not carry it.
+
+    SFT and OPD fire the child-stream heartbeat from a non-step line, so it can start late in the
+    current step. A call running 0.09s to 0.99s of a 0.1s workload buffers nine lines exactly as a
+    call covering the whole span would -- but measuring the next arrival from the PREVIOUS STEP LINE
+    reads 0.991s against a 0.9s call and concludes the reader waited. The drain never armed and the
+    burst was timed as steps: 0.001s published against a true 0.1s, understating the ETA and the
+    wall risk a hundredfold.
+
+    Subtracting the duration from the span cannot recover this: that conflates time before the call
+    started with time after it ended. The instant the call RETURNED is the only reference that
+    answers the question, so callers pass it.
+    """
+    real, pipe = 0.1, 0.001
+
+    def run(tail: int) -> step_timing.StepClock:
+        clock = step_timing.StepClock()
+        clock.record(0.0, 0)
+        # the call starts 0.09 into the step and returns at 0.99, well past the step boundary.
+        clock.note_if_blocked(0.9, 0.99)
+        t, step = 0.991, 1
+        for _ in range(9):
+            clock.record(t, step)
+            step += 1
+            t += pipe
+        for _ in range(tail):
+            t += real
+            clock.record(t, step)
+            step += 1
+        return clock
+
+    # a short tail is the case that matters: with few clean intervals there is nothing to outvote
+    # the burst, so an admitted burst TAKES the median rather than merely skewing it.
+    for tail in (2, 5, 9, 20, 40):
+        clock = run(tail)
+        assert clock.step_seconds() == pytest.approx(real, abs=0.001), (
+            f"tail={tail} published {clock.step_seconds()}s against a true {real}s"
+        )
+        assert not [gap for gap in clock.intervals() if gap < real / 2], (
+            f"tail={tail} left pipe-speed intervals in the window"
+        )
+
+    # without the end instant the clock falls back to the span test, which is all it can do.
+    legacy = step_timing.StepClock()
+    legacy.record(0.0, 0)
+    legacy.note_if_blocked(0.9)
+    legacy.record(0.9, 1)
+    assert legacy._draining_backlog, "the span test must still catch a call that spans the step"
+
+
 def test_a_long_call_that_delayed_nothing_keeps_the_interval_it_did_not_touch():
     """Length alone does not prove a call blocked the reader; the next arrival does.
 
@@ -1475,7 +1565,10 @@ def test_the_child_stream_heartbeat_is_timed_like_the_step_one():
                 body = " ".join(ast.unparse(node).split())
         assert body is not None, f"{name} has no child_heartbeat"
         assert "started = time.monotonic()" in body, name
-        assert "note_if_blocked(time.monotonic() - started)" in body, name
+        # the end instant travels with the duration: this callback is the one that fires from a
+        # NON-step line, so it is exactly where the call's phase within the step matters.
+        assert "ended = time.monotonic()" in body, name
+        assert "note_if_blocked(ended - started, ended)" in body, name
 
     # the guard's effect: the stalled span is dropped rather than published as what a step costs.
     clock = step_timing.StepClock()
@@ -1521,7 +1614,10 @@ def test_no_synchronous_upload_declares_a_block_it_never_measured():
     # and the RL site specifically now measures around its forced ping, as SFT and OPD do.
     rl = " ".join(ast.unparse(ast.parse((worker_dir / "rl_train_runner.py").read_text())).split())
     assert "started = time.monotonic()" in rl
-    assert "note_if_blocked(time.monotonic() - started)" in rl
+    # the end instant is bound once and passed alongside the duration, so the two cannot describe
+    # different moments -- calling monotonic() twice would let the gap between them drift.
+    assert "ended = time.monotonic()" in rl
+    assert "note_if_blocked(ended - started, ended)" in rl
 
 
 def test_a_fast_first_heartbeat_does_not_silence_a_fast_run():
