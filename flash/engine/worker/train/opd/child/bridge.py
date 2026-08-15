@@ -81,9 +81,11 @@ _SECRET_URL_PARAM = (
 # runtime (a broker dsn, a database url) is in no environment variable, so the value pass misses it
 # too. Only the password is replaced: the scheme, user and host say WHICH endpoint failed and are
 # the diagnostic. The password stops at `@`, and `[^\s/?#@]` keeps a later `@` in a path or query
-# from extending the match past the authority. The user is required to be non-empty so a bare
-# `scheme://:@host` or a `//` in prose cannot match.
-_SECRET_URL_USERINFO = re.compile(r"(?i)\b([a-z][\w+.-]*://[^\s:/?#@]+:)[^\s/?#@]+(?=@)")
+# from extending the match past the authority. The user may be EMPTY: `redis://:password@host` is
+# the ordinary shape for a password-only dsn, and requiring a user there would leak exactly the
+# runtime-built credential no environment variable holds. It is the PASSWORD being non-empty that
+# keeps a bare `scheme://:@host` out, and the scheme that keeps a `//` in prose out.
+_SECRET_URL_USERINFO = re.compile(r"(?i)\b([a-z][\w+.-]*://[^\s:/?#@]*:)[^\s/?#@]+(?=@)")
 # a KEY-suffixed field is a credential only when a qualifier says so. `key` alone cannot join the
 # list above: `cache_key`, `partition_key` and `idempotency_key` are ordinary diagnostic fields, and
 # redacting them eats the message this record exists to carry. So the qualifier is required and

@@ -5004,6 +5004,12 @@ def test_child_failure_sanitizer_redacts_a_password_in_url_userinfo(monkeypatch)
         "child failed: redis://default:runtimepw123@cache.internal:6379",
         "child failed: https://svc:runtimepw123@api.example.com/v1/runs returned 503",
         "child failed: MONGODB://svc:runtimepw123@mongo.internal/db",  # scheme case-insensitive
+        # the user is OPTIONAL. `redis://:password@host` is the ordinary shape for a password-only
+        # dsn, and it is exactly the runtime-built credential the value pass cannot see, so a rule
+        # that required a user would leak the one case it was written for.
+        "child failed: redis://:runtimepw123@cache.internal:6379/0",
+        "child failed: postgres://:runtimepw123@db.example.com/app",
+        "child failed: amqp://:runtimepw123@rabbit.internal:5672/%2f",
     ):
         redacted = _safe_child_failure_detail(ValueError(message))
         assert "runtimepw123" not in redacted, f"leaked: {redacted!r}"
@@ -5033,6 +5039,14 @@ def test_child_failure_sanitizer_redacts_a_password_in_url_userinfo(monkeypatch)
         )
         == "child failed: postgresql://flash:<redacted>@db.example:5432/runs"
     )
+    # the same for the userless form: the empty user is preserved, so the reader can still tell a
+    # password-only dsn from one whose user was redacted away.
+    assert (
+        _safe_child_failure_detail(
+            ValueError("child failed: redis://:runtimepw123@cache.internal:6379/0")
+        )
+        == "child failed: redis://:<redacted>@cache.internal:6379/0"
+    )
 
     # the other direction: no userinfo means no credential, and a colon in a path, a port or prose
     # must not be read as one. Redacting these would eat ordinary diagnostics.
@@ -5042,6 +5056,11 @@ def test_child_failure_sanitizer_redacts_a_password_in_url_userinfo(monkeypatch)
         "child failed: see https://docs.example.com/errors/a:b/c",
         "child failed: user:pass was not supplied",  # no scheme, so not a url at all
         "child failed: bare //host:1234 is not a url",
+        # an EMPTY password is not a credential. Allowing an empty user (above) means the password
+        # is now the only thing keeping these out, so both empty-userinfo forms are pinned here --
+        # a rule that dropped the password's `+` would redact a url that carries no secret at all.
+        "child failed: scheme://:@host refused the connection",
+        "child failed: redis://:@cache.internal:6379 has no password",
     ):
         assert _safe_child_failure_detail(ValueError(message)) == message, message
 
