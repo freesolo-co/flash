@@ -410,6 +410,10 @@ def run_rl_train():
                 **_reward_observability(),
             },
             progress_step=True,
+            # `fields` drives the silence watchdog above, so it must not be sampled from the thread
+            # that uploads: a wedged commit would freeze the counter and a child that died while
+            # the upload was stuck would never be condemned.
+            sample_off_thread=True,
         ):
             rc = _execute_rl_child(
                 python_bin=python_bin,

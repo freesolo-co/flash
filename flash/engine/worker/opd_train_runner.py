@@ -684,6 +684,10 @@ def _run_child(
                 progress=lambda: int(callbacks.progress["step"] or 0),
                 progress_step=True,
                 fields=callbacks.liveness_fields,
+                # `liveness_fields` drives the silence watchdog, so it must not be sampled from the
+                # thread that uploads: a wedged commit would freeze the counter and a child that
+                # died while the upload was stuck would never be condemned.
+                sample_off_thread=True,
             ):
                 return_code = _opd_train.run_verl_training(
                     command,

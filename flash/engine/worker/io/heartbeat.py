@@ -563,14 +563,57 @@ _STALL_DUMP_S = 1200.0
 
 
 @contextlib.contextmanager
-def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, keepalive=False):
+def liveness_heartbeat(
+    stage,
+    progress=None,
+    fields=None,
+    progress_step=False,
+    keepalive=False,
+    sample_off_thread=False,
+):
     """Emit liveness heartbeats while a main-thread block runs.
     ``keepalive`` marks blocking uploads as progress (dev #445); use a throttled stage. ``fields``
     carries payload data, while ``progress_step`` wins for trainer steps (dev #442). Missing a step
     can misbill cancellation. Use nvidia-smi because the main thread may hold CUDA allocator locks.
+
+    ``sample_off_thread`` moves the ``fields()`` call onto a thread of its own. Set it when
+    ``fields`` is not a pure read -- the silence watchdog advances its counter from there, and the
+    emitting loop below can block for minutes inside the heartbeat upload (``HfApi`` takes no
+    timeout, and this suite already REQUIRES callers to survive that: see
+    ``test_liveness_heartbeat_join_is_bounded_even_if_emit_wedges``). Sampling from the emitting
+    loop makes a wedged upload freeze the counter, so a child that dies while an upload is stuck --
+    the combined failure, where a paid gpu is held by a dead run -- is never condemned.
+
+    The sampling thread stays the SOLE caller of ``fields`` when it runs: the counter advances once
+    per call, so two callers per tick would double its rate and both halve the deadline and publish
+    a wrong number in the run log. The emitter reads the sample this thread took.
     """
     done = threading.Event()
     spawner = threading.current_thread()
+    # the sampling thread's most recent `fields()` result, handed to the emitting loop below.
+    latest_fields: list[dict] = [{}]
+    samples_off_thread = sample_off_thread and fields is not None
+
+    def _sample_loop() -> None:
+        # same inline-stub guard as `_loop`, for the same reason: a test that runs thread targets
+        # on .start() would otherwise never return from this one.
+        if threading.current_thread() is spawner:
+            return
+
+        def _sample() -> None:
+            sample: dict = {}
+            with contextlib.suppress(Exception):
+                sample = fields() or {}
+            latest_fields[0] = sample
+
+        # sample BEFORE the first sleep. both loops wait the same interval from starts microseconds
+        # apart, so without this the emitter's first heartbeat can win the race and publish without
+        # the counter -- exactly the tick a child dying during import is judged by, since a run torn
+        # down at the deadline publishes no later heartbeat to correct it. this cannot pull the
+        # deadline forward: the first observation on a fresh counter baselines rather than counting.
+        _sample()
+        while not done.wait(_LIVENESS_TICK_S):
+            _sample()
 
     def _loop() -> None:
         if threading.current_thread() is spawner:
@@ -598,7 +641,13 @@ def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, k
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
             extra = {}
-            if fields is not None:
+            if samples_off_thread:
+                # the sampling thread is the sole caller of `fields` (see `_sample_loop`): calling
+                # it here too would advance the silence counter a second time per tick. take its
+                # most recent sample instead. a list store is atomic under the GIL, so this reads
+                # either the previous tick's fields or this tick's, never a torn mixture.
+                extra = dict(latest_fields[0])
+            elif fields is not None:
                 with contextlib.suppress(Exception):
                     extra = fields() or {}
             if progress_step and last_val is not None:
@@ -613,11 +662,20 @@ def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, k
 
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
+    sampler: threading.Thread | None = None
+    if samples_off_thread:
+        # only when `fields` drives a watchdog: every other liveness wrap in the worker keeps the
+        # single thread it has always had.
+        sampler = threading.Thread(target=_sample_loop, daemon=True)
+        sampler.start()
     try:
         yield
     finally:
         done.set()
         t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
+        if sampler is not None:
+            # bounded like the join above, and this thread only ever sleeps on `done`.
+            sampler.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
 
 
 # checkpoint drain time scales with model size and network throughput; a fixed timeout killed a

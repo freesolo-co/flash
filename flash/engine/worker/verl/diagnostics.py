@@ -80,6 +80,7 @@ class ChildOutputTail:
     def __init__(self, limit: int = CHILD_TAIL_LINES) -> None:
         self._lines: collections.deque[str] = collections.deque(maxlen=limit)
         self._written = 0
+        self._last_line: str | None = None
         self._retriable_infra_signature: str | None = None
         self._cuda_oom_evidence: str | None = None
         self._host_ram_kill_evidence: str | None = None
@@ -104,8 +105,15 @@ class ChildOutputTail:
             # across the cut and defeat full-value redaction. this is the worker side, where the
             # run's secret values are known, and every consumer of the retained tail (heartbeat
             # payload, streamed run log, persisted status) reads it from here.
-            self._lines.append(sanitize_diagnostic(text, limit=_CHILD_TAIL_LINE_CHARS))
-            self._written += 1
+            sanitized = sanitize_diagnostic(text, limit=_CHILD_TAIL_LINE_CHARS)
+            self._lines.append(sanitized)
+            # compare against the retained (sanitized, capped) form rather than the raw line: two
+            # reprints of one frozen status line can differ only inside a redacted value or past
+            # the per-line cap, and treating those as new content would be exactly the repetition
+            # this counter exists to see through.
+            if sanitized != self._last_line:
+                self._written += 1
+            self._last_line = sanitized
 
     @property
     def retriable_infra_signature(self) -> str | None:
@@ -124,11 +132,19 @@ class ChildOutputTail:
 
     @property
     def written(self) -> int:
-        """how many non-empty lines the child has produced, ever.
+        """how many non-empty lines of NEW content the child has produced, ever.
 
         monotonic and independent of the retention limit, which is what makes it usable as a
-        staleness signal: a child looping on the same line still advances this, and a child that has
-        gone silent cannot advance it even though its retained tail stays fully populated.
+        staleness signal: a child that has gone silent cannot advance it even though its retained
+        tail stays fully populated.
+
+        a line identical to the one immediately before it does not advance this, and that exclusion
+        is the whole difference between watching bytes and watching work. a wedged run is not
+        silent: the observed wedge had a verl TransferQueue timer re-printing a FROZEN
+        `Total success requests: 299` every five minutes, forever. counting each of those as output
+        reset every staleness measure built on this, which is why the published silent-tick counter
+        never climbed past single digits on runs that were already dead. a repeated line is a
+        process still breathing and still not working, so only genuinely new output resets the clock.
         """
         return self._written
 
