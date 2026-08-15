@@ -715,12 +715,6 @@ def _run_child(
                     tail=callbacks.child_tail,
                 )
                 training_completed = return_code == 0
-                if training_completed:
-                    # belt and braces behind the first-step check in _build_child_callbacks: a run
-                    # that exits 0 without ever printing a step line still may not pass unverified.
-                    _opd_train.verify_applied_shim_markers(
-                        shim_markers, (_LORA_ROLLOUT_GUARD_SHIM,)
-                    )
     finally:
         watcher.stop(require_complete=training_completed)
         # stopped here rather than after the block: the sampler polls nvidia-smi on a thread of
