@@ -785,10 +785,15 @@ def test_a_checkpoint_path_is_not_timed_as_a_step(tmp_path):
 
 
 def _replay(clock, timeline):
-    """Drive the clock the way a trainer's on_step does: record, heartbeat, then note the duration."""
+    """Drive the clock the way a trainer's on_step does: record, heartbeat, then note the duration.
+
+    The end instant is passed the way every production call site passes it. A helper that omits it
+    replays the fallback path instead of the one that runs, so a defect in the phase judgment would
+    sit under whichever scenario used this helper without failing anything.
+    """
     for arrival, step, heartbeat_s in timeline:
         clock.record(arrival, step)
-        clock.note_if_blocked(heartbeat_s)
+        clock.note_if_blocked(heartbeat_s, arrival + heartbeat_s)
 
 
 def test_the_backlog_a_block_leaves_behind_is_not_timed_as_fast_steps():
