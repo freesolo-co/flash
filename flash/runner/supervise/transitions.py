@@ -195,6 +195,25 @@ def mark_deployment_pending(
         return status
 
 
+def _confirmed_active_failed_predecessor(deployment: object, run_id: str) -> bool:
+    if not isinstance(deployment, dict):
+        return False
+    revision = deployment.get("adapter_revision")
+    parsed = parse_adapter_revision(revision) if isinstance(revision, str) else None
+    return (
+        deployment.get("state") == "failed"
+        and deployment.get("alias_activation_confirmed") is True
+        and parsed is not None
+        and parsed[0] == run_id
+    )
+
+
+def _restorable_deployment_predecessor(deployment: object, run_id: str) -> bool:
+    return (
+        isinstance(deployment, dict) and deployment.get("state") in _RESTORABLE_DEPLOYMENT_STATES
+    ) or _confirmed_active_failed_predecessor(deployment, run_id)
+
+
 def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
     """Record a failed deployment attempt while preserving the run lifecycle state."""
     from flash.runner import _save_status_unlocked, _status_guard, get_status
@@ -212,10 +231,12 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
         ):
             return status
         previous = deployment.get("previous_deployment")
-        if (
+        if _restorable_deployment_predecessor(previous, run_id) and (
             not deployment.get("activation_outcome_unknown")
-            and isinstance(previous, dict)
-            and previous.get("state") in _RESTORABLE_DEPLOYMENT_STATES
+            or (
+                deployment.get("state") == "failed"
+                and _confirmed_active_failed_predecessor(previous, run_id)
+            )
         ):
             status.deployment = {
                 **previous,
