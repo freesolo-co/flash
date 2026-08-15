@@ -5923,41 +5923,81 @@ def test_remote_distillation_config_declares_every_field_post_init_assigns():
     )
 
 
-def test_multi_turn_rollout_marks_its_prompt_failed_before_hard_exiting(monkeypatch):
-    """A dying rollout must clear its own "running" marker, or the trainer waits on it forever.
+def _set_multiturn_loop_env(monkeypatch):
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_URL", "http://bridge.invalid")
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", "token")
+    monkeypatch.setenv("FLASH_OPD_SEED", "41")
+    monkeypatch.setenv("FLASH_OPD_MAX_TURNS", "2")
+    monkeypatch.setenv("FLASH_OPD_MAX_MODEL_LEN", "128")
+    monkeypatch.setenv(
+        "FLASH_OPD_ENV_CAPABILITIES",
+        json.dumps(["new_rollout_state", "record_model_turn", "env_reply", "rollout_done"]),
+    )
 
-    The loop runs in a ray actor, so `os._exit` kills that actor alone: the driver's dispatch was
-    fire-and-forget and ray reports nothing back, leaving verl's `_run_prompt` handler -- the only
-    writer of "failure" -- unreached.
-    """
+
+def _build_multiturn_failure_loop(
+    *,
+    post_json,
+    score_failure_handler,
+    process_exit,
+    mark_prompt_failed=None,
+):
     from flash.engine.worker.train.opd.child import multiturn as opd_multiturn
+
+    class _Base:
+        async def apply_chat_template(self, _messages):
+            return [10, 11]
+
+    loop_cls = opd_multiturn.build_flash_multi_turn_agent_loop(
+        register=lambda _name: lambda cls: cls,
+        agent_loop_base=_Base,
+        agent_loop_output=object,
+        post_json=post_json,
+        score_failure_handler=score_failure_handler,
+        deterministic_seed=lambda *args, **kwargs: 0,
+        process_exit=process_exit,
+        mark_prompt_failed=mark_prompt_failed,
+    )
+    return loop_cls()
+
+
+class _StubReplayBuffer:
+    def __init__(self):
+        self.partitions = {"train": {}}
+        self.lock = threading.Lock()
+
+    def close(self):
+        pass
+
+    def sample(self, partition_id, global_steps=None, batch_size=None):
+        return SimpleNamespace(
+            keys=[
+                key
+                for key, tag in self.partitions[partition_id].items()
+                if tag["status"] == "success"
+            ],
+            partition_id=partition_id,
+        )
+
+
+def test_multi_turn_rollout_marks_its_prompt_failed_before_hard_exiting():
+    """The outer exception path must still mark before exiting."""
 
     class ChildExit(Exception):
         def __init__(self, code):
             self.code = code
 
-    class _Base:
-        def __init__(self):
-            pass
-
-    registered = {}
     marked = []
 
     async def fake_mark(kwargs):
         marked.append(dict(kwargs))
 
-    loop_cls = opd_multiturn.build_flash_multi_turn_agent_loop(
-        register=lambda name: lambda cls: registered.setdefault(name, cls) or cls,
-        agent_loop_base=_Base,
-        agent_loop_output=object,
-        post_json=lambda *a, **k: {},
+    loop = _build_multiturn_failure_loop(
+        post_json=lambda *args, **kwargs: {},
         score_failure_handler=lambda error: None,
-        deterministic_seed=lambda *a, **k: 0,
         process_exit=lambda code: (_ for _ in ()).throw(ChildExit(code)),
         mark_prompt_failed=fake_mark,
     )
-
-    loop = loop_cls()
 
     async def boom(sampling_params, **kwargs):
         raise RuntimeError("teacher is gone")
@@ -5965,14 +6005,151 @@ def test_multi_turn_rollout_marks_its_prompt_failed_before_hard_exiting(monkeypa
     loop._run = boom
 
     with pytest.raises(ChildExit) as exit_info:
-        asyncio.run(loop.run({}, uid="prompt-7"))
+        asyncio.run(loop.run({}, uid="prompt-7", global_steps=5))
 
     assert exit_info.value.code == 86
-    # the marker must be written BEFORE the exit, not merely attempted at some point
-    assert marked == [{"uid": "prompt-7"}], (
-        "the rollout hard-exited without marking its prompt failed; the trainer's "
-        "ReplayBuffer.sample would poll a 'running' marker nobody will ever clear"
+    assert marked == [{"uid": "prompt-7", "global_steps": 5}]
+
+
+def test_multiturn_opd_run_failure_marks_before_its_direct_exit_and_matches_replay_guard(
+    monkeypatch,
+):
+    """A failure caught inside `_opd_run` must mark before its direct hard exit.
+
+    Returning from the injected exit makes the normally unreachable ordering observable. On the real
+    path `os._exit` never returns, so a marker written by `run`'s outer exception handler is too late.
+    """
+    from flash.engine.worker.train.opd.child import multiturn as opd_multiturn
+
+    _set_multiturn_loop_env(monkeypatch)
+    events = []
+    puts = []
+
+    async def async_kv_put(**call):
+        puts.append(call)
+        events.append(("marker", call["tag"]))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transfer_queue",
+        SimpleNamespace(async_kv_put=async_kv_put),
     )
+
+    def post_json(_url, _token, path, _payload):
+        if path == "/multiturn/start":
+            raise RuntimeError("teacher is gone")
+        assert path == "/multiturn/close"
+        events.append(("close", path))
+        return {}
+
+    loop = _build_multiturn_failure_loop(
+        post_json=post_json,
+        score_failure_handler=lambda error: None,
+        process_exit=lambda code: events.append(("exit", code)),
+    )
+
+    async def exercise():
+        loop.loop = asyncio.get_running_loop()
+        with pytest.raises(AssertionError, match="process exit returned unexpectedly"):
+            await loop.run(
+                {},
+                uid="prompt-7",
+                global_steps="7",
+                index=0,
+                raw_prompt=[{"role": "user", "content": "question"}],
+            )
+
+    asyncio.run(exercise())
+
+    # the close posts to the same bridge this rollout just gave up on, so its 600s transport
+    # timeout is the modal case here. marking after it would hold the trainer's poll for ten more
+    # minutes with the diagnosis already known, so pin marker BEFORE close, and close before exit.
+    #
+    # the trailing second "exit" is an artifact of injecting an exit that RETURNS: the real
+    # `os._exit` never comes back, so `_opd_run`'s AssertionError and `run`'s outer handler are
+    # both unreachable in production. the marker is written exactly once either way.
+    assert [event[0] for event in events] == ["marker", "close", "exit", "exit"]
+    assert [event[0] for event in events].count("marker") == 1
+    assert events[0] == ("marker", {"global_steps": 7, "status": "failure"})
+    assert puts == [
+        {
+            "key": "prompt-7",
+            "partition_id": "train",
+            "tag": {"global_steps": 7, "status": "failure"},
+        }
+    ]
+
+    buffer = opd_multiturn.build_flash_replay_buffer(_StubReplayBuffer)()
+    buffer.partitions["train"] = {"prompt-7": dict(puts[0]["tag"])}
+    with pytest.raises(RuntimeError, match="rollout failed for 1 prompt"):
+        buffer.sample("train", global_steps=7)
+
+
+def test_multiturn_score_failure_defers_handler_exit_until_marker_is_written(monkeypatch):
+    """The executor's score failure must return to async code to mark before hard exit."""
+    _set_multiturn_loop_env(monkeypatch)
+    events = []
+    main_thread = threading.get_ident()
+
+    class DeliveryUnknown(RuntimeError):
+        delivery_unknown = True
+        classification = "transient"
+
+    async def fake_mark(kwargs):
+        events.append(("marker", threading.get_ident(), dict(kwargs)))
+
+    def post_json(_url, _token, path, _payload):
+        if path == "/multiturn/start":
+            return {"max_turns": 1}
+        if path == "/multiturn/score":
+            events.append(("score-post", threading.get_ident()))
+            raise DeliveryUnknown("score response was truncated")
+        assert path == "/multiturn/close"
+        return {}
+
+    def score_failure_handler(error):
+        events.append(("score-exit", threading.get_ident(), error))
+
+    loop = _build_multiturn_failure_loop(
+        post_json=post_json,
+        score_failure_handler=score_failure_handler,
+        process_exit=lambda code: events.append(("exit", code)),
+        mark_prompt_failed=fake_mark,
+    )
+
+    async def no_turns(_sampling_params, _outputs, **_kwargs):
+        return None
+
+    loop._run_turns = no_turns
+
+    async def exercise():
+        loop.loop = asyncio.get_running_loop()
+        with pytest.raises(AssertionError, match="process exit returned unexpectedly"):
+            await loop.run(
+                {},
+                uid="prompt-9",
+                global_steps=11,
+                index=0,
+                raw_prompt=[{"role": "user", "content": "question"}],
+            )
+
+    asyncio.run(exercise())
+
+    assert events[0][0] == "score-post"
+    assert events[0][1] != main_thread
+    assert events[1] == (
+        "marker",
+        main_thread,
+        {
+            "uid": "prompt-9",
+            "global_steps": 11,
+            "index": 0,
+            "raw_prompt": [{"role": "user", "content": "question"}],
+        },
+    )
+    assert events[2][0] == "score-exit"
+    assert events[2][1] == main_thread
+    assert [event[0] for event in events].count("marker") == 1
 
 
 def test_replay_buffer_refuses_to_train_on_a_batch_a_failed_rollout_shrank():
@@ -5983,24 +6160,6 @@ def test_replay_buffer_refuses_to_train_on_a_batch_a_failed_rollout_shrank():
     an invisible partial-batch train.
     """
     from flash.engine.worker.train.opd.child.multiturn import build_flash_replay_buffer
-
-    class _StubReplayBuffer:
-        def __init__(self):
-            self.partitions = {"train": {}}
-            self.lock = threading.Lock()
-
-        def close(self):
-            pass
-
-        def sample(self, partition_id, global_steps=None, batch_size=None):
-            return SimpleNamespace(
-                keys=[
-                    key
-                    for key, tag in self.partitions[partition_id].items()
-                    if tag["status"] == "success"
-                ],
-                partition_id=partition_id,
-            )
 
     buffer = build_flash_replay_buffer(_StubReplayBuffer)()
     buffer.partitions["train"] = {

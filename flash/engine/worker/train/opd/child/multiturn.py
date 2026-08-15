@@ -46,6 +46,16 @@ __all__ = [
 ]
 
 
+class _DeferredScoreFailure(Exception):
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.error = error
+
+
+def _defer_score_failure(error) -> None:
+    raise _DeferredScoreFailure(error)
+
+
 def _post_multiturn_score(
     post_json,
     score_failure_handler,
@@ -185,6 +195,7 @@ async def _opd_run(
     permanent_teacher_exit: int,
     transient_teacher_exit: int,
     exit_process,
+    failure_marker,
     **kwargs,
 ):
     raw_prompt = validate_transcript_messages(
@@ -201,6 +212,7 @@ async def _opd_run(
     outputs = []
     start_attempted = False
     failure_exit_code = None
+    score_failure = None
     try:
         start_attempted = True
         start = await run_executor_call(
@@ -236,13 +248,19 @@ async def _opd_run(
             self.loop,
             lambda: _post_multiturn_score(
                 post_json,
-                score_failure_handler,
+                _defer_score_failure,
                 bridge_url,
                 bridge_token,
                 session_id,
             ),
         )
         _attach_teacher_rows(outputs, score_payload)
+    except _DeferredScoreFailure as deferred:
+        # score delivery failures normally call `os._exit` on the executor thread. defer only that
+        # exit to this async boundary so the transfer-queue marker can complete first; the original
+        # handler still owns fallback publication and the authoritative transient exit code.
+        score_failure = deferred.error
+        failure_exit_code = transient_teacher_exit
     except Exception as error:
         failure_exit_code = (
             transient_teacher_exit
@@ -250,6 +268,12 @@ async def _opd_run(
             else permanent_teacher_exit
         )
     finally:
+        if failure_exit_code is not None:
+            # mark before the close below, not after it. the bridge this rollout is about to give
+            # up on is the same one the close posts to, so `_post_json`'s 600s transport timeout is
+            # the MODAL case on this path rather than a tail: waiting for cleanup to drain would
+            # hold the trainer in its poll for ten more minutes with the diagnosis already known.
+            await failure_marker.mark()
         if start_attempted:
             with contextlib.suppress(Exception):
                 await run_executor_call(
@@ -262,6 +286,8 @@ async def _opd_run(
                     ),
                 )
     if failure_exit_code is not None:
+        if score_failure is not None:
+            score_failure_handler(score_failure)
         exit_process(failure_exit_code)
         raise AssertionError("multi-turn OPD process exit returned unexpectedly")
     return outputs
@@ -392,6 +418,11 @@ async def _mark_prompt_failed(kwargs: dict[str, Any]) -> None:
     `_run_prompt` catches. A hard exit reaches neither, and the trainer's `ReplayBuffer.sample`
     waits on "running" forever. Writing the tag here restores the failure edge the exit destroys.
 
+    The trainer-local replay-buffer mirror merges transfer-queue tags but creates an empty key when
+    a uid is first observed there. Its upstream `sample` then hard-subscripts `tag["global_steps"]`,
+    so the failure write must carry the same step metadata as verl's success write rather than rely
+    on a prior "running" observation to have populated it.
+
     The key is the prompt `uid`, which verl forwards into the loop's kwargs alongside the prompt
     itself. The partition is always "train": verl decides it from `trajectory["validate"]`, which
     `_run_agent_loop` consumes without forwarding, and flash's OPD overrides pin
@@ -412,10 +443,27 @@ async def _mark_prompt_failed(kwargs: dict[str, Any]) -> None:
         await tq.async_kv_put(
             key=kwargs["uid"],
             partition_id="train",
-            tag={"status": "failure"},
+            tag={"global_steps": int(kwargs["global_steps"]), "status": "failure"},
         )
-    except Exception:  # pragma: no cover - defensive, the exit code is the real diagnosis
+    except BaseException:  # pragma: no cover - the exit code must remain the diagnosis
         pass
+
+
+class _PromptFailureMarker:
+    """Write the rollout's marker at most once across all multi-turn exit paths."""
+
+    def __init__(self, kwargs, mark_prompt_failed):
+        self._kwargs = kwargs
+        self._mark_prompt_failed = mark_prompt_failed
+        self._marked = False
+
+    async def mark(self) -> None:
+        if self._marked:
+            return
+        self._marked = True
+        with contextlib.suppress(BaseException):
+            # every caller is immediately preserving a meaningful 86/87 hard exit
+            await self._mark_prompt_failed(self._kwargs)
 
 
 def build_flash_replay_buffer(ReplayBuffer):
@@ -477,8 +525,13 @@ def build_flash_multi_turn_agent_loop(
 
     class FlashMultiTurnAgentLoop(agent_loop_base):
         async def run(self, sampling_params: dict[str, Any], **kwargs):
+            failure_marker = _PromptFailureMarker(kwargs, mark_failed)
             try:
-                return await self._run(sampling_params, **kwargs)
+                return await self._run(
+                    sampling_params,
+                    failure_marker=failure_marker,
+                    **kwargs,
+                )
             except Exception as error:
                 exit_code = (
                     transient_teacher_exit
@@ -492,11 +545,11 @@ def build_flash_multi_turn_agent_loop(
                 # into "failure", and `os._exit` skips it, so `ReplayBuffer.sample` -- an unbounded
                 # `while True` with no deadline or actor-health check -- polls a marker nobody will
                 # ever clear. mark the prompt BEFORE exiting so the trainer wakes and fails.
-                await mark_failed(kwargs)
+                await failure_marker.mark()
                 exit_process(exit_code)
                 raise AssertionError("multi-turn OPD process exit returned unexpectedly") from error
 
-        async def _run(self, sampling_params: dict[str, Any], **kwargs):
+        async def _run(self, sampling_params: dict[str, Any], *, failure_marker, **kwargs):
             return await _opd_run(
                 self,
                 sampling_params,
@@ -505,6 +558,7 @@ def build_flash_multi_turn_agent_loop(
                 permanent_teacher_exit=permanent_teacher_exit,
                 transient_teacher_exit=transient_teacher_exit,
                 exit_process=exit_process,
+                failure_marker=failure_marker,
                 **kwargs,
             )
 
