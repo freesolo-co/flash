@@ -1238,7 +1238,7 @@ def test_export_refuses_adapter_whose_tensors_contradict_its_declared_rank(tmp_p
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 8))
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32, "lora_alpha": 64}))
 
-    with pytest.raises(ValueError, match=r"declares r=32.*not a multiple of it"):
+    with pytest.raises(ValueError, match=r"declares r=32.*a multiple of none of them"):
         export._normalize_export_adapter_keys(tmp_path)
 
 
@@ -1269,7 +1269,7 @@ def test_export_rank_mismatch_reaches_the_caller_as_itself(tmp_path):
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}))
 
-    with pytest.raises(ValueError, match="not a multiple of it") as excinfo:
+    with pytest.raises(ValueError, match="a multiple of none of them") as excinfo:
         export._normalize_export_adapter_keys(tmp_path)
     assert "could not normalize exported adapter keys" not in str(excinfo.value)
 
@@ -1301,7 +1301,7 @@ def test_export_refuses_rank_mismatch_before_touching_the_destination_repo(monke
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
     from flash.serve.export import export_adapter
 
-    with pytest.raises(ValueError, match="not a multiple of it"):
+    with pytest.raises(ValueError, match="a multiple of none of them"):
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="sft/run-x/adapter",
@@ -1325,14 +1325,33 @@ def test_export_accepts_an_adapter_whose_tensors_match_its_declared_rank(tmp_pat
 
 
 def test_export_reads_rank_pattern_overrides_rather_than_refusing_them(tmp_path):
-    """PEFT records per-module ranks in `rank_pattern`, and `rank_from_adapter_config` returns the
-    max across both places. A module legitimately trained at the higher rank must still export."""
+    """PEFT records per-module ranks in `rank_pattern`. A module legitimately trained at the
+    overridden rank must still export."""
     from flash.serve import export
 
     header = _lora_pair_header(80, 80, prefix="base_model.model.model.layers.0.mlp.up_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
     (tmp_path / "adapter_config.json").write_text(
         json.dumps({"r": 12, "rank_pattern": {"layers.0.mlp.up_proj": 80}})
+    )
+
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+
+def test_export_accepts_modules_the_rank_pattern_did_not_override(tmp_path):
+    """A `rank_pattern` adapter carries BOTH ranks: the overridden module at 64 and every other
+    module at the `r: 32` default. Checking against one summary number (the max, which is what
+    serving-capacity questions want) refuses every module that number did not come from -- so the
+    tensors are checked against the SET of declared ranks."""
+    from flash.serve import export
+
+    header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
+    header.update(
+        _lora_pair_header(64, 64, prefix="base_model.model.model.layers.0.mlp.up_proj", offset=4)
+    )
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 8))
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps({"r": 32, "rank_pattern": {"layers.0.mlp.up_proj": 64}})
     )
 
     assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
@@ -1411,7 +1430,7 @@ def test_export_checks_ranks_across_every_shard_not_just_the_first(tmp_path):
     )
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32}))
 
-    with pytest.raises(ValueError, match="not a multiple of it"):
+    with pytest.raises(ValueError, match="a multiple of none of them"):
         export._normalize_export_adapter_keys(tmp_path)
 
 

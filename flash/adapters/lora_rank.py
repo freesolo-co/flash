@@ -283,8 +283,33 @@ _LORA_A_INFIX = ".lora_A."
 _LORA_B_INFIX = ".lora_B."
 
 
-def lora_tensor_rank_disagrees(key: str, shape: Any, declared: int) -> bool:
-    """True only when a weight's own shape provably contradicts the declared LoRA rank.
+def declared_lora_ranks(config: Mapping[str, Any]) -> set[int]:
+    """Every rank ``adapter_config.json`` declares: the ``r`` default plus any ``rank_pattern``.
+
+    A set rather than the maximum, unlike :func:`rank_from_adapter_config`. That function answers
+    "how large a LoRA slot must serving be able to hold", where the largest is the only number that
+    matters. The question here is the opposite one -- "is this tensor's rank one this config
+    accounts for" -- and against the maximum alone every module a ``rank_pattern`` did NOT override
+    reads as a contradiction, which would refuse a correct adapter.
+
+    Empty when nothing readable is declared, which leaves the caller with no basis to refuse.
+    """
+    if not isinstance(config, Mapping):
+        return set()
+    ranks: set[int] = set()
+    for field in ("r", "rank_pattern"):
+        value = config.get(field)
+        candidates = value.values() if isinstance(value, Mapping) else [value]
+        for candidate in candidates:
+            try:
+                ranks.add(_positive_int(candidate, source="adapter_config.json", field=field))
+            except ValueError:
+                continue
+    return ranks
+
+
+def lora_tensor_rank_disagrees(key: str, shape: Any, declared: set[int]) -> bool:
+    """True only when a weight's own shape provably contradicts every rank the config declares.
 
     PEFT writes ``lora_A`` as ``[r, in_features]`` and ``lora_B`` as ``[out_features, r]``, so the
     rank is legible from the tensor itself rather than taken on the config's word. That second
@@ -292,19 +317,21 @@ def lora_tensor_rank_disagrees(key: str, shape: Any, declared: int) -> bool:
     different code paths and can disagree, and the config is the half a serving engine sizes its
     LoRA slots from.
 
-    The rank axis is accepted as any positive multiple of ``declared``, not just equality, because
-    a fused MoE parameter targeted via ``target_parameters`` legitimately stacks every expert on
-    that axis: ``lora.ParamWrapper.update_layer`` builds ``nn.Linear(in_features, r *
-    num_experts)``, so an ``r=32`` adapter over 256 experts really does carry a 8192-long axis.
-    Demanding equality would refuse those adapters, which load correctly. A rank axis that is not a
-    multiple of the declared rank cannot be that layout under any expert count, and is the
-    disagreement worth refusing.
+    A rank axis is accepted when it is a positive multiple of ANY declared rank. Both halves of
+    that are load-bearing:
+
+    - *any*, because ``rank_pattern`` gives different modules different ranks, and checking against
+      one summary number refuses every module that number did not come from.
+    - *multiple*, because a fused MoE parameter targeted via ``target_parameters`` stacks its
+      experts on that axis -- ``lora.ParamWrapper.update_layer`` builds ``nn.Linear(in_features,
+      r * num_experts)``, so an ``r=32`` adapter over 256 experts really does carry an 8192-long
+      axis, and demanding equality would refuse adapters that load correctly.
 
     False for everything whose shape cannot answer the question at all -- ``modules_to_save``
     copies, biases, ``lora_embedding_A``/``_B`` (which the infixes deliberately do not match), and
     3-D stacked layouts. Guessing at those would refuse adapters that are fine.
     """
-    if not isinstance(declared, int) or isinstance(declared, bool) or declared <= 0:
+    if not declared:
         return False
     is_a = _LORA_A_INFIX in key
     is_b = _LORA_B_INFIX in key
@@ -315,7 +342,8 @@ def lora_tensor_rank_disagrees(key: str, shape: Any, declared: int) -> bool:
     dims = [d for d in shape if isinstance(d, int) and not isinstance(d, bool) and d > 0]
     if len(dims) != 2:
         return False
-    return (dims[0] if is_a else dims[1]) % declared != 0
+    axis = dims[0] if is_a else dims[1]
+    return all(axis % rank != 0 for rank in declared)
 
 
 def alpha_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
