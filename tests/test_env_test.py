@@ -2312,8 +2312,11 @@ def test_env_test_warns_when_every_episode_scores_zero_under_sft(monkeypatch, tm
 
     This is the shape that reaches paid GPUs: one published environment serves all three
     algorithms, and an `output` shape that only the SFT rows satisfy leaves every GRPO/OPD rollout
-    scoring 0.0. Constant reward means zero advantage, so training completes, the loss curve looks
-    unremarkable, W&B looks healthy, and the adapter is identical to its warm start.
+    scoring 0.0. The warning's job here is to stop this run being read as clearance to train GRPO
+    later - NOT to claim the sft run itself is broken. SFT never reads `env.reward`, so an all-zero
+    scorer costs this run nothing, and a placeholder `reward()` on an sft-only environment is a
+    deliberate and correct choice. Telling that author to debug their scorer is a false alarm on
+    working code, so the wording is asserted, not just the fact that something was printed.
     """
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(
@@ -2325,7 +2328,17 @@ def test_env_test_warns_when_every_episode_scores_zero_under_sft(monkeypatch, tm
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
     assert "all 2 scored episode(s) returned reward 0.000000" in captured.err
-    assert "measured nothing" in captured.err
+    assert "sft does not train from `env.reward`" in captured.err
+    assert "no evidence the reward function works" in captured.err
+    # the grpo-only consequence must not be asserted about an sft run, and the uniformly-zero line
+    # must not send the reader to fix a scorer this algorithm never calls. scoped to that line: the
+    # per-episode low-reward warning legitimately says "check the reward function", because a gold
+    # answer scoring zero is worth looking at whatever the algorithm.
+    zero_line = next(
+        line for line in captured.err.splitlines() if "scored episode(s) returned reward" in line
+    )
+    assert "zero advantage" not in zero_line
+    assert "check the reward function" not in zero_line
 
 
 def test_env_test_does_not_call_a_reasoning_markup_run_unmeasured(monkeypatch, tmp_path, capsys):
@@ -2552,6 +2565,60 @@ def test_env_test_blames_the_environment_only_when_gold_covered_every_turn(
     assert "replay gold answer never finished: it used all 12 turn(s)" in captured.err
     assert "means no rollout can either" in captured.err
     assert "covers only part of a trajectory" not in captured.err
+
+
+class _FixedLengthEnv(_MultiTurnEnv):
+    """A HEALTHY env that ends only by exhausting its budget and never sets `state["done"]`.
+
+    A supported shape, not a defect: the real `rollout_done` (flash/envs/adapter.py) returns True at
+    `turn >= cap` regardless of `done`, so a fixed-length game trains fine. From this command it is
+    indistinguishable from an environment no rollout can finish -- both replay every turn and both
+    leave `done` unset -- so the warning may report it but must not tell its author their
+    termination condition is broken.
+    """
+
+    max_turns = 3
+
+    def dataset(self):
+        return [
+            {
+                "input": "three rounds",
+                "output": [{"role": "assistant", "content": f"r{n}"} for n in range(1, 4)],
+            }
+        ]
+
+    def env_reply(self, messages, state):
+        state["turn"] += 1
+        reply = {"role": "user", "content": "next"}
+        messages.append(reply)
+        return [reply]
+
+    def reward(self, completion, example, state=None):
+        self.scored_state = state
+        return 1.0
+
+
+def test_env_test_does_not_blame_a_fixed_length_env_for_using_its_whole_budget(
+    monkeypatch, tmp_path, capsys
+):
+    """A fixed-length episode must not be told its termination condition is broken.
+
+    The warning still fires -- the shape genuinely cannot be distinguished from a dead environment
+    here -- but the verdict has to stay open, and the reward that separates them in practice has to
+    be on the line. Asserting the absence of the unconditional claim is the point: this env scores
+    1.0 and is correct, so sending its author to audit `step_episode` is a false alarm on working
+    code, which is what teaches people to ignore the warning on the broken case.
+    """
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _FixedLengthEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=replay turns=3" in captured.out
+    assert "replay gold answer never finished: it used all 3 turn(s)" in captured.err
+    # the alternative is named, and the reward that distinguishes the two is quoted.
+    assert "fixed-length episode that ends by using its whole budget" in captured.err
+    assert "reward=1.000000" in captured.err
 
 
 class _RealRolloutDoneDeadEnv(_DeadEnvWithShortGoldEnv):

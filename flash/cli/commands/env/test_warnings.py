@@ -112,10 +112,21 @@ def _warn_on_unfinished_replay(record: dict) -> None:
             "whether the dataset row is complete first, then the episode termination condition"
         )
         return
+    # even here the environment is not the only explanation. `rollout_done` (flash/envs/adapter.py)
+    # returns True at `turn >= cap` REGARDLESS of `state["done"]`, so a fixed-length environment
+    # that ends purely by exhausting its budget and never sets `done` is a supported shape that
+    # trains fine -- and from here it is indistinguishable from one no rollout can finish, since
+    # both replay every turn and both leave `done` unset. what separates them is whether the
+    # environment considers the outcome a success, which the reward reports: the dead board that
+    # motivated this warning paid partial credit (0.60-0.65), while a fixed-length game pays its
+    # normal score. that is a difference of degree, not of kind, so it cannot carry a verdict --
+    # the reward is quoted and the reader decides.
     _emit(
-        f"{opening}. a reference answer that cannot complete an episode means no rollout can "
-        "either; check the episode termination condition and whether each turn is applied exactly "
-        "once"
+        f"{opening} (reward={record['reward']:.6f}). if the episode is meant to end on a win "
+        "condition, check the termination condition and whether each turn is applied exactly once "
+        "-- a reference that cannot complete an episode means no rollout can either. if it is a "
+        "fixed-length episode that ends by using its whole budget, this is expected and the score "
+        "above is the thing to trust"
     )
 
 
@@ -332,16 +343,27 @@ def _warn_on_uniformly_zero_rewards(
         # would pay. saying the adapter is guaranteed to come out unchanged would overstate the
         # evidence, and an operator who trains anyway and sees a normal-looking run learns to
         # distrust the warning.
-        detail = (
-            "if sampled rollouts score alike, GRPO centres the group to a zero advantage and a "
-            "zero gradient: the run completes, reports an unremarkable loss curve, and produces "
-            "an adapter identical to its warm start"
-            if algorithm == _REWARD_DRIVEN_ALGORITHM
-            else "a reward that is constant across every row measures nothing about the environment"
-        )
-        message = (
-            f"all {count} scored episode(s) returned reward 0.000000, so this run measured "
-            f"nothing. {detail}. check the reward function, its runtime dependencies, and that "
-            "the gold answer it scored is in the shape it expects"
-        )
+        if algorithm == _REWARD_DRIVEN_ALGORITHM:
+            message = (
+                f"all {count} scored episode(s) returned reward 0.000000, so this run measured "
+                "nothing. if sampled rollouts score alike, GRPO centres the group to a zero "
+                "advantage and a zero gradient: the run completes, reports an unremarkable loss "
+                "curve, and produces an adapter identical to its warm start. check the reward "
+                "function, its runtime dependencies, and that the gold answer it scored is in the "
+                "shape it expects"
+            )
+        else:
+            # sft and opd never read `env.reward` (`_REWARD_DRIVEN_ALGORITHM`), so an all-zero
+            # scorer is not a defect for THIS run and "check the reward function" is the wrong
+            # instruction: a placeholder `reward()` on an sft-only environment is a deliberate,
+            # correct choice, and telling its author to debug it sends them to fix working code.
+            # what is still worth saying is that the run carries no evidence about the grader, so
+            # nobody should read this PASS as clearance to train grpo on the same environment.
+            message = (
+                f"all {count} scored episode(s) returned reward 0.000000. {algorithm} does not "
+                "train from `env.reward`, so this does not affect this run -- a placeholder scorer "
+                "is a legitimate choice for an environment used only this way. it does mean the "
+                "run is no evidence the reward function works: before training grpo on this "
+                "environment, exercise the grader with `--algorithm grpo`"
+            )
     _emit(message)
