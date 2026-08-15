@@ -417,7 +417,7 @@ def test_heartbeat_console_summarizes_metric_backlog():
     assert "metrics_last" not in console
     assert "sampled_completions" not in console
     assert console["metrics_last_count"] == 1024
-    assert console["sampled_completions_count"] == 128
+    assert console["samples_count"] == 128
     assert console["step"] == 1024
 
 

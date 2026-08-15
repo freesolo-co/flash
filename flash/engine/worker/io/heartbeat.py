@@ -151,7 +151,7 @@ def _console_heartbeat_snapshot(
         console_payload["metrics_last_count"] = len(metrics_last)
     samples = console_payload.pop("sampled_completions", None)
     if isinstance(samples, list):
-        console_payload["sampled_completions_count"] = len(samples)
+        console_payload["samples_count"] = len(samples)
     if not payload_committed:
         with _HB_LOCK:
             claim_uncommitted = provisional_claim > _HB_COMMITTED_CLAIM_SEQ
