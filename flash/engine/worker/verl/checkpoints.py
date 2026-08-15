@@ -72,9 +72,8 @@ def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
     need = _model_shard_bytes(ckpt_actor_dir)
     if need <= 0:
         return
-    try:
-        free = shutil.disk_usage(os.path.dirname(merge_out.rstrip("/")) or ".").free
-    except OSError:
+    free = _free_bytes(merge_out)
+    if free is None:
         # an unreadable mount is not evidence of exhaustion; let the merger run and report for real.
         return
     if free >= need:
