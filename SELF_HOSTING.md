@@ -51,10 +51,11 @@ the plane itself never terminates TLS. On the same machine, skip the proxy and u
 Then point a client at it:
 
 ```bash
+export FREESOLO_API_KEY="$FREESOLO_INTERNAL_KEY"
 # remote: the https address of your TLS proxy, not the plane's own :8080
-flash login --api-url https://your-plane.example --api-key "$FREESOLO_INTERNAL_KEY"
+flash login --api-url https://your-plane.example
 # same machine: loopback plaintext is fine
-# flash login --api-url http://127.0.0.1:8080 --api-key "$FREESOLO_INTERNAL_KEY"
+# flash login --api-url http://127.0.0.1:8080
 flash train run.toml
 ```
 
@@ -400,8 +401,8 @@ small run and watch it allocate.
 is not set, so the plane is trying to reach a Freesolo backend. Set it to `1`.
 
 **`401` on every request.** In standalone mode only `FREESOLO_INTERNAL_KEY` is accepted.
-Confirm the client is sending that exact value (`flash login --api-key ...`), with no
-trailing newline.
+Confirm `FREESOLO_API_KEY` contains that exact value, with no trailing newline, then run
+`flash login` again.
 
 **Startup says no GPU provider is configured** but you set a key. The value must be
 non-empty and non-whitespace. For RunPod specifically, a value of `","` parses to zero
