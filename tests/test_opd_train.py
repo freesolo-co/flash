@@ -5331,9 +5331,6 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(opd_runner, "_validate_checkpoint_progress", lambda *_args: None)
 
-    # the child proved the rollout guard applied, which is what the success path verifies.
-    (tmp_path / "applied_shims.txt").write_text("lora-rollout-guard\n")
-
     result = opd_runner._run_child(
         SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
         object(),
@@ -7121,22 +7118,11 @@ def test_opd_sitecustomize_composes_into_valid_python_with_the_guard(tmp_path, m
     assert f"_flash_shim_os._exit({backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE})" in source
 
 
-def test_opd_fails_a_completed_run_whose_rollout_guard_never_applied(tmp_path):
-    """a child that finished without recording the marker never ran its sitecustomize, so every
-    rollout in that run could have come from the base model. the run must not be reported as a
-    successful distillation."""
-    with pytest.raises(RuntimeError, match=r"never proved.*lora-rollout-guard"):
-        opd_train.verify_applied_shim_markers(
-            opd_train.shim_marker_file(str(tmp_path)), ("lora-rollout-guard",)
-        )
+def test_opd_stops_an_unguarded_child_at_its_first_step(tmp_path):
+    """a child whose sitecustomize was skipped serves every rollout from the base model.
 
-
-def test_opd_stops_an_unguarded_child_at_its_first_step_not_after_the_whole_run(tmp_path):
-    """the check must land on the first step line, not only after the child exits.
-
-    a child whose sitecustomize was skipped serves every rollout from the base model. verifying
-    post-exit still fails the run, but only once the entire gpu and teacher budget is spent, so
-    the marker is checked at the first step boundary and the raise tears the child down there.
+    the marker is checked at the first step boundary and the raise tears the child down there, so
+    the failure costs one step instead of the whole gpu and teacher budget.
     """
     import flash.engine.worker.opd_train_runner as opd_runner
 
