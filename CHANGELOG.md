@@ -103,7 +103,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     mismatch is reported independently of whether the episode finished, because the two are not the
     same question: an environment that sets `done` while applying the capped prefix ends the episode
     tidily, so the not-done signal never fires, and the dropped gold turns went unmentioned on an
-    otherwise clean `overall: PASS`. Otherwise
+    otherwise clean `overall: PASS`. The count it reports is the turns actually replayed, not the
+    cap - an environment that terminates before reaching the cap sends fewer, and quoting the cap
+    claimed a turn had been replayed that never was, contradicting the episode line just below it.
+    Otherwise
     the wording stops short of a verdict, because `rollout_done`
     returns True at `turn >= cap` regardless of `state["done"]`, so a fixed-length episode that ends
     purely by using its whole budget is a supported shape that never sets `done` and is
