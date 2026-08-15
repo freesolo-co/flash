@@ -59,6 +59,7 @@ from flash.env_formats import (
     _after_skippable_frames,
     _has_zip_end_record,
     _looks_compressed,
+    _looks_like_lzma_alone,
     _looks_like_tar,
     _looks_like_textual,
     _looks_like_zlib,
@@ -380,7 +381,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
             # tar as well as the compressed magics: a tar's own members are literal, but a
             # COMPRESSED member inside one is not, so an oversized tar that went past the buffer
             # cap is as unverifiable as an oversized gzip and must refuse rather than pass.
-            container_head = _looks_compressed(chunk[:6]) or _looks_like_tar(chunk)
+            container_head = _looks_compressed(chunk) or _looks_like_tar(chunk)
         if depth and not overflowed:
             buffered.extend(chunk)
             if len(buffered) > _MAX_NESTED_BUFFER_BYTES:
@@ -636,8 +637,8 @@ def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> 
 
 
 def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
-    """The kind of credential inside a gzip, bzip2, xz or zlib stream, or None."""
-    head = source[:6] if isinstance(source, bytes) else source.open("rb").read(6)
+    """The kind of credential inside a gzip, bzip2, xz, lzma-alone or zlib stream, or None."""
+    head = source[:13] if isinstance(source, bytes) else source.open("rb").read(13)
     opener = {b"BZh": bz2.open, b"\xfd7zXZ\x00": lzma.open}.get(
         next((magic for magic in (b"BZh", b"\xfd7zXZ\x00") if head.startswith(magic)), b""),
         gzip.open,
@@ -720,7 +721,11 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
                 raise _Unscannable("contains a compressed stream too large to inspect")
         else:
             raise _Unscannable("contains more compressed records than this check can inspect")
-    with opener(source if isinstance(source, Path) else io.BytesIO(source), "rb") as stream:
+    stream_source = source if isinstance(source, Path) else io.BytesIO(source)
+    if _looks_like_lzma_alone(head):
+        with lzma.open(stream_source, "rb", format=lzma.FORMAT_ALONE) as stream:
+            return _scan_stream(stream, deadline=deadline, depth=depth)
+    with opener(stream_source, "rb") as stream:
         try:
             return _scan_stream(stream, deadline=deadline, depth=depth)
         except gzip.BadGzipFile:
@@ -784,6 +789,7 @@ def _credential_in_ar(source: Path | bytes, *, deadline: float, depth: int) -> s
         refusal=_Unscannable,
         named=credential_in_name,
         member_limit=_MAX_ARCHIVE_MEMBERS,
+        size_limit=_MAX_NESTED_BUFFER_BYTES,
     )
 
 

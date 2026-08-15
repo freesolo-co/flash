@@ -208,8 +208,10 @@ def credential_in_tar(
     they are in a zip -- one unreadable entry must not abandon the entries behind it.
     """
     handle = source.open("rb") if isinstance(source, Path) else io.BytesIO(source)
+    source_size = len(source) if isinstance(source, bytes) else source.stat().st_size
     saw_header = False
     unreadable = ""
+    remainder_at: int | None = None
     try:
         with tarfile.open(fileobj=handle, mode="r|*") as archive:
             try:
@@ -259,10 +261,35 @@ def credential_in_tar(
                 if not saw_header:
                     raise
                 unreadable = unreadable or "an archive member this check cannot read"
+            else:
+                # the streaming iterator stops at the first zero block and may have read ahead into
+                # its own buffer, so the underlying handle's position is not the archive boundary.
+                # its logical position is the point it actually consumed and must be captured before
+                # closing the stream wrapper below.
+                remainder_at = archive.fileobj.tell()
     finally:
         handle.close()
     if unreadable:
         raise refusal(f"contains {unreadable}")
+    if remainder_at is not None and 0 < remainder_at < source_size:
+        tail = (
+            source[remainder_at:]
+            if isinstance(source, bytes)
+            else _read_at(source, remainder_at, source_size - remainder_at)
+        )
+        # tar writers pad the two zero end blocks to a 10 KiB record. Leaving those blocks in front
+        # made a complete second tar invisible to the next structural walk; stripping only whole
+        # zero blocks preserves a real suffix whose first header byte happens to be zero.
+        while tail.startswith(bytes(512)):
+            tail = tail[512:]
+        # every recursive pass starts strictly later than its parent. This is both the concatenated
+        # tar fix and the recursion guard: a remainder that did not advance is never dispatched.
+        if tail and len(tail) < source_size:
+            try:
+                if kind := scan(io.BytesIO(tail), deadline, depth):
+                    return kind
+            except _UNREADABLE_MEMBER:
+                raise refusal("contains an archive member this check cannot read") from None
     return None
 
 
@@ -284,6 +311,7 @@ def credential_in_ar(
     refusal: type[Exception],
     named: Namer,
     member_limit: int,
+    size_limit: int | None = None,
 ) -> str | None:
     """The kind of credential in any readable member of an ar archive, or None.
 
@@ -305,6 +333,11 @@ def credential_in_ar(
         with source.open("rb") as head:
             if head.read(len(_AR_MAGIC)) != _AR_MAGIC:
                 return None
+        # the ar walk needs random access to member bodies, so it holds the archive once recognised.
+        # a 200 MiB archive previously drove peak rss up by 448 MiB before any nested-buffer bound
+        # applied; oversized containers are undecided rather than clean, as in the pdf walk.
+        if size_limit is not None and source.stat().st_size > size_limit:
+            raise refusal("contains an archive too large to inspect")
         data = source.read_bytes()
     else:
         data = source

@@ -50,6 +50,14 @@ _MAX_ARCHIVE_MEMBERS = 100_000
 # (a tar's magic sits 257 bytes in, and an uncompressed tar has no leading signature at all).
 _COMPRESSED_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00")
 
+# a legacy lzma-alone stream has a 13-byte structural header rather than fixed magic: one properties
+# byte, a little-endian dictionary size, and an uncompressed size. The dictionary encodings below
+# are the canonical sizes emitted by lzma encoders, which keeps the weak signature from probing
+# ordinary binaries while still covering custom lc/lp/pb combinations.
+_LZMA_ALONE_HEADER_BYTES = 13
+_LZMA_ALONE_MIN_DICTIONARY = 1 << 12
+_LZMA_ALONE_MAX_DICTIONARY = 3 << 29
+
 # Containers this scan can RECOGNISE but not expand, because the stdlib has no decompressor for
 # them. A `.jsonl.zst` -- the ordinary way a dataset shard ships -- holds its credential nowhere a
 # pattern can see, exactly like a gzip, so treating it as final content was a silent bypass.
@@ -201,9 +209,31 @@ def _after_skippable_frames(head: bytes) -> tuple[bytes, bool]:
     return b"", True
 
 
+def _looks_like_lzma_alone(head: bytes) -> bool:
+    """Whether `head` has the conservative structural header of an lzma-alone stream."""
+    if len(head) < _LZMA_ALONE_HEADER_BYTES:
+        return False
+    properties = head[0]
+    if properties >= 9 * 5 * 5:
+        return False
+    lc = properties % 9
+    lp = (properties // 9) % 5
+    if lc + lp > 4:
+        return False
+    dictionary = int.from_bytes(head[1:5], "little")
+    if not _LZMA_ALONE_MIN_DICTIONARY <= dictionary <= _LZMA_ALONE_MAX_DICTIONARY:
+        return False
+    unit = dictionary // 3 if dictionary % 3 == 0 else dictionary
+    return unit & (unit - 1) == 0
+
+
 def _looks_compressed(head: bytes) -> bool:
     """Whether `head` begins a compressed container this scan can expand."""
-    return head.startswith(_COMPRESSED_MAGIC) or _looks_like_zlib(head)
+    return (
+        head.startswith(_COMPRESSED_MAGIC)
+        or _looks_like_zlib(head)
+        or (_looks_like_lzma_alone(head) and _decompresses(head[:_OVERLAY_PROBE_BYTES]))
+    )
 
 
 def _jks_private_key_entries(store: bytes) -> bool | None:
@@ -232,7 +262,8 @@ def _jks_private_key_entries(store: bytes) -> bool | None:
     """
     if len(store) < 16 or store[:4] not in _KEYSTORE_MAGIC:
         return False
-    if int.from_bytes(store[4:8], "big") not in (1, 2):
+    version = int.from_bytes(store[4:8], "big")
+    if version not in (1, 2):
         return False
     count, at, truncated = int.from_bytes(store[8:12], "big"), 12, False
 
@@ -285,8 +316,14 @@ def _jks_private_key_entries(store: bytes) -> bool | None:
             # not an entry tag this format defines: the walk is off the rails, so this is not the
             # structure it claimed and the other checks get their turn
             return unwalked()
-        # the alias, then an 8-byte creation timestamp, then the certificate's type and its DER
-        if not skip(read(2)) or not skip(8) or not skip(read(2)) or not skip(read(4)):
+        # the alias and timestamp exist in both versions, but only version 2 carries a certificate
+        # type string. Reading one from a version-1 truststore consumed the DER length as text length
+        # and refused a certificate-only store that the equivalent version-2 walk settled as clean.
+        if not skip(read(2)) or not skip(8):
+            return unwalked()
+        if version == 2 and not skip(read(2)):
+            return unwalked()
+        if not skip(read(4)):
             return unwalked()
     return False
 
@@ -306,11 +343,11 @@ def _decompresses(probe: bytes) -> bool:
     chance do not survive 64 KiB of block decoding. Measured 0 acceptances across 2,000 random
     bodies behind a real `BZh` magic.
 
-    gzip and xz are deliberately NOT given the same treatment. Both emit output within the first
-    few bytes of any stream -- measured 4,096 bytes from the probe on gzip and xz payloads up to
-    2 MB, random or not -- so "no output yet" really is a rejection for them, and accepting
-    `needs_input` instead measured 97 false acceptances in 2,000 random gzip-magic bodies. That is
-    a bound-exhausting cost on any large binary, and this search has to stay cheap on model shards.
+    gzip, xz and lzma-alone are deliberately NOT given the same treatment. They emit output within
+    the probe, so "no output yet" really is a rejection for them. Accepting `needs_input` instead
+    measured 97 false acceptances in 2,000 random gzip-magic bodies. For lzma-alone, requiring output
+    after a valid 0x5d/8 MiB/unknown-size header measured 0 acceptances across 2,000 random 64 KiB
+    bodies. That proof matters because its header is structural rather than fixed magic.
     """
     try:
         if probe.startswith(b"\x1f\x8b\x08"):
@@ -334,6 +371,8 @@ def _decompresses(probe: bytes) -> bool:
             return bool(decompressor.decompress(probe, 4096)) or decompressor.needs_input
         if probe.startswith(b"\xfd7zXZ\x00"):
             return bool(lzma.LZMADecompressor().decompress(probe, 4096))
+        if _looks_like_lzma_alone(probe):
+            return bool(lzma.LZMADecompressor(format=lzma.FORMAT_ALONE).decompress(probe, 4096))
     except (OSError, EOFError, ValueError, zlib.error, lzma.LZMAError):
         return False
     return False

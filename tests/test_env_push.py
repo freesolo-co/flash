@@ -8524,3 +8524,152 @@ def test_an_indirect_pdf_decode_parameter_is_refused(tmp_path):
     )
     with pytest.raises(_Unscannable, match="filter this cannot undo"):
         credential_in_file(indirect)
+
+
+def test_a_tar_appended_to_another_tar_is_still_walked(tmp_path):
+    """The streaming reader stops at the zero blocks that end the first archive.
+
+    `cat a.tar b.tar` is a valid archive to `tar -x`, but the iterator returns at the first end
+    marker and every member of the second archive went unvisited -- a key compressed inside one
+    published intact while that same archive standing alone reported it.
+    """
+    import tarfile
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    def _one(name: str, body: bytes) -> bytes:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(body))
+        return buffer.getvalue()
+
+    harmless = _one("readme.txt", b"nothing sensitive here at all\n")
+    secret = _one("payload.z", zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode()))
+
+    control = tmp_path / "second.tar"
+    control.write_bytes(secret)
+    assert credential_in_file(control) == "a Freesolo API key"  # the control the pair must match
+
+    first = tmp_path / "first.tar"
+    first.write_bytes(harmless)
+    assert credential_in_file(first) is None  # an ordinary single tar is unaffected
+
+    joined = tmp_path / "joined.tar"
+    joined.write_bytes(harmless + secret)
+    assert credential_in_file(joined) == "a Freesolo API key"
+
+
+def test_an_ar_larger_than_the_buffer_is_refused_not_read(tmp_path):
+    """`read_bytes` on an ar allocated a whole second copy of the archive.
+
+    Every other oversized container is refused rather than held: a 200 MiB ar drove peak RSS from
+    41 MiB to 489 MiB, a 448 MiB spike that walked straight past the 64 MiB nested-buffer
+    discipline. Undecided is not clean, so the honest answer is the refusal the PDF path already
+    gives at the same bound.
+    """
+    from flash.env_archive import credential_in_ar
+    from flash.env_secrets import _MAX_NESTED_BUFFER_BYTES, _Unscannable
+
+    def _named(_name: str) -> str | None:
+        return None
+
+    def _scan(_handle, _deadline, _depth) -> str | None:
+        return None
+
+    body = _MAX_NESTED_BUFFER_BYTES + 1
+    oversized = tmp_path / "big.a"
+    with oversized.open("wb") as handle:
+        handle.write(b"!<arch>\n")
+        handle.write(
+            b"big.bin".ljust(16)
+            + b"0".ljust(12)
+            + b"0".ljust(6)
+            + b"0".ljust(6)
+            + b"100644".ljust(8)
+            + str(body).ljust(10).encode()
+            + b"`\n"
+        )
+        handle.truncate(handle.tell() + body)
+
+    with pytest.raises(_Unscannable, match="too large to inspect"):
+        credential_in_ar(
+            oversized,
+            deadline=1e18,
+            depth=0,
+            scan=_scan,
+            refusal=_Unscannable,
+            named=_named,
+            member_limit=100,
+            size_limit=_MAX_NESTED_BUFFER_BYTES,
+        )
+
+
+def test_a_legacy_lzma_stream_is_expanded_like_an_xz_one(tmp_path):
+    """`.lzma` is the pre-xz container, and `lzma.compress(..., FORMAT_ALONE)` still writes it.
+
+    It carries no magic -- a properties byte, a dictionary size, an uncompressed size -- so it was
+    never recognised and its compressed bytes were scanned as opaque content, while the identical
+    payload in xz form was expanded and reported.
+    """
+    import lzma
+
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    alone = lzma.compress(key, format=lzma.FORMAT_ALONE)
+    assert key not in alone  # compression hides it from the raw pass
+    assert key in lzma.decompress(alone, format=lzma.FORMAT_ALONE)  # but any reader recovers it
+
+    control = tmp_path / "payload.xz"
+    control.write_bytes(lzma.compress(key, format=lzma.FORMAT_XZ))
+    assert credential_in_file(control) == "a Freesolo API key"  # the control the pair must match
+
+    legacy = tmp_path / "payload.lzma"
+    legacy.write_bytes(alone)
+    assert credential_in_file(legacy) == "a Freesolo API key"
+
+
+def test_a_version_one_key_store_of_certificates_is_publishable(tmp_path):
+    """Version 1 omits the per-certificate type string that version 2 writes.
+
+    The version was parsed and then discarded, so the walk skipped a type field that is not there
+    and read the certificate's leading DER bytes as its length -- a truststore holding no private
+    key at all was refused, which blocks an honest publish.
+    """
+    import struct
+
+    from flash.env_secrets import credential_in_file
+
+    der = bytes.fromhex("308201223045") + b"\x00" * 200
+
+    def _store(version: int) -> bytes:
+        out = bytearray(bytes.fromhex("feedfeed") + struct.pack(">I", version))
+        out += struct.pack(">I", 1)
+        out += struct.pack(">I", 2)  # tag 2 = TrustedCertificateEntry
+        out += struct.pack(">H", 4) + b"myca"
+        out += b"\x00" * 8  # creation timestamp
+        if version == 2:
+            out += struct.pack(">H", 5) + b"X.509"  # the field version 1 does not write
+        out += struct.pack(">I", len(der)) + der
+        return bytes(out + b"\x00" * 20)
+
+    control = tmp_path / "v2.jks"
+    control.write_bytes(_store(2))
+    assert credential_in_file(control) is None  # the control the pair must match
+
+    legacy = tmp_path / "v1.jks"
+    legacy.write_bytes(_store(1))
+    assert credential_in_file(legacy) is None
+
+    # a version 1 store that really does hold a private key is still reported
+    keyed = bytearray(bytes.fromhex("feedfeed") + struct.pack(">I", 1) + struct.pack(">I", 1))
+    keyed += struct.pack(">I", 1)  # tag 1 = PrivateKeyEntry
+    keyed += struct.pack(">H", 5) + b"mykey"
+    keyed += b"\x00" * 8
+    keyed += struct.pack(">I", 64) + b"\x11" * 64
+    holding = tmp_path / "v1key.jks"
+    holding.write_bytes(bytes(keyed))
+    assert credential_in_file(holding) == "a key store"

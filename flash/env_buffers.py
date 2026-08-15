@@ -117,7 +117,7 @@ def _looks_like_container(data: bytes) -> bool:
     holding a tar of gzipped shards left the innermost key unreached.
     """
     return (
-        _looks_compressed(data[:6])
+        _looks_compressed(data)
         or _looks_like_tar(data)
         # ar has no nested predicate elsewhere: a top-level archive was walked by its handler, while
         # the same bytes inside a zip were treated as final content and hid a compressed key member.
