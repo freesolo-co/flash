@@ -205,9 +205,9 @@ def _state_argument(score) -> str | None:
     if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
         return "keyword"
     if any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
-        # state is the third call argument, so *args receives it only when no regular option occupies
-        # that position.
-        return "positional" if len(positional) == 2 else None
+        # scorer(case, response, state) reaches *args when the signature has no fixed third slot.
+        # zero, one, or two regular positional parameters can all bind that call.
+        return "positional" if len(positional) <= 2 else None
     return None
 
 

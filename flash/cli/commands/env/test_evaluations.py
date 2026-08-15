@@ -1,12 +1,13 @@
 """Offline contract checks for an environment's evaluation sidecar.
 
 Split from `test.py` to keep that file under the 1000-line gate. Single-turn cases validate prompt
-construction and reference replay. Episode cases initialize rollout state and record one synthetic
-model turn to validate state-aware scoring without stepping or scoring the environment.
+construction and reference replay. Episode cases validate initial rollout and prompt construction,
+then bind the scorer signature without executing it against unfinished state.
 """
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 from flash.cli.commands.env.push import _err
@@ -76,28 +77,33 @@ def _evaluation_response(env, case) -> tuple[str, str]:
     return policy, response
 
 
-def _episode_evaluation_response(env, case) -> tuple[str, dict]:
-    """Build one synthetic model turn to validate a state-aware scorer offline."""
+def _check_episode_evaluation_prompt(env, case) -> None:
+    """Validate the held-out case's initial rollout state and prompt without advancing it."""
     # imported here rather than at module scope: `test.py` imports this module.
-    from flash.cli.commands.env.test import (
-        _ECHO_RESPONSE,
-        _new_multi_turn_replay_state,
-        _new_record,
-    )
+    from flash.cli.commands.env.test import _new_multi_turn_replay_state, _new_record
 
-    example = _evaluation_example(case)
-    record = _new_record()
-    state = _new_multi_turn_replay_state(env, example, record)
-    env.record_model_turn(state, _ECHO_RESPONSE)
-    return _ECHO_RESPONSE, state
+    _new_multi_turn_replay_state(env, _evaluation_example(case), _new_record())
 
 
-def _call_evaluation_scorer(scorer, case, response: str, state: dict, state_style: str | None):
+def _validate_episode_scorer_signature(scorer, case, state_style: str | None) -> None:
+    """Bind the online scorer call shape without executing it against unfinished state."""
+    if not callable(scorer):
+        raise TypeError("evaluation suite score must be callable")
+    try:
+        signature = inspect.signature(scorer)
+    except (TypeError, ValueError):
+        # some builtins and extension callables expose no signature, so keep the permissive runtime
+        # behavior without calling them during an offline check.
+        return
+
+    response = "response"
+    state = {}
     if state_style is None:
-        return scorer(case, response)
-    if state_style == "keyword":
-        return scorer(case, response, state=state)
-    return scorer(case, response, state)
+        signature.bind(case, response)
+    elif state_style == "keyword":
+        signature.bind(case, response, state=state)
+    else:
+        signature.bind(case, response, state)
 
 
 def _check_evaluation_suites(entrypoint: Path, env) -> bool:
@@ -143,16 +149,21 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
                     "and has no episode to play"
                 )
             scorer = getattr(suite, "score", None)
-            state_style = _state_argument(scorer) if episode_suite else None
             if episode_suite:
+                state_style = _state_argument(scorer)
                 _warn_if_episode_state_is_hidden(suite, state_style)
+                for case in cases:
+                    _check_episode_evaluation_prompt(env, case)
+                _validate_episode_scorer_signature(scorer, cases[0], state_style)
+                print(
+                    f"evaluation suite {suite.name}: {len(cases)}/{len(cases)} cases "
+                    "passed contract checks"
+                )
+                continue
+
             for index, case in enumerate(cases, start=1):
-                state: dict = {}
-                if episode_suite:
-                    response, state = _episode_evaluation_response(env, case)
-                else:
-                    _policy, response = _evaluation_response(env, case)
-                scored = _call_evaluation_scorer(scorer, case, response, state, state_style)
+                _policy, response = _evaluation_response(env, case)
+                scored = scorer(case, response)
                 result = normalize_eval_result(
                     case,
                     response,

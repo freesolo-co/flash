@@ -320,7 +320,9 @@ def test_env_test_validates_evaluation_sidecar_offline(monkeypatch, tmp_path, ca
     assert "overall: PASS" in output
 
 
-def test_env_test_validates_episode_suite_with_rollout_state(monkeypatch, tmp_path, capsys):
+def test_env_test_validates_episode_suite_without_executing_its_scorer(
+    monkeypatch, tmp_path, capsys
+):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import EvalCase\n"
@@ -333,8 +335,9 @@ def test_env_test_validates_episode_suite_with_rollout_state(monkeypatch, tmp_pa
         "            {'role': 'assistant', 'content': 'second'},\n"
         "        ])]\n"
         "    def score(self, case, response, state):\n"
-        "        turns = [m['content'] for m in state['messages'] if m['role'] == 'assistant']\n"
-        "        return response == 'test' and turns == ['test']\n"
+        "        if not state.get('done'):\n"
+        "            raise AssertionError('episode scorer requires finished state')\n"
+        "        return True\n"
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
@@ -351,10 +354,39 @@ def test_env_test_validates_episode_suite_with_rollout_state(monkeypatch, tmp_pa
     _patch_loader(monkeypatch, env)
 
     assert cmd_env_test(_args(env_dir)) == 0
-    assert env.starts == 2  # one dataset episode and one held-out scorer state
+    assert env.starts == 2  # one dataset episode and one held-out initial state
+    assert env.scored_state is not None
+    assert env.scored_state["turn"] == 2
     captured = capsys.readouterr()
     assert "evaluation suite episode: 1/1 cases passed contract checks" in captured.out
+    assert "mean_score=" not in captured.out
+    assert "episode scorer requires finished state" not in captured.err
     assert "one generation per turn" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_keeps_uninspectable_episode_scorers_permissive(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Scorer:\n"
+        "    @property\n"
+        "    def __signature__(self): raise ValueError('signature unavailable')\n"
+        "    def __call__(self, *args): raise AssertionError('scorer must not run offline')\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    score = Scorer()\n"
+        "    def cases(self): return [EvalCase(id='episode', input='held out')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _MultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "evaluation suite episode: 1/1 cases passed contract checks" in captured.out
+    assert "signature unavailable" not in captured.err
+    assert "scorer must not run offline" not in captured.err
     assert "overall: PASS" in captured.out
 
 
@@ -374,7 +406,7 @@ def test_env_test_episode_suite_does_not_require_sft_gold(
         "    grades_episodes = True\n"
         f"    def cases(self): return [EvalCase(id='episode', input='held out'{expected_clause})]\n"
         "    def score(self, case, response, state):\n"
-        "        return response == 'test' and bool(state['messages'])\n"
+        "        raise AssertionError('episode scorer must not run offline')\n"
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
@@ -411,7 +443,78 @@ def test_env_test_episode_suite_does_not_require_sft_gold(
     assert "evaluation suite episode: 1/1 cases passed contract checks" in captured.out
     assert "evaluation case requested an sft target" not in captured.err
     assert "evaluation case requested environment reward" not in captured.err
+    assert "episode scorer must not run offline" not in captured.err
     assert "overall: PASS" in captured.out
+
+
+def test_env_test_checks_each_episode_cases_initial_rollout(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self): return [\n"
+        "        EvalCase(id='ok', input='held out ok'),\n"
+        "        EvalCase(id='broken', input='held out broken'),\n"
+        "    ]\n"
+        "    def score(self, case, response, state): return True\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class _HeldOutRolloutEnv(_MultiTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.started_inputs = []
+
+        def new_rollout_state(self, example):
+            self.started_inputs.append(example["input"])
+            if example["input"] == "held out broken":
+                raise KeyError("no initial rollout for held out broken")
+            return super().new_rollout_state(example)
+
+    env = _HeldOutRolloutEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    assert env.started_inputs == ["finish the exchange", "held out ok", "held out broken"]
+    captured = capsys.readouterr()
+    assert "no initial rollout for held out broken" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+@pytest.mark.parametrize(
+    "scorer_source",
+    [
+        "def score(self, case): return True",
+        "def score(self, case, response, *, state, required): return True",
+        "def score(self, case, response, state, required, /): return True",
+    ],
+    ids=[
+        "two-argument-call-does-not-bind",
+        "state-keyword-misses-required",
+        "state-position-misses-required",
+    ],
+)
+def test_env_test_rejects_inspectable_episode_scorers_that_cannot_bind_online_call(
+    monkeypatch, tmp_path, capsys, scorer_source
+):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self): return [EvalCase(id='episode', input='held out')]\n"
+        f"    {scorer_source}\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _MultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "evaluation suite episode failed contract checks" in captured.err
+    assert "overall: FAIL" in captured.err
 
 
 def test_env_test_warns_when_episode_suite_cannot_receive_state(monkeypatch, tmp_path, capsys):

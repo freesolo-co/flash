@@ -3808,6 +3808,8 @@ def test_state_argument_detects_how_the_scorer_takes_state() -> None:
     assert _state_argument(lambda case, response, *, state=None: None) == "keyword"
     assert _state_argument(lambda case, response, **kwargs: None) == "keyword"
     assert _state_argument(lambda case, response, *args, **kwargs: None) == "keyword"
+    assert _state_argument(lambda *args: None) == "positional"
+    assert _state_argument(lambda case, *args: None) == "positional"
     assert _state_argument(lambda case, response, *args: None) == "positional"
     assert _state_argument(lambda case, response, state, /: None) == "positional"
     assert _state_argument(lambda case, response, state, /, **kwargs: None) == "positional"
@@ -3824,7 +3826,9 @@ def test_state_argument_detects_how_the_scorer_takes_state() -> None:
         "def score(self, case, response, state, /, **kwargs): return _graded(case, state)",
         "def score(self, case, response, *, state=None): return _graded(case, state)",
         "def score(self, case, response, **kwargs): return _graded(case, kwargs.get('state'))",
-        "def score(self, case, response, *args): return _graded(case, args[0] if args else None)",
+        "def score(self, *args): return _graded(args[0], args[2])",
+        "def score(self, case, *args): return _graded(case, args[1])",
+        "def score(self, case, response, *args): return _graded(case, args[0])",
     ],
     ids=[
         "state",
@@ -3832,7 +3836,9 @@ def test_state_argument_detects_how_the_scorer_takes_state() -> None:
         "state_positional_only_kwargs",
         "keyword_only",
         "kwargs",
-        "varargs",
+        "varargs_only",
+        "case_then_varargs",
+        "case_response_then_varargs",
     ],
 )
 def test_every_state_accepting_scorer_shape_actually_receives_the_episode(
