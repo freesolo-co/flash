@@ -278,13 +278,18 @@ def _character_class_expansions(pattern: str) -> tuple[str, ...] | None:
     if not any(character in pattern for character in "[]"):
         return None
     names: set[str] = {""}
+    # literal runs are accumulated and appended once per CLASS rather than once per character.
+    # rebuilding every name for each literal made classification quadratic in a caller-controlled
+    # pattern -- `^[Pp]` with an 80,000-character suffix took 0.69s, on the persistence path that
+    # runs after the paid upstream call -- while the expanded set is unchanged.
+    literal: list[str] = []
     index = 0
     while index < len(pattern):
         character = pattern[index]
         if character == "\\" or character == "]":
             return None
         if character != "[":
-            names = {name + character for name in names}
+            literal.append(character)
             index += 1
             continue
         end = pattern.find("]", index + 1)
@@ -293,13 +298,18 @@ def _character_class_expansions(pattern: str) -> tuple[str, ...] | None:
         members = pattern[index + 1 : end]
         if not members or "-" in members or members.startswith("^") or "\\" in members:
             return None
+        prefix = "".join(literal)
+        literal.clear()
         # names are deduplicated case-insensitively as they grow, because the comparison that
         # judges them is case-folded too. spelling one word as `[Pp][Aa][Ss][Ss]...` would
         # otherwise multiply out to hundreds of variants of a single name and blow the cap.
-        names = {_dedupe_name(name + member) for name in names for member in members}
+        names = {_dedupe_name(name + prefix + member) for name in names for member in members}
         if len(names) > _MAX_CLASS_EXPANSIONS:
             return None
         index = end + 1
+    if literal:
+        suffix = "".join(literal)
+        names = {name + suffix for name in names}
     return tuple(names)
 
 

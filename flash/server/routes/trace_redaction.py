@@ -813,6 +813,7 @@ def _sanitize_for_trace(
     secrets: tuple[str, ...],
     *,
     response: bool = False,
+    payload_root: bool = True,
     flag: _SanitizationFlag | None = None,
 ) -> Any:
     if isinstance(value, str):
@@ -828,8 +829,10 @@ def _sanitize_for_trace(
     # `payload_root` opens the REQUEST's schema-host vocabulary (`tools`, `response_format`, ...).
     # a response declares no request schema, so honouring those names in one let an upstream error
     # body that echoes a submitted declaration claim the exemption -- and a nested secret property
-    # then kept its unknown literal, exporting a credential the caller had sent us.
+    # then kept its unknown literal, exporting a credential the caller had sent us. callers that
+    # sanitize a FRAGMENT rather than a whole body pass `payload_root=False` for the same reason:
+    # arbitrary caller data is not a request root just because it is handed here on its own.
     redacted = _redact_secret_fields(
-        value, payload_root=not response, response_root=response, flag=flag
+        value, payload_root=payload_root and not response, response_root=response, flag=flag
     )
     return _redact_secret_values(redacted, secrets, flag=flag)

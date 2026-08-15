@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import re
 import sqlite3
@@ -11047,3 +11048,229 @@ def test_the_identifier_length_bound_still_applies() -> None:
 
     assert bounded is not None
     assert len(bounded) <= platform_traces._MAX_IDENTIFIER_LENGTH
+
+
+def _remove_dot_segments_by_slicing(path: str) -> str:
+    """RFC 3986 5.2.4 written the obvious way, as an oracle for the index-walking version.
+
+    This is the implementation the module used before it was made linear. Keeping it here means the
+    rewrite is checked against behaviour rather than against its own comments.
+    """
+    input_buffer = path
+    output: list[str] = []
+    while input_buffer:
+        if input_buffer.startswith("../"):
+            input_buffer = input_buffer[3:]
+        elif input_buffer.startswith("./"):
+            input_buffer = input_buffer[2:]
+        elif input_buffer.startswith("/./"):
+            input_buffer = f"/{input_buffer[3:]}"
+        elif input_buffer == "/.":
+            input_buffer = "/"
+        elif input_buffer.startswith("/../"):
+            input_buffer = f"/{input_buffer[4:]}"
+            if output:
+                output.pop()
+        elif input_buffer == "/..":
+            input_buffer = "/"
+            if output:
+                output.pop()
+        elif input_buffer in {".", ".."}:
+            input_buffer = ""
+        else:
+            segment_end = input_buffer.find("/", 1 if input_buffer.startswith("/") else 0)
+            if segment_end < 0:
+                output.append(input_buffer)
+                input_buffer = ""
+            else:
+                output.append(input_buffer[:segment_end])
+                input_buffer = input_buffer[segment_end:]
+    return "".join(output)
+
+
+def test_every_short_path_canonicalizes_exactly_as_it_did() -> None:
+    """The linear rewrite must be a pure move: same output for every input, not merely for the
+    cases someone thought to write down. `/`, `.`, and two ordinary characters generate every
+    branch of the algorithm, so this is exhaustive over the alphabet that drives it."""
+
+    for length in range(8):
+        for combination in itertools.product("/.ab", repeat=length):
+            path = "".join(combination)
+
+            assert trace_uri._remove_dot_segments(path) == _remove_dot_segments_by_slicing(path), (
+                path
+            )
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/a/b/c/./../../g", "/a/g"),
+        ("/../a", "/a"),
+        ("/./a", "/a"),
+        ("mid/content=5/../6", "mid/6"),
+        ("/a/../..", "/"),
+        ("/..", "/"),
+        ("/.", "/"),
+        ("..", ""),
+        (".", ""),
+        ("", ""),
+    ],
+    ids=[
+        "rfc-example",
+        "parent-at-root",
+        "dot-at-root",
+        "relative-parent",
+        "past-root",
+        "bare-parent",
+        "bare-dot",
+        "parent-only",
+        "dot-only",
+        "empty",
+    ],
+)
+def test_dot_segment_removal_matches_the_specification(path: str, expected: str) -> None:
+    assert trace_uri._remove_dot_segments(path) == expected
+
+
+def test_uri_canonicalization_cost_grows_with_the_path_not_its_square() -> None:
+    """A `$id` is caller-controlled and a payload may carry 8 MiB of them. Re-slicing the remaining
+    path each iteration copied nearly all of it every time, so 400 KB of `a/../` took over four
+    seconds -- on the persistence path that runs AFTER the paid upstream call, where it holds a
+    completed call open and occupies a worker.
+
+    Doubling the input roughly doubles linear work and roughly quadruples quadratic work, so the
+    ratio separates them without asserting a wall-clock budget that would flake on a busy machine.
+    """
+    timings = []
+    for segments in (40_000, 80_000):
+        path = "a/../" * segments
+        started = time.perf_counter()
+        trace_uri._remove_dot_segments(path)
+        timings.append(time.perf_counter() - started)
+
+    assert timings[1] < timings[0] * 3
+
+
+def _class_expansions_rebuilding_every_prefix(pattern: str) -> tuple[str, ...] | None:
+    """The pre-fix expansion, as an oracle for the fragment-accumulating one."""
+    if not any(character in pattern for character in "[]"):
+        return None
+    names: set[str] = {""}
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "\\" or character == "]":
+            return None
+        if character != "[":
+            names = {name + character for name in names}
+            index += 1
+            continue
+        end = pattern.find("]", index + 1)
+        if end == -1:
+            return None
+        members = pattern[index + 1 : end]
+        if not members or "-" in members or members.startswith("^") or "\\" in members:
+            return None
+        names = {
+            trace_secret_names._dedupe_name(name + member) for name in names for member in members
+        }
+        if len(names) > trace_secret_names._MAX_CLASS_EXPANSIONS:
+            return None
+        index = end + 1
+    return tuple(names)
+
+
+def test_every_short_pattern_expands_to_exactly_the_same_names() -> None:
+    """Exhaustive over the alphabet that drives the expansion: the class delimiters, characters
+    that do and do not fold, and the three members that make a class unexpandable (`-`, `^`, `\\`).
+    Order is not part of the contract -- the result feeds a set membership test -- so the names are
+    compared as sets."""
+
+    for length in range(6):
+        for combination in itertools.product("[]Ppa-^\\", repeat=length):
+            pattern = "".join(combination)
+            rewritten = trace_secret_names._character_class_expansions(pattern)
+            oracle = _class_expansions_rebuilding_every_prefix(pattern)
+
+            assert (rewritten is None) == (oracle is None), pattern
+            if rewritten is not None and oracle is not None:
+                assert set(rewritten) == set(oracle), pattern
+
+
+def test_pattern_classification_cost_grows_with_the_pattern_not_its_square() -> None:
+    """Rebuilding every accumulated name for each literal character made classification quadratic
+    in a caller-controlled pattern: `^[Pp]` with an 80,000-character suffix took 0.69s, and the
+    request limit permits several megabytes."""
+    timings = []
+    for suffix in (40_000, 80_000):
+        pattern = "^[Pp]" + ("a" * suffix) + "$"
+        started = time.perf_counter()
+        trace_secret_names._is_secret_property_pattern(pattern)
+        timings.append(time.perf_counter() - started)
+
+    assert timings[1] < timings[0] * 3
+
+
+_SCHEMA_SHAPED_METADATA: dict[str, Any] = {
+    "tools": [
+        {
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"password": {"type": "object", "value": "THIRDPARTY"}},
+                },
+            },
+        }
+    ]
+}
+
+
+def test_caller_metadata_does_not_earn_the_request_schema_exemption() -> None:
+    """`payload_root` opens the REQUEST's schema-host vocabulary, which exempts a declared schema's
+    unknown members from redaction. Metadata is a FRAGMENT of the request, so sanitizing it as its
+    own root let `metadata.tools` shaped like a function declaration keep a secret property's
+    literal -- exported through `metadata.tags` even though the identical subtree, reached through
+    the request body, was redacted."""
+
+    sanitized = traces._sanitize_for_trace(_SCHEMA_SHAPED_METADATA, (), payload_root=False)
+
+    assert "THIRDPARTY" not in json.dumps(sanitized)
+
+
+def test_the_same_subtree_is_redacted_through_the_request_body() -> None:
+    sanitized = traces._sanitize_for_trace(
+        {"model": "m", "messages": [], "metadata": _SCHEMA_SHAPED_METADATA}, ()
+    )
+
+    assert "THIRDPARTY" not in json.dumps(sanitized)
+
+
+def test_a_real_request_root_still_reads_its_declared_schemas() -> None:
+    """The exemption exists so an ordinary tool declaration is not blanked wholesale. Removing it
+    from a genuine request root would be the inverse defect."""
+
+    sanitized = traces._sanitize_for_trace(
+        {"model": "m", "messages": [], **_SCHEMA_SHAPED_METADATA}, ()
+    )
+
+    declared = sanitized["tools"][0]["function"]["parameters"]["properties"]["password"]
+    assert isinstance(declared, dict)
+    assert declared["type"] == "object"
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({"source": "test", "n": 3}, {"source": "test", "n": 3}),
+        ({"api_key": "AKIA-SECRET"}, {"api_key": "[redacted]"}),
+        ({}, {}),
+    ],
+    ids=["ordinary", "secret-key", "empty"],
+)
+def test_ordinary_metadata_is_unaffected_by_the_fragment_reading(
+    metadata: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    assert traces._sanitize_for_trace(metadata, (), payload_root=False) == expected

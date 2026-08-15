@@ -239,7 +239,11 @@ def _build_trace_record(
     metadata = {
         "source": "recording_proxy",
         "route": context.provider,
-        "tags": _sanitize_for_trace(context.metadata or {}, context.secrets),
+        # caller metadata is a FRAGMENT of the request, not a request of its own. sanitizing it as
+        # a payload root granted it the request schema-host exemption, so `metadata.tools` shaped
+        # like a function declaration kept a secret property's unknown literal here -- while the
+        # same subtree, reached through the real request body, was redacted.
+        "tags": _sanitize_for_trace(context.metadata or {}, context.secrets, payload_root=False),
     }
     return metadata, {"spans": [span]}
 

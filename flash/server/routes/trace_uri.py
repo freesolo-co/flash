@@ -40,35 +40,52 @@ def _normalize_percent_encoding(value: str, *, fold_decoded: bool = False) -> st
 
 
 def _remove_dot_segments(path: str) -> str:
-    input_buffer = path
+    """RFC 3986 section 5.2.4, walked by index rather than by re-slicing the remainder.
+
+    The literal transcription of the algorithm replaces the input buffer with a suffix of itself on
+    every iteration, which copies nearly the whole remaining path each time. A `$id` is
+    caller-controlled and a payload may carry 8 MiB of them, so a path of `a/../` segments made
+    canonicalization quadratic: 400 KB took over four seconds, on the persistence path that runs
+    AFTER the paid upstream call. `start` advances instead, so each character is read a fixed
+    number of times; the emitted output is unchanged.
+    """
     output: list[str] = []
-    while input_buffer:
-        if input_buffer.startswith("../"):
-            input_buffer = input_buffer[3:]
-        elif input_buffer.startswith("./"):
-            input_buffer = input_buffer[2:]
-        elif input_buffer.startswith("/./"):
-            input_buffer = f"/{input_buffer[3:]}"
-        elif input_buffer == "/.":
-            input_buffer = "/"
-        elif input_buffer.startswith("/../"):
-            input_buffer = f"/{input_buffer[4:]}"
+    start = 0
+    length = len(path)
+    while start < length:
+        remaining = length - start
+        if path.startswith("../", start):
+            start += 3
+        elif path.startswith("./", start):
+            start += 2
+        elif path.startswith("/./", start):
+            # `/./x` leaves a leading slash for the next round, which is what the buffer rewrite
+            # `f"/{buffer[3:]}"` produced; stepping to the final slash of the prefix is the same.
+            start += 2
+        elif remaining == 2 and path.startswith("/.", start):
+            output.append("/")
+            start += 2
+        elif path.startswith("/../", start):
+            start += 3
             if output:
                 output.pop()
-        elif input_buffer == "/..":
-            input_buffer = "/"
+        elif remaining == 3 and path.startswith("/..", start):
             if output:
                 output.pop()
-        elif input_buffer in {".", ".."}:
-            input_buffer = ""
+            output.append("/")
+            start += 3
+        elif remaining == 1 and path[start] == ".":
+            start += 1
+        elif remaining == 2 and path.startswith("..", start):
+            start += 2
         else:
-            segment_end = input_buffer.find("/", 1 if input_buffer.startswith("/") else 0)
+            segment_end = path.find("/", start + 1 if path[start] == "/" else start)
             if segment_end < 0:
-                output.append(input_buffer)
-                input_buffer = ""
+                output.append(path[start:])
+                start = length
             else:
-                output.append(input_buffer[:segment_end])
-                input_buffer = input_buffer[segment_end:]
+                output.append(path[start:segment_end])
+                start = segment_end
     return "".join(output)
 
 
