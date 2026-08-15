@@ -1412,6 +1412,25 @@ def test_export_accepts_modules_the_rank_pattern_did_not_override(tmp_path):
     assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
 
 
+def test_export_matches_rank_pattern_only_on_module_boundaries(tmp_path):
+    """PEFT matches a `rank_pattern` entry as `(.*\\.)?(entry)$` against the module path, so an
+    entry only ever governs a whole dot-delimited suffix. A bare `proj` override therefore does NOT
+    govern `q_proj`, which keeps its `r: 32` default -- matching on any substring instead would read
+    a correct rank-32 q_proj as contradicting the pattern's 64 and refuse a valid adapter."""
+    from flash.serve import export
+
+    header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
+    header.update(
+        _lora_pair_header(64, 64, prefix="base_model.model.model.layers.0.mlp.proj", offset=4)
+    )
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 8))
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps({"r": 32, "rank_pattern": {"proj": 64}})
+    )
+
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+
 def test_export_ignores_shapes_that_cannot_report_a_rank(tmp_path):
     """`modules_to_save` copies, biases and stacked 3-D fused layouts are not [r, in] / [out, r].
     None of them can answer the question, and reading a rank out of them anyway would refuse

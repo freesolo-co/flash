@@ -339,17 +339,25 @@ def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
 def _rank_for_module(key: str, declared: DeclaredLoraRanks) -> int | None:
     """The rank this tensor's own module is configured for, mirroring PEFT's pattern matching.
 
-    PEFT matches a ``rank_pattern`` entry against the module path either exactly or as a suffix
-    (``peft.tuners.tuners_utils.get_pattern_key``), so the longest matching entry wins and anything
-    unmatched falls back to ``r``.
+    ``peft.utils.other.get_pattern_key`` matches each entry as ``(.*\\.)?(entry)$`` against the
+    module path and returns the first hit, so an entry only ever governs a whole dot-delimited
+    suffix: ``proj`` does not match ``q_proj``. Anything unmatched falls back to ``r``.
     """
-    matched = [
-        (module, rank)
-        for module, rank in declared.by_module.items()
-        if module and (f".{module}." in key or key.startswith(f"{module}.") or module in key)
-    ]
-    if matched:
-        return max(matched, key=lambda pair: len(pair[0]))[1]
+    module_path = key
+    for infix in (_LORA_A_INFIX, _LORA_B_INFIX):
+        head, sep, _ = key.partition(infix)
+        if sep:
+            module_path = head
+            break
+    for module, rank in declared.by_module.items():
+        if not module:
+            continue
+        try:
+            # entries are regexes in PEFT, deliberately not escaped here either
+            if re.match(rf"(.*\.)?({module})$", module_path):
+                return rank
+        except re.error:
+            continue
     return declared.default
 
 
