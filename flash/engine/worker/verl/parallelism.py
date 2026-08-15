@@ -25,3 +25,52 @@ from __future__ import annotations
 # parallelism splits attention heads rather than the sequence, so it has no recurrent-state problem
 # (and is why the allocator's head-divisibility cap is still load-bearing).
 ULYSSES_SEQUENCE_PARALLEL_SIZE = 1
+
+
+def resolve_reshard_after_forward(
+    *,
+    model_id: str,
+    algorithm: str,
+    gpu_type: str,
+    n_gpus: int,
+    train=None,
+    thinking: bool = False,
+    model_revision: str = "",
+) -> bool:
+    """verl's ``reshard_after_forward`` for this run: False selects ZeRO-2, True keeps ZeRO-3.
+
+    ZeRO-2 keeps each rank's parameter copy resident after the forward, removing one all-gather per
+    step (measured 1.377x on pcie, 1.150x on nvlink) at a fixed per-card memory cost. That cost is
+    only affordable on some shapes, so the decision belongs to the ALLOCATOR's fit model rather than
+    to the worker: `zero2_enabled` is the one gate, and this function only re-asks it with the run's
+    own resolved geometry.
+
+    Answering it here rather than trusting a flag from the caller keeps a single source of truth
+    when a run is recovered or re-launched onto a different card than it was first quoted for -- the
+    policy follows the hardware the run actually lands on. Fails CLOSED to ZeRO-3 (verl's default)
+    on any unknown card, unsizable model, or sizing error, because ZeRO-3 is the strictly
+    lower-memory strategy and a wrong ZeRO-2 answer OOMs a paid run.
+    """
+    if n_gpus <= 1 or not (gpu_type or "").strip():
+        return True
+    try:
+        from flash.engine.plan.vram import model_required_vram_gb, resolve_params_b
+        from flash.providers.base import get_gpu_info, zero2_enabled
+
+        # the PINNED revision's real weight count, not the catalog default: the retained copy is
+        # priced off the weights the worker actually loads.
+        params_b = float(resolve_params_b(model_id, model_revision) or 0.0)
+        if params_b <= 0:
+            return True
+        need = float(
+            model_required_vram_gb(
+                model_id,
+                algorithm,
+                train=train,
+                thinking=thinking,
+                model_revision=model_revision,
+            )
+        )
+        return not zero2_enabled(int(get_gpu_info(gpu_type).vram_gb), int(n_gpus), params_b, need)
+    except Exception:
+        return True
