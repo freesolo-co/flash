@@ -1152,8 +1152,10 @@ two cannot disagree:
 ```python
 import math
 
-# exactly one finite reward per GENERATED assistant turn - assert it here, because
-# nothing downstream checks the length and both mismatch directions are bad (see below).
+# exactly one finite reward per GENERATED assistant turn - assert it here as an early
+# author-side guard: downstream layers do check the length, but they react by silently
+# discarding the vector and falling back to episode credit (see below), so a mismatch
+# costs the per-turn signal rather than failing. this is where it surfaces loudly.
 # count episode.turns, NOT episode.messages: messages starts out holding everything
 # start_episode() returned, so any assistant few-shot demo in the prompt inflates the
 # count. turns starts empty. it does collect your own env replies alongside the
@@ -1206,15 +1208,18 @@ per-turn values rather than `None`.
 
 ### Scoring must not depend on state accumulated in `step_episode`
 
-The worker's turn loop breaks out **before** the final `env_reply` when an episode hits the
-hard turn cap. An environment that accumulates state inside `step_episode` therefore scores
-the second-to-last position on exactly those episodes, silently under- or over-crediting the
-model — and only on the capped ones, which is a hard bias to spot in aggregate.
+The capped turn does get its `step_episode` call, as above — but there is one turn the
+environment never sees at all. A turn that hit `max_completion_tokens`, decoded empty, or
+carried a replacement character is unusable, and the bridge returns **before**
+`record_model_turn`, so it enters neither the transcript nor `step_episode`. An environment
+that accumulates state inside `step_episode` therefore scores the position before that turn
+on exactly those episodes, silently under- or over-crediting the model — and only on the
+episodes that ended badly, which is a hard bias to spot in aggregate.
 
 Make scoring a pure function of the transcript: re-derive state from the assistant turns on
 every hook call. That is correct whether the episode ended by succeeding, by an env-signalled
-done, or by hitting the cap, and it also means concurrent rollouts sharing one environment
-instance cannot corrupt each other.
+done, by hitting the cap, or by a turn that never reached you, and it also means concurrent
+rollouts sharing one environment instance cannot corrupt each other.
 
 ### `messages` already ends with the turn you are being asked to apply
 
@@ -1278,15 +1283,24 @@ FINAL_ACTION = re.compile(r"<move>(.*?)</move>\s*\Z", re.DOTALL)
 
 
 class MyEnv(EnvironmentMultiTurn):
+    # set this to match the `thinking` in your run config. your env is not handed the
+    # flag Flash derives from the rendered template, and it cannot derive it itself.
+    THINKING = True
+
     def _answer_of(self, content: str) -> str:
         """The committed answer, with any reasoning span removed.
 
         Mirrors how Flash splits a turn for grading: the LAST </think> wins, and text
-        before an unclosed <think> is still an answer.
+        before an unclosed <think> is still an answer. Under THINKING a turn with no tag
+        at all is "" rather than the raw text, because a pre-opening template can leave a
+        real reasoning turn tagless and Flash grades that turn as an empty answer --
+        accepting a trailing action from it would advance state the scorer never credited.
         """
         if "</think>" in content:
             return content.rsplit("</think>", 1)[1]
-        return content.split("<think>", 1)[0] if "<think>" in content else content
+        if "<think>" in content:
+            return content.split("<think>", 1)[0]
+        return "" if self.THINKING else content
 
     def _action_of(self, content: str, state) -> Move | None:
         """The action in a turn, or None if it carries none this state can use.
@@ -1345,12 +1359,30 @@ neither the transcript nor `step_episode`. Its tokens are masked out of the loss
 turn span. The tagless-answer rule above therefore matters for turns the model _finished_ while
 leaving a `<think>` open, not for the ones the cap cut off.
 
-One case does stay genuinely ambiguous. When the chat template pre-opens the reasoning block,
-the model never emits `<think>` itself, so a turn that stopped cleanly inside reasoning carries
-no tag at all and reads as a plain answer. Flash resolves this with a flag it derives from the
-rendered template and sets on the adapter; that flag is not passed through to your hook, so your
-environment cannot see it. Do not hardcode a guess either, because the same environment needs a
-different answer under a different model.
+One case does stay genuinely ambiguous, and it is the reason the parser above demands a
+`</think>`. When the chat template pre-opens the reasoning block, the model never emits
+`<think>` itself, so a turn that never closed one carries no tag at all and reads as a plain
+answer. Flash resolves this with a flag it derives from the rendered template and sets on the
+adapter; that flag is not passed through to your hook, so your environment cannot see it. Do
+not hardcode a guess either, because the same environment needs a different answer under a
+different model.
+
+That matters beyond the truncated case, because a turn can end this way and still reach you.
+A model that emits its action and then stops on EOS or an accepted stop without ever closing
+`</think>` is **not** truncated, so it passes the gate above and arrives at `step_episode`
+looking like a committed action. Flash grades that same turn with
+`strip_think(..., prompt_opened_thinking=True)`, which finds no `</think>` and returns an
+empty answer. Apply the trailing action and your state advances on a turn the scorer just
+graded as saying nothing: the board moves, the reward does not, and the episode continues from
+a position the reward never credited.
+
+With `thinking` on, therefore, require a visible `</think>` before you accept any action —
+that is what `_answer_of` returning `""` for a tagless turn under `THINKING` buys you. Mirror
+your run config in that constant, since the hook cannot see it. It costs you the turn
+where a model skipped reasoning entirely, which under a pre-opening template cannot be told
+from unfinished reasoning anyway. Prefer that trade: an unparsed turn takes the error-observation
+path and the model can correct itself, while a wrongly-applied one desynchronises state from
+reward for the rest of the episode.
 
 What the parser above does instead is require the action to be the **last** thing in the turn.
 That is why `FINAL_ACTION` is anchored: reasoning that was still weighing options usually runs
