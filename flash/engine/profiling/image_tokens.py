@@ -35,8 +35,6 @@ from pathlib import Path
 
 # qwen VL publishes its pixel budget under `size`, older revisions under min_pixels/max_pixels.
 # these defaults are the transformers fallbacks, used only when the config declares neither.
-_DEFAULT_PATCH_SIZE = 16
-_DEFAULT_MERGE_SIZE = 2
 _DEFAULT_MIN_PIXELS = 56 * 56
 _DEFAULT_MAX_PIXELS = 14 * 14 * 4 * 1280
 # the same bound transformers enforces: beyond it smart_resize cannot hold the aspect ratio.
@@ -45,6 +43,10 @@ _MAX_ASPECT_RATIO = 200
 
 class ImageGeometryUnavailable(ValueError):
     """the model's published preprocessor config does not describe its image geometry."""
+
+    def __init__(self, message: str, *, plane_fault: bool = False) -> None:
+        super().__init__(message)
+        self.plane_fault = plane_fault
 
 
 @dataclass(frozen=True)
@@ -96,12 +98,21 @@ def _positive_int(value: object) -> int | None:
     return number if number > 0 else None
 
 
+def _explicit_positive_json_int(config: dict, field: str) -> int:
+    value = config.get(field)
+    if type(value) is not int or value <= 0:
+        raise ImageGeometryUnavailable(
+            f"preprocessor config must declare {field} as a positive JSON integer"
+        )
+    return value
+
+
 def geometry_from_preprocessor_config(config: dict) -> ImageGeometry:
     """Read the published patch/merge sizes and pixel budget from a preprocessor config."""
     if not isinstance(config, dict):
         raise ImageGeometryUnavailable("preprocessor config is not an object")
-    patch_size = _positive_int(config.get("patch_size")) or _DEFAULT_PATCH_SIZE
-    merge_size = _positive_int(config.get("merge_size")) or _DEFAULT_MERGE_SIZE
+    patch_size = _explicit_positive_json_int(config, "patch_size")
+    merge_size = _explicit_positive_json_int(config, "merge_size")
     size = config.get("size")
     size = size if isinstance(size, dict) else {}
     # `size` is the current spelling; min_pixels/max_pixels the older one. prefer whichever the
@@ -128,6 +139,49 @@ def geometry_from_preprocessor_config(config: dict) -> ImageGeometry:
     )
 
 
+def _geometry_load_error_is_transient(exc: BaseException) -> bool:
+    """Match the worker prefetch classifier without importing its worker boundary."""
+    import httpx
+    from huggingface_hub.errors import (
+        EntryNotFoundError,
+        GatedRepoError,
+        HfHubHTTPError,
+        LocalEntryNotFoundError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+    from requests.exceptions import RequestException
+    from requests.exceptions import Timeout as RequestsTimeout
+
+    if isinstance(exc, (RepositoryNotFoundError, RevisionNotFoundError, GatedRepoError)):
+        return False
+    if isinstance(exc, LocalEntryNotFoundError):
+        return True
+    if isinstance(exc, EntryNotFoundError):
+        return False
+    if isinstance(
+        exc,
+        (
+            RequestsConnectionError,
+            RequestsTimeout,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        ),
+    ):
+        return True
+    if isinstance(exc, HfHubHTTPError):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if status in {401, 403, 404}:
+            return False
+        return status is None or status == 429 or (isinstance(status, int) and 500 <= status <= 599)
+    if isinstance(exc, RequestException):
+        return False
+    return isinstance(exc, OSError)
+
+
 def load_image_geometry(model_id: str, revision: str = "") -> ImageGeometry:
     """Fetch the model's published image geometry from the hub without importing torch."""
     import os
@@ -148,7 +202,8 @@ def load_image_geometry(model_id: str, revision: str = "") -> ImageGeometry:
     except Exception as exc:
         raise ImageGeometryUnavailable(
             f"could not read the image geometry published by {model_id!r}; an image-bearing sft "
-            "dataset cannot be quoted without it"
+            "dataset cannot be quoted without it",
+            plane_fault=_geometry_load_error_is_transient(exc),
         ) from exc
     return geometry_from_preprocessor_config(config)
 

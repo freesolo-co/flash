@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,7 @@ from flash.engine.profiling.image_tokens import (
     expand_image_pad_runs,
     geometry_from_preprocessor_config,
     image_pad_tokens,
+    load_image_geometry,
     smart_resize,
 )
 
@@ -120,7 +122,7 @@ class TestImagePadTokens:
 
 
 class TestGeometryFromConfig:
-    def test_reads_the_published_geometry(self):
+    def test_accepts_explicit_positive_json_integers(self):
         geometry = geometry_from_preprocessor_config(
             {
                 "patch_size": 16,
@@ -129,6 +131,22 @@ class TestGeometryFromConfig:
             }
         )
         assert geometry == QWEN_GEOMETRY
+
+    @pytest.mark.parametrize("field", ["patch_size", "merge_size"])
+    def test_rejects_missing_geometry(self, field):
+        config = {"patch_size": 16, "merge_size": 2}
+        del config[field]
+
+        with pytest.raises(ImageGeometryUnavailable, match=field):
+            geometry_from_preprocessor_config(config)
+
+    @pytest.mark.parametrize("field", ["patch_size", "merge_size"])
+    @pytest.mark.parametrize("value", [0, -1, True, "16", 16.5])
+    def test_rejects_non_positive_or_non_integer_geometry(self, field, value):
+        config = {"patch_size": 16, "merge_size": 2, field: value}
+
+        with pytest.raises(ImageGeometryUnavailable, match=field):
+            geometry_from_preprocessor_config(config)
 
     def test_accepts_the_older_min_max_pixels_spelling(self):
         geometry = geometry_from_preprocessor_config(
@@ -148,11 +166,132 @@ class TestGeometryFromConfig:
 
     def test_rejects_an_inverted_pixel_budget(self):
         with pytest.raises(ImageGeometryUnavailable, match="min_pixels"):
-            geometry_from_preprocessor_config({"min_pixels": 4096, "max_pixels": 1024})
+            geometry_from_preprocessor_config(
+                {
+                    "patch_size": 16,
+                    "merge_size": 2,
+                    "min_pixels": 4096,
+                    "max_pixels": 1024,
+                }
+            )
 
     def test_rejects_a_non_object_config(self):
         with pytest.raises(ImageGeometryUnavailable):
             geometry_from_preprocessor_config([])  # type: ignore[arg-type]
+
+
+class TestImageGeometrySubmissionFailures:
+    @staticmethod
+    def _submission_status(exc: Exception) -> int:
+        from flash.server.routes.runs import _submit_failure_http_error
+
+        return _submit_failure_http_error(exc).status_code
+
+    @staticmethod
+    def _load_failure(monkeypatch, failure: Exception) -> ImageGeometryUnavailable:
+        def fail_download(**_kwargs):
+            raise failure
+
+        monkeypatch.setattr("huggingface_hub.hf_hub_download", fail_download)
+        with pytest.raises(ImageGeometryUnavailable) as excinfo:
+            load_image_geometry("org/model")
+        return excinfo.value
+
+    @pytest.mark.parametrize(
+        ("status", "expected_plane_fault", "expected_http_status"),
+        [
+            (401, False, 400),
+            (403, False, 400),
+            (404, False, 400),
+            (429, True, 503),
+            (500, True, 503),
+            (503, True, 503),
+        ],
+    )
+    def test_hub_http_status_distinguishes_permanent_and_transient_failures(
+        self, monkeypatch, status, expected_plane_fault, expected_http_status
+    ):
+        from huggingface_hub.errors import HfHubHTTPError
+
+        response = SimpleNamespace(
+            status_code=status,
+            headers={},
+            request=SimpleNamespace(),
+        )
+        failure = self._load_failure(
+            monkeypatch,
+            HfHubHTTPError("hub request failed", response=response),
+        )
+
+        assert failure.plane_fault is expected_plane_fault
+        assert self._submission_status(failure) == expected_http_status
+
+    def test_network_timeout_is_a_plane_fault(self, monkeypatch):
+        import httpx
+
+        failure = self._load_failure(monkeypatch, httpx.ReadTimeout("timed out"))
+
+        assert failure.plane_fault is True
+        assert self._submission_status(failure) == 503
+
+    def test_local_cache_miss_is_a_plane_fault(self, monkeypatch):
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        failure = self._load_failure(
+            monkeypatch,
+            LocalEntryNotFoundError("cache entry is unavailable"),
+        )
+
+        assert failure.plane_fault is True
+        assert self._submission_status(failure) == 503
+
+    def test_local_file_io_failure_is_a_plane_fault(self, monkeypatch, tmp_path):
+        missing_path = tmp_path / "missing-preprocessor-config.json"
+        monkeypatch.setattr(
+            "huggingface_hub.hf_hub_download",
+            lambda **_kwargs: str(missing_path),
+        )
+
+        with pytest.raises(ImageGeometryUnavailable) as excinfo:
+            load_image_geometry("org/model")
+
+        assert excinfo.value.plane_fault is True
+        assert self._submission_status(excinfo.value) == 503
+
+    def test_missing_hub_file_is_a_submission_error(self, monkeypatch):
+        from huggingface_hub.errors import EntryNotFoundError
+
+        failure = self._load_failure(
+            monkeypatch,
+            EntryNotFoundError("preprocessor_config.json is missing"),
+        )
+
+        assert failure.plane_fault is False
+        assert self._submission_status(failure) == 400
+
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            "{not-json",
+            json.dumps([]),
+            json.dumps({"patch_size": 16, "merge_size": 0}),
+        ],
+    )
+    def test_malformed_or_invalid_config_is_a_submission_error(
+        self, monkeypatch, tmp_path, contents
+    ):
+        config_path = tmp_path / "preprocessor_config.json"
+        config_path.write_text(contents)
+        monkeypatch.setattr(
+            "huggingface_hub.hf_hub_download",
+            lambda **_kwargs: str(config_path),
+        )
+
+        with pytest.raises(ImageGeometryUnavailable) as excinfo:
+            load_image_geometry("org/model")
+
+        assert excinfo.value.plane_fault is False
+        assert self._submission_status(excinfo.value) == 400
 
 
 class TestExpandImagePadRuns:
