@@ -372,6 +372,34 @@ def test_merger_uses_the_shared_streaming_supervisor(monkeypatch):
     }
 
 
+def test_short_write_marker_survives_the_merger_subprocess_boundary(
+    monkeypatch, actor_dir, tmp_path
+):
+    from flash.engine.worker import backend_common
+    from flash.engine.worker.verl import checkpoints
+
+    free = {"value": 1 << 40}
+
+    def supervise(cmd, *, env, on_line, errors):
+        on_line("unexpected pos 221967808 vs 221967696\n")
+        free["value"] = 0
+        return 7
+
+    monkeypatch.setattr(backend_common, "_run_streaming_verl_subprocess", supervise)
+    monkeypatch.setattr(checkpoints.shutil, "disk_usage", lambda path: _disk_usage(free["value"]))
+
+    with pytest.raises(checkpoints.MergeDiskExhaustedError) as caught:
+        checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+    cause = caught.value.__cause__
+    assert isinstance(cause, subprocess.CalledProcessError)
+    assert cause.output == "unexpected pos 221967808 vs 221967696"
+
+
 def test_merger_preserves_cancellation_identity(monkeypatch):
     from flash.engine.worker import backend_common
     from flash.engine.worker.verl import checkpoints

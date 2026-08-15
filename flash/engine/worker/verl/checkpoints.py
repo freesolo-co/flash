@@ -41,6 +41,7 @@ _DISK_EXHAUSTED_MARKERS = (
     "os error 122",
 )
 _SHORT_WRITE_MARKERS = ("unexpected pos",)
+_MERGE_FAILURE_MARKERS = _DISK_EXHAUSTED_MARKERS + _SHORT_WRITE_MARKERS
 
 # disk size is platform-managed, so checkpoint frequency is the reachable remedy.
 _FEWER_CHECKPOINTS_ADVICE = (
@@ -86,23 +87,23 @@ def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
 
 
 def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
-    """stream merger output and retain the first disk-exhaustion marker."""
+    """stream merger output and retain the first disk or short-write marker."""
     from flash.engine.worker import backend_common
 
-    exhausted_line = ""
+    evidence_line = ""
 
     def handle_line(line: str) -> None:
-        nonlocal exhausted_line
+        nonlocal evidence_line
         print(line, end="", flush=True)
-        if not exhausted_line and any(marker in line.lower() for marker in _DISK_EXHAUSTED_MARKERS):
-            exhausted_line = line.strip()
+        if not evidence_line and any(marker in line.lower() for marker in _MERGE_FAILURE_MARKERS):
+            evidence_line = line.strip()
 
     merger_env = {**env, "PYTHONUNBUFFERED": "1"}
     return_code = backend_common._run_streaming_verl_subprocess(
         cmd, env=merger_env, on_line=handle_line, errors="replace"
     )
     if return_code != 0:
-        raise subprocess.CalledProcessError(return_code, cmd, output=exhausted_line or None)
+        raise subprocess.CalledProcessError(return_code, cmd, output=evidence_line or None)
 
 
 def _free_bytes(path: str) -> int | None:
