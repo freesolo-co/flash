@@ -5459,9 +5459,11 @@ def test_child_failure_sanitizer_redacts_pwd_fields_without_treating_pwd_env_as_
         assert "runtime-password" not in redacted
         assert "<redacted>" in redacted
 
-    assert _safe_child_failure_detail(ValueError("failed under /workspace/ordinary-path")) == (
-        "failed under /workspace/ordinary-path"
-    )
+    for ordinary in (
+        "failed under /workspace/ordinary-path",
+        "spwd_cache=visible remains ordinary diagnostic metadata",
+    ):
+        assert _safe_child_failure_detail(ValueError(ordinary)) == ordinary
 
 
 def test_parent_redacts_declared_secret_before_returning_bridge_error_to_child(monkeypatch):

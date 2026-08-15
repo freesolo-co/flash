@@ -67,13 +67,16 @@ _SECRET_KEY_FIELD = (
 )
 # unanchored, so `Set-Cookie` matches through the `Cookie` inside it.
 _SECRET_COOKIE_KEY = r"(?P<cookie>cookie)"
+# ODBC's PWD is a standalone field. Bound both edges so an unrelated longer key containing those
+# three letters is not shape-redacted merely because this short alternative appears inside it.
+_SECRET_PWD_KEY = r"(?<![\w-])pwd(?![\w-])"
 # comma and semicolon delimit another field only when a key follows (`;SERVER=` / `, scope=`).
 # Otherwise they are credential characters: stopping at `password=abc,runtime-secret` leaks the
 # suffix. This keeps benign connection-string fields while failing closed on ambiguous punctuation.
 _SECRET_NEXT_FIELD = r"[,;](?=[A-Za-z][\w.-]*(?: [A-Za-z][\w.-]*)?\s*=)"
 _SECRET_DETAIL = re.compile(
     rf"(?i)(?P<key>{_SECRET_AUTH_KEY}|api[-_ ]?key|access[-_ ]?token|token|secret"
-    rf"|pass(?:[-_ ]?phrase|word|wd)|pwd"
+    rf"|pass(?:[-_ ]?phrase|word|wd)|{_SECRET_PWD_KEY}"
     rf"|credentials?|{_SECRET_COOKIE_KEY}|{_SECRET_KEY_FIELD}|{_SECRET_URL_PARAM})"
     r"(?P<sep>(?:\\?['\"])?\s*[:=]\s*)"
     # escaped-quote branch first: `\"secret\"` starts with a backslash, so `quote` misses it and
