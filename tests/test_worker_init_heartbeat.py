@@ -275,7 +275,7 @@ def test_liveness_heartbeat_sets_the_stall_event_at_the_silence_threshold(monkey
     """
     hb, w, _ = _liveness_env(monkeypatch)
     monkeypatch.setattr(w, "heartbeat", lambda s, **k: None)
-    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_TICKS", 3)
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_S", 0.05)
     stall = threading.Event()
     ticks = iter([0, 1, 2, 3, 3, 3])
 
@@ -297,7 +297,7 @@ def test_liveness_heartbeat_does_not_condemn_a_child_below_the_threshold(monkeyp
     # -- and killing it would turn this watchdog into the thing that breaks healthy runs.
     hb, w, _ = _liveness_env(monkeypatch)
     monkeypatch.setattr(w, "heartbeat", lambda s, **k: None)
-    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_TICKS", 5)
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_S", 0.15)
     stall = threading.Event()
     ticks = iter([0, 1, 2, 0, 1, 2, 0, 1, 2])
 
@@ -317,8 +317,72 @@ def test_child_tail_stall_ignores_a_malformed_counter():
     hb = importlib.import_module("flash.engine.worker.io.heartbeat")
     for bogus in (True, "60", None, 3.5, [60]):
         stall = threading.Event()
-        hb._observe_child_tail_stall(bogus, stall)
+        clock = hb._ChildTailStallClock()
+        clock.observe(bogus, stall)
         assert not stall.is_set(), f"{bogus!r} was treated as a silence count"
+
+
+def test_child_tail_stall_is_measured_in_elapsed_time_not_tick_count(monkeypatch):
+    """The deadline is a DURATION, so a slow loop cannot stretch it past the provider's grace.
+
+    each iteration costs the 30s sleep plus whatever ran inside it -- two nvidia-smi calls that can
+    each burn an 8s timeout on a sick box, plus a heartbeat upload that can block. counting ticks
+    made the deadline elastic in exactly the wrong direction: the more degraded the host, the longer
+    the wedge billed, until the provider's 3000s grace fired first and reported the retriable
+    "stalled" that this watchdog exists to preempt.
+    """
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_S", 1800.0)
+    stall = threading.Event()
+    now = [0.0]
+    monkeypatch.setattr(hb.time, "monotonic", lambda: now[0])
+
+    # THE DIRECTION THAT COSTS MONEY. each iteration here takes 200s of wall clock, because the two
+    # nvidia-smi probes are timing out and the heartbeat upload is blocking -- the degraded box this
+    # watchdog is for. after 10 such ticks half an hour of billed silence has passed and the child
+    # must be condemned, even though a 60-tick counter has seen only 10 of its 60 ticks and would
+    # keep waiting for another two and a half hours.
+    clock = hb._ChildTailStallClock()
+    for tick in range(1, 11):
+        now[0] = tick * 200.0
+        clock.observe(tick, stall)
+    assert stall.is_set(), (
+        "a slow loop stretched the deadline: 30 minutes of silence elapsed and the child was not "
+        "condemned, so the provider's 3000s grace fires first and reports the retriable 'stalled'"
+    )
+
+    # THE OPPOSITE DIRECTION. a fast loop must not condemn early: 60 ticks that took 10s each is
+    # only 10 minutes of silence, well inside the legitimate quiet floors (a 600s teacher call, a
+    # warmup-dominated first step). a tick counter would have killed this healthy run.
+    stall_fast = threading.Event()
+    clock_fast = hb._ChildTailStallClock()
+    for tick in range(1, 61):
+        now[0] = 100_000.0 + tick * 10.0
+        clock_fast.observe(tick, stall_fast)
+    assert not stall_fast.is_set(), (
+        "a fast loop's tick count condemned a child after only 10 minutes of silence"
+    )
+
+
+def test_child_tail_stall_clock_restarts_after_new_output(monkeypatch):
+    # silence that is BROKEN does not accumulate: a child that speaks again starts a fresh window,
+    # so several legitimate quiet phases can never add up to a kill.
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_S", 100.0)
+    clock = hb._ChildTailStallClock()
+    stall = threading.Event()
+
+    now = [0.0]
+    monkeypatch.setattr(hb.time, "monotonic", lambda: now[0])
+
+    for _ in range(3):
+        now[0] += 1.0
+        clock.observe(1, stall)  # silence starts
+        now[0] += 90.0
+        clock.observe(2, stall)  # still silent, but under the deadline
+        now[0] += 1.0
+        clock.observe(0, stall)  # new output: the window resets
+    assert not stall.is_set(), "repeated quiet phases accumulated into a false kill"
 
 
 def test_liveness_heartbeat_join_is_bounded_even_if_emit_wedges(monkeypatch):

@@ -530,41 +530,66 @@ def _bounded_reward_metrics(metrics) -> dict[str, float]:
 
 _LIVENESS_TICK_S = 30.0
 _STALL_DUMP_S = 1200.0
-# consecutive liveness ticks of NO NEW child output before the child is declared wedged. 60 ticks is
-# 30 minutes at the cadence above.
+# how long a child may produce NO NEW output before it is declared wedged.
+#
+# a DURATION, not a tick count. the loop sleeps `_LIVENESS_TICK_S` between iterations rather than on
+# a fixed period, so each iteration costs the sleep plus whatever the work inside it took: two
+# nvidia-smi calls that can each burn their 8s timeout on a sick box, plus a heartbeat upload that
+# can block. counting 60 ticks therefore measures somewhere between 30 and ~47 minutes depending on
+# how degraded the host is -- and the sicker the box, the longer the deadline stretches, which is
+# backwards. worse, past ~50 minutes the provider's own 3000s setup grace fires first and reports
+# "stalled", which is in INFRA_RETRY_FAILURES: the wedge is then retried against the retry floor and
+# bills the same dead run five more times, exactly the amplification this exists to prevent.
 #
 # deliberately larger than the 20-minute stack-dump threshold beside it: dumping stacks is free, and
 # killing a paid run that was merely slow is not. the floors this has to clear are real -- an opd
 # teacher bridge request blocks up to 600s on one urlopen, and a first step carries warmup, engine
-# start, compilation and scoring -- so 30 minutes leaves 3x margin over the longest of them. it also
-# lands ~20 minutes inside the provider's 3000s setup grace, which is what makes it worth having:
-# the provider's own backstop eventually fires, but it reports "stalled", and stalled is in
-# INFRA_RETRY_FAILURES, so a wedge that reaches it is retried against the retry floor and bills the
-# same dead run five more times. failing here instead ends the run on the first attempt.
+# start, compilation and scoring -- so 30 minutes leaves 3x margin over the longest of them, while
+# landing ~20 minutes inside the provider grace no matter how slow the loop's own iterations get.
 #
-# separate quiet phases never accumulate: any new child content resets the counter to zero.
-CHILD_TAIL_STALL_TICKS = 60
+# separate quiet phases never accumulate: any new child content resets the clock.
+CHILD_TAIL_STALL_S = 1800.0
 
 
-def _observe_child_tail_stall(silent_ticks: object, stall_event) -> None:
-    """Set ``stall_event`` once the child has gone ``CHILD_TAIL_STALL_TICKS`` ticks without new output.
+class _ChildTailStallClock:
+    """Sets ``stall_event`` once the child has been silent for ``CHILD_TAIL_STALL_S`` seconds.
 
-    reads the counter off the payload the heartbeat is already carrying rather than sampling the
-    tail again, so the number that terminates the run is the same one printed in the run log.
+    holds the monotonic timestamp of the last tick that reported new child output, so the verdict is
+    measured in elapsed time rather than in loop iterations whose duration the loop does not control.
+
+    the silent-tick counter is still the INPUT: it is what distinguishes "no new output" from "the
+    fields callback did not report", and it is the number printed in the run log. this only decides
+    when a run of silence has lasted long enough to be fatal.
 
     the gpu utilisation sampled on this tick is deliberately NOT part of the predicate. nvidia-smi
     reports an instantaneous sample, and a healthy trainer reads 0% between kernels, during host-side
     setup and while blocked on io -- requiring it would trade a false kill for a missed one on the
     exact failure this exists to catch. it stays on the heartbeat as evidence for the diagnosis.
     """
-    if stall_event is None or stall_event.is_set():
-        return
-    # bool is an int subclass, and this value arrives from a caller-supplied ``fields`` callback: a
-    # malformed counter must not be able to tear down a paid run.
-    if isinstance(silent_ticks, bool) or not isinstance(silent_ticks, int):
-        return
-    if silent_ticks >= CHILD_TAIL_STALL_TICKS:
-        stall_event.set()
+
+    def __init__(self) -> None:
+        self._silent_since: float | None = None
+
+    def observe(self, silent_ticks: object, stall_event) -> None:
+        if stall_event is None or stall_event.is_set():
+            return
+        # bool is an int subclass, and this value arrives from a caller-supplied ``fields`` callback:
+        # a malformed counter must not be able to tear down a paid run.
+        if isinstance(silent_ticks, bool) or not isinstance(silent_ticks, int):
+            return
+        if silent_ticks <= 0:
+            # new output this tick (or the child has not started producing any yet): the clock only
+            # runs across an unbroken run of silent ticks.
+            self._silent_since = None
+            return
+        now = time.monotonic()
+        if self._silent_since is None:
+            # first silent tick of this run. the silence actually began up to one tick earlier, but
+            # starting from here only ever makes the deadline more conservative.
+            self._silent_since = now
+            return
+        if now - self._silent_since >= CHILD_TAIL_STALL_S:
+            stall_event.set()
 
 
 @contextlib.contextmanager
@@ -581,7 +606,7 @@ def liveness_heartbeat(
     carries payload data, while ``progress_step`` wins for trainer steps (dev #442). Missing a step
     can misbill cancellation. Use nvidia-smi because the main thread may hold CUDA allocator locks.
     ``child_tail_stall_event`` is SET (never raised) once ``fields`` reports a child that has gone
-    ``CHILD_TAIL_STALL_TICKS`` ticks without new output: this runs on a daemon thread, so an
+    ``CHILD_TAIL_STALL_S`` seconds without new output: this runs on a daemon thread, so an
     exception here would die with the thread while the main thread stayed blocked on a dead child.
     """
     done = threading.Event()
@@ -595,6 +620,7 @@ def liveness_heartbeat(
             return
         last_val = None
         dumped = False
+        stall_clock = _ChildTailStallClock()
         while not done.wait(_LIVENESS_TICK_S):
             made_progress = False
             if progress is not None:
@@ -618,7 +644,7 @@ def liveness_heartbeat(
                     extra = fields() or {}
             if progress_step and last_val is not None:
                 extra["step"] = int(last_val)
-            _observe_child_tail_stall(extra.get("child_tail_silent_ticks"), child_tail_stall_event)
+            stall_clock.observe(extra.get("child_tail_silent_ticks"), child_tail_stall_event)
             # keepalive: a legitimate blocking upload IS progress the daemon can't sample per-step, so
             # force a REAL heartbeat every tick to keep the provider's stall clock fed (see docstring).
             _w.heartbeat(stage, liveness=(not made_progress) and not keepalive, gpu=gpu, **extra)

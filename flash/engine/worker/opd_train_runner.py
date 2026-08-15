@@ -90,6 +90,10 @@ class _ChildCallbacks:
     on_step: Any
     child_heartbeat: Any
     liveness_fields: Any
+    # the daemon's ``progress`` callback. attempt-local by construction: publishing the absolute
+    # restored step would flip the provider out of its setup grace on a resumed attempt's first
+    # tick. see `liveness_progress`.
+    liveness_progress: Any
     progress: dict[str, Any]
     wandb_link: dict[str, str | None]
     child_tail: Any
@@ -594,6 +598,12 @@ def _build_child_callbacks(
 ) -> _ChildCallbacks:
     progress = {
         "step": resume_step,
+        # the highest step the VALIDATED parser has seen, which is not the same thing as `step`
+        # above. `step` is fed by run_verl_training's loose `step:\s*(\d+)` scan, which also matches
+        # "global_step: 1" and a path ending in "step: 1" -- lines `verl_step_number` deliberately
+        # refuses. anything gating on "has a real optimizer step landed" must read this one, or a
+        # single pre-training diagnostic line silences the gate for the rest of the run.
+        "validated_step": resume_step,
         "loss": None,
         "truncation_rate": None,
         "truncation_step": None,
@@ -608,6 +618,10 @@ def _build_child_callbacks(
         step_number = _opd_train.verl_step_number(line)
         if step_number is None:
             return
+        # recorded BEFORE the metric filter below: a step-tagged line with no distillation loss
+        # (a timer, a validation row) is still proof that verl reached that step, and the gate this
+        # feeds asks whether the child is making progress, not whether it logged a loss.
+        progress["validated_step"] = max(int(progress["validated_step"] or 0), step_number)
         # use parse_verl_metric because numpy 2 pprint emits np.float64(...); float() would drop
         # every step and leave a trained run with an empty loss curve.
         loss = _opd_train.parse_verl_metric(line, "actor/distillation/loss")
@@ -632,26 +646,57 @@ def _build_child_callbacks(
         _opd_train._w.heartbeat("opd_step", **payload)
 
     def child_heartbeat() -> None:
-        _opd_train._w.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
+        # attempt-local for the same reason as `liveness_progress`: this ping can be upgraded to a
+        # real heartbeat by the progress-carry latch, and an absolute restored step would then read
+        # as "training has started" and tighten the provider's stall window on a resumed attempt
+        # that is still in cold start. `poll.STEP_GATED_STAGES` documents the intended contract:
+        # an opd_step ping reports opt_steps, 0 until the first optimizer update lands.
+        _opd_train._w.heartbeat("opd_step", liveness=True, step=steps_this_child())
 
     child_tail = _opd_train.ChildOutputTail()
     # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside
     # the per-tick callback.
     tail_staleness = _opd_train.ChildTailStaleness()
 
+    def steps_this_child() -> int:
+        """optimizer steps THIS child has completed, by the validated parser.
+
+        two corrections in one number, both of which otherwise silence the stall signal for the
+        rest of a run:
+
+        - `validated_step` rather than `step`: the loose scan feeding `step` counts a pre-training
+          "global_step: 1" as an optimizer step, and `stall_tail_fields` returns {} forever once its
+          argument goes positive, so one such line before a wedge hides it completely.
+        - minus `resume_step`: a resumed attempt starts at the restored step, and the attempts most
+          likely to wedge ARE the resumed ones, since a resume re-runs the whole import and ray
+          startup.
+        """
+        return max(0, int(progress["validated_step"] or 0) - resume_step)
+
+    def liveness_progress() -> int:
+        """the progress value the liveness daemon publishes as ``step``.
+
+        attempt-local for the same reason as the field above, but the consequence here is the
+        provider's, not the worker's: `poll.is_training_heartbeat` treats an `opd_step` heartbeat
+        carrying step >= 1 as proof that cold-start is over and swaps the 3000s setup grace for the
+        1500s training window. publishing the absolute restored step would do that on the FIRST tick
+        of every resumed attempt, so the provider would give up at 1500s and report the retriable
+        "stalled" -- five minutes before this watchdog's 30-minute deadline can fire, which is the
+        retry-and-rebill path the watchdog exists to cut off.
+        """
+        return steps_this_child()
+
     def liveness_fields() -> dict[str, object]:
-        # steps THIS child has taken, not the absolute step it resumed at. `stall_tail_fields`
-        # stops reporting once its step argument is above zero, so passing the resumed step would
-        # silence the stall signal from the first tick of every resumed attempt -- exactly the
-        # attempts most likely to wedge, since a resume re-runs the whole import and ray startup.
-        steps_this_child = max(0, int(progress["step"] or 0) - resume_step)
-        return _opd_train.stall_tail_fields(steps_this_child, child_tail, staleness=tail_staleness)
+        return _opd_train.stall_tail_fields(
+            steps_this_child(), child_tail, staleness=tail_staleness
+        )
 
     return _ChildCallbacks(
         on_line,
         on_step,
         child_heartbeat,
         liveness_fields,
+        liveness_progress,
         progress,
         wandb_link,
         child_tail,
@@ -664,8 +709,7 @@ def _build_child_callbacks(
 # fault or a named ray defect. built once at import so the training call carries no attribute lookup
 # that could fail inside the try whose finally decides whether the run counts as complete.
 _CHILD_STALL_ABORT_REASON = (
-    f"opd child produced no new output for {_heartbeat.CHILD_TAIL_STALL_TICKS} liveness ticks "
-    f"(~{round(_heartbeat.CHILD_TAIL_STALL_TICKS * _heartbeat._LIVENESS_TICK_S / 60)} minutes) and "
+    f"opd child produced no new output for {round(_heartbeat.CHILD_TAIL_STALL_S / 60)} minutes and "
     "had not completed its first optimizer step; the process group was torn down to release the gpu"
 )
 
@@ -694,7 +738,7 @@ def _run_child(
             progress_state.start_training()
             with _opd_train.liveness_heartbeat(
                 "opd_step",
-                progress=lambda: int(callbacks.progress["step"] or 0),
+                progress=callbacks.liveness_progress,
                 progress_step=True,
                 fields=callbacks.liveness_fields,
                 child_tail_stall_event=callbacks.child_tail_stall_event,

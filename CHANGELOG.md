@@ -36,9 +36,16 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   changes make it terminate. The counter now ignores a line identical to the one before it, so a
   wedged child re-printing one frozen status line reads as no progress rather than as activity
   (previously it reset the counter and capped it around 9, which is why the published value never
-  climbed). After 60 consecutive ticks (30 minutes) with no new content and no completed optimizer
-  step, the child's process group is torn down and the run fails with a message naming what was
-  observed. Genuinely new output resets the counter, so the 600s teacher bridge request and the
+  climbed). After 30 minutes of elapsed time with no new content and no completed optimizer step,
+  the child's process group is torn down and the run fails with a message naming what was observed.
+  The deadline is measured in elapsed time rather than in loop iterations, because each iteration
+  costs its sleep plus however long the tick's `nvidia-smi` probes and heartbeat upload took: on a
+  degraded host a 60-tick count stretched to roughly 47 minutes, past the provider's own 3000s
+  grace, which reports the retriable `stalled` and bills the dead run through its retries. Only
+  optimizer steps recognised by the shared verl step parser count as progress, so a pre-training
+  diagnostic such as `global_step: 1` no longer switches the detector off for the rest of the run,
+  and a resumed attempt reports steps taken by the current child rather than the restored step it
+  started from. Genuinely new output resets the window, so the 600s teacher bridge request and the
   warmup-dominated first step are unaffected.
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,

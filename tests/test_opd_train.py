@@ -5288,6 +5288,7 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
         on_line=lambda _line: None,
         child_heartbeat=lambda: None,
         liveness_fields=dict,
+        liveness_progress=lambda: 0,
         child_tail=None,
         child_tail_stall_event=threading.Event(),
         wandb_link={"wandb_url": None, "wandb_id": None},
@@ -6770,7 +6771,7 @@ def test_opd_stall_abort_reason_states_only_what_was_observed():
     reason = opd_runner._CHILD_STALL_ABORT_REASON
     assert "no new output" in reason
     assert "optimizer step" in reason
-    assert str(hb.CHILD_TAIL_STALL_TICKS) in reason, (
+    assert str(round(hb.CHILD_TAIL_STALL_S / 60)) in reason, (
         "the threshold that fired belongs in the message; a bare 'no progress' leaves the reader "
         "unable to tell a wedge from an impatient watchdog"
     )
@@ -6803,8 +6804,66 @@ def test_a_resumed_child_still_reports_silence_before_its_own_first_step():
     assert callbacks.liveness_fields()["child_tail_silent_ticks"] == 1
 
     # once THIS child takes a step past the resume point, progress is real and reporting stops.
-    callbacks.on_step(121)
+    # driven through on_line, because that is the path carrying the VALIDATED step number.
+    callbacks.on_line("step:121 - actor/distillation/loss:0.5\n")
     assert callbacks.liveness_fields() == {}
+
+
+def test_a_pre_training_diagnostic_step_does_not_silence_the_stall_signal():
+    """`global_step: 1` is not an optimizer step, and must not switch the watchdog off.
+
+    `run_verl_training` scans stdout with a loose `step:\\s*(\\d+)` and calls `on_step` on any match,
+    including "global_step: 1" and a path ending in "step: 1" -- shapes the shared `verl_step_number`
+    parser explicitly refuses. Gating on that loose value meant ONE pre-training diagnostic line
+    made `stall_tail_fields` return {} permanently, so a child that then wedged before its first
+    real update could never be condemned and billed until the provider timeout.
+    """
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    watcher = SimpleNamespace(raise_if_failed=lambda: None)
+    progress_state = SimpleNamespace(record_step=lambda *_args: None)
+    callbacks = opd_runner._build_child_callbacks(watcher, progress_state, object(), 0)
+
+    # the loose scan matches this and drives on_step; the validated parser does not.
+    callbacks.on_step(1)
+    callbacks.on_line("saving checkpoint to /ckpt/global_step: 1\n")
+
+    fields = callbacks.liveness_fields()
+    assert "child_tail_silent_ticks" in fields, (
+        "a pre-training diagnostic was counted as an optimizer step, so the wedge detector went "
+        "silent for the rest of the run"
+    )
+
+    # a genuine step line does stop it.
+    callbacks.on_line("step:1 - actor/distillation/loss:0.5\n")
+    assert callbacks.liveness_fields() == {}
+
+
+def test_liveness_progress_is_attempt_local_on_a_resumed_run():
+    """The daemon's progress value must not tighten the provider's stall window on a resume.
+
+    `poll.is_training_heartbeat` treats an `opd_step` heartbeat carrying step >= 1 as proof that
+    cold start is over and swaps the 3000s setup grace for the 1500s training window. Publishing the
+    ABSOLUTE restored step does that on the first tick of a resumed attempt, so the provider reports
+    the retriable "stalled" five minutes before this watchdog's own deadline can fire -- which is
+    the retry-and-rebill path the watchdog exists to cut off.
+    """
+    import flash.engine.worker.opd_train_runner as opd_runner
+    from flash.providers._lifecycle.poll import is_training_heartbeat
+
+    watcher = SimpleNamespace(raise_if_failed=lambda: None)
+    progress_state = SimpleNamespace(record_step=lambda *_args: None)
+    callbacks = opd_runner._build_child_callbacks(watcher, progress_state, object(), 120)
+
+    assert callbacks.liveness_progress() == 0
+    assert not is_training_heartbeat("opd_step", callbacks.liveness_progress()), (
+        "a resumed attempt's first liveness tick flipped the provider out of its setup grace"
+    )
+
+    # a real step by THIS child is real training progress and should tighten the window.
+    callbacks.on_line("step:121 - actor/distillation/loss:0.5\n")
+    assert callbacks.liveness_progress() == 1
+    assert is_training_heartbeat("opd_step", callbacks.liveness_progress())
 
 
 def test_transfer_queue_init_passes_the_config_through_and_returns():
