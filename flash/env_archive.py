@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 import lzma
+import stat
 import tarfile
 import time
 import zipfile
@@ -73,6 +74,45 @@ def _zip_extra_payloads(extra: bytes) -> Iterator[bytes]:
         at = end
 
 
+_ZIP_LOCAL_HEADER_BYTES = 30
+_ZIP_SYMLINK_TARGET_BYTES = 64 << 10
+
+
+def _zip_local_extra(source: Path | bytes, info: zipfile.ZipInfo) -> bytes | None:
+    """The extra field in a member's local header, or None when it cannot be read."""
+    header = _read_at(source, info.header_offset, _ZIP_LOCAL_HEADER_BYTES)
+    if header is None or len(header) != _ZIP_LOCAL_HEADER_BYTES or header[:4] != b"PK\x03\x04":
+        return None
+    name_size = int.from_bytes(header[26:28], "little")
+    extra_size = int.from_bytes(header[28:30], "little")
+    extra = _read_at(source, info.header_offset + _ZIP_LOCAL_HEADER_BYTES + name_size, extra_size)
+    return extra if extra is not None and len(extra) == extra_size else None
+
+
+def _zip_metadata_kind(
+    source: Path | bytes,
+    info: zipfile.ZipInfo,
+    metadata: MetadataScanner,
+    refusal: type[Exception],
+) -> str | None:
+    """The credential kind in one entry's central and local metadata, or None."""
+    if info.comment and (kind := metadata(info.comment)):
+        return kind
+    local_extra = _zip_local_extra(source, info)
+    if local_extra is None:
+        raise refusal("contains an archive member this check cannot read")
+    for extra in (info.extra, local_extra if local_extra != info.extra else b""):
+        for payload in _zip_extra_payloads(extra):
+            if payload and (kind := metadata(payload)):
+                return kind
+    return None
+
+
+def _zip_is_symlink(info: zipfile.ZipInfo) -> bool:
+    """Whether a Unix-created zip entry records a symbolic link."""
+    return info.create_system == 3 and stat.S_ISLNK(info.external_attr >> 16)
+
+
 def credential_in_zip(
     source: Path | bytes,
     *,
@@ -118,15 +158,9 @@ def credential_in_zip(
             # refused that same string on its own.
             if kind := named(info.filename.rstrip("/")):
                 return kind
-            # each entry comment is another exact central-directory value. checking it before the
-            # directory shortcut covers comments attached to directory entries as well as files.
-            if info.comment and (kind := metadata(info.comment)):
+            # central and local headers can publish different metadata, so both are inspected.
+            if kind := _zip_metadata_kind(source, info, metadata, refusal):
                 return kind
-            # each extra record's data is exact metadata too. the binary tag and size are framing,
-            # so including them in one raw scan made the encoded value speculative rather than whole.
-            for payload in _zip_extra_payloads(info.extra):
-                if payload and (kind := metadata(payload)):
-                    return kind
             if info.is_dir():
                 continue
             # Bit 0 of the general-purpose flags marks an encrypted member. Its bytes cannot be
@@ -143,7 +177,15 @@ def credential_in_zip(
                 continue
             try:
                 with archive.open(info) as member:
-                    if kind := scan(member, deadline, depth):
+                    if _zip_is_symlink(info):
+                        target = member.read(_ZIP_SYMLINK_TARGET_BYTES + 1)
+                        if len(target) > _ZIP_SYMLINK_TARGET_BYTES:
+                            raise refusal("contains a symlink target too large to inspect")
+                        if kind := named(target.decode("utf-8", "replace")):
+                            return kind
+                        if kind := scan(io.BytesIO(target), deadline, depth):
+                            return kind
+                    elif kind := scan(member, deadline, depth):
                         return kind
             except NotImplementedError:
                 # The member is valid but uses a compression method this Python has no decompressor
@@ -654,7 +696,10 @@ def _credential_in_binary_cpio(
         if (order := _binary_cpio_order(data[at : at + _CPIO_PROBE_BYTES])) is None:
             raise refusal("contains an archive member this check cannot read")
         name_size = int.from_bytes(header[20:22], order)
-        size = int.from_bytes(header[22:26], order)
+        # the size is a pair of 16-bit halfwords, most significant first, not one 32-bit word.
+        # accepting a second spelling would give a crafted archive two possible member lengths
+        # and let it hide bytes behind whichever one this walk did not take.
+        size = (int.from_bytes(header[22:24], order) << 16) | int.from_bytes(header[24:26], order)
         name_at = at + _CPIO_BINARY_HEADER
         name_end = name_at + name_size
         body_at = (name_end + 1) & ~1

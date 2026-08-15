@@ -45,9 +45,9 @@ from flash.env_buffers import (
     _blocks_of,
     _looks_like_container,
     _looks_like_container_head,
+    _looks_like_source_container,
     _paired_markers_kind,
     _paired_state,
-    _wide_runs,
     _zlib_prefix_inflates,
 )
 from flash.env_deflate import (
@@ -93,6 +93,7 @@ from flash.env_openpgp import (
 from flash.env_patterns import _MAX_BODY, _match, _unfinished_private_key_armor
 from flash.env_policy import _unexpandable_format, _uninspectable_reason
 from flash.env_redact import redacted_name
+from flash.env_wide import credential_in_wide_runs
 
 # Carried between chunks so a credential straddling a chunk boundary is still matched. Derived from
 # `_MAX_BODY` rather than written as a bare number, so the two cannot drift apart: the overlap must
@@ -196,6 +197,7 @@ def _credential_kind(
     truncated: bool = False,
     paired: bool = True,
     shell: bool = False,
+    rejoin: bool = True,
 ) -> str | None:
     """The kind of credential `data` contains under any of its plausible text encodings.
 
@@ -217,31 +219,26 @@ def _credential_kind(
     costs nothing on genuine UTF-16/32 and leaves machine code with nothing long enough to match.
     """
     if kind := _decoded_kind(
-        data, deadline=deadline, depth=depth, truncated=truncated, paired=paired, shell=shell
+        data,
+        deadline=deadline,
+        depth=depth,
+        truncated=truncated,
+        paired=paired,
+        shell=shell,
+        rejoin=rejoin,
     ):
         return kind
     if b"\x00" not in data:
         return None
-    for width, keep in ((2, (0, 1)), (4, (0, 3))):
-        for offset in keep:
-            # take every `width`-th byte: for UTF-16 that is the ASCII half of each code unit, in
-            # whichever of the two byte orders the file used.
-            for run in _wide_runs(data, width, offset):
-                # `truncated` is carried through. Dropping it told the base64 path that every
-                # narrowed run ended where the file did, so an encoded container crossing a chunk
-                # boundary had its first fragment treated as a complete value while later fragments
-                # began mid-stream and could not be expanded from either side. Measured: the same
-                # base64 gzip refused as narrow text returned clean in UTF-16LE.
-                if kind := _decoded_kind(
-                    run,
-                    deadline=deadline,
-                    depth=depth,
-                    truncated=truncated,
-                    paired=paired,
-                    shell=shell,
-                ):
-                    return kind
-    return None
+    return credential_in_wide_runs(
+        data,
+        detector=_decoded_kind,
+        deadline=deadline,
+        depth=depth,
+        truncated=truncated,
+        shell=shell,
+        rejoin=rejoin,
+    )
 
 
 def _decoded_kind(
@@ -252,6 +249,7 @@ def _decoded_kind(
     truncated: bool = False,
     paired: bool = True,
     shell: bool = False,
+    rejoin: bool = True,
 ) -> str | None:
     """The kind of credential in `data` literally, or inside a base64 run within it."""
     if kind := _match(data, paired=paired) or _match_base64(
@@ -266,6 +264,8 @@ def _decoded_kind(
     #
     # Only tried when the literal pass found nothing, and `_rejoined` returns the input unchanged
     # when no seam is present, so the ordinary file pays two cheap searches and no rematch.
+    if not rejoin:
+        return None
     joined = _rejoined(data, shell=shell)
     return _match(joined, paired=paired) if joined != data else None
 
@@ -356,7 +356,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     carry = b""
     buffered = bytearray()
     tail = b""
-    container_head = False
+    container_head = source_container = False
     overflowed = False
     seen = _paired_state()
     store_head = bytearray()
@@ -379,9 +379,11 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
                 return "a key store"
             if not walking_store:
                 store_head = bytearray()
-        if not carry and (kind := _openpgp_kind(chunk, truncated=bool(upcoming))):
-            return kind
         if not carry:
+            container_head = _looks_like_container_head(chunk)
+            source_container = _looks_like_source_container(chunk)
+            if kind := _openpgp_kind(chunk, truncated=bool(upcoming)):
+                return kind
             # zstd and LZ4 both allow a metadata envelope before the real frame. What matters here
             # is only whether that prelude could be READ to its end: a frame declaring a payload
             # longer than the bytes available leaves the format undecided, and undecided is not
@@ -394,11 +396,6 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
             # short zstd and LZ4 magics that are not searched for at arbitrary offsets below.
             if fmt := _unexpandable_format(head, anchored=True):
                 raise _Unscannable(_uninspectable_reason(fmt))
-        if not carry and depth:
-            # tar as well as the compressed magics: a tar's own members are literal, but a
-            # COMPRESSED member inside one is not, so an oversized tar that went past the buffer
-            # cap is as unverifiable as an oversized gzip and must refuse rather than pass.
-            container_head = _looks_like_container_head(chunk)
         if depth and not overflowed:
             buffered.extend(chunk)
             if len(buffered) > _MAX_NESTED_BUFFER_BYTES:
@@ -456,6 +453,10 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
                 truncated=bool(upcoming),
                 paired=False,
                 shell=shell,
+                # archive framing is not source syntax, so its raw pass must not join bytes that
+                # belong to separate names, headers, or members. exact metadata and members are
+                # scanned independently by their container walkers.
+                rejoin=not source_container,
             ):
                 return kind
         except _RunTooLongToExpand:

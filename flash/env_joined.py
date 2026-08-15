@@ -165,12 +165,29 @@ def _raw_literal_spans(data: bytes) -> list[tuple[int, int]]:
     return spans
 
 
+def _ansi_c_quote_end(data: bytes, at: int) -> int:
+    """The end of a shell `$'...'` word, whose backslash escapes are evaluated."""
+    at += 2
+    while at < len(data):
+        if data[at] == 92 and at + 1 < len(data):
+            at += 2
+        elif data[at] == 39:
+            return at + 1
+        else:
+            at += 1
+    return at
+
+
 def _shell_literal_spans(data: bytes) -> list[tuple[int, int]]:
     """Quoted spans inside shell assignment words, where `\\x` remains literal text."""
     spans = []
     for assignment in _SHELL_ASSIGNMENT.finditer(data):
         at = assignment.end()
         while at < len(data) and data[at] not in _SHELL_WORD_END:
+            if data[at : at + 2] == b"$'":
+                # ansi-c quotes evaluate escapes, unlike ordinary posix single quotes.
+                at = _ansi_c_quote_end(data, at)
+                continue
             if data[at] not in (34, 39):
                 at += 2 if data[at] == 92 and at + 1 < len(data) else 1
                 continue

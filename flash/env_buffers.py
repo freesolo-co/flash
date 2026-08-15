@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from flash.env_archive import _looks_like_cpio_header
-from flash.env_formats import _looks_compressed, _looks_like_tar, _overlay_offset
+from flash.env_formats import _COMPRESSED_MAGIC, _looks_compressed, _looks_like_tar, _overlay_offset
 from flash.env_patterns import (
     _PAIRED_PATTERNS,
     SHORTEST_TOKEN_BYTES,
@@ -98,6 +98,15 @@ def _paired_markers_kind(
         if halves.paired(window, ends):
             return kind
     return None
+
+
+def _looks_like_source_container(data: bytes) -> bool:
+    """Whether source-language rejoining is invalid for this structured byte stream."""
+    return (
+        data.startswith((*_COMPRESSED_MAGIC, b"!<arch>\n", b"!<thin>\n", b"%PDF-"))
+        or _looks_like_tar(data)
+        or _looks_like_cpio_header(data)
+    )
 
 
 def _looks_like_container_head(data: bytes) -> bool:

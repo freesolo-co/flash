@@ -9897,8 +9897,13 @@ def test_legacy_binary_cpio_is_walked_in_both_byte_orders(tmp_path):
         name = b"payload.zz\0"
         fields = (0o070707, 0, 1, 0o100644, 0, 0, 1, 0)
         header = b"".join(value.to_bytes(2, order) for value in fields)
-        header += (0).to_bytes(4, order) + len(name).to_bytes(2, order)
-        header += len(payload).to_bytes(4, order)
+        # mtime and filesize are each a pair of 16-bit halfwords, most significant first, which
+        # is not the same as one 32-bit integer in either byte order. verified against gnu cpio
+        # -H bin output: a 70000-byte member stores 0x0001 then 0x1170.
+        header += (0).to_bytes(2, order) + (0).to_bytes(2, order)
+        header += len(name).to_bytes(2, order)
+        header += (len(payload) >> 16).to_bytes(2, order)
+        header += (len(payload) & 0xFFFF).to_bytes(2, order)
         data = bytearray(header + name)
         data += b"\0" * (-len(data) % 2)
         data += payload
@@ -9934,3 +9939,210 @@ def test_an_oversized_nested_ar_is_refused_before_its_buffer_is_dropped(tmp_path
         zipped.writestr("inner.a", archive)
     with pytest.raises(env_secrets._Unscannable, match="archive too large"):
         env_secrets.credential_in_file(nested)
+
+
+def test_assigned_values_on_following_lines_are_scanned(tmp_path):
+    """assignment matching must cross to a value line without adopting the next mapping key."""
+    from flash.env_secrets import credential_in_file
+
+    key = "0123456789abcdef0123456789abcdef01234567"
+    next_key = tmp_path / "next-key.yaml"
+    next_key.write_text(f"wandb_api_key:\n{key}: something\n")
+    assert credential_in_file(next_key) is None
+
+    for name, text in (
+        ("pretty.json", f'{{\n  "wandb_api_key":\n    "{key}"\n}}\n'),
+        ("value.yaml", f"wandb_api_key:\n  {key}\n"),
+    ):
+        published = tmp_path / name
+        published.write_text(text)
+        assert credential_in_file(published) == "a Weights & Biases API key", name
+
+
+def test_ansi_c_shell_quotes_decode_escapes(tmp_path):
+    """ansi-c `$'...'` evaluates escapes that ordinary posix single quotes preserve."""
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY
+    escaped = body[:10] + f"\\x{ord(body[10]):02x}" + body[11:]
+    literal = tmp_path / "literal.sh"
+    literal.write_text(f"API_KEY='fslo_{escaped}'\n")
+    assert credential_in_file(literal) is None
+
+    published = tmp_path / "ansi-c.sh"
+    published.write_text(f"API_KEY=$'fslo_{escaped}'\n")
+    assert credential_in_file(published) == "a Freesolo API key"
+
+
+def test_zip_local_header_extra_payloads_are_scanned(tmp_path):
+    """zip local-header extra fields may differ from the central copy exposed by zipfile."""
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+
+    def archive(path):
+        with zipfile.ZipFile(path, "w") as zipped:
+            info = zipfile.ZipInfo("harmless.txt")
+            info.extra = b"\xff\xff" + len(encoded).to_bytes(2, "little") + encoded
+            zipped.writestr(info, b"harmless\n")
+
+    control = tmp_path / "central-extra.zip"
+    archive(control)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(control)
+
+    published = tmp_path / "local-extra.zip"
+    archive(published)
+    raw = bytearray(published.read_bytes())
+    central = raw.index(b"PK\x01\x02")
+    name_size = int.from_bytes(raw[central + 28 : central + 30], "little")
+    extra_size = int.from_bytes(raw[central + 30 : central + 32], "little")
+    extra_at = central + 46 + name_size
+    raw[extra_at + 4 : extra_at + extra_size] = b"x" * (extra_size - 4)
+    published.write_bytes(raw)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
+
+
+def test_gzip_extra_subfield_payloads_are_scanned(tmp_path):
+    """gzip fextra subfield payloads are published metadata, like its filename and comment."""
+    import gzip
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    ordinary = gzip.compress(b"harmless\n", mtime=0)
+
+    named_header = bytearray(ordinary[:10])
+    named_header[3] |= 0x08
+    named = tmp_path / "named.gz"
+    named.write_bytes(bytes(named_header) + encoded + b"\0" + ordinary[10:])
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(named)
+
+    extra_header = bytearray(ordinary[:10])
+    extra_header[3] |= 0x04
+    subfield = b"ZZ" + len(encoded).to_bytes(2, "little") + encoded
+    published = tmp_path / "extra.gz"
+    published.write_bytes(
+        bytes(extra_header) + len(subfield).to_bytes(2, "little") + subfield + ordinary[10:]
+    )
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
+
+
+def test_little_endian_binary_cpio_combines_size_halfwords(tmp_path):
+    """binary cpio stores each 32-bit size as a high halfword followed by a low halfword."""
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    payload = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+
+    def archive(order: str) -> bytes:
+        name = b"payload.zz\0"
+        fields = (0o070707, 0, 1, 0o100644, 0, 0, 1, 0)
+        header = b"".join(value.to_bytes(2, order) for value in fields)
+        header += (0).to_bytes(2, order) * 2 + len(name).to_bytes(2, order)
+        high, low = divmod(len(payload), 1 << 16)
+        header += high.to_bytes(2, order) + low.to_bytes(2, order)
+        data = bytearray(header + name)
+        data += b"\0" * (-len(data) % 2)
+        data += payload
+        data += b"\0" * (-len(data) % 2)
+        return bytes(data)
+
+    for order in ("big", "little"):
+        published = tmp_path / f"{order}-standard.cpio"
+        published.write_bytes(archive(order))
+        assert credential_in_file(published) == "a Freesolo API key", order
+
+
+def test_archive_raw_bytes_are_not_rejoined_as_shell_source(tmp_path):
+    """archive framing must not join a member name to unrelated member bytes as shell source."""
+    import zipfile
+
+    from flash.env_secrets import credential_in_file
+
+    first, rest = _FAKE_KEY_BODY[:10], _FAKE_KEY_BODY[10:]
+    control = tmp_path / "control.sh"
+    control.write_text(f"API_KEY=fslo_{first}\\\n{rest}\n")
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    published = tmp_path / "archive.sh"
+    with zipfile.ZipFile(published, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr(f"API_KEY=fslo_{first}\\", f"\n{rest}\n")
+    assert credential_in_file(published) is None
+
+
+def test_inline_images_inside_flate_pdf_streams_are_inspected(tmp_path):
+    """inline images inside an inflated page content stream need a second inline-image walk."""
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    packed_key = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+    inline = b"BI /W 21 /H 1 /CS /G /BPC 8 /F /Fl ID " + packed_key + b" EI\n"
+
+    raw = tmp_path / "raw-inline.pdf"
+    raw.write_bytes(
+        b"%PDF-1.4\n4 0 obj\n<< /Length 100 >>\nstream\n"
+        + inline
+        + b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+    )
+    assert credential_in_file(raw) == "a Freesolo API key"
+
+    content = zlib.compress(inline)
+    published = tmp_path / "compressed-inline.pdf"
+    published.write_bytes(_flate_pdf(b"/Filter /FlateDecode", content))
+    assert credential_in_file(published) == "a Freesolo API key"
+
+
+def test_paired_credentials_are_scanned_in_wide_text(tmp_path):
+    """utf-16 and utf-32 narrowed views must retain paired jwk and netrc detection."""
+    from flash.env_secrets import credential_in_file
+
+    cases = (
+        ("jwk", f'{{"kty":"RSA","n":"public-only","d":"{_FAKE_KEY_BODY}"}}\n', "a private key"),
+        (
+            "netrc",
+            f"machine api.wandb.ai\n  login user\n  password {_FAKE_KEY_BODY}\n",
+            "a machine password in a netrc file",
+        ),
+    )
+    for name, text, expected in cases:
+        control = tmp_path / f"{name}-utf8.txt"
+        control.write_text(text)
+        assert credential_in_file(control) == expected
+        for encoding in ("utf-16-le", "utf-32-le"):
+            published = tmp_path / f"{name}-{encoding}.txt"
+            published.write_bytes(text.encode(encoding))
+            assert credential_in_file(published) == expected, (name, encoding)
+
+
+def test_zip_symlink_targets_are_scanned_like_names(tmp_path):
+    """a zip symlink target path is published metadata and needs filename semantics."""
+    import stat
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    target = f"safe/{encoded.decode()}.json"
+
+    control = tmp_path / "named.zip"
+    with zipfile.ZipFile(control, "w") as archive:
+        archive.writestr(target, b"harmless\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(control)
+
+    published = tmp_path / "linked.zip"
+    with zipfile.ZipFile(published, "w", zipfile.ZIP_DEFLATED) as archive:
+        info = zipfile.ZipInfo("safe-link")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, target.encode())
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)

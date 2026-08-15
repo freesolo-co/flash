@@ -323,8 +323,20 @@ class _TooManyStreams(Exception):
 _LATIN1_TEXT = frozenset(range(0x20, 0x7F)) | frozenset(range(0xA0, 0x100))
 
 
-def _gzip_header_parts(probe: bytes) -> tuple[bytes | None, bytes | None, bool]:
-    """The gzip name, comment, and whether its header consumes the available probe.
+def _gzip_extra_payloads(extra: bytes) -> Iterator[bytes]:
+    """The payload of each complete RFC 1952 extra subfield."""
+    at = 0
+    while at + 4 <= len(extra):
+        size = int.from_bytes(extra[at + 2 : at + 4], "little")
+        end = at + 4 + size
+        if end > len(extra):
+            return
+        yield extra[at + 4 : end]
+        at = end
+
+
+def _gzip_header_parts(probe: bytes) -> tuple[tuple[bytes, ...], bytes | None, bytes | None, bool]:
+    """The gzip extra payloads, name, comment, and whether the header consumes the probe.
 
     RFC 1952 puts a fixed 10-byte header first, then four optional fields the flag byte announces: an
     extra field of up to 65,535 bytes, a NUL-terminated name, a NUL-terminated comment, and a 2-byte
@@ -344,16 +356,17 @@ def _gzip_header_parts(probe: bytes) -> tuple[bytes | None, bytes | None, bool]:
 
     The boolean means only "payload not yet judgeable". It is not a claim that the stream is real,
     so a candidate reaching it is expanded and judged there rather than accepted here. Both text
-    fields are returned exactly as stored, so published metadata goes through the name scanner too.
+    metadata fields are returned exactly as stored, so published values reach the name scanner too.
     """
     if len(probe) < 12 or not probe.startswith(b"\x1f\x8b\x08"):
-        return None, None, False
+        return (), None, None, False
     flags = probe[3]
     # The two reserved bits must be clear: no real header sets them, and requiring that is most of
     # what keeps a chance magic from looking like a header at all.
     if flags & 0b11100000:
-        return None, None, False
+        return (), None, None, False
     at = 10
+    extras: tuple[bytes, ...] = ()
     name: bytes | None = None
     comment: bytes | None = None
     # The extra field declares a LENGTH, so it is decided by arithmetic. A chance length is small
@@ -361,7 +374,8 @@ def _gzip_header_parts(probe: bytes) -> tuple[bytes | None, bytes | None, bool]:
     if flags & 0b100:
         at = 12 + int.from_bytes(probe[10:12], "little")
         if at >= len(probe):
-            return name, comment, True
+            return extras, name, comment, True
+        extras = tuple(_gzip_extra_payloads(probe[12:at]))
     # FNAME and FCOMMENT are NUL-terminated and unbounded, so a legal one longer than the probe
     # reaches the end with no terminator -- the same "payload not reached yet" the extra field
     # reports by arithmetic. Excluding them meant a valid stream with an 80 KiB name inflated to
@@ -378,11 +392,11 @@ def _gzip_header_parts(probe: bytes) -> tuple[bytes | None, bytes | None, bool]:
     for present in (0b1000, 0b10000):
         if flags & present:
             if at >= len(probe):
-                return name, comment, True
+                return extras, name, comment, True
             end = probe.find(b"\0", at)
             if end < 0:
                 unterminated = probe[at:]
-                return name, comment, all(byte in _LATIN1_TEXT for byte in unterminated)
+                return extras, name, comment, all(byte in _LATIN1_TEXT for byte in unterminated)
             if present == 0b1000:
                 name = probe[at:end]
             else:
@@ -390,12 +404,12 @@ def _gzip_header_parts(probe: bytes) -> tuple[bytes | None, bytes | None, bool]:
             at = end + 1
     if flags & 0b10:
         at += 2
-    return name, comment, len(probe) - at < 2
+    return extras, name, comment, len(probe) - at < 2
 
 
 def _gzip_header_unfinished(probe: bytes) -> bool:
     """Whether a gzip header consumes the probe before two payload bytes are visible."""
-    return _gzip_header_parts(probe)[2]
+    return _gzip_header_parts(probe)[3]
 
 
 class _GzipHeaderTooLarge(Exception):
@@ -415,9 +429,9 @@ def _gzip_metadata(source: Path | bytes, limit: int = 4 << 20) -> tuple[bytes, .
         else:
             with source.open("rb") as handle:
                 probe = handle.read(wanted)
-        name, comment, unfinished = _gzip_header_parts(probe)
+        extras, name, comment, unfinished = _gzip_header_parts(probe)
         if not unfinished:
-            return tuple(part for part in (name, comment) if part is not None)
+            return extras + tuple(part for part in (name, comment) if part is not None)
         if len(probe) >= source_size:
             return ()
         if wanted >= limit:
@@ -623,7 +637,12 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
             plain = inflate.decompress(body, budget)
         except zlib.error:
             continue
-        yield None if inflate.unconsumed_tail else _undo_ascii85(plain, after)
+        if inflate.unconsumed_tail:
+            yield None
+            continue
+        decoded = _undo_ascii85(plain, after)
+        yield decoded
+        yield from _pdf_inline_payloads(decoded, budget)
     # Stopping at the bound silently reported every later stream as clean, so a document with one
     # more stream than the limit published the credential in it. Undecided is not clean, and every
     # other bound here already refuses rather than truncating -- this one returned a verdict.

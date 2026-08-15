@@ -181,9 +181,11 @@ def _json_escapable(text: bytes, *, fold_case: bool = False) -> bytes:
     )
 
 
-# horizontal space surrounds the assignment operator. `\s*` crossed a newline after a null yaml
-# value and adopted an unrelated 40-hex mapping key on the next line, making a harmless config
-# unpublishable. block scalars cross lines explicitly through `_BLOCK_SCALAR` instead.
+# an ordinary scalar may begin on the following line, but a credential-shaped mapping key there is
+# not the assigned value. the trailing check distinguishes the two by the `:` or `=` after a key.
+_ASSIGNMENT_GAP = rb"[ \t]*(?:\r?\n[ \t]*)?"
+_NOT_MAPPING_KEY = rb"(?!(?:[\"'][ \t]*)?[:=])"
+
 _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     (
         "a Weights & Biases API key",
@@ -193,11 +195,13 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
             # loads identically.
             rb"(?i:"
             + _json_escapable(b"wandb_api_key", fold_case=True)
-            + rb")[\"']?[ \t]*[:=][ \t]*"
+            + rb")[\"']?[ \t]*[:=]"
+            + _ASSIGNMENT_GAP
             + _BLOCK_SCALAR
             + _NODE_PROPERTIES
             + _OPEN_QUOTE
-            + rb"([A-Za-z0-9_-]{40,%d})" % _MAX_BODY
+            + rb"([A-Za-z0-9_-]{40,%d})(?![A-Za-z0-9_-])" % _MAX_BODY
+            + _NOT_MAPPING_KEY
         ),
     ),
     (
@@ -216,7 +220,8 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
             + _json_escapable(b"aws_secret_access_key", fold_case=True)
             + rb"|(?<![A-Za-z0-9_])"
             + _json_escapable(b"secretaccesskey", fold_case=True)
-            + rb")[\"']?[ \t]*[:=][ \t]*"
+            + rb")[\"']?[ \t]*[:=]"
+            + _ASSIGNMENT_GAP
             + _BLOCK_SCALAR
             + _NODE_PROPERTIES
             + _OPEN_QUOTE
@@ -226,6 +231,7 @@ _ASSIGNED_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
             # SAME key published clean purely because of how the document was serialized. Each
             # position admits the escaped spelling; the count stays 40 DECODED characters.
             + rb"((?:[A-Za-z0-9+=]|\\?/){40})(?![A-Za-z0-9/+=])"
+            + _NOT_MAPPING_KEY
         ),
     ),
 )
