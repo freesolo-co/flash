@@ -10,12 +10,22 @@ import os
 import random
 import shutil
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
+from flash.engine.worker.train.opd.reporting import (
+    _build_train_note_sections as _build_train_note_sections,
+)
+from flash.engine.worker.train.opd.state import (
+    _ChildCallbacks,
+    _ChildResult,
+    _OpdRequest,
+    _PromptState,
+    _RuntimeState,
+    _WorkloadState,
+)
 from flash.engine.worker.verl.child_io import (
     LORA_ROLLOUT_GUARD_SHIM,
     render_lora_rollout_guard_fragment,
@@ -24,92 +34,6 @@ from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
     resolve_reshard_after_forward,
 )
-
-
-@dataclass(frozen=True)
-class _OpdRequest:
-    spec: Any
-    env: Any
-    multi_turn: bool
-    max_turns: int
-    knobs: Any
-    model_id: str
-    model_revision: str
-    structured_outputs: Any = None
-    model_vocab_size: int | None = None
-
-
-@dataclass(frozen=True)
-class _PromptState:
-    teacher: Any
-    tokenizer: Any
-    thinking_prefill: str
-    max_model_len: int
-    prompt_budget: int
-    prompts: list[Any]
-    dropped_long: int
-
-
-@dataclass(frozen=True)
-class _WorkloadState:
-    prompts_per_step: int
-    update_horizon: int
-    prompt_pool_fingerprint: str
-    workdir: str
-    shim_dir: str
-    local_dir: str
-    export_root: str
-    mutation_failure_path: str
-    score_delivery_failure_path: str
-    abandonment_failure_path: str
-    resample_failure_path: str
-    cycle_commit_failure_path: str
-    train_file: str
-    val_file: str
-    lora_rank: int
-    lora_alpha: int
-    target_modules: Any
-    warmstart_adapter: str | None
-
-
-@dataclass(frozen=True)
-class _RuntimeState:
-    python_bin: str
-    model_path: str
-    gpu_count: int
-    save_freq: int
-    loggers: list[str]
-    project_name: str
-    experiment_name: str
-    gdn_reset_arch: str | None
-    entry_path: str
-    reward_path: str
-    resume_step: int
-    resume_state: dict[str, Any] | None
-    bridge: Any
-
-
-@dataclass(frozen=True)
-class _ChildCallbacks:
-    on_line: Any
-    on_step: Any
-    child_heartbeat: Any
-    liveness_fields: Any
-    progress: dict[str, Any]
-    wandb_link: dict[str, str | None]
-    child_tail: Any
-
-
-@dataclass(frozen=True)
-class _ChildResult:
-    final_accounting: dict[str, Any]
-    actor_dir: str
-    final_step: int
-    train_wall: float
-    peak_gpu_gb: float
-    train_started_at: float
-    wandb_url: str | None
-    wandb_id: str | None
 
 
 def _prepare_request(spec: Any) -> _OpdRequest:
@@ -444,16 +368,12 @@ def _materialize_child_files(
         int(getattr(request.spec.gpu, "count", 1) or 1),
         workload.prompts_per_step * knobs.group_size,
     )
-    save_freq = (
-        math.gcd(*knobs.save_at_steps)
-        if knobs.save_at_steps
-        else max(1, min(knobs.save_every, workload.update_horizon))
-    )
+    default_save_freq = max(1, min(knobs.save_every, workload.update_horizon))
+    save_freq = math.gcd(*knobs.save_at_steps) if knobs.save_at_steps else default_save_freq
     # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
     loggers = _opd_train.resolve_verl_loggers(caps)
-    project_name = (
-        request.spec.wandb.project if request.spec and request.spec.wandb else None
-    ) or "flash"
+    wandb = request.spec.wandb if request.spec else None
+    project_name = wandb.project if wandb and wandb.project else "flash"
     experiment_name = _opd_train._w.wandb_run_name()
     entry_path, reward_path = _write_child_shims(
         request,
@@ -925,80 +845,3 @@ def _export_and_upload_adapter(
     )
     _opd_train._w.hf_upload_folder(adapter_dir, "adapter", required=True)
     return adapter_dir
-
-
-def _build_train_note_sections(
-    request: _OpdRequest,
-    prompt_state: _PromptState,
-    workload: _WorkloadState,
-    runtime: _RuntimeState,
-    result: _ChildResult,
-    download_seconds: float,
-) -> tuple[
-    dict[str, Any],
-    dict[str, Any],
-    dict[str, Any],
-    tuple[dict[str, Any], dict[str, Any]],
-]:
-    final_accounting = result.final_accounting
-    knobs = request.knobs
-    initial = {
-        "epochs": knobs.epochs,
-        "retained_prompts": len(prompt_state.prompts),
-        "dropped_long_prompts": prompt_state.dropped_long,
-        "method": "gkd",
-        "init_from_adapter": request.spec.train.init_from_adapter or None,
-        "teacher_model": knobs.teacher_model,
-        "download_seconds": download_seconds,
-        "thinking": _opd_train._w.THINKING,
-        "loss_curve": final_accounting["loss_curve"],
-        "mean_coverage": (
-            float(final_accounting["coverage_sum"]) / int(final_accounting["aligned_sequences"])
-            if final_accounting["aligned_sequences"]
-            else 0.0
-        ),
-    }
-    accounting = {
-        "truncated_rollouts": int(final_accounting["truncated_rollouts"]),
-        "forced_tokens": int(final_accounting["forced_tokens"]),
-        "dropped_forced_groups": int(final_accounting["dropped_forced_groups"]),
-        "teacher_input_tokens": int(final_accounting["teacher_input_tokens"]),
-        "teacher_output_tokens": int(final_accounting["teacher_output_tokens"]),
-        "aligned_sequences": int(final_accounting["aligned_sequences"]),
-        "empty_alignments": int(final_accounting["empty_alignments"]),
-        "teacher_ok": int(final_accounting["teacher_ok"]),
-    }
-    training = {
-        "temperature": knobs.temperature,
-        "group_size": knobs.group_size,
-        "prompts_per_step": workload.prompts_per_step,
-        "max_completion_len": knobs.max_completion,
-        "multi_turn": request.multi_turn,
-        "max_turns": request.max_turns if request.multi_turn else None,
-        "episodes": int(final_accounting["episodes_seen"]) if request.multi_turn else None,
-        "mean_turns_per_episode": (
-            int(final_accounting["mt_turn_records"]) / int(final_accounting["episodes_seen"])
-            if request.multi_turn and final_accounting["episodes_seen"]
-            else None
-        ),
-    }
-    backend = (
-        {
-            "rollout_backend": "verl_vllm",
-            "verl_version": "0.8.0",
-            "verl_backend": "fsdp",
-            # report the EXECUTED width, not the allocation: the card count here would claim a
-            # sequence-parallel run that did not happen. token-balanced batching makes every
-            # allocated rank a dp rank, so unlike sft the executed dp width IS the card count.
-            "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
-            "data_parallel_size": runtime.gpu_count,
-        },
-        {
-            "peak_gpu_gb": result.peak_gpu_gb,
-            "warm_started": bool(workload.warmstart_adapter),
-            "resumed": bool(runtime.resume_step),
-            "wandb_project": runtime.project_name if "wandb" in runtime.loggers else None,
-            "wandb_run_name": runtime.experiment_name if "wandb" in runtime.loggers else None,
-        },
-    )
-    return initial, accounting, training, backend

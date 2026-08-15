@@ -336,6 +336,7 @@ def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
         retry_budget=_RetryBudget(0, 1, 0),
         failed_providers=set(),
         tried_classes=set(),
+        capacity_refusals={},
         seed=1,
         log=io.StringIO(),
     )

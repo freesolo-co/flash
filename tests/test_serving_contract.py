@@ -337,9 +337,12 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
         *,
         expected_identity=None,
         require_provenance=True,
+        budget_s=None,
     ):
         assert adapter_revision == revision
         assert expected_identity["metadata"]["hf_revision"] == sha
+        # the readiness wait is funded from the base model's own budget, never the bare default
+        assert budget_s == deploy.revision_ready_budget_seconds("Qwen/Qwen3.5-0.8B")
         events.append("ready")
         return {}
 
