@@ -294,6 +294,88 @@ def test_env_test_validates_evaluation_sidecar_offline(monkeypatch, tmp_path, ca
     assert "overall: PASS" in output
 
 
+def test_env_test_validates_episode_suite_with_finished_state(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self):\n"
+        "        return [EvalCase(id='episode', input='finish the exchange', expected=[\n"
+        "            {'role': 'assistant', 'content': 'first'},\n"
+        "            {'role': 'assistant', 'content': 'second'},\n"
+        "        ])]\n"
+        "    def score(self, case, response, state):\n"
+        "        turns = [m['content'] for m in state['messages'] if m['role'] == 'assistant']\n"
+        "        return response == 'second' and turns == ['first', 'second']\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class _CountingEnv(_MultiTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.starts = 0
+
+        def new_rollout_state(self, example):
+            self.starts += 1
+            return super().new_rollout_state(example)
+
+    env = _CountingEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    assert env.starts == 2  # one dataset episode and one held-out episode
+    captured = capsys.readouterr()
+    assert "evaluation suite episode: 1/1 cases passed contract checks" in captured.out
+    assert "one generation per turn" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_warns_when_episode_suite_cannot_receive_state(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'last-response'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self):\n"
+        "        return [EvalCase(id='episode', input='finish the exchange', expected=[\n"
+        "            {'role': 'assistant', 'content': 'first'},\n"
+        "            {'role': 'assistant', 'content': 'second'},\n"
+        "        ])]\n"
+        "    def score(self, case, response): return response == 'second'\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _MultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "evaluation suite last-response: 1/1 cases passed contract checks" in captured.out
+    assert captured.err.count("each episode will still be played out") == 1
+    assert "only the episode's final response text, not the transcript" in captured.err
+
+
+def test_env_test_rejects_episode_suite_for_single_turn_environment(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self): return [EvalCase(id='a', input='what is 2 + 2?', expected='4')]\n"
+        "    def score(self, case, response, state): return True\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "suite sets grades_episodes = True, but this environment is single-turn" in captured.err
+    assert "each episode will still be played out" not in captured.err
+    assert "overall: FAIL" in captured.err
+
+
 def test_env_test_rejects_an_evaluation_case_whose_image_cannot_be_resolved(
     monkeypatch, tmp_path, capsys
 ):

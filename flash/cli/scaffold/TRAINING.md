@@ -227,7 +227,7 @@ against a differently-configured environment is not measuring your run.
 For a multi-turn environment, evaluation still defaults to one prompt and one reply, which is a
 valid first-action check. Set `grades_episodes = True` on a suite to play the full episode at one
 generation per turn. Its scorer must accept `score(case, response, state)` to receive the transcript;
-otherwise it receives only the final turn's text.
+otherwise it receives only the episode's final response text.
 
 **It is also a three-example smoke test, not a dataset audit.** `flash env test` runs the
 contract checks against the **first 3 rows only** (`_DEFAULT_EPISODES = 3`, and it iterates

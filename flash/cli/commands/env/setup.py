@@ -141,7 +141,8 @@ depends on, and it is the honest scope of a single-shot evaluation.
 To grade a finished transcript instead, set `grades_episodes = True` on the suite
 and define `score(self, case, response, state)`. `env eval` then plays each case out
 against the deployed model -- generating, stepping the environment, and repeating to
-`max_episode_turns` -- and passes the resulting transcript in `state`. Such a suite
+`max_episode_turns` -- and passes the resulting transcript in `state`; without that
+argument the scorer receives only the episode's final response text. Such a suite
 needs cases the environment can actually advance (the cases below carry no `output`,
 so `step_episode` has no secret to compare against), and each case then costs one
 generation per turn rather than one in total.

@@ -9,7 +9,10 @@ from pathlib import Path
 
 from flash.cli.commands.env.episode import _effective_turn_cap
 from flash.cli.commands.env.push import _err, _resolve_local_env_entrypoint
-from flash.cli.commands.env.test_evaluations import _check_evaluation_suites
+from flash.cli.commands.env.test_evaluations import (
+    _check_evaluation_suites,
+    _normalize_prompt_images,
+)
 from flash.cli.commands.env.test_params import _env_params
 from flash.cli.commands.env.test_warnings import (
     _warn_on_low_replay_reward,
@@ -265,9 +268,12 @@ def _drive_single_turn(env, example: dict, record: dict, *, force_echo: bool = F
     )
 
 
-def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = False) -> None:
+def _drive_multi_turn(
+    env, example: dict, record: dict, *, force_echo: bool = False, score: bool = True
+) -> None:
     state = env.new_rollout_state(example)
     record["prompt"] = _check_messages(state.get("prompt") or state.get("messages"), "prompt")
+    _normalize_prompt_images(env, example, record["prompt"])
     completion = _gold_completion(env, example)
     record["completion"] = completion
     reference_turns = _reference_turns(completion)
@@ -408,9 +414,10 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     record["gold_exceeds_cap"] = policy == "replay" and len(reference_turns) > hard_cap
     record["turn_cap"] = hard_cap
     record["reference_turns"] = len(reference_turns)
-    record["reward"], record["scorer_error"], record["scored_text"] = _score_with_error(
-        env, "", example, state
-    )
+    if score:
+        record["reward"], record["scorer_error"], record["scored_text"] = _score_with_error(
+            env, "", example, state
+        )
     record["state"] = state
 
 

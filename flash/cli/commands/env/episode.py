@@ -125,7 +125,14 @@ def _effective_turn_cap(environment, state: dict) -> int:
 
 
 def _score_episode_case(
-    suite, case: EvalCase, case_id: str, state: dict, *, thinking: bool = False
+    suite,
+    case: EvalCase,
+    case_id: str,
+    state: dict,
+    *,
+    scorer,
+    state_style: str | None,
+    thinking: bool = False,
 ) -> EvalResult:
     """Grade a finished episode through the suite's own scorer.
 
@@ -136,18 +143,19 @@ def _score_episode_case(
     `reward(completion, example, state)`, which is what reaches the SDK's `score_episodes`.
 
     `EvalSuite.score(case, response)` is the published two-argument contract, so state is offered
-    only to a suite that accepts it, detected by signature rather than by try/except: a TypeError
-    raised INSIDE a scorer that does accept state would otherwise be silently retried as a
-    two-argument call and graded on the wrong text.
+    only to a suite that accepts it. The caller resolves one scorer and signature style for the
+    whole suite rather than retrying on TypeError: an error raised INSIDE a state-aware scorer must
+    not be retried as a two-argument call and graded on the wrong text.
     """
     response = state.get("response_text")
     if not isinstance(response, str):
         turns = state.get("turns") or []
         response = str(turns[-1]) if turns else ""
     eval_module = _eval_module()
-    style = _state_argument(getattr(suite, "score", None))
-    if style is None:
-        return eval_module._score_case(suite, case, case_id, response, thinking=thinking)
+    if state_style is None:
+        return eval_module._score_case(
+            suite, case, case_id, response, thinking=thinking, scorer=scorer
+        )
     return eval_module._score_case(
         suite,
         case,
@@ -155,7 +163,8 @@ def _score_episode_case(
         response,
         thinking=thinking,
         state=state,
-        state_keyword=style == "keyword",
+        state_keyword=state_style == "keyword",
+        scorer=scorer,
     )
 
 
@@ -188,14 +197,26 @@ def _state_argument(score) -> str | None:
         return "keyword"
     if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters):
         return "positional"
-    positional = [
-        p
-        for p in parameters
-        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    # (case, response) is the published contract; a third positional is the episode state. This
-    # also catches a positional-only `state`, which the named check above deliberately skips.
-    return "positional" if len(positional) >= 3 else None
+    # A positional-only parameter is supported only when it explicitly names the episode state.
+    # Treating any third positional as state silently overwrote unrelated options such as a scorer's
+    # `threshold=0.5` parameter.
+    if named_state is not None and named_state.kind is inspect.Parameter.POSITIONAL_ONLY:
+        return "positional"
+    return None
+
+
+def _warn_if_episode_state_is_hidden(suite, state_style: str | None) -> None:
+    """Warn once when full-episode work feeds a scorer that cannot see the transcript."""
+    if state_style is not None:
+        return
+    message = (
+        f"suite {getattr(suite, 'name', 'evaluation')!r} sets grades_episodes = True; "
+        "each episode will still be played out with one generation per turn, but the scorer "
+        "will receive only the episode's final response text, not the transcript. Add a third "
+        "`state` argument to "
+        "`score(case, response, state)` to grade the transcript."
+    )
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
 def _run_episode_cases(
@@ -222,14 +243,9 @@ def _run_episode_cases(
             )
             for case_id in case_ids
         )
-    if _state_argument(getattr(suite, "score", None)) is None:
-        message = (
-            f"suite {getattr(suite, 'name', 'evaluation')!r} sets grades_episodes = True; "
-            "each episode will still be played out with one generation per turn, but the scorer "
-            "will receive only the final turn's text. Add a third `state` argument to "
-            "`score(case, response, state)` to grade the transcript."
-        )
-        print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+    scorer = getattr(suite, "score", None)
+    state_style = _state_argument(scorer)
+    _warn_if_episode_state_is_hidden(suite, state_style)
     results = []
     # The adapter defaults to `thinking = False` (flash/envs/adapter.py), and with it off
     # `_scored_turn_text` returns the turn unstripped -- so `state["response_text"]` keeps its
@@ -247,7 +263,17 @@ def _run_episode_cases(
             if isinstance(outcome, str):
                 results.append(eval_module._generation_error(case_id, outcome))
                 continue
-            results.append(_score_episode_case(suite, case, case_id, outcome, thinking=thinking))
+            results.append(
+                _score_episode_case(
+                    suite,
+                    case,
+                    case_id,
+                    outcome,
+                    scorer=scorer,
+                    state_style=state_style,
+                    thinking=thinking,
+                )
+            )
     return tuple(results)
 
 

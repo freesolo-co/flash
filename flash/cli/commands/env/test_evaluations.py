@@ -76,7 +76,35 @@ def _evaluation_response(env, case) -> tuple[str, str]:
     return policy, response
 
 
+def _episode_evaluation_response(env, case) -> tuple[str, dict]:
+    """Replay one held-out episode without re-running the environment's reward."""
+    # imported here rather than at module scope: `test.py` imports THIS module.
+    from flash.cli.commands.env.test import _drive_multi_turn, _new_record
+
+    record = _new_record()
+    _drive_multi_turn(env, _evaluation_example(case), record, score=False)
+    state = record["state"]
+    response = state.get("response_text")
+    if not isinstance(response, str):
+        turns = record["responses"]
+        response = str(turns[-1]) if turns else ""
+    return response, state
+
+
+def _call_evaluation_scorer(scorer, case, response: str, state: dict, state_style: str | None):
+    if state_style is None:
+        return scorer(case, response)
+    if state_style == "keyword":
+        return scorer(case, response, state=state)
+    return scorer(case, response, state)
+
+
 def _check_evaluation_suites(entrypoint: Path, env) -> bool:
+    from flash.cli.commands.env.episode import (
+        _grades_episodes,
+        _state_argument,
+        _warn_if_episode_state_is_hidden,
+    )
     from flash.envs.evaluations import (
         _DEFAULT_EVALUATIONS_PATH,
         EvalSuiteReport,
@@ -107,9 +135,23 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
                     f"evaluation suite {suite.name} failed contract checks: suite produced no cases"
                 )
                 continue
+            episode_suite = _grades_episodes(suite)
+            if episode_suite and not getattr(env, "multi_turn", False):
+                raise TypeError(
+                    "suite sets grades_episodes = True, but this environment is single-turn "
+                    "and has no episode to play"
+                )
+            scorer = getattr(suite, "score", None)
+            state_style = _state_argument(scorer) if episode_suite else None
+            if episode_suite:
+                _warn_if_episode_state_is_hidden(suite, state_style)
             for index, case in enumerate(cases, start=1):
-                _policy, response = _evaluation_response(env, case)
-                scored = suite.score(case, response)
+                state: dict = {}
+                if episode_suite:
+                    response, state = _episode_evaluation_response(env, case)
+                else:
+                    _policy, response = _evaluation_response(env, case)
+                scored = _call_evaluation_scorer(scorer, case, response, state, state_style)
                 result = normalize_eval_result(
                     case,
                     response,

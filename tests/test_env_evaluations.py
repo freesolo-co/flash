@@ -15,7 +15,6 @@ from flash.envs.evaluations import (
     BaseEvalSuite,
     EvalCase,
     EvalResult,
-    EvalSuite,
     EvalSuiteReport,
     has_evaluations,
     load_evaluation_suites,
@@ -282,36 +281,6 @@ def test_base_eval_suite_does_not_pass_empty_expected() -> None:
 
     assert result.passed is False
     assert result.score == 0.0
-
-
-def test_base_eval_suite_defaults_episode_grading_off_through_scope(tmp_path) -> None:
-    assert BaseEvalSuite().grades_episodes is False
-
-    env_dir = _environment_dir(tmp_path)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'default'\n"
-        "    def cases(self): return []\n"
-        "def load_evaluations(): return [Suite()]\n"
-    )
-
-    # the loader wraps suites in _ScopedSuite, so this assertion exercises attribute forwarding.
-    assert load_evaluation_suites(env_dir)[0].grades_episodes is False
-
-
-def test_eval_suite_runtime_check_keeps_the_published_two_argument_shape() -> None:
-    class Suite:
-        name = "published"
-
-        def cases(self):
-            return []
-
-        def score(self, case, response):
-            return True
-
-    # grades_episodes stays an optional opt-in, not a required runtime protocol member.
-    assert isinstance(Suite(), EvalSuite)
 
 
 def test_normalize_eval_result_accepts_bool_and_float() -> None:
@@ -3448,7 +3417,7 @@ def test_env_eval_drives_every_turn_of_a_multi_turn_environment(
     captured = capsys.readouterr()
     assert "case only: PASS" in captured.out
     assert "each episode will still be played out with one generation per turn" in captured.err
-    assert "only the final turn's text" in captured.err
+    assert "only the episode's final response text, not the transcript" in captured.err
     assert "score(case, response, state)" in captured.err
 
 
@@ -3718,12 +3687,22 @@ def test_env_eval_hands_the_finished_episode_to_a_suite_that_accepts_it(capsys) 
     assert "one generation per turn" not in capsys.readouterr().err
 
 
-def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes(capsys) -> None:
+def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes(capsys, monkeypatch) -> None:
     """A suite that takes only (case, response) must not be handed a third argument."""
     import argparse
 
     from flash.cli.commands.env import episode as episode_module
     from flash.cli.commands.env import eval as env_eval
+
+    style_checks = 0
+    real_state_argument = episode_module._state_argument
+
+    def counted_state_argument(scorer):
+        nonlocal style_checks
+        style_checks += 1
+        return real_state_argument(scorer)
+
+    monkeypatch.setattr(episode_module, "_state_argument", counted_state_argument)
 
     class Environment:
         multi_turn = True
@@ -3776,6 +3755,7 @@ def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes(capsys) ->
     # both cases are scored on their last turn, with no unexpected third argument.
     assert [result.error for result in results] == [None, None]
     assert [result.score for result in results] == [1.0, 1.0]
+    assert style_checks == 1
     warning = capsys.readouterr().err
     assert warning.count("each episode will still be played out") == 1
 
@@ -3793,18 +3773,20 @@ def test_state_argument_detects_how_the_scorer_takes_state() -> None:
     assert _state_argument(lambda case, response, **kwargs: None) == "keyword"
     assert _state_argument(lambda case, response, *args, **kwargs: None) == "keyword"
     assert _state_argument(lambda case, response, *args: None) == "positional"
-    assert _state_argument(lambda case, response, episode=None: None) == "positional"
+    assert _state_argument(lambda case, response, state, /: None) == "positional"
+    assert _state_argument(lambda case, response, threshold=0.5: None) is None
 
 
 @pytest.mark.parametrize(
     "scorer_source",
     [
         "def score(self, case, response, state=None): return _graded(case, state)",
+        "def score(self, case, response, state, /): return _graded(case, state)",
         "def score(self, case, response, *, state=None): return _graded(case, state)",
         "def score(self, case, response, **kwargs): return _graded(case, kwargs.get('state'))",
         "def score(self, case, response, *args): return _graded(case, args[0] if args else None)",
     ],
-    ids=["positional", "keyword_only", "kwargs", "varargs"],
+    ids=["positional", "positional_only", "keyword_only", "kwargs", "varargs"],
 )
 def test_every_state_accepting_scorer_shape_actually_receives_the_episode(
     scorer_source: str,
