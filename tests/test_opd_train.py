@@ -6795,13 +6795,13 @@ def test_the_arming_heartbeat_never_abandons_the_shared_upload_lock(monkeypatch)
     An earlier revision bounded this call and ABANDONED the upload on a daemon thread, so the child
     launch could not be delayed. That was strictly worse than blocking. `heartbeat` holds the
     process-wide `_HB_UPLOAD_LOCK` across the commit, and the commit is unbounded because `HfApi`
-    accepts no timeout — so the orphan kept that lock forever, and every later liveness, progress
+    accepts no timeout, so the orphan kept that lock forever, and every later liveness, progress
     and terminal heartbeat could then only time out acquiring it and return False. A perfectly
     healthy long-running child went invisible to the provider and was failed as `stalled` anyway,
     which is the outcome this PR exists to prevent, reached through the code added to prevent it.
 
     Blocking is the lesser failure: bounded in practice by the upload's own retry budget, confined
-    to this run, with the provider's 3000s setup grace still the backstop — the same contract every
+    to this run, with the provider's 3000s setup grace still the backstop: the same contract every
     other setup heartbeat in the worker already has.
     """
     import flash.engine.worker.opd_train as opd_train
