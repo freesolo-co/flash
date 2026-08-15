@@ -438,36 +438,22 @@ def queue_wait_note(
     pass_now = now if classifier_now is None else classifier_now
     cadence = _health_probe_cadence(interval_s)
     candidates = []
-    if unhealthy:
-        waited = 0.0 if unhealthy_since is None else now - unhealthy_since
+    for active, since, grace, label in (
+        (unhealthy, unhealthy_since, unhealthy_grace_s, "unhealthy"),
+        (throttled, throttled_since, throttled_grace_s, "throttled"),
+    ):
+        if not active:
+            continue
+        waited = 0.0 if since is None else now - since
         remaining = _health_deadline_in(
-            unhealthy_grace_s - waited,
-            armed=unhealthy_since is not None,
+            grace - waited,
+            armed=since is not None,
             now=now,
             probe_at=probe_at,
             cadence=cadence,
-            classifier_remaining=(
-                unhealthy_grace_s
-                if unhealthy_since is None
-                else unhealthy_grace_s - (pass_now - unhealthy_since)
-            ),
+            classifier_remaining=grace if since is None else grace - (pass_now - since),
         )
-        candidates.append((remaining, health_order, waited, unhealthy_grace_s, "unhealthy", ""))
-    if throttled:
-        waited = 0.0 if throttled_since is None else now - throttled_since
-        remaining = _health_deadline_in(
-            throttled_grace_s - waited,
-            armed=throttled_since is not None,
-            now=now,
-            probe_at=probe_at,
-            cadence=cadence,
-            classifier_remaining=(
-                throttled_grace_s
-                if throttled_since is None
-                else throttled_grace_s - (pass_now - throttled_since)
-            ),
-        )
-        candidates.append((remaining, health_order, waited, throttled_grace_s, "throttled", ""))
+        candidates.append((remaining, health_order, waited, grace, label, ""))
     # the caller only asks for a note when it has just confirmed no usable or recovering worker, so
     # the capacity timer is either running or about to re-arm on the next poll. a cleared `since`
     # therefore means zero elapsed, not "not applicable": _classify_queue_state clears it via the
