@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import math
 import os
 import sys
@@ -11,9 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from flash.content.multimodal import ImageDescriptorMetadata
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
-from flash.engine.profiling.sft_image_rows import _tokenize_sft_image_row
+from flash.engine.profiling.sft_image_rows import (
+    estimate_sft_image_row,
+    process_sft_image_row,
+)
 from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
     horizon_row_count,
@@ -56,99 +59,6 @@ class PreparedSftWorkload:
     truncated_reasoning_spans: int
 
 
-def _serialize_multimodal_inputs(values: dict) -> bytes:
-    if not values:
-        return b""
-    import numpy as np
-
-    arrays = {}
-    for key, value in values.items():
-        if value is None:
-            continue
-        if hasattr(value, "detach"):
-            value = value.detach().cpu().numpy()
-        arrays[key] = np.asarray(value)
-    if not arrays:
-        return b""
-    payload = io.BytesIO()
-    np.savez(payload, **arrays)
-    return payload.getvalue()
-
-
-def _multimodal_messages_with_images(messages: list[dict], images: list[object]) -> list[dict]:
-    image_iter = iter(images)
-    prepared = []
-    for message in messages:
-        copied = dict(message)
-        content = copied.get("content")
-        if isinstance(content, list):
-            blocks = []
-            for block in content:
-                block = dict(block)
-                if block.get("type") == "image":
-                    block["image"] = next(image_iter)
-                blocks.append(block)
-            copied["content"] = blocks
-        prepared.append(copied)
-    try:
-        next(image_iter)
-    except StopIteration:
-        return prepared
-    raise ValueError("unused decoded image while preparing multimodal sft tokens")
-
-
-def _processor_tokenized_row(
-    processor,
-    prompt_messages: list[dict],
-    completion_messages: list[dict],
-    images: list[object],
-    *,
-    max_length: int,
-    thinking: bool,
-) -> tuple[list[int], list[int], bytes, int]:
-    from flash.engine.worker.model.packing import completion_mask_from_ids
-
-    prepared_prompt = _multimodal_messages_with_images(prompt_messages, images)
-    full_messages = [*prepared_prompt, *completion_messages]
-    common = {
-        "tokenize": True,
-        "return_dict": True,
-        "return_tensors": "pt",
-        "enable_thinking": thinking,
-    }
-    full = dict(
-        processor.apply_chat_template(
-            full_messages,
-            add_generation_prompt=False,
-            **common,
-        )
-    )
-    prompt = dict(
-        processor.apply_chat_template(
-            prepared_prompt,
-            add_generation_prompt=True,
-            **common,
-        )
-    )
-
-    def ids(value) -> list[int]:
-        if hasattr(value, "tolist"):
-            value = value.tolist()
-        if value and isinstance(value[0], list):
-            value = value[0]
-        return [int(item) for item in value]
-
-    untruncated_ids = ids(full.pop("input_ids"))
-    # true length BEFORE the cap: realized_max_length is measured after this slice, so it can never
-    # report more than max_length and cannot say whether the cap actually bound.
-    untruncated_length = len(untruncated_ids)
-    input_ids = untruncated_ids[:max_length]
-    prompt_ids = ids(prompt["input_ids"])[:max_length]
-    loss_mask = completion_mask_from_ids(prompt_ids, input_ids)
-    full.pop("attention_mask", None)
-    return input_ids, loss_mask, _serialize_multimodal_inputs(full), untruncated_length
-
-
 def _resolve_sft_tokenization(
     spec,
     *,
@@ -157,12 +67,7 @@ def _resolve_sft_tokenization(
     tokenizer_loader: Callable[[str, str], Any],
     processor_loader: Callable[[str, str], Any] | None,
 ):
-    """Pick how this workload turns messages into tokens, and validate it may.
-
-    Returns ``(tokenizer, processor, image_geometry)``. Exactly one of ``processor`` and
-    ``image_geometry`` is set for an image workload: the GPU worker tokenizes through the real VL
-    processor, while the torch-free control plane counts what that processor would produce.
-    """
+    """resolve the tokenizer plus exactly one image processor or geometry source."""
     from flash.content.multimodal import validate_multimodal_training
     from flash.engine.profiling.image_tokens import load_image_geometry
 
@@ -181,9 +86,6 @@ def _resolve_sft_tokenization(
             )
             tokenizer = processor.tokenizer
         else:
-            # the control plane has transformers and pillow but no torch, and the VL AutoProcessor
-            # cannot even import without torchvision. it only needs token counts, so it reads the
-            # published image geometry and expands the rendered placeholders arithmetically.
             image_geometry = load_image_geometry(spec.model, spec.model_revision)
             tokenizer = tokenizer_loader(spec.model, spec.model_revision)
     else:
@@ -207,17 +109,21 @@ def _materialize_verl_images(
     os.makedirs(image_dir, exist_ok=True)
     images = decode_image_descriptors(descriptors, package_root)
     rows: list[str] = []
-    for image_index, image in enumerate(images):
-        path = Path(image_dir, f"row-{row_index}-image-{image_index}.png").resolve()
-        image.save(path, format="PNG")
-        rows.append(path.as_uri())
-    return rows
+    try:
+        for image_index, image in enumerate(images):
+            path = Path(image_dir, f"row-{row_index}-image-{image_index}.png").resolve()
+            image.save(path, format="PNG")
+            rows.append(path.as_uri())
+        return rows
+    finally:
+        for image in images:
+            image.close()
 
 
 def _default_processor_loader(model_id: str, revision: str):
     from transformers import AutoProcessor
 
-    from flash.engine.worker.io.hf import model_revision_kwargs
+    from flash.engine.huggingface import model_revision_kwargs
 
     return AutoProcessor.from_pretrained(
         model_id,
@@ -439,9 +345,9 @@ def _tokenize_prompt_rows(
     tokenizer,
     processor,
     image_geometry,
+    validation_cache: dict[str, ImageDescriptorMetadata],
     max_length: int,
     image_dir: str | None,
-    decode_image_descriptors: Callable,
     normalize_prompt_images: Callable,
     record_has_images: Callable,
     text_only_prompt_messages: Callable,
@@ -487,19 +393,30 @@ def _tokenize_prompt_rows(
         if record_has_images(example, prompt_messages):
             normalized = normalize_prompt_images(example, prompt_messages, package_root)
             completion_messages = text_only_prompt_messages(completion_messages)
-            input_ids, loss_mask, multimodal_inputs, untruncated_length = _tokenize_sft_image_row(
-                tokenizer,
-                processor,
-                normalized.messages,
-                completion_messages,
-                normalized.descriptors,
-                package_root=package_root,
-                geometry=image_geometry,
-                max_length=max_length,
-                thinking=bool(spec.thinking),
-                decode_image_descriptors=decode_image_descriptors,
-                processor_tokenized_row=_processor_tokenized_row,
-            )
+            if processor is None:
+                input_ids, loss_mask, multimodal_inputs, untruncated_length = (
+                    estimate_sft_image_row(
+                        tokenizer,
+                        normalized.messages,
+                        completion_messages,
+                        normalized.descriptors,
+                        package_root=package_root,
+                        geometry=image_geometry,
+                        validation_cache=validation_cache,
+                        max_length=max_length,
+                        thinking=bool(spec.thinking),
+                    )
+                )
+            else:
+                input_ids, loss_mask, multimodal_inputs, untruncated_length = process_sft_image_row(
+                    processor,
+                    normalized.messages,
+                    completion_messages,
+                    normalized.descriptors,
+                    package_root=package_root,
+                    max_length=max_length,
+                    thinking=bool(spec.thinking),
+                )
             untruncated_by_index[row_index] = untruncated_length
             row_by_index[row_index] = {
                 "input_ids": input_ids,
@@ -514,11 +431,8 @@ def _tokenize_prompt_rows(
             }
             text = render_transcript([*normalized.messages, *completion_messages])
             sampled_texts.append(text)
-            # training truncates the PROCESSOR's ids, which expand each image into visual tokens the
-            # text render never contains, so measuring a span against the raw cap would call a block
-            # retained that the visual tokens had already pushed past it. every image is in the
-            # prompt (`_reject_image_completion` above), so the expansion is a constant shift on
-            # every completion position: charging it to the budget puts the two back in scale.
+            # every image is in the prompt, so visual expansion shifts every completion position by
+            # the same amount; charge that inflation before measuring reasoning against the cap.
             visual_inflation = max(0, untruncated_length - _encoded_length(tokenizer, text))
             reasoning_by_index[row_index] = _row_reasoning(
                 normalized.messages,
@@ -835,15 +749,8 @@ def prepare_sft_workload(
     source_examples: int | None = None,
     examples_preselected: bool = False,
 ) -> PreparedSftWorkload:
-    """Render, tokenize, filter, and pack the exact rows consumed by SFT.
-
-    ``require_processor`` distinguishes the two callers. The GPU worker leaves it True and builds
-    real multimodal tensors through the VL processor. The control plane sets it False: it has no
-    torch, so it counts the tokens the processor would produce instead of producing them, which is
-    all a quote reads.
-    """
+    """render, tokenize, filter, and pack the exact rows consumed by sft."""
     from flash.content.multimodal import (
-        decode_image_descriptors,
         normalize_prompt_images,
         record_has_images,
         text_only_prompt_messages,
@@ -871,6 +778,7 @@ def prepare_sft_workload(
         completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
         prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
     package_root = getattr(env, "package_root", None)
+    validation_cache: dict[str, ImageDescriptorMetadata] = {}
     multimodal = any(
         record_has_images(example, prompt_messages)
         for example, prompt_messages, _completion, _used_fallback in prompt_rows
@@ -890,9 +798,9 @@ def prepare_sft_workload(
         tokenizer=tokenizer,
         processor=processor,
         image_geometry=image_geometry,
+        validation_cache=validation_cache,
         max_length=max_length,
         image_dir=image_dir,
-        decode_image_descriptors=decode_image_descriptors,
         normalize_prompt_images=normalize_prompt_images,
         record_has_images=record_has_images,
         text_only_prompt_messages=text_only_prompt_messages,

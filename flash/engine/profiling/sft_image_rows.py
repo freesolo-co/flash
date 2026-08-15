@@ -1,41 +1,99 @@
-"""image-row tokenization shared by sft profiling paths."""
+"""explicit image-row tokenization for sft profiling and training."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import io
+from pathlib import Path
+
+from flash.content.multimodal import (
+    IMAGE_PAD_TOKEN,
+    ImageDescriptorMetadata,
+    decode_image_descriptors,
+)
+from flash.engine.profiling.image_tokens import (
+    ImageGeometry,
+    descriptor_pad_tokens,
+    expand_image_pad_runs,
+)
+from flash.engine.worker.model.packing import completion_mask_from_ids
 
 
-def _estimated_tokenized_row(
+def _serialize_multimodal_inputs(values: dict) -> bytes:
+    if not values:
+        return b""
+    import numpy as np
+
+    arrays = {}
+    for key, value in values.items():
+        if value is None:
+            continue
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        arrays[key] = np.asarray(value)
+    if not arrays:
+        return b""
+    payload = io.BytesIO()
+    np.savez(payload, **arrays)
+    return payload.getvalue()
+
+
+def _multimodal_messages_with_images(messages: list[dict], images: list[object]) -> list[dict]:
+    image_iter = iter(images)
+    prepared = []
+    for message in messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                copied_block = dict(block)
+                if copied_block.get("type") == "image":
+                    copied_block["image"] = next(image_iter)
+                blocks.append(copied_block)
+            copied["content"] = blocks
+        prepared.append(copied)
+    try:
+        next(image_iter)
+    except StopIteration:
+        return prepared
+    raise ValueError("unused decoded image while preparing multimodal sft tokens")
+
+
+def _ids(value) -> list[int]:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if value and isinstance(value[0], list):
+        value = value[0]
+    return [int(item) for item in value]
+
+
+def estimate_sft_image_row(
     tokenizer,
     prompt_messages: list[dict],
     completion_messages: list[dict],
     descriptors: list[str],
     *,
-    package_root,
-    geometry,
+    package_root: str | Path | None,
+    geometry: ImageGeometry,
+    validation_cache: dict[str, ImageDescriptorMetadata],
     max_length: int,
     thinking: bool,
-) -> tuple[list[int], list[int], int]:
-    """Tokenize one image row without a processor, for the torch-free control plane.
-
-    The plain tokenizer renders an image block to a single ``<|image_pad|>``; expanding that
-    placeholder to the run the vision tower occupies reproduces the processor's exact id sequence,
-    so the prompt/full boundary -- and therefore the completion mask -- is unchanged. the shared
-    worker validator fully loads each bounded payload before its dimensions are used here.
-    """
-    from flash.content.multimodal import IMAGE_PAD_TOKEN
-    from flash.engine.profiling.image_tokens import descriptor_pad_tokens, expand_image_pad_runs
-    from flash.engine.worker.model.packing import completion_mask_from_ids
-
+) -> tuple[list[int], list[int], bytes, int]:
+    """count the exact processor token ids without constructing image tensors."""
     pad_token_id = tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
     if not isinstance(pad_token_id, int) or pad_token_id < 0:
         raise ValueError(
             f"tokenizer does not define the image placeholder {IMAGE_PAD_TOKEN!r}, so an "
             "image-bearing sft dataset cannot be quoted for this model"
         )
-    pad_counts = descriptor_pad_tokens(descriptors, package_root, geometry)
+    pad_counts = descriptor_pad_tokens(
+        descriptors,
+        package_root,
+        geometry,
+        validation_cache,
+    )
 
-    def ids(messages: list[dict], *, add_generation_prompt: bool) -> list[int]:
+    def token_ids(messages: list[dict], *, add_generation_prompt: bool) -> list[int]:
         rendered = dict(
             tokenizer.apply_chat_template(
                 messages,
@@ -45,55 +103,62 @@ def _estimated_tokenized_row(
                 enable_thinking=thinking,
             )
         )["input_ids"]
-        if rendered and isinstance(rendered[0], list):
-            rendered = rendered[0]
-        return expand_image_pad_runs([int(item) for item in rendered], pad_token_id, pad_counts)
+        return expand_image_pad_runs(_ids(rendered), pad_token_id, pad_counts)
 
-    untruncated_ids = ids([*prompt_messages, *completion_messages], add_generation_prompt=False)
+    untruncated_ids = token_ids(
+        [*prompt_messages, *completion_messages], add_generation_prompt=False
+    )
     untruncated_length = len(untruncated_ids)
     input_ids = untruncated_ids[:max_length]
-    prompt_ids = ids(prompt_messages, add_generation_prompt=True)[:max_length]
-    return input_ids, completion_mask_from_ids(prompt_ids, input_ids), untruncated_length
+    prompt_ids = token_ids(prompt_messages, add_generation_prompt=True)[:max_length]
+    return input_ids, completion_mask_from_ids(prompt_ids, input_ids), b"", untruncated_length
 
 
-def _tokenize_sft_image_row(
-    tokenizer,
+def process_sft_image_row(
     processor,
     prompt_messages: list[dict],
     completion_messages: list[dict],
     descriptors: list[str],
     *,
-    package_root,
-    geometry,
+    package_root: str | Path | None,
     max_length: int,
     thinking: bool,
-    decode_image_descriptors: Callable,
-    processor_tokenized_row: Callable,
 ) -> tuple[list[int], list[int], bytes, int]:
-    """tokenize one normalized image row through the selected profiling path."""
-    if processor is None:
-        # torch-free control plane: count the tokens the processor would produce rather
-        # than producing them. pillow validates the pixels but no training tensors exist, so
-        # the row carries no multimodal_inputs -- the worker, which has the processor, builds
-        # the real ones (sft_train_runner passes a real image_dir).
-        input_ids, loss_mask, untruncated_length = _estimated_tokenized_row(
-            tokenizer,
-            prompt_messages,
-            completion_messages,
-            descriptors,
-            package_root=package_root,
-            geometry=geometry,
-            max_length=max_length,
-            thinking=thinking,
+    """tokenize one image row through the real processor and serialize its tensors."""
+    images = decode_image_descriptors(descriptors, package_root)
+    try:
+        prepared_prompt = _multimodal_messages_with_images(prompt_messages, images)
+        common = {
+            "tokenize": True,
+            "return_dict": True,
+            "return_tensors": "pt",
+            "enable_thinking": thinking,
+        }
+        full = dict(
+            processor.apply_chat_template(
+                [*prepared_prompt, *completion_messages],
+                add_generation_prompt=False,
+                **common,
+            )
         )
-        return input_ids, loss_mask, b"", untruncated_length
-
-    decoded_images = decode_image_descriptors(descriptors, package_root)
-    return processor_tokenized_row(
-        processor,
-        prompt_messages,
-        completion_messages,
-        decoded_images,
-        max_length=max_length,
-        thinking=thinking,
-    )
+        prompt = dict(
+            processor.apply_chat_template(
+                prepared_prompt,
+                add_generation_prompt=True,
+                **common,
+            )
+        )
+        untruncated_ids = _ids(full.pop("input_ids"))
+        untruncated_length = len(untruncated_ids)
+        input_ids = untruncated_ids[:max_length]
+        prompt_ids = _ids(prompt["input_ids"])[:max_length]
+        full.pop("attention_mask", None)
+        return (
+            input_ids,
+            completion_mask_from_ids(prompt_ids, input_ids),
+            _serialize_multimodal_inputs(full),
+            untruncated_length,
+        )
+    finally:
+        for image in images:
+            image.close()

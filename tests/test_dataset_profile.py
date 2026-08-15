@@ -605,6 +605,66 @@ def test_the_quote_grows_with_the_image_the_user_packaged(tmp_path, monkeypatch)
     assert large - small == 768 - 64
 
 
+def test_repeated_descriptors_decode_once_but_count_every_occurrence(tmp_path, monkeypatch) -> None:
+    from flash.content import multimodal
+
+    image_module = pytest.importorskip("PIL.Image")
+    rows = [
+        {"input": "same", "output": "answer", "images": ["dataset/a.png"]},
+        {
+            "input": "same",
+            "output": "answer",
+            "images": ["dataset/a.png", "dataset/a.png"],
+        },
+        {
+            "input": "same",
+            "output": "answer",
+            "images": ["dataset/a.png", "dataset/b.png"],
+        },
+    ]
+    entrypoint = _package(
+        tmp_path / "images",
+        {"dataset/train.jsonl": "".join(json.dumps(row) + "\n" for row in rows)},
+    )
+    image_module.new("RGB", (56, 56), (200, 10, 10)).save(
+        entrypoint.parent / "dataset" / "a.png", format="PNG"
+    )
+    image_module.new("RGB", (300, 200), (10, 200, 10)).save(
+        entrypoint.parent / "dataset" / "b.png", format="PNG"
+    )
+    monkeypatch.setattr(
+        "flash.engine.profiling.image_tokens.load_image_geometry",
+        lambda *_args, **_kwargs: ImageGeometry(
+            patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
+        ),
+    )
+    successful_decodes = []
+    real_decode = multimodal._decode_image_bytes
+
+    def count_successful_decode(data):
+        image = real_decode(data)
+        successful_decodes.append(image.size)
+        return image
+
+    monkeypatch.setattr(multimodal, "_decode_image_bytes", count_successful_decode)
+
+    spec = replace(
+        _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B"),
+        train=TrainSpec(epochs=2, batch_size=2, max_context_tokens=4096),
+    )
+    profile = profile_packaged_sft_dataset(
+        spec,
+        producer_version="1.2.3",
+        tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
+        packing_support=lambda _model, _revision: ("gdn-hybrid", True),
+    )
+
+    assert successful_decodes == [(56, 56), (300, 200)]
+    assert profile.retained_examples == 3
+    # 64 + 2*64 + 64 + 70 image pads, plus the fixed text ids for three rows.
+    assert profile.real_tokens_per_epoch == 356
+
+
 def test_an_unreadable_image_is_a_packaging_error_not_a_crash(tmp_path, monkeypatch) -> None:
     entrypoint = _package(
         tmp_path,

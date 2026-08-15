@@ -33,6 +33,14 @@ class NormalizedImages:
     descriptors: list[str]
 
 
+@dataclass(frozen=True)
+class ImageDescriptorMetadata:
+    source_bytes: int
+    decoded_rgb_bytes: int
+    width: int
+    height: int
+
+
 def _is_pil_image(value: object) -> bool:
     try:
         from PIL import Image
@@ -140,18 +148,27 @@ def _validate_dimensions(width: int, height: int) -> int:
     return pixels * 3
 
 
-def _inspect_image_bytes(data: bytes) -> int:
+def _inspect_image_metadata(data: bytes) -> ImageDescriptorMetadata:
     try:
         from PIL import Image
     except ImportError as exc:
         raise RuntimeError("Pillow is required for multimodal image training") from exc
     try:
         with Image.open(io.BytesIO(data)) as image:
-            return _validate_dimensions(image.width, image.height)
+            return ImageDescriptorMetadata(
+                source_bytes=len(data),
+                decoded_rgb_bytes=_validate_dimensions(image.width, image.height),
+                width=image.width,
+                height=image.height,
+            )
     except ValueError:
         raise
     except Exception as exc:
         raise ValueError("image source is not a valid image") from exc
+
+
+def _inspect_image_bytes(data: bytes) -> int:
+    return _inspect_image_metadata(data).decoded_rgb_bytes
 
 
 def _pil_descriptor(image: object) -> str:
@@ -379,7 +396,7 @@ def normalize_prompt_images(
                 f"example encoded image descriptors total {descriptor_bytes} bytes, exceeding the "
                 f"{MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES}-byte limit"
             )
-        source_bytes += descriptor_source_size(descriptor, package_root)
+        source_bytes += _descriptor_source_size(descriptor, package_root)
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(
                 f"example image sources total {source_bytes} bytes, exceeding the "
@@ -459,7 +476,7 @@ def normalize_prompt_images(
     return NormalizedImages(normalized, descriptors)
 
 
-def descriptor_source_size(descriptor: str, package_root: str | Path | None) -> int:
+def _descriptor_source_size(descriptor: str, package_root: str | Path | None) -> int:
     kind, value = _parse_descriptor(descriptor)
     if kind == "bytes":
         return len(base64.b64decode(value, validate=True))
@@ -472,7 +489,7 @@ def descriptor_source_size(descriptor: str, package_root: str | Path | None) -> 
     raise ValueError("invalid internal image descriptor kind")
 
 
-def read_descriptor_source(descriptor: str, package_root: str | Path | None) -> bytes:
+def _read_descriptor_source(descriptor: str, package_root: str | Path | None) -> bytes:
     kind, value = _parse_descriptor(descriptor)
     if kind == "bytes":
         try:
@@ -523,7 +540,7 @@ def image_descriptors_to_data_uris(
     source_bytes = 0
     decoded_bytes = 0
     for descriptor in descriptors:
-        data = read_descriptor_source(descriptor, package_root)
+        data = _read_descriptor_source(descriptor, package_root)
         source_bytes += len(data)
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(
@@ -544,21 +561,69 @@ def _decode_image_bytes(data: bytes):
         from PIL import Image
     except ImportError as exc:
         raise RuntimeError("Pillow is required for multimodal image training") from exc
+    converted = None
     try:
         with Image.open(io.BytesIO(data)) as image:
             _validate_dimensions(image.width, image.height)
             image.load()
-            return image.convert("RGB")
+            converted = image.convert("RGB")
+            converted.load()
+            return converted
     except ValueError:
+        if converted is not None:
+            converted.close()
         raise
     except Exception as exc:
+        if converted is not None:
+            converted.close()
         raise ValueError("image source is not a valid image") from exc
 
 
-def validate_image_descriptors(
+def image_descriptor_metadata(
+    descriptors: list[str],
+    package_root: str | Path | None,
+    validation_cache: dict[str, ImageDescriptorMetadata] | None = None,
+) -> list[ImageDescriptorMetadata]:
+    """return fully validated dimensions while counting every descriptor occurrence."""
+    if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
+        raise ValueError(
+            f"example contains {len(descriptors)} images, exceeding the {MAX_IMAGES_PER_EXAMPLE}-image limit"
+        )
+    cache = validation_cache if validation_cache is not None else {}
+    pending: dict[str, tuple[bytes, ImageDescriptorMetadata]] = {}
+    source_bytes = 0
+    decoded_bytes = 0
+    for descriptor in descriptors:
+        item = cache.get(descriptor)
+        if item is None:
+            prepared = pending.get(descriptor)
+            if prepared is None:
+                data = _read_descriptor_source(descriptor, package_root)
+                prepared = data, _inspect_image_metadata(data)
+                pending[descriptor] = prepared
+            _, item = prepared
+        source_bytes += item.source_bytes
+        if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
+            raise ValueError(
+                f"example image sources exceed the {MAX_TOTAL_IMAGE_SOURCE_BYTES}-byte limit"
+            )
+        decoded_bytes += item.decoded_rgb_bytes
+        if decoded_bytes > MAX_TOTAL_DECODED_BYTES:
+            raise ValueError(
+                f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
+            )
+
+    for descriptor, (data, item) in pending.items():
+        image = _decode_image_bytes(data)
+        image.close()
+        cache[descriptor] = item
+    return [cache[descriptor] for descriptor in descriptors]
+
+
+def decode_image_descriptors(
     descriptors: list[str], package_root: str | Path | None
 ) -> list[object]:
-    """Validate one row under worker limits and return fully loaded RGB images."""
+    """decode one row to fully loaded rgb images under aggregate limits."""
     if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
         raise ValueError(
             f"example contains {len(descriptors)} images, exceeding the {MAX_IMAGES_PER_EXAMPLE}-image limit"
@@ -567,7 +632,7 @@ def validate_image_descriptors(
     source_bytes = 0
     decoded_bytes = 0
     for descriptor in descriptors:
-        data = read_descriptor_source(descriptor, package_root)
+        data = _read_descriptor_source(descriptor, package_root)
         source_bytes += len(data)
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(
@@ -587,12 +652,6 @@ def validate_image_descriptors(
             image.close()
         raise
     return images
-
-
-def decode_image_descriptors(
-    descriptors: list[str], package_root: str | Path | None
-) -> list[object]:
-    return validate_image_descriptors(descriptors, package_root)
 
 
 def resolve_image_pad_token_id(processor, tok) -> int:

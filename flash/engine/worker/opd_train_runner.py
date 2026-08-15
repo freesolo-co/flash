@@ -884,6 +884,17 @@ def _validate_checkpoint_progress(result: _ChildResult, update_horizon: int) -> 
         )
 
 
+def _validate_aligned_sequences(final_accounting: dict[str, Any]) -> None:
+    if int(final_accounting.get("aligned_sequences", 0) or 0) <= 0:
+        # zeroed-mask pass-through batches still emit a (zero) loss metric, so the loss-curve
+        # check alone cannot distinguish real distillation from a run where the teacher never
+        # aligned once. require at least one aligned sequence before publishing.
+        raise RuntimeError(
+            "verl OPD saw zero aligned teacher sequences for the whole run — every batch was "
+            "no-signal; refusing to publish an unchanged adapter"
+        )
+
+
 def _report_training_complete(result: _ChildResult, started_at: float) -> float:
     _opd_train._w.heartbeat(
         "opd_trained",

@@ -6,7 +6,6 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
 
 from flash.engine.plan.recipe import RECIPE  # noqa: F401
 from flash.engine.plan.steps import (  # noqa: F401
@@ -282,17 +281,6 @@ def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[f
     return download_seconds, eos_token_ids
 
 
-def _validate_aligned_sequences(final_accounting: dict[str, Any]) -> None:
-    if int(final_accounting.get("aligned_sequences", 0) or 0) <= 0:
-        # zeroed-mask pass-through batches still emit a (zero) loss metric, so the loss-curve
-        # check alone cannot distinguish real distillation from a run where the teacher never
-        # aligned once. require at least one aligned sequence before publishing.
-        raise RuntimeError(
-            "verl OPD saw zero aligned teacher sequences for the whole run — every batch was "
-            "no-signal; refusing to publish an unchanged adapter"
-        )
-
-
 def run_opd_train(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
     from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
@@ -450,6 +438,7 @@ from flash.engine.worker.opd_train_runner import (  # noqa: E402
     _render_prompt_rows,
     _report_training_complete,
     _run_child,
+    _validate_aligned_sequences,
     _validate_teacher_transport,
     _with_structured_validation,
 )

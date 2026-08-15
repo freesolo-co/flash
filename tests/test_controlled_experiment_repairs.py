@@ -323,6 +323,7 @@ def test_prefetch_error_classification():
     assert _prefetch_error_is_retriable(hf_error(HfHubHTTPError, 503))
     assert _prefetch_error_is_retriable(hf_error(HfHubHTTPError, 429))
     assert _prefetch_error_is_retriable(hf_error(HfHubHTTPError, None))
+    assert not _prefetch_error_is_retriable(OSError("local file failure"))
     assert not _prefetch_error_is_retriable(ValueError("bug"))
 
 

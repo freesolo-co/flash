@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-
-def model_revision_kwargs(revision: str = "") -> dict[str, str]:
-    """return the hugging face revision keyword for a nonempty pinned revision."""
-    return {"revision": revision} if revision else {}
+from flash.engine.huggingface import model_revision_kwargs
 
 
 def load_tokenizer(model_id: str, revision: str = "", *, trust_remote_code: bool = True):

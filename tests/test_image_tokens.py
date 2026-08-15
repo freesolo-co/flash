@@ -24,6 +24,21 @@ from flash.engine.profiling.image_tokens import (
 # pixel budget from `size`). read from config in production; pinned here so the expectations below
 # are readable numbers rather than a second copy of the lookup.
 QWEN_GEOMETRY = ImageGeometry(patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216)
+PROCESSOR_PAD_CASES = [
+    (56, 56, 64),
+    (64, 64, 64),
+    (112, 84, 70),
+    (224, 224, 64),
+    (300, 200, 70),
+    (1, 1, 64),
+    (17, 133, 69),
+    (640, 480, 300),
+    (1024, 768, 768),
+    (33, 33, 64),
+    (4000, 60, 250),
+    (200, 300, 70),
+    (97, 53, 66),
+]
 
 
 def _png_bytes(width: int, height: int) -> bytes:
@@ -53,23 +68,7 @@ class TestSmartResizeMatchesTransformers:
             "transformers.models.qwen2_vl.image_processing_qwen2_vl",
             reason="needs torchvision, which the control plane deliberately lacks",
         )
-        sizes = [
-            (56, 56),
-            (64, 64),
-            (112, 84),
-            (224, 224),
-            (300, 200),
-            (1, 1),
-            (17, 133),
-            (640, 480),
-            (1024, 768),
-            (33, 33),
-            (4000, 60),
-            (200, 300),
-            (97, 53),
-            (8192, 8192),
-        ]
-        for width, height in sizes:
+        for width, height, _expected in PROCESSOR_PAD_CASES:
             assert smart_resize(
                 height,
                 width,
@@ -93,24 +92,7 @@ class TestImagePadTokens:
     tokenized row. They are ground truth, not a restatement of the formula.
     """
 
-    @pytest.mark.parametrize(
-        ("width", "height", "expected"),
-        [
-            (56, 56, 64),
-            (64, 64, 64),
-            (112, 84, 70),
-            (224, 224, 64),
-            (300, 200, 70),
-            (1, 1, 64),
-            (17, 133, 69),
-            (640, 480, 300),
-            (1024, 768, 768),
-            (33, 33, 64),
-            (4000, 60, 250),
-            (200, 300, 70),
-            (97, 53, 66),
-        ],
-    )
+    @pytest.mark.parametrize(("width", "height", "expected"), PROCESSOR_PAD_CASES)
     def test_reproduces_the_processors_pad_run(self, width, height, expected):
         assert image_pad_tokens(width, height, QWEN_GEOMETRY) == expected
 
@@ -155,6 +137,52 @@ class TestGeometryFromConfig:
 
         with pytest.raises(ImageGeometryUnavailable, match=field):
             geometry_from_preprocessor_config(config)
+
+    @pytest.mark.parametrize(
+        ("container", "field"),
+        [
+            ("root", "min_pixels"),
+            ("root", "max_pixels"),
+            ("size", "shortest_edge"),
+            ("size", "longest_edge"),
+        ],
+    )
+    @pytest.mark.parametrize("value", [0, -1, True, "65536", 65536.0])
+    def test_rejects_invalid_published_pixel_budgets(self, container, field, value):
+        config = {"patch_size": 16, "merge_size": 2}
+        target = config if container == "root" else config.setdefault("size", {})
+        target[field] = value
+
+        with pytest.raises(ImageGeometryUnavailable, match=field):
+            geometry_from_preprocessor_config(config)
+
+    def test_rejects_an_invalid_size_budget_even_when_the_root_budget_wins(self):
+        with pytest.raises(ImageGeometryUnavailable, match="shortest_edge"):
+            geometry_from_preprocessor_config(
+                {
+                    "patch_size": 16,
+                    "merge_size": 2,
+                    "min_pixels": 65536,
+                    "size": {"shortest_edge": "ignored-if-not-validated"},
+                }
+            )
+
+    @pytest.mark.parametrize("value", [[], "pixels", 1, False])
+    def test_rejects_a_present_non_object_size(self, value):
+        with pytest.raises(ImageGeometryUnavailable, match="size must be an object"):
+            geometry_from_preprocessor_config({"patch_size": 16, "merge_size": 2, "size": value})
+
+    def test_none_pixel_budget_fields_use_the_existing_defaults(self):
+        geometry = geometry_from_preprocessor_config(
+            {
+                "patch_size": 16,
+                "merge_size": 2,
+                "min_pixels": None,
+                "max_pixels": None,
+                "size": None,
+            }
+        )
+        assert (geometry.min_pixels, geometry.max_pixels) == (3136, 1003520)
 
     def test_accepts_the_older_min_max_pixels_spelling(self):
         geometry = geometry_from_preprocessor_config(
@@ -356,13 +384,17 @@ class TestDescriptorPadTokens:
         with pytest.raises(ValueError, match="not a valid image"):
             descriptor_pad_tokens([descriptor], None, QWEN_GEOMETRY)
 
-    def test_rejects_aggregate_decoded_bytes_before_counting_tokens(self, monkeypatch):
+    def test_rejects_aggregate_decoded_bytes_before_full_decode(self, monkeypatch):
         from flash.content import multimodal
 
         data = _png_bytes(10, 10)
         descriptors = [multimodal.normalize_image_source(data, None) for _ in range(2)]
         monkeypatch.setattr(multimodal, "MAX_TOTAL_DECODED_BYTES", 599)
+        monkeypatch.setattr(
+            multimodal,
+            "_decode_image_bytes",
+            lambda _data: (_ for _ in ()).throw(AssertionError("full decode reached")),
+        )
 
-        assert descriptor_pad_tokens(descriptors[:1], None, QWEN_GEOMETRY) == [64]
         with pytest.raises(ValueError, match="decoded images"):
             descriptor_pad_tokens(descriptors, None, QWEN_GEOMETRY)

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.profiling.sft_workload import _serialize_multimodal_inputs
+from flash.engine.profiling.sft_image_rows import _serialize_multimodal_inputs
 from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.entry.sft import _pretokenize_completion_only
 from flash.engine.worker.sft_train import (

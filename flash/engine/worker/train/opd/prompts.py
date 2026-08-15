@@ -14,7 +14,7 @@ import hashlib
 import json
 from typing import TYPE_CHECKING
 
-from flash.engine.profiling.sft_workload import _multimodal_messages_with_images
+from flash.engine.profiling.sft_image_rows import _multimodal_messages_with_images
 from flash.engine.worker.train.opd.gkd import _trim_trailing_stop
 
 if TYPE_CHECKING:  # the prompt record, for annotations only -- it lives in the orchestrator

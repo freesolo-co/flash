@@ -13,7 +13,7 @@ import math
 import os
 
 from flash.content.structured_outputs import reasoning_parser_for
-from flash.engine.profiling.sft_workload import _multimodal_messages_with_images
+from flash.engine.profiling.sft_image_rows import _multimodal_messages_with_images
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
