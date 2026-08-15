@@ -219,6 +219,14 @@ def _new_record() -> dict:
         # it was done. a gold answer that cannot finish inside the cap is the signature of an env
         # no trajectory can complete, and the scalar reward alone never shows it.
         "hit_turn_cap": False,
+        # whether the gold trajectory is LONGER than the effective turn cap, so only a prefix could
+        # be replayed. a cap/dataset mismatch, not an environment defect, and the only unfinished
+        # shape here whose cause is fully determined by the inputs.
+        "gold_exceeds_cap": False,
+        # the effective ceiling and the reference length, kept so the mismatch above can name both
+        # numbers -- an author cannot act on "raise the cap" without knowing what to raise it to.
+        "turn_cap": 0,
+        "reference_turns": 0,
         # the gold completion messages as returned, kept so the rendered-role check can inspect the
         # concatenation SFT would train on rather than the per-turn replay this command scores.
         "completion": [],
@@ -383,6 +391,19 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     # `_episode_completed` reads.
     unfinished = gold_finished is False if gold_finished is not None else True
     record["hit_turn_cap"] = stopped_at_ceiling and unfinished
+    # a reference LONGER than the cap is the one case here that is not ambiguous at all. the driver
+    # replays a prefix and stops, so `replay_incomplete` never gets set (that flag means the driver
+    # ran PAST the reference and padded), and the episode lands in the branch that blames the
+    # environment. but the dataset itself states the trajectory needs more turns than the cap
+    # allows, so the environment's termination logic was never reached, let alone shown to be
+    # broken. the mismatch is checkable from these two numbers alone, and its remedy is exact --
+    # raise the cap or shorten the row -- so it is reported as itself rather than as a guess
+    # between two other explanations.
+    record["gold_exceeds_cap"] = (
+        stopped_at_ceiling and policy == "replay" and len(reference_turns) > hard_cap
+    )
+    record["turn_cap"] = hard_cap
+    record["reference_turns"] = len(reference_turns)
     record["reward"], record["scorer_error"], record["scored_text"] = _score_with_error(
         env, "", example, state
     )

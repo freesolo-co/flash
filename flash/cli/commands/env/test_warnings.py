@@ -100,6 +100,20 @@ def _warn_on_unfinished_replay(record: dict) -> None:
     """
     if not record["hit_turn_cap"]:
         return
+    # reported before the two ambiguous readings below because this one is not a reading at all:
+    # the reference is longer than the cap, so the episode was cut off by the budget and the
+    # environment's termination logic never ran. both numbers are named -- an author cannot act on
+    # "raise the cap" without knowing the target.
+    if record["gold_exceeds_cap"]:
+        _emit(
+            f"replay gold answer never finished: the gold trajectory is "
+            f"{record['reference_turns']} turn(s) but the episode is capped at "
+            f"{record['turn_cap']}, so only the first {record['turn_cap']} were replayed and the "
+            "environment never got the chance to finish. this is a cap/dataset mismatch, not an "
+            "environment fault: raise the turn cap (`max_turns`, or the row's `max_episode_turns`) "
+            "to at least the length of the gold trajectory, or shorten the row"
+        )
+        return
     opening = (
         f"replay gold answer never finished: it used all {record['turns']} turn(s) and the "
         "environment never reported the episode done"

@@ -2567,6 +2567,58 @@ def test_env_test_blames_the_environment_only_when_gold_covered_every_turn(
     assert "covers only part of a trajectory" not in captured.err
 
 
+class _OverlongGoldEnv(_MultiTurnEnv):
+    """A HEALTHY env whose gold trajectory is LONGER than the turn cap.
+
+    The driver replays a prefix and stops, so `replay_incomplete` is never set -- that flag means
+    the driver ran PAST the reference and padded with junk, which is the opposite situation. The
+    episode therefore reached the branch that blames the environment, even though the cap stopped
+    the episode before the environment's termination logic could run at all.
+    """
+
+    max_turns = 3
+
+    def dataset(self):
+        return [
+            {
+                "input": "five steps",
+                "output": [{"role": "assistant", "content": f"step {n}"} for n in range(1, 6)],
+            }
+        ]
+
+    def env_reply(self, messages, state):
+        state["turn"] += 1
+        # would finish on the fifth turn, which the cap never lets it reach.
+        state["done"] = state["turn"] >= 5
+        reply = {"role": "user", "content": "next"}
+        messages.append(reply)
+        return [reply]
+
+    def reward(self, completion, example, state=None):
+        self.scored_state = state
+        return 0.4
+
+
+def test_env_test_names_a_cap_shorter_than_the_gold_trajectory(monkeypatch, tmp_path, capsys):
+    """A cap/dataset mismatch has an exact cause, so it must not be reported as a guess.
+
+    The other two unfinished shapes are genuinely ambiguous from here and say so. This one is not:
+    the reference length and the cap are both known, and their comparison settles it. Reporting it
+    as "either the row or your termination condition" would send an author to audit code that never
+    ran, so the numbers and the remedy are both asserted.
+    """
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _OverlongGoldEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "the gold trajectory is 5 turn(s) but the episode is capped at 3" in captured.err
+    assert "cap/dataset mismatch, not an environment fault" in captured.err
+    # neither ambiguous reading may be offered for a case whose cause is determined.
+    assert "check the termination condition" not in captured.err
+    assert "covers only part of a trajectory" not in captured.err
+
+
 class _FixedLengthEnv(_MultiTurnEnv):
     """A HEALTHY env that ends only by exhausting its budget and never sets `state["done"]`.
 

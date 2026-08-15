@@ -90,7 +90,11 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     that ran out before the cap names both explanations and puts the cheaper one first, since
     extending a dataset row costs less than auditing termination logic that works. Only a reference
     that covered every turn and still never finished leaves the environment as the sole
-    explanation - and even then the wording stops short of a verdict, because `rollout_done`
+    explanation. A gold trajectory _longer_ than the cap is separated out before either reading,
+    since its cause is fully determined rather than guessed: only a prefix could be replayed, so
+    the environment's termination logic never ran, and the report names both numbers and the exact
+    remedy (raise the cap, or shorten the row) instead of sending the author to audit it. Otherwise
+    the wording stops short of a verdict, because `rollout_done`
     returns True at `turn >= cap` regardless of `state["done"]`, so a fixed-length episode that ends
     purely by using its whole budget is a supported shape that never sets `done` and is
     indistinguishable from a dead one here. Both are reported, the reward that separates them in
