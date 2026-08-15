@@ -283,30 +283,39 @@ _LORA_A_INFIX = ".lora_A."
 _LORA_B_INFIX = ".lora_B."
 
 
-def rank_from_lora_tensor_shape(key: str, shape: Any) -> int | None:
-    """The LoRA rank a weight's own shape carries, or None when that shape cannot report one.
+def lora_tensor_rank_disagrees(key: str, shape: Any, declared: int) -> bool:
+    """True only when a weight's own shape provably contradicts the declared LoRA rank.
 
-    PEFT stores ``lora_A`` as ``[r, in_features]`` and ``lora_B`` as ``[out_features, r]``, so the
-    rank is legible from the tensor itself instead of being taken on the config's word. That second
-    reading is the point: ``adapter_config.json`` and the tensors beside it are written by different
-    code paths and can disagree, and the config is the half a serving engine sizes its LoRA slots
-    from.
+    PEFT writes ``lora_A`` as ``[r, in_features]`` and ``lora_B`` as ``[out_features, r]``, so the
+    rank is legible from the tensor itself rather than taken on the config's word. That second
+    reading is the point: ``adapter_config.json`` and the tensors beside it are produced by
+    different code paths and can disagree, and the config is the half a serving engine sizes its
+    LoRA slots from.
 
-    None for everything that is not one of those two 2-D matrices -- ``modules_to_save`` copies,
-    biases, ``lora_embedding_A``/``_B`` (which the infixes above deliberately do not match), and the
-    stacked 3-D layouts some fused-MoE saves use. A shape that is not this one cannot answer the
-    question, and guessing at it would refuse adapters that are fine.
+    The rank axis is accepted as any positive multiple of ``declared``, not just equality, because
+    a fused MoE parameter targeted via ``target_parameters`` legitimately stacks every expert on
+    that axis: ``lora.ParamWrapper.update_layer`` builds ``nn.Linear(in_features, r *
+    num_experts)``, so an ``r=32`` adapter over 256 experts really does carry a 8192-long axis.
+    Demanding equality would refuse those adapters, which load correctly. A rank axis that is not a
+    multiple of the declared rank cannot be that layout under any expert count, and is the
+    disagreement worth refusing.
+
+    False for everything whose shape cannot answer the question at all -- ``modules_to_save``
+    copies, biases, ``lora_embedding_A``/``_B`` (which the infixes deliberately do not match), and
+    3-D stacked layouts. Guessing at those would refuse adapters that are fine.
     """
+    if not isinstance(declared, int) or isinstance(declared, bool) or declared <= 0:
+        return False
     is_a = _LORA_A_INFIX in key
     is_b = _LORA_B_INFIX in key
     if is_a == is_b:  # neither, or a key somehow claiming both
-        return None
+        return False
     if not isinstance(shape, (list, tuple)) or len(shape) != 2:
-        return None
+        return False
     dims = [d for d in shape if isinstance(d, int) and not isinstance(d, bool) and d > 0]
     if len(dims) != 2:
-        return None
-    return dims[0] if is_a else dims[1]
+        return False
+    return (dims[0] if is_a else dims[1]) % declared != 0
 
 
 def alpha_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:

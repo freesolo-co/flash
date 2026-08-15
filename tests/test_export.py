@@ -1223,12 +1223,30 @@ def _lora_pair_header(rank_a: int, rank_b: int, *, prefix: str, offset: int = 0)
 
 
 def test_export_refuses_adapter_whose_tensors_contradict_its_declared_rank(tmp_path):
-    """The LMR-030 artifact: `r: 32` in the config, rank-8192 fused MoE expert tensors beside it.
+    """A rank axis no expert count can explain: `r: 32` beside a 100-long axis.
 
     Export used to check only that the weight files were present and their key namespace readable,
-    so this published a Hub URL while the identical adapter failed to deploy. A successful export
-    then read as evidence the artifact worked.
+    so an unloadable adapter published a Hub URL while the identical artifact failed to deploy. A
+    successful export then read as evidence the artifact worked.
     """
+    from flash.serve import export
+
+    header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
+    header.update(
+        _lora_pair_header(100, 100, prefix="base_model.model.model.layers.0.mlp.up_proj", offset=4)
+    )
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 8))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32, "lora_alpha": 64}))
+
+    with pytest.raises(ValueError, match=r"declares r=32.*not a multiple of it"):
+        export._normalize_export_adapter_keys(tmp_path)
+
+
+def test_export_accepts_fused_moe_experts_stacked_on_the_rank_axis(tmp_path):
+    """The exact LMR-030 shapes, which are LEGITIMATE: `lora.ParamWrapper.update_layer` builds
+    `nn.Linear(in_features, r * num_experts)`, so an r=32 adapter over 256 experts really does
+    carry an 8192-long rank axis. Demanding equality here would refuse adapters that load, which
+    is a worse failure than the one being fixed -- export is the user's escape hatch."""
     from flash.serve import export
 
     header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
@@ -1240,19 +1258,18 @@ def test_export_refuses_adapter_whose_tensors_contradict_its_declared_rank(tmp_p
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 8))
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32, "lora_alpha": 64}))
 
-    with pytest.raises(ValueError, match=r"declares r=32.*carry a different rank"):
-        export._normalize_export_adapter_keys(tmp_path)
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
 
 
 def test_export_rank_mismatch_reaches_the_caller_as_itself(tmp_path):
     """Not reported as an unnormalizable key namespace: that is a different defect and remedy."""
     from flash.serve import export
 
-    header = _lora_pair_header(8, 8, prefix="base_model.model.model.layers.0.mlp.up_proj")
+    header = _lora_pair_header(24, 24, prefix="base_model.model.model.layers.0.mlp.up_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}))
 
-    with pytest.raises(ValueError, match="carry a different rank") as excinfo:
+    with pytest.raises(ValueError, match="not a multiple of it") as excinfo:
         export._normalize_export_adapter_keys(tmp_path)
     assert "could not normalize exported adapter keys" not in str(excinfo.value)
 
@@ -1266,7 +1283,7 @@ def test_export_refuses_rank_mismatch_before_touching_the_destination_repo(monke
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "sft/run-x/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        header = _lora_pair_header(64, 64, prefix="base_model.model.model.layers.0.mlp.gate_proj")
+        header = _lora_pair_header(48, 48, prefix="base_model.model.model.layers.0.mlp.gate_proj")
         (adapter / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
         (adapter / "adapter_config.json").write_text(json.dumps({"r": 32}))
         return str(local_dir)
@@ -1284,7 +1301,7 @@ def test_export_refuses_rank_mismatch_before_touching_the_destination_repo(monke
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
     from flash.serve.export import export_adapter
 
-    with pytest.raises(ValueError, match="carry a different rank"):
+    with pytest.raises(ValueError, match="not a multiple of it"):
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="sft/run-x/adapter",
@@ -1312,10 +1329,10 @@ def test_export_reads_rank_pattern_overrides_rather_than_refusing_them(tmp_path)
     max across both places. A module legitimately trained at the higher rank must still export."""
     from flash.serve import export
 
-    header = _lora_pair_header(64, 64, prefix="base_model.model.model.layers.0.mlp.up_proj")
+    header = _lora_pair_header(80, 80, prefix="base_model.model.model.layers.0.mlp.up_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
     (tmp_path / "adapter_config.json").write_text(
-        json.dumps({"r": 8, "rank_pattern": {"layers.0.mlp.up_proj": 64}})
+        json.dumps({"r": 12, "rank_pattern": {"layers.0.mlp.up_proj": 80}})
     )
 
     assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
@@ -1323,7 +1340,8 @@ def test_export_reads_rank_pattern_overrides_rather_than_refusing_them(tmp_path)
 
 def test_export_ignores_shapes_that_cannot_report_a_rank(tmp_path):
     """`modules_to_save` copies, biases and stacked 3-D fused layouts are not [r, in] / [out, r].
-    Reading a rank out of them would refuse adapters that are fine, so they are skipped."""
+    None of them can answer the question, and reading a rank out of them anyway would refuse
+    adapters that are fine -- so they are skipped rather than guessed at."""
     from flash.serve import export
 
     header = {
@@ -1374,7 +1392,7 @@ def test_export_checks_ranks_across_every_shard_not_just_the_first(tmp_path):
     from flash.serve import export
 
     good = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
-    bad = _lora_pair_header(8192, 8192, prefix="base_model.model.model.layers.1.mlp.experts")
+    bad = _lora_pair_header(100, 100, prefix="base_model.model.model.layers.1.mlp.up_proj")
     (tmp_path / "adapter_model-00001-of-00002.safetensors").write_bytes(
         _safetensors_bytes(good, b"\x01" * 4)
     )
@@ -1393,7 +1411,7 @@ def test_export_checks_ranks_across_every_shard_not_just_the_first(tmp_path):
     )
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32}))
 
-    with pytest.raises(ValueError, match="carry a different rank"):
+    with pytest.raises(ValueError, match="not a multiple of it"):
         export._normalize_export_adapter_keys(tmp_path)
 
 

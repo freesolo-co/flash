@@ -27,7 +27,7 @@ from flash.adapters.artifacts import (
     has_loadable_adapter_weights,
     is_adapter_weight_filename,
 )
-from flash.adapters.lora_rank import rank_from_adapter_config, rank_from_lora_tensor_shape
+from flash.adapters.lora_rank import lora_tensor_rank_disagrees, rank_from_adapter_config
 from flash.serve.deploy import ServingError
 
 logger = get_logger(__name__)
@@ -494,10 +494,14 @@ def _verify_export_tensor_ranks(adapter_dir: Path, scans: list[_WeightScan]) -> 
 
     A serving engine sizes its LoRA slots from ``adapter_config.json`` and then binds the tensors,
     so the two disagreeing is not a cosmetic metadata bug: it is an adapter that cannot be loaded.
-    That is not hypothetical -- a 35B MoE SFT run published `r: 32` beside rank-8192 fused expert
-    tensors, and because export checked only that the files were present and their key namespace
-    readable, it succeeded and printed a Hub URL. Deploying the same artifact failed. Export
-    exiting 0 is what made a broken adapter look like a finished deliverable.
+    That is not hypothetical -- a 35B MoE SFT run published `r: 32` beside expert tensors export
+    checked only for presence and key-namespace readability, so it succeeded and printed a Hub URL
+    while deploying the identical artifact failed. Export exiting 0 is what made a broken adapter
+    look like a finished deliverable.
+
+    Deliberately narrow: `lora_tensor_rank_disagrees` accepts any positive multiple of the declared
+    rank, because a fused MoE parameter stacks its experts on that axis. Only a rank axis that is
+    not a multiple of the declared rank is refused, which no expert count can produce.
 
     Only safetensors headers are read, because they carry shapes as metadata and are already parsed
     here. A `.bin` would have to be loaded through torch, which the control plane does not install,
@@ -506,21 +510,22 @@ def _verify_export_tensor_ranks(adapter_dir: Path, scans: list[_WeightScan]) -> 
     declared = _declared_export_rank(adapter_dir)
     if declared is None:
         return
-    mismatched: list[str] = []
-    for scan in scans:
-        for key, descriptor in (scan.header or {}).items():
-            if key == "__metadata__" or not isinstance(descriptor, dict):
-                continue
-            found = rank_from_lora_tensor_shape(key, descriptor.get("shape"))
-            if found is not None and found != declared:
-                mismatched.append(f"{key} has rank {found}")
+    mismatched = [
+        f"{key} has shape {descriptor.get('shape')}"
+        for scan in scans
+        for key, descriptor in (scan.header or {}).items()
+        if key != "__metadata__"
+        and isinstance(descriptor, dict)
+        and lora_tensor_rank_disagrees(key, descriptor.get("shape"), declared)
+    ]
     if not mismatched:
         return
     shown = ", ".join(sorted(mismatched)[:3])
     raise _AdapterRankMismatch(
         f"adapter_config.json declares r={declared} but {len(mismatched)} LoRA tensor(s) carry a "
-        f"different rank (e.g. {shown}); a serving engine sizes its LoRA slots from the config, so "
-        "this adapter cannot be loaded and exporting it would publish a broken artifact"
+        f"rank axis that is not a multiple of it (e.g. {shown}); a serving engine sizes its LoRA "
+        "slots from the config, so this adapter cannot be loaded and exporting it would publish a "
+        "broken artifact"
     )
 
 
