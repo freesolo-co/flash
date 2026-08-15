@@ -444,7 +444,11 @@ def _materialize_child_files(
         int(getattr(request.spec.gpu, "count", 1) or 1),
         workload.prompts_per_step * knobs.group_size,
     )
-    save_freq = math.gcd(*knobs.save_at_steps) if knobs.save_at_steps else knobs.save_every
+    save_freq = (
+        math.gcd(*knobs.save_at_steps)
+        if knobs.save_at_steps
+        else max(1, min(knobs.save_every, workload.update_horizon))
+    )
     # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
     loggers = _opd_train.resolve_verl_loggers(caps)
     project_name = (
