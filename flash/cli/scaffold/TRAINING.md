@@ -159,9 +159,13 @@ the git form instead — commit this folder to a repo your plane can read, then 
 
 ```toml
 [environment]
-id = "github:OWNER/REPO@main:environment.py"   # REF is a branch/tag name without `/`, or a commit
+id = "github:OWNER/REPO@REF:environment.py"    # REF is a branch/tag name without `/`, or a commit
                                                # sha; the path is the file, or a directory holding
-                                               # environment.py
+                                               # environment.py. For a branch, use the repo's
+                                               # actual DEFAULT branch -- check it rather than
+                                               # assuming `main`, since it depends on how the repo
+                                               # was created. A ref that does not exist fails with
+                                               # GitHub's "No commit found for SHA: <ref>".
 ```
 
 The ref is resolved at submit time, so re-pushing the repo and re-submitting picks up your edits
@@ -244,7 +248,7 @@ algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-poli
 
 [environment]
 id = "your-org/your-project/my-env"      # the id printed by `flash env push`
-                            # self-hosted plane: "github:OWNER/REPO@main:environment.py" (see above)
+                            # self-hosted plane: "github:OWNER/REPO@REF:environment.py" (see above)
 # params = { split = "train" }    # kwargs passed to load_environment(); the table is
                                    # `params` — NOT `args`
 # secrets = ["SERPAPI_API_KEY"]   # only the NAMES of env vars your environment reads;
