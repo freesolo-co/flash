@@ -51,6 +51,7 @@ from flash.engine.worker.teacher.tokenizer_align import TeacherToken
 from flash.engine.worker.train.opd.child.plugin import (
     FlashTeacherBridgeError,
     _AllNoSignalBatch,
+    _bounded_replay_buffer_sample,
     _bridge_score_payload,
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
@@ -5312,6 +5313,7 @@ def _reconcile_opd_failure(truncation_window: _TruncationWindow):
         abandonment_failure_path="",
         mutation_failure_path="",
         cycle_commit_failure_path="",
+        teacher_worker_failure_path="",
     )
     opd_runner._reconcile_child_failures(
         workload,
@@ -6306,6 +6308,12 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypat
         abandonment_failure_path=str(tmp_path / "abandonment-failure"),
         resample_failure_path=str(tmp_path / "resample-failure"),
         cycle_commit_failure_path=str(tmp_path / "cycle-commit-failure"),
+        teacher_worker_failure_path=str(tmp_path / "teacher-worker-failure"),
+    )
+    # the dying agent-loop actor can only leave its record where the parent will look for it, so
+    # this path has to reach the child env or the evidence is written nowhere readable.
+    assert child["FLASH_OPD_TEACHER_WORKER_FAILURE_PATH"] == str(
+        tmp_path / "teacher-worker-failure"
     )
     assert child["FLASH_OPD_BRIDGE_URL"] == "http://127.0.0.1:4444"
     assert child["FLASH_OPD_BRIDGE_TOKEN"] == "bridge-token"
@@ -6933,10 +6941,12 @@ def test_transfer_queue_init_that_never_returns_fails_with_the_resource_state(mo
     # with no timeout, so an unsatisfiable reservation stops the run before a single gpu is touched --
     # silently, because tq's logger defaults to WARNING. without a deadline the run burns the whole
     # setup grace period at 0% gpu and is reported as a generic stall.
-    import flash.engine.worker.train.opd.child.plugin as plugin
+    # patch the watchdog module, not the plugin: the plugin re-exports this name, so patching the
+    # re-export rebinds a copy the caller never reads and the probe runs unpatched.
+    import flash.engine.worker.train.opd.child.rollout_watchdog as watchdog
 
     monkeypatch.setattr(
-        plugin,
+        watchdog,
         "_describe_ray_resources",
         lambda: "cluster CPU=1.0 GPU=1.0, free CPU=0.0 GPU=0.0",
     )
@@ -7330,3 +7340,261 @@ def test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction():
     # rather than a second gradient path, so moving it changes the objective, not just the value.
     assert "flat_student.detach()" in source
     assert source.count(".detach()") == 1
+
+
+def _never_returns(release: threading.Event):
+    """Stand-in for verl's ReplayBuffer.sample when an entry can never be cleared.
+
+    verl's real sample() is `while True: sleep(poll)` gated on no entry being "running". A worker
+    that died without unwinding leaves its entry running forever, so the real call never returns --
+    exactly what this models. The event only exists so the parked thread can be released at the end
+    of the test rather than leaking for the whole session.
+    """
+
+    def sample():
+        release.wait(60)
+        return "unreachable"
+
+    return sample
+
+
+def test_bounded_sample_returns_the_buffers_batch_untouched():
+    # the wrapper must not change what verl hands back, only how long it is willing to wait.
+    batch = object()
+    result = _bounded_replay_buffer_sample(
+        lambda: batch,
+        running_entries=lambda: 0,
+        dead_workers=list,
+        stall_timeout_s=30.0,
+        poll_interval_s=0.01,
+    )
+    assert result is batch
+
+
+def test_bounded_sample_fails_immediately_when_an_agent_loop_worker_died():
+    # THE WEDGE. dispatch marks every prompt "running"; only the owning worker ever clears it, and
+    # flash's teacher path exits via os._exit, which skips the except that would write "failure".
+    # so the entry stays running and verl polls a status no living process can publish -- observed
+    # as 8 allocations, 8 wedges, 0 optimizer steps, each burning a gpu until a human cancelled it.
+    # without the liveness check below this call does not return.
+    release = threading.Event()
+    try:
+        with pytest.raises(RuntimeError, match="died while") as excinfo:
+            _bounded_replay_buffer_sample(
+                _never_returns(release),
+                running_entries=lambda: 4,
+                dead_workers=lambda: ["agent-loop worker 2"],
+                stall_timeout_s=3600.0,
+                poll_interval_s=0.01,
+            )
+    finally:
+        release.set()
+    message = str(excinfo.value)
+    # name the dead actor and the stranded entries: "rollout failed" alone does not distinguish a
+    # dead worker from a slow one, and that distinction is the whole diagnosis.
+    assert "agent-loop worker 2" in message
+    assert "4 prompt(s)" in message
+    # and point at the artifact that actually explains the death. it is unreachable from outside the
+    # pod, so an operator who does not know to look for it cannot get past "a worker died".
+    assert "stderr" in message
+
+
+def test_bounded_sample_does_not_fail_a_slow_but_live_rollout():
+    # the false positive that would matter most: a long legitimate rollout must never be killed just
+    # for being slow. only a dead worker or genuine no-progress may fail the step.
+    release = threading.Event()
+    calls = []
+
+    def running_entries():
+        calls.append(1)
+        # progress: entries keep clearing, so the stall clock keeps resetting.
+        return max(0, 8 - len(calls))
+
+    try:
+        with pytest.raises(RuntimeError, match="no progress"):
+            _bounded_replay_buffer_sample(
+                _never_returns(release),
+                running_entries=running_entries,
+                dead_workers=list,
+                stall_timeout_s=0.05,
+                poll_interval_s=0.001,
+            )
+    finally:
+        release.set()
+    # it only gave up AFTER the entries stopped changing -- had it tripped on wall-clock alone it
+    # would have fired while the count was still dropping.
+    assert len(calls) > 8
+
+
+def test_bounded_sample_stall_deadline_reports_the_running_count():
+    release = threading.Event()
+    try:
+        with pytest.raises(RuntimeError, match="no progress") as excinfo:
+            _bounded_replay_buffer_sample(
+                _never_returns(release),
+                running_entries=lambda: 3,
+                dead_workers=list,
+                stall_timeout_s=0.05,
+                poll_interval_s=0.001,
+            )
+    finally:
+        release.set()
+    message = str(excinfo.value)
+    assert "3 prompt(s)" in message
+    # the deadline path must say the workers were ALIVE. otherwise it reads like the dead-worker
+    # case and sends an operator looking for a crash that did not happen.
+    assert "alive" in message
+
+
+def test_bounded_sample_propagates_a_real_sample_error_unwrapped():
+    # a genuine buffer error must not be reported as a timeout, and must not be swallowed by the
+    # worker thread the sample now runs on.
+    class Boom(RuntimeError):
+        pass
+
+    def sample():
+        raise Boom("buffer exploded")
+
+    with pytest.raises(Boom, match="buffer exploded"):
+        _bounded_replay_buffer_sample(
+            sample,
+            running_entries=lambda: 0,
+            dead_workers=list,
+            stall_timeout_s=30.0,
+            poll_interval_s=0.01,
+        )
+
+
+def test_bounded_sample_deadline_can_be_disabled():
+    # a zero timeout disables only the wall-clock backstop; liveness still fails the step, so the
+    # run cannot go back to hanging forever on a dead worker.
+    release = threading.Event()
+    try:
+        with pytest.raises(RuntimeError, match="died while"):
+            _bounded_replay_buffer_sample(
+                _never_returns(release),
+                running_entries=lambda: 1,
+                dead_workers=lambda: ["agent-loop worker 0"],
+                stall_timeout_s=0.0,
+                poll_interval_s=0.001,
+            )
+    finally:
+        release.set()
+
+
+def test_teacher_worker_exit_records_the_cause_before_exiting(tmp_path, monkeypatch):
+    # the exit codes 86/87 are read off the CHILD process return code, but these exits run inside a
+    # ray agent-loop actor: os._exit kills the actor while the child driver lives on, so those codes
+    # never arrive and failures.py's classifier -- which is correct -- can never fire. the fallback
+    # record is the only channel that survives, because the parent reads it from disk.
+    import flash.engine.worker.train.opd.child.bridge as bridge
+
+    base = tmp_path / "teacher-worker-failure"
+    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKER_FAILURE_PATH", str(base))
+    exits = []
+    monkeypatch.setattr(bridge.os, "_exit", lambda code: exits.append(code))
+
+    bridge._exit_teacher_worker(86, "permanent", "teacher rejected the request")
+
+    assert exits == [86]
+    recovered = opd_train._read_classified_failure_fallback(str(base))
+    assert recovered == ("permanent", "teacher rejected the request")
+
+
+def test_score_failure_records_evidence_even_when_delivery_is_known(tmp_path, monkeypatch):
+    # the gap this closes: the fallback used to be written ONLY when delivery was unknown, so an
+    # ordinary teacher rejection -- the common case -- left no evidence at all and the run was
+    # reported as a bare wedge with nothing to attribute it to.
+    import flash.engine.worker.train.opd.child.bridge as bridge
+
+    base = tmp_path / "teacher-worker-failure"
+    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKER_FAILURE_PATH", str(base))
+    exits = []
+    monkeypatch.setattr(bridge.os, "_exit", lambda code: exits.append(code))
+
+    error = bridge.FlashTeacherBridgeError("teacher said no", classification="permanent")
+    assert error.delivery_unknown is False
+    bridge._exit_for_score_failure(error)
+
+    assert exits == [86]
+    classification, message = opd_train._read_classified_failure_fallback(str(base))
+    assert classification == "permanent"
+    assert "teacher said no" in message
+
+
+def test_teacher_worker_exit_still_exits_when_the_record_cannot_be_written(monkeypatch):
+    # recording is best-effort by design: if a full disk could block the exit, the clean attributable
+    # death would turn back into the indefinite hang this whole change exists to remove.
+    import flash.engine.worker.train.opd.child.bridge as bridge
+
+    def explode(*_args, **_kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(bridge, "_write_teacher_worker_failure_fallback", explode)
+    exits = []
+    monkeypatch.setattr(bridge.os, "_exit", lambda code: exits.append(code))
+
+    bridge._exit_teacher_worker(87, "transient", "bridge timed out")
+
+    assert exits == [87]
+
+
+def test_multiturn_exit_adapter_maps_the_code_to_its_classification(tmp_path, monkeypatch):
+    import flash.engine.worker.train.opd.child.bridge as bridge
+    import flash.engine.worker.train.opd.child.plugin as plugin
+
+    base = tmp_path / "teacher-worker-failure"
+    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKER_FAILURE_PATH", str(base))
+    monkeypatch.setattr(bridge.os, "_exit", lambda code: None)
+
+    plugin._exit_process_for_multiturn(87)
+
+    classification, _message = opd_train._read_classified_failure_fallback(str(base))
+    # 87 is the retriable code: misclassifying it as permanent would turn a retriable blip into a
+    # terminal run failure.
+    assert classification == "transient"
+
+
+def test_verl_failure_names_the_teacher_worker_when_the_child_code_cannot():
+    # the child exits nonzero for an unrelated reason (the actor died, not the driver), so no
+    # teacher return code is available -- the record is what supplies the diagnosis.
+    with pytest.raises(RuntimeError, match="permanent teacher worker failure"):
+        opd_train._raise_verl_failure(
+            1,
+            None,
+            teacher_worker_failure=("permanent", "teacher rejected the request"),
+        )
+
+
+def test_transient_teacher_worker_failure_is_retriable():
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    with pytest.raises(RetriableInfraError):
+        opd_train._raise_verl_failure(
+            1,
+            None,
+            teacher_worker_failure=("transient", "bridge timed out"),
+        )
+
+
+def test_the_rollout_watchdog_is_copied_into_the_child_workdir():
+    # the plugin imports the watchdog under its flat name at child-import time. flash is not
+    # importable in the verl interpreter, so if this file is not copied beside the plugin the child
+    # dies at import -- before any bound is installed, which would restore the wedge this fixes.
+    import inspect
+
+    from flash.engine.worker import opd_train_runner
+
+    source = inspect.getsource(opd_train_runner)
+    assert '("train/opd/child/rollout_watchdog.py", "flash_opd_rollout_watchdog.py")' in source
+
+
+def test_the_watchdog_reexport_and_definition_are_the_same_object():
+    # the plugin re-exports these for its existing callers. if the re-export ever drifts from the
+    # definition, patching one would leave the other live -- the exact trap that made the
+    # transfer-queue test pass against an unpatched probe.
+    import flash.engine.worker.train.opd.child.plugin as plugin
+    import flash.engine.worker.train.opd.child.rollout_watchdog as watchdog
+
+    assert plugin._bounded_replay_buffer_sample is watchdog._bounded_replay_buffer_sample
+    assert plugin._init_transfer_queue is watchdog._init_transfer_queue

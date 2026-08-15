@@ -167,6 +167,7 @@ def _raise_verl_failure(
     score_delivery_failure: tuple[str, str] | None = None,
     *,
     truncation_window: _TruncationWindow | None = None,
+    teacher_worker_failure: tuple[str, str] | None = None,
 ) -> None:
     if return_code == 0:
         return
@@ -201,6 +202,15 @@ def _raise_verl_failure(
         raise _w.RetriableInfraError("transient teacher bridge failure")
     if return_code == _PERMANENT_TEACHER_EXIT:
         raise RuntimeError("permanent teacher bridge failure")
+    # the two branches above only fire when the *child driver* exits with a teacher code. when the
+    # teacher path runs inside a ray agent-loop actor -- which is the normal case -- os._exit kills
+    # the actor and the driver exits some other way, so those codes never arrive. the fallback
+    # record the dying actor left behind is what carries the classification instead.
+    if teacher_worker_failure is not None:
+        classification, message = teacher_worker_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(f"transient teacher worker failure: {message}")
+        raise RuntimeError(f"permanent teacher worker failure: {message}")
     if truncation_window is not None and truncation_window.indicates_completion_cap:
         raise RuntimeError(
             f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "

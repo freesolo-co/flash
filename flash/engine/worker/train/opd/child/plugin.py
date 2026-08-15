@@ -14,7 +14,6 @@ import importlib.metadata
 import importlib.util
 import json
 import os
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -313,104 +312,28 @@ def _resolve_image_token_id(processor, tokenizer) -> int:
     raise ValueError("could not resolve a valid image token id from the processor or tokenizer")
 
 
-_TQ_INIT_TIMEOUT_S = 600.0
-
-
-def _describe_ray_resources() -> str:
-    """summarise ray's cluster and free resources, or say why they could not be read.
-
-    ray drops a resource key from available_resources() once it is fully allocated rather than reporting
-    it as zero -- verified against ray 2.56.1, where consuming every cpu removes 'CPU' from the mapping
-    entirely. that is exactly the exhaustion this probe exists to name, so a missing key reads as 0.0
-    instead of None. cluster_resources() omits a resource the node does not have at all, which 0.0 also
-    describes correctly.
-
-    this is only ever called on the timeout path, so it must not raise: a probe failure here would
-    replace the diagnosis it exists to produce.
-    """
-    import ray
-
-    try:
-        total = ray.cluster_resources()
-        free = ray.available_resources()
-    except Exception as error:  # pragma: no cover - defensive, ray is up by this point
-        return f"ray resources unreadable: {type(error).__name__}: {error}"
-    return (
-        f"cluster CPU={total.get('CPU', 0.0)} GPU={total.get('GPU', 0.0)}, "
-        f"free CPU={free.get('CPU', 0.0)} GPU={free.get('GPU', 0.0)}"
+# the flat name is the one that exists in the verl child workdir, where `flash` is not importable;
+# the package import is the one that runs in-repo. same shape as the bridge and multiturn imports.
+try:
+    from flash_opd_rollout_watchdog import (
+        _bounded_replay_buffer_sample,
+        _dead_agent_loop_workers,
+        _describe_ray_resources,
+        _describe_stalled_thread,
+        _init_transfer_queue,
+        _rollout_stall_timeout_s,
+        install_bounded_replay_buffer_sample,
     )
-
-
-def _describe_stalled_thread(ident: int | None, depth: int = 4) -> str:
-    """render the innermost frames of a thread that is still parked, or say why they are unavailable.
-
-    which of tq.init's three waits is stuck is not decidable from ray's resource counts alone: a
-    satisfied placement group rules out the first, but the controller ray.get and the get_config spin
-    look identical from outside. the wedged thread is still alive at this point, so its own frames name
-    the wait directly. like the resource probe, this runs only on the failure path and must not raise.
-    """
-    import sys
-    import traceback
-
-    try:
-        frame = sys._current_frames().get(ident) if ident is not None else None
-        if frame is None:
-            return "stack unavailable"
-        frames = traceback.extract_stack(frame)[-depth:]
-        return " <- ".join(
-            f"{f.name} ({f.filename.rsplit('/', 1)[-1]}:{f.lineno})" for f in reversed(frames)
-        )
-    except Exception as error:  # pragma: no cover - defensive, the thread is alive by construction
-        return f"stack unreadable: {type(error).__name__}: {error}"
-
-
-def _init_transfer_queue(
-    init: Callable[[Any], Any], conf: Any, timeout_s: float = _TQ_INIT_TIMEOUT_S
-) -> None:
-    """run verl's transfer-queue init under a deadline, reporting the resource state on timeout.
-
-    verl force-enables TransferQueue on the opd entry point (main_ppo_sync.main sets
-    transfer_queue.enable = True with no opt-out), so this runs before a single gpu is touched. tq.init
-    has three separate unbounded waits, none of which can be observed from outside:
-
-      - get_placement_group blocks in ray.get(pg.ready()) until every 1-cpu storage bundle is placed,
-      - process_zmq_server_info blocks in ray.get on the controller, itself a 1-cpu actor scheduled
-        outside any placement group,
-      - _init_from_existing spins `while conf is None` on get_config against a controller that may
-        never publish one.
-
-    all three are silent: tq's get_logger defaults to WARNING and TQ_LOGGING_LEVEL is unset here, so
-    every progress line inside tq.init is suppressed. a wedge therefore presents as a run that reaches
-    the ray banner and then stops, burning the full setup grace period at 0% gpu before the plane
-    calls it a stall -- with no indication that transfer_queue was even involved.
-
-    the thread is a daemon and is deliberately not joined after the timeout: it is parked inside an
-    unbounded ray.get that no signal will interrupt, and the exception below fails the run anyway. that
-    is also what makes its stack readable here, which is the only thing that tells the three waits apart.
-    """
-    import threading
-
-    failure: list[BaseException] = []
-
-    def _run() -> None:
-        try:
-            init(conf)
-        except BaseException as error:  # surfaced below, on the caller's thread
-            failure.append(error)
-
-    thread = threading.Thread(target=_run, name="flash-tq-init", daemon=True)
-    thread.start()
-    thread.join(timeout_s)
-    if thread.is_alive():
-        raise RuntimeError(
-            f"verl transfer_queue init did not finish within {timeout_s:.0f}s; "
-            f"stalled at {_describe_stalled_thread(thread.ident)}; {_describe_ray_resources()}. "
-            "tq.init waits without a timeout in three places -- an unplaceable storage placement group, "
-            "a controller rpc that never returns, and a spin on a controller that never publishes its "
-            "config -- so read the stalled frame: only the first is a capacity problem"
-        )
-    if failure:
-        raise failure[0]
+except ImportError:
+    from flash.engine.worker.train.opd.child.rollout_watchdog import (  # noqa: F401
+        _bounded_replay_buffer_sample,
+        _dead_agent_loop_workers,
+        _describe_ray_resources,
+        _describe_stalled_thread,
+        _init_transfer_queue,
+        _rollout_stall_timeout_s,
+        install_bounded_replay_buffer_sample,
+    )
 
 
 def _register_flash_distillation_loss() -> None:
@@ -488,8 +411,12 @@ def _build_flash_teacher_extensions():
                 )
             except FlashTeacherBridgeError as error:
                 _exit_for_score_failure(error)
-            except Exception:
-                os._exit(_PERMANENT_TEACHER_EXIT)
+            except Exception as error:
+                _exit_teacher_worker(
+                    _PERMANENT_TEACHER_EXIT,
+                    "permanent",
+                    f"unexpected teacher bridge failure: {type(error).__name__}: {error}",
+                )
             teacher_ids = torch.tensor(payload["teacher_ids"], dtype=torch.int32).unsqueeze(-1)
             teacher_logprobs = torch.tensor(
                 payload["teacher_logprobs"], dtype=torch.float32
@@ -555,6 +482,21 @@ def _build_flash_teacher_extensions():
     return FlashBridgeTeacherManager, compute_flash_teacher_logprobs
 
 
+def _exit_process_for_multiturn(exit_code: int) -> None:
+    """Exit adapter for the multi-turn loop, which supplies an exit code and nothing else.
+
+    The loop has already collapsed the error to one of the two teacher exit codes by the time it
+    calls this, so recover the classification from the code rather than plumbing the exception
+    through a second parameter that every other caller would have to supply.
+    """
+    classification = "transient" if exit_code == _TRANSIENT_TEACHER_EXIT else "permanent"
+    _exit_teacher_worker(
+        exit_code,
+        classification,
+        f"multi-turn OPD rollout failed with teacher exit code {exit_code}",
+    )
+
+
 def _build_flash_ppo_trainer(PPOTrainer, tq, KVBatchMeta):
     import numpy as np
     import torch
@@ -601,6 +543,8 @@ def _build_flash_ppo_trainer(PPOTrainer, tq, KVBatchMeta):
             super().init_workers()
             self.use_teacher_policy = True
             self.distillation_config = omega_conf_to_dataclass(self.config.distillation)
+            # after super(), because the agent-loop actor handles this consults are created there.
+            install_bounded_replay_buffer_sample(self)
 
         def step(self, batch_dict, metrics, timing_raw):
             def run_attempt(attempt_ordinal: int):
@@ -890,6 +834,10 @@ def _install_verl_extensions() -> None:
         deterministic_seed=deterministic_rollout_seed,
         permanent_teacher_exit=_PERMANENT_TEACHER_EXIT,
         transient_teacher_exit=_TRANSIENT_TEACHER_EXIT,
+        # without this the multi-turn loop exits through a bare os._exit, which kills the ray actor
+        # while the child driver survives -- so the prompt entry stays "running" and the trainer
+        # polls a status no living worker can publish. record the cause, then exit.
+        process_exit=_exit_process_for_multiturn,
     )
     globals()["FlashMultiTurnAgentLoop"] = FlashMultiTurnAgentLoop
 
@@ -928,6 +876,7 @@ try:
         FlashTeacherBridgeError,
         _coordinate_first_mutation_notice,
         _exit_for_score_failure,
+        _exit_teacher_worker,
         _fallback_classification,
         _mutation_distributed,
         _post_json,
@@ -945,12 +894,14 @@ try:
         _write_mutation_failure_fallback,
         _write_resample_failure_fallback,
         _write_score_delivery_failure_fallback,
+        _write_teacher_worker_failure_fallback,
     )
 except ImportError:
     from flash.engine.worker.train.opd.child.bridge import (  # noqa: F401
         FlashTeacherBridgeError,
         _coordinate_first_mutation_notice,
         _exit_for_score_failure,
+        _exit_teacher_worker,
         _fallback_classification,
         _mutation_distributed,
         _post_json,
@@ -968,6 +919,7 @@ except ImportError:
         _write_mutation_failure_fallback,
         _write_resample_failure_fallback,
         _write_score_delivery_failure_fallback,
+        _write_teacher_worker_failure_fallback,
     )
 
 

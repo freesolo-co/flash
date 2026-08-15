@@ -57,6 +57,7 @@ class _WorkloadState:
     abandonment_failure_path: str
     resample_failure_path: str
     cycle_commit_failure_path: str
+    teacher_worker_failure_path: str
     train_file: str
     val_file: str
     lora_rank: int
@@ -353,6 +354,7 @@ def _prepare_workload(
     abandonment_failure_path = os.path.join(workdir, "abandonment-failure")
     resample_failure_path = os.path.join(workdir, "resample-failure")
     cycle_commit_failure_path = os.path.join(workdir, "cycle-commit-failure")
+    teacher_worker_failure_path = os.path.join(workdir, "teacher-worker-failure")
     for path in (data_dir, shim_dir, local_dir, export_root):
         os.makedirs(path, exist_ok=True)
     materialized_images: dict[int, list[dict[str, str]]] = {}
@@ -410,6 +412,7 @@ def _prepare_workload(
         abandonment_failure_path,
         resample_failure_path,
         cycle_commit_failure_path,
+        teacher_worker_failure_path,
         train_file,
         val_file,
         lora_rank,
@@ -504,6 +507,9 @@ def _write_child_shims(
         ("train/opd/child/plugin.py", "flash_opd_plugin.py"),
         # the plugin imports this by its flat name at child-import time, so it has to land next to it.
         ("train/opd/child/bridge.py", "flash_opd_bridge.py"),
+        # likewise: the plugin imports the watchdog flat at child-import time, and without it the
+        # child dies with NameError before any bound is ever installed.
+        ("train/opd/child/rollout_watchdog.py", "flash_opd_rollout_watchdog.py"),
         ("train/opd/child/structured.py", "flash_opd_structured.py"),
         ("train/opd/child/multiturn.py", "flash_opd_multiturn.py"),
         ("train/core/child/glue.py", "flash_multiturn_glue.py"),
@@ -782,6 +788,7 @@ def _build_child_env(
         abandonment_failure_path=workload.abandonment_failure_path,
         resample_failure_path=workload.resample_failure_path,
         cycle_commit_failure_path=workload.cycle_commit_failure_path,
+        teacher_worker_failure_path=workload.teacher_worker_failure_path,
     )
 
 
@@ -811,6 +818,13 @@ def _reconcile_child_failures(
     cycle_commit_failure = _opd_train._read_classified_failure_fallback(
         workload.cycle_commit_failure_path
     )
+    # a teacher-path exit kills the ray agent-loop actor, not the child driver, so its exit code
+    # never reaches the return-code branches in _raise_verl_failure. this record is the only
+    # surviving evidence of why that worker died -- without it the run is reported as a bare
+    # "worker died" or, before the sample deadline existed, as an indefinite hang.
+    teacher_worker_failure = _opd_train._read_classified_failure_fallback(
+        workload.teacher_worker_failure_path
+    )
     _opd_train._raise_verl_failure(
         return_code,
         bridge.teacher_failure,
@@ -819,6 +833,7 @@ def _reconcile_child_failures(
         no_signal_failure,
         score_delivery_failure,
         truncation_window=truncation_window,
+        teacher_worker_failure=teacher_worker_failure,
     )
 
 
