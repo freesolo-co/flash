@@ -29,6 +29,7 @@ import pytest
 from flash.engine.worker import backend_common as vc
 from flash.engine.worker import rl_train
 from flash.engine.worker.perf.lifecycle import RetriableInfraError
+from flash.engine.worker.verl import child_io as _child_io
 
 # several tests below drive real subprocesses that import flash from a checkout, not from the venv.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -5287,12 +5288,20 @@ def _lora_rollout_server_module(loaded, *, lora_as_adapter=True):
     class _Engine:
         def __init__(self, ids):
             self._ids = set(ids)
+            self.calls = 0
 
         async def list_loras(self):
+            self.calls += 1
             return set(self._ids)
+
+        def generate(self, *args, **kwargs):
+            return ("generated", kwargs.get("lora_request"))
 
     # name matched to verl's own class: the shim looks it up by this exact attribute.
     class vLLMHttpServer:  # noqa: N801
+        # set to force the request verl hands the engine, independently of what list_loras says.
+        lora_request_override = "unset"
+
         def __init__(self):
             self.lora_as_adapter = lora_as_adapter
             self.engine = _Engine(loaded)
@@ -5306,6 +5315,22 @@ def _lora_rollout_server_module(loaded, *, lora_as_adapter=True):
             priority=0,
             **kwargs,
         ):
+            # verl's own body at vllm_async_server.py:524-538: it decides lora_request from its
+            # OWN lookup and hands it to the engine. reproducing that here is what makes these
+            # tests able to fail -- a stub that never consults list_loras cannot catch a guard
+            # that checks a different value than the one generation actually uses.
+            lora_request = None
+            if self.lora_as_adapter and module.VLLM_LORA_INT_ID in await self.engine.list_loras():
+                lora_request = f"lora:{module.VLLM_LORA_INT_ID}"
+            if self.lora_request_override != "unset":
+                lora_request = self.lora_request_override
+            self.engine.generate(
+                prompt=list(prompt_ids),
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+                priority=priority,
+            )
             return ("generated", list(prompt_ids), request_id, priority)
 
     module.vLLMHttpServer = vLLMHttpServer
@@ -5326,7 +5351,7 @@ def _apply_lora_rollout_guard(module, monkeypatch):
         stub.__path__ = []
         monkeypatch.setitem(_sys.modules, name, stub)
     monkeypatch.setitem(_sys.modules, module.__name__, module)
-    exec(compile(vc.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+    exec(compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
 
 
 def test_the_lora_rollout_guard_refuses_to_generate_from_the_base_model(monkeypatch):
@@ -5342,9 +5367,8 @@ def test_the_lora_rollout_guard_refuses_to_generate_from_the_base_model(monkeypa
         asyncio.run(module.vLLMHttpServer().generate([1, 2, 3], {}, "req-1"))
 
 
-def test_the_lora_rollout_guard_names_the_adapter_and_what_the_engine_holds(monkeypatch):
-    """the message has to be actionable from the child log alone: which id was expected, and what
-    the engine actually had."""
+def test_the_lora_rollout_guard_names_the_adapter_in_the_failure(monkeypatch):
+    """the message has to be actionable from the child log alone: which adapter was expected."""
     import asyncio
 
     module = _lora_rollout_server_module({7, 9})
@@ -5352,9 +5376,44 @@ def test_the_lora_rollout_guard_names_the_adapter_and_what_the_engine_holds(monk
 
     with pytest.raises(RuntimeError) as excinfo:
         asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-1"))
-    message = str(excinfo.value)
-    assert "123" in message
-    assert "[7, 9]" in message
+    assert "123" in str(excinfo.value)
+
+
+def test_the_lora_rollout_guard_fails_a_base_model_call_its_own_lookup_would_clear(monkeypatch):
+    """the guard must gate on the request verl actually built, not on a second lookup of its own.
+
+    here ``list_loras`` reports the adapter loaded, but generation still reaches the engine with
+    ``lora_request=None`` -- verl's own lookup disagreed, or the request was built before the
+    adapter landed. a guard that re-queries ``list_loras`` and delegates sees a healthy engine and
+    waves this through, which is exactly the base-model rollout it was written to stop. only a
+    guard reading the outgoing request catches it.
+    """
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+    server = module.vLLMHttpServer()
+    # verl's decision, not the engine's inventory, is what reaches generation.
+    server.lora_request_override = None
+
+    with pytest.raises(RuntimeError, match="refusing to roll out from the base model"):
+        asyncio.run(server.generate([1], {}, "req-no-lora-request"))
+
+
+def test_the_lora_rollout_guard_adds_no_engine_round_trip_per_rollout(monkeypatch):
+    """``list_loras`` is an awaited zeromq utility rpc, not a local read. checking it a second time
+    would double the adapter-list control-plane traffic on every grpo/opd rollout request."""
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+    server = module.vLLMHttpServer()
+
+    asyncio.run(server.generate([1], {}, "req-a"))
+    asyncio.run(server.generate([2], {}, "req-b"))
+
+    # exactly verl's own one lookup per request, with nothing added by the guard.
+    assert server.engine.calls == 2
 
 
 def test_the_lora_rollout_guard_passes_the_call_through_once_the_adapter_is_loaded(monkeypatch):
@@ -5423,6 +5482,9 @@ def test_the_lora_rollout_guard_patches_the_module_on_a_real_deferred_import(tmp
                 async def list_loras(self):
                     return set()
 
+                def generate(self, **kwargs):
+                    return "generated"
+
 
             class vLLMHttpServer:
                 def __init__(self):
@@ -5430,7 +5492,12 @@ def test_the_lora_rollout_guard_patches_the_module_on_a_real_deferred_import(tmp
                     self.engine = _Engine()
 
                 async def generate(self, prompt_ids, sampling_params, request_id, **kwargs):
-                    return "generated"
+                    lora_request = None
+                    if VLLM_LORA_INT_ID in await self.engine.list_loras():
+                        lora_request = "lora"
+                    return self.engine.generate(
+                        prompt=prompt_ids, lora_request=lora_request
+                    )
             """
         )
     )
@@ -5445,7 +5512,7 @@ def test_the_lora_rollout_guard_patches_the_module_on_a_real_deferred_import(tmp
     armed = list(_sys.meta_path)
     monkeypatch.setattr(_sys, "meta_path", armed)
 
-    exec(compile(vc.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+    exec(compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
     try:
         module = importlib.import_module(target)
 
@@ -5465,7 +5532,7 @@ def test_the_lora_rollout_guard_imports_nothing_heavy_at_interpreter_startup():
     import sys as _sys
 
     before = set(_sys.modules)
-    exec(compile(vc.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+    exec(compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
     heavy = {
         name
         for name in set(_sys.modules) - before

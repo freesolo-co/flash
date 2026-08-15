@@ -619,11 +619,12 @@ def _build_child_callbacks(
         if step_number is None:
             return
         # the first step line is the training-start boundary: sitecustomize import is long finished
-        # by then, so a marker still missing means this child never ran ours and every rollout it
-        # has already served could have come from the base model. raising here kills the child
-        # (run_verl_training tears the process group down on a callback failure), which costs one
-        # step instead of the whole gpu and teacher budget. not on the first output line: fragments
-        # print while later ones are still applying.
+        # by then, so a marker still missing means this child never ran ours at all -- a shadowing
+        # sitecustomize or a dropped PYTHONPATH entry -- and every rollout it has already served
+        # could have come from the base model. raising here kills the child (run_verl_training
+        # tears the process group down on a callback failure), which costs one step instead of the
+        # whole gpu and teacher budget. not on the first output line: fragments print while later
+        # ones are still applying.
         if not shims_verified:
             _opd_train.verify_applied_shim_markers(shim_markers, (_LORA_ROLLOUT_GUARD_SHIM,))
             shims_verified = True
@@ -722,7 +723,10 @@ def _run_child(
                     )
     finally:
         watcher.stop(require_complete=training_completed)
-    peak_gpu_gb = gpu_sampler.stop_gb()
+        # stopped here rather than after the block: the sampler polls nvidia-smi on a thread of
+        # its own, the first-step marker check can raise straight out of run_verl_training, and
+        # this worker outlives the run -- a missed stop leaks that polling for the whole process.
+        peak_gpu_gb = gpu_sampler.stop_gb()
     truncation_window = None
     if return_code != 0:
         truncation_window = progress_state.truncation_window(

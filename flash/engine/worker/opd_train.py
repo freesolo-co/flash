@@ -29,7 +29,6 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     parse_wandb_link,
     probe_verl_capabilities,
     render_gdn_varlen_shim,
-    render_lora_rollout_guard_shim,
     render_shim_marker_prologue,
     render_wandb_link_shim,
     require_gdn_boundary_resets,
@@ -69,6 +68,7 @@ from flash.engine.worker.train.core.child.glue import (  # noqa: F401
 from flash.engine.worker.train.opd.gkd import (
     generation_eos_from_cached_config,
 )
+from flash.engine.worker.verl.child_io import render_lora_rollout_guard_shim  # noqa: F401
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
 _PERMANENT_TEACHER_EXIT = 86

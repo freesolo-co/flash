@@ -430,23 +430,29 @@ FLASH_LORA_ROLLOUT_MARKER = "[flash-verl] lora rollout guard active"
 _LORA_ROLLOUT_TARGET = "verl.workers.rollout.vllm_rollout.vllm_async_server"
 
 
-# Why this fragment exists at all.
+# why this fragment exists at all.
 #
-# verl's `vLLMHttpServer.generate` builds a LoRARequest only when `lora_as_adapter` is set AND
+# verl's `vLLMHttpServer.generate` builds a LoRARequest only when `lora_as_adapter` is set and
 # `VLLM_LORA_INT_ID` is already in `await self.engine.list_loras()`; it then passes whatever it has
 # to `self.engine.generate(..., lora_request=lora_request, ...)`.
 #
-# when the adapter is missing, `lora_request` stays None and generation proceeds FROM THE BASE
-# MODEL. there is no raise, no warning and no counter, so the run completes and the loss descends
+# when the adapter is missing, `lora_request` stays none and generation proceeds from the base
+# model. there is no raise, no warning and no counter, so the run completes and the loss descends
 # while every rollout came from a different policy than the one being trained. for opd that silently
 # turns on-policy distillation into off-policy distillation from the stock base model; for grpo it
 # scores trajectories the policy never produced. the symptom is "the method did not beat sft", which
 # reads as a failed experiment rather than a broken run, and no loss curve can distinguish the two.
 #
-# the shim supplies the else-branch verl omits: with lora_as_adapter set, an absent adapter is a
-# hard error. every flash rollout is a lora rollout (train.lora_rank parses with minimum=1), and
-# there is no legitimate window where the adapter is missing:
-#   - ray_trainer.fit loads the checkpoint and calls update_weights BEFORE any generation,
+# the guard wraps `self.engine.generate` rather than `vLLMHttpServer.generate`, because that is
+# where the decision is actually consumed. checking `list_loras` ourselves and then calling verl's
+# original would leave verl free to repeat its own lookup and reach the opposite conclusion, so an
+# adapter that disappeared between the two calls would still generate from the base model -- the
+# exact outcome this exists to prevent. reading the `lora_request` verl computed is also one fewer
+# engine round trip per rollout: `list_loras` is an awaited zeromq utility rpc, not a local read.
+#
+# every flash rollout is a lora rollout (train.lora_rank parses with minimum=1), and there is no
+# legitimate window where the adapter is missing:
+#   - ray_trainer.fit loads the checkpoint and calls update_weights before any generation,
 #     including the optional pre-train validation pass, so the first rollout is already post-sync.
 #   - the adapter is re-added on every step's weight sync (utils.py _update_weights -> add_lora),
 #     and the one remove_lora is inside that same awaited sync, with no generation scheduled in it.
@@ -468,6 +474,25 @@ import sys as _flash_lora_sys
 _FLASH_LORA_TARGET = {_LORA_ROLLOUT_TARGET!r}
 
 
+def _flash_guard_lora_engine(engine, adapter_id):
+    """refuse an engine.generate that carries no LoRARequest on a lora rollout."""
+    inner = engine.generate
+
+    def guarded(*args, **kwargs):
+        if kwargs.get("lora_request") is None:
+            raise RuntimeError(
+                "[flash-verl] refusing to roll out from the base model: this run trains a lora "
+                f"adapter (id {{adapter_id}}), but it was not loaded in the vllm engine when this "
+                "request was built, so verl passed no LoRARequest. generating here would train "
+                "the adapter on tokens a different policy produced, which no loss curve can "
+                "distinguish from a healthy run."
+            )
+        return inner(*args, **kwargs)
+
+    engine.generate = guarded
+    engine._flash_lora_guarded = True
+
+
 def _flash_patch_lora_rollout(module):
     server = module.vLLMHttpServer
     if getattr(server.generate, "_flash_lora_guarded", False):
@@ -475,18 +500,13 @@ def _flash_patch_lora_rollout(module):
     original = server.generate
 
     async def generate(self, *args, **kwargs):
-        # mirror verl's own condition: a merged-lora rollout serves the adapter through the base
-        # weights and legitimately carries no LoRARequest.
-        if self.lora_as_adapter:
-            loaded = await self.engine.list_loras()
-            if module.VLLM_LORA_INT_ID not in loaded:
-                raise RuntimeError(
-                    "[flash-verl] refusing to roll out from the base model: this run trains a lora "
-                    f"adapter, but adapter id {{module.VLLM_LORA_INT_ID}} is not loaded in the vllm "
-                    f"engine (loaded: {{sorted(loaded)}}). verl would silently generate from the "
-                    "base model here, which trains the adapter on tokens a different policy "
-                    "produced and cannot be detected from the loss curve."
-                )
+        # arm the engine once, on the first lora request it serves. `lora_as_adapter` is derived
+        # from config and never changes for the life of the process, so from here on any request
+        # reaching the engine without a LoRARequest is the defect. installing once (rather than
+        # around each call) keeps this correct while many rollouts share the one engine object.
+        engine = self.engine
+        if self.lora_as_adapter and not getattr(engine, "_flash_lora_guarded", False):
+            _flash_guard_lora_engine(engine, module.VLLM_LORA_INT_ID)
         return await original(self, *args, **kwargs)
 
     generate._flash_lora_guarded = True

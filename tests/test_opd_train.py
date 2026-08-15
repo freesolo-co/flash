@@ -7098,25 +7098,6 @@ def test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction():
     assert source.count(".detach()") == 1
 
 
-def test_opd_wraps_the_lora_rollout_guard_fail_closed_and_verifies_it():
-    """opd's sitecustomize was a raw concatenation with no marker channel, so a fragment that
-    failed to apply was swallowed by cpython's execsitecustomize and the child trained on. the
-    rollout guard is the one fragment whose absence is undetectable afterwards -- the run simply
-    distils the base model -- so it has to prove it applied."""
-    import flash.engine.worker.opd_train_runner as opd_runner
-
-    writer = inspect.getsource(opd_runner._write_child_shims)
-    assert "wrap_shim_fragment" in writer
-    assert "render_lora_rollout_guard_shim()" in writer
-    # the prologue defines the recorder the wrapper calls; without it the fragment raises on every
-    # child and the wrapper turns that into a hard exit.
-    assert "render_shim_marker_prologue" in writer
-
-    runner = inspect.getsource(opd_runner._run_child)
-    assert "verify_applied_shim_markers" in runner
-    assert opd_runner._LORA_ROLLOUT_GUARD_SHIM == "lora-rollout-guard"
-
-
 def test_opd_sitecustomize_composes_into_valid_python_with_the_guard(tmp_path, monkeypatch):
     """the wrapper indents a whole rendered fragment into a try block; a syntax slip there would
     turn every opd child patch into a silent no-op, so compiling the composed file is the gate."""

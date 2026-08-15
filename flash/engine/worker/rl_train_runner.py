@@ -23,7 +23,6 @@ from flash.engine.worker.backend_common import (
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
-    render_lora_rollout_guard_shim,
     render_shim_marker_prologue,
     render_tf32_shim,
     render_tilelang_cudart_shim,
@@ -62,6 +61,7 @@ from flash.engine.worker.train.rl.single_turn import (
     score_single_turn,
     score_single_turn_batch,
 )
+from flash.engine.worker.verl.child_io import render_lora_rollout_guard_shim
 
 
 def _rl_train():
