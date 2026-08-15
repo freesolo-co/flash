@@ -142,28 +142,7 @@ class _VerlCheckpointWatcher:
         return not self.required_steps or step in self.required_steps
 
     def _publishable(self, pending: list[tuple[int, str]]) -> list[tuple[int, str]]:
-        """drop optional checkpoints a newer completed checkpoint has already superseded.
-
-        Publishing is asynchronous and slower than training, so the watcher falls behind: exporting
-        one checkpoint materializes the FULL base model (see `require_merge_headroom`), which takes
-        long enough that verl writes several more saves meanwhile. A run that died at `step-350_merge`
-        with `global_step_350/400/450` all on disk is the shape of it (ISSUE-016).
-
-        Working through that backlog in order is what makes the disk peak unbounded, and the cost is
-        not merely one merge per step. `_staged_source` hardlinks the checkpoint being published so
-        verl's retention cannot prune it mid-export, so publishing a lagging step PINS a checkpoint
-        verl has already deleted -- its bytes stay on the disk on top of the newest checkpoint verl
-        is keeping (`max_ckpt_to_keep=1`) and the merge tree itself. Publishing the newest one
-        instead hardlinks what verl is retaining anyway, so the staged copy costs no extra bytes and
-        the peak drops by a whole checkpoint. Falling behind is also self-sustaining: every extra
-        merge is time the publisher spends getting further behind.
-
-        Only OPTIONAL periodic saves are dropped. When `required_steps` is set, the customer asked
-        for those exact steps and every one is published -- that path is untouched, and the older
-        steps it skips are already skipped by `_should_publish`. Nothing is lost for the run either
-        way: the deployable for the last step is published by the finalization path in `sft_train`,
-        which exports from `latest_global_step_dir` and does not consult this watcher.
-        """
+        """coalesce only an optional multi-checkpoint backlog to its newest save."""
         if self.required_steps or len(pending) <= 1:
             return pending
         superseded = pending[:-1]

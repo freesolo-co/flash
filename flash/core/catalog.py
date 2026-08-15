@@ -643,9 +643,8 @@ def resolve_model(model_id: str, algorithm: str, model_revision: str = "") -> Mo
             params_b=params_b,
             params=f"{params_b:.1f}B",
             vocab_size=vocab_size,
-            min_disk_gb=max(info.min_disk_gb, int(params_b * 2) + 64),
         )
-    return info
+    return replace(info, min_disk_gb=max(info.min_disk_gb, int(info.params_b * 2) + 64))
 
 
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
