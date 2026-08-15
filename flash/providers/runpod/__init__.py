@@ -192,7 +192,7 @@ class RunpodProvider:
         # every acceptable class, not just the head: allocation ranks a multi-class pin on cost and
         # may rent a fallback, whose endpoint name is derived from THAT class. matching is by name,
         # so naming a class this run never rented is a no-op.
-        for gpu_type in spec.gpu.acceptable_types or (spec.gpu.type,):
+        for gpu_type in spec.gpu.acceptable_types:
             terminate_endpoint(gpu_type, spec.run_id)
 
     def sweep_orphans(

@@ -453,45 +453,6 @@ def _resolve_exact_gpu(
     return exact, reachable
 
 
-def _resolve_acceptable_gpus(
-    gpu_types: tuple[str, ...],
-    **kwargs,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Validate the authored class set and narrow ``available`` to providers offering any of them.
-
-    One acceptable class is exactly ``_resolve_exact_gpu``, error for error: a scalar pin keeps the
-    precise "this class cannot fit, here is the width that would" diagnosis it always had.
-
-    With several, a class that cannot be satisfied is DROPPED rather than fatal -- naming an
-    alternative is the author saying "any of these will do", so rejecting the whole run because the
-    third choice is too small would defeat the point. Only when every class fails is the run
-    unplaceable, and then the FIRST class's error is raised: it is the one the author asked for, so
-    its remedy (a wider count, a dropped provider pin) is the one worth acting on.
-    """
-    resolved: list[str] = []
-    reachable: list[str] = []
-    first_failure: UnsupportedGpuError | None = None
-    for gpu_type in gpu_types:
-        try:
-            exact, providers = _resolve_exact_gpu(gpu_type, **kwargs)
-        except UnsupportedGpuError as exc:
-            if first_failure is None:
-                first_failure = exc
-            continue
-        resolved.append(exact)
-        reachable += [name for name in providers if name not in reachable]
-    if not resolved:
-        raise (
-            first_failure
-            if first_failure is not None
-            else UnsupportedGpuError("no acceptable GPU class was named")
-        )
-    # provider order follows `available`, which the caller ranks; preserving it keeps the pinned and
-    # unpinned searches querying providers in the same sequence.
-    ordered = tuple(name for name in kwargs["available"] if name in set(reachable))
-    return tuple(resolved), ordered
-
-
 def _narrow_to_pinned_gpus(
     gpu_type: str,
     gpu_type_fallbacks: tuple[str, ...],
@@ -499,49 +460,54 @@ def _narrow_to_pinned_gpus(
     model_id: str,
     algorithm: str,
     need: float,
-    max_gpu_count: int | None,
+    max_gpu_count: int,
     model_revision: str,
     provider: str,
     available: tuple[str, ...],
     unpinned: tuple[str, ...] | None,
     executed_width,
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
-    """Resolve an authored pin into ``(exact, acceptable, available)`` for the search below it.
-
-    Returns the narrowed provider set alongside the classes: which providers remain is decided by
-    which classes survived, so the two cannot be computed apart without asking the same question
-    twice.
-    """
-    # an auto-sized run has no authored ceiling, so the pinned-fit checks below read the widest
-    # width the platform would ever rent -- the same interpretation `_resolved_gpu_count` gives
-    # `None`. using 1 here would reject a fitting multi-card shape as unsatisfiable.
-    pin_ceiling = MAX_COMBINATION_CARDS if max_gpu_count is None else max_gpu_count
-    acceptable, available = _resolve_acceptable_gpus(
-        (gpu_type, *gpu_type_fallbacks),
-        need=need,
-        cap=geometry_safe_gpu_cap(
-            model_id, pin_ceiling, model_revision=model_revision, certify=True
-        ),
-        max_gpu_count=pin_ceiling,
-        provider=provider,
-        available=available,
-        # the ceiling a `--gpus` suggestion may name: the authored count is what rejected this
-        # run, so the remedy has to be searched against the widest width the model allows.
-        widest_cap=geometry_safe_gpu_cap(
-            model_id, MAX_COMBINATION_CARDS, model_revision=model_revision, certify=True
-        ),
-        unpinned=unpinned,
-        executed_width=executed_width,
-        algorithm=algorithm,
+    """Resolve an authored pin and narrow the search to its satisfiable classes and providers."""
+    cap = geometry_safe_gpu_cap(
+        model_id, max_gpu_count, model_revision=model_revision, certify=True
     )
-    # the structural gates below ask about ONE class ("is this pin satisfiable"), which only has
-    # an answer when exactly one class is acceptable. with a list, a class that cannot fit was
-    # already dropped above, so leaving `exact` empty asks the unpinned question of the surviving
-    # set -- and `_gather_candidates` still restricts the result to `acceptable`.
+    widest_cap = geometry_safe_gpu_cap(
+        model_id, MAX_COMBINATION_CARDS, model_revision=model_revision, certify=True
+    )
+    acceptable: list[str] = []
+    reachable: set[str] = set()
+    first_failure: UnsupportedGpuError | None = None
+    for candidate in (gpu_type, *gpu_type_fallbacks):
+        try:
+            exact, providers = _resolve_exact_gpu(
+                candidate,
+                need=need,
+                cap=cap,
+                max_gpu_count=max_gpu_count,
+                provider=provider,
+                available=available,
+                widest_cap=widest_cap,
+                unpinned=unpinned,
+                executed_width=executed_width,
+                algorithm=algorithm,
+            )
+        except UnsupportedGpuError as exc:
+            if first_failure is None:
+                first_failure = exc
+            continue
+        acceptable.append(exact)
+        reachable.update(providers)
+    if not acceptable:
+        if first_failure is not None:
+            raise first_failure
+        raise UnsupportedGpuError("no acceptable GPU class was named")
+
+    # preserve the caller's provider order after narrowing; it is also the ranking tiebreak order.
+    available = tuple(name for name in available if name in reachable)
     exact = acceptable[0] if len(acceptable) == 1 else ""
     if not available:
         raise UnsupportedGpuError(f"exact GPU {acceptable[0]!r} has no configured active provider")
-    return exact, acceptable, available
+    return exact, tuple(acceptable), available
 
 
 def _structural_gpu_names(available: tuple[str, ...], exact: str) -> tuple[str, ...]:
@@ -821,6 +787,7 @@ def allocate(
     exact = ""
     acceptable: tuple[str, ...] = ()
     if gpu_type:
+        assert max_gpu_count is not None
         exact, acceptable, available = _narrow_to_pinned_gpus(
             gpu_type,
             gpu_type_fallbacks,

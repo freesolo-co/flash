@@ -193,21 +193,10 @@ def persisted_gpu_types(spec: dict[str, Any] | None) -> tuple[str, ...]:
 
 
 def persisted_gpu_head(spec: dict[str, Any] | None) -> str:
-    """The first acceptable class, for a caller that needs exactly one name. "" when there is none.
+    """First acceptable class for scalar reporting before allocation records the winner.
 
-    A BEST GUESS, not a derivation: authored order is preference, and ``_cheapest_allocation``
-    re-ranks the acceptable classes on dollars-per-step, so an ordered pin whose second class is
-    cheaper per step rents that one instead. Exact for every scalar pin.
-
-    Acceptable only because of what the callers do with it. Those REPORTING a class (billing,
-    reconcile, the run registry) read ``remote.allocated_gpu`` first and reach this only before
-    allocation stamps one. Those NAMING AN ENDPOINT for teardown cannot prefer ``allocated_gpu``,
-    since teardown runs after the parse already failed -- but a wrong guess there names an endpoint
-    that does not exist, which those best-effort sites already tolerate, and is strictly better than
-    a list that raises before naming anything at all.
-
-    Where a MISSING name would hide a paid resource -- the idle reaper, which skips endpoints absent
-    from its index -- use ``persisted_gpu_types`` and name them all.
+    Exact for scalar pins. Ordered pins are cost-ranked, so callers must prefer
+    ``remote.allocated_gpu`` and use this only while no allocated class exists.
     """
     types = persisted_gpu_types(spec)
     return types[0] if types else ""
@@ -497,11 +486,18 @@ class GpuSpec:
         )
         if self.provider and providers:
             raise ValueError("gpu.provider and gpu.providers cannot both be set")
+        if not isinstance(self.type, str):
+            raise TypeError("gpu.type must be a string")
+        gpu_type = (
+            _validated_gpu_type(self.type, field_name="gpu.type") if self.type.strip() else ""
+        )
+        fallbacks = _validated_gpu_type_fallbacks(self.type_fallbacks, head=gpu_type)
+        if fallbacks and not gpu_type:
+            raise ValueError("gpu.type_fallbacks requires gpu.type")
+        object.__setattr__(self, "type", gpu_type)
+        object.__setattr__(self, "type_fallbacks", fallbacks)
         object.__setattr__(self, "providers", providers)
         object.__setattr__(self, "count", _gpu_count(self.count))
-        object.__setattr__(self, "type_fallbacks", tuple(self.type_fallbacks))
-        if self.type_fallbacks and not self.type:
-            raise ValueError("gpu.type_fallbacks requires gpu.type")
 
     @property
     def acceptable_types(self) -> tuple[str, ...]:

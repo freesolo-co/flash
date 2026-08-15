@@ -1367,6 +1367,18 @@ def test_persisted_gpu_type_fallbacks_are_canonicalized_and_require_a_head() -> 
         _job_from_dict({"gpu": {"type_fallbacks": ["H100"]}})
 
 
+def test_gpu_spec_guards_direct_ordered_pin_construction() -> None:
+    spec = GpuSpec(type=" h100 ", type_fallbacks=[" a100 pcie ", "H100"])
+    assert spec.acceptable_types == ("H100", "A100 PCIe")
+
+    with pytest.raises(TypeError, match=r"must be a list of strings"):
+        GpuSpec(type="H100", type_fallbacks="A100 PCIe")
+    with pytest.raises(TypeError, match=r"entry must be a string"):
+        GpuSpec(type="H100", type_fallbacks=(123,))
+    with pytest.raises(ValueError, match=r"unsupported gpu"):
+        GpuSpec(type="H100", type_fallbacks=("H10O",))
+
+
 def test_persisted_ordered_gpu_pin_survives_a_status_reload() -> None:
     """`to_dict()` writes the AUTHORED list, and the runner reloads that record through
     `JobSpec.from_dict` on roughly twenty paths (status reads, attach, recovery, serving, billing).

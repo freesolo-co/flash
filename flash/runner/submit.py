@@ -93,15 +93,13 @@ def prepare_job(
                 raise ValueError(f"unknown gpu.provider {spec.gpu.provider!r}")
             if provider not in configured:
                 raise ValueError(f"requested gpu.provider {provider!r} is not configured")
-        elif spec.gpu.type and not any(
+        elif spec.gpu.acceptable_types and not any(
             name in configured
             for gpu_type in spec.gpu.acceptable_types
             for name in providers_for(gpu_type)
         ):
             # an ordered pin is unplaceable only when NO acceptable class has a configured provider;
-            # rejecting on the head alone would refuse a run whose fallback is perfectly rentable. the
-            # `type` guard keeps a providers-only spec out of here: it pins no class, so there is no
-            # acceptable set to place and the preference stays soft.
+            # rejecting on the head alone would refuse a run whose fallback is perfectly rentable.
             unplaceable = " / ".join(repr(name) for name in spec.gpu.acceptable_types)
             raise ValueError(f"no configured provider can provision gpu.type {unplaceable}")
     info = _runner().resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)
