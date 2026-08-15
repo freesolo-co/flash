@@ -60,7 +60,10 @@ def _stub_prepare_dependencies(monkeypatch, spec=None):
     )
     # these tests isolate model revision and structured-output validation. environment image
     # discovery and managed-teacher configuration have their own boundary suites.
-    monkeypatch.setattr("flash.content.multimodal.preflight_validate_image_opd", lambda _spec: None)
+    monkeypatch.setattr(
+        "flash.content.multimodal.preflight_validate_image_opd",
+        lambda _spec, **_kwargs: None,
+    )
     monkeypatch.setattr(
         "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
         lambda _spec: None,

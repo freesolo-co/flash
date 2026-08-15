@@ -419,7 +419,7 @@ def test_a_nonexistent_environment_is_refused_before_the_402(api, monkeypatch):
 
 
 def test_transient_environment_resolve_is_attempted_once_per_request(api, monkeypatch):
-    """the request-side preflight owns one bounded attempt before deferring a transient failure."""
+    """packaged opd defers after one bounded request-side attempt on a transient failure."""
     import flash.envs.loader as env_loader
     from flash.envs.identity import GitHubUnavailableError
 
@@ -431,16 +431,59 @@ def test_transient_environment_resolve_is_attempted_once_per_request(api, monkey
 
     monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", _transient)
+    monkeypatch.setattr(
+        "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
+        lambda _spec: None,
+    )
+    spec = {
+        **SPEC,
+        "algorithm": "opd",
+        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
+    }
 
     res = api.post(
         "/v1/runs",
-        json={"spec": SPEC, "dry_run": True},
+        json={"spec": spec, "dry_run": True},
         headers=_bearer("fslo-user-1"),
     )
 
     assert res.status_code == 200, res.text
     assert res.json()["state"] == "dry_run"
     assert calls == [1], f"environment ref was resolved {len(calls)} times"
+
+
+def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monkeypatch):
+    """a tokenless plane must not turn a private packaged opd environment into a false 404."""
+    import flash.envs.loader as env_loader
+    from flash.envs.identity import GitHubPermanentError
+
+    calls = []
+
+    def _anonymous_404(_parsed, *_args, **_kwargs):
+        calls.append(1)
+        raise GitHubPermanentError("GitHub environment request failed (404): Not Found")
+
+    monkeypatch.setattr(env_loader, "_github_token", lambda: None)
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", _anonymous_404)
+    monkeypatch.setattr(
+        "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
+        lambda _spec: None,
+    )
+    spec = {
+        **SPEC,
+        "algorithm": "opd",
+        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
+    }
+
+    res = api.post(
+        "/v1/runs",
+        json={"spec": spec, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["state"] == "dry_run"
+    assert calls == []
 
 
 def test_submit_fails_open_when_precheck_unreachable(api, monkeypatch):

@@ -130,11 +130,16 @@ def prepare_job(
     )
     # these read-only gates belong to preparation: every submit path passes here exactly once, and
     # callers receive the pinned worker spec before quoting, affordability, persistence, or allocation.
-    worker_spec = _runner().preflight_validate_environment_ref(worker_spec)
+    worker_spec, environment_ref_deferred = _runner().preflight_validate_environment_ref(
+        worker_spec
+    )
     from flash.content.multimodal import preflight_validate_image_opd
     from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
 
-    preflight_validate_image_opd(worker_spec)
+    preflight_validate_image_opd(
+        worker_spec,
+        scan_packaged_environment=not environment_ref_deferred,
+    )
     preflight_validate_managed_teacher(worker_spec)
     from flash.cost.spec import estimate_for_spec
 

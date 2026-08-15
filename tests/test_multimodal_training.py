@@ -637,7 +637,7 @@ def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path
         mm.preflight_validate_image_opd(unsupported)
 
 
-def test_image_opd_preflight_rejects_multi_turn_with_a_vision_teacher():
+def test_image_opd_preflight_keeps_inline_validation_when_packaged_scan_is_deferred():
     spec = SimpleNamespace(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
@@ -662,7 +662,7 @@ def test_image_opd_preflight_rejects_multi_turn_with_a_vision_teacher():
     )
 
     with pytest.raises(ValueError, match="multi-turn image-bearing opd is not supported"):
-        mm.preflight_validate_image_opd(spec)
+        mm.preflight_validate_image_opd(spec, scan_packaged_environment=False)
 
 
 def test_image_opd_preflight_allows_max_turns_on_a_single_turn_env():

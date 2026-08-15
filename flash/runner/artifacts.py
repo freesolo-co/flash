@@ -8,6 +8,7 @@ import re
 
 import flash.runner as runner
 from flash.core.spec import JobSpec
+from flash.envs.identity import GitHubEnvironmentRef
 
 
 def artifact_namespace() -> str:
@@ -77,17 +78,14 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return runner.JobSpec.from_dict(d)
 
 
-def _resolve_environment_sha_once(
-    spec: JobSpec, *, timeout: float
-) -> tuple[JobSpec, Exception | None]:
-    """resolve and pin one environment ref, preserving the typed failure for its caller."""
+def _github_environment_ref(spec: JobSpec) -> GitHubEnvironmentRef | None:
+    """parse the spec's resolvable github environment ref without making a request."""
     env_id = spec.environment.id
     if not env_id or spec.environment.resolved_sha:
-        return spec, None
+        return None
     try:
         from flash.envs.loader import (
             _parse_github_environment_ref,
-            _resolve_ref_sha,
             is_managed_environment_slug,
             managed_slug_to_github_ref,
         )
@@ -95,9 +93,18 @@ def _resolve_environment_sha_once(
         ref_str = (
             managed_slug_to_github_ref(env_id) if is_managed_environment_slug(env_id) else env_id
         )
-        parsed = _parse_github_environment_ref(ref_str)
-        if parsed is None:
-            return spec, None
+        return _parse_github_environment_ref(ref_str)
+    except Exception:
+        return None
+
+
+def _resolve_environment_sha_once(
+    spec: JobSpec, parsed: GitHubEnvironmentRef, *, timeout: float
+) -> tuple[JobSpec, Exception | None]:
+    """resolve and pin one environment ref, preserving the typed failure for its caller."""
+    try:
+        from flash.envs.loader import _resolve_ref_sha
+
         sha = _resolve_ref_sha(parsed, timeout=timeout, max_rate_limit_retries=0)
     except Exception as exc:
         return spec, exc
@@ -112,7 +119,10 @@ def _pin_env_sha_with_reason(spec: JobSpec) -> tuple[JobSpec, str]:
     """best-effort pinning with the exact failure reason used by sft diagnostics."""
     import logging
 
-    pinned, error = _resolve_environment_sha_once(spec, timeout=10.0)
+    parsed = _github_environment_ref(spec)
+    if parsed is None:
+        return spec, ""
+    pinned, error = _resolve_environment_sha_once(spec, parsed, timeout=10.0)
     if error is None:
         return pinned, ""
     logging.getLogger(runner.__name__).warning(
@@ -128,24 +138,27 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
     return _pin_env_sha_with_reason(spec)[0]
 
 
-def preflight_validate_environment_ref(spec: JobSpec) -> JobSpec:
-    """reject an authenticated 404/422 before billing or allocation.
+def preflight_validate_environment_ref(spec: JobSpec) -> tuple[JobSpec, bool]:
+    """reject permanent refs and report whether github-dependent work must defer.
 
     transient and unclassified failures keep the existing worker deferral. tokenless planes skip
-    the gate because github also returns 404 for private repositories an anonymous caller cannot
+    the request because github also returns 404 for private repositories an anonymous caller cannot
     read. a successful resolve is retained on the returned worker spec.
     """
     from flash.envs.identity import GitHubPermanentError
     from flash.envs.loader import _github_token
 
+    parsed = _github_environment_ref(spec)
+    if parsed is None:
+        return spec, False
     if not _github_token():
-        return spec
+        return spec, True
 
-    pinned, error = _resolve_environment_sha_once(spec, timeout=4.0)
+    pinned, error = _resolve_environment_sha_once(spec, parsed, timeout=4.0)
     if isinstance(error, GitHubPermanentError):
         env_id = spec.environment.id
         raise runner.EnvironmentRefNotFound(
             f"environment {env_id!r} could not be resolved on GitHub: {error}. Verify the repository "
             "and ref exist and that the plane's GitHub token can read them"
         ) from error
-    return pinned
+    return pinned, not bool(pinned.environment.resolved_sha)
