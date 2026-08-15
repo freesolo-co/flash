@@ -2902,22 +2902,24 @@ def _progress_bridge_snapshot(*, samples_seen: int, truncated_rollouts: int):
     )
 
 
-def test_opd_progress_truncation_rate_is_per_step_not_cumulative():
+def test_opd_progress_truncation_metrics_are_per_step_not_cumulative():
     progress = _OpdProgressState()
 
-    first = progress.record_step(
+    first_rate, first_discarded = progress.record_step(
         1,
         0.8,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
-    second = progress.record_step(
+    second_rate, second_discarded = progress.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=3),
     )
 
-    assert first == pytest.approx(0.75)
-    assert second == 0.0
+    assert first_rate == pytest.approx(0.75)
+    assert first_discarded == 3
+    assert second_rate == 0.0
+    assert second_discarded == 0
 
 
 def test_opd_progress_truncation_rate_zero_delta_does_not_reuse_history():
@@ -2928,28 +2930,30 @@ def test_opd_progress_truncation_rate_zero_delta_does_not_reuse_history():
         0.8,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
-    second = progress.record_step(
+    second_rate, second_discarded = progress.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
 
-    assert second == 0.0
+    assert second_rate == 0.0
+    assert second_discarded == 0
 
 
 def test_opd_progress_truncation_rate_handles_zero_rollouts():
     progress = _OpdProgressState()
 
-    rate = progress.record_step(
+    rate, discarded = progress.record_step(
         1,
         0.8,
         _progress_bridge_snapshot(samples_seen=0, truncated_rollouts=0),
     )
 
     assert rate == 0.0
+    assert discarded == 0
 
 
-def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
+def test_opd_progress_step_metrics_stay_out_of_the_persisted_resume_state(tmp_path):
     """checkpoint_state is spread verbatim into opd_state.json, whose schema is fail-closed.
 
     a per-step display value is meaningless on resume and no consumer reads it back: the CLI
@@ -2962,12 +2966,13 @@ def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
     # fail-closed schema, so a partial snapshot would fail before reaching the assertion below.
     full = _resume_accounting(step=1)
     progress = _OpdProgressState()
-    rate = progress.record_step(
+    rate, discarded = progress.record_step(
         1,
         0.8,
         SimpleNamespace(accounting_snapshot=lambda: dict(full)),
     )
     assert rate == pytest.approx(0.375)
+    assert discarded == 3
 
     checkpoint = tmp_path / "checkpoint"
     adapter = tmp_path / "adapter"
@@ -2991,6 +2996,7 @@ def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
 
     state = json.loads((checkpoint / "opd_state.json").read_text())
     assert "truncation_rate" not in state
+    assert "discarded_rollouts" not in state
 
 
 def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
@@ -3000,7 +3006,7 @@ def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
         0.8,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=0),
     )
-    high_rate = high.record_step(
+    high_rate, high_discarded = high.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=12, truncated_rollouts=8),
@@ -3011,13 +3017,16 @@ def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
         0.8,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=4),
     )
-    low_rate = low.record_step(
+    low_rate, low_discarded = low.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=12, truncated_rollouts=2),
     )
 
     assert [high_rate, low_rate] == pytest.approx([1.0, 0.0])
+    # the count is bounded by the step's own sample delta (8 -> 12 is 4 samples), so a split
+    # snapshot reporting 8 truncations cannot attribute more discards than the step drew.
+    assert [high_discarded, low_discarded] == [4, 0]
 
 
 def test_opd_failure_accounting_defaults_optional_no_signal_counter():
@@ -8017,7 +8026,12 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
     assert emitted == [
         (
             "opd_step",
-            {"step": 1, "loss": 0.5, "truncation_rate": pytest.approx(0.75)},
+            {
+                "step": 1,
+                "loss": 0.5,
+                "truncation_rate": pytest.approx(0.75),
+                "discarded_rollouts": 3,
+            },
         )
     ]
 
@@ -8046,6 +8060,7 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
     assert emitted[1][0] == "opd_step"
     assert emitted[1][1]["step"] == 2
     assert "truncation_rate" not in emitted[1][1]
+    assert "discarded_rollouts" not in emitted[1][1]
 
 
 def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch):
@@ -8085,6 +8100,7 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
 
     assert [payload["step"] for _, payload in emitted] == [1, 2]
     assert all("truncation_rate" in payload for _, payload in emitted)
+    assert [payload["discarded_rollouts"] for _, payload in emitted] == [3, 0]
 
 
 def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
