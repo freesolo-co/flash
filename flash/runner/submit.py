@@ -75,18 +75,27 @@ def prepare_job(
             preflight_train_context_within_serving(spec)
         except ValueError as exc:
             raise ServingPreflightError(str(exc)) from exc
-    if spec.gpu.provider or spec.gpu.type:
-        from flash.providers import PROVIDER_NAMES, available_providers
+    if spec.gpu.provider or spec.gpu.providers or spec.gpu.type:
+        from flash.providers import (
+            PROVIDER_NAMES,
+            available_providers,
+            validated_provider_preferences,
+        )
         from flash.providers.base import providers_for
 
         configured = available_providers()
         provider = spec.gpu.provider.strip().lower()
+        providers = validated_provider_preferences(spec.gpu.providers, allow_empty=True)
+        if provider and providers:
+            raise ValueError("gpu.provider and gpu.providers cannot both be set")
         if provider:
             if provider not in PROVIDER_NAMES:
                 raise ValueError(f"unknown gpu.provider {spec.gpu.provider!r}")
             if provider not in configured:
                 raise ValueError(f"requested gpu.provider {provider!r} is not configured")
-        elif not any(name in configured for name in providers_for(spec.gpu.type)):
+        elif spec.gpu.type and not any(name in configured for name in providers_for(spec.gpu.type)):
+            # the preference stays soft even when none of its named providers carries this class:
+            # unnamed configured providers still serve it, and only a fleet-wide miss is unsatisfiable.
             raise ValueError(f"no configured provider can provision gpu.type {spec.gpu.type!r}")
     info = _runner().resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)
     if spec.algorithm == "opd" and spec.train.structured_outputs:
