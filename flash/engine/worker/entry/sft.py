@@ -52,7 +52,12 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
             # role-aware: the prompt boundary alone would also supervise the environment's replies
             # between assistant turns of a multi-turn target.
             "completion_mask": assistant_only_mask(
-                completion_mask_from_ids(pids, ids), ids, tokenizer, t["target_messages"]
+                completion_mask_from_ids(pids, ids),
+                ids,
+                tokenizer,
+                t["target_messages"],
+                source_messages=t.get("source_messages"),
+                template_kwargs=t.get("template_kwargs"),
             ),
             "untruncated_length": length,
         }

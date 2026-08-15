@@ -60,6 +60,9 @@ from flash.envs.identity import (
     GitHubEnvironmentRef as GitHubEnvironmentRef,
 )
 from flash.envs.identity import (
+    GitHubPermanentError as GitHubPermanentError,
+)
+from flash.envs.identity import (
     GitHubRateLimitError as GitHubRateLimitError,
 )
 from flash.envs.identity import (
@@ -279,6 +282,14 @@ def _urlopen(
             if exc.code >= 500:
                 raise GitHubUnavailableError(
                     f"GitHub server error ({exc.code}, transient) after {attempt} retries: {body[:300]}"
+                ) from exc
+            # 404 (no such repo, or one the token cannot read) and 422 (a ref that does not exist,
+            # e.g. "No commit found for SHA: main" on a master-default repo) are settled answers.
+            # Typed so the submit-time pin can fail closed on them while still deferring a blip;
+            # every other code keeps the untyped RuntimeError it has always raised.
+            if exc.code in (404, 422):
+                raise GitHubPermanentError(
+                    f"GitHub environment request failed ({exc.code}): {body[:500]}"
                 ) from exc
             raise RuntimeError(
                 f"GitHub environment request failed ({exc.code}): {body[:500]}"

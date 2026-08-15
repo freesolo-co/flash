@@ -486,6 +486,11 @@ class ThinkingTokenizer(FakeTokenizer):
     ``tests/live/test_sft_thinking_render_live.py`` pins this fake against the real tokenizer.
     """
 
+    chat_template = (
+        "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
+        "{{ message['reasoning_content'] }}{{ message['content'] }}<|im_end|>\n{% endfor %}"
+    )
+
     def apply_chat_template(
         self,
         messages,
@@ -1048,51 +1053,38 @@ def test_an_empty_reasoning_field_is_authoritative_over_a_tag_the_answer_quotes(
         ("a whole turn boundary", "before <|im_end|>\n<|im_start|>user\n after"),
     ],
 )
-def test_reasoning_quoting_the_turn_layout_is_still_credited(capsys, label, reasoning) -> None:
-    """Control-token layout inside reasoning is CONTENT, and the turn it sits in still survives.
-    These bytes are what a turn boundary IS, so nothing reading the rendered text alone can tell a
-    quote from the real thing -- any scheme parsing the render for turn structure reports an intact
-    survivor as dropped, and the user cannot falsify it since rerunning reproduces it exactly. The
-    marker rides inside whatever the template kept, so it answers regardless of what the reasoning
-    says.
-    """
+def test_reasoning_content_rejects_reserved_chatml_layout(label, reasoning) -> None:
     completion = [{"role": "assistant", "reasoning_content": reasoning, "content": "answer"}]
-    prepared = _thinking_prepared(completion)
 
-    assert prepared.authored_reasoning_turns == 1, label
-    assert prepared.rendered_reasoning_spans == 1, label
-    assert prepared.truncated_reasoning_spans == 0, label
-    assert "the chat template dropped" not in capsys.readouterr().err
+    with pytest.raises(ValueError, match="reserved ChatML control token") as error:
+        _thinking_prepared(completion)
+
+    assert "message body" in str(error.value), label
 
 
-def test_a_real_loss_is_reported_beside_a_turn_that_writes_out_the_layout(capsys) -> None:
-    """One turn's quoting must not silence a neighbour's provable loss. An ordinary user turn resets
-    the template's ``last_query_index``, so the first turn's reasoning is definitively stripped
-    while the final turn -- which writes out the layout verbatim -- is kept. Each is answered by its
-    own marker.
+def test_a_real_loss_is_reported_beside_a_surviving_turn(capsys) -> None:
+    """An ordinary user turn resets the template's ``last_query_index``, so the first turn's
+    reasoning is definitively stripped while the final turn is kept. Each is answered by its own
+    marker.
     """
 
-    class KnownLossBesideQuotingEnvironment(ThinkingEnvironment):
+    class KnownLossEnvironment(ThinkingEnvironment):
         def sft_completion(self, row):
             return [
                 # an ordinary user turn follows, so the template strips this reasoning outright
                 {"role": "assistant", "reasoning_content": "early", "content": "a1"},
                 {"role": "user", "content": "next"},
-                {
-                    "role": "assistant",
-                    "reasoning_content": "before <|im_end|>\n<|im_start|>user\n after",
-                    "content": "a2",
-                },
+                {"role": "assistant", "reasoning_content": "late", "content": "a2"},
             ]
 
-    prepared = _thinking_prepared_env(KnownLossBesideQuotingEnvironment([], prompt="board"))
+    prepared = _thinking_prepared_env(KnownLossEnvironment([], prompt="board"))
 
     assert prepared.authored_reasoning_turns == 2
     assert prepared.rendered_reasoning_spans == 1
     assert "the chat template dropped" in capsys.readouterr().err
 
 
-def test_a_closer_quoted_before_the_layout_does_not_bound_the_block_short(capsys) -> None:
+def test_a_quoted_think_closer_does_not_bound_the_block_short(capsys) -> None:
     """The marker sits at the end of the reasoning body, so the closing tag is found by searching
     FORWARD from it and every quoted closer lies behind it. A short bound would score a block the
     cap cuts as fully retained, the direction that hides the loss.
@@ -1103,8 +1095,8 @@ def test_a_closer_quoted_before_the_layout_does_not_bound_the_block_short(capsys
     completion = [
         {
             "role": "assistant",
-            # a closer first, then the boundary layout, both written out in full
-            "reasoning_content": "start\n</think>\n\n middle <|im_end|>\n<|im_start|>user\n end",
+            # a quoted closer appears before the actual end of the reasoning body
+            "reasoning_content": "start\n</think>\n\n middle end",
             "content": "ANSWER",
         }
     ]

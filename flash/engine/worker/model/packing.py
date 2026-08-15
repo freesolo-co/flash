@@ -257,23 +257,110 @@ def _active_chat_template(source) -> str | None:
     return template if isinstance(template, str) else None
 
 
-def _uses_chatml_template(source) -> bool:
+def _chatml_template(source) -> str | None:
     template = _active_chat_template(source)
-    return template is not None and all(token in template for token in _CHATML_CONTROL_TOKENS)
+    if template is None or not all(token in template for token in _CHATML_CONTROL_TOKENS):
+        return None
+    return template
 
 
-def _reject_chatml_control_content(target_messages: list[dict]) -> None:
-    """Reject ambiguous control strings in multi-turn targets containing observations."""
-    if not any(_normalized_source_role(message) != "assistant" for message in target_messages):
-        return
-    for message in target_messages:
-        text = message_content_text(message.get("content"))
-        for token in _CHATML_CONTROL_TOKENS:
-            if token in text:
-                raise ValueError(
-                    f"SFT message content contains reserved ChatML control token {token}; "
-                    "remove or escape the literal token before training"
-                )
+def _sanitized_probe_text(text: str) -> str:
+    for token in _CHATML_CONTROL_TOKENS:
+        text = text.replace(token, "<|flash_reserved_control|>")
+    return text
+
+
+def _probe_content(content, sentinel: str | None):
+    if isinstance(content, str):
+        return _sanitized_probe_text(content) + (sentinel or "")
+    if not isinstance(content, list):
+        return content
+    copied = [dict(block) if isinstance(block, dict) else block for block in content]
+    text_indexes = [
+        index
+        for index, block in enumerate(copied)
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ]
+    for index in text_indexes:
+        copied[index]["text"] = _sanitized_probe_text(copied[index]["text"])
+    if sentinel is not None and text_indexes:
+        last = text_indexes[-1]
+        copied[last]["text"] += sentinel
+    return copied
+
+
+def _rendered_target_body_fields(
+    template_source,
+    template: str,
+    source_messages: list[dict],
+    target_messages: list[dict],
+    template_kwargs: dict,
+) -> list[set[str]]:
+    """Probe which target body fields the independently selected template actually renders."""
+    target_start = len(source_messages) - len(target_messages)
+    if target_start < 0:
+        raise ValueError("SFT target messages cannot outnumber the full source transcript")
+    haystack = template + repr(source_messages)
+    prefix = "flashchatmlfieldprobe"
+    while prefix in haystack:
+        prefix += "x"
+
+    sentinels: dict[tuple[int, str], str] = {}
+    probed: list[dict] = []
+    for index, message in enumerate(source_messages):
+        copied = dict(message)
+        target_index = index - target_start
+        content_sentinel = None
+        reasoning_sentinel = None
+        if target_index >= 0:
+            content_sentinel = f"{prefix}{target_index}content"
+            reasoning_sentinel = f"{prefix}{target_index}reasoning"
+            sentinels[(target_index, "content")] = content_sentinel
+            sentinels[(target_index, "reasoning_content")] = reasoning_sentinel
+        if "content" in copied:
+            copied["content"] = _probe_content(copied["content"], content_sentinel)
+        reasoning = copied.get("reasoning_content")
+        if isinstance(reasoning, str):
+            copied["reasoning_content"] = _sanitized_probe_text(reasoning) + (
+                reasoning_sentinel or ""
+            )
+        probed.append(copied)
+
+    rendered = template_source.apply_chat_template(
+        probed,
+        tokenize=False,
+        add_generation_prompt=False,
+        **template_kwargs,
+    )
+    if not isinstance(rendered, str):
+        raise TypeError("chat template field probe must return rendered text")
+    fields = [set() for _ in target_messages]
+    for (target_index, field), sentinel in sentinels.items():
+        if sentinel in rendered:
+            fields[target_index].add(field)
+    return fields
+
+
+def _reject_chatml_control_bodies(
+    target_messages: list[dict], rendered_fields: list[set[str]]
+) -> None:
+    """Reject source body text that is ambiguous with structural ChatML delimiters."""
+    for message, fields in zip(target_messages, rendered_fields, strict=True):
+        texts = []
+        if "content" in fields:
+            texts.append(message_content_text(message.get("content")))
+        reasoning = message.get("reasoning_content")
+        if "reasoning_content" in fields and isinstance(reasoning, str):
+            texts.append(reasoning)
+        for text in texts:
+            for token in _CHATML_CONTROL_TOKENS:
+                if token in text:
+                    raise ValueError(
+                        f"SFT message body contains reserved ChatML control token {token}; "
+                        "remove or escape the literal token before training"
+                    )
 
 
 def _chatml_message_spans(full_ids: list[int], tokenizer) -> list[tuple[int, int, str]] | None:
@@ -334,6 +421,8 @@ def assistant_only_mask(
     tokenizer,
     target_messages: list[dict],
     template_source=None,
+    source_messages: list[dict] | None = None,
+    template_kwargs: dict | None = None,
 ) -> list[int]:
     """Clear supervision over every non-assistant span of a rendered transcript.
 
@@ -348,25 +437,40 @@ def assistant_only_mask(
     ChatML the mask is returned unchanged -- narrowing supervision on a guess would silently drop
     real training signal.
 
-    ChatML control strings are reserved in multi-turn target content when the active template is
-    ChatML and the target contains non-assistant observations. Their token ids are identical to
-    structural delimiters after rendering, so accepting a literal would make the boundary ambiguous
-    and could expose the rest of a non-assistant turn to supervision. Single-turn and non-ChatML
-    targets keep their prior behavior.
+    ChatML control strings are reserved in every rendered target body when the active template is
+    ChatML. Their token ids are identical to structural delimiters after rendering, so accepting a
+    literal would make the boundary ambiguous and could either expose an observation or hide real
+    assistant supervision. Non-ChatML targets keep their prior behavior.
     """
     template_source = tokenizer if template_source is None else template_source
-    if not _uses_chatml_template(template_source):
+    template = _chatml_template(template_source)
+    if template is None:
         return loss_mask
-    _reject_chatml_control_content(target_messages)
+    source_messages = target_messages if source_messages is None else source_messages
+    rendered_fields = _rendered_target_body_fields(
+        template_source,
+        template,
+        source_messages,
+        target_messages,
+        template_kwargs or {},
+    )
+    _reject_chatml_control_bodies(target_messages, rendered_fields)
     if not full_ids or not any(loss_mask):
         return loss_mask
     spans = _chatml_message_spans(full_ids, tokenizer)
     if spans is None:
         return loss_mask
     masked = list(loss_mask)
+    last_target_span: tuple[int, int, str] | None = None
     for start, end, role in spans:
+        bounded_end = min(end, len(masked))
+        if any(loss_mask[start:bounded_end]):
+            last_target_span = (start, bounded_end, role)
         if role == "assistant":
             continue
-        for position in range(start, min(end, len(masked))):
+        for position in range(start, bounded_end):
+            masked[position] = 0
+    if last_target_span is not None and last_target_span[2] != "assistant":
+        for position in range(last_target_span[1], len(masked)):
             masked[position] = 0
     return masked

@@ -149,7 +149,9 @@ def _processor_tokenized_row(
         input_ids,
         getattr(processor, "tokenizer", processor),
         completion_messages,
-        processor,
+        template_source=processor,
+        source_messages=[*prompt_messages, *completion_messages],
+        template_kwargs={"enable_thinking": thinking},
     )
     full.pop("attention_mask", None)
     return input_ids, loss_mask, _serialize_multimodal_inputs(full), untruncated_length
@@ -507,6 +509,8 @@ def _tokenize_prompt_rows(
                     "text": text,
                     "prompt_text": prompt_text,
                     "target_messages": completion_messages,
+                    "source_messages": [*prompt_messages, *completion_messages],
+                    "template_kwargs": {"enable_thinking": spec.thinking},
                     "row_index": row_index,
                 }
             )
