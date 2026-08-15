@@ -285,39 +285,25 @@ _LORA_B_INFIX = ".lora_B."
 
 @dataclass(frozen=True)
 class DeclaredLoraRanks:
-    """The ranks a config declares, and whether a fused stacked rank axis is possible at all.
-
-    ``by_module`` holds the ``rank_pattern`` overrides keyed by the pattern PEFT matches against the
-    module path; ``default`` is the ``r`` every non-overridden module gets. Kept apart rather than
-    collapsed to one summary number because PEFT resolves the rank PER MODULE
-    (``lora.LoraModel._create_and_replace``: ``rank_pattern.get(matched_key, config.r)``), so any
-    single number is wrong for every module it did not come from.
-
-    ``allows_stacked_rank_axis`` is true only when ``target_parameters`` is non-empty. That is what
-    routes a module through ``lora.ParamWrapper``, the one code path that builds
-    ``nn.Linear(in_features, r * num_experts)`` and so legitimately carries a rank axis larger than
-    ``r``. Ordinary ``target_modules`` never do, and their axis must equal the module's rank exactly.
-    """
+    """The default rank, per-module overrides, and parameter-target module paths in a config."""
 
     default: int | None = None
     by_module: Mapping[str, int] = field(default_factory=dict)
-    allows_stacked_rank_axis: bool = False
+    stacked_rank_modules: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
         return self.default is not None or bool(self.by_module)
 
 
 def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
-    """Read the per-module LoRA rank structure out of ``adapter_config.json``.
-
-    Falsy when nothing readable is declared, which leaves the caller with no basis to refuse.
-    """
+    """Read the per-module LoRA rank structure out of ``adapter_config.json``."""
     if not isinstance(config, Mapping):
         return DeclaredLoraRanks()
     try:
         default = _positive_int(config["r"], source="adapter_config.json", field="r")
     except (KeyError, ValueError):
         default = None
+
     by_module: dict[str, int] = {}
     pattern = config.get("rank_pattern")
     if isinstance(pattern, Mapping):
@@ -328,27 +314,26 @@ def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
                 )
             except ValueError:
                 continue
+
+    stacked_rank_modules: list[str] = []
     targets = config.get("target_parameters")
+    if isinstance(targets, list):
+        for target in targets:
+            if not isinstance(target, str):
+                continue
+            module, separator, _ = target.rpartition(".")
+            if separator and module:
+                stacked_rank_modules.append(module)
+
     return DeclaredLoraRanks(
         default=default,
         by_module=by_module,
-        allows_stacked_rank_axis=bool(targets) and not isinstance(targets, (str, bytes)),
+        stacked_rank_modules=tuple(stacked_rank_modules),
     )
 
 
-def _rank_for_module(key: str, declared: DeclaredLoraRanks) -> int | None:
-    """The rank this tensor's own module is configured for, mirroring PEFT's pattern matching.
-
-    ``peft.utils.other.get_pattern_key`` matches each entry as ``(.*\\.)?(entry)$`` against the
-    module path and returns the first hit, so an entry only ever governs a whole dot-delimited
-    suffix: ``proj`` does not match ``q_proj``. Anything unmatched falls back to ``r``.
-    """
-    module_path = key
-    for infix in (_LORA_A_INFIX, _LORA_B_INFIX):
-        head, sep, _ = key.partition(infix)
-        if sep:
-            module_path = head
-            break
+def _rank_for_module(module_path: str, declared: DeclaredLoraRanks) -> int | None:
+    """Resolve a module's rank with PEFT's ordered, anchored ``rank_pattern`` matching."""
     for module, rank in declared.by_module.items():
         if not module:
             continue
@@ -361,27 +346,21 @@ def _rank_for_module(key: str, declared: DeclaredLoraRanks) -> int | None:
     return declared.default
 
 
+def _module_uses_target_parameters(module_path: str, declared: DeclaredLoraRanks) -> bool:
+    """Whether this serialized module came from one of PEFT's targeted parameters."""
+    return any(
+        module_path == module or module_path.endswith(f".{module}")
+        for module in declared.stacked_rank_modules
+    )
+
+
 def lora_tensor_rank_disagrees(key: str, shape: Any, declared: DeclaredLoraRanks) -> bool:
-    """True only when a weight's own shape provably contradicts its module's configured rank.
+    """Return whether a 2-D LoRA weight provably contradicts its configured rank.
 
-    PEFT writes ``lora_A`` as ``[r, in_features]`` and ``lora_B`` as ``[out_features, r]``, so the
-    rank is legible from the tensor itself rather than taken on the config's word. That second
-    reading is the point: ``adapter_config.json`` and the tensors beside it are produced by
-    different code paths and can disagree, and the config is the half a serving engine sizes its
-    LoRA slots from.
-
-    The axis must EQUAL the rank resolved for that module. Equality is the rule because loading a
-    rank-64 tensor into a rank-32 LoRA layer is a size mismatch, and accepting any multiple would
-    wave through exactly that. The single exception is a config declaring ``target_parameters``,
-    where ``lora.ParamWrapper`` stacks every expert on the rank axis
-    (``nn.Linear(in_features, r * num_experts)``) and a positive multiple is the correct shape.
-    Applying that exception unconditionally is what would let the original 35B report through: its
-    config carried ``target_parameters: None`` with ``experts`` as an ordinary ``target_modules``
-    entry, so its rank-8192 tensors had no fused layout to justify them.
-
-    False for everything whose shape cannot answer the question at all -- ``modules_to_save``
-    copies, biases, ``lora_embedding_A``/``_B`` (which the infixes deliberately do not match), and
-    3-D stacked layouts. Guessing at those would refuse adapters that are fine.
+    Ordinary module weights carry exactly ``r`` on the LoRA axis. A 3-D parameter targeted through
+    PEFT's ``target_parameters`` serializes under its parent module and stacks experts on that axis,
+    so only that module may carry a positive multiple of ``r``. The distinction must be per module:
+    one config may contain both ordinary ``target_modules`` and fused ``target_parameters``.
     """
     if not declared:
         return False
@@ -394,11 +373,16 @@ def lora_tensor_rank_disagrees(key: str, shape: Any, declared: DeclaredLoraRanks
     dims = [d for d in shape if isinstance(d, int) and not isinstance(d, bool) and d > 0]
     if len(dims) != 2:
         return False
-    rank = _rank_for_module(key, declared)
+
+    infix = _LORA_A_INFIX if is_a else _LORA_B_INFIX
+    module_path = key.partition(infix)[0]
+    rank = _rank_for_module(module_path, declared)
     if rank is None:
         return False
     axis = dims[0] if is_a else dims[1]
-    return axis % rank != 0 if declared.allows_stacked_rank_axis else axis != rank
+    if _module_uses_target_parameters(module_path, declared):
+        return axis % rank != 0
+    return axis != rank
 
 
 def alpha_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:

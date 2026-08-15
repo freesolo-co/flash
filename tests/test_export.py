@@ -1269,6 +1269,33 @@ def test_export_accepts_fused_moe_experts_when_target_parameters_declares_them(t
     assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
 
 
+def test_export_limits_the_fused_rank_allowance_to_target_parameter_modules(tmp_path):
+    """PEFT permits one config to target ordinary modules and parameters together. The expert
+    tensor may stack its rank across experts, but that cannot make a rank-64 q_proj valid under
+    r=32; granting the allowance config-wide would recreate the false-success bug for q_proj."""
+    from flash.serve import export
+
+    header = _lora_pair_header(64, 64, prefix="base_model.model.model.layers.0.self_attn.q_proj")
+    header.update(
+        _lora_pair_header(
+            8192, 8192, prefix="base_model.model.model.layers.0.mlp.experts", offset=4
+        )
+    )
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 8))
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 32,
+                "target_modules": ["q_proj"],
+                "target_parameters": ["mlp.experts.gate_up_proj"],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="do not carry the rank configured"):
+        export._normalize_export_adapter_keys(tmp_path)
+
+
 def test_export_refuses_the_reported_35b_artifact_with_no_target_parameters(tmp_path):
     """The LMR-030 artifact itself. Its config carried `target_parameters: None` with `experts` as
     an ordinary `target_modules` entry, so its rank-8192 tensors had NO fused layout to justify
