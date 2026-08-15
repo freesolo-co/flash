@@ -1206,6 +1206,197 @@ def test_export_rejects_source_with_config_but_no_adapter_weight(monkeypatch):
     assert not uploaded["called"], "must reject before touching the destination repo"
 
 
+def _lora_pair_header(rank_a: int, rank_b: int, *, prefix: str, offset: int = 0) -> dict:
+    """A `lora_A`/`lora_B` pair in PEFT's real 2-D layout: A is [r, in], B is [out, r]."""
+    return {
+        f"{prefix}.lora_A.default.weight": {
+            "dtype": "F16",
+            "shape": [rank_a, 64],
+            "data_offsets": [offset, offset + 2],
+        },
+        f"{prefix}.lora_B.default.weight": {
+            "dtype": "F16",
+            "shape": [64, rank_b],
+            "data_offsets": [offset + 2, offset + 4],
+        },
+    }
+
+
+def test_export_refuses_adapter_whose_tensors_contradict_its_declared_rank(tmp_path):
+    """The LMR-030 artifact: `r: 32` in the config, rank-8192 fused MoE expert tensors beside it.
+
+    Export used to check only that the weight files were present and their key namespace readable,
+    so this published a Hub URL while the identical adapter failed to deploy. A successful export
+    then read as evidence the artifact worked.
+    """
+    from flash.serve import export
+
+    header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
+    header.update(
+        _lora_pair_header(
+            8192, 8192, prefix="base_model.model.model.layers.0.mlp.experts", offset=4
+        )
+    )
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 8))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32, "lora_alpha": 64}))
+
+    with pytest.raises(ValueError, match=r"declares r=32.*carry a different rank"):
+        export._normalize_export_adapter_keys(tmp_path)
+
+
+def test_export_rank_mismatch_reaches_the_caller_as_itself(tmp_path):
+    """Not reported as an unnormalizable key namespace: that is a different defect and remedy."""
+    from flash.serve import export
+
+    header = _lora_pair_header(8, 8, prefix="base_model.model.model.layers.0.mlp.up_proj")
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}))
+
+    with pytest.raises(ValueError, match="carry a different rank") as excinfo:
+        export._normalize_export_adapter_keys(tmp_path)
+    assert "could not normalize exported adapter keys" not in str(excinfo.value)
+
+
+def test_export_refuses_rank_mismatch_before_touching_the_destination_repo(monkeypatch):
+    """The refusal has to land before create_repo/upload_folder: `delete_patterns` clears the
+    destination's prior adapter, so failing mid-upload would destroy a good published adapter and
+    replace it with an unloadable one."""
+    touched = {"called": False}
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "sft/run-x/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        header = _lora_pair_header(64, 64, prefix="base_model.model.model.layers.0.mlp.gate_proj")
+        (adapter / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
+        (adapter / "adapter_config.json").write_text(json.dumps({"r": 32}))
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            touched["called"] = True
+
+        def upload_folder(self, **kw):
+            touched["called"] = True
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    with pytest.raises(ValueError, match="carry a different rank"):
+        export_adapter(
+            source_repo="org/test-runs",
+            source_subfolder="sft/run-x/adapter",
+            dest_repo="me/adapters",
+            dest_token="hf_user",
+            base_model=BASE_MODEL,
+            source_token="hf_operator",
+        )
+    assert not touched["called"], "must refuse before touching the destination repo"
+
+
+def test_export_accepts_an_adapter_whose_tensors_match_its_declared_rank(tmp_path):
+    """The check must not cost a good export: matching shapes pass straight through."""
+    from flash.serve import export
+
+    header = _lora_pair_header(16, 16, prefix="base_model.model.model.layers.0.mlp.up_proj")
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32}))
+
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+
+def test_export_reads_rank_pattern_overrides_rather_than_refusing_them(tmp_path):
+    """PEFT records per-module ranks in `rank_pattern`, and `rank_from_adapter_config` returns the
+    max across both places. A module legitimately trained at the higher rank must still export."""
+    from flash.serve import export
+
+    header = _lora_pair_header(64, 64, prefix="base_model.model.model.layers.0.mlp.up_proj")
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps({"r": 8, "rank_pattern": {"layers.0.mlp.up_proj": 64}})
+    )
+
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+
+def test_export_ignores_shapes_that_cannot_report_a_rank(tmp_path):
+    """`modules_to_save` copies, biases and stacked 3-D fused layouts are not [r, in] / [out, r].
+    Reading a rank out of them would refuse adapters that are fine, so they are skipped."""
+    from flash.serve import export
+
+    header = {
+        "base_model.model.model.layers.0.mlp.up_proj.lora_A.default.weight": {
+            "dtype": "F16",
+            "shape": [16, 64],
+            "data_offsets": [0, 2],
+        },
+        # 3-D stacked expert weights: no [r, in] / [out, r] reading exists
+        "base_model.model.model.layers.0.mlp.experts.lora_A.default.weight": {
+            "dtype": "F16",
+            "shape": [8, 16, 64],
+            "data_offsets": [2, 4],
+        },
+        # a saved full module copy, which carries no rank at all
+        "base_model.model.model.embed_tokens.modules_to_save.default.weight": {
+            "dtype": "F16",
+            "shape": [1000, 64],
+            "data_offsets": [4, 6],
+        },
+        "base_model.model.model.layers.0.mlp.up_proj.lora_B.default.bias": {
+            "dtype": "F16",
+            "shape": [64],
+            "data_offsets": [6, 8],
+        },
+    }
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 8))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}))
+
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+
+def test_export_without_a_readable_declared_rank_still_exports(tmp_path):
+    """Every pre-existing fixture and any PEFT save without `r` has no rank to disagree with.
+    The check needs both halves, so a config that declares none leaves export exactly as it was."""
+    from flash.serve import export
+
+    header = _lora_pair_header(16, 16, prefix="base_model.model.model.layers.0.mlp.up_proj")
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
+    (tmp_path / "adapter_config.json").write_text("{}")
+
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+
+def test_export_checks_ranks_across_every_shard_not_just_the_first(tmp_path):
+    """Sharding splits one key namespace over several files, so a bad expert tensor can sit in a
+    shard the first-file-only reading never opens."""
+    from flash.serve import export
+
+    good = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
+    bad = _lora_pair_header(8192, 8192, prefix="base_model.model.model.layers.1.mlp.experts")
+    (tmp_path / "adapter_model-00001-of-00002.safetensors").write_bytes(
+        _safetensors_bytes(good, b"\x01" * 4)
+    )
+    (tmp_path / "adapter_model-00002-of-00002.safetensors").write_bytes(
+        _safetensors_bytes(bad, b"\x01" * 4)
+    )
+    (tmp_path / "adapter_model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    **dict.fromkeys(good, "adapter_model-00001-of-00002.safetensors"),
+                    **dict.fromkeys(bad, "adapter_model-00002-of-00002.safetensors"),
+                }
+            }
+        )
+    )
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32}))
+
+    with pytest.raises(ValueError, match="carry a different rank"):
+        export._normalize_export_adapter_keys(tmp_path)
+
+
 def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
     from flash.serve.deploy import ServingError
 

@@ -279,6 +279,36 @@ def rank_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
     )
 
 
+_LORA_A_INFIX = ".lora_A."
+_LORA_B_INFIX = ".lora_B."
+
+
+def rank_from_lora_tensor_shape(key: str, shape: Any) -> int | None:
+    """The LoRA rank a weight's own shape carries, or None when that shape cannot report one.
+
+    PEFT stores ``lora_A`` as ``[r, in_features]`` and ``lora_B`` as ``[out_features, r]``, so the
+    rank is legible from the tensor itself instead of being taken on the config's word. That second
+    reading is the point: ``adapter_config.json`` and the tensors beside it are written by different
+    code paths and can disagree, and the config is the half a serving engine sizes its LoRA slots
+    from.
+
+    None for everything that is not one of those two 2-D matrices -- ``modules_to_save`` copies,
+    biases, ``lora_embedding_A``/``_B`` (which the infixes above deliberately do not match), and the
+    stacked 3-D layouts some fused-MoE saves use. A shape that is not this one cannot answer the
+    question, and guessing at it would refuse adapters that are fine.
+    """
+    is_a = _LORA_A_INFIX in key
+    is_b = _LORA_B_INFIX in key
+    if is_a == is_b:  # neither, or a key somehow claiming both
+        return None
+    if not isinstance(shape, (list, tuple)) or len(shape) != 2:
+        return None
+    dims = [d for d in shape if isinstance(d, int) and not isinstance(d, bool) and d > 0]
+    if len(dims) != 2:
+        return None
+    return dims[0] if is_a else dims[1]
+
+
 def alpha_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
     """Return the maximum LoRA alpha across default and per-module metadata."""
     return _max_adapter_value(
