@@ -390,9 +390,105 @@ def test_submit_blocked_when_precheck_402(api, monkeypatch):
     assert api.get("/v1/runs", headers=_bearer("fslo-user-1")).json()["runs"] == []
 
 
+def test_a_nonexistent_environment_is_refused_before_the_402(api, monkeypatch):
+    """A run that can never launch must not be reported as an affordability problem.
+
+    The budget precheck runs on the request path, so a gate placed after it answers "insufficient
+    balance" for a typo'd environment -- sending the user to top up, for a run no balance can buy.
+    Both faults are live here at once, and the spec's own defect has to win.
+    """
+    import flash.envs.loader as env_loader
+    import flash.server.billing.charges as billing_mod
+    from flash.envs.identity import GitHubPermanentError
+
+    def _block(**k):
+        raise billing_mod.BillingError(402, "insufficient balance")
+
+    def _permanent(_parsed, *_a, **_k):
+        raise GitHubPermanentError("GitHub environment request failed (404): Not Found")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
+    monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", _permanent)
+
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
+
+    assert res.status_code == 400, res.text
+    assert "could not be resolved on GitHub" in res.text
+    assert "insufficient" not in res.text
+
+
+def test_transient_environment_resolve_is_attempted_once_per_request(api, monkeypatch):
+    """packaged opd defers after one bounded request-side attempt on a transient failure."""
+    import flash.envs.loader as env_loader
+    from flash.envs.identity import GitHubUnavailableError
+
+    calls = []
+
+    def _transient(_parsed, *_args, **_kwargs):
+        calls.append(1)
+        raise GitHubUnavailableError("GitHub server error (503, transient)")
+
+    monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", _transient)
+    monkeypatch.setattr(
+        "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
+        lambda _spec: None,
+    )
+    spec = {
+        **SPEC,
+        "algorithm": "opd",
+        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
+    }
+
+    res = api.post(
+        "/v1/runs",
+        json={"spec": spec, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["state"] == "dry_run"
+    assert calls == [1], f"environment ref was resolved {len(calls)} times"
+
+
+def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monkeypatch):
+    """a tokenless plane must not turn a private packaged opd environment into a false 404."""
+    import flash.envs.loader as env_loader
+    from flash.envs.identity import GitHubPermanentError
+
+    calls = []
+
+    def _anonymous_404(_parsed, *_args, **_kwargs):
+        calls.append(1)
+        raise GitHubPermanentError("GitHub environment request failed (404): Not Found")
+
+    monkeypatch.setattr(env_loader, "_github_token", lambda: None)
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", _anonymous_404)
+    monkeypatch.setattr(
+        "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
+        lambda _spec: None,
+    )
+    spec = {
+        **SPEC,
+        "algorithm": "opd",
+        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
+    }
+
+    res = api.post(
+        "/v1/runs",
+        json={"spec": spec, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["state"] == "dry_run"
+    assert calls == []
+
+
 def test_submit_fails_open_when_precheck_unreachable(api, monkeypatch):
-    # a non-402 billing error (backend unreachable / 5xx) must NOT block training; the completion
-    # charge is the backstop. The run is still accepted and recorded.
+    # a non-402 billing error (backend unreachable / 5xx) must not block training; the completion
+    # charge is the backstop. the run is still accepted and recorded.
     import flash.server.billing.charges as billing_mod
 
     def _unreachable(**k):
