@@ -33,6 +33,18 @@ from flash.serve.errors import (  # noqa: F401 -- re-exported: callers import th
     RetryableServingUnavailable,
     ServingError,
 )
+from flash.serve.responses import (
+    active_alias_target as _active_alias_target,
+)
+from flash.serve.responses import (
+    matches_revision_identity as _matches_revision_identity,
+)
+from flash.serve.responses import (
+    serving_status_error as _serving_status_error,
+)
+from flash.serve.responses import (
+    validate_activation_response as _validate_activation_response,
+)
 from flash.serve.urls import (  # noqa: F401 -- re-exported: callers import these from here
     DEV_FREESOLO_SERVING_URL,
     PROD_FREESOLO_SERVING_URL,
@@ -49,7 +61,30 @@ logger = get_logger(__name__)
 DEFAULT_FREESOLO_SERVING_URL = default_serving_url()
 READBACK_DELAY_SECONDS = 0.5
 READBACK_MAX_DELAY_SECONDS = 2.0
-REVISION_READY_BUDGET_SECONDS = 5 * 60.0
+# how long to wait for serving to report a newly registered revision ready. the wait covers a COLD
+# engine: serving pulls the base model, starts the engine, then loads the adapter, and none of that
+# is proportional to the adapter, which is megabytes. so the budget scales with the BASE model.
+#
+# the floor is NOT the old 5 minutes: a 4B deploy was observed timing out on a cold engine and then
+# succeeding in ~4.6 minutes against the now-warm one, so 5 minutes did not even cover the warm case
+# with margin. the floor is doubled to 10 and the per-B term covers a bigger base on top.
+#
+# the cap is the real constraint, and readiness is only one leg of the attempt. the same deploy also
+# spends time BEFORE this wait (resolving the hub revision, downloading the adapter config to read
+# its rank, the capability check, registration) and AFTER it (`_SMOKE_BUDGET_SECONDS` = 600s of
+# smoke, then activation). the whole attempt must finish inside BOTH `_DEPLOYMENT_STALE_SECONDS`
+# (1800s, when the plane declares an in-flight attempt abandoned) and the CLI's 1800s default
+# `--wait`, or a deploy that is still progressing is reaped or reported as failed.
+#
+# so the cap leaves real slack rather than just clearing smoke: 900 + 600 = 1500, keeping 300s for
+# the surrounding hub reads, registration, activation, and poll latency, none of which share a
+# wall-clock bound with this one.
+#
+# a longer budget costs little: an adapter serving REJECTS raises as soon as the revision reports
+# `failed`, so only a revision that is genuinely still loading waits out the clock.
+REVISION_READY_MIN_BUDGET_SECONDS = 10 * 60.0
+REVISION_READY_MAX_BUDGET_SECONDS = 15 * 60.0
+REVISION_READY_SECONDS_PER_PARAM_B = 20.0
 ACTIVATION_READBACK_ATTEMPTS = 3
 ACTIVATION_READBACK_DELAY_SECONDS = 2.0
 # smoke-retry fallback when a 503 carries no usable Retry-After: keep the prior 2s default rather
@@ -186,31 +221,6 @@ def _serving_request(
         raise _serving_status_error(url, exc) from exc
     except httpx.RequestError as exc:
         raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
-
-
-def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
-    """Build a ServingError from an upstream HTTP failure with a tailored hint."""
-    resp = exc.response
-    status = resp.status_code if resp is not None else None
-    detail = ((resp.text if resp is not None else "") or "").strip()[:500]
-    msg = f"serving backend error for {url}"
-    if status is not None:
-        msg += f" (HTTP {status})"
-    if detail:
-        msg += f": {detail}"
-    if status is not None and status < 500:
-        msg += (
-            " — the serving backend rejected the request (4xx); check FREESOLO_INTERNAL_KEY "
-            "and the request payload (this is a client/auth error, not a serving outage)"
-        )
-    else:
-        msg += (
-            " — the serving backend is unavailable or has no engine for this base model; "
-            "an operator must check the freesolo serving deployment"
-        )
-    headers = getattr(resp, "headers", {}) if resp is not None else {}
-    retry_after = headers.get("Retry-After")
-    return ServingError(msg, status_code=status, retry_after=retry_after)
 
 
 def serving_openai_base_url() -> str:
@@ -380,7 +390,11 @@ def deploy_adapter(
         )
 
     _wait_revision_ready(
-        revision, subfolder, expected_identity=body, require_provenance=require_provenance
+        revision,
+        subfolder,
+        expected_identity=body,
+        require_provenance=require_provenance,
+        budget_s=revision_ready_budget_seconds(model),
     )
     if before_activate is not None:
         before_activate(revision, checkpoint)
@@ -430,36 +444,6 @@ def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> d
     """Read one authoritative adapter record, including disabled records."""
     record, _ = _registered_adapter_response(adapter_id, timeout_s=timeout_s)
     return record
-
-
-def _matches_revision_identity(
-    record: dict, expected: dict, *, require_provenance: bool = True
-) -> bool:
-    scalar_fields = (
-        "adapter_id",
-        "repo_id",
-        "repo_type",
-        "subfolder",
-        "base_model",
-        "checkpoint",
-        "thinking",
-    )
-    if any(record.get(field) != expected.get(field) for field in scalar_fields):
-        return False
-    if (record.get("org_id") or None) != (expected.get("org_id") or None):
-        return False
-    if (record.get("structured_outputs") or None) != (expected.get("structured_outputs") or None):
-        return False
-    if not require_provenance:
-        # backends without revision_provenance do not echo provenance metadata; the immutable
-        # adapter_id already pins the artifact, so this cross-check is best effort here.
-        return True
-    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    expected_metadata = expected["metadata"]
-    return all(
-        metadata.get(field) == expected_metadata.get(field)
-        for field in ("record_type", "run_id", "checkpoint_step", "hf_revision")
-    )
 
 
 def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) -> set[str]:
@@ -517,6 +501,25 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
     return advertised
 
 
+def revision_ready_budget_seconds(model: str) -> float:
+    """Readiness budget for a cold serving engine holding ``model``, scaled by base-model size.
+
+    An unknown model keeps the floor: a fork can add a catalog entry, and a revision-pinned id need
+    not be a catalog key, so a lookup miss must not fail a deploy that would otherwise succeed.
+    """
+    from flash.core.catalog import MODELS
+
+    info = MODELS.get(str(model or "").strip())
+    if info is None:
+        return REVISION_READY_MIN_BUDGET_SECONDS
+    # total params, not active: an MoE loads every expert into VRAM even though a token routes
+    # through few, so the cold-start cost tracks the full checkpoint.
+    scaled = REVISION_READY_MIN_BUDGET_SECONDS + REVISION_READY_SECONDS_PER_PARAM_B * max(
+        0.0, float(info.params_b)
+    )
+    return min(scaled, REVISION_READY_MAX_BUDGET_SECONDS)
+
+
 def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
     if retry_after is not None:
         try:
@@ -535,11 +538,17 @@ def _wait_revision_ready(
     *,
     expected_identity: dict | None = None,
     require_provenance: bool = True,
-    budget_s: float = REVISION_READY_BUDGET_SECONDS,
+    budget_s: float = REVISION_READY_MIN_BUDGET_SECONDS,
 ) -> dict:
-    deadline = time.monotonic() + max(0.0, float(budget_s))
+    budget = max(0.0, float(budget_s))
+    deadline = time.monotonic() + budget
     last_state = "registered"
     last_read_error: ServingError | None = None
+    # the loader's own complaint, kept even when serving reports it WITHOUT moving the revision to
+    # `failed`. without this a stuck load times out reporting only the state, and the one piece of
+    # evidence that says which subsystem is at fault is dropped on the floor.
+    last_failure: str | None = None
+    observed_record = False
     first_read = True
     attempt = 0
     retry_after: str | None = None
@@ -579,11 +588,16 @@ def _wait_revision_ready(
             raise ServingError(
                 f"adapter revision {revision} resolved to a different immutable identity"
             )
+        observed_record = True
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         last_state = str(
             metadata.get("lifecycle_state") or record.get("lifecycle_state") or "registered"
         )
+        # track the LATEST record's failure, not the first one seen: a record that later omits or
+        # clears `failure` has withdrawn that complaint, and keeping the stale string would make the
+        # timeout below prescribe "fix the artifact" for what is now a plain cold-engine timeout.
         failure = metadata.get("failure")
+        last_failure = str(failure) if failure else None
         if last_state == "failed" or record.get("status") == "disabled":
             raise ServingError(
                 f"serving failed to load adapter revision {revision}: {failure or 'unknown error'}"
@@ -594,22 +608,65 @@ def _wait_revision_ready(
             if record_subfolder == subfolder:
                 return record
     if last_read_error is not None:
-        raise ServingError(
+        # a transient read error is not an authoritative record, so it withdraws nothing. when an
+        # earlier authoritative record named a loader failure, that complaint still stands and is
+        # the more actionable half: reporting only the read error would send the reader to retry
+        # against serving when serving already said the artifact itself is wrong.
+        message = (
             f"adapter revision {revision} readiness could not be confirmed after transient "
             f"serving errors: {last_read_error}"
-        ) from last_read_error
+        )
+        if last_failure:
+            message += (
+                f". before those errors the loader reported: {last_failure} -- that is not "
+                "transient and survives a warm engine, so fix it before retrying"
+            )
+        raise ServingError(message) from last_read_error
+    # a TIMEOUT, not a rejection. the two are distinguishable in code (a rejected adapter raises
+    # "serving failed to load adapter revision" above) but the old message said only that the
+    # revision "remained 'registered'", which reads as a serving fault and sent readers to the wrong
+    # subsystem. say which of the two happened, what the clock actually was, and that a retry is the
+    # correct response to THIS one.
+    details = [f"waited {budget:g}s"]
+    if observed_record:
+        details.append(f"last state {last_state!r}")
+    else:
+        # serving never returned a record: every completed poll 404ed. that is registration
+        # visibility, not a slow load, and it points at a different failure than a stuck loader.
+        # no lifecycle state was ever observed, so do not quote the initial one as if it were read.
+        details.append("serving never returned the revision record (every completed poll 404ed)")
+    if last_failure:
+        details.append(f"loader reported: {last_failure}")
+    # the advice depends on WHICH timeout this is. a loader that named a failure while leaving the
+    # revision un-failed has already told us the artifact or config is wrong, and that survives a
+    # warm engine, so prescribing a retry there would send the reader into a futile loop -- the same
+    # wrong-direction problem this message exists to fix.
+    if last_failure:
+        remedy = (
+            "serving reported that failure without failing the revision, so this is unlikely to be "
+            "a cold-engine timeout: fix what the loader reported before retrying, because a retry "
+            "against a warm engine will hit the same artifact."
+        )
+    elif not observed_record:
+        # nothing was ever read back, so there is no evidence of a loading engine to retry against.
+        # the fault is that the revision never became visible, which a warm engine does not fix.
+        remedy = (
+            "no engine or loader state was ever observed, so this is a registration-visibility "
+            "problem rather than a slow load: check that the revision was registered against this "
+            "serving backend before retrying."
+        )
+    else:
+        remedy = (
+            "serving may still be loading, so retrying this deploy is the correct response: a cold "
+            "engine loading a large base model can exceed the budget, and the retry usually "
+            "succeeds against the now-warm engine."
+        )
     raise ServingError(
-        f"adapter revision {revision} remained {last_state!r}; the previous alias remains available"
+        f"revision_ready_timeout: adapter revision {revision} did not become ready in time "
+        f"({'; '.join(details)}). the previous alias remains available and {remedy} this is NOT "
+        "the same as serving rejecting the adapter, which fails the deployment with 'serving "
+        "failed to load adapter revision'."
     )
-
-
-def _active_alias_target(record: dict | None) -> str | None:
-    if not isinstance(record, dict) or record.get("status") == "disabled":
-        return None
-    metadata = record.get("metadata")
-    if isinstance(metadata, dict) and isinstance(metadata.get("alias_of"), str):
-        return metadata["alias_of"]
-    return None
 
 
 def adapter_alias_target(run_id: str) -> str | None:
@@ -623,27 +680,6 @@ def adapter_alias_target(run_id: str) -> str | None:
             f"serving alias {run_id} is not an immutable alias record; legacy aliases are unsupported"
         )
     return target
-
-
-def _validate_activation_response(
-    response: object,
-    *,
-    run_id: str,
-    revision: str,
-    checkpoint: str,
-    expected_adapter_revision: str | None,
-) -> dict:
-    if not isinstance(response, dict):
-        raise ServingError("serving returned an invalid alias activation response")
-    if response.get("adapter_id") != run_id or response.get("target_adapter_revision") != revision:
-        raise ServingError("serving returned mismatched committed alias activation provenance")
-    if response.get("previous_adapter_revision") != expected_adapter_revision:
-        raise ServingError("serving returned mismatched previous alias revision")
-    if response.get("checkpoint") != checkpoint:
-        raise ServingError("serving returned mismatched committed alias checkpoint")
-    if not isinstance(response.get("updated_at"), str) or not response["updated_at"].strip():
-        raise ServingError("serving returned committed alias activation without updated_at")
-    return response
 
 
 def _activate_revision(

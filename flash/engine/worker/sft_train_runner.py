@@ -291,6 +291,10 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
             "WARN: thinking mode is ON but no sampled SFT target contains a <think> trace; "
             "training on non-reasoning targets teaches the model to skip thinking"
         )
+    # the partial case -- the template keeping only the last turn's reasoning and stripping the
+    # rest -- renders a <think>, so the all-or-nothing check above stays quiet for it. it is
+    # reported by `prepare_sft_workload`, which this function already called, so that one warning
+    # reaches both the control-plane estimate and this worker log without being printed twice.
 
     total_tokens_per_epoch = realized_profile.real_tokens_per_epoch
     realized_max_length = realized_profile.realized_max_length
@@ -357,7 +361,11 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     update_horizon = data.profile.authoritative_steps
     validate_save_steps(options.save_at_steps, update_horizon)
     loop_epochs = max(options.epochs, math.ceil(update_horizon / steps_per_epoch))
-    save_freq = reduce(gcd, options.save_at_steps) if options.save_at_steps else options.save_every
+    save_freq = (
+        reduce(gcd, options.save_at_steps)
+        if options.save_at_steps
+        else max(1, min(options.save_every, update_horizon))
+    )
 
     card_vram_gb = float(options.gpu_probe.get("memory_gb") or 0.0)
     raw_capability = options.gpu_probe.get("capability")
