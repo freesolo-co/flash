@@ -528,14 +528,13 @@ def _train_body(input_data: dict) -> dict:
 
             The terminal snapshot must be the LAST writer: every caller commits to the same repo
             path, so an older periodic one landing after it restores a pre-failure console over the
-            bytes that explain the failure. ``final`` therefore never yields INDEFINITELY (upload_file
-            takes no timeout, so a wedged holder would suppress it forever) nor past the run wall
-            deadline, periodic callers drop their commit once ``console_teardown`` is set, and a
-            terminal upload forced through without the lock re-commits once it frees. Each rule has a
-            test_serverless_*console* case.
-
-            Returns whether the tail landed: errors are swallowed, not raised, so a caller tracking
-            what is stored cannot read a normal return as success and skip the retry it earned."""
+            bytes explaining the failure. So ``final`` never yields INDEFINITELY (upload_file takes no
+            timeout, so a wedged holder would suppress it forever) nor past the run wall deadline,
+            periodic callers drop their commit once ``console_teardown`` is set, and a terminal upload
+            forced through without the lock re-commits once it frees. Each rule has a
+            test_serverless_*console* case. Returns whether the tail landed: errors are swallowed, so
+            a caller tracking what is stored cannot read a normal return as success and skip its
+            retry."""
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
                 return False
@@ -547,10 +546,10 @@ def _train_body(input_data: dict) -> dict:
             def _wait_s() -> float:
                 """Lock wait, clamped to what is left of the run wall deadline. The watchdog
                 hard-exits AT the deadline, so a terminal upload still blocked on the lock is killed
-                mid-acquire and the unsynchronized commit that could have landed in the window that
-                remained never runs; the reserve keeps room for it. Each retry re-reads the clock, so
-                the tries shrink rather than each being clamped and still summing past it. Zero polls
-                without waiting: acquire rejects a negative, and a blown deadline must still try."""
+                mid-acquire and the commit that could have landed in the window that remained never
+                runs; the reserve keeps room for it. Each retry re-reads the clock, so the tries
+                shrink rather than each being clamped and still summing past it. Zero polls without
+                waiting: acquire rejects a negative, and a blown deadline must still try."""
                 try:
                     return min(120.0, max(0.0, _require_deadline_allowance() - 30.0))
                 except (TimeoutError, RuntimeError):
@@ -568,10 +567,9 @@ def _train_body(input_data: dict) -> dict:
             # `not held`: the commit above raced a holder still inside upload_file, whose older bytes
             # can land after it. acquiring is proof that finished, so one more commit wins. the wait
             # is BOUNDED, never a retry loop: a permanently wedged holder never frees and this must
-            # still return. it is split into tries so a holder needing longer than one timeout is
-            # still caught -- an HF upload recovering after ~240s otherwise lands last and restores
-            # the pre-failure console. a holder past the bound is treated as wedged and the
-            # unsynchronized commit stands.
+            # still return. split into tries so a holder needing longer than one timeout is still
+            # caught -- an HF upload recovering after ~240s otherwise lands last and restores the
+            # pre-failure console. past the bound it is treated as wedged and the raw commit stands.
             for _ in range(3) if final and not held else ():
                 if console_upload_lock.acquire(timeout=_wait_s()):
                     try:
@@ -639,14 +637,14 @@ def _train_body(input_data: dict) -> dict:
                 # test_first_console_snapshot_precedes_the_stall_teardown. Mirrors
                 # bootstrap._console_upload_loop, whose docstring carries the rules.
                 due_s, since, quiet_polls = 600.0, 0.0, 0
-                uploaded_size, size, quiet_used, progressed = -1, -1, False, False
+                uploaded_size, size, quiet_spent, armed = -1, -1, 0, False
                 while not stop_upload.wait(120.0):
                     since += 120.0
                     try:
                         # count STAGED heartbeats, not bytes: a wedged worker still prints ray
-                        # warnings, so a size-only rule never fires. reads only new bytes.
-                        # liveness pings carry "stage" too and print every 30s from a daemon, so
-                        # they are subtracted -- counting them reads a wedge as progress forever.
+                        # warnings, so a size-only rule never fires. reads only new bytes. liveness
+                        # pings carry "stage" too and print every 30s from a daemon, so subtract
+                        # them -- counting them reads a wedge as progress forever.
                         with open(console, "rb") as hf:
                             hf.seek(max(size, 0))
                             buf = hf.read()
@@ -654,18 +652,20 @@ def _train_body(input_data: dict) -> dict:
                             size = hf.tell()
                     except OSError:
                         size, staged = -1, 0
-                    progressed = progressed or bool(staged)
+                    # a wedge is progress that STOPPED: a heartbeat arms, a spend disarms, progress
+                    # RE-arms (or a slow stage reading as silence spends the only credit and a real
+                    # hang later dies uncaptured), and only a stall that BOUGHT an upload spends
+                    # one. the 2 is per RUN. _console_wedge_credit's docstring carries the rules.
+                    armed = armed or bool(staged)
                     quiet_polls = 0 if staged else quiet_polls + 1
                     due = since >= due_s
-                    # `not due`: only a stall that BOUGHT an upload spends the latch. `progressed`:
-                    # a wedge is progress that STOPPED, and startup is quiet, so counting it would
-                    # spend the latch on an empty console and leave a later hang with none.
-                    wedged = progressed and quiet_polls >= 4 and not quiet_used and not due
+                    wedged = armed and quiet_polls >= 4 and quiet_spent < 2 and not due
                     if size == uploaded_size or not (due or wedged):
                         continue
                     ok = _upload_console(mode)  # swallows its own errors; False if it did not land
                     uploaded_size = size if ok else uploaded_size
-                    quiet_used = quiet_used or (wedged and ok)
+                    quiet_spent += 1 if wedged and ok else 0
+                    armed = armed and not (wedged and ok)
                     # only a LANDED upload advances the deadline: resetting on a swallowed
                     # failure puts the retry an interval out, past the stall teardown.
                     if ok:

@@ -22,7 +22,9 @@ from email.utils import parsedate_to_datetime
 if __package__:
     from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
+        _console_latch_update,
         _console_progress,
+        _console_wedge_credit,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
@@ -32,7 +34,9 @@ else:
     # same directory, and the script directory leads sys.path.
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
+        _console_latch_update,
         _console_progress,
+        _console_wedge_credit,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
@@ -44,6 +48,7 @@ _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
 _CONSOLE_UPLOAD_POLL_S = 120.0
 _CONSOLE_UPLOAD_QUIET_POLLS = 4
+_CONSOLE_UPLOAD_CREDITS = 2  # wedge snapshots per RUN; bounded, so it stays out of the rate budget
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
@@ -272,39 +277,34 @@ def _console_upload_loop(
     """Snapshot the console until ``stop_upload`` is set, polling cheaply for a wedge. Polling is
     free; committing is not (the heartbeat spends 4 of this repo's 5 commits/hour), and the stall
     classifier kills a wedged run at 1200s/3000s -- long before an hourly snapshot would capture the
-    hang. So commit only on un-uploaded bytes AND either the interval elapsing or
-    _CONSOLE_UPLOAD_QUIET_POLLS samples with no STAGED heartbeat (_console_progress explains why
-    bytes cannot serve); and spend that quiet snapshot once per run. ``wedged`` excludes an
-    already-due poll, so the latch is spent only when a stall BOUGHT an upload -- charging it for a
-    was happening anyway would disarm detection for a later hang. QUIET_POLLS is sized so that
-    (it + 1) * poll stays under poll_job's 1200s training stall, or the box dies before the wedge
-    snapshot commits.
+    hang. So commit only on un-uploaded bytes AND either the interval elapsing or sustained silence
+    (``_console_wedge_credit`` decides when silence has earned one, and its docstring carries the
+    arming, re-arming and per-run-cap rules; ``_console_progress`` explains why bytes cannot serve
+    as the signal). ``wedged`` excludes an already-due poll, so a credit is spent only when a stall
+    BOUGHT an upload -- charging it for one that was happening anyway would disarm detection for a
+    later hang. QUIET_POLLS is sized so that (it + 1) * poll stays under poll_job's 1200s training
+    stall, or the box dies before the wedge snapshot commits.
 
-    A wedge is progress that STOPPED, so the latch arms only after a staged heartbeat. Startup is
-    quiet by nature -- a cold image outruns QUIET_POLLS before the first snapshot is even due -- and
-    counting it spends the latch on an empty console AND pushes the next commit an interval out, so
-    a later hang dies at 1200s with nothing: worse than no wedge detection. A setup that NEVER
-    reaches a heartbeat stays uncovered on purpose; holding the first-snapshot cadence until
-    progress starts would fix it but costs a commit in the SUSTAINED rate (4h with a 600s setup
-    measures 1.25/hr + 4/hr heartbeat = 5.25/hr, over the hard 5.0), so it is left to the 3000s
-    setup grace. A FAILED upload advances neither ``sent`` nor the deadline: hf_upload swallows its
-    exception and returns falsy, so resetting ``since`` books a snapshot that reached no repo and
-    puts the retry an interval out, past both teardowns. Staying due retries until one lands. The
-    failure is printed with ``flush``: it is its only trace, and teardown kills this process
-    outright. Each rule is pinned by a test_instance_console_upload_loop_* case."""
+    A setup that NEVER reaches a heartbeat stays uncovered on purpose: holding the first-snapshot
+    cadence until progress starts costs a commit in the SUSTAINED rate (5.25/hr against a hard 5.0,
+    measured by ..._keeps_a_slow_starting_run_in_budget), so it is left to the 3000s setup grace. A
+    FAILED upload advances neither ``sent`` nor the deadline: hf_upload swallows its exception and
+    returns falsy, so resetting ``since`` books a snapshot that reached no repo and puts the retry an
+    interval out, past both teardowns. Staying due retries until one lands. The failure is printed
+    with ``flush``: it is its only trace, and teardown kills this process outright. Each rule is
+    pinned by a test_instance_console_upload_loop_* case."""
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
     sent = size = -1
     since = quiet_polls = 0.0
-    quiet_used = progressed = False
+    latch = {"armed": False, "spent": 0, "credits": _CONSOLE_UPLOAD_CREDITS}
     while not stop_upload.wait(poll_s):
         since += poll_s
         size, staged = _console_progress(console, max(size, 0))
-        progressed = progressed or bool(staged)
+        _console_latch_update(latch, progressed=bool(staged))
         quiet_polls = 0.0 if staged else quiet_polls + 1
         due = since >= due_s
-        stalled = quiet_polls >= _CONSOLE_UPLOAD_QUIET_POLLS and progressed
-        wedged = stalled and not quiet_used and not due
+        wedged = not due and _console_wedge_credit(quiet_polls, _CONSOLE_UPLOAD_QUIET_POLLS, latch)
         if size == sent or not (due or wedged):
             continue
         try:
@@ -313,7 +313,7 @@ def _console_upload_loop(
             detail = _safe_detail(exc, secrets=_payload_secrets(payload))
             print(f"console upload warn: {detail}", flush=True)
             uploaded = False
-        quiet_used = quiet_used or (wedged and uploaded)
+        _console_latch_update(latch, spent=bool(wedged and uploaded))
         if uploaded:
             sent, since, due_s = size, 0.0, interval_s
 

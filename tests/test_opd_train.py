@@ -4939,6 +4939,40 @@ def test_child_failure_sanitizer_redacts_a_credential_containing_an_escaped_quot
     )
 
 
+def test_child_failure_sanitizer_redacts_a_double_serialized_credential_field():
+    """A field whose own DELIMITERS are backslash-escaped must still be redacted.
+
+    An exception that embeds serialized json inside another serialized string carries the field as
+    ``{\\"password\\":\\"secret\\"}``: the quotes around both the key and the value are escaped. A
+    separator accepting only a bare optional quote stops at that backslash, and the value branch
+    then sees a leading ``\\`` rather than a quote -- so the quoted branch does not match and the
+    bare branch halts on the backslash, printing the entire credential verbatim.
+
+    This is distinct from an escaped quote INSIDE a value (covered by
+    ``..._redacts_a_credential_containing_an_escaped_quote``): there the delimiters are intact and
+    only the content is escaped. A double-serialized value is runtime-minted, so it appears in no
+    environment variable and the value pass cannot remove it before the record is persisted and
+    served as an artifact.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, leak in (
+        (r"child failed: {\"password\":\"runtime-secret\"}", "runtime-secret"),
+        (r"{\"api_key\":\"sk-runtime-abc123\"}", "sk-runtime-abc123"),
+        (r"{\"access_token\":\"at-runtime-99\"} while calling the teacher", "at-runtime-99"),
+        (r"{\'secret\':\'sq-runtime-value\'}", "sq-runtime-value"),
+    ):
+        detail = _safe_child_failure_detail(ValueError(message))
+        assert leak not in detail, f"{message!r} leaked its credential: {detail!r}"
+        assert "<redacted>" in detail, message
+
+    # the escaped delimiters are reprinted, so the surrounding json stays readable and the
+    # diagnostic AFTER the field survives -- over-redacting to end of line would eat the reason.
+    assert _safe_child_failure_detail(ValueError(r"{\"password\":\"hunter2\"} at step 4")) == (
+        r"{\"password\":\"<redacted>\"} at step 4"
+    )
+
+
 def test_child_failure_sanitizer_survives_a_non_utf8_credential_in_the_environment(monkeypatch):
     """A surrogate in an env value must not abort the sanitizer.
 

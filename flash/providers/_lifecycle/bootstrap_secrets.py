@@ -197,3 +197,41 @@ def _console_progress(console: str, offset: int) -> tuple[int, int]:
             return f.tell(), max(0, buf.count(b'"stage":') - buf.count(b'"liveness":'))
     except OSError:
         return -1, 0
+
+
+def _console_wedge_credit(quiet_polls: float, quiet_threshold: int, state: dict) -> bool:
+    """Whether sustained silence should buy a console snapshot right now.
+
+    ``state`` carries ``armed`` (progress has been seen and no credit is outstanding), ``spent``
+    (credits used) and ``credits`` (the per-run cap).
+
+    A wedge is progress that STOPPED, so this arms only after a staged heartbeat: startup is quiet
+    by nature and counting it would spend a credit on an empty console. The latch RE-ARMS on
+    progress, because a healthy slow stage -- one transition, then only liveness pings, which
+    ``_console_progress`` subtracts -- reads as silence and buys a snapshot; with a single permanent
+    credit that run could never buy another, so a genuine hang later would wait for the hourly
+    cadence and be torn down at 1200s with no failure-era console, the exact loss the uploader
+    exists to prevent.
+
+    The per-run cap is what keeps the re-arm honest: a run alternating a heartbeat with sustained
+    silence re-arms every cycle, and uncapped that buys 6/hr console against a 5.0/hr budget the
+    heartbeat already spends 4 of. Credits are per RUN, so they never enter the SUSTAINED rate.
+    """
+    return (
+        quiet_polls >= quiet_threshold
+        and bool(state.get("armed"))
+        and int(state.get("spent", 0)) < int(state.get("credits", 0))
+    )
+
+
+def _console_latch_update(state: dict, *, progressed: bool = False, spent: bool = False) -> None:
+    """Fold one poll's outcome into the latch.
+
+    ``progressed`` records a staged heartbeat, which arms the latch and re-arms a spent credit.
+    ``spent`` charges a wedge snapshot that LANDED, disarming the latch until progress resumes.
+    """
+    if progressed:
+        state["armed"] = True
+    if spent:
+        state["spent"] = int(state.get("spent", 0)) + 1
+        state["armed"] = False

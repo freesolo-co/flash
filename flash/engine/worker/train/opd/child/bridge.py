@@ -79,8 +79,18 @@ _SECRET_URL_PARAM = (
 _SECRET_DETAIL = re.compile(
     rf"(?i)(?P<key>{_SECRET_AUTH_KEY}|api[-_ ]?key|access[-_ ]?token|token|secret|password"
     rf"|{_SECRET_URL_PARAM})"
-    r"(?P<sep>['\"]?\s*[:=]\s*)"
-    rf"(?:(?P<quote>['\"])(?:digest\s+(?P<qdigest>[^\r\n]+)"
+    # the quote around the key may itself be BACKSLASH-ESCAPED: a child exception that embeds
+    # serialized json carries `{\"password\":\"secret\"}`, and a bare `['\"]?` stops at the
+    # backslash, so the whole credential printed verbatim. a runtime-minted value is in no
+    # environment variable, so the value pass cannot catch it either. distinct from an escaped
+    # quote INSIDE the value, which `quoted` already handles.
+    r"(?P<sep>(?:\\?['\"])?\s*[:=]\s*)"
+    # the VALUE's opening quote may be escaped too, and it is tried FIRST: `\"secret\"` starts with
+    # a backslash, so `quote` does not match it and `bare` stops dead at that backslash, printing
+    # the credential. it ends at the matching ESCAPED quote, which keeps the tail after the field
+    # (`{\"password\":\"s\"} while calling`) instead of consuming the rest of the diagnostic.
+    rf"(?:\\(?P<eq>['\"])(?P<escaped>(?:(?!\\(?P=eq))[^\r\n])*)"
+    rf"|(?P<quote>['\"])(?:digest\s+(?P<qdigest>[^\r\n]+)"
     rf"|{_SECRET_SCHEME}(?P<quoted>(?:\\.|(?!(?P=quote))[^\r\n])*))"
     r"|digest\s+(?P<digest>[^\r\n]+)"
     # an AUTHORIZATION value with an UNRECOGNISED scheme runs to end of line: the bare branch below
@@ -350,6 +360,20 @@ def _is_token_id(match: re.Match[str]) -> bool:
     )
 
 
+def _redact_secret_match(match: re.Match) -> str:
+    """The matched credential replaced by ``<redacted>``, keeping what framed it.
+
+    The opening quote is reprinted, never the closing one: it was not consumed, so it is still in
+    the text after the match and reprinting it would double. An ESCAPED opening quote carries its
+    backslash back with it, so the surrounding serialized json stays readable.
+    """
+    if _is_token_id(match):
+        return match.group(0)
+    escaped_quote = match.group("eq")
+    opener = "\\" + escaped_quote if escaped_quote else match.group("quote") or ""
+    return f"{match.group('key')}{match.group('sep')}{opener}<redacted>"
+
+
 def _safe_child_failure_detail(error: Exception) -> str:
     """``error`` rendered with credentials removed, never raising.
 
@@ -379,16 +403,7 @@ def _safe_child_failure_detail(error: Exception) -> str:
     # shape redaction stays as the fail-closed net for a credential this process cannot know by
     # value -- one minted at runtime (a presigned url, a broker capability) is in neither the
     # environment nor any payload, so it contributes no needle above.
-    return _SECRET_DETAIL.sub(
-        lambda match: (
-            match.group(0)
-            if _is_token_id(match)
-            # the opening quote is reprinted, never the closing one: it was not consumed, so it is
-            # still in the text after the match and reprinting it would double.
-            else f"{match.group('key')}{match.group('sep')}{match.group('quote') or ''}<redacted>"
-        ),
-        message,
-    )
+    return _SECRET_DETAIL.sub(_redact_secret_match, message)
 
 
 def _write_child_failure_fallback(

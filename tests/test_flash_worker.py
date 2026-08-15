@@ -1141,24 +1141,31 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     body = inspect.getsource(endpoints._train_body)
     assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_POLL_S})" in body
     assert f"due_s, since, quiet_polls = {endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S}" in body
-    assert "quiet_used = quiet_used or (wedged and ok)" in body
+    # a credit is spent only by a wedge snapshot that LANDED, and spending it disarms the latch
+    # until progress resumes.
+    assert "quiet_spent += 1 if wedged and ok else 0" in body
     # the deadline advances only on a LANDED upload: resetting on a swallowed failure books a
     # snapshot that reached no repo and puts the retry an interval out, past the stall teardown.
     assert f"since, due_s = 0.0, {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
     assert "if ok:" in body
     # the latch is spent only on silence that bought an upload, not on an already-due snapshot.
-    assert "and not quiet_used and not due" in body
+    assert "and not due" in body
+    # progress RE-ARMS the latch: without this a healthy slow stage spends the only credit and a
+    # genuine wedge later is torn down with no failure-era console. the credits bound the total, so
+    # the re-arm cannot turn into an unbounded commit rate.
+    assert "armed = armed and not (wedged and ok)" in body
+    # the shipped loop inlines the credit cap; the instance loop reads it from the constant, and
+    # they must agree or one provider detects a second wedge and the other does not.
+    assert f"quiet_spent < {_instance_bootstrap._CONSOLE_UPLOAD_CREDITS}" in body
     # the sustained-silence threshold and the success-gated watermark, which keep a sparsely
     # logging run inside the shared repo's commit budget and retry a swallowed upload failure.
-    assert (
-        f"quiet_polls >= {_instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS} and not quiet_used"
-        in body
-    )
+    assert f"quiet_polls >= {_instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS}" in body
     # the latch arms only after real progress: a cold image is quiet through startup and would
     # otherwise spend it on an empty console, leaving a later hang with no snapshot before teardown
     # (test_..._keeps_its_wedge_credit_through_a_slow_startup covers the behavior on the twin loop).
-    assert "progressed = progressed or bool(staged)" in body
-    assert "wedged = progressed and quiet_polls" in body
+    assert "armed = armed or bool(staged)" in body
+    assert "wedged = armed and quiet_polls" in body
+    assert "quiet_spent, armed = -1, -1, 0, False" in body
     assert "uploaded_size = size if ok else uploaded_size" in body
     # the wedge signal is STAGED HEARTBEATS, not console bytes: a stuck worker still logs, so a
     # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
@@ -1337,6 +1344,86 @@ def test_instance_console_upload_loop_saves_the_quiet_snapshot_for_a_real_wedge(
     assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
 
 
+def test_instance_console_upload_loop_rearms_its_wedge_credit_after_progress_resumes(monkeypatch):
+    """A healthy quiet stage must not disarm wedge detection for the whole run.
+
+    A slow ``sft_model_load`` emits one staged transition and then only liveness pings, which
+    ``_console_progress`` subtracts -- so it reads as sustained silence and buys a wedge snapshot
+    even though nothing is wrong. With a single PERMANENT credit that run can never buy another, so
+    a genuine hang later waits for the hourly cadence and the box is torn down at 1200s with no
+    failure-era console: exactly the loss this loop exists to prevent, reached through the
+    detection built to prevent it.
+
+    Progress after a spent credit means the run RECOVERED, so the next quiet run is a different
+    stall and re-arms. The credits bound the total, which is what keeps the re-arm from becoming an
+    unbounded commit rate -- ``..._keeps_a_slow_starting_run_in_budget`` measures that ceiling.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
+    # one staged transition, a long healthy-but-quiet load that spends a credit, one more
+    # transition (the load finished), then a permanent wedge.
+    healthy_quiet = quiet_polls + 5
+    staged = [1] + [0] * healthy_quiet + [1]
+    wedge_at = len(staged)
+    staged += [0] * (quiet_polls + 8)
+    # the console keeps growing throughout: a wedged worker still prints ray warnings, so bytes
+    # never signal the stall and only the staged count can.
+    sizes = [1000 * (n + 1) for n in range(len(staged))]
+    _waits, uploads = _drive_instance_upload_loop(
+        monkeypatch, sizes, cycles=len(sizes), staged=staged
+    )
+
+    after_wedge = [u for u in uploads if u > wedge_at]
+    assert after_wedge, (
+        "the healthy quiet stage spent the only wedge credit, so the real hang got no snapshot"
+    )
+    # and it lands inside the 1200s training stall, measured from when progress actually stopped.
+    assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
+
+
+def test_instance_console_upload_loop_bounds_its_wedge_credits_over_a_flapping_run(monkeypatch):
+    """Re-arming must not become an unbounded commit rate.
+
+    The latch re-arms on progress, so a run that alternates a heartbeat with sustained silence
+    re-arms on every cycle. Without a cap that shape buys a wedge snapshot each time -- 6/hr
+    console plus the heartbeat's 4/hr, double the shared repo's hard 5.0 ceiling -- and the loop
+    written to respect the budget becomes the thing that blows it. The credits are what bound it,
+    and they are per RUN, so they never enter the sustained rate.
+    """
+    import flash.engine.worker as worker
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
+    interval_s = _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
+    hours = 4
+    cycles = int(hours * 3600.0 / poll_s)
+    # adversarial: one heartbeat, then just enough silence to look wedged, forever.
+    cycle = [1] + [0] * quiet_polls
+    staged = (cycle * (cycles // len(cycle) + 1))[:cycles]
+    sizes = [1000 * (n + 1) for n in range(cycles)]
+    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles, staged=staged)
+
+    # the BUDGET, not the credit constant: deriving the allowance from the value under test makes
+    # the assertion self-referential -- raising the credits raises the bar with it, so the test can
+    # never fail. (Measured: credits=999 commits 24 times at 10/hr and still "passes" that way.)
+    scheduled_per_hour = 3600.0 / interval_s
+    heartbeat_per_hour = 3600.0 / worker._HB_MIN_INTERVAL_S
+    assert scheduled_per_hour + heartbeat_per_hour <= 5.0, "the schedule alone must fit the budget"
+    # the credits are a fixed per-run addition, so the total is the scheduled cadence plus a
+    # constant -- never one commit per silent cycle, which is what an unbounded re-arm buys.
+    unbounded = cycles // len(cycle)
+    assert len(uploads) < unbounded, (
+        f"{len(uploads)} commits over {hours}h is the unbounded rate: every silent cycle bought one"
+    )
+    # and the whole run stays inside the ceiling once its one-off credits are amortized.
+    assert len(uploads) / hours + heartbeat_per_hour <= 5.0 + 1.0, (
+        f"console {len(uploads) / hours}/hr + heartbeat exceeds the 5.0/hr ceiling"
+    )
+
+
 def test_instance_console_upload_loop_does_not_spend_the_latch_on_a_due_snapshot(monkeypatch):
     """A run quiet across its FIRST scheduled snapshot must keep its wedge credit.
 
@@ -1363,6 +1450,58 @@ def test_instance_console_upload_loop_does_not_spend_the_latch_on_a_due_snapshot
     after_wedge = [u for u in uploads if u > wedge_at]
     assert after_wedge, "the overlapping scheduled snapshot consumed the real wedge's credit"
     assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
+
+
+def test_instance_console_upload_loop_never_charges_a_credit_to_a_scheduled_snapshot(monkeypatch):
+    """Silence coinciding with a DUE snapshot must not spend a credit, even after re-arming.
+
+    The test above covers a run silent from the start, where the ``armed`` rule alone already
+    withholds the credit. This one arms the latch first, so only the ``not due`` guard can withhold
+    it. Progress re-arms the latch but never refunds ``spent``, so charging an upload that the
+    schedule was making anyway drains the per-run cap on snapshots that cost nothing to skip: two
+    such coincidences exhaust it, and the genuine wedge afterwards gets no console before the 1200s
+    stall teardown. Each scheduled boundary here is approached with output still flowing and goes
+    quiet only for exactly the wedge threshold, so no INDEPENDENT wedge fires -- the sole difference
+    between guarded and unguarded is what the due polls are charged.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    threshold = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
+    first_polls = int(_instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S / poll_s)
+    interval_polls = int(_instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S / poll_s)
+    # the run must be able to reach each deadline with output still flowing, or the silence that
+    # coincides with it is indistinguishable from a wedge that was already owed a snapshot.
+    assert first_polls > threshold, "the first deadline must land after the wedge threshold"
+
+    sizes: list[int] = []
+    staged: list[int] = []
+    size = [1000]
+
+    def _phase(progress: int, quiet: int) -> None:
+        for _ in range(progress):
+            size[0] += 1000
+            sizes.append(size[0])
+            staged.append(1)
+        for _ in range(quiet):
+            sizes.append(size[0])
+            staged.append(0)
+
+    # each deadline is met with quiet_polls at exactly the threshold: due and wedge coincide.
+    _phase(first_polls - threshold, threshold)
+    _phase(interval_polls - threshold, threshold)
+    _phase(1, 0)  # output resumes, re-arming the latch
+    wedge_at = len(sizes)
+    _phase(0, threshold + 6)  # then the run wedges for good, far from any deadline
+    _waits, uploads = _drive_instance_upload_loop(
+        monkeypatch, sizes, cycles=len(sizes), staged=staged
+    )
+
+    after_wedge = [u for u in uploads if u > wedge_at]
+    assert after_wedge, "the scheduled snapshots drained the credits the real wedge needed"
+    assert (after_wedge[0] - wedge_at) * poll_s < 1200.0, (
+        "the wedge snapshot landed after the stall teardown would have killed the box"
+    )
 
 
 def test_instance_console_upload_loop_keeps_a_slow_starting_run_in_budget(monkeypatch):
