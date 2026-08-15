@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import sys
 
 from flash.cli.commands.env.test_evaluations import _evaluation_example
-from flash.envs.evaluations import EvalCase, EvalResult
+from flash.cli.ui import render
+from flash.envs.evaluations import EvalCase, EvalResult, _episode_grading_enabled
 
 
 def _eval_module():
@@ -34,7 +36,7 @@ def _grades_episodes(suite) -> bool:
     Keying off the environment scored the wrong turn there and turned a well-formed first action
     into an error, so the suite has to say so itself.
     """
-    return bool(getattr(suite, "grades_episodes", False))
+    return _episode_grading_enabled(suite)
 
 
 def _drive_episode(client, target: str, environment, case: EvalCase, args) -> dict | str:
@@ -123,7 +125,14 @@ def _effective_turn_cap(environment, state: dict) -> int:
 
 
 def _score_episode_case(
-    suite, case: EvalCase, case_id: str, state: dict, *, thinking: bool = False
+    suite,
+    case: EvalCase,
+    case_id: str,
+    state: dict,
+    *,
+    scorer,
+    state_style: str | None,
+    thinking: bool = False,
 ) -> EvalResult:
     """Grade a finished episode through the suite's own scorer.
 
@@ -134,18 +143,19 @@ def _score_episode_case(
     `reward(completion, example, state)`, which is what reaches the SDK's `score_episodes`.
 
     `EvalSuite.score(case, response)` is the published two-argument contract, so state is offered
-    only to a suite that accepts it, detected by signature rather than by try/except: a TypeError
-    raised INSIDE a scorer that does accept state would otherwise be silently retried as a
-    two-argument call and graded on the wrong text.
+    only to a suite that accepts it. The caller resolves one scorer and signature style for the
+    whole suite rather than retrying on TypeError: an error raised INSIDE a state-aware scorer must
+    not be retried as a two-argument call and graded on the wrong text.
     """
     response = state.get("response_text")
     if not isinstance(response, str):
         turns = state.get("turns") or []
         response = str(turns[-1]) if turns else ""
     eval_module = _eval_module()
-    style = _state_argument(getattr(suite, "score", None))
-    if style is None:
-        return eval_module._score_case(suite, case, case_id, response, thinking=thinking)
+    if state_style is None:
+        return eval_module._score_case(
+            suite, case, case_id, response, thinking=thinking, scorer=scorer
+        )
     return eval_module._score_case(
         suite,
         case,
@@ -153,7 +163,8 @@ def _score_episode_case(
         response,
         thinking=thinking,
         state=state,
-        state_keyword=style == "keyword",
+        state_keyword=state_style == "keyword",
+        scorer=scorer,
     )
 
 
@@ -173,27 +184,45 @@ def _state_argument(score) -> str | None:
     except (TypeError, ValueError):
         # builtins and C callables expose no signature; treat them as the published contract.
         return None
-    named_state = next((p for p in parameters if p.name == "state"), None)
-    if named_state is not None and named_state.kind in (
-        inspect.Parameter.KEYWORD_ONLY,
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-    ):
-        # By keyword even where positional would also bind: it cannot land on the wrong parameter.
-        return "keyword"
-    # Checked before `*args`, since a scorer with both can take `state=` but one with only
-    # `*args` cannot.
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters):
-        return "keyword"
-    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters):
-        return "positional"
     positional = [
-        p
-        for p in parameters
-        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        parameter
+        for parameter in parameters
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
     ]
-    # (case, response) is the published contract; a third positional is the episode state. This
-    # also catches a positional-only `state`, which the named check above deliberately skips.
-    return "positional" if len(positional) >= 3 else None
+    named_state = next((parameter for parameter in parameters if parameter.name == "state"), None)
+    if named_state is not None:
+        if named_state.kind is inspect.Parameter.POSITIONAL_ONLY:
+            return "positional" if positional.index(named_state) == 2 else None
+        if named_state.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            # by keyword even where positional would also bind: it cannot land on the wrong parameter.
+            return "keyword"
+    # checked before `*args`, since a scorer with both can take `state=` but one with only
+    # `*args` cannot.
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return "keyword"
+    if any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
+        # scorer(case, response, state) reaches *args when the signature has no fixed third slot.
+        # zero, one, or two regular positional parameters can all bind that call.
+        return "positional" if len(positional) <= 2 else None
+    return None
+
+
+def _warn_if_episode_state_is_hidden(suite, state_style: str | None) -> None:
+    """Warn once when full-episode work feeds a scorer that cannot see the transcript."""
+    if state_style is not None:
+        return
+    message = (
+        f"suite {getattr(suite, 'name', 'evaluation')!r} sets grades_episodes = True; "
+        "each episode will still be played out with one generation per turn, but the scorer "
+        "will receive only the episode's final response text, not the transcript. Add a third "
+        "`state` argument to "
+        "`score(case, response, state)` to grade the transcript."
+    )
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
 def _run_episode_cases(
@@ -220,6 +249,9 @@ def _run_episode_cases(
             )
             for case_id in case_ids
         )
+    scorer = getattr(suite, "score", None)
+    state_style = _state_argument(scorer)
+    _warn_if_episode_state_is_hidden(suite, state_style)
     results = []
     # The adapter defaults to `thinking = False` (flash/envs/adapter.py), and with it off
     # `_scored_turn_text` returns the turn unstripped -- so `state["response_text"]` keeps its
@@ -237,7 +269,17 @@ def _run_episode_cases(
             if isinstance(outcome, str):
                 results.append(eval_module._generation_error(case_id, outcome))
                 continue
-            results.append(_score_episode_case(suite, case, case_id, outcome, thinking=thinking))
+            results.append(
+                _score_episode_case(
+                    suite,
+                    case,
+                    case_id,
+                    outcome,
+                    scorer=scorer,
+                    state_style=state_style,
+                    thinking=thinking,
+                )
+            )
     return tuple(results)
 
 

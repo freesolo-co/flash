@@ -34,6 +34,7 @@ from flash.core.spec import (  # noqa: F401
     GpuSpec,
     JobSpec,
 )
+from flash.engine.plan.prompt_budget import PromptBudget
 from flash.providers._lifecycle.poll import _attempt_int as _attempt_int
 from flash.teacher.retry_contract import (
     OPD_RETRY_CONTRACT_STATUS_KEY,
@@ -190,6 +191,10 @@ class RunStatus:
     gpu_status: dict | None = None
     workload_profile_input_digest: str | None = None
     workload_profile: dict | None = None
+    # submit-time derived grpo/opd prompt budget from flash.engine.plan.prompt_budget. workers drop
+    # over-budget prompts rather than truncating them, so record the value before gpu allocation.
+    # none for sft, which reports truncation through workload_profile, and for older records.
+    prompt_budget: PromptBudget | None = None
     effective_preparation: dict | None = None
 
     def to_dict(self) -> dict:
@@ -424,6 +429,8 @@ class PreparedJob:
     worker_spec: JobSpec
     estimated_cost_usd: float
     adapter_identity: dict | None = None
+    # derived grpo/opd prompt budget, resolved where the warm-start source is authorized and read.
+    prompt_budget: PromptBudget | None = None
 
 
 _BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})

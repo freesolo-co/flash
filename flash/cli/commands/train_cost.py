@@ -91,6 +91,9 @@ def _cmd_train_cost_offline(spec) -> int:
         print(render.cost_panel(estimate))
     else:
         print(estimate.breakdown())
+    from flash.cli.commands.prompt_budget import warn_cost_prompt_budget
+
+    warn_cost_prompt_budget(spec)
     return 0
 
 

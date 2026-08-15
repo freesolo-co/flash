@@ -39,20 +39,39 @@ def _previous_ready_deployment(deployment: dict) -> dict | None:
     return None
 
 
-def _deployment_predecessor(deployment: dict) -> dict | None:
+def _confirmed_active_failed_deployment(deployment: object, *, run_id: str) -> dict | None:
+    if not isinstance(deployment, dict):
+        return None
+    revision = deployment.get("adapter_revision")
+    parsed = parse_adapter_revision(revision) if isinstance(revision, str) else None
+    if (
+        deployment.get("state") == "failed"
+        and deployment.get("alias_activation_confirmed") is True
+        and parsed is not None
+        and parsed[0] == run_id
+    ):
+        return dict(deployment)
+    return None
+
+
+def _deployment_predecessor(deployment: dict, *, run_id: str) -> dict | None:
     ready = _previous_ready_deployment(deployment)
     if ready is not None:
         return ready
+    active_failed = _confirmed_active_failed_deployment(deployment, run_id=run_id)
+    if active_failed is not None:
+        return active_failed
     if deployment.get("activation_outcome_unknown"):
         previous = deployment.get("previous_deployment")
         if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
             return dict(previous)
+        return _confirmed_active_failed_deployment(previous, run_id=run_id)
     return None
 
 
 def _activation_predecessor(run_id: str, deployment: dict) -> tuple[str | None, dict | None]:
     if not deployment.get("activation_outcome_unknown"):
-        predecessor = _deployment_predecessor(deployment)
+        predecessor = _deployment_predecessor(deployment, run_id=run_id)
         revision = predecessor.get("adapter_revision") if predecessor is not None else None
         return (revision if isinstance(revision, str) else None), predecessor
 
@@ -65,7 +84,18 @@ def _activation_predecessor(run_id: str, deployment: dict) -> tuple[str | None, 
 
     nested = deployment.get("previous_deployment")
     candidates = [deployment, nested if isinstance(nested, dict) else None]
-    predecessor = next(
+    failed_predecessor = next(
+        (
+            confirmed
+            for candidate in candidates
+            if candidate is not None
+            and candidate.get("adapter_revision") == target
+            and (confirmed := _confirmed_active_failed_deployment(candidate, run_id=run_id))
+            is not None
+        ),
+        None,
+    )
+    predecessor = failed_predecessor or next(
         (
             dict(candidate)
             for candidate in candidates
@@ -80,10 +110,11 @@ def _activation_predecessor(run_id: str, deployment: dict) -> tuple[str | None, 
     )
     predecessor.pop("previous_deployment", None)
     predecessor.pop("activation_outcome_unknown", None)
-    predecessor.pop("error", None)
-    predecessor["state"] = (
-        "ready" if target in read_verified_adapter_revisions(run_id) else "reconciling"
-    )
+    if failed_predecessor is None:
+        predecessor.pop("error", None)
+        predecessor["state"] = (
+            "ready" if target in read_verified_adapter_revisions(run_id) else "reconciling"
+        )
     return target, predecessor
 
 
