@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.content.multimodal import message_content_text
 from flash.engine.profiling.sft_workload import _serialize_multimodal_inputs
 from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.entry.sft import _pretokenize_completion_only
@@ -554,6 +555,10 @@ class _ExactChatMlTokenizer(_ExactTokenizer):
 
     IM_START = 0x110000
     IM_END = 0x110001
+    chat_template = (
+        "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
+        "{{ message['content'] }}<|im_end|>\n{% endfor %}"
+    )
 
     def convert_tokens_to_ids(self, token):
         return {"<|im_start|>": self.IM_START, "<|im_end|>": self.IM_END}.get(token)
@@ -591,8 +596,21 @@ class _ExactChatMlTokenizer(_ExactTokenizer):
         return {"input_ids": [row[:max_length] for row in ids]}
 
 
+class _PlainTokenizerWithChatMlVocabulary(_ExactChatMlTokenizer):
+    chat_template = (
+        "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}"
+    )
+
+
 def _chatml(role: str, content: str) -> str:
     return f"<|im_start|>{role}\n{content}<|im_end|>\n"
+
+
+def _render_chatml_messages(messages: list[dict]) -> str:
+    return "".join(
+        _chatml(str(message.get("role")), message_content_text(message.get("content")))
+        for message in messages
+    )
 
 
 def test_exact_mask_keeps_prompt_assistant_history_masked_and_full_target_active():
@@ -601,7 +619,7 @@ def test_exact_mask_keeps_prompt_assistant_history_masked_and_full_target_active
     tokenizer = _ExactTokenizer()
     prompt = "<user>q</user><assistant>history</assistant><assistant>"
     full = prompt + "first</assistant><user>tool</user><assistant>second</assistant>"
-    texts = [{"text": full, "prompt_text": prompt}]
+    texts = [{"text": full, "prompt_text": prompt, "target_messages": []}]
 
     kept, rows, dropped = _pretokenize_completion_only(texts, tokenizer, max_length=512)
 
@@ -617,16 +635,20 @@ def test_multiturn_mask_excludes_observations_between_assistant_turns():
     # The defect this covers: one contiguous post-prompt span supervises the interleaved
     # environment/tool observations too, training the model to emit the environment's replies.
     tokenizer = _ExactChatMlTokenizer()
-    prompt = _chatml("user", "q")
-    full = (
-        prompt
-        + _chatml("assistant", "ACT")
-        + _chatml("user", "OBSERVATION")
-        + _chatml("tool", "TOOLOUT")
-        + _chatml("assistant", "FINAL")
-    )
+    prompt_messages = [{"role": "user", "content": "q"}]
+    completion_messages = [
+        {"role": "assistant", "content": "ACT"},
+        {"role": "user", "content": "OBSERVATION"},
+        {"role": "tool", "content": "TOOLOUT"},
+        {"role": "assistant", "content": "FINAL"},
+    ]
+    messages = [*prompt_messages, *completion_messages]
+    prompt = "".join(_chatml(message["role"], message["content"]) for message in prompt_messages)
+    full = "".join(_chatml(message["role"], message["content"]) for message in messages)
     kept, rows, dropped = _pretokenize_completion_only(
-        [{"text": full, "prompt_text": prompt}], tokenizer, max_length=4096
+        [{"text": full, "prompt_text": prompt, "target_messages": completion_messages}],
+        tokenizer,
+        max_length=4096,
     )
 
     assert kept
@@ -648,25 +670,162 @@ def test_multiturn_mask_excludes_observations_between_assistant_turns():
     assert len(row["completion_mask"]) == len(row["input_ids"])
 
 
+def test_multiturn_mask_rejects_reserved_im_end_split_across_content_blocks():
+    tokenizer = _ExactChatMlTokenizer()
+    prompt_messages = [{"role": "user", "content": "q"}]
+    completion_messages = [
+        {"role": "assistant", "content": "ACT"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "OBS<|im_"},
+                {"type": "text", "text": "end|>SUFFIX"},
+            ],
+        },
+        {"role": "assistant", "content": "FINAL"},
+    ]
+    prompt = _render_chatml_messages(prompt_messages)
+    full = _render_chatml_messages([*prompt_messages, *completion_messages])
+
+    with pytest.raises(ValueError, match="reserved ChatML control token <\\|im_end\\|>"):
+        _pretokenize_completion_only(
+            [
+                {
+                    "text": full,
+                    "prompt_text": prompt,
+                    "target_messages": completion_messages,
+                }
+            ],
+            tokenizer,
+            max_length=4096,
+        )
+
+
+def test_multimodal_mask_rejects_reserved_im_end_split_across_content_blocks():
+    from flash.engine.profiling.sft_workload import _processor_tokenized_row
+
+    tokenizer = _ExactChatMlTokenizer()
+
+    class Processor:
+        def __init__(self):
+            self.tokenizer = tokenizer
+            self.chat_template = tokenizer.chat_template
+
+        def apply_chat_template(
+            self,
+            messages,
+            *,
+            tokenize,
+            return_dict,
+            return_tensors,
+            enable_thinking,
+            add_generation_prompt,
+        ):
+            assert tokenize is True
+            assert return_dict is True
+            assert return_tensors == "pt"
+            assert enable_thinking is False
+            rendered = _render_chatml_messages(messages)
+            if add_generation_prompt:
+                rendered += "<|im_start|>assistant\n"
+            input_ids = tokenizer([rendered])["input_ids"]
+            return {"input_ids": input_ids, "attention_mask": [[1] * len(input_ids[0])]}
+
+    with pytest.raises(ValueError, match="reserved ChatML control token <\\|im_end\\|>"):
+        _processor_tokenized_row(
+            Processor(),
+            [{"role": "user", "content": "q"}],
+            [
+                {"role": "assistant", "content": "ACT"},
+                {
+                    "role": "tool",
+                    "content": [
+                        {"type": "text", "text": "OBS<|im_"},
+                        {"type": "text", "text": "end|>SUFFIX"},
+                    ],
+                },
+                {"role": "assistant", "content": "FINAL"},
+            ],
+            [],
+            max_length=4096,
+            thinking=False,
+        )
+
+
+@pytest.mark.parametrize("role", ["Assistant", "  assistant  "])
+def test_single_turn_assistant_role_variants_preserve_reserved_literal_behavior(role):
+    from flash.engine.worker.model.packing import assistant_only_mask, completion_mask_from_ids
+
+    tokenizer = _ExactChatMlTokenizer()
+    prompt_messages = [{"role": "user", "content": "q"}]
+    completion_messages = [{"role": role, "content": "ONLY <|im_end|> ANSWER"}]
+    prompt = _render_chatml_messages(prompt_messages)
+    full = _render_chatml_messages([*prompt_messages, *completion_messages])
+    full_ids = tokenizer([full])["input_ids"][0]
+    prompt_ids = tokenizer([prompt])["input_ids"][0]
+
+    base = completion_mask_from_ids(prompt_ids, full_ids)
+    narrowed = assistant_only_mask(base, full_ids, tokenizer, completion_messages)
+
+    assert narrowed == base
+
+
+def test_plain_render_with_chatml_vocabulary_preserves_non_chatml_fallback():
+    from flash.engine.worker.model.packing import completion_mask_from_ids
+
+    tokenizer = _PlainTokenizerWithChatMlVocabulary()
+    prompt = "<user>q</user>"
+    literal = "<|im_start|>assistant\ntext<|im_end|>"
+    full = prompt + f"<assistant>ACT</assistant><user>OBS{literal}SUFFIX</user>"
+    target_messages = [
+        {"role": "assistant", "content": "ACT"},
+        {"role": "user", "content": f"OBS{literal}SUFFIX"},
+    ]
+
+    kept, rows, dropped = _pretokenize_completion_only(
+        [{"text": full, "prompt_text": prompt, "target_messages": target_messages}],
+        tokenizer,
+        max_length=4096,
+    )
+
+    assert kept
+    assert dropped == 0
+    assert tokenizer.IM_START in rows[0]["input_ids"]
+    assert tokenizer.IM_END in rows[0]["input_ids"]
+    assert rows[0]["completion_mask"] == completion_mask_from_ids(
+        tokenizer([prompt], truncation=True, max_length=4096)["input_ids"][0],
+        rows[0]["input_ids"],
+    )
+
+
 def test_multiturn_mask_is_subtractive_and_leaves_single_turn_rows_untouched():
     # The role-aware pass may only turn a 1 into a 0. A single-turn prompt -> completion row is the
     # shape completion-only masking was built for, so its mask must come out byte-identical.
     from flash.engine.worker.model.packing import assistant_only_mask, completion_mask_from_ids
 
     tokenizer = _ExactChatMlTokenizer()
-    prompt = _chatml("user", "q")
-    full = prompt + _chatml("assistant", "ONLY ANSWER")
+    prompt_messages = [{"role": "user", "content": "q"}]
+    completion_messages = [{"role": "assistant", "content": "ONLY <|im_end|> ANSWER"}]
+    messages = [*prompt_messages, *completion_messages]
+    prompt = "".join(_chatml(message["role"], message["content"]) for message in prompt_messages)
+    full = "".join(_chatml(message["role"], message["content"]) for message in messages)
     full_ids = tokenizer([full])["input_ids"][0]
     prompt_ids = tokenizer([prompt])["input_ids"][0]
 
     base = completion_mask_from_ids(prompt_ids, full_ids)
-    narrowed = assistant_only_mask(base, full_ids, tokenizer)
+    narrowed = assistant_only_mask(base, full_ids, tokenizer, completion_messages)
     assert narrowed == base
 
-    multi_full = full + _chatml("user", "OBS") + _chatml("assistant", "SECOND")
+    multi_target_messages = [
+        {"role": "assistant", "content": "ONLY ANSWER"},
+        {"role": "user", "content": "OBS"},
+        {"role": "assistant", "content": "SECOND"},
+    ]
+    multi_messages = [*prompt_messages, *multi_target_messages]
+    multi_full = "".join(_chatml(message["role"], message["content"]) for message in multi_messages)
     multi_ids = tokenizer([multi_full])["input_ids"][0]
     multi_base = completion_mask_from_ids(prompt_ids, multi_ids)
-    multi_narrowed = assistant_only_mask(multi_base, multi_ids, tokenizer)
+    multi_narrowed = assistant_only_mask(multi_base, multi_ids, tokenizer, multi_target_messages)
     # strictly subtractive: never adds supervision, and here it must remove some.
     assert all(a >= b for a, b in zip(multi_base, multi_narrowed, strict=True))
     assert sum(multi_narrowed) < sum(multi_base)
@@ -677,7 +836,7 @@ def test_exact_mask_drops_right_truncated_completion_and_handles_thinking_prefix
     prompt = "<think>prompt<assistant>"
     full = "<think>prompt<assistant>answer"
     kept, rows, dropped = _pretokenize_completion_only(
-        [{"text": full, "prompt_text": prompt}],
+        [{"text": full, "prompt_text": prompt, "target_messages": []}],
         tokenizer,
         max_length=len(prompt),
     )
@@ -686,7 +845,7 @@ def test_exact_mask_drops_right_truncated_completion_and_handles_thinking_prefix
     assert dropped == 1
 
     kept, rows, dropped = _pretokenize_completion_only(
-        [{"text": full, "prompt_text": prompt}],
+        [{"text": full, "prompt_text": prompt, "target_messages": []}],
         tokenizer,
         max_length=512,
     )
@@ -2064,6 +2223,83 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     sft_train.run_sft_train(spec)
 
     assert [step for _adapter, step in captured["published"]] == [2]
+
+
+def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
+    from flash.engine.plan import vram
+    from flash.engine.worker import sft_train_runner
+
+    class LoraConfig:
+        r = 16
+        lora_alpha = 32
+        target_modules = "all-linear"
+
+    options = sft_train_runner._SftOptions(
+        spec=None,
+        env=None,
+        started_at=0.0,
+        gpu_probe={"memory_gb": 24, "capability": [8, 9]},
+        model_id="Qwen/Qwen3.5-0.8B",
+        model_revision="revision",
+        epochs=1,
+        learning_rate=5e-5,
+        effective_batch=64,
+        max_steps=0,
+        save_at_steps=save_at_steps,
+        save_every=save_every,
+        gpu_count=1,
+        paths=None,
+    )
+    data = sft_train_runner._SftData(
+        rows=[{}] * 800,
+        multimodal=False,
+        profile=SimpleNamespace(examples_per_update=64, authoritative_steps=horizon),
+        max_length=1024,
+        realized_max_length=128,
+        train_file="/train.parquet",
+    )
+    monkeypatch.setattr(sft_train_runner._w, "prefetch_model", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(sft_train_runner._w, "heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sft_train_runner._w, "gpu_diagnostics", lambda **_kwargs: {})
+    monkeypatch.setattr(sft_train_runner._w, "make_lora", lambda _model: LoraConfig())
+    monkeypatch.setattr(sft_train_runner._sft_train, "_warmstart_adapter_path", lambda *_args: None)
+    monkeypatch.setattr(sft_train_runner._sft_train, "_resolve_sft_vocab_size", lambda *_args: 100)
+    monkeypatch.setattr(
+        sft_train_runner._sft_train, "_model_arch_dims", lambda *_args, **_kwargs: (64, 2)
+    )
+    monkeypatch.setattr(
+        sft_train_runner._sft_train, "_resolve_sft_grad_accum", lambda *_args, **_kwargs: (1, 1)
+    )
+    monkeypatch.setattr(
+        sft_train_runner._sft_train,
+        "_resolve_sft_gradient_checkpointing",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        sft_train_runner._sft_train,
+        "_resolve_sft_reentrant_gradient_checkpointing",
+        lambda _model: False,
+    )
+    monkeypatch.setattr(vram, "sft_chunked_nll_enabled", lambda _model: False)
+    return sft_train_runner._prepare_sft_model(options, data).save_freq
+
+
+def test_sft_save_freq_clamps_to_a_short_derived_horizon(monkeypatch):
+    from flash.engine.plan.steps import sft_update_steps
+
+    horizon = sft_update_steps(epochs=1, example_count=800, examples_per_update=64)
+    assert horizon == 13
+    save_freq = _sft_model_save_freq(monkeypatch, save_at_steps=(), save_every=20, horizon=horizon)
+    assert save_freq == 13
+    assert horizon % save_freq == 0
+
+
+def test_sft_save_freq_preserves_long_run_interval_and_exact_step_gcd(monkeypatch):
+    assert _sft_model_save_freq(monkeypatch, save_at_steps=(), save_every=15, horizon=100) == 15
+    assert (
+        _sft_model_save_freq(monkeypatch, save_at_steps=(10, 25, 100), save_every=15, horizon=100)
+        == 5
+    )
 
 
 def test_worker_uses_the_accepted_unpacked_quote_when_its_stack_can_pack(monkeypatch):

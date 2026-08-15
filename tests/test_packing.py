@@ -171,9 +171,13 @@ def test_pretokenize_completion_only_drops_empty_and_keeps_lockstep():
 
     tok = _FakeTok(eos="!")
     texts = [
-        {"text": "ABxy", "prompt_text": "AB"},  # real completion -> kept
-        {"text": "AB", "prompt_text": "AB!"},  # prompt == full row -> all-zero mask -> dropped
-        {"text": "CDz", "prompt_text": "CD"},  # real completion -> kept
+        {"text": "ABxy", "prompt_text": "AB", "target_messages": []},  # real completion -> kept
+        {
+            "text": "AB",
+            "prompt_text": "AB!",
+            "target_messages": [],
+        },  # prompt == full row -> all-zero mask -> dropped
+        {"text": "CDz", "prompt_text": "CD", "target_messages": []},  # real completion -> kept
     ]
     kept_texts, pretok, n_dropped = _pretokenize_completion_only(texts, tok, max_length=100)
     assert n_dropped == 1
@@ -197,8 +201,13 @@ def test_pretokenize_drops_content_free_completion():
         {
             "text": "AB",
             "prompt_text": "AB",
+            "target_messages": [],
         },  # full [1,A,B,!]; prompt [1,A,B] -> completion=[!] (EOS) -> dropped
-        {"text": "ABx", "prompt_text": "AB"},  # completion=[x,!] has real token x -> kept
+        {
+            "text": "ABx",
+            "prompt_text": "AB",
+            "target_messages": [],
+        },  # completion=[x,!] has real token x -> kept
     ]
     kept_texts, _pretok, n_dropped = _pretokenize_completion_only(texts, tok, max_length=100)
     assert n_dropped == 1

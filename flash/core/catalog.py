@@ -148,6 +148,9 @@ class ModelInfo:
     mamba_block_size: int = 0
     # grouped (in_features, out_features, count) for peft all-linear on the full loaded model.
     lora_target_shapes: tuple[tuple[int, int, int], ...] = ()
+    # fused routed experts stacked on the lora rank axis for target_parameters. zero means no
+    # catalog-backed stacked allowance; ordinary and unknown target parameters carry exactly r.
+    lora_expert_count: int = 0
 
     @property
     def is_moe(self) -> bool:
@@ -174,6 +177,7 @@ class ModelInfo:
             "linear_value_head_dim",
             "linear_conv_kernel_dim",
             "lora_target_shapes",
+            "lora_expert_count",
         ):
             data.pop(key, None)
         serving = data["serving"]
@@ -500,6 +504,7 @@ MODELS: dict[str, ModelInfo] = {
             (4608, 2048, 1),
             (4608, 4608, 1),
         ),
+        lora_expert_count=256,
         vocab_size=248_320,
         algos=ALGORITHMS,
         min_vram_gb=141,
@@ -567,6 +572,14 @@ def serving_lora_rank_cap(model: str | ModelInfo | None) -> int | None:
     if info is None or info.serving is None:
         return None
     return int(info.serving.max_lora_rank)
+
+
+def lora_expert_count(model: str | ModelInfo | None) -> int | None:
+    """Return the exact fused-expert stack size for LoRA target parameters, when cataloged."""
+    info = _model_info_for_serving(model)
+    if info is None or info.lora_expert_count <= 0:
+        return None
+    return int(info.lora_expert_count)
 
 
 def serving_context_cap(model: str | ModelInfo | None) -> int | None:

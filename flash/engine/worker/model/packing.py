@@ -9,6 +9,8 @@ boundaries -- without both, state carries across examples inside a packed micro-
 
 from __future__ import annotations
 
+from flash.content.multimodal import message_content_text
+
 
 def _text_config(cfg):
     """Return the decoder sub-config (multimodal checkpoints nest it under ``text_config``)."""
@@ -222,6 +224,58 @@ def completion_mask_from_ids(prompt_ids: list[int], full_ids: list[int]) -> list
     return [0] * n + [1] * (n_full - n)
 
 
+_CHATML_CONTROL_TOKENS = ("<|im_start|>", "<|im_end|>")
+
+
+def _chatml_control_ids(tokenizer) -> tuple[int, int] | None:
+    to_id = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if not callable(to_id):
+        return None
+    im_start, im_end = (to_id(token) for token in _CHATML_CONTROL_TOKENS)
+    unk = getattr(tokenizer, "unk_token_id", None)
+    if im_start is None or im_end is None or im_start in (unk, im_end) or im_end == unk:
+        return None
+    return im_start, im_end
+
+
+def _normalized_source_role(message: dict) -> str:
+    return str(message.get("role")).strip().lower()
+
+
+def _active_chat_template(source) -> str | None:
+    """Return the metadata-selected template without rendering user-controlled messages."""
+    get_template = getattr(source, "get_chat_template", None)
+    if callable(get_template):
+        try:
+            template = get_template()
+        except (AttributeError, TypeError, ValueError):
+            return None
+    else:
+        template = getattr(source, "chat_template", None)
+        if isinstance(template, dict):
+            template = template.get("default")
+    return template if isinstance(template, str) else None
+
+
+def _uses_chatml_template(source) -> bool:
+    template = _active_chat_template(source)
+    return template is not None and all(token in template for token in _CHATML_CONTROL_TOKENS)
+
+
+def _reject_chatml_control_content(target_messages: list[dict]) -> None:
+    """Reject ambiguous control strings in multi-turn targets containing observations."""
+    if not any(_normalized_source_role(message) != "assistant" for message in target_messages):
+        return
+    for message in target_messages:
+        text = message_content_text(message.get("content"))
+        for token in _CHATML_CONTROL_TOKENS:
+            if token in text:
+                raise ValueError(
+                    f"SFT message content contains reserved ChatML control token {token}; "
+                    "remove or escape the literal token before training"
+                )
+
+
 def _chatml_message_spans(full_ids: list[int], tokenizer) -> list[tuple[int, int, str]] | None:
     """Split a rendered transcript into ``(start, end, role)`` per ChatML message.
 
@@ -236,15 +290,11 @@ def _chatml_message_spans(full_ids: list[int], tokenizer) -> list[tuple[int, int
     guess. Roles are lowercased; a header the tokenizer splits across several tokens is joined
     before comparison so a multi-token role name still resolves.
     """
-    to_id = getattr(tokenizer, "convert_tokens_to_ids", None)
     decode = getattr(tokenizer, "decode", None)
-    if not callable(to_id) or not callable(decode):
+    control_ids = _chatml_control_ids(tokenizer)
+    if control_ids is None or not callable(decode):
         return None
-    im_start = to_id("<|im_start|>")
-    im_end = to_id("<|im_end|>")
-    unk = getattr(tokenizer, "unk_token_id", None)
-    if im_start is None or im_end is None or im_start == unk or im_end == unk:
-        return None
+    im_start, im_end = control_ids
     if im_start not in full_ids or im_end not in full_ids:
         return None
 
@@ -278,7 +328,13 @@ def _chatml_message_spans(full_ids: list[int], tokenizer) -> list[tuple[int, int
     return spans or None
 
 
-def assistant_only_mask(loss_mask: list[int], full_ids: list[int], tokenizer) -> list[int]:
+def assistant_only_mask(
+    loss_mask: list[int],
+    full_ids: list[int],
+    tokenizer,
+    target_messages: list[dict],
+    template_source=None,
+) -> list[int]:
     """Clear supervision over every non-assistant span of a rendered transcript.
 
     ``completion_mask_from_ids`` returns ONE contiguous supervised span, which is right for a
@@ -291,7 +347,17 @@ def assistant_only_mask(loss_mask: list[int], full_ids: list[int], tokenizer) ->
     target is a single assistant turn is returned unchanged. When the transcript does not parse as
     ChatML the mask is returned unchanged -- narrowing supervision on a guess would silently drop
     real training signal.
+
+    ChatML control strings are reserved in multi-turn target content when the active template is
+    ChatML and the target contains non-assistant observations. Their token ids are identical to
+    structural delimiters after rendering, so accepting a literal would make the boundary ambiguous
+    and could expose the rest of a non-assistant turn to supervision. Single-turn and non-ChatML
+    targets keep their prior behavior.
     """
+    template_source = tokenizer if template_source is None else template_source
+    if not _uses_chatml_template(template_source):
+        return loss_mask
+    _reject_chatml_control_content(target_messages)
     if not full_ids or not any(loss_mask):
         return loss_mask
     spans = _chatml_message_spans(full_ids, tokenizer)
