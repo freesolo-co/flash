@@ -851,18 +851,103 @@ def test_an_unarmed_health_timer_never_displaces_the_capacity_deadline():
     assert "capacity grace" in unhealthy_tie, unhealthy_tie
     assert "unhealthy" not in unhealthy_tie, unhealthy_tie
 
-    # but the handicap is one health cadence, NOT a veto: an unarmed timer whose grace is genuinely
-    # shorter still fires first and is still the honest number to report. Dropping unarmed timers
-    # outright would hide the 240s unhealthy grace behind a 900s capacity one.
-    from flash.providers.runpod.jobs import HEALTH_ARM_PENALTY_S
+    # but the handicap is a cadence, NOT a veto: an unarmed timer whose grace is genuinely shorter
+    # still fires first and is still the honest number to report. Dropping unarmed timers outright
+    # would hide the 240s unhealthy grace behind a 900s capacity one.
+    from flash.providers.runpod.jobs import HEALTH_PROBE_CADENCE_S
 
     shorter = _note(0.0, unhealthy=True, unhealthy_since=None, unhealthy_grace_s=240.0)
     assert "unhealthy grace" in shorter, shorter
-    assert HEALTH_ARM_PENALTY_S == 90.0
+    assert HEALTH_PROBE_CADENCE_S == 90.0
+
+
+def test_an_armed_health_timer_is_charged_the_probe_gap_it_must_wait_for():
+    # An ARMED health timer cannot fire at its raw deadline either: _classify_queue_state re-reads
+    # health only on the ~90s cadence, while capacity/no-progress/wall are checked every poll. A
+    # timer with 10s of grace left therefore bites at the next probe, not in 10s -- so a capacity
+    # timer with 20s left really does fire first, and quoting the health grace would name a deadline
+    # the run reaches later. Rounding the health remainder up to the cadence is what encodes that.
+    nearer_in_name_only = _note(
+        890.0,
+        unhealthy=True,
+        unhealthy_since=0.0,
+        unhealthy_grace_s=900.0,  # 10s raw left, but not checked for another cadence
+        queued_since=0.0,
+        queue_grace_s=910.0,  # 20s left, checked every poll -> fires first
+    )
+    assert "capacity grace" in nearer_in_name_only, nearer_in_name_only
+    assert "unhealthy" not in nearer_in_name_only, nearer_in_name_only
+
+    # a health grace that is nearer by MORE than the probe gap is still the one reported.
+    genuinely_nearer = _note(
+        100.0, unhealthy=True, unhealthy_since=0.0, unhealthy_grace_s=140.0, queue_grace_s=900.0
+    )
+    assert "unhealthy grace" in genuinely_nearer, genuinely_nearer
+
+
+def test_a_recovering_worker_still_reports_the_budgets_that_do_apply():
+    # An initializing worker suppresses the capacity and health countdowns -- those timers are not
+    # running for it. But the run wall deadline and the setup/no-progress limit still apply and
+    # still end the wait, so suppressing the WHOLE note printed a bare queued line at an attempt
+    # that was about to fail as `stalled`: silence exactly where the warning was needed.
+    wall = _note(0.0, capacity_applies=False, absolute_deadline=45.0, stall_limit_s=3000.0)
+    assert "45s left of the run wall deadline" in wall, wall
+    assert "capacity" not in wall, wall
+
+    progress = _note(2900.0, capacity_applies=False, stall_since=0.0, stall_limit_s=3000.0)
+    assert "no-progress limit" in progress, progress
+    assert "capacity" not in progress, progress
 
     # once armed, a genuinely nearer health deadline is still the one reported.
     armed = _note(60.0, throttled=True, throttled_since=0.0, throttled_grace_s=300.0)
     assert "throttled grace" in armed, armed
+
+
+def test_the_note_is_timestamped_after_a_slow_health_request(monkeypatch):
+    # `now` is captured before the heartbeat read AND the health request. The RunPod client allows
+    # multiple 30s attempts plus backoff, so on a slow or retried probe the printed figures would be
+    # stale by tens of seconds -- still claiming budget that the very next poll has already spent.
+    import io
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    # a clock driven almost entirely BY the health request: ordinary reads advance it by a tick
+    # (so the run still reaches its deadline and the test terminates), while the request itself
+    # burns 200s. That makes the request duration, not the ambient tick, the thing under test --
+    # a free-running clock would advance either way and prove nothing.
+    clock = {"t": 0.0}
+
+    def _time():
+        clock["t"] += 0.5
+        return clock["t"]
+
+    monkeypatch.setattr(jobs.time, "time", _time)
+
+    def _slow_health(eid, _fp, **_kw):
+        clock["t"] += 200.0  # a retried REST call: multiple 30s attempts plus backoff
+        return {"workers": {}}
+
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", _slow_health)
+    log = io.StringIO()
+    jobs.poll_job(
+        _runpod_handle(jobs),
+        log=log,
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=3000.0,
+        stall_after_s=3000.0,
+        queue_grace_s=900.0,
+        on_last_gpu=True,
+    )
+    queued = [ln for ln in log.getvalue().splitlines() if "capacity grace" in ln]
+    assert queued, log.getvalue()
+    waited = [int(ln.split("waited ")[1].split("s of")[0]) for ln in queued]
+    # stamped after the health read, the first line already carries that request's 200s. Stamped
+    # before it, the line reads 0s and tells the operator the wait has barely begun.
+    assert waited[0] >= 200, queued[0]
 
 
 def test_the_elapsed_figure_is_never_negative():
@@ -917,10 +1002,11 @@ def test_the_queued_line_reports_progress_that_landed_in_this_same_iteration(mon
     # the fresh one (one 20s clock tick), not the whole wait charged against a stale last_progress.
     progress = [ln for ln in queued if "no-progress" in ln]
     assert progress, queued
-    # one clock tick of elapsed at most: the heartbeat that landed this iteration is what the note
-    # charges against. Before the fix the whole preceding wait was charged (40s and climbing), which
-    # is how a live run got told its no-progress budget was nearly spent.
-    assert all("waited 0s of 200s" in ln for ln in progress), progress
+    # one clock tick of elapsed: the heartbeat that landed this iteration is what the note charges
+    # against, plus the tick the note's own post-health-read timestamp costs. Before the fix the
+    # whole preceding wait was charged (40s and climbing), which is how a live run got told its
+    # no-progress budget was nearly spent.
+    assert all("waited 20s of 200s" in ln for ln in progress), progress
 
 
 def test_longer_capacity_explanation_is_gated_on_the_grace_actually_in_force():

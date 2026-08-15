@@ -495,33 +495,40 @@ def _classify_queue_state(
         state.worker_coming_up_at = now if (usable or recovering) else None
         if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
             # name the budget this wait is spending, so a queued line separates "still inside its
-            # grace" from "wedged". a worker that is coming up is governed by the much larger setup
-            # grace and has no countdown to report -- gate on `usable or recovering`, the same
-            # evidence that clears the timer two lines above, rather than on the timers' `since`,
-            # which is still armed from the classify pass that ran BEFORE this health read.
-            budget = ""
-            if not (usable or recovering):
-                note = _jobs.queue_wait_note(
-                    now,
-                    unhealthy=bool(workers.get("unhealthy")),
-                    unhealthy_since=state.unhealthy_timer.since,
-                    unhealthy_grace_s=context.unhealthy_grace_s,
-                    throttled=bool(workers.get("throttled")),
-                    throttled_since=state.throttled_timer.since,
-                    throttled_grace_s=context.throttled_grace_s,
-                    queued_since=state.queued_timer.since,
-                    queue_grace_s=context.queue_grace_s,
-                    on_last_gpu=context.on_last_gpu,
-                    absolute_deadline=context.absolute_deadline,
-                    stall_since=state.last_progress,
-                    # the same choice _classify_stall makes one call later in this iteration.
-                    stall_limit_s=(
-                        context.setup_grace_s
-                        if context.heartbeat_reader is not None and not state.seen_training_hb
-                        else context.stall_after_s
-                    ),
-                )
-                budget = f"; {note}" if note else ""
+            # grace" from "wedged". A worker that is coming up suppresses only the capacity and
+            # health candidates -- those timers really are not running for it -- but the run wall
+            # deadline and the setup/no-progress limit still apply and still end the wait, so the
+            # note is always asked for. Gate on `usable or recovering`, the same evidence that
+            # clears the timer above, rather than on the timers' `since`, which is still armed from
+            # the classify pass that ran BEFORE this health read.
+            coming_up = bool(usable or recovering)
+            # re-read the clock: `now` was taken before the heartbeat read and the health request,
+            # and the RunPod client allows multiple 30s attempts plus backoff, so on a slow or
+            # retried probe the figures printed here would be stale by tens of seconds -- claiming
+            # budget that is already spent, which is the exact false reassurance this note exists to
+            # remove. The timers below keep using `now`, the instant their evidence was classified.
+            note = _jobs.queue_wait_note(
+                _jobs.time.time(),
+                unhealthy=bool(workers.get("unhealthy")) and not coming_up,
+                unhealthy_since=state.unhealthy_timer.since,
+                unhealthy_grace_s=context.unhealthy_grace_s,
+                throttled=bool(workers.get("throttled")) and not coming_up,
+                throttled_since=state.throttled_timer.since,
+                throttled_grace_s=context.throttled_grace_s,
+                queued_since=state.queued_timer.since,
+                queue_grace_s=context.queue_grace_s,
+                capacity_applies=not coming_up,
+                on_last_gpu=context.on_last_gpu,
+                absolute_deadline=context.absolute_deadline,
+                stall_since=state.last_progress,
+                # the same choice _classify_stall makes one call later in this iteration.
+                stall_limit_s=(
+                    context.setup_grace_s
+                    if context.heartbeat_reader is not None and not state.seen_training_hb
+                    else context.stall_after_s
+                ),
+            )
+            budget = f"; {note}" if note else ""
             context.say(f"queued; workers: {workers}{budget}")
         if state.unhealthy_timer.expired(
             workers.get("unhealthy") and not usable and not recovering,

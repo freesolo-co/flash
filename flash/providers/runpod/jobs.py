@@ -92,11 +92,12 @@ LAST_GPU_CAPACITY_GRACE_S = 900.0
 # observation nobody can still confirm.
 WORKER_COMING_UP_TTL_S = 300.0
 
-# the handicap `queue_wait_note` charges an unarmed unhealthy/throttled timer when deciding which
-# deadline to report. Such a timer arms on the NEXT poll and is then only re-checked on the 90s
-# health cadence, while the capacity timer is driven every poll -- so on an equal grace the capacity
-# timer terminates the wait first. One health cadence is the tightest bound on that lateness.
-HEALTH_ARM_PENALTY_S = 90.0
+# how often _classify_queue_state re-reads endpoint health, and therefore how often the
+# unhealthy/throttled timers can fire at all. `queue_wait_note` rounds those graces up to this
+# cadence when deciding which deadline to report: capacity, no-progress and the wall deadline are
+# checked EVERY poll, so a health grace that runs out mid-gap is not acted on until the next probe
+# and must not be quoted as if it were. Kept equal to the probe gate in _classify_queue_state.
+HEALTH_PROBE_CADENCE_S = 90.0
 
 TERMINAL_OK = {"COMPLETED"}
 # CANCELLED/TIMED_OUT = provider-killed (retriable); FAILED = worker died on its own (fails fast).
@@ -316,6 +317,25 @@ def capacity_escalation_note(on_last_gpu: bool) -> str:
     )
 
 
+def _health_deadline_in(raw_remaining: float, *, armed: bool) -> float:
+    """When a health grace can actually FIRE, not when it nominally runs out.
+
+    `_classify_queue_state` evaluates the unhealthy/throttled timers only on the ~90s probe cadence,
+    so a grace that runs out mid-gap is not acted on until the next probe. Capacity, no-progress and
+    the wall deadline are checked every poll and need no such adjustment, which is why quoting a raw
+    health remainder against them overstates how soon the health timer bites.
+
+    This note is itself emitted from inside a probe, and the timers are checked a few lines later in
+    the same pass -- so a grace already spent fires now (0), and otherwise it waits for the first
+    probe boundary at or beyond its deadline. An unarmed timer is one further cadence out: the poll
+    that arms it cannot also expire it.
+    """
+    probes = math.ceil(max(raw_remaining, 0.0) / HEALTH_PROBE_CADENCE_S)
+    if not armed:
+        probes += 1
+    return probes * HEALTH_PROBE_CADENCE_S
+
+
 def queue_wait_note(
     now: float,
     *,
@@ -327,6 +347,7 @@ def queue_wait_note(
     throttled_grace_s: float,
     queued_since: float | None,
     queue_grace_s: float,
+    capacity_applies: bool = True,
     on_last_gpu: bool,
     absolute_deadline: float | None,
     stall_since: float,
@@ -349,22 +370,24 @@ def queue_wait_note(
 
     The no-progress limit always applies, so there is always at least one deadline to report.
     """
-    # (remaining, waited, budget, label, clause). An unarmed health timer (`since is None`) has
-    # charged no time AND arms only on the next poll, after which it is checked on the ~90s health
-    # cadence while the capacity timer is driven every poll. So it needs a strictly shorter grace to
-    # fire first -- on a tie the capacity timer gets there first, and quoting the health grace would
-    # name a deadline the run never reaches. HEALTH_ARM_PENALTY_S expresses that one-poll handicap;
-    # a genuinely shorter grace still wins and is still reported.
+    # (remaining, waited, budget, label, clause). The health timers cannot fire at their raw
+    # deadline: _classify_queue_state only re-checks them on the ~90s probe cadence, while capacity,
+    # no-progress and the wall deadline are checked every poll. So a health timer actually expires at
+    # its NEXT eligible probe, and an unarmed one needs one further probe to arm at all. Charging
+    # that lateness is what makes "nearest" honest -- an unhealthy timer with 10s of raw grace left
+    # does not beat a capacity timer with 20s, because capacity fires inside the probe gap.
     candidates = []
     if unhealthy:
-        armed = unhealthy_since is not None
-        waited = now - unhealthy_since if armed else 0.0
-        remaining = unhealthy_grace_s - waited + (0.0 if armed else HEALTH_ARM_PENALTY_S)
+        waited = 0.0 if unhealthy_since is None else now - unhealthy_since
+        remaining = _health_deadline_in(
+            unhealthy_grace_s - waited, armed=unhealthy_since is not None
+        )
         candidates.append((remaining, waited, unhealthy_grace_s, "unhealthy", ""))
     if throttled:
-        armed = throttled_since is not None
-        waited = now - throttled_since if armed else 0.0
-        remaining = throttled_grace_s - waited + (0.0 if armed else HEALTH_ARM_PENALTY_S)
+        waited = 0.0 if throttled_since is None else now - throttled_since
+        remaining = _health_deadline_in(
+            throttled_grace_s - waited, armed=throttled_since is not None
+        )
         candidates.append((remaining, waited, throttled_grace_s, "throttled", ""))
     # the caller only asks for a note when it has just confirmed no usable or recovering worker, so
     # the capacity timer is either running or about to re-arm on the next poll. a cleared `since`
@@ -372,20 +395,21 @@ def queue_wait_note(
     # PREVIOUS probe's still-recent worker sighting, one step before the fresh probe below finds no
     # worker at all. dropping the candidate there would quote the 3000s no-progress limit while the
     # 300s capacity grace is what actually terminates the run.
-    waited = 0.0 if queued_since is None else now - queued_since
-    # the escalation fact ONLY, like `capacity_escalation_note`: on_last_gpu is also true when the
-    # infra retry budget is exhausted with GPU classes still untried, so it must never be reported
-    # as "this GPU class is pinned". derive "is given longer" from the grace ACTUALLY in force, not
-    # from the flag: poll_job exposes on_last_gpu and queue_grace_s independently and never ties
-    # them, so a caller can set the flag while overriding the grace down.
-    clause = (
-        " (no further GPU-class escalation follows, so capacity is given longer)"
-        if on_last_gpu and queue_grace_s > 300.0
-        else " (no further GPU-class escalation follows)"
-        if on_last_gpu
-        else ""
-    )
-    candidates.append((queue_grace_s - waited, waited, queue_grace_s, "capacity", clause))
+    if capacity_applies:
+        waited = 0.0 if queued_since is None else now - queued_since
+        # the escalation fact ONLY, like `capacity_escalation_note`: on_last_gpu is also true when
+        # the infra retry budget is exhausted with GPU classes still untried, so it must never be
+        # reported as "this GPU class is pinned". derive "is given longer" from the grace ACTUALLY
+        # in force, not from the flag: poll_job exposes on_last_gpu and queue_grace_s independently
+        # and never ties them, so a caller can set the flag while overriding the grace down.
+        clause = (
+            " (no further GPU-class escalation follows, so capacity is given longer)"
+            if on_last_gpu and queue_grace_s > 300.0
+            else " (no further GPU-class escalation follows)"
+            if on_last_gpu
+            else ""
+        )
+        candidates.append((queue_grace_s - waited, waited, queue_grace_s, "capacity", clause))
     # the no-progress limit, checked one call after the queue classifier in the same iteration.
     # setup_grace_s normally dwarfs the queue graces, but poll_job accepts both independently, so a
     # short stall_after_s can be the real deadline while the capacity grace is still wide open.
