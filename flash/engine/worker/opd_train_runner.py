@@ -726,6 +726,7 @@ def _run_child(
     try:
         if runtime.resume_step < workload.update_horizon:
             progress_state.start_training()
+            _opd_train.arm_provider_stall_clock()
             with _opd_train.liveness_heartbeat(
                 "opd_step",
                 progress=callbacks.liveness_progress,

@@ -238,6 +238,24 @@ def _validate_multimodal_opd(request, spec, model_id: str) -> None:
         raise ValueError("multi-turn image-bearing opd is not supported")
 
 
+def arm_provider_stall_clock() -> None:
+    """Restart the PROVIDER's stall clock at the moment the child's own watchdog arms.
+
+    a real heartbeat, not a liveness ping: `_process_heartbeat` advances the clock only on a staged
+    one. without this the provider's 3000s setup grace has been running since `opd_start` -- before
+    the model load, the venv build and the capability probe, each held open by liveness pings it
+    deliberately does not credit -- so roughly 20 minutes of ordinary setup leaves under 1800s, the
+    provider reports the retriable "stalled" before the child-local clock can fire, and the wedge
+    goes back through the infra retry floor: the amplification this whole change exists to stop.
+
+    `opd_initializing` is in the setup registries on both sides (heartbeat.py and poll.py's
+    SETUP_HEARTBEAT_STAGES), so it advances the clock without tightening the window to
+    STALL_AFTER_S the way a step-bearing `opd_step` would, and it is exempted from the throttle
+    (_HB_MODEL_LOAD_STAGES) so the setup pings that just ran cannot coalesce the commit away.
+    """
+    _w.heartbeat("opd_initializing", gpu=_w.gpu_diagnostics(include_torch=False))
+
+
 def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[float, list]:
     """Pull the base weights and read back the generation EOS ids, reporting progress throughout.
 

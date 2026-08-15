@@ -385,6 +385,46 @@ def test_child_tail_stall_clock_restarts_after_new_output(monkeypatch):
     assert not stall.is_set(), "repeated quiet phases accumulated into a false kill"
 
 
+def test_a_wedged_heartbeat_upload_does_not_also_suppress_the_stall_verdict(monkeypatch):
+    """The detector must survive the emitter it shares a wrap with.
+
+    `_w.heartbeat` uploads through HfApi, which takes no timeout, and the suite already REQUIRES
+    callers to survive a wedged one (see the bounded-join test below). If the deadline were only
+    ever checked in the emitting loop, that loop blocking would freeze the verdict too: the child
+    stays alive on a paid gpu and the provider eventually reports the retriable "stalled", which is
+    the retry-and-rebill path this watchdog exists to cut off. The two failures COMBINE in practice
+    -- a sick host wedges uploads and children alike -- so this is the case that must still fire.
+    """
+    hb, w, _ = _liveness_env(monkeypatch)
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_S", 0.05)
+    emitting = threading.Event()
+
+    def wedged_emit(_stage, **_kw):
+        # blocks forever on the FIRST emit, exactly like an HfApi upload with no timeout. the first
+        # tick therefore observes one silent tick and then never returns to observe another.
+        emitting.set()
+        time.sleep(30)
+
+    monkeypatch.setattr(w, "heartbeat", wedged_emit)
+    monkeypatch.setattr(hb, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.2)
+    stall = threading.Event()
+
+    with hb.liveness_heartbeat(
+        "opd_step",
+        fields=lambda: {"child_tail_silent_ticks": 1},
+        child_tail_stall_event=stall,
+    ):
+        assert emitting.wait(5), "the emitting loop never ran, so this proves nothing"
+        deadline = time.time() + 5
+        while not stall.is_set() and time.time() < deadline:
+            time.sleep(0.01)
+
+    assert stall.is_set(), (
+        "the heartbeat upload wedged and took the stall detector down with it: the child was never "
+        "condemned, so the run keeps billing until the provider's own grace expires"
+    )
+
+
 def test_liveness_heartbeat_join_is_bounded_even_if_emit_wedges(monkeypatch):
     """The exit join must be BOUNDED: a wedged heartbeat() upload can't hang the worker at block exit."""
     hb, w, _ = _liveness_env(monkeypatch)

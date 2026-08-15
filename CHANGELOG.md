@@ -46,7 +46,13 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   diagnostic such as `global_step: 1` no longer switches the detector off for the rest of the run,
   and a resumed attempt reports steps taken by the current child rather than the restored step it
   started from. Genuinely new output resets the window, so the 600s teacher bridge request and the
-  warmup-dominated first step are unaffected.
+  warmup-dominated first step are unaffected. A staged heartbeat is emitted as the watchdog arms, so
+  the provider's own stall clock restarts alongside the child's: it advances only on staged pings,
+  and the whole setup span before the child is held open by liveness pings it does not credit, so
+  ~20 minutes of ordinary setup previously left less grace than the watchdog needs and the provider
+  reported the retriable `stalled` first. The deadline is also re-checked from a thread that never
+  uploads, because the heartbeat upload has no timeout and a wedged one would otherwise freeze the
+  detector on the same thread -- the combined child-plus-upload failure a sick host produces.
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always

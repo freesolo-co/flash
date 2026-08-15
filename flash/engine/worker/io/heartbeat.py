@@ -76,7 +76,14 @@ _HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset({"rl_step", "sft_st
 # throttled: the transition is the only record that the run reached the stage, and it is emitted
 # right after a download that has been pinging throughout, so the throttle would almost always
 # swallow it. the wrap that follows re-emits with liveness=True and stays throttled.
-_HB_MODEL_LOAD_STAGES = frozenset({"sft_model_load", "opd_model_load"})
+#
+# opd_initializing carries the same shape and one added consequence. it is emitted once, right
+# before the verl child is launched, after a setup span (model load, venv build, capability probe)
+# that has been sending LIVENESS pings the provider deliberately does not credit -- so it is
+# emitted exactly when the throttle is most likely to be closed, and it is the only staged ping
+# that restarts the provider's stall clock at the moment the child's own watchdog arms. throttled
+# away, the two clocks run from different origins and the provider gives up first.
+_HB_MODEL_LOAD_STAGES = frozenset({"sft_model_load", "opd_model_load", "opd_initializing"})
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
@@ -565,6 +572,14 @@ class _ChildTailStallClock:
     reports an instantaneous sample, and a healthy trainer reads 0% between kernels, during host-side
     setup and while blocked on io -- requiring it would trade a false kill for a missed one on the
     exact failure this exists to catch. it stays on the heartbeat as evidence for the diagnosis.
+
+    ``elapse`` is what makes the verdict survive a wedged emitter. ``observe`` only runs once per
+    loop iteration, and an iteration can block forever inside the heartbeat upload: HfApi takes no
+    timeout, and the suite already REQUIRES callers to survive that (see
+    ``test_liveness_heartbeat_join_is_bounded_even_if_emit_wedges``). a detector that only advances
+    between uploads would then sit at whatever it last saw while the child stayed alive on a paid
+    gpu -- the combined child-plus-upload failure, where this is needed most. so the deadline is
+    re-checked against the clock without a fresh sample, from a caller that cannot block.
     """
 
     def __init__(self) -> None:
@@ -582,13 +597,22 @@ class _ChildTailStallClock:
             # runs across an unbroken run of silent ticks.
             self._silent_since = None
             return
-        now = time.monotonic()
         if self._silent_since is None:
             # first silent tick of this run. the silence actually began up to one tick earlier, but
             # starting from here only ever makes the deadline more conservative.
-            self._silent_since = now
+            self._silent_since = time.monotonic()
             return
-        if now - self._silent_since >= CHILD_TAIL_STALL_S:
+        self.elapse(stall_event)
+
+    def elapse(self, stall_event) -> None:
+        """condemn the child if the silence already observed has now lasted long enough.
+
+        takes no new sample: it answers "has the deadline passed" for a silence run that is already
+        open, which is exactly what a caller that never blocks can still contribute.
+        """
+        if stall_event is None or stall_event.is_set() or self._silent_since is None:
+            return
+        if time.monotonic() - self._silent_since >= CHILD_TAIL_STALL_S:
             stall_event.set()
 
 
@@ -608,9 +632,24 @@ def liveness_heartbeat(
     ``child_tail_stall_event`` is SET (never raised) once ``fields`` reports a child that has gone
     ``CHILD_TAIL_STALL_S`` seconds without new output: this runs on a daemon thread, so an
     exception here would die with the thread while the main thread stayed blocked on a dead child.
+    The deadline is additionally re-checked from a second thread that never emits, so a heartbeat
+    upload wedged inside this loop cannot also suppress the verdict (see ``_ChildTailStallClock``).
     """
     done = threading.Event()
     spawner = threading.current_thread()
+    stall_clock = _ChildTailStallClock()
+
+    def _elapse_loop() -> None:
+        # same inline-stub guard as `_loop` below, for the same reason: a test that runs thread
+        # targets on .start() would otherwise never return from this one.
+        if threading.current_thread() is spawner:
+            return
+        # deliberately does nothing but read a clock and compare it. it shares no lock with the
+        # emitting loop, calls nothing that can block, and only ever ACTS on a silence run that
+        # loop already opened -- so it cannot condemn a child on its own, and cannot be stopped by
+        # whatever the emitting loop is stuck in.
+        while not done.wait(_LIVENESS_TICK_S):
+            stall_clock.elapse(child_tail_stall_event)
 
     def _loop() -> None:
         if threading.current_thread() is spawner:
@@ -620,7 +659,6 @@ def liveness_heartbeat(
             return
         last_val = None
         dumped = False
-        stall_clock = _ChildTailStallClock()
         while not done.wait(_LIVENESS_TICK_S):
             made_progress = False
             if progress is not None:
@@ -655,11 +693,20 @@ def liveness_heartbeat(
 
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
+    elapser: threading.Thread | None = None
+    if child_tail_stall_event is not None:
+        # only when there is a child to condemn: every other liveness wrap in the worker keeps the
+        # single thread it has always had.
+        elapser = threading.Thread(target=_elapse_loop, daemon=True)
+        elapser.start()
     try:
         yield
     finally:
         done.set()
         t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
+        if elapser is not None:
+            # bounded like the join above, and this thread only ever sleeps on `done`.
+            elapser.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
 
 
 # checkpoint drain time scales with model size and network throughput; a fixed timeout killed a

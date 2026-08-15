@@ -6762,6 +6762,114 @@ def test_opd_child_shares_one_stall_event_between_detector_and_teardown(monkeypa
     )
 
 
+def test_arming_the_watchdog_restarts_the_providers_stall_clock(monkeypatch):
+    """The two clocks must start from the same origin, or the provider gives up first.
+
+    The child-local watchdog gets a fresh 1800s the moment the child is launched. The provider's
+    3000s setup grace does NOT restart there: `_process_heartbeat` advances it only on a STAGED
+    heartbeat, and the whole span before the child -- model load, venv build, capability probe --
+    is held open by liveness pings it deliberately does not credit. So the last thing to advance it
+    is `opd_start`, and roughly 20 minutes of ordinary setup leaves under 1800s of grace: the
+    provider reports the retriable "stalled" before the watchdog can fire, and the wedge goes back
+    through the infra retry floor to bill on up to five more gpus.
+
+    Three properties, each of which alone makes the ping useless: it must be REAL (a liveness ping
+    is not credited), it must be a SETUP stage (a step-bearing `opd_step` tightens the window to
+    1500s instead), and it must actually COMMIT (the throttle is closed by the setup pings that
+    just ran, and a swallowed heartbeat advances nothing).
+    """
+    from contextlib import nullcontext
+
+    import flash.engine.worker.io.heartbeat as hb
+    import flash.engine.worker.opd_train_runner as opd_runner
+    from flash.providers._lifecycle.poll import is_training_heartbeat
+
+    class ProgressState:
+        def __init__(self, _resume_state):
+            pass
+
+        def start_training(self):
+            pass
+
+        def final_state(self, _bridge):
+            return {"loss_curve": [0.5], "train_wall_seconds": 1.0}
+
+    class Watcher:
+        def start(self):
+            pass
+
+        def stop(self, *, require_complete):
+            pass
+
+    class GpuSampler:
+        def start(self):
+            return self
+
+        def stop_gb(self):
+            return 0.0
+
+    emitted: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        opd_runner._opd_train._w,
+        "heartbeat",
+        lambda stage, **kw: emitted.append((stage, kw)),
+    )
+    monkeypatch.setattr(opd_runner._opd_train._w, "gpu_diagnostics", lambda include_torch=True: {})
+    monkeypatch.setattr(opd_runner._opd_train, "build_opd_overrides", lambda _config: [])
+    monkeypatch.setattr(opd_runner._opd_train, "_OpdProgressState", ProgressState)
+    monkeypatch.setattr(opd_runner, "_build_checkpoint_watcher", lambda *_args: Watcher())
+    monkeypatch.setattr(opd_runner, "_build_child_env", lambda *_args: {})
+    monkeypatch.setattr(opd_runner._opd_train, "_NvidiaSmiPeakSampler", GpuSampler)
+    monkeypatch.setattr(
+        opd_runner._opd_train, "liveness_heartbeat", lambda *_a, **_k: nullcontext()
+    )
+    monkeypatch.setattr(opd_runner._opd_train, "run_verl_training", lambda *_a, **_k: 0)
+    monkeypatch.setattr(
+        opd_runner, "_reconcile_child_failures", lambda *_args, truncation_window: None
+    )
+    monkeypatch.setattr(
+        opd_runner._opd_train, "latest_global_step_dir", lambda _path: ("/actor", 1)
+    )
+    monkeypatch.setattr(opd_runner, "_validate_checkpoint_progress", lambda *_args: None)
+
+    opd_runner._run_child(
+        SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
+        object(),
+        SimpleNamespace(update_horizon=1, local_dir="/unused"),
+        SimpleNamespace(
+            resume_state=None,
+            resume_step=0,
+            python_bin="python",
+            entry_path="entry.py",
+            bridge=object(),
+        ),
+        {},
+        (),
+    )
+
+    arming = [(stage, kw) for stage, kw in emitted if stage == "opd_initializing"]
+    assert arming, (
+        "no staged heartbeat was emitted when the watchdog armed, so the provider's setup grace "
+        "keeps running from before the model load while the child's own clock starts at zero"
+    )
+    stage, kw = arming[0]
+    assert not kw.get("liveness"), (
+        "the arming heartbeat is a liveness ping, which _process_heartbeat does not credit: the "
+        "provider's stall clock is not advanced and the fix is inert"
+    )
+    assert not is_training_heartbeat(stage, kw.get("step")), (
+        "the arming heartbeat reads as training, which swaps the 3000s setup grace for the 1500s "
+        "training window -- tightening the very clock this is meant to reset"
+    )
+    # and it must survive the throttle. every stage before it here is a throttled setup stage that
+    # has been pinging for minutes, so without this exemption the commit is coalesced away and
+    # nothing reaches the provider at all.
+    assert stage in hb._HB_MODEL_LOAD_STAGES, (
+        "the arming heartbeat is throttled with no one-shot exemption, so the setup pings that "
+        "just ran will usually swallow the commit it depends on"
+    )
+
+
 def test_opd_stall_abort_reason_states_only_what_was_observed():
     # silence localises the failure to the child's progress boundary. it does NOT identify which
     # component stopped, so the message users and the run log get must not name a cause.
