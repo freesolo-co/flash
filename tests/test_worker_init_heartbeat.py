@@ -385,6 +385,43 @@ def test_child_tail_stall_clock_restarts_after_new_output(monkeypatch):
     assert not stall.is_set(), "repeated quiet phases accumulated into a false kill"
 
 
+def test_elapse_survives_the_window_being_cleared_underneath_it(monkeypatch):
+    """`elapse` and `observe` run on DIFFERENT threads, so the window can vanish mid-call.
+
+    `observe` clears `_silent_since` to None the moment the child speaks again. If `elapse` tested
+    the attribute and then subtracted the attribute, those are two reads of a value another thread
+    is writing: between them it can become None, and `monotonic() - None` raises TypeError on a
+    daemon thread with no handler. That thread dies silently, and with it the independent detection
+    that survives a wedged upload -- so the fix for that failure would itself be disarmed by an
+    ordinary healthy child that happened to speak at the wrong moment.
+    """
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_S", 100.0)
+    clock = hb._ChildTailStallClock()
+    stall = threading.Event()
+
+    clock.observe(1, stall)  # opens a silence window
+    assert clock._silent_since is not None, "no window was opened, so this proves nothing"
+
+    real_monotonic = time.monotonic
+    cleared = []
+
+    def racing_monotonic():
+        # `elapse` reads the clock exactly once, and that read happens AFTER the None check and
+        # (in the buggy form) as part of the subtraction. clearing here is the emitting thread
+        # landing in precisely that gap.
+        clock._silent_since = None
+        cleared.append(1)
+        return real_monotonic()
+
+    monkeypatch.setattr(hb.time, "monotonic", racing_monotonic)
+    clock.elapse(stall)  # must not raise TypeError
+    assert cleared, (
+        "elapse never read the clock, so the race window was never entered and this test is inert"
+    )
+    assert not stall.is_set(), "a cleared window still condemned the child"
+
+
 def test_a_wedged_heartbeat_upload_does_not_also_suppress_the_stall_verdict(monkeypatch):
     """The detector must survive the emitter it shares a wrap with.
 

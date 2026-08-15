@@ -609,10 +609,17 @@ class _ChildTailStallClock:
 
         takes no new sample: it answers "has the deadline passed" for a silence run that is already
         open, which is exactly what a caller that never blocks can still contribute.
+
+        reads ``_silent_since`` ONCE, into a local. this runs on a different thread from the
+        ``observe`` that writes it, and the child speaking again clears it to None -- so checking
+        the attribute and then subtracting the attribute can see two different values, and
+        ``monotonic() - None`` is a TypeError on a daemon thread that would then die silently,
+        taking with it the very redundancy this method exists to provide.
         """
-        if stall_event is None or stall_event.is_set() or self._silent_since is None:
+        silent_since = self._silent_since
+        if stall_event is None or stall_event.is_set() or silent_since is None:
             return
-        if time.monotonic() - self._silent_since >= CHILD_TAIL_STALL_S:
+        if time.monotonic() - silent_since >= CHILD_TAIL_STALL_S:
             stall_event.set()
 
 
