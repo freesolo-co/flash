@@ -291,6 +291,10 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
     def _should_publish(self, step: int) -> bool:
         return True
 
+    def _publishable(self, pending: list[tuple[int, str]]) -> list[tuple[int, str]]:
+        """keep every pending retry state because each checkpoint carries distinct accounting."""
+        return pending
+
     def _publish(self, step: int, checkpoint_dir: str) -> None:
         actor_dir = os.path.join(checkpoint_dir, "actor")
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
