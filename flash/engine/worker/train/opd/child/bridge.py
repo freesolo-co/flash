@@ -55,6 +55,19 @@ _FAILURE_FALLBACK_MAX_CHARS = 8192
 # digest is absent by design: its own branches below run first and consume the whole line, so
 # listing it here too would be dead alternation.
 _SECRET_SCHEME = r"(?:(?:bearer|basic|token)\s+)?"
+# AUTHORIZATION carries `scheme credential`, and the scheme space is open-ended -- Negotiate, NTLM,
+# AWS4-HMAC-SHA256, any vendor word. An unrecognised scheme is the dangerous case: the bare branch
+# matches the SCHEME as the value and prints the credential after it, redacting the one word on the
+# line that is not secret. So an authorization value whose scheme is NOT a known single-token one
+# runs to end of line, like digest. The known schemes keep the whitespace stop, because their value
+# is a single token and consuming the rest of the line would eat the diagnostic AROUND an already
+# fully redacted credential (`Authorization: Bearer tok while calling the teacher`).
+_SECRET_AUTH_KEY = r"(?P<auth>authorization)"
+# a scheme word followed by a credential; the negative lookahead is what routes the known ones back
+# to the bare branch. the guard is `(?![\w-])`, not `\b`: `\b` treats a hyphen as a boundary, so
+# `Digest-Custom` would read as the known `digest` and its credential would print verbatim.
+# `digest` is listed because its own branches run first and already consume that line.
+_SECRET_UNKNOWN_SCHEME = r"(?!(?:bearer|basic|token|digest)(?![\w-]))[A-Za-z][\w-]*\s+"
 # a presigned url carries its capability in QUERY PARAMETERS whose names look nothing like the
 # credential words above: `?X-Amz-Credential=...&X-Amz-Signature=...` is a complete, immediately
 # usable capability and matched none of them. it is minted per-request, so it is in no environment
@@ -64,12 +77,19 @@ _SECRET_URL_PARAM = (
     r"x-(?:amz|goog)-(?:signature|credential|security-token)|signature|(?<![\w-])sig"
 )
 _SECRET_DETAIL = re.compile(
-    r"(?i)(?P<key>authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password"
+    rf"(?i)(?P<key>{_SECRET_AUTH_KEY}|api[-_ ]?key|access[-_ ]?token|token|secret|password"
     rf"|{_SECRET_URL_PARAM})"
     r"(?P<sep>['\"]?\s*[:=]\s*)"
     rf"(?:(?P<quote>['\"])(?:digest\s+(?P<qdigest>[^\r\n]+)"
     rf"|{_SECRET_SCHEME}(?P<quoted>(?:\\.|(?!(?P=quote))[^\r\n])*))"
     r"|digest\s+(?P<digest>[^\r\n]+)"
+    # an AUTHORIZATION value with an UNRECOGNISED scheme runs to end of line: the bare branch below
+    # would otherwise match that scheme and print the credential after it. This alternative is tried
+    # first and its lookahead fails for the known single-token schemes, so those fall through to the
+    # bare branch and keep the whitespace stop. It is guarded by `(?=...)` on the key rather than a
+    # conditional, because `(?(auth)yes|no)` makes the bare branch the ELSE -- unreachable for the
+    # very key that needs it, so `Bearer`/`Basic` would stop being consumed at all.
+    rf"|(?(auth){_SECRET_UNKNOWN_SCHEME}[^\r\n]+|(?!))"
     # `&` terminates an unquoted value: without it the first signed-url parameter swallows every
     # later one, so a single <redacted> replaces the whole query string including the benign
     # `X-Amz-Expires` that says WHY a capability failed. each parameter is redacted on its own.

@@ -4873,6 +4873,42 @@ def test_child_failure_sanitizer_redacts_a_quoted_credential_containing_spaces(m
     )
 
 
+def test_child_failure_sanitizer_redacts_every_authorization_scheme():
+    """An Authorization value is redacted through its credential, whatever the scheme is called.
+
+    The scheme space is open-ended -- Negotiate, NTLM, AWS4-HMAC-SHA256, any vendor word -- so a
+    closed whitelist does not merely miss one case: the pattern matches the SCHEME as the value and
+    prints the credential after it, redacting the single word on the line that is NOT secret while
+    publishing the one that is. That is worse than no rule at all, and the value pass cannot save it
+    because a runtime-minted Negotiate/NTLM token is in no environment variable.
+
+    So an unquoted Authorization value runs to end of line, the same fail-closed rule digest uses.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, leak in (
+        ("Authorization: Negotiate YIIFruntime-token-leak", "YIIFruntime-token-leak"),
+        ("Authorization: NTLM TlRMTVNTUAABleak", "TlRMTVNTUAABleak"),
+        ("authorization: AWS4-HMAC-SHA256 Credential=AKIA-leak", "AKIA-leak"),
+        ("Authorization: Digest-Custom abc-leak", "abc-leak"),
+        ('Authorization: "Negotiate YIIF-quoted-leak"', "YIIF-quoted-leak"),
+    ):
+        detail = _safe_child_failure_detail(ValueError(message))
+        assert leak not in detail, f"{message!r} leaked its credential: {detail!r}"
+        assert "<redacted>" in detail, message
+
+    # the whitelisted schemes keep working -- the scheme word is still consumed, not printed as the
+    # value, so the line does not degrade to redacting `Bearer` and publishing the token.
+    assert _safe_child_failure_detail(ValueError("Authorization: Bearer sk-live-x")) == (
+        "Authorization: <redacted>"
+    )
+    # and running to end of line is scoped to authorization: every OTHER key still stops at
+    # whitespace, or one credential in a sentence would erase the diagnostic around it.
+    assert _safe_child_failure_detail(ValueError("api_key=zzz failed at step 4")) == (
+        "api_key=<redacted> failed at step 4"
+    )
+
+
 def test_child_failure_sanitizer_redacts_a_credential_containing_an_escaped_quote():
     """A quoted value whose credential contains the delimiter must be consumed whole.
 
