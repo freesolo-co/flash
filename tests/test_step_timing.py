@@ -1,3 +1,4 @@
+import json
 import math
 
 import pytest
@@ -36,6 +37,41 @@ def test_median_resists_outlier_while_projection_uses_mean() -> None:
 
     assert fields["step_duration_s"] == 92.0
     assert fields["projected_remaining_s"] == pytest.approx(((92 + 92 + 900) / 3) * 10)
+
+
+def test_overflowing_diagnostic_is_omitted_through_step_ingestion(monkeypatch) -> None:
+    calls = []
+
+    def heartbeat(stage, **fields):
+        calls.append((stage, fields))
+        return True
+
+    monkeypatch.setattr(rl_train_runner._w, "heartbeat", heartbeat)
+    monkeypatch.setattr(rl_train_runner._w, "_remaining_worker_wall_seconds", lambda: 20000.0)
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = _StepMetricState()
+    inp = {"max_completion": 512, "steps": 190}
+
+    for step, duration in ((1, 500.0), (2, 1e308), (3, 1e308)):
+        state.progress["step"] = step
+        _ingest_step_metrics(
+            _line(step, duration),
+            inp,
+            state,
+            lambda: rl_train_runner._step_timing_fields(inp, state),
+        )
+
+    assert len(calls) == 1
+    assert "step_duration_s" not in calls[0][1]
+    assert "projected_remaining_s" not in calls[0][1]
+    assert (
+        state.step_timing.heartbeat_fields(
+            current_step=3,
+            total_steps=190,
+            remaining_wall_s=20000.0,
+        )
+        == {}
+    )
 
 
 def test_retains_only_the_latest_64_post_warmup_samples() -> None:
@@ -127,6 +163,68 @@ def test_first_usable_pace_is_forced_after_first_metrics_commit(monkeypatch) -> 
     assert calls[1][1]["projected_remaining_s"] == pytest.approx(17296.0)
     assert state.sent_first_metrics is True
     assert state.sent_first_timing is True
+
+
+def test_first_timing_bypasses_force_floor_and_retries_with_real_wrapper(monkeypatch) -> None:
+    import importlib
+
+    import flash.engine.worker as worker
+
+    heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
+
+    now = {"value": 1000.0}
+    outcomes = iter((True, False, True))
+    uploads = []
+
+    def upload(local, *_args, **_kwargs):
+        with open(local) as f:
+            uploads.append(json.load(f))
+        return next(outcomes)
+
+    monkeypatch.setattr(heartbeat_module.time, "time", lambda: now["value"])
+    monkeypatch.setattr(worker, "hf_upload_file", upload)
+    monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(worker, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
+    monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 999.0)
+    monkeypatch.setattr(worker, "_HB_LAST_FORCED_UPLOAD", 0.0)
+    monkeypatch.setattr(worker, "_HB_LAST_COMMITTED_STEP", 0)
+    monkeypatch.setattr(worker, "_HB_PROGRESS_SEQ", 0)
+    monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+    monkeypatch.setattr(rl_train_runner._w, "heartbeat", worker.heartbeat)
+    monkeypatch.setattr(rl_train_runner._w, "_remaining_worker_wall_seconds", lambda: 20000.0)
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = _StepMetricState()
+    inp = {"max_completion": 512, "steps": 190}
+
+    def observability():
+        return rl_train_runner._step_timing_fields(inp, state)
+
+    state.progress["step"] = 1
+    _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
+    assert state.sent_first_metrics is True
+    assert worker._HB_LAST_FORCED_UPLOAD == 1000.0
+
+    now["value"] = 1001.0
+    state.progress["step"] = 2
+    _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
+    assert state.sent_first_timing is False
+    assert worker._HB_LAST_COMMITTED_STEP == 1
+    assert worker._HB_LAST_FORCED_UPLOAD == 1000.0
+
+    now["value"] = 1002.0
+    state.progress["step"] = 3
+    _ingest_step_metrics(_line(3, 93.0), inp, state, observability)
+    assert state.sent_first_timing is True
+
+    now["value"] = 1003.0
+    state.progress["step"] = 4
+    _ingest_step_metrics(_line(4, 94.0), inp, state, observability)
+    assert worker.heartbeat("rl_step", step=4, force=True) is False
+
+    assert [payload["step"] for payload in uploads] == [1, 2, 3]
+    assert "step_duration_s" not in uploads[0]
+    assert uploads[1]["step_duration_s"] == 92.0
+    assert uploads[2]["step_duration_s"] == 92.5
 
 
 def test_failed_first_timing_commit_retries_on_next_step(monkeypatch) -> None:
@@ -222,10 +320,9 @@ def test_current_running_rl_attempt_renders_compact_pace_and_one_warning() -> No
 
     pairs = _step_timing_pairs(heartbeat, running=True, current_attempt=True)
 
-    assert pairs[0] == ("pace", "92s/step · ~4.8h left")
+    assert pairs[:2] == [("median pace", "92s/step"), ("mean ETA", "~4.8h left")]
     warnings = [value for label, value in pairs if label == "warning"]
-    assert len(warnings) == 1
-    assert "exceeds" in warnings[0]
+    assert warnings == ["mean-based remaining-time projection exceeds the run's wall time left"]
 
 
 def test_pace_is_suppressed_for_superseded_finished_and_non_rl_heartbeats() -> None:
@@ -248,8 +345,10 @@ def test_pace_is_suppressed_for_superseded_finished_and_non_rl_heartbeats() -> N
         "last_heartbeat": {**heartbeat, "attempt": 1},
     }
     finished = {"state": "done", "last_heartbeat": heartbeat}
-    assert "pace" not in dict(_heartbeat_pairs(superseded))
-    assert "pace" not in dict(_heartbeat_pairs(finished))
+    assert "median pace" not in dict(_heartbeat_pairs(superseded))
+    assert "mean ETA" not in dict(_heartbeat_pairs(superseded))
+    assert "median pace" not in dict(_heartbeat_pairs(finished))
+    assert "mean ETA" not in dict(_heartbeat_pairs(finished))
 
 
 @pytest.mark.parametrize("bad", [None, True, 0, -1, math.nan, math.inf, "92", 10**1000])
@@ -272,7 +371,7 @@ def test_warning_requires_a_valid_projection_and_literal_true_flag() -> None:
     base = {"stage": "rl_step", "step_duration_s": 92.0}
 
     assert dict(_step_timing_pairs(base, running=True, current_attempt=True)) == {
-        "pace": "92s/step"
+        "median pace": "92s/step"
     }
     assert "warning" not in dict(
         _step_timing_pairs(

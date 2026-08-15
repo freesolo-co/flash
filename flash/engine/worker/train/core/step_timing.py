@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import statistics
 from dataclasses import dataclass, field
 
@@ -37,9 +38,19 @@ class StepTiming:
             return {}
 
         remaining_steps = max(0, int(total_steps) - int(current_step))
-        projected_remaining_s = statistics.fmean(durations) * remaining_steps
+        try:
+            median_duration_s = statistics.median(durations)
+            mean_duration_s = statistics.fmean(durations)
+            projected_remaining_s = mean_duration_s * remaining_steps
+        except OverflowError:
+            return {}
+        if not all(
+            math.isfinite(value)
+            for value in (median_duration_s, mean_duration_s, projected_remaining_s)
+        ):
+            return {}
         fields: dict[str, float | bool] = {
-            "step_duration_s": statistics.median(durations),
+            "step_duration_s": median_duration_s,
             "projected_remaining_s": projected_remaining_s,
         }
         if (

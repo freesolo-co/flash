@@ -139,7 +139,13 @@ def _console_heartbeat_snapshot(payload: dict, payload_committed: bool = True) -
 
 
 def heartbeat(
-    stage: str, *, liveness: bool = False, force: bool = False, initial: bool = False, **kw
+    stage: str,
+    *,
+    liveness: bool = False,
+    force: bool = False,
+    initial: bool = False,
+    first_timing: bool = False,
+    **kw,
 ):
     global _HB_CLAIM_SEQ
     ts = time.time()
@@ -198,18 +204,19 @@ def heartbeat(
             # requires a step advance, but a sample-bearing payload may match the committed step because
             # the liveness daemon can commit that step first without the samples. the per-force floor still
             # coalesces fast bursts to protect the hf commit cap, while an unrelated liveness commit does
-            # not arm the floor and therefore cannot suppress the first sample-bearing payload.
+            # not arm the floor and therefore cannot suppress the first sample-bearing payload. the first
+            # timing payload gets one dedicated floor bypass because the forced metrics-only payload just
+            # before it armed that clock; its caller retries this flag until the timing upload succeeds.
             if force and not upload_due:
                 fstep = kw.get("step")
                 has_samples = bool(kw.get("sampled_completions"))
+                first_timing_due = first_timing and "step_duration_s" in kw
                 force_step_due = isinstance(fstep, (int, float)) and (
                     fstep > _w._HB_LAST_COMMITTED_STEP
                     or (has_samples and fstep == _w._HB_LAST_COMMITTED_STEP)
                 )
-                if (
-                    force_step_due
-                    and (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
-                ):
+                force_floor_due = (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
+                if force_step_due and (first_timing_due or force_floor_due):
                     upload_due = True
         # the initial training snapshot must land before the shared throttle can hide it.
         if initial:

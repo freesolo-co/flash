@@ -349,16 +349,14 @@ def _step_timing_pairs(
         return []
 
     projected_remaining_s = _finite_positive(heartbeat.get("projected_remaining_s"))
-    pace = f"{_humanize_step_duration(step_duration_s)}/step"
+    pairs = [("median pace", f"{_humanize_step_duration(step_duration_s)}/step")]
     if projected_remaining_s is not None:
-        pace += f" · ~{_humanize_duration(projected_remaining_s)} left"
-
-    pairs = [("pace", pace)]
+        pairs.append(("mean ETA", f"~{_humanize_duration(projected_remaining_s)} left"))
     if heartbeat.get("wall_deadline_at_risk") is True and projected_remaining_s is not None:
         pairs.append(
             (
                 "warning",
-                "at this pace the projected remaining training exceeds the run's wall time left",
+                "mean-based remaining-time projection exceeds the run's wall time left",
             )
         )
     return pairs
