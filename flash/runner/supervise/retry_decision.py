@@ -44,17 +44,11 @@ _REFUSALS_BEFORE_GIVING_UP = 2
 
 
 # what the log says INSTEAD of naming a retry target, when the run stops on exhausted capacity.
-# it names the things that actually change the outcome, because waiting is not one of them.
 #
-# worded off exactly what the stop establishes, which is narrower than it first looks. NOT "every
-# class refused twice": over an ordered pin the walk is A, B, A, so A has refused twice and B once.
-# and NOT "every fitting class was tried" either -- key 1 of `_select_candidate` sorts on failed
-# provider BEFORE key 2 sorts on untried, so with an untried class stranded on an already-failed
-# provider the picker returns to a tried shape on a healthy one (probed exhaustively: 266 such
-# states over a 2-provider, 3-class candidate set). the one thing true in every case is that the
-# class this retry would land on has already refused twice. say that, and let the remedies cover
-# the rest -- overclaiming here would misdescribe the run in its own failure line, which is the
-# same defect as the docstring this change corrects.
+# claims only what the stop establishes: that the class this retry would land on has refused twice.
+# NOT "every class refused twice" (over an ordered pin the walk is A, B, A) and not "every fitting
+# class was tried" (`_select_candidate` sorts on failed provider before untried, so an untried class
+# on a failed provider loses to a tried one on a healthy provider). the remedies cover the rest.
 _EXHAUSTED_CAPACITY_ACTION = (
     "not retrying: the GPU class this retry would return to has already refused capacity twice, "
     "and no better class is left to fail over to, so re-queueing would fail the same way. Widen "
@@ -73,32 +67,22 @@ def _capacity_exhausted(
 
     A ``no_capacity`` verdict is about the CLASS, not the host: unlike a stall or a preemption, which
     a fresh box can clear, re-submitting to a shape the provider refuses asks the identical question
-    and gets the identical answer -- at up to ``LAST_GPU_CAPACITY_GRACE_S`` (900s) of queue grace per
-    attempt, which is what turned an unavailable pin into a 75-minute serial retry loop.
+    at up to 900s of queue grace per attempt, which is what turned an unavailable pin into a
+    75-minute serial retry loop.
 
-    The bar is a SECOND refusal of the same shape, not the first. ``no_capacity`` covers a
-    transient search flake and an exhausted provider pool as well as the 900s queue-grace expiry,
-    and a market that was dry a minute ago routinely frees a card -- so one refusal is a data point,
-    while the same shape refusing twice is the pattern that no amount of re-queueing fixes.
-
-    Counted PER SHAPE, which is the whole reason this is a tally and not a set of names. Over an
-    ordered pin of A and B, "A refused, B refused" puts both shapes on a membership list after a
-    single refusal each, so the retry projecting back onto A would stop there -- writing off two
-    classes on one refusal apiece, which is the transient-shortage failure the margin prevents.
+    The bar is a SECOND refusal, since ``no_capacity`` also covers a transient search flake and a
+    market that was dry a minute ago routinely frees a card. Counted PER SHAPE rather than as a set
+    of names: over an ordered pin of A and B, a membership list writes off both classes after one
+    refusal each.
 
     Asked of the shape the retry WOULD pick, not of every candidate. "Have they all refused twice?"
-    reads like the safer question and is in fact unreachable: ``_select_candidate`` prefers an
-    untried shape once, then falls back to the allocator's cheapest-per-step order, so it clamps
-    onto the cheapest class and never returns to a dearer one it has already tried. Over a dry
-    ordered pin the walk is A, B, A, A, A... -- B is stuck at one refusal forever, the all() never
-    becomes true, and the stop is inert for exactly the multi-class pins this feature exists to
-    create. Reading the projection instead asks the only question that decides the next attempt:
-    is the class we are about to re-submit to one that has already refused twice?
+    is unreachable -- ``_select_candidate`` prefers an untried shape once, then clamps onto the
+    cheapest, so a dry ordered pin walks A, B, A, A... and B stays at one refusal forever, leaving
+    the stop inert for exactly the multi-class pins this feature creates.
 
-    Deliberately narrow beyond that. It fires only when no cache-less retry is left to change the
-    search: those retries are not repeats, because dropping the shared weight cache lifts the
-    volume's datacenter restriction and reaches hosts the cached attempt could not. Every other
-    infra failure keeps its full retry budget.
+    Narrow by design: it never fires while a cache-less retry is left, because dropping the weight
+    cache lifts the volume's datacenter restriction and reaches hosts the cached attempt could not.
+    Every other infra failure keeps its full retry budget.
     """
     if outcome.result.failure != "no_capacity" or first_cache_drop:
         return False

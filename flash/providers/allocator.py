@@ -771,10 +771,10 @@ def allocate(
     ``max_gpu_count=None`` auto-sizes to the smallest geometry-safe ceiling that can fit. an integer
     is an authored hard ceiling; fitting shapes up to that ceiling still compete on dollars per step.
 
-    ``gpu_type`` plus ``gpu_type_fallbacks`` is the authored acceptable set, in preference order.
+    ``gpu_type`` plus ``gpu_type_fallbacks`` is the authored acceptable SET, in authored order.
     Restricting the search to several classes rather than one is what gives a pinned run somewhere to
     fail over when its first class is out of capacity. Ranking among the survivors is unchanged --
-    still cheapest-per-step -- so authored order narrows the search without dictating the winner.
+    still cheapest-per-step -- so the order narrows the search without influencing the winner.
     """
     # the same profile knobs ranking prices on: VRAM must be sized for the work that will RUN, not
     # the authored request. an exact-unpacked run executes batch 1 at the measured length, so sizing
@@ -850,7 +850,6 @@ def allocate(
         disk_gb=disk_gb,
         max_wall_seconds=max_wall_seconds,
         gpu_type=exact,
-        gpu_types=acceptable,
         required_vram_gb=need,
         max_gpu_count=cap,
     )

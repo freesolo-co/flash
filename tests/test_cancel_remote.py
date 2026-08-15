@@ -263,6 +263,39 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
     assert out.state == "cancelled"
 
 
+def test_cancel_tears_down_every_acceptable_class_of_an_ordered_pin(tmp_path, monkeypatch):
+    """The endpoint name is RECONSTRUCTED from the GPU class, not read back from the handle.
+
+    Allocation ranks a multi-class pin on cost, so the class actually rented may not be the head --
+    and naming only the head leaves the rented endpoint running and billing. Terminating by name is
+    best-effort, so a class this run never rented simply matches nothing.
+    """
+    import flash.runner as orch
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from flash.core.spec import JobSpec
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "gpu": {"type": ["A100 PCIe", "A100 SXM"]},
+            "run_id": "flash-9-feedface",
+        }
+    )
+    orch._save_status(provisioned_status(orch, spec, state="running"))
+
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        ftrain,
+        "terminate_endpoint",
+        lambda gpu, run_id: terminated.append(gpu) or [{"success": True}],
+    )
+
+    assert orch.cancel_run(spec.run_id).state == "cancelled"
+    assert terminated == ["A100 PCIe", "A100 SXM"]
+
+
 def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     # Cancelling a deployed run tears down its serve endpoint; the deployment record
     # must flip to "undeployed" so /v1/deployments and /chat stop treating the

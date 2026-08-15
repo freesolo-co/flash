@@ -12,7 +12,7 @@ import os
 import threading
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
-from flash.core.spec import JobSpec, persisted_gpu_head
+from flash.core.spec import JobSpec, persisted_gpu_types
 from flash.runner import adapter_prefix, get_status, runs_file_path
 from flash.server.platform import db
 
@@ -711,8 +711,10 @@ def _classify_recoverable_runs(
                 # persisted status without parsing the spec. Terminate by that reconstructed
                 # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
                 with contextlib.suppress(Exception):
-                    gpu_type = persisted_gpu_head(status.spec)
-                    if gpu_type:
+                    # every acceptable class: allocation may have rented a fallback, and naming only
+                    # the head would leave that endpoint running. matching by name, so a class that
+                    # was never rented matches nothing.
+                    for gpu_type in persisted_gpu_types(status.spec):
                         from flash.providers.runpod.serverless import terminate_endpoint
 
                         terminate_endpoint(gpu_type, status.run_id)

@@ -1374,9 +1374,11 @@ A single class is a hard pin: allocation rents that class or nothing. That is th
 controlled experiment, but it also removes failover, so a class that is simply sold out has nowhere
 to go. A list narrows the search the same way while leaving somewhere to walk: allocation considers
 every named class and rents the cheapest fitting one, so a capacity shortage on the first is not a
-dead end. Order records preference, not priority: the classes compete on dollars per optimizer step
-exactly as an unpinned search does, so naming a class does not force allocation to pay more for it.
-A one-element list is exactly a scalar pin.
+dead end. The list is a SET, not a ranking: the classes compete on dollars per optimizer step
+exactly as an unpinned search does, so the class you name first is not the one you necessarily get,
+and naming a class does not force allocation to pay more for it. Order is preserved only so error
+messages and pre-allocation labels have one class to name. A one-element list is exactly a scalar
+pin.
 
 Every named class is validated at parse time, including the ones after the first: a class that
 cannot hold the run, or that the pinned `[gpu] provider` cannot provision, is rejected before submit

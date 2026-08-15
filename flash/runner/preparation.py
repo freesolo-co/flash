@@ -427,14 +427,6 @@ def _preparation_digest(
     ):
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
-    # `gpu.type_fallbacks` is new, so to_internal_dict() now emits it for every spec -- including
-    # the pre-upgrade snapshots that were hashed with no such key. Same reason as the top-level
-    # omissions above, one level down: absent and empty are the same single-class pin, so they must
-    # hash alike, and without this every warm-start or auto-pinned run in flight fails integrity
-    # validation on the first recovery after the upgrade. An ordered pin is non-empty and stays
-    # bound, so tampering with a persisted fallback list is still caught.
-    if not worker_payload.get("gpu", {}).get("type_fallbacks"):
-        worker_payload.get("gpu", {}).pop("type_fallbacks", None)
     # Restore since-removed keys the STORED payload carried, for the same reason as the omissions
     # above: the digest has to reproduce the bytes that were hashed, not today's serialization. A
     # pre-upgrade snapshot hashed `model_policy` in (to_internal_dict was asdict, so it emitted the
@@ -539,11 +531,14 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     # class onto the worker spec. the fallbacks ride with it -- they qualify `type`, so comparing
     # them against a public half whose head has not been rewritten would fail every ordered pin
     # that allocated to anything but its first class.
-    effective_gpu = {
-        **effective["gpu"],
-        "type": public_gpu["type"],
-        "type_fallbacks": public_gpu.get("type_fallbacks", ()),
-    }
+    effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
+    # `to_internal_dict` omits an empty fallback list rather than emitting one, so mirror the key's
+    # PRESENCE as well as its value -- writing an unconditional `()` here would add a key the public
+    # half does not carry and fail every single-class run.
+    if public_gpu.get("type_fallbacks"):
+        effective_gpu["type_fallbacks"] = public_gpu["type_fallbacks"]
+    else:
+        effective_gpu.pop("type_fallbacks", None)
     # _spec_with_gpu writes the SELECTED count onto the worker spec -- the worker sizes its
     # rank count from it and the provider payload rents it -- so comparing it against the
     # authored ceiling would fail every narrowed run here, before any provider is reached.

@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from flash.core.spec import JobSpec, persisted_gpu_head
+from flash.core.spec import JobSpec, persisted_gpu_types
 from flash.providers._lifecycle.deadline import deadline_kwargs
 from flash.providers._lifecycle.poll import _attempt_int
 
@@ -555,8 +555,11 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
         _record_cleanup_remote(run_id, persisted_remote)
     _compare_and_fail_remote(run_id, persisted_remote, detail)
     with contextlib.suppress(Exception):
-        gpu_type = persisted_gpu_head(status.spec)
-        if gpu_type:
+        # every acceptable class, not just the head: allocation may have rented a fallback, and the
+        # endpoint name is reconstructed from the class rather than read back, so naming only the
+        # head leaves a fallback endpoint running. `terminate_endpoint` is best-effort and matches
+        # by name, so a class that was never rented simply matches nothing.
+        for gpu_type in persisted_gpu_types(status.spec):
             from flash.providers.runpod.serverless import terminate_endpoint
 
             terminate_endpoint(gpu_type, run_id)

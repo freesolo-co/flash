@@ -122,8 +122,8 @@ def _validated_gpu_type_fallbacks(value: Any, *, head: str) -> tuple[str, ...]:
     """Canonicalize the alternatives after `gpu.type`, preserving authored order.
 
     Duplicates are dropped rather than rejected: the same class named twice asks for nothing the
-    first entry did not already ask for, and allocation walks a set. Order is the author's stated
-    preference, so the FIRST occurrence is the one kept.
+    first entry did not already ask for, and allocation walks a set. The FIRST occurrence is kept,
+    so the authored order is stable for the callers that need one class to name.
     """
     if value is None:
         return ()
@@ -171,66 +171,17 @@ def _parse_persisted_gpu_types(gpu: dict) -> tuple[str, tuple[str, ...]]:
     )
 
 
-def persisted_gpu_head(spec: dict[str, Any] | None) -> str:
-    """The one GPU class name to use when reading a persisted spec WITHOUT parsing it.
-
-    ``to_dict()`` writes an ordered pin as ``gpu.type = ["A100 PCIe", "A100 SXM"]``, because the
-    public parser owns the head/fallbacks split and rejects ``type_fallbacks`` as unauthorable, so
-    the list spelling is what makes a resubmitted payload round-trip. That leaves the raw persisted
-    record holding a list where a handful of callers need a single class name.
-
-    Those callers exist precisely BECAUSE the spec may be unparseable -- endpoint teardown after
-    ``JobSpec.from_dict`` has already failed, the idle reaper walking every stored run, billing that
-    must stay chargeable on a stale record. They cannot route through the parser by definition, and
-    handing a list to ``canonical_gpu`` raises ``AttributeError: 'list' object has no attribute
-    'strip'``. Every one of those sites swallows exceptions to protect its caller, so the failure is
-    silent: a paid endpoint is simply never torn down.
-
-    Returns the HEAD rather than joining, since these callers name a concrete resource, and a joined
-    label is not one. It is a BEST GUESS, not a derivation: authored order is preference, and
-    ``_cheapest_allocation`` re-ranks the acceptable classes on dollars-per-step, so an ordered pin
-    whose second class is cheaper per step rents that one first and its endpoint carries that name.
-    The head is right whenever the classes rank in authored order (including every scalar pin, where
-    it is exact), and wrong otherwise.
-
-    That is acceptable here only because of what the callers do with it, which splits in two.
-
-    The ones REPORTING a class -- billing, reconcile, the run registry -- must not report a guess
-    when the truth is on hand, so they read ``remote.allocated_gpu`` first and reach this only in
-    the narrow submit-to-handle-persist window before allocation stamps one.
-
-    The ones NAMING AN ENDPOINT -- teardown in ``attach``/``runtime`` -- pass it to
-    ``endpoint_name(canonical_gpu(gpu), _run_suffix(run_id))``, which is a deterministic
-    reconstruction and not a report. They cannot prefer ``allocated_gpu``: teardown runs after the
-    parse already failed. A wrong guess there names an endpoint that does not exist, and each site
-    is already best-effort about a name resolving to nothing, so it deletes nothing. Strictly better
-    than a raw list, which raises before naming anything at all and so deletes nothing in EVERY
-    case, ordered-pin runs included.
-
-    A guess is only acceptable where a wrong name is inert. Where a MISSING name would hide a paid
-    resource -- the idle reaper, which skips endpoints absent from its index -- use
-    ``persisted_gpu_types`` and name them all.
-    """
-    gpu = (spec or {}).get("gpu")
-    raw = gpu.get("type") if isinstance(gpu, dict) else None
-    if isinstance(raw, (list, tuple)):
-        raw = raw[0] if raw else None
-    return raw if isinstance(raw, str) else ""
-
-
 def persisted_gpu_types(spec: dict[str, Any] | None) -> tuple[str, ...]:
-    """EVERY GPU class a persisted spec finds acceptable, in authored order, without parsing it.
+    """Every GPU class a persisted spec finds acceptable, in authored order, without parsing it.
 
-    The set form of ``persisted_gpu_head``, for the caller that must not guess: the idle reaper
-    indexes deterministic endpoint names to decide which endpoints are in ITS scope, and skips any
-    it cannot name. Since allocation may rent any acceptable class, indexing only the head leaves an
-    orphaned fallback endpoint permanently unnameable -- never swept, holding worker quota forever.
-    A guess is fine when a wrong name resolves to nothing; it is not fine when a missing name means
-    a paid resource is invisible.
+    For the callers that CANNOT go through ``JobSpec.from_dict``, because they run when the record
+    may already be unparseable: endpoint teardown after a parse failure, the idle reaper walking
+    every stored run, billing on a stale record. ``to_dict()`` writes an ordered pin as
+    ``gpu.type = ["A100 PCIe", "A100 SXM"]``, and handing that list to ``canonical_gpu`` raises
+    ``AttributeError: 'list' object has no attribute 'strip'``. Those sites suppress exceptions to
+    protect their caller, so the failure is silent and a paid endpoint is never torn down.
 
-    Prefer the head where exactly one name is wanted (teardown names one concrete resource). Prefer
-    this wherever a missed name costs more than an extra one, which is both of the reaper's sets:
-    scope gains reach, and protection correctly shields a fallback the run may actually hold.
+    Total over malformed input: a raise here would reintroduce that silent skip.
     """
     gpu = (spec or {}).get("gpu")
     raw = gpu.get("type") if isinstance(gpu, dict) else None
@@ -239,6 +190,27 @@ def persisted_gpu_types(spec: dict[str, Any] | None) -> tuple[str, ...]:
     elif not isinstance(raw, (list, tuple)):
         return ()
     return tuple(dict.fromkeys(entry for entry in raw if isinstance(entry, str) and entry))
+
+
+def persisted_gpu_head(spec: dict[str, Any] | None) -> str:
+    """The first acceptable class, for a caller that needs exactly one name. "" when there is none.
+
+    A BEST GUESS, not a derivation: authored order is preference, and ``_cheapest_allocation``
+    re-ranks the acceptable classes on dollars-per-step, so an ordered pin whose second class is
+    cheaper per step rents that one instead. Exact for every scalar pin.
+
+    Acceptable only because of what the callers do with it. Those REPORTING a class (billing,
+    reconcile, the run registry) read ``remote.allocated_gpu`` first and reach this only before
+    allocation stamps one. Those NAMING AN ENDPOINT for teardown cannot prefer ``allocated_gpu``,
+    since teardown runs after the parse already failed -- but a wrong guess there names an endpoint
+    that does not exist, which those best-effort sites already tolerate, and is strictly better than
+    a list that raises before naming anything at all.
+
+    Where a MISSING name would hide a paid resource -- the idle reaper, which skips endpoints absent
+    from its index -- use ``persisted_gpu_types`` and name them all.
+    """
+    types = persisted_gpu_types(spec)
+    return types[0] if types else ""
 
 
 def _opt_int(value: Any) -> int | None:
@@ -497,8 +469,8 @@ class TrainSpec:
 @dataclass(frozen=True)
 class GpuSpec:
     # empty selects managed auto-allocation; a set value restricts allocation to `acceptable_types`
-    # (this class plus `type_fallbacks`), preferred in authored order. a lone `type` is therefore a
-    # hard pin to exactly that class, unchanged.
+    # (this class plus `type_fallbacks`), which compete on cost rather than authored order. a lone
+    # `type` is therefore a hard pin to exactly that class, unchanged.
     type: str = ""
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
@@ -533,10 +505,11 @@ class GpuSpec:
 
     @property
     def acceptable_types(self) -> tuple[str, ...]:
-        """Classes allocation may rent, in authored preference order; empty means auto-allocate.
+        """Classes allocation may rent, in authored order; empty means auto-allocate.
 
         The single source of "what did the author pin", so a caller never has to remember to union
-        `type` with `type_fallbacks` and accidentally narrow an ordered list back to its head.
+        `type` with `type_fallbacks` and accidentally narrow the list back to its head. Order does
+        not rank the classes -- they compete on cost -- it only fixes which one gets named first.
         """
         return (self.type, *self.type_fallbacks) if self.type else ()
 
@@ -749,6 +722,12 @@ class JobSpec:
         # without serializing it into an explicit empty preference, which every parser rejects.
         if not data["gpu"].get("providers"):
             data["gpu"].pop("providers", None)
+        # same rule for the fallbacks, and it is also what keeps a pre-upgrade preparation digest
+        # valid: those snapshots were hashed before this key existed, so emitting an empty one for
+        # every single-class pin would fail integrity validation on the first recovery after the
+        # upgrade. an ordered pin is non-empty and stays bound, so tampering is still caught.
+        if not data["gpu"].get("type_fallbacks"):
+            data["gpu"].pop("type_fallbacks", None)
         return data
 
     def to_json(self) -> str:

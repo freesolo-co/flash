@@ -432,9 +432,10 @@ def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, An
 def _authored_gpu_types(raw: Any) -> tuple[str, ...]:
     """Canonicalize `[gpu] type`, which is either one class or an ordered list of acceptable ones.
 
-    A list narrows allocation to those classes in preference order instead of collapsing it to one,
-    so a capacity shortage on the first can fail over to the next rather than re-queueing on a class
-    the provider has already said it cannot serve. A one-element list is exactly a scalar pin.
+    A list narrows allocation to those classes instead of collapsing it to one, so a capacity
+    shortage on any of them can fail over to another rather than re-queueing on a class the provider
+    has already said it cannot serve. The classes compete on cost, so the list is a set and not a
+    ranking; order only fixes which class gets named first. A one-element list is a scalar pin.
     Duplicates are dropped (the second mention asks for nothing new) but an empty list is rejected:
     it reads as a pin while meaning auto-allocation, and silently treating it as auto would hand back
     the cheapest-fit behaviour the author was trying to override.
