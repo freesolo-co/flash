@@ -1150,6 +1150,58 @@ def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
     assert reparsed.gpu.max_wall_seconds == defaults.max_wall_seconds
 
 
+def test_gpu_provider_preferences_validate_dedupe_and_round_trip_in_order() -> None:
+    spec = spec_from_dict(
+        _raw(**{"gpu.providers": [" Vast ", "runpod", "vast", "lambda", "runpod"]}),
+        run_id="gpu-provider-preferences",
+    )
+
+    assert spec.gpu.providers == ("vast", "runpod", "lambda")
+    public = spec.to_dict()
+    assert public["gpu"]["providers"] == ("vast", "runpod", "lambda")
+    assert JobSpec.from_dict(public).gpu.providers == ("vast", "runpod", "lambda")
+    assert JobSpec.from_json(spec.to_json()).gpu.providers == ("vast", "runpod", "lambda")
+
+
+def test_gpu_provider_preferences_reject_invalid_authoring() -> None:
+    with pytest.raises(ValueError, match="must name at least one provider"):
+        GpuSpec(providers=[])
+    with pytest.raises(ConfigError, match="must name at least one provider"):
+        spec_from_dict(_raw(**{"gpu.providers": []}))
+    with pytest.raises(ConfigError, match=r"one of runpod, lambda, vast"):
+        spec_from_dict(_raw(**{"gpu.providers": ["aws"]}))
+    with pytest.raises(ConfigError, match=r"gpu\.provider and gpu\.providers cannot both be set"):
+        spec_from_dict(_raw(**{"gpu.provider": "runpod", "gpu.providers": ["vast"]}))
+
+
+def test_cost_quote_preserves_soft_provider_preference() -> None:
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.spec import runconfig_from_spec
+
+    spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda", "vast"]}))
+    config = runconfig_from_spec(spec)
+
+    assert config.provider == "auto"
+    assert config.providers == ("lambda", "vast")
+    assert estimate_cost(config).provider == "lambda"
+
+
+def test_soft_provider_preference_does_not_reject_an_ineligible_gpu_type_pair() -> None:
+    spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"], "gpu.type": "RTX 4090"}))
+
+    assert spec.gpu.providers == ("lambda",)
+    assert spec.gpu.type == "RTX 4090"
+
+
+def test_persisted_gpu_provider_preferences_reject_invalid_values() -> None:
+    with pytest.raises(ValueError, match="must name at least one provider"):
+        _job_from_dict({"gpu": {"providers": []}})
+    with pytest.raises(ValueError, match=r"one of runpod, lambda, vast"):
+        _job_from_dict({"gpu": {"providers": ["aws"]}})
+    with pytest.raises(ValueError, match=r"gpu\.provider and gpu\.providers cannot both be set"):
+        _job_from_dict({"gpu": {"provider": "runpod", "providers": ["vast"]}})
+
+
 def test_gpu_constraints_reject_unknown_unsupported_or_undersized_values() -> None:
     with pytest.raises(ConfigError, match=r"gpu\.provider"):
         spec_from_dict(_raw(**{"gpu.provider": "aws"}))

@@ -560,12 +560,47 @@ def _quote_gpu_ceiling(
     )
 
 
+def _offline_preferred_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
+    """quote the first structurally usable preference, then cost-rank unnamed fallbacks."""
+    from dataclasses import replace
+
+    from flash.providers import PROVIDER_NAMES
+
+    for provider in config.providers:
+        try:
+            return _offline_gpu_shape(replace(config, provider=provider, providers=()))
+        except ValueError:
+            # a soft preference that cannot carry this shape contributes no candidate. keep walking
+            # instead of turning its authored position into a hard pin.
+            continue
+    unnamed = tuple(name for name in PROVIDER_NAMES if name not in config.providers)
+    fallback_quotes = []
+    for provider in unnamed:
+        try:
+            fallback_quotes.append(
+                _offline_gpu_shape(replace(config, provider=provider, providers=()))
+            )
+        except ValueError:
+            continue
+    if fallback_quotes:
+        return min(
+            fallback_quotes,
+            key=lambda quote: (
+                quote[4] * quote[2] * sharded_step_seconds(config, quote[0], quote[2], quote[3])
+            ),
+        )
+    # preserve the existing unpinned diagnostic when no registered provider has a structural fit.
+    return _offline_gpu_shape(replace(config, providers=()))
+
+
 def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
     """Return an offline structural GPU quote.
 
     Preparation must not consume live-capacity failures before run creation. Rank rentable shapes
     offline, then replace the quote with the selected live candidate before provisioning.
     """
+    if config.providers:
+        return _offline_preferred_gpu_shape(config)
     # Fail closed on a model that cannot be sized at all. Curated entries answer from the catalog
     # with no network call; a PINNED revision still resolves that commit's real geometry, so the
     # revision has to be passed or the check sizes a different set of weights than the worker loads.

@@ -253,6 +253,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         opd_multi_turn=opd_multi_turn,
         opd_max_turns=opd_max_turns,
         provider=g.provider or "auto",
+        providers=g.providers,
         gpu_type=g.type,
         model_revision=spec.model_revision,
         disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
