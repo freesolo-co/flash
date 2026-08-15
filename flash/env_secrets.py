@@ -182,7 +182,12 @@ _UNREADABLE_ARCHIVE = (
 
 
 def _credential_kind(
-    data: bytes, *, deadline: float | None = None, depth: int = 0, truncated: bool = False
+    data: bytes,
+    *,
+    deadline: float | None = None,
+    depth: int = 0,
+    truncated: bool = False,
+    paired: bool = True,
 ) -> str | None:
     """The kind of credential `data` contains under any of its plausible text encodings.
 
@@ -203,7 +208,9 @@ def _credential_kind(
     character keeps its padding byte NUL, so requiring an unbroken NUL run alongside the candidate
     costs nothing on genuine UTF-16/32 and leaves machine code with nothing long enough to match.
     """
-    if kind := _decoded_kind(data, deadline=deadline, depth=depth, truncated=truncated):
+    if kind := _decoded_kind(
+        data, deadline=deadline, depth=depth, truncated=truncated, paired=paired
+    ):
         return kind
     if b"\x00" not in data:
         return None
@@ -217,16 +224,23 @@ def _credential_kind(
                 # boundary had its first fragment treated as a complete value while later fragments
                 # began mid-stream and could not be expanded from either side. Measured: the same
                 # base64 gzip refused as narrow text returned clean in UTF-16LE.
-                if kind := _decoded_kind(run, deadline=deadline, depth=depth, truncated=truncated):
+                if kind := _decoded_kind(
+                    run, deadline=deadline, depth=depth, truncated=truncated, paired=paired
+                ):
                     return kind
     return None
 
 
 def _decoded_kind(
-    data: bytes, *, deadline: float | None = None, depth: int = 0, truncated: bool = False
+    data: bytes,
+    *,
+    deadline: float | None = None,
+    depth: int = 0,
+    truncated: bool = False,
+    paired: bool = True,
 ) -> str | None:
     """The kind of credential in `data` literally, or inside a base64 run within it."""
-    if kind := _match(data) or _match_base64(
+    if kind := _match(data, paired=paired) or _match_base64(
         data, _decoded_container(deadline, depth), truncated=truncated
     ):
         return kind
@@ -239,7 +253,7 @@ def _decoded_kind(
     # Only tried when the literal pass found nothing, and `_rejoined` returns the input unchanged
     # when no seam is present, so the ordinary file pays two cheap searches and no rematch.
     joined = _rejoined(data)
-    return _match(joined) if joined != data else None
+    return _match(joined, paired=paired) if joined != data else None
 
 
 def _decoded_container(deadline: float | None, depth: int) -> _Inspector | None:
@@ -421,8 +435,12 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         if bool(upcoming) and _unfinished_private_key_armor(window):
             raise _Unscannable("contains a private key armor header too long to read past")
         try:
+            # The two-marker detectors are left out here and run below instead, over state
+            # carried between windows. Inside `_match` they build a fresh record splitter per
+            # window, which knows neither the depth nor the quote phase the previous window ended
+            # on -- right for a whole file, wrong for one window of one.
             if kind := _credential_kind(
-                window, deadline=deadline, depth=depth, truncated=bool(upcoming)
+                window, deadline=deadline, depth=depth, truncated=bool(upcoming), paired=False
             ):
                 return kind
         except _RunTooLongToExpand:
@@ -432,7 +450,11 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         # scan re-imposed a window between the halves at the chunk boundary. Remembering which
         # halves have gone past keeps memory bounded whatever the distance -- which is unbounded,
         # since JWK members and PuTTY sections may sit behind any amount of intervening data.
-        if kind := _paired_markers_kind(window, seen):
+        # The overlap is declared so the splitter can rewind to where the next window starts:
+        # those bytes are tokenized twice and must be counted once.
+        if kind := _paired_markers_kind(
+            window, seen, overlap=_SCAN_OVERLAP_BYTES if upcoming else 0
+        ):
             return kind
         carry = window[-_SCAN_OVERLAP_BYTES:]
         chunk = upcoming

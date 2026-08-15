@@ -6945,6 +6945,58 @@ def test_a_jwk_pairs_across_any_distance_inside_one_object(tmp_path):
         assert credential_in_file(published) == "a private key", name
 
 
+def test_record_boundaries_survive_a_value_split_by_a_read_boundary(tmp_path):
+    """Rows must not merge because a quoted value straddles the chunk the scan reads in.
+
+    The record splitter carries its state between windows, and only the depth crossed. A string
+    spanning the cut left the next window resuming half a string out: it read that value's CLOSING
+    quote as an opening one, mispaired every quote after it, and matched `"}\\n{"` as a single
+    string token -- so the brace between two JSONL rows vanished and they merged into one record.
+    A public JWK in one row then paired with an ordinary high-entropy `d` in the other as a private
+    key that neither row held, on a file that scanned clean in a single buffer.
+
+    Swept over where the padding row ENDS rather than tested at one offset: what matters is which
+    byte of the value the cut lands on, and the desync only reaches the rows behind it when the
+    quote that closes the padding sits past that point. Escaped padding is swept too, in whole
+    pairs -- a value truncated mid-pair ends on a lone backslash that escapes its own closing
+    quote, and the string is then genuinely unterminated in any buffering, so refusing it would be
+    correct JSON reading rather than the defect under test.
+    """
+    from flash.env_secrets import _SCAN_CHUNK_BYTES, _SCAN_OVERLAP_BYTES, credential_in_file
+
+    public = b'{"kty":"EC","crv":"P-256","x":"%s","y":"%s"}' % (
+        _FAKE_KEY_BODY.encode(),
+        _FAKE_KEY_BODY.encode(),
+    )
+    # an ordinary high-entropy value under a private member name, in a row of its own: a build id
+    # scores exactly as random as a key body, so only the record boundary separates them
+    unrelated = b'{"note":"nightly","d":"%s"}' % _FAKE_KEY_BODY.encode()
+    opener = b'{"pad":"'
+    fillers = (b"A", b'\\"', b"\\\\")
+    offsets = (-600, -8, 0, 8, 600, 900, 1200)
+    for filler in fillers:
+        for offset in offsets:
+            width = _SCAN_CHUNK_BYTES - _SCAN_OVERLAP_BYTES + offset - len(opener)
+            value = (filler * width)[: width // len(filler) * len(filler)]
+            published = tmp_path / "shard.jsonl"
+            published.write_bytes(opener + value + b'"}\n' + public + b"\n" + unrelated + b"\n")
+            assert credential_in_file(published) is None, (filler, offset)
+
+    # the same two markers inside ONE row is a real key and must still refuse, at every offset
+    for filler in fillers:
+        for offset in offsets:
+            width = _SCAN_CHUNK_BYTES - _SCAN_OVERLAP_BYTES + offset - len(opener)
+            value = (filler * width)[: width // len(filler) * len(filler)]
+            together = tmp_path / "key.jsonl"
+            together.write_bytes(
+                opener
+                + value
+                + b'"}\n'
+                + b'{"kty":"EC","crv":"P-256","d":"%s"}\n' % _FAKE_KEY_BODY.encode()
+            )
+            assert credential_in_file(together) == "a private key", (filler, offset)
+
+
 def test_a_netrc_entry_spanning_lines_is_still_one_record(tmp_path):
     """A `.netrc` writes one entry over several lines, and both halves are in it.
 

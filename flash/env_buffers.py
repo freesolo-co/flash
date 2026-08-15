@@ -67,7 +67,7 @@ def _paired_state() -> tuple[_RecordSplitter, tuple[_RecordHalves, ...]]:
 
 
 def _paired_markers_kind(
-    window: bytes, seen: tuple[_RecordSplitter, tuple[_RecordHalves, ...]]
+    window: bytes, seen: tuple[_RecordSplitter, tuple[_RecordHalves, ...]], *, overlap: int = 0
 ) -> str | None:
     """The kind of two-marker credential whose halves share a RECORD, by the end of `window`.
 
@@ -83,9 +83,12 @@ def _paired_markers_kind(
 
     One state per detector, positionally, so two detectors sharing a pattern cannot be confused
     for each other.
+
+    `overlap` is how much of the NEXT window this one shares with it, so the splitter can rewind
+    to that point instead of counting the shared bytes a second time.
     """
     splitter, states = seen
-    ends = splitter.ends(window)
+    ends = splitter.ends(window, overlap=overlap)
     for (kind, _), halves in zip(_PAIRED_PATTERNS, states, strict=True):
         # `_RecordHalves` applies `payload_match`, so the captured body goes through the same
         # entropy test the single-buffer path applies. Calling `detector.payload` directly here
