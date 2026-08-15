@@ -22,6 +22,7 @@ _SECRET_RE = re.compile(
 # component lines are registered as needles too; the floor keeps a common fragment such as ``}``
 # from erasing innocent output. Mirrors flash._internal.diagnostics.
 _MIN_SECRET_COMPONENT = 8
+_CONSOLE_PROGRESS_SCAN_BYTES = 1_048_576
 
 
 def _bounded_pattern(needle: str) -> str:
@@ -179,45 +180,33 @@ def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> st
 
 
 def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
-    """``(size, progress heartbeats, any heartbeats)`` after ``offset``; size -1 if unreadable.
+    """Return ``(cursor, committed, any)`` for complete heartbeat lines after ``offset``.
 
-    The two counts answer different questions and must not be collapsed. The first is the COMMITTED
-    count: a heartbeat that reached HF, the only thing the provider's stall clock advances on. The
-    second additionally counts ``pending`` ones -- produced, but whose upload failed. Which one the
-    uploader's wedge timer keys on switches at the first COMMITTED heartbeat. After one, only
-    committed ones may count: the stall clock is anchored to it and already counting down to a
-    teardown, so treating a later ``pending`` line as progress would push the wedge snapshot past
-    the box's own death. Before one there is no such clock to contradict -- teardown is the fixed
-    setup grace -- and a run whose heartbeat uploads ALL fail emits nothing but ``pending`` lines,
-    indistinguishable on the committed count from a worker that never reached the training loop. It
-    would never arm, buy no wedge snapshot, and reach only the hourly cadence at 4200s: past the
-    3000s grace, with the console covering the hang lost entirely. Bytes cannot tell a
-    wedge from a noisy one: a stuck worker keeps printing Ray warnings, so the size grows every poll
-    and a size-only rule never fires. The stall classifier advances only on a progress heartbeat,
-    echoed here as ``HEARTBEAT {...}``, so counting those tracks the signal that decides teardown.
-    Only a line that IS one counts, hence the ``HEARTBEAT `` anchor rather than a bare ``"stage":``
-    scan: any third-party line carrying that key -- structured json from ray, verl or a library --
-    would otherwise read as progress, and a wedged worker keeps printing those, so the wedge would
-    never be detected at all. Liveness pings are excluded: EVERY payload carries ``"stage"`` and
-    those print every 30s from a daemon, so counting them reads a worker wedged inside a liveness
-    block as busy forever -- ``poll`` refuses to advance on them for the same reason, and this must
-    agree or the run dies with no console. ``"pending"`` heartbeats are excluded too: their upload
-    did not land, so the provider's stall clock is still anchored to the older committed one, and
-    counting them would reset this timer against a teardown already counting down. A match spans
-    a WHOLE line and the offset stops at the last newline, not at EOF, so a line split across two
-    polls is judged exactly once, on the poll completing it. Both halves must be inert alone or the
-    split decides the run: the head carries the prefix but not yet the ``"liveness"`` disqualifying
-    it, so counting it there reads a wedge as progress -- the exact bug, arriving through the fix --
-    while a tail measured from EOF would have lost its prefix and dropped a real heartbeat, faking a
-    wedge the other way. Stopping at the newline also keeps ``offset`` on a line start, which is
-    what lets ``^`` mean what it says; re-reading one partial line is the whole cost. Only bytes
-    past ``offset`` are read, so a scan costs one poll's output."""
+    Reads are capped per poll. A line larger than the cap is skipped in bounded chunks; checking the
+    preceding byte keeps a cursor inside that line from treating its tail as a new record. Ordinary
+    partial lines remain behind the cursor until their newline arrives, so they are judged once.
+    """
     try:
         with open(console, "rb") as f:
+            line_start = True
+            if offset:
+                f.seek(offset - 1)
+                line_start = f.read(1) == b"\n"
             f.seek(offset)
-            buf = f.read()
+            buf = f.read(_CONSOLE_PROGRESS_SCAN_BYTES)
     except OSError:
         return -1, 0, 0
+
+    cursor = offset
+    if not line_start:
+        first_newline = buf.find(b"\n")
+        if first_newline < 0:
+            return cursor + len(buf), 0, 0
+        cursor += first_newline + 1
+        buf = buf[first_newline + 1 :]
+
     cut = buf.rfind(b"\n") + 1
+    if not cut and len(buf) == _CONSOLE_PROGRESS_SCAN_BYTES:
+        return cursor + len(buf), 0, 0
     hb = re.findall(rb'(?m)^HEARTBEAT (?!.*"liveness":).*$', buf[:cut])
-    return offset + cut, sum(b'"pending":' not in b for b in hb), len(hb)
+    return cursor + cut, sum(b'"pending":' not in b for b in hb), len(hb)

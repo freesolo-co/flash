@@ -19,10 +19,10 @@ def _run_console_upload_loop(
 ) -> None:
     """Poll ``console`` and upload on schedule or after sustained loss of progress.
 
-    Polling is free; committing is not. Heartbeats already spend 4 of the shared repo's 5
-    commits/hour, while the stall classifier kills a wedged run at 1200s/3000s, before an hourly
-    snapshot. An upload therefore requires unseen bytes and either a due schedule or a bounded
-    wedge credit.
+    Polling is free; committing is not. Heartbeats spend 4/hour and the steady console cadence uses
+    the remaining 1/hour in this run's allocation. Repository-wide admission is outside this worker;
+    this loop only bounds its own steady rate and two fixed emergency credits. The stall classifier
+    kills a wedged run at 1200s/3000s, before an hourly snapshot can preserve its diagnostics.
 
     ``armed`` means real progress was observed and then stopped. Before the first committed
     heartbeat, a pending heartbeat may arm the loop because it is the only proof setup reached the
@@ -30,9 +30,9 @@ def _run_console_upload_loop(
     anchored to what reached the artifact repo. Progress re-arms the latch; the per-run credit cap
     prevents a flapping run from turning the poll cadence into the commit cadence.
 
-    A setup that never reaches a heartbeat stays uncovered deliberately: holding the first-snapshot
-    cadence until progress starts costs 5.25 commits/hour against a hard 5.0. Failed uploads advance
-    neither the size marker nor the deadline, so the next poll retries before teardown.
+    Before any heartbeat commits, one additional setup snapshot lands before the fixed 3000-second
+    teardown. It does not enter the steady rate: the first committed heartbeat moves the deadline to
+    the normal interval. Failed uploads advance neither marker nor deadline, so the next poll retries.
     """
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
@@ -40,7 +40,10 @@ def _run_console_upload_loop(
     while not stop_upload.wait(poll_s):
         since += poll_s
         size, staged, beats = progress(console, max(size, 0))
+        had_committed = ever
         ever = ever or bool(staged)
+        if ever and not had_committed and sent >= 0:
+            due_s = interval_s
         made_progress = staged if ever else beats
         armed = armed or bool(made_progress)
         quiet = 0.0 if made_progress else quiet + 1
@@ -53,4 +56,5 @@ def _run_console_upload_loop(
         spent += 1 if wedged and uploaded else 0
         armed = armed and not (wedged and uploaded)
         if uploaded:
-            sent, since, due_s = size, 0.0, interval_s
+            next_due = interval_s if ever else min(1800.0, interval_s)
+            sent, since, due_s = size, 0.0, next_due

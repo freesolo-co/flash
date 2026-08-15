@@ -364,6 +364,42 @@ def test_heartbeat_console_marks_only_an_attempted_upload_that_failed(monkeypatc
     assert throttled["step"] == 3, "the throttled heartbeat still reaches the console"
 
 
+def test_heartbeat_suppressed_behind_a_failed_upload_is_pending(monkeypatch):
+    """A provisional throttle claim must not make a concurrent heartbeat look committed."""
+    import json
+    import threading
+
+    import flash.engine.worker as worker
+
+    hbmod = sys.modules[worker.heartbeat.__module__]
+    lines: list[str] = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def _upload(*_args, **_kwargs):
+        started.set()
+        assert release.wait(5.0)
+        return False
+
+    monkeypatch.setattr("builtins.print", lambda *a, **_k: lines.append(" ".join(map(str, a))))
+    monkeypatch.setattr(worker, "hf_upload_file", _upload)
+    monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(hbmod, "_HB_CLAIM_SEQ", 0)
+    monkeypatch.setattr(hbmod, "_HB_COMMITTED_CLAIM_SEQ", 0)
+    monkeypatch.setattr(hbmod, "_HB_THROTTLE_CLAIM", 0)
+
+    first = threading.Thread(target=worker.heartbeat, args=("rl_step",), kwargs={"step": 1})
+    first.start()
+    assert started.wait(5.0)
+    worker.heartbeat("rl_step", step=2)
+    second = json.loads(next(line[10:] for line in lines if '"step": 2' in line))
+    assert second["pending"] is True
+    release.set()
+    first.join(timeout=5.0)
+    assert not first.is_alive()
+
+
 def test_heartbeat_console_summarizes_metric_backlog():
     import json
 
@@ -375,12 +411,15 @@ def test_heartbeat_console_summarizes_metric_backlog():
                 "stage": "rl_step",
                 "step": 1024,
                 "metrics_last": [{"step": step} for step in range(1024)],
+                "sampled_completions": ["large completion"] * 128,
             }
         )
     )
 
     assert "metrics_last" not in console
+    assert "sampled_completions" not in console
     assert console["metrics_last_count"] == 1024
+    assert console["sampled_completions_count"] == 128
     assert console["step"] == 1024
 
 

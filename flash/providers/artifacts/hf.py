@@ -342,6 +342,12 @@ def make_hf_failure_detail_reader(
         min_interval_s,
         **deadline_kwargs(make_hf_text_reader, deadline_at),
     )
+    live_console_reader = make_hf_text_reader(
+        hf_repo,
+        f"{prefix}/console_{phase}_live.txt",
+        min_interval_s,
+        **deadline_kwargs(make_hf_text_reader, deadline_at),
+    )
 
     def read(force: bool = False) -> str | None:
         parts: list[str] = []
@@ -351,6 +357,9 @@ def make_hf_failure_detail_reader(
         console_text = console_reader(force=force)
         if console_text:
             parts.append(f"--- console_{phase}.txt ---\n{console_text}")
+        live_console_text = live_console_reader(force=force)
+        if live_console_text:
+            parts.append(f"--- console_{phase}_live.txt ---\n{live_console_text}")
         return "\n".join(parts) if parts else None
 
     return read

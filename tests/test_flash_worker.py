@@ -1146,7 +1146,7 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     assert "quiet_spent += 1 if wedged and ok else 0" in body
     # the deadline advances only on a LANDED upload: resetting on a swallowed failure books a
     # snapshot that reached no repo and puts the retry an interval out, past the stall teardown.
-    assert f"since, due_s = 0.0, {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
+    assert "since, due_s = 0.0, 3600.0 if committed else 1800.0" in body
     assert "if ok:" in body
     # the latch is spent only on silence that bought an upload, not on an already-due snapshot.
     assert "and not due" in body
@@ -1182,6 +1182,8 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # read as progress), and a tail measured from EOF would have lost its prefix and dropped a real
     # heartbeat (a wedge faked the other way). It is also what lets `^` mean what it says.
     assert 'cut = buf.rfind(b"\\n") + 1' in body
+    assert "buf = hf.read(1_048_576)" in body
+    assert 'line_start = hf.read(1) == b"\\n"' in body
     # ONE scan yields both counts: the committed one drops "pending" lines (an uploaded heartbeat
     # that never reached HF), the arming one keeps them. Which drives the timer switches at the
     # first COMMITTED heartbeat. A run whose uploads all fail emits nothing but pending lines: on
@@ -1251,7 +1253,7 @@ def _drive_instance_upload_loop(
 def test_instance_console_upload_loop_polls_faster_than_it_commits(monkeypatch):
     """A healthy, growing run polls often but still commits only on the hourly boundary.
 
-    The poll cadence must not become the COMMIT cadence: the shared artifact repo budgets 5
+    The poll cadence must not become the COMMIT cadence: this run's artifact cadence budgets 5
     commits/hour and the heartbeat already spends 4 (see
     test_live_console_uploads_are_throttled_for_shared_artifact_repos).
     """
@@ -1310,7 +1312,7 @@ def test_instance_console_upload_loop_keeps_a_sparsely_logging_run_in_budget(mon
 
     Momentary quiet is normal: a worker in a teacher call or a compile emits nothing for minutes at
     a time. Treating ONE unchanged sample as the wedge signature commits on nearly every poll, so
-    the loop that exists to respect the shared repo's 5 commits/hour spends 10 by itself. Silence
+    the loop that exists to respect this run's 5 commits/hour spends 10 by itself. Silence
     has to be sustained, and the resulting snapshot spent once, or the rate is unbounded.
 
     The budget governs the SUSTAINED rate, so that is what is asserted here: the scheduled cadence
@@ -1417,7 +1419,7 @@ def test_instance_console_upload_loop_bounds_its_wedge_credits_over_a_flapping_r
 
     The latch re-arms on progress, so a run that alternates a heartbeat with sustained silence
     re-arms on every cycle. Without a cap that shape buys a wedge snapshot each time -- 6/hr
-    console plus the heartbeat's 4/hr, double the shared repo's hard 5.0 ceiling -- and the loop
+    console plus the heartbeat's 4/hr, double this run's hard 5.0/hour allocation -- and the loop
     written to respect the budget becomes the thing that blows it. The credits are what bound it,
     and they are per RUN, so they never enter the sustained rate.
     """
@@ -1855,6 +1857,25 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     part.write_bytes(whole + _hb(step=4)[:20])
     assert _instance_bootstrap._console_progress(str(part), 0) == (len(whole), 1, 1)
 
+    # one hostile line must not allocate or rescan its entire size on every poll. the cursor advances
+    # through capped chunks, recognizes that it is mid-line, then resumes at the next complete record.
+    from flash.providers._lifecycle import bootstrap_secrets
+
+    cap = bootstrap_secrets._CONSOLE_PROGRESS_SCAN_BYTES
+    huge = tmp_path / "console_huge_line.txt"
+    huge.write_bytes(b"x" * (2 * cap + 17) + b"\n" + _hb(step=99))
+    cursor = 0
+    observed = 0
+    for _ in range(4):
+        if cursor == huge.stat().st_size:
+            break
+        next_cursor, count, _ = _instance_bootstrap._console_progress(str(huge), cursor)
+        assert next_cursor > cursor
+        assert next_cursor - cursor <= cap
+        cursor, observed = next_cursor, observed + count
+    assert cursor == huge.stat().st_size
+    assert observed == 1
+
     assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (-1, 0, 0)
 
 
@@ -1906,7 +1927,7 @@ def test_instance_console_upload_loop_arms_on_a_heartbeat_whose_upload_failed(mo
     _w2, uploads2 = _drive_instance_upload_loop(
         monkeypatch, sizes, cycles=cycles, staged=[0] * cycles, beats=[0] * cycles
     )
-    assert {n * poll_s for n in uploads2} <= scheduled_at, "unarmed run bought a wedge snapshot"
+    assert {n * poll_s for n in uploads2} == {first_s, 2400.0}
 
     # once a heartbeat has COMMITTED, pending ones must stop counting as progress: the provider's
     # stall clock is anchored to that commit and is already counting down to a teardown, so a
@@ -1982,419 +2003,35 @@ def test_instance_console_upload_loop_retries_a_failed_snapshot_before_any_progr
     assert (uploads[1] - uploads[0]) * poll_s <= poll_s
 
 
-def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots():
-    """The final snapshot must be the last writer, even if a periodic one is still uploading.
+def test_instance_console_upload_takes_a_second_setup_snapshot_before_teardown(monkeypatch):
+    """Pending heartbeats cannot postpone the last setup diagnostic past the 3000s teardown."""
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
 
-    The periodic uploader is a daemon thread joined with a 10s timeout, so a slow snapshot outlives
-    the join and races the final upload. Both write the same ``.tail`` file and commit to the same
-    repo path; if the older call landed last it would REPLACE the terminal console with bytes
-    captured before the failure -- destroying the evidence. Moving the first snapshot to 600s made
-    this reachable for an ordinary run, where the hourly-only cadence had made it rare.
-
-    Both callers pass the SAME ``mode``, as the loop and the terminal call sites do. Driving them
-    with different modes would be the easy mistake: ``console_{mode}.txt`` already differs, so the
-    scratch paths could never collide and the test would pass however the file is named.
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
-    )
-    order: list[str] = []
-    tails: list[str] = []
-    started = threading.Event()
-
-    def _upload_console_locked(_mode: str, _console: str, tail_path: str, _final: bool) -> bool:
-        started.set()
-        order.append(f"begin:{tail_path}")
-        tails.append(tail_path)
-        time.sleep(0.3)
-        order.append(f"end:{tail_path}")
-        return True
-
-    namespace: dict = {
-        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-        "console_upload_lock": threading.Lock(),
-        "console_teardown": threading.Event(),  # not set: teardown has not begun
-        # far from the wall deadline, so the lock wait clamp is not what this test exercises.
-        "_require_deadline_allowance": lambda: 86_400.0,
-        "_upload_console_locked": _upload_console_locked,
-    }
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-    upload_console = namespace["_upload_console"]
-
-    periodic = threading.Thread(target=upload_console, args=("train",), daemon=True)
-    periodic.start()
-    started.wait(5.0)
-    upload_console("train", final=True)  # the terminal snapshot, racing the one in flight
-    periodic.join(timeout=5.0)
-
-    # never interleaved: each upload completes before the next begins, so the last call wins.
-    assert [entry.split(":")[0] for entry in order] == ["begin", "end", "begin", "end"]
-    # and each caller staged its own bytes: one shared .tail would let the periodic snapshot
-    # overwrite the file the final upload is reading, splicing pre-failure bytes into it.
-    assert len(set(tails)) == 2, f"both callers staged the same scratch file: {tails}"
-
-
-def test_serverless_terminal_console_upload_recommits_after_a_slow_holder_finishes():
-    """A periodic upload that outlives the acquire timeout must not be the last writer.
-
-    ``console_teardown`` is checked before the HF call, so it stops a periodic snapshot that has not
-    started -- but a request already inside ``upload_file`` cannot be recalled. If it held the lock
-    past 120s and completed afterwards, the terminal upload (which proceeds unsynchronized rather
-    than skip) commits FIRST and the older, pre-failure snapshot lands on top of it. That is the
-    exact evidence-destroying overwrite the serialization is for, arriving through the timeout.
-
-    So a terminal upload that ran without the lock re-acquires afterwards: getting it is proof the
-    slow request finished, and ``console_teardown`` blocks any later one, so one more commit ends
-    the sequence. The lock double here comes free on the second attempt, modelling a holder that
-    was slow rather than wedged (``..._never_yields_to_a_wedged_snapshot`` pins the wedged case,
-    where the re-commit must NOT fire).
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
-    )
-    order: list[str] = []
-
-    class _SlowHolder:
-        """Times out once (the holder is mid-``upload_file``), then frees."""
-
-        def __init__(self) -> None:
-            self.attempts = 0
-
-        def acquire(self, timeout: float) -> bool:
-            self.attempts += 1
-            if self.attempts == 1:
-                return False
-            order.append("holder finished")
-            return True
-
-        def release(self) -> None:
-            order.append("released")
-
-    def _locked(mode: str, _console: str, tail_path: str, final: bool) -> bool:
-        order.append(f"commit:{'final' if final else 'periodic'}:{tail_path}")
-        return True
-
-    lock = _SlowHolder()
-    namespace: dict = {
-        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-        "console_upload_lock": lock,
-        "console_teardown": threading.Event(),
-        # far from the wall deadline, so the lock wait clamp is not what this test exercises.
-        "_require_deadline_allowance": lambda: 86_400.0,
-        "_upload_console_locked": _locked,
-        "print": lambda *_a, **_k: None,
-    }
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-
-    assert namespace["_upload_console"]("train", final=True) is True
-    commits = [n for n, entry in enumerate(order) if entry.startswith("commit:")]
-    assert len(commits) == 2, f"the terminal upload must re-commit once the holder frees: {order}"
-    # positions, not values: both commits render identically, so comparing the strings would find
-    # the FIRST one and the assertion would hold however the calls were ordered. The re-commit must
-    # follow the holder freeing, or it is no better ordered than the first and the stale snapshot
-    # can still land last.
-    assert commits[1] > order.index("holder finished")
-
-
-def test_serverless_terminal_console_upload_never_yields_to_a_wedged_snapshot():
-    """``final=True`` must upload even when the lock never comes free.
-
-    ``upload_file`` takes no timeout, so a periodic snapshot wedged on a hung HF request holds the
-    lock past the acquire timeout and forever after. Skipping the terminal upload there is the worst
-    case, not a safe one: the run is failing, and the bytes explaining WHY are exactly the ones that
-    never reach the repo, leaving the pre-failure console as the only record. A periodic snapshot
-    still yields -- another is in flight and it has nothing new to say.
-
-    The wait is bounded, not skipped: a HEALTHY in-flight snapshot finishes inside the timeout and
-    the terminal one commits after it, which is what
-    ``test_serverless_console_upload_serializes_the_periodic_and_final_snapshots`` pins. So the lock
-    here is a double that reports the timeout expiring, rather than a real one held for 120s.
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
-    )
-    uploaded: list[str] = []
-    timeouts: list[float] = []
-
-    class _NeverFree:
-        """Acquire always times out; releasing a lock we never took would raise."""
-
-        def acquire(self, timeout: float) -> bool:
-            timeouts.append(timeout)
-            return False
-
-        def release(self) -> None:
-            raise AssertionError("released a lock that was never acquired")
-
-    namespace: dict = {
-        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-        "console_upload_lock": _NeverFree(),
-        "console_teardown": threading.Event(),
-        # far from the wall deadline, so the per-try 120s bound is what this test measures.
-        "_require_deadline_allowance": lambda: 86_400.0,
-        "_upload_console_locked": lambda mode, _c, _t, _f: uploaded.append(mode) or True,
-        "print": lambda *_a, **_k: None,
-    }
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-    upload_console = namespace["_upload_console"]
-
-    assert upload_console("periodic") is False, "a periodic snapshot must yield to the holder"
-    assert upload_console("final", final=True) is True
-    # exactly one commit: the re-commit that makes an unsynchronized terminal upload last-writer
-    # is conditional on the lock coming free, and here it never does. a second commit would mean
-    # the re-commit fires blind, doubling every terminal upload on a genuinely wedged holder.
-    assert uploaded == ["final"], "the terminal snapshot must not be skipped for a held lock"
-    # bounded wait, so a wedged holder delays the terminal upload rather than suppressing it. the
-    # TOTAL is what bounds it: the compensating acquire retries, so per-try alone would pass with
-    # an unbounded loop that never returns against a holder that never frees.
-    assert timeouts
-    assert all(0 < t <= 120.0 for t in timeouts)
-    assert sum(timeouts) <= 600.0, f"the terminal path can wait at most 600s in total: {timeouts}"
-
-
-def test_serverless_terminal_console_upload_never_waits_past_the_run_wall_deadline():
-    """The lock wait must be clamped to the time left before the watchdog hard-exits.
-
-    ``_train_body`` arms ``threading.Timer(remaining, _deadline_exit)``, and ``_deadline_exit``
-    calls ``os._exit(124)``. A fixed 120s acquire therefore does not merely wait too long: a worker
-    with less than that left is KILLED mid-acquire, so the unsynchronized commit that could have
-    finished inside the window that remained never runs at all, and the terminal snapshot -- the
-    only record of why the run failed -- is lost. That is the same loss the whole terminal path
-    exists to prevent, arriving through the fix for it.
-
-    The clock advances by each wait, exactly as a real blocking acquire consumes wall time, so this
-    also pins the TOTAL: every retry re-reads the deadline, so the tries shrink to zero instead of
-    each being individually clamped and still summing past it.
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    setup_grace_s = 3000.0
+    cycles = int(setup_grace_s / poll_s) + 1
+    sizes = [1000 * (index + 1) for index in range(cycles + 2)]
+    # heartbeat production continues, but no heartbeat upload ever commits. the provider therefore
+    # remains on its fixed setup grace even though the console uploader can still reach hf.
+    _waits, uploads = _drive_instance_upload_loop(
+        monkeypatch,
+        sizes,
+        cycles=cycles,
+        staged=[0] * cycles,
+        beats=[1] * cycles,
     )
 
-    class _NeverFree:
-        """A wedged holder; every acquire burns its full timeout, as a real one would."""
-
-        def __init__(self, clock: dict, asked: list[float]) -> None:
-            self.clock = clock
-            self.asked = asked
-
-        def acquire(self, timeout: float) -> bool:
-            self.asked.append(timeout)
-            self.clock["t"] += timeout
-            return False
-
-        def release(self) -> None:
-            raise AssertionError("released a lock that was never acquired")
-
-    def _run(allowance, clock: dict, asked: list[float]) -> tuple[bool, list[str]]:
-        """Exec the shipped closure against one deadline model. Args are passed, not closed
-        over, so each case binds its OWN state rather than the last loop iteration's."""
-        uploaded: list[str] = []
-        namespace: dict = {
-            "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-            "console_upload_lock": _NeverFree(clock, asked),
-            "console_teardown": threading.Event(),
-            "_upload_console_locked": lambda m, _c, _t, _f, _u=uploaded: _u.append(m) or True,
-            "print": lambda *_a, **_k: None,
-            "_require_deadline_allowance": allowance,
-        }
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-        return namespace["_upload_console"]("train", final=True), uploaded
-
-    for remaining in (5.0, 45.0, 200.0, 600.0):
-        clock: dict = {"t": 0.0}
-        asked: list[float] = []
-        # re-read per call, like the real one: it closes over time.time(). bound as defaults so
-        # this case's own clock is captured.
-        ok, uploaded = _run(lambda _r=remaining, _c=clock: _r - _c["t"], clock, asked)
-
-        assert ok is True
-        # the commit still happens -- clamping must not turn into skipping.
-        assert uploaded == ["train"], f"terminal snapshot lost with {remaining}s left: {uploaded}"
-        # nothing waited past the deadline, so the watchdog never fires mid-acquire.
-        assert clock["t"] < remaining, (
-            f"waited {clock['t']}s of {remaining}s remaining; the watchdog would have killed the "
-            f"worker mid-acquire: {asked}"
-        )
-        # acquire() rejects a negative timeout, so the clamp must floor at zero rather than pass
-        # the negative straight through and raise out of the terminal path.
-        assert all(t >= 0 for t in asked), asked
-
-    # a deadline already blown must still poll and commit, not raise out of the terminal path.
-    def _blown() -> float:
-        raise TimeoutError("run wall deadline exceeded")
-
-    asked_blown: list[float] = []
-    ok, committed = _run(_blown, {"t": 0.0}, asked_blown)
-
-    assert ok is True
-    assert committed == ["train"], "a run past its deadline must still attempt the last snapshot"
-    assert asked_blown
-    assert all(t == 0 for t in asked_blown), asked_blown
+    at_s = [attempt * poll_s for attempt in uploads]
+    assert at_s[0] == first_s
+    assert len(at_s) >= 2
+    assert at_s[1] < setup_grace_s
 
 
-def test_serverless_terminal_console_upload_recommits_after_two_timeouts(monkeypatch):
-    """A holder slower than a SINGLE compensating wait must still not be the last writer.
-
-    The re-commit exists because a terminal upload forced through without the lock can be overtaken
-    by a periodic request already inside ``upload_file``. One compensating acquire only covers a
-    holder that frees within its timeout: an HF upload recovering after roughly 240s outlives both
-    the original acquire and that one retry, so the terminal path gave up, and the older pre-failure
-    snapshot then landed last -- restoring exactly the console the failure needed to replace.
-
-    So the compensating wait is split into several bounded tries. It must still TERMINATE against a
-    holder that never frees (``..._never_yields_to_a_wedged_snapshot`` pins that, and the total-wait
-    assertion there is what stops this becoming an unbounded loop).
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
-    )
-
-    class _VerySlowHolder:
-        """Times out until ``free_at``, modelling an upload_file that recovers late."""
-
-        def __init__(self, free_at: int, log: list[str]) -> None:
-            self.attempts = 0
-            self.free_at = free_at
-            self.log = log
-
-        def acquire(self, timeout: float) -> bool:
-            self.attempts += 1
-            if self.attempts < self.free_at:
-                return False
-            self.log.append("holder finished")
-            return True
-
-        def release(self) -> None:
-            self.log.append("released")
-
-    def _commit(log: list[str]):
-        # bound as a default so the closure captures THIS iteration's log, not the loop variable.
-        return lambda _m, _c, _t, final, _log=log: (
-            _log.append(f"commit:{'final' if final else 'periodic'}") or True
-        )
-
-    for frees_on in (3, 4):
-        order: list[str] = []
-        namespace: dict = {
-            "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-            "console_upload_lock": _VerySlowHolder(frees_on, order),
-            "console_teardown": threading.Event(),
-            # far from the wall deadline, so the clamp never shortens these tries.
-            "_require_deadline_allowance": lambda: 86_400.0,
-            "_upload_console_locked": _commit(order),
-            "print": lambda *_a, **_k: None,
-        }
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-
-        assert namespace["_upload_console"]("train", final=True) is True
-        commits = [n for n, entry in enumerate(order) if entry.startswith("commit:")]
-        assert len(commits) == 2, (
-            f"holder freeing on acquire {frees_on} lost the re-commit: {order}"
-        )
-        # positions, not values: both commits render identically, so comparing strings would find
-        # the first and hold however the calls were ordered.
-        assert commits[1] > order.index("holder finished"), order
-
-
-def test_serverless_periodic_console_upload_defers_once_teardown_begins():
-    """A periodic snapshot must not commit after the terminal one is under way.
-
-    ``final=True`` deliberately does not wait for the lock, so the two can run concurrently and the
-    periodic upload -- captured BEFORE the failure -- could land last and overwrite the terminal
-    console with pre-failure bytes, losing the diagnostic. The terminal call sets
-    ``console_teardown``, so a periodic snapshot that sees it drops its commit rather than racing.
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
-    )
-    uploaded: list[str] = []
-    console_teardown = threading.Event()
-    console_teardown.set()  # a terminal snapshot has begun
-
-    namespace: dict = {
-        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-        "console_upload_lock": threading.Lock(),  # free: only the teardown flag may defer
-        "console_teardown": console_teardown,
-        # far from the wall deadline, so the lock wait clamp is not what this test exercises.
-        "_require_deadline_allowance": lambda: 86_400.0,
-        "_upload_console_locked": lambda mode, _c, _t, _f: uploaded.append(mode) or True,
-        "print": lambda *_a, **_k: None,
-    }
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-    upload_console = namespace["_upload_console"]
-
-    assert upload_console("train") is False, "a periodic snapshot must defer once teardown began"
-    assert uploaded == []
-    # the terminal snapshot is exactly the one teardown is running, so it must still commit.
-    assert upload_console("train", final=True) is True
-    assert uploaded == ["train"]
-
-
-def test_serverless_periodic_console_upload_drops_a_commit_started_before_teardown(
+def test_serverless_live_and_terminal_console_snapshots_use_distinct_repo_paths(
     tmp_path, monkeypatch
 ):
-    """Teardown can begin while a periodic snapshot is already staging its tail.
-
-    The pre-acquire gate cannot catch that one: it passed before teardown started. Without a
-    re-check immediately before the commit, the in-flight periodic upload lands AFTER the terminal
-    one and overwrites the failure console with bytes read before the failure -- the exact loss the
-    terminal upload exists to prevent. This drives the real ``_upload_console_locked``, since the
-    re-check lives there rather than in the caller.
-    """
+    """A live upload that finishes late cannot overwrite the canonical terminal snapshot."""
     import ast
     import inspect
     import json
@@ -2408,13 +2045,11 @@ def test_serverless_periodic_console_upload_drops_a_commit_started_before_teardo
     node = next(
         n
         for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_upload_console_locked"
+        if isinstance(n, ast.FunctionDef) and n.name == "_commit_console_snapshot"
     )
     console = tmp_path / "console_train.txt"
     console.write_text("line one\nline two\n")
     commits: list[str] = []
-    console_teardown = threading.Event()
-    console_teardown.set()  # teardown began while this snapshot was staging its tail
 
     class _Api:
         def __init__(self, token=None):
@@ -2423,13 +2058,10 @@ def test_serverless_periodic_console_upload_drops_a_commit_started_before_teardo
         def upload_file(self, *, path_in_repo: str, **_kw) -> None:
             commits.append(path_in_repo)
 
-    # the function imports HfApi from huggingface_hub itself, so a namespace entry is ignored and
-    # the real client would make a LIVE network call. patch where it is looked up.
     import huggingface_hub
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-
-    warnings: list[str] = []
+    teardown = threading.Event()
     namespace: dict = {
         "os": os,
         "json": json,
@@ -2438,22 +2070,66 @@ def test_serverless_periodic_console_upload_drops_a_commit_started_before_teardo
             "hf_repo": "org/repo",
         },
         "env": {},
-        "console_teardown": console_teardown,
+        "console_teardown": teardown,
         "_require_deadline_allowance": lambda: None,
         "_safe_detail": lambda text, _env, _limit=0: text,
-        "print": lambda *args, **_kw: warnings.append(" ".join(str(a) for a in args)),
+        "print": lambda *_args, **_kw: None,
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-    upload_locked = namespace["_upload_console_locked"]
-
+    commit = namespace["_commit_console_snapshot"]
     tail = str(tmp_path / "console_train.txt.tail")
-    assert upload_locked("train", str(console), tail, False) is False
-    assert commits == [], "a periodic upload must not commit once teardown has begun"
-    # the terminal snapshot still commits: it IS the teardown upload.
-    assert upload_locked("train", str(console), tail + ".final", True) is True
-    assert commits == ["opd/r1/console_train.txt"]
-    # a False from a swallowed error would satisfy the first assertion for the wrong reason.
-    assert not [w for w in warnings if "warn" in w], warnings
+
+    assert commit("train", str(console), tail, False) is True
+    assert commit("train", str(console), tail + ".final", True) is True
+    assert commits == [
+        "opd/r1/console_train_live.txt",
+        "opd/r1/console_train.txt",
+    ]
+
+
+def test_serverless_terminal_console_does_not_wait_for_a_stuck_live_upload(tmp_path):
+    """The terminal snapshot has its own path, so an unbounded live request cannot block it."""
+    import ast
+    import inspect
+    import textwrap
+    import threading
+    import types
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
+    )
+    console = tmp_path / "console_train.txt"
+    console.write_text("before failure\n")
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[bool] = []
+
+    def _commit(_mode: str, _console: str, _tail: str, final: bool) -> bool:
+        calls.append(final)
+        if not final:
+            started.set()
+            release.wait(5.0)
+        return True
+
+    namespace = {
+        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
+        "console_teardown": threading.Event(),
+        "_commit_console_snapshot": _commit,
+    }
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    upload = namespace["_upload_console"]
+
+    live = threading.Thread(target=upload, args=("train",), daemon=True)
+    live.start()
+    assert started.wait(5.0)
+    assert upload("train", final=True) is True
+    assert calls == [False, True], "terminal upload waited behind the stuck live request"
+    release.set()
+    live.join(timeout=5.0)
+    assert not live.is_alive()
 
 
 def test_instance_console_upload_loop_never_waits_longer_than_the_interval():
