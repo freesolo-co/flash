@@ -106,6 +106,68 @@ def _secret_key_candidates(normalized: str) -> tuple[str, ...]:
             return tuple(candidates)
 
 
+def _strip_required_anchors(pattern: str) -> str | None:
+    """The body of a fully anchored pattern, or None when it does not constrain the whole match.
+
+    A `patternProperties` key is applied as a search, not a full match, so only `^...$` names one
+    field. `^(password)$` is accepted -- the anchors sit outside the group and still bound both
+    ends -- but a bare `password`, a one-sided `^password`, and `(password)` are all substring
+    expressions that also match longer ordinary names.
+    """
+    if not (pattern.startswith("^") and pattern.endswith("$")):
+        return None
+    body = pattern[1:-1]
+    # `password\$` ends in an ESCAPED dollar: a literal character, not an anchor. an odd run of
+    # trailing backslashes means the final `$` was escaped, so the match is unbounded at the end.
+    if (len(body) - len(body.rstrip("\\"))) % 2:
+        return None
+    return body
+
+
+def _normalize_exact_quantifiers(pattern: str) -> str:
+    """Remove `{1}` repetitions, which name exactly what the element they follow already named.
+
+    An anchored `^passw{1}ord$` matches only `password`, but the braces read as metacharacters, so
+    the pattern was refused and the credential-bearing `default`, `const` and `enum` values under
+    that perfectly valid schema stayed visible in raw exports.
+
+    Only the count `1` is removed. `{2}` repeats the element and so spells a different name, and a
+    RANGE (`{1,2}`, `{1,}`) matches several names at once; both are left in place, where the brace
+    fails the name test and nothing is judged secret -- the direction that preserves an ordinary
+    schema's annotations. A `{1}` with nothing before it, or one inside a character class, is not a
+    quantifier at all and is likewise left alone.
+    """
+    result: list[str] = []
+    index = 0
+    quantifiable = False
+    in_class = False
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "\\" and index + 1 < len(pattern):
+            result.append(pattern[index : index + 2])
+            index += 2
+            quantifiable = not in_class
+            continue
+        if in_class:
+            result.append(character)
+            in_class = character != "]"
+            index += 1
+            continue
+        if character == "{" and quantifiable:
+            end = pattern.find("}", index + 1)
+            if end != -1 and pattern[index + 1 : end] == "1":
+                index = end + 1
+                quantifiable = False
+                continue
+        result.append(character)
+        in_class = character == "["
+        # `(` and `|` open an element rather than completing one, so a brace directly after either
+        # repeats nothing and stays a metacharacter.
+        quantifiable = character not in "(|"
+        index += 1
+    return "".join(result)
+
+
 def _is_secret_property_pattern(pattern: Any) -> bool:
     """Whether a `patternProperties` key matches property names this module treats as secret.
 
@@ -121,10 +183,24 @@ def _is_secret_property_pattern(pattern: Any) -> bool:
     An alternation names several fields at once. It is secret only when EVERY branch is, since one
     non-secret branch means the pattern also matches an ordinary property whose literals must
     survive: `^(password|api_key)$` is a credential either way, while `^(password|city)$` is not.
+
+    BOTH anchors are required before any of that runs. `patternProperties` applies its key as a
+    SUBSTRING match, so the unanchored `password` also matches `password_policy_url` -- an ordinary
+    field `_is_secret_key` deliberately does not treat as a credential. Reading it as the single
+    name `password` rewrote that field's annotations to "[redacted]" and corrupted the stored raw
+    schema, so a pattern that does not constrain the whole match names nothing here.
     """
     if not isinstance(pattern, str):
         return False
-    unwrapped = _unwrap_pattern_groups(pattern)
+    # `^password$|^api_key$` anchors each branch separately rather than the alternation as a whole,
+    # so the split happens before the anchor test and every branch must carry its own pair.
+    top_level = _alternation_branches(pattern)
+    if top_level is not None:
+        return all(_is_secret_property_pattern(branch) for branch in top_level)
+    anchored = _strip_required_anchors(pattern)
+    if anchored is None:
+        return False
+    unwrapped = _unwrap_pattern_groups(_normalize_exact_quantifiers(anchored))
     branches = _alternation_branches(_peel_enclosing_group(unwrapped))
     if branches is not None:
         return all(_is_secret_branch(_unwrap_pattern_groups(branch)) for branch in branches)

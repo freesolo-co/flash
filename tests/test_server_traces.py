@@ -4663,7 +4663,7 @@ def test_schema_map_keywords_preserve_subschemas_and_redact_their_literals() -> 
                 "properties": {"token": {"type": "string", "default": "SECRET-DEPENDENT"}},
             }
         },
-        "patternProperties": {"^secret_": {"type": "string", "default": "SECRET-PATTERN"}},
+        "patternProperties": {"^secret_token$": {"type": "string", "default": "SECRET-PATTERN"}},
         "metadata": {"password": "SECRET-INSTANCE"},
     }
 
@@ -4675,7 +4675,7 @@ def test_schema_map_keywords_preserve_subschemas_and_redact_their_literals() -> 
             "token": {"type": "string", "default": "[redacted]"},
         },
     }
-    assert stored["patternProperties"]["^secret_"] == {
+    assert stored["patternProperties"]["^secret_token$"] == {
         "type": "string",
         "default": "[redacted]",
     }
@@ -8434,7 +8434,7 @@ def test_a_secret_pattern_property_follows_its_references() -> None:
                     "name": "lookup",
                     "parameters": {
                         "type": "object",
-                        "patternProperties": {"^secret_": {"$ref": "#/$defs/Cred"}},
+                        "patternProperties": {"^secret_token$": {"$ref": "#/$defs/Cred"}},
                         "$defs": {"Cred": {"type": "string", "default": "PATTERNLEAK"}},
                     },
                 },
@@ -8454,7 +8454,7 @@ def test_a_secret_pattern_property_follows_its_references() -> None:
                         "name": "lookup",
                         "parameters": {
                             "type": "object",
-                            "patternProperties": {"^item_": {"$ref": "#/$defs/Item"}},
+                            "patternProperties": {"^item_id$": {"$ref": "#/$defs/Item"}},
                             "$defs": {"Item": {"type": "string", "default": "widget"}},
                         },
                     },
@@ -8858,7 +8858,9 @@ def test_an_escaped_trailing_root_dot_names_the_same_host() -> None:
     [
         ("^(password)$", True),
         ("^((api_key))$", True),
-        ("(secret)", True),
+        # unanchored: patternProperties applies it as a SUBSTRING match, so it also matches
+        # `secretary_name`, which is not a credential. grouping alone does not name one field.
+        ("(secret)", False),
         ("^(?:access_token)$", True),
         # alternation names more than one field, so the group is NOT redundant and stays.
         ("^(password|city)$", False),
@@ -11274,3 +11276,195 @@ def test_ordinary_metadata_is_unaffected_by_the_fragment_reading(
     metadata: dict[str, Any], expected: dict[str, Any]
 ) -> None:
     assert traces._sanitize_for_trace(metadata, (), payload_root=False) == expected
+
+
+def _pattern_tool(pattern: str, literal: str) -> dict[str, Any]:
+    """A request declaring one `patternProperties` entry carrying `literal` as its default."""
+    return {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "patternProperties": {pattern: {"type": "string", "default": literal}},
+                    },
+                },
+            }
+        ]
+    }
+
+
+def test_a_nested_legacy_id_does_not_break_a_modern_definitions_secret_scope() -> None:
+    """`id` declares a resource in draft-04 only. The boundary check omitted the active dialect and
+    defaulted to the legacy reading, so a 2020-12 definition's ordinary `id` ANNOTATION was read as
+    a new resource, reset the inherited secret flag, and left the nested credential in raw export."""
+
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "properties": {"password": {"$ref": "#/$defs/cred"}},
+                        "$defs": {
+                            "cred": {
+                                "type": "object",
+                                "properties": {"note": {"id": "note", "default": "DIALECTLEAK"}},
+                            }
+                        },
+                    },
+                },
+            }
+        ]
+    }
+
+    assert "DIALECTLEAK" not in json.dumps(traces._redact_secret_fields(payload))
+
+
+@pytest.mark.parametrize(
+    ("dialect", "identifier"),
+    [
+        ("http://json-schema.org/draft-04/schema#", "id"),
+        ("http://json-schema.org/draft-03/schema#", "id"),
+        ("https://json-schema.org/draft/2020-12/schema", "$id"),
+    ],
+    ids=["draft-04-legacy-id", "draft-03-legacy-id", "modern-dollar-id"],
+)
+def test_a_resource_boundary_still_holds_where_the_dialect_declares_one(
+    dialect: str, identifier: str
+) -> None:
+    """The narrowing must not remove real boundaries: where the dialect DOES define the keyword, an
+    embedded resource still starts its own scope and its unreferenced annotation survives."""
+
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "$schema": dialect,
+                        "type": "object",
+                        "properties": {"password": {"$ref": "#/$defs/cred"}},
+                        "$defs": {
+                            "cred": {
+                                "type": "object",
+                                "properties": {
+                                    "note": {identifier: "https://e.test/n", "default": "KEEPME"}
+                                },
+                            }
+                        },
+                    },
+                },
+            }
+        ]
+    }
+
+    assert "KEEPME" in json.dumps(traces._redact_secret_fields(payload))
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected_secret"),
+    [
+        ("^passw{1}ord$", True),
+        ("^api_ke{1}y$", True),
+        ("^(password){1}$", True),
+        # a count above one REPEATS the element, so the pattern spells a different name.
+        ("^passw{2}ord$", False),
+        # a range matches several names at once and must stay refused.
+        ("^passw{1,2}ord$", False),
+        ("^passw{1,}ord$", False),
+        ("^passw{0}ord$", False),
+        # `{1}` must not rescue an ordinary name, and a malformed brace is not a quantifier.
+        ("^cit{1}y$", False),
+        ("^passw{1ord$", False),
+        ("^passw{a}ord$", False),
+        (r"^passw\{1\}ord$", False),
+    ],
+)
+def test_a_fixed_single_count_quantifier_still_names_one_field(
+    pattern: str, expected_secret: bool
+) -> None:
+    """`^passw{1}ord$` matches exactly `password`, but the braces read as metacharacters, so the
+    pattern was refused and the credential literals under that valid schema stayed in raw export."""
+
+    redacted = json.dumps(traces._redact_secret_fields(_pattern_tool(pattern, "QUANTLEAK")))
+    assert ("QUANTLEAK" not in redacted) is expected_secret
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected_secret"),
+    [
+        # `patternProperties` applies its key as a SEARCH, so a one-sided or bare pattern also
+        # matches longer ordinary names -- `password` matches `password_policy_url`.
+        ("password", False),
+        ("^password", False),
+        ("password$", False),
+        ("(password)", False),
+        ("api_key", False),
+        # fully anchored still names exactly one field.
+        ("^password$", True),
+        ("^(password)$", True),
+        ("^[Pp]assword$", True),
+        ("^(password|api_key)$", True),
+        # each branch of a top-level alternation carries its own anchors.
+        ("^password$|^api_key$", True),
+        ("^password$|api_key", False),
+    ],
+)
+def test_only_a_fully_anchored_pattern_names_a_single_field(
+    pattern: str, expected_secret: bool
+) -> None:
+    """An unanchored `password` also matches `password_policy_url`, which `_is_secret_key`
+    deliberately does not classify as a credential. Reading it as the single name `password`
+    rewrote that ordinary field's annotations to "[redacted]", corrupting the stored raw schema."""
+
+    redacted = json.dumps(traces._redact_secret_fields(_pattern_tool(pattern, "ANCHORLEAK")))
+    assert ("ANCHORLEAK" not in redacted) is expected_secret
+
+
+@pytest.mark.parametrize(
+    "content",
+    [None, "", []],
+    ids=["absent", "empty-string", "empty-list"],
+)
+def test_a_refusal_beside_empty_content_is_still_exported(content: object) -> None:
+    """A refusal IS the assistant's complete reply. Providers routinely send one beside
+    `"content": ""`, and testing `is not None` rejected exactly that shape -- so the commonest
+    spelling of a refusal silently dropped every safety row from `records`."""
+
+    message: dict[str, Any] = {"role": "assistant", "refusal": "cannot comply"}
+    if content is not None:
+        message["content"] = content
+
+    reply = platform_traces._chat_reply(
+        {"choices": [{"finish_reason": "stop", "message": message}]}
+    )
+
+    assert reply == "cannot comply"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"content": "here is how", "refusal": "cannot comply"},
+        {"content": " ", "refusal": "cannot comply"},
+        {"content": [{"type": "text", "text": "x"}], "refusal": "cannot comply"},
+        {"content": "", "refusal": {"reason": "no"}},
+    ],
+    ids=["substantive-text", "whitespace-text", "content-parts", "non-string-refusal"],
+)
+def test_a_refusal_carrying_competing_content_is_still_rejected(message: dict[str, Any]) -> None:
+    """The narrowing must not accept the malformed both-halves combination: a message carrying a
+    refusal AND assistant text has no single faithful training target. Whitespace is text."""
+
+    reply = platform_traces._chat_reply(
+        {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", **message}}]}
+    )
+
+    assert reply is None

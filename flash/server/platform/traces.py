@@ -526,10 +526,30 @@ def _chat_reply(payload: Any) -> str | None:
         # a refusal IS the assistant's complete reply, and skipping it silently drops every safety
         # and policy row from `records`. it substitutes only when ordinary content is absent: a
         # message carrying both is a malformed combination with no single faithful target.
-        if not isinstance(refusal, str) or message.get("content") is not None:
+        #
+        # absent means "carries no assistant text", not "the key is missing". providers routinely
+        # send a refusal alongside `"content": ""` or `"content": []`, and testing `is not None`
+        # rejected those -- so the shape most refusals actually arrive in was the one shape that
+        # dropped every safety row on the floor.
+        if not isinstance(refusal, str) or not _is_empty_content(message.get("content")):
             return None
         return refusal
     return _message_text(message.get("content"))
+
+
+def _is_empty_content(content: Any) -> bool:
+    """Whether a message's content carries no assistant text at all.
+
+    Only the two shapes that hold nothing count: an absent/null value, and an empty string or list.
+    A whitespace-only string is NOT empty -- it is text the model produced, so a refusal beside it
+    is still the malformed both-halves combination. Any other type is content this cannot read, and
+    saying "empty" about it would let a refusal stand in for a reply it cannot account for.
+    """
+    if content is None:
+        return True
+    if isinstance(content, str | list):
+        return not content
+    return False
 
 
 def _message_text(content: Any) -> str | None:

@@ -240,6 +240,7 @@ def _resolve_secret_schema_refs(
     secret_schema_definition: bool,
     secret_schema_refs: set[tuple[str, ...]] | None,
     schema_definition_path: tuple[str, ...],
+    legacy_id_dialect: bool,
 ) -> tuple[set[tuple[str, ...]], bool]:
     """Collect the pointers whose targets hold secret literals, and whether THIS node is one.
 
@@ -256,7 +257,14 @@ def _resolve_secret_schema_refs(
     # legacy resource did not start its own scope here -- so an unrelated sibling definition
     # inherited the enclosing target's secrecy and its annotation was rewritten to "[redacted]".
     # `_schema_resource_id` is the same legacy-aware detection the reference collectors use.
-    if schema_definition_path and isinstance(_schema_resource_id(value), str):
+    #
+    # the dialect has to be the one in force AT this node, not the legacy-leaning default. under
+    # 2020-12 a plain `id` is an ordinary annotation and declares no resource, so reading it as a
+    # boundary reset the inherited flag mid-definition and left the nested `default` verbatim in
+    # the raw export -- a credential surviving inside a definition already known to be secret.
+    if schema_definition_path and isinstance(
+        _schema_resource_id(value, legacy_id_dialect=legacy_id_dialect), str
+    ):
         return active, referenced
     return active, secret_schema_definition or referenced
 
@@ -376,6 +384,7 @@ def _redact_secret_child(
     payload_root: bool,
     active_secret_schema_refs: set[tuple[str, ...]],
     current_schema_path: tuple[str, ...],
+    legacy_id_dialect: bool,
     flag: _SanitizationFlag | None,
 ) -> Any:
     """Redact one member of a mapping, deciding what context the child inherits.
@@ -461,6 +470,7 @@ def _redact_secret_child(
         tool_call_list=key == "tool_calls" and isinstance(item, list),
         secret_schema_refs=active_secret_schema_refs,
         schema_definition_path=current_schema_path,
+        legacy_id_dialect=legacy_id_dialect,
         flag=flag,
     )
 
@@ -495,6 +505,7 @@ def _redact_secret_fields(
     tool_call: bool = False,
     secret_schema_refs: set[tuple[str, ...]] | None = None,
     schema_definition_path: tuple[str, ...] = (),
+    legacy_id_dialect: bool = True,
     flag: _SanitizationFlag | None = None,
 ) -> Any:
     if depth >= platform_traces._MAX_PAYLOAD_DEPTH:
@@ -503,12 +514,16 @@ def _redact_secret_fields(
         return "[redacted]"
     if isinstance(value, dict):
         schema_context = schema_context or schema_wrapper or _has_schema_context(value)
+        # an embedded resource may select its own dialect, so this is read per node rather than
+        # once for the payload, and the reading in force here is what the children inherit.
+        legacy_id_dialect = _node_legacy_id_dialect(value, legacy_id_dialect)
         active_secret_schema_refs, secret_schema_definition = _resolve_secret_schema_refs(
             value,
             depth=depth,
             secret_schema_definition=secret_schema_definition,
             secret_schema_refs=secret_schema_refs,
             schema_definition_path=schema_definition_path,
+            legacy_id_dialect=legacy_id_dialect,
         )
         redact_schema_literals = secret_schema_definition or secret_schema_property
         redacted: dict[Any, Any] = {}
@@ -553,6 +568,7 @@ def _redact_secret_fields(
                     payload_root=payload_root,
                     active_secret_schema_refs=active_secret_schema_refs,
                     current_schema_path=current_schema_path,
+                    legacy_id_dialect=legacy_id_dialect,
                     flag=flag,
                 )
         return redacted
@@ -577,6 +593,7 @@ def _redact_secret_fields(
             schema_wrapper=schema_wrapper,
             secret_schema_refs=secret_schema_refs,
             schema_definition_path=schema_definition_path,
+            legacy_id_dialect=legacy_id_dialect,
             flag=flag,
         )
     return _redact_secret_scalar(
@@ -659,6 +676,7 @@ def _redact_secret_sequence(
     schema_wrapper: bool,
     secret_schema_refs: set[tuple[str, ...]] | None,
     schema_definition_path: tuple[str, ...],
+    legacy_id_dialect: bool,
     flag: _SanitizationFlag | None,
 ) -> list[Any]:
     """Redact each entry of an array, carrying the flags its position implies."""
