@@ -4817,6 +4817,45 @@ def test_child_failure_sanitizer_redacts_key_named_credential_fields(monkeypatch
         assert _safe_child_failure_detail(ValueError(message)) == message, field
 
 
+def test_child_failure_sanitizer_redacts_a_generically_labelled_credential(monkeypatch):
+    """``credential``/``credentials`` is the generic label, and it needs no qualifier.
+
+    Unlike ``key``, which qualifies something else and is ordinary on its own (``cache_key``), this
+    word names the value outright: a field called ``credentials`` holds one. It is what a library
+    reaches for when the value has no more specific name, so it is the likeliest spelling to arrive
+    from code this repo does not own -- and a runtime-minted value is in no environment variable, so
+    the value pass cannot reach it. Both spellings are covered: the plural is the commoner json
+    form. Prose is asserted in the other direction, since the fix is a bare word in an alternation
+    and over-redaction would eat the sentence explaining why the child died.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message in (
+        'child failed: {"credentials":"runtime-minted-abc123"}',
+        'child failed: {"credential": "runtime-minted-abc123"}',
+        "child failed: credential=runtime-minted-abc123",
+        "child failed: credentials: runtime-minted-abc123",
+        "child failed: CREDENTIAL=runtime-minted-abc123",  # the field is matched case-insensitively
+        'child failed: {"aws_credentials":"runtime-minted-abc123"}',  # a prefixed spelling
+        # and the serialized-json spelling, where the quotes arrive backslash-escaped
+        r"child failed: {\"credentials\":\"runtime-minted-abc123\"}",
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "runtime-minted-abc123" not in redacted, f"leaked: {redacted!r}"
+        assert "<redacted>" in redacted, message
+
+    # the other direction: the word in PROSE carries no value, and a field merely describing a
+    # credential is not one. Redacting these would delete the failure reason itself.
+    for message in (
+        "child failed: missing credentials for the run",
+        "child failed: invalid credential format detected",
+        "child failed: credentials expired",
+        'child failed: {"credential_type": "oauth"}',
+    ):
+        assert _safe_child_failure_detail(ValueError(message)) == message, message
+
+
 def test_child_failure_sanitizer_redacts_every_percent_encoding_casing(monkeypatch):
     """A secret's percent-escapes are matched whatever hex casing the exception rendered.
 

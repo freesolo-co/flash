@@ -84,7 +84,12 @@ _SECRET_URL_PARAM = (
 _SECRET_KEY_FIELD = r"(?:private|secret|signing|encryption|session|access)[-_ ]?key(?:[-_ ]?id)?"
 _SECRET_DETAIL = re.compile(
     rf"(?i)(?P<key>{_SECRET_AUTH_KEY}|api[-_ ]?key|access[-_ ]?token|token|secret|password|passwd"
-    rf"|{_SECRET_KEY_FIELD}|{_SECRET_URL_PARAM})"
+    # `credential`/`credentials` is the generic label a library reaches for when the value has no
+    # more specific name, and it names the value outright rather than qualifying something else, so
+    # unlike `key` it needs no qualifier. plural included: `{"credentials": ...}` is the commoner
+    # json spelling. a runtime-minted value is in no environment variable, so the value pass cannot
+    # reach it and this shape rule is the only thing standing between it and the record.
+    rf"|credentials?|{_SECRET_KEY_FIELD}|{_SECRET_URL_PARAM})"
     # the quote around the key may itself be BACKSLASH-ESCAPED: a child exception that embeds
     # serialized json carries `{\"password\":\"secret\"}`, and a bare `['\"]?` stops at the
     # backslash, so the whole credential printed verbatim. a runtime-minted value is in no
