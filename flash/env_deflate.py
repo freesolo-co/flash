@@ -663,7 +663,9 @@ def _document_payloads(
     """Decoded compressed text from supported document and image containers."""
     _check_document_deadline(deadline)
     if data.startswith(_PNG_SIGNATURE):
-        yield from _png_text_payloads(data, budget, _UnreadablePngText)
+        yield from _png_text_payloads(
+            data, budget, _UnreadablePngText, check=_document_checker(deadline)
+        )
         return
     yield from _pdf_stream_payloads(data, budget, deadline=deadline)
 

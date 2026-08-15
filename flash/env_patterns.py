@@ -23,13 +23,12 @@ from flash.env_records import (  # noqa: F401
     _RecordHalves,
     _RecordSplitter,
 )
+from flash.env_sensitive import _MAX_BODY, GnuPGPrivateKey, UriPassword, _is_high_entropy
 
 # Bodies are bounded rather than open-ended so a match has a maximum length, which is what lets
 # `_SCAN_OVERLAP_BYTES` below be a real guarantee instead of a hope. The cap is far above every
 # issued key format; a longer key still matches its first `_MAX_BODY` characters, which is a
 # detection either way.
-_MAX_BODY = 256
-
 # (kind, pattern) for issued tokens: an issuer prefix plus a long key body, captured as a group.
 # The kind names the credential in the refusal so the author knows which key to rotate; the matched
 # text is NEVER echoed, since the error is printed and may reach a log.
@@ -457,11 +456,6 @@ class _TwoMarkers:
         return _RecordHalves(self).paired(data, _RecordSplitter().ends(data))
 
 
-# An all-hex body of key length. Recognised so `_is_high_entropy` admits a legacy 40-hex W&B key,
-# whose lowercase letters would otherwise read as the hand-written-placeholder convention.
-_HEX_BODY = re.compile(r"[0-9a-fA-F]{32,}")
-
-
 # A PEM header only means a key is present when the BODY follows it. The header alone is something
 # documentation says -- "if you see -----BEGIN RSA PRIVATE KEY----- in a log, redact it" -- and
 # refusing on it blocks a legitimate publish over prose about credentials. Requiring a base64 line
@@ -489,8 +483,9 @@ _NETRC_PASSWORD = re.compile(
     rb"(?i)(?:^|\s)password[ \t]+[\"']?([A-Za-z0-9/+=_-]{32,%d})" % _MAX_BODY
 )
 
-
 _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
+    ("a private key", GnuPGPrivateKey()),
+    ("a password", UriPassword()),
     ("an age private identity", _AgeIdentity()),
     #
     # `(?: BLOCK)?` because OpenPGP armours as `-----BEGIN PGP PRIVATE KEY BLOCK-----`. Without it
@@ -703,52 +698,6 @@ _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
 _PAIRED_PATTERNS: tuple[tuple[str, _TwoMarkers], ...] = tuple(
     (kind, pattern) for kind, pattern in _LITERAL_PATTERNS if isinstance(pattern, _TwoMarkers)
 )
-
-
-def _is_high_entropy(body: bytes, *, hex_is_issued: bool = False) -> bool:
-    """Whether a key body looks issued rather than hand-written.
-
-    An issued token is random over its alphabet, so each rejected shape below is one a real key
-    essentially never takes. For a 16-character base62 body -- the shortest any pattern admits --
-    the chance of landing in one is about 5 in 10,000,000, and for the 45-character Freesolo bodies
-    actually issued it is vanishingly smaller still. The three rejected shapes are exactly the
-    placeholder conventions:
-
-      * all lowercase letters, no digit -- `fslo_retry_after_close`, `fslo_your_api_key_here`
-      * all capital letters, no digit -- `fslo_YOUR_API_KEY_HERE`, `fslo_REPLACE_ME`
-      * one or two distinct characters -- `fslo_XXXXXXXXXXXXXXXX`, a masked value
-
-    Testing only for "a digit or a capital" caught the lowercase convention and missed the other
-    two, so `flash env push` refused a scaffolded environment and told the author to rotate a key
-    that had never existed. A false refusal is not harmless: it is the failure mode that gets a
-    check switched off.
-
-    Mixed-case and digit-bearing bodies are still treated as issued, which keeps a real key whose
-    body happens to read like a word. Erring that way is deliberate -- a false refusal is visible
-    and recoverable, a missed credential is permanent in a shared repository's history.
-
-    Applied to the assignment-anchored patterns too. Exempting those was a false-positive
-    regression: once the W&B body widened past 40 hex characters,
-    `WANDB_API_KEY=your_wandb_api_key_here_replace_before_push` matched and a scaffolded
-    environment could not be published. The exemption existed for the all-hex legacy key
-    (`abcdef...` is all-lowercase-alpha, which reads as a placeholder), so that one case is
-    admitted explicitly below rather than by exempting the whole group.
-
-    `hex_is_issued` carries that admission, and only the assignment-anchored patterns set it. It
-    is what tells an all-hex W&B key from `hf_deadbeefdeadbeefdeadbeefdeadbeef`: applying it to
-    every pattern refused the canonical hex placeholder under an issuer prefix, because the hex
-    test ran before the all-lowercase-alpha rule that would have cleared it. Withholding it costs
-    no real token -- an issued `hf_`/`fslo_`/`sk-` body is base62, so one confined to `[a-f]` with
-    no digit at all is not a shape they take.
-    """
-    text = body.decode("ascii", "ignore").replace("_", "").replace("-", "")
-    if len(set(text)) <= 2:
-        return False
-    if hex_is_issued and _HEX_BODY.fullmatch(text):
-        # a full-length hex body is a key or a hash, never a hand-written placeholder: the
-        # convention is words (`your_key_here`), and those are not confined to `[a-f]`.
-        return True
-    return not (text.isalpha() and (text.isupper() or text.islower()))
 
 
 # The keyword each expensive pattern is anchored on, in every spelling a substring test can see.

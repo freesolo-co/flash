@@ -17,6 +17,7 @@ from pathlib import Path
 
 from flash.env_archive import _looks_like_cpio_header
 from flash.env_formats import _COMPRESSED_MAGIC, _looks_compressed, _looks_like_tar, _overlay_offset
+from flash.env_opaque import looks_like_opaque_candidate, opaque_format
 from flash.env_patterns import (
     _PAIRED_PATTERNS,
     SHORTEST_TOKEN_BYTES,
@@ -105,6 +106,7 @@ def _looks_like_source_container(data: bytes) -> bool:
     """Whether source-language rejoining is invalid for this structured byte stream."""
     return (
         data.startswith((*_COMPRESSED_MAGIC, b"!<arch>\n", b"!<thin>\n", b"%PDF-"))
+        or opaque_format(data) is not None
         or _looks_like_tar(data)
         or _looks_like_cpio_header(data)
     )
@@ -114,6 +116,7 @@ def _looks_like_container_head(data: bytes) -> bool:
     """Whether a bounded prefix proves an oversized nested value is a container."""
     return (
         _looks_compressed(data)
+        or looks_like_opaque_candidate(data)
         or _looks_like_tar(data)
         or data.startswith((b"!<arch>\n", b"!<thin>\n", b"%PDF-"))
         or _looks_like_cpio_header(data)
@@ -139,6 +142,7 @@ def _looks_like_container(data: bytes) -> bool:
     """
     return (
         _looks_compressed(data)
+        or opaque_format(data) is not None
         or _looks_like_tar(data)
         # ar has no nested predicate elsewhere: a top-level archive was walked by its handler, while
         # the same bytes inside a zip were treated as final content and hid a compressed key member.

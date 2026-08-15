@@ -93,6 +93,7 @@ from flash.env_keystores import (
     _Unscannable,
 )
 from flash.env_names import exact_name_values
+from flash.env_opaque import OpaqueDeadlineExceeded, opaque_format
 from flash.env_openpgp import (
     _encrypted_text_format,
     _has_openpgp_message_armor,
@@ -117,7 +118,6 @@ _SKIPPABLE_SCAN_BYTES = 64 << 10
 # or an appended log writes a handful; the bound is what stops a file of many tiny records from
 # becoming an expansion cost of its own, and exceeding it refuses rather than passes.
 _MAX_ZLIB_RECORDS = 64
-
 
 # How many container layers deep to expand. A zip holding a gzipped shard is an ordinary way to
 # ship a dataset, and stopping at one level meant the inner member's bytes were treated as final
@@ -146,16 +146,6 @@ _MAX_NESTED_BUFFER_BYTES = 64 << 20
 # 5,000 x 60s of expansion from an authenticated `POST /v1/envs` while every individual file stayed
 # inside the apparent one-minute limit.
 _MAX_DECOMPRESS_SECONDS = 60.0
-# How many members of ONE archive to enumerate, imported above. `ZipFile` reads the entire central
-# directory up front, so a nested archive of millions of empty entries materialises millions of
-# `ZipInfo` objects before any per-member budget is consulted -- and empty members never enter the
-# read loop that checks the deadline, so neither bound could stop it. The package extractor counts
-# such an archive as a single ordinary file, so this is the only place the inner count is bounded.
-#
-# Every read of it is in THIS module, and the directory walk takes it as an argument rather than
-# reading it from its own, so rebinding it here still governs the whole check.
-
-
 # Everything the standard library raises for an archive it cannot read. There is no single base
 # class to catch, and most of these are not OSError, so each omission crashed `flash env push` with
 # a traceback on an ordinary corrupt shard: an encrypted member raises RuntimeError, an
@@ -522,6 +512,11 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
     """
     if depth > _MAX_CONTAINER_DEPTH:
         raise _Unscannable("nests compressed containers too deeply to inspect")
+    try:
+        if fmt := opaque_format(source, deadline=deadline):
+            raise _Unscannable(_uninspectable_reason(fmt))
+    except OpaqueDeadlineExceeded:
+        raise _Unscannable("takes too long to decompress") from None
     # EVERY applicable format is tried, not just the first one that claims a match. The detectors
     # are heuristics over untrusted bytes and one of them was decisive: `is_zipfile` searches the
     # last 64 KiB for the end-of-central-directory record, so four bytes of `PK\x05\x06` ANYWHERE
