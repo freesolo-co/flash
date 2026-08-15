@@ -80,8 +80,11 @@ _SECRET_URL_PARAM = (
 # list above: `cache_key`, `partition_key` and `idempotency_key` are ordinary diagnostic fields, and
 # redacting them eats the message this record exists to carry. So the qualifier is required and
 # enumerated -- `private_key` and `secret_key` name a credential, `primary_key` does not. The
-# separator is optional so `privateKey` (camelCase, as json from a js caller arrives) matches too.
-_SECRET_KEY_FIELD = r"(?:private|secret|signing|encryption|session|access)[-_ ]?key(?:[-_ ]?id)?"
+# separator is optional so `privateKey` (camelCase, as json from a js caller arrives) matches too,
+# which is also what makes azure's separator-less `AccountKey=` match the `account` qualifier.
+_SECRET_KEY_FIELD = (
+    r"(?:private|secret|signing|encryption|session|access|account)[-_ ]?key(?:[-_ ]?id)?"
+)
 # a COOKIE header is credential-bearing as a WHOLE value, not at one inner name: `Cookie: a=1;
 # sessionid=X; b=2` carries the session in a semicolon-delimited list, and matching only the inner
 # name leaves the rest -- including whatever else the header carries -- verbatim. So the header is

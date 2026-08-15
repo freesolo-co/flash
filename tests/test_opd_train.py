@@ -4803,6 +4803,8 @@ def test_child_failure_sanitizer_redacts_key_named_credential_fields(monkeypatch
         "session_key",
         "access_key",
         "access_key_id",  # an AWS key id is half a credential pair, not an identifier
+        "account_key",  # azure storage; `AccountKey=` is the separator-less spelling below
+        "accountKey",
         "passwd",
     ):
         message = f'child failed: {{"{field}":"runtime-minted-abc123"}}'
@@ -4810,9 +4812,32 @@ def test_child_failure_sanitizer_redacts_key_named_credential_fields(monkeypatch
         assert "runtime-minted-abc123" not in redacted, f"{field} leaked: {redacted!r}"
         assert "<redacted>" in redacted, field
 
+    # an azure storage connection string carries the credential as one `;`-delimited field among
+    # several benign ones. Only the key goes: the surrounding fields say WHICH account and endpoint
+    # failed, and redacting the whole string would replace the diagnostic with one <redacted>.
+    conn = (
+        "child failed: DefaultEndpointsProtocol=https;AccountName=x;"
+        "AccountKey=runtime-minted-abc123;EndpointSuffix=core.windows.net"
+    )
+    redacted_conn = _safe_child_failure_detail(ValueError(conn))
+    assert "runtime-minted-abc123" not in redacted_conn, redacted_conn
+    assert "AccountName=x" in redacted_conn, redacted_conn
+    assert "EndpointSuffix=core.windows.net" in redacted_conn, redacted_conn
+
     # the other direction: an ordinary key-suffixed field keeps its value, or the failure reason
-    # this record carries is destroyed by its own sanitizer.
-    for field in ("cache_key", "idempotency_key", "partition_key", "primary_key", "row_key", "key"):
+    # this record carries is destroyed by its own sanitizer. `account_id`/`account_name` matter
+    # here specifically: adding `account` as a KEY qualifier must not make the whole account
+    # namespace secret, or the record stops saying which account failed.
+    for field in (
+        "cache_key",
+        "idempotency_key",
+        "partition_key",
+        "primary_key",
+        "row_key",
+        "key",
+        "account_id",
+        "account_name",
+    ):
         message = f'child failed: {{"{field}":"user-visible-value"}}'
         assert _safe_child_failure_detail(ValueError(message)) == message, field
 
