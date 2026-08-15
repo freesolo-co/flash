@@ -495,6 +495,7 @@ from flash.engine.worker.rl_train_runner import (  # noqa: E402,F401
     _run_rl_child_under_liveness,
     _start_resume_uploader,
     _start_reward_runtime,
+    _step_timing_fields,
     _StepMetricState,
     _validate_rl_child,
     _write_rl_shim,

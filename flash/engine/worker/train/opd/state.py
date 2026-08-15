@@ -1,4 +1,4 @@
-"""Typed state passed across OPD runner preparation and execution phases."""
+"""immutable state carriers for OPD parent-runner stages."""
 
 from __future__ import annotations
 
