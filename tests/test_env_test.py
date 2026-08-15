@@ -216,6 +216,50 @@ class _MalformedReplyMultiTurnEnv(_MultiTurnEnv):
         return [reply]
 
 
+class _ImageReplyMultiTurnEnv(_MultiTurnEnv):
+    def __init__(self):
+        super().__init__()
+        self.reply_calls = 0
+        self.state = None
+
+    def new_rollout_state(self, example):
+        self.state = super().new_rollout_state(example)
+        return self.state
+
+    def env_reply(self, messages, state):
+        self.reply_calls += 1
+        state["turn"] += 1
+        reply = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/later.png"},
+                }
+            ],
+        }
+        messages.append(reply)
+        return [reply]
+
+
+class _NaturallyDoneImageReplyMultiTurnEnv(_ImageReplyMultiTurnEnv):
+    max_turns = 4
+
+    def dataset(self):
+        return [
+            {
+                "input": "finish now",
+                "output": [{"role": "assistant", "content": "finished"}],
+            }
+        ]
+
+    def env_reply(self, messages, state):
+        reply = super().env_reply(messages, state)
+        state["done"] = True
+        state["applied"] = True
+        return reply
+
+
 def _environment_dir(tmp_path):
     env_dir = tmp_path / "local-env"
     env_dir.mkdir()
@@ -292,6 +336,247 @@ def test_env_test_validates_evaluation_sidecar_offline(monkeypatch, tmp_path, ca
         "evaluation suite held-out: 1/1 cases passed contract checks mean_score=1.000000" in output
     )
     assert "overall: PASS" in output
+
+
+def test_env_test_validates_episode_suite_without_executing_its_scorer(
+    monkeypatch, tmp_path, capsys
+):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self):\n"
+        "        return [EvalCase(id='episode', input='finish the exchange', expected=[\n"
+        "            {'role': 'assistant', 'content': 'first'},\n"
+        "            {'role': 'assistant', 'content': 'second'},\n"
+        "        ])]\n"
+        "    def score(self, case, response, state):\n"
+        "        if not state.get('done'):\n"
+        "            raise AssertionError('episode scorer requires finished state')\n"
+        "        return True\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class _CountingEnv(_MultiTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.starts = 0
+
+        def new_rollout_state(self, example):
+            self.starts += 1
+            return super().new_rollout_state(example)
+
+    env = _CountingEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    assert env.starts == 2  # one dataset episode and one held-out initial state
+    assert env.scored_state is not None
+    assert env.scored_state["turn"] == 2
+    captured = capsys.readouterr()
+    assert "evaluation suite episode: 1/1 cases passed contract checks" in captured.out
+    assert "mean_score=" not in captured.out
+    assert "episode scorer requires finished state" not in captured.err
+    assert "one generation per turn" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_keeps_uninspectable_episode_scorers_permissive(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Scorer:\n"
+        "    @property\n"
+        "    def __signature__(self): raise ValueError('signature unavailable')\n"
+        "    def __call__(self, *args): raise AssertionError('scorer must not run offline')\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    score = Scorer()\n"
+        "    def cases(self): return [EvalCase(id='episode', input='held out')]\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _MultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "evaluation suite episode: 1/1 cases passed contract checks" in captured.out
+    assert "signature unavailable" not in captured.err
+    assert "scorer must not run offline" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+@pytest.mark.parametrize(
+    "expected_clause",
+    ["", ", expected='success'", ", expected={'status': 'success'}"],
+    ids=["missing", "scalar", "structured"],
+)
+def test_env_test_episode_suite_does_not_require_sft_gold(
+    monkeypatch, tmp_path, capsys, expected_clause
+):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        f"    def cases(self): return [EvalCase(id='episode', input='held out'{expected_clause})]\n"
+        "    def score(self, case, response, state):\n"
+        "        raise AssertionError('episode scorer must not run offline')\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class _NoEvaluationGoldEnv(_MultiTurnEnv):
+        def dataset(self):
+            return [
+                {
+                    "input": "finish the exchange",
+                    "output": [
+                        {"role": "assistant", "content": "1"},
+                        {"role": "assistant", "content": "2"},
+                    ],
+                }
+            ]
+
+        def sft_completion(self, example):
+            if example["input"] == "held out":
+                raise AssertionError("evaluation case requested an sft target")
+            return super().sft_completion(example)
+
+        def env_reply(self, messages, state):
+            int(state["response_text"])
+            return super().env_reply(messages, state)
+
+        def reward(self, completion, example, state=None):
+            if example["input"] == "held out":
+                raise AssertionError("evaluation case requested environment reward")
+            return super().reward(completion, example, state)
+
+    _patch_loader(monkeypatch, _NoEvaluationGoldEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "evaluation suite episode: 1/1 cases passed contract checks" in captured.out
+    assert "evaluation case requested an sft target" not in captured.err
+    assert "evaluation case requested environment reward" not in captured.err
+    assert "episode scorer must not run offline" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_checks_each_episode_cases_initial_rollout(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self): return [\n"
+        "        EvalCase(id='ok', input='held out ok'),\n"
+        "        EvalCase(id='broken', input='held out broken'),\n"
+        "    ]\n"
+        "    def score(self, case, response, state): return True\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    class _HeldOutRolloutEnv(_MultiTurnEnv):
+        def __init__(self):
+            super().__init__()
+            self.started_inputs = []
+
+        def new_rollout_state(self, example):
+            self.started_inputs.append(example["input"])
+            if example["input"] == "held out broken":
+                raise KeyError("no initial rollout for held out broken")
+            return super().new_rollout_state(example)
+
+    env = _HeldOutRolloutEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    assert env.started_inputs == ["finish the exchange", "held out ok", "held out broken"]
+    captured = capsys.readouterr()
+    assert "no initial rollout for held out broken" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+@pytest.mark.parametrize(
+    "scorer_source",
+    [
+        "def score(self, case): return True",
+        "def score(self, case, response, *, state, required): return True",
+        "def score(self, case, response, state, required, /): return True",
+    ],
+    ids=[
+        "two-argument-call-does-not-bind",
+        "state-keyword-misses-required",
+        "state-position-misses-required",
+    ],
+)
+def test_env_test_rejects_inspectable_episode_scorers_that_cannot_bind_online_call(
+    monkeypatch, tmp_path, capsys, scorer_source
+):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self): return [EvalCase(id='episode', input='held out')]\n"
+        f"    {scorer_source}\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _MultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "evaluation suite episode failed contract checks" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_warns_when_episode_suite_cannot_receive_state(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'last-response'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self):\n"
+        "        return [EvalCase(id='episode', input='finish the exchange', expected=[\n"
+        "            {'role': 'assistant', 'content': 'first'},\n"
+        "            {'role': 'assistant', 'content': 'second'},\n"
+        "        ])]\n"
+        "    def score(self, case, response): return response == 'second'\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _MultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "evaluation suite last-response: 1/1 cases passed contract checks" in captured.out
+    assert captured.err.count("each episode will still be played out") == 1
+    assert "only the episode's final response text, not the transcript" in captured.err
+
+
+def test_env_test_rejects_episode_suite_for_single_turn_environment(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'episode'\n"
+        "    grades_episodes = True\n"
+        "    def cases(self): return [EvalCase(id='a', input='what is 2 + 2?', expected='4')]\n"
+        "    def score(self, case, response, state): return True\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+    _patch_loader(monkeypatch, _SingleTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "suite sets grades_episodes = True, but this environment is single-turn" in captured.err
+    assert "each episode will still be played out" not in captured.err
+    assert "overall: FAIL" in captured.err
 
 
 def test_env_test_rejects_an_evaluation_case_whose_image_cannot_be_resolved(
@@ -1231,6 +1516,42 @@ def test_env_test_multi_turn_malformed_env_reply_fails_contract(monkeypatch, tmp
     assert "0/1 episodes passed contract checks" in captured.out
     assert "env_reply is not well-formed" in captured.err
     assert "overall: FAIL" in captured.err
+
+
+def test_env_test_validates_images_added_by_an_in_loop_env_reply(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    env = _ImageReplyMultiTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "remote image URLs are not supported" in captured.err
+    assert "overall: FAIL" in captured.err
+    assert env.reply_calls == 1
+    assert env.scored_state is None
+    assert env.state["messages"][-1]["content"][0]["type"] == "image_url"
+
+
+def test_env_test_skips_prompt_validation_after_natural_in_loop_termination(
+    monkeypatch, tmp_path, capsys
+):
+    env_dir = _environment_dir(tmp_path)
+    env = _NaturallyDoneImageReplyMultiTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=replay turns=1 reward=0.500000" in captured.out
+    assert "overall: PASS" in captured.out
+    assert "remote image URLs are not supported" not in captured.err
+    assert "env_reply is not well-formed" not in captured.err
+    assert "never finished" not in captured.err
+    assert env.reply_calls == 1
+    assert env.scored_state is env.state
+    assert env.state["done"] is True
+    assert env.state["applied"] is True
+    assert env.state["turn"] == 1 < env.max_turns
+    assert env.state["messages"][-1]["content"][0]["type"] == "image_url"
 
 
 def test_env_test_multi_turn_stops_on_empty_env_reply(monkeypatch, tmp_path, capsys):
@@ -2951,12 +3272,7 @@ def test_env_test_does_not_warn_when_an_episode_finishes_on_its_per_example_cap(
 
 
 class _MalformedFinalReplyEnv(_PerExampleCapDeadEnv):
-    """An env whose LAST `env_reply` is malformed, reached only at the ceiling.
-
-    Scalar `content` breaks the chat template in a real rollout, which is why every in-loop reply is
-    envelope-checked. This one is issued by the deferred call after the loop, and a per-example
-    budget makes that the common path rather than a rare one.
-    """
+    """An env whose terminal reply is not suitable for a future model prompt."""
 
     def env_reply(self, messages, state):
         state["turn"] += 1
@@ -2969,21 +3285,58 @@ class _MalformedFinalReplyEnv(_PerExampleCapDeadEnv):
         return [reply]
 
 
-def test_env_test_validates_the_deferred_final_env_reply(monkeypatch, tmp_path, capsys):
-    """The last `env_reply` of a capped episode must be checked like every other one.
+class _ImageFinalReplyEnv(_PerExampleCapDeadEnv):
+    def __init__(self):
+        super().__init__()
+        self.reply_calls = 0
+        self.state = None
 
-    An episode stopped at the ceiling has its final reply issued by the deferred call after the
-    loop, so that call is the ONLY `env_reply` an author sees validated for such an episode. It was
-    unchecked, and an environment whose final reply is malformed reached `overall: PASS` -- then
-    broke tokenization on the paid run, which is precisely what the in-loop check exists to prevent.
-    """
+    def new_rollout_state(self, example):
+        self.state = super().new_rollout_state(example)
+        return self.state
+
+    def env_reply(self, messages, state):
+        self.reply_calls += 1
+        state["turn"] += 1
+        content = (
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/final.png"},
+                }
+            ]
+            if state["turn"] >= 3
+            else "keep going"
+        )
+        reply = {"role": "user", "content": content}
+        messages.append(reply)
+        return [reply]
+
+
+def test_env_test_does_not_validate_the_deferred_final_reply_as_a_prompt(
+    monkeypatch, tmp_path, capsys
+):
     env_dir = _environment_dir(tmp_path)
     _patch_loader(monkeypatch, _MalformedFinalReplyEnv())
 
-    assert cmd_env_test(_args(env_dir)) == 1
+    assert cmd_env_test(_args(env_dir)) == 0
     captured = capsys.readouterr()
-    assert "env_reply is not well-formed" in captured.err
-    assert "overall: FAIL" in captured.err
+    assert "env_reply is not well-formed" not in captured.err
+    assert "overall: PASS" in captured.out
+
+
+def test_env_test_allows_images_added_by_the_deferred_final_reply(monkeypatch, tmp_path, capsys):
+    env_dir = _environment_dir(tmp_path)
+    env = _ImageFinalReplyEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "remote image URLs are not supported" not in captured.err
+    assert "overall: PASS" in captured.out
+    assert env.reply_calls == 3
+    assert env.scored_state is env.state
+    assert env.state["messages"][-1]["content"][0]["type"] == "image_url"
 
 
 class _NoFinalReplyEnv(_PerExampleCapDeadEnv):
@@ -3000,13 +3353,7 @@ class _NoFinalReplyEnv(_PerExampleCapDeadEnv):
 
 
 def test_env_test_allows_an_empty_deferred_final_env_reply(monkeypatch, tmp_path, capsys):
-    """Returning no final observation is legal, and must not be read as a malformed reply.
-
-    The paired negative for the test above. `_check_messages` rejects an empty list, so validating
-    the deferred reply without checking for emptiness first would fail every environment that simply
-    has nothing more to say -- the in-loop path breaks on that case before validating, and this one
-    has to agree.
-    """
+    """Returning no final observation is legal and still applies the final action."""
     env_dir = _environment_dir(tmp_path)
     _patch_loader(monkeypatch, _NoFinalReplyEnv())
 

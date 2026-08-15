@@ -224,6 +224,11 @@ int, `strict=true` as a bool, and anything that does not parse as a TOML scalar 
 `flash env eval` takes the same two flags, for the same reason: a held-out suite scored
 against a differently-configured environment is not measuring your run.
 
+For a multi-turn environment, `flash env eval` still defaults to one prompt and one reply, which is
+a valid first-action check. Set `grades_episodes = True` on a suite to play one generation per turn.
+A scorer with the recommended `score(case, response, state)` signature receives the finished
+transcript state; otherwise the scorer receives only the episode's final response text.
+
 **It is also a three-example smoke test, not a dataset audit.** `flash env test` runs the
 contract checks against the **first 3 rows only** (`_DEFAULT_EPISODES = 3`, and it iterates
 `dataset[:episode_count]`), so a malformed prompt, a scorer that raises, or a bad episode
