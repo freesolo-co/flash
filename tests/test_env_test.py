@@ -358,8 +358,13 @@ def test_env_test_validates_episode_suite_with_finished_state(monkeypatch, tmp_p
     assert "overall: PASS" in captured.out
 
 
-def test_env_test_episode_suite_without_expected_does_not_require_sft_gold(
-    monkeypatch, tmp_path, capsys
+@pytest.mark.parametrize(
+    "expected_clause",
+    ["", ", expected='success'", ", expected={'status': 'success'}"],
+    ids=["missing", "scalar", "structured"],
+)
+def test_env_test_episode_suite_does_not_require_sft_gold(
+    monkeypatch, tmp_path, capsys, expected_clause
 ):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
@@ -367,7 +372,7 @@ def test_env_test_episode_suite_without_expected_does_not_require_sft_gold(
         "class Suite:\n"
         "    name = 'episode'\n"
         "    grades_episodes = True\n"
-        "    def cases(self): return [EvalCase(id='episode', input='held out')]\n"
+        f"    def cases(self): return [EvalCase(id='episode', input='held out'{expected_clause})]\n"
         "    def score(self, case, response, state):\n"
         "        return response == 'test' and bool(state['messages'])\n"
         "def load_evaluations(environment=None): return [Suite()]\n"
@@ -375,7 +380,7 @@ def test_env_test_episode_suite_without_expected_does_not_require_sft_gold(
 
     class _NoEvaluationGoldEnv(_MultiTurnEnv):
         def sft_completion(self, example):
-            if example.get("output") is None:
+            if example["input"] == "held out":
                 raise AssertionError("evaluation case requested an sft target")
             return super().sft_completion(example)
 

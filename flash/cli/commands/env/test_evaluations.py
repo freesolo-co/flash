@@ -87,7 +87,7 @@ def _episode_evaluation_response(env, case) -> tuple[str, dict]:
         _evaluation_example(case),
         record,
         score=False,
-        replay_gold=case.expected is not None,
+        replay_gold=False,
     )
     state = record["state"]
     response = state.get("response_text")
