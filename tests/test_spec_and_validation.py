@@ -1174,7 +1174,14 @@ def test_gpu_provider_preferences_reject_invalid_authoring() -> None:
         spec_from_dict(_raw(**{"gpu.provider": "runpod", "gpu.providers": ["vast"]}))
 
 
-def test_cost_quote_preserves_soft_provider_preference() -> None:
+def test_cost_quote_preserves_soft_provider_preference(monkeypatch) -> None:
+    """The quote follows the authored preference, on a plane configured to serve it.
+
+    The harness deletes the lambda/vast keys and injects only a RunPod pool, so the preference has
+    to be made reachable explicitly -- quoting lambda on the bare fixture plane would assert the
+    very defect `test_cost_quote_skips_a_preference_this_plane_cannot_provision` guards against.
+    """
+    import flash.providers as providers_registry
     from flash.cost.analytical import estimate_cost
     from flash.cost.spec import runconfig_from_spec
 
@@ -1183,6 +1190,33 @@ def test_cost_quote_preserves_soft_provider_preference() -> None:
 
     assert config.provider == "auto"
     assert config.providers == ("lambda", "vast")
+    monkeypatch.setattr(
+        providers_registry, "available_providers", lambda: ("runpod", "lambda", "vast")
+    )
+    assert estimate_cost(config).provider == "lambda"
+
+
+def test_cost_quote_skips_a_preference_this_plane_cannot_provision(monkeypatch) -> None:
+    """The quote must price what allocation would really rent, not an unreachable preference.
+
+    ``allocate()`` searches the CONFIGURED providers, so a preference naming one this plane has no
+    credentials for is silently ignored there. Quoting it anyway prices a shape the run can never
+    get, and the server's affordability check runs on that estimate -- so a balance that covers the
+    real allocation can be refused with a 402.
+    """
+    import flash.providers as providers_registry
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.spec import runconfig_from_spec
+
+    spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"]}))
+    config = runconfig_from_spec(spec)
+
+    monkeypatch.setattr(providers_registry, "available_providers", lambda: ("runpod",))
+    unreachable = estimate_cost(config)
+    assert unreachable.provider == "runpod"
+
+    # the same preference is still honored on a plane that can actually provision it.
+    monkeypatch.setattr(providers_registry, "available_providers", lambda: ("runpod", "lambda"))
     assert estimate_cost(config).provider == "lambda"
 
 
