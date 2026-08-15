@@ -1,11 +1,4 @@
-"""Fused-expert LoRA targeting and legacy-export normalization.
-
-PEFT adapts fused routed experts through ``target_parameters`` because the experts are direct
-``nn.Parameter`` objects rather than ordinary modules. verl's exporter currently loses that field
-and derives synthetic ``target_modules`` names from PEFT's nested wrapper tensor paths. This module
-is the single definition of those adapter-shape rules so submit, export, and worker recovery cannot
-drift into accepting different artifacts.
-"""
+"""Fused-expert LoRA targeting, validation, and export normalization."""
 
 from __future__ import annotations
 
@@ -18,6 +11,8 @@ _QWEN35_EXPERT_TARGET_PARAMETERS = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
 )
+_FUSED_EXPERT_SYNTHETIC_MODULES = frozenset({"experts", "base_layer"})
+_FUSED_EXPERT_WRAPPER_MODULES = ("mlp.experts", "mlp.experts.base_layer")
 
 
 def lora_target_parameters(model_id: str | None) -> list[str] | None:
@@ -27,38 +22,71 @@ def lora_target_parameters(model_id: str | None) -> list[str] | None:
     return None
 
 
-def expected_fused_expert_modules(model_id: str | None) -> set[str]:
-    """Return the synthetic ``target_modules`` names verl emits for the expert wrappers."""
-    targets = lora_target_parameters(model_id)
-    if not targets:
-        return set()
-    return {target.split(".")[-2] for target in targets if "." in target} | {"base_layer"}
-
-
-def restore_fused_expert_targets(config: dict[str, Any], model_id: str) -> None:
-    """Restore the fused-expert targets verl drops and remove its synthetic module names."""
-    targets = lora_target_parameters(model_id)
-    if not targets:
+def validate_fused_expert_adapter_config(config: Mapping[str, Any], model_id: str) -> None:
+    """Validate the exact current adapter config required by a fused-expert model."""
+    required = lora_target_parameters(model_id)
+    if not required:
         return
-    config["target_parameters"] = list(targets)
+
+    targets = config.get("target_parameters")
+    if not isinstance(targets, list):
+        raise ValueError(
+            f"adapter for {model_id} omits required expert targets; "
+            "target_parameters must be a list of strings"
+        )
+    if any(not isinstance(target, str) for target in targets):
+        raise ValueError(
+            f"adapter for {model_id} must declare target_parameters as a list of strings"
+        )
+    if len(targets) != len(set(targets)):
+        raise ValueError(f"adapter for {model_id} must declare unique target_parameters")
+    if set(targets) != set(required):
+        raise ValueError(
+            f"adapter for {model_id} must declare exactly the fused expert targets {required}"
+        )
+
     modules = config.get("target_modules")
-    if isinstance(modules, list):
-        config["target_modules"] = sorted(
-            {str(module) for module in modules} - expected_fused_expert_modules(model_id)
+    if modules is None:
+        return
+    if isinstance(modules, str):
+        if modules != "all-linear":
+            raise ValueError(f"adapter for {model_id} string target_modules must be 'all-linear'")
+        return
+    if not isinstance(modules, list) or any(
+        not isinstance(module, str) or not module for module in modules
+    ):
+        raise ValueError(
+            f"adapter for {model_id} target_modules must be null, 'all-linear', or a list of "
+            "non-empty strings"
+        )
+    synthetic = [module for module in modules if _targets_fused_expert_wrapper(module)]
+    if synthetic:
+        raise ValueError(
+            f"adapter for {model_id} contains invalid synthetic target_modules {sorted(synthetic)}"
         )
 
 
-def legacy_fused_expert_config_is_recoverable(config: Mapping[str, Any], model_id: str) -> bool:
-    """Return whether config has the complete fingerprint of verl's lossy legacy export.
+def _targets_fused_expert_wrapper(module: str) -> bool:
+    """Return whether PEFT suffix matching binds this target to an expert wrapper."""
+    return any(
+        module == wrapper or module.endswith(f".{wrapper}") or wrapper.endswith(f".{module}")
+        for wrapper in _FUSED_EXPERT_WRAPPER_MODULES
+    )
 
-    This is eligibility for tensor-backed recovery, not proof that the weights are complete. The
-    worker must still validate the tensor keys before restoring the fields.
-    """
-    fingerprint = expected_fused_expert_modules(model_id)
-    if not fingerprint or config.get("target_parameters"):
-        return False
+
+def normalize_verl_fused_expert_export(config: dict[str, Any], model_id: str) -> None:
+    """Write the canonical fused targets into a verl-exported adapter config."""
+    targets = lora_target_parameters(model_id)
+    if not targets:
+        return
+    config["target_parameters"] = targets
     modules = config.get("target_modules")
-    return isinstance(modules, (list, tuple)) and fingerprint <= {str(module) for module in modules}
+    if isinstance(modules, list):
+        config["target_modules"] = [
+            module
+            for module in modules
+            if not isinstance(module, str) or module not in _FUSED_EXPERT_SYNTHETIC_MODULES
+        ]
 
 
 def has_complete_fused_expert_tensors(keys: Iterable[str], model_id: str) -> bool:

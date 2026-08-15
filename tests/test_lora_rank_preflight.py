@@ -311,95 +311,183 @@ def test_lora_rank_uses_schema_adapter_storage_ref_parser():
     )
 
 
-def test_submit_rejects_a_warmstart_source_that_never_trained_the_fused_experts():
-    """the expert contract is checked at submit, not after the gpus are rented.
+_FUSED_MODEL = "Qwen/Qwen3.6-35B-A3B"
+_FUSED_TARGETS = [
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+]
+_MISSING = object()
 
-    the worker-side check ran at ``stage=rl_adapter_loading``, so a bad warm-start source was only
-    discovered once 2x H200 were allocated -- and the dead run still reported ``cost: 0.0`` against
-    a real rental. the source adapter's config is already fetched during preparation, so the same
-    contract costs nothing here.
-    """
-    from flash.runner.preparation import _require_warmstart_expert_targets
 
-    moe = "Qwen/Qwen3.6-35B-A3B"
-    targets = ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
+@pytest.mark.parametrize("targets", [_FUSED_TARGETS, list(reversed(_FUSED_TARGETS))])
+def test_fused_expert_config_accepts_exact_target_order_variants(targets):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
 
-    # a correctly exported adapter passes.
-    _require_warmstart_expert_targets(
-        {"target_parameters": targets, "target_modules": ["q_proj"]}, moe
+    validate_fused_expert_adapter_config(
+        {"target_parameters": targets, "target_modules": ["q_proj"]}, _FUSED_MODEL
     )
-    # so does a pre-fix verl export: it dropped target_parameters but flattened the wrapped expert
-    # modules into target_modules, which is the fingerprint the worker recovers from the weights.
-    _require_warmstart_expert_targets(
-        {"target_parameters": None, "target_modules": ["q_proj", "experts", "base_layer"]}, moe
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        pytest.param(_MISSING, id="missing"),
+        pytest.param(None, id="null"),
+        pytest.param([], id="empty"),
+        pytest.param("mlp.experts.gate_up_proj", id="string"),
+        pytest.param(["mlp.experts.gate_up_proj"], id="partial"),
+        pytest.param([*_FUSED_TARGETS, "mlp.router"], id="extra"),
+        pytest.param([_FUSED_TARGETS[0], _FUSED_TARGETS[0]], id="duplicate"),
+        pytest.param([_FUSED_TARGETS[0], 7], id="non-string"),
+    ],
+)
+def test_fused_expert_config_rejects_noncanonical_target_parameters(targets):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    config = {"target_modules": ["q_proj"]}
+    if targets is not _MISSING:
+        config["target_parameters"] = targets
+    with pytest.raises(ValueError, match=r"target_parameters|fused expert targets"):
+        validate_fused_expert_adapter_config(config, _FUSED_MODEL)
+
+
+@pytest.mark.parametrize(
+    "modules",
+    [
+        pytest.param(_MISSING, id="missing"),
+        pytest.param(None, id="null"),
+        pytest.param("all-linear", id="string"),
+        pytest.param(["q_proj", "v_proj"], id="list"),
+    ],
+)
+def test_fused_expert_config_accepts_supported_target_module_shapes(modules):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    config = {"target_parameters": list(_FUSED_TARGETS)}
+    if modules is not _MISSING:
+        config["target_modules"] = modules
+    validate_fused_expert_adapter_config(config, _FUSED_MODEL)
+
+
+@pytest.mark.parametrize(
+    "modules",
+    [
+        pytest.param("experts", id="synthetic-string-experts"),
+        pytest.param("base_layer", id="synthetic-string-base-layer"),
+        pytest.param(r".*\.mlp\.experts", id="synthetic-regex"),
+        pytest.param("[", id="invalid-regex"),
+        pytest.param(["q_proj", "experts"], id="synthetic-list-experts"),
+        pytest.param(["base_layer", "q_proj"], id="synthetic-list-base-layer"),
+        pytest.param(["mlp.experts"], id="synthetic-list-owner"),
+        pytest.param(["experts.base_layer"], id="synthetic-list-nested"),
+        pytest.param(["model.layers.0.mlp.experts"], id="synthetic-list-qualified"),
+        pytest.param(["q_proj", ""], id="empty-list-entry"),
+        pytest.param(7, id="integer"),
+        pytest.param({"q_proj"}, id="set"),
+        pytest.param(("q_proj",), id="tuple"),
+        pytest.param(["q_proj", 7], id="non-string-list-entry"),
+    ],
+)
+def test_fused_expert_config_rejects_synthetic_or_malformed_target_modules(modules):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match="target_modules"):
+        validate_fused_expert_adapter_config(
+            {"target_parameters": list(_FUSED_TARGETS), "target_modules": modules},
+            _FUSED_MODEL,
+        )
+
+
+def test_fused_expert_config_is_a_noop_for_non_fused_models():
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    malformed = {"target_parameters": None, "target_modules": {"experts"}}
+    validate_fused_expert_adapter_config(malformed, "Qwen/Qwen3.5-9B")
+
+
+def _patch_fused_submit_preflight(monkeypatch, config, *, reject_config):
+    import flash.adapters.fused_experts as fused_experts
+    import flash.adapters.lora_rank as lora_rank
+    import flash.runner.preparation as preparation
+    import flash.runner.results.checkpoints as checkpoints
+
+    target_spec = _spec(model=_FUSED_MODEL)
+    target_spec = replace(
+        target_spec,
+        train=replace(target_spec.train, init_from_adapter="source-run"),
     )
-    # a non-moe model has no expert contract at all.
-    _require_warmstart_expert_targets({"target_parameters": None}, "Qwen/Qwen3.5-9B")
+    source_spec = replace(
+        target_spec,
+        train=replace(
+            target_spec.train,
+            init_from_adapter="",
+            hf_repo="owner/runs",
+        ),
+    )
+    status = SimpleNamespace(state="done")
+    runner = SimpleNamespace(
+        _require_supported_adapter_continuation=lambda _spec: None,
+        get_status=lambda _run_id: status,
+        _warmstart_source_is_authorized=lambda *_args, **_kwargs: True,
+        effective_spec_from_status=lambda _status: source_spec,
+    )
+    events = []
 
-    # neither the targets nor the fingerprint: the experts were genuinely never adapted.
-    with pytest.raises(ValueError, match="fused routed experts"):
-        _require_warmstart_expert_targets(
-            {"target_parameters": None, "target_modules": ["q_proj", "v_proj"]}, moe
-        )
-    # a partial target set is not silently topped up.
-    with pytest.raises(ValueError, match="fused routed experts"):
-        _require_warmstart_expert_targets(
-            {"target_parameters": ["mlp.experts.gate_up_proj"], "target_modules": ["q_proj"]}, moe
-        )
+    def load_config(_ref, _token, _revision):
+        events.append(("load", config))
+        return config
 
+    def validate_config(seen, model_id):
+        assert seen is config
+        assert model_id == _FUSED_MODEL
+        events.append(("validate", seen))
+        if reject_config:
+            raise ValueError("invalid fused config")
 
-def test_submit_rejects_a_partial_declaration_before_the_worker():
-    """a partial target list is definitely invalid and must fail before hardware allocation.
+    def preflight(spec, *, token, config_loader):
+        assert spec.model == _FUSED_MODEL
+        seen = config_loader("unused", token, "unused")
+        assert seen is config
+        events.append(("preflight", seen))
+        return SimpleNamespace(rank=16, alpha=32)
 
-    verl drops ``target_parameters`` wholesale, so a partial list alongside the flattened-module
-    fingerprint is not a legacy export shape. the worker rejects it too; accepting it at submit
-    would merely defer the same error to ``stage=rl_adapter_loading`` on allocated hardware.
-    """
-    import flash.engine.worker.model.adapter as adapter_mod
-    from flash.runner.preparation import _require_warmstart_expert_targets
-
-    moe = "Qwen/Qwen3.6-35B-A3B"
-    partial_with_fingerprint = {
-        "target_parameters": ["mlp.experts.gate_up_proj"],
-        "target_modules": ["q_proj", "experts", "base_layer"],
-    }
-
-    with pytest.raises(ValueError, match="fused routed experts"):
-        _require_warmstart_expert_targets(partial_with_fingerprint, moe)
-
-    # and the worker rejects the same config, which is why submit must not have accepted it.
-    with pytest.raises(ValueError, match="omits required expert targets"):
-        adapter_mod.prepare_warmstart_adapter_config(dict(partial_with_fingerprint), moe, None)
-
-
-@pytest.mark.parametrize("synthetic", ["experts", "base_layer"])
-def test_submit_requires_the_complete_legacy_fingerprint(synthetic):
-    """HALF the fingerprint means a TRUNCATED adapter, which the worker will reject.
-
-    verl derives ``target_modules`` from tensor names, so an adapter that trained both fused
-    parameters yields both synthetic names while one that trained a single parameter yields only
-    one. accepting either name on its own therefore admits exactly the truncated adapter the
-    worker's wrapper count rejects -- after the gpus are rented, which is the cost regression this
-    preflight exists to prevent.
-    """
-    from flash.runner.preparation import _require_warmstart_expert_targets
-
-    with pytest.raises(ValueError, match="fused routed experts"):
-        _require_warmstart_expert_targets(
-            {"target_parameters": None, "target_modules": ["q_proj", synthetic]},
-            "Qwen/Qwen3.6-35B-A3B",
-        )
+    monkeypatch.setattr(preparation, "_runner", lambda: runner)
+    monkeypatch.setattr(preparation, "_adopted_warmstart_revision", lambda spec, _source: spec)
+    monkeypatch.setattr(checkpoints, "adapter_artifact_exists", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(lora_rank, "resolve_hf_dataset_revision", lambda *_args: "revision")
+    monkeypatch.setattr(lora_rank, "load_hf_adapter_config", load_config)
+    monkeypatch.setattr(lora_rank, "preflight_init_adapter_lora_rank", preflight)
+    monkeypatch.setattr(
+        lora_rank,
+        "adapter_artifact_identity",
+        lambda *_args, **_kwargs: SimpleNamespace(to_dict=dict),
+    )
+    monkeypatch.setattr(fused_experts, "validate_fused_expert_adapter_config", validate_config)
+    return preparation, target_spec, events
 
 
-def test_the_legacy_fingerprint_has_exactly_one_definition():
-    """the exporter, the preflight and the worker must not re-derive this set independently.
+def test_submit_rejects_fused_config_before_rank_preflight(monkeypatch):
+    config = _config(target_parameters=None)
+    preparation, target_spec, events = _patch_fused_submit_preflight(
+        monkeypatch, config, reject_config=True
+    )
 
-    they need it for three different reasons (strip it, recognize it, agree with both), so three
-    local derivations are how they drift apart -- which is what let the preflight accept half a
-    fingerprint the worker rejected.
-    """
-    from flash.adapters.fused_experts import expected_fused_expert_modules
+    with pytest.raises(ValueError, match="invalid fused config"):
+        preparation._prepare_init_from_adapter_inner(target_spec)
 
-    assert expected_fused_expert_modules("Qwen/Qwen3.6-35B-A3B") == {"experts", "base_layer"}
-    assert expected_fused_expert_modules("Qwen/Qwen3.5-9B") == set()
-    assert expected_fused_expert_modules(None) == set()
+    assert events == [("load", config), ("validate", config)]
+
+
+def test_submit_passes_the_loaded_config_to_validation_then_rank_preflight(monkeypatch):
+    config = _config(target_parameters=list(_FUSED_TARGETS))
+    preparation, target_spec, events = _patch_fused_submit_preflight(
+        monkeypatch, config, reject_config=False
+    )
+
+    preparation._prepare_init_from_adapter_inner(target_spec)
+
+    assert events == [
+        ("load", config),
+        ("validate", config),
+        ("preflight", config),
+    ]

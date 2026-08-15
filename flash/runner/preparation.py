@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -163,40 +162,6 @@ def _prepare_init_from_adapter(
         raise _runner().WarmStartPreparationError(str(exc)) from exc
 
 
-def _require_warmstart_expert_targets(config: Mapping[str, Any], model_id: str) -> None:
-    """reject a warm-start source that never adapted the model's fused routed experts.
-
-    the worker proves the tensor coverage after download, but only after the gpus are rented. this
-    config-only gate catches sources that are DEFINITELY invalid while the config is already in hand,
-    so those runs fail at submit instead of at ``stage=rl_adapter_loading`` on allocated hardware.
-
-    a pre-fix verl export is not definitely invalid merely because ``target_parameters`` is empty:
-    verl dropped the field wholesale and flattened the two wrapped parameters into the complete
-    ``experts``/``base_layer`` fingerprint. that fingerprint makes the source ELIGIBLE for the
-    worker's tensor-backed recovery; it is not itself proof that every tensor is present.
-
-    partial declarations and partial fingerprints are rejected here. neither is a shape verl's
-    lossy exporter can produce from a complete adapter, and the worker would reject both once it can
-    inspect the weights.
-    """
-    from flash.adapters.fused_experts import (
-        legacy_fused_expert_config_is_recoverable,
-        lora_target_parameters,
-    )
-
-    required = set(lora_target_parameters(model_id) or ())
-    if not required:
-        return
-    declared = {str(target) for target in (config.get("target_parameters") or ())}
-    if required <= declared or legacy_fused_expert_config_is_recoverable(config, model_id):
-        return
-    raise ValueError(
-        f"train.init_from_adapter source did not train the fused routed experts required by "
-        f"{model_id} (missing {sorted(required - declared)}); warm start would silently leave "
-        "them unadapted"
-    )
-
-
 def _prepare_init_from_adapter_inner(
     spec: JobSpec,
     *,
@@ -208,6 +173,7 @@ def _prepare_init_from_adapter_inner(
     ref = spec.train.init_from_adapter
     if not ref:
         return spec, spec, None
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
     from flash.adapters.lora_rank import (
         adapter_artifact_identity,
         load_hf_adapter_config,
@@ -290,7 +256,7 @@ def _prepare_init_from_adapter_inner(
         ),
     )
     config = load_hf_adapter_config(storage, token, revision)
-    _require_warmstart_expert_targets(config, spec.model)
+    validate_fused_expert_adapter_config(config, spec.model)
     metadata = preflight_init_adapter_lora_rank(
         worker_spec, token=token, config_loader=lambda _ref, _token, _revision: config
     )

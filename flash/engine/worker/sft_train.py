@@ -67,7 +67,7 @@ def _warmstart_adapter_path(model_id: str, model_revision: str, expected_rank: i
             f"SFT warm-start adapter rank {rank} does not match the prepared train.lora_rank "
             f"{expected_rank}; rank changes are not supported"
         )
-    _w.prepare_warmstart_adapter_config(config, model_id, adapter_dir)
+    _w.validate_warmstart_adapter(config, model_id, adapter_dir)
     base = str(config.get("base_model_name_or_path") or "").strip()
     if base and base != model_id:
         raise ValueError("SFT warm-start adapter base model does not match the target model")
