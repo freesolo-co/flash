@@ -495,25 +495,69 @@ def _unwrap_pattern_groups(pattern: str) -> str:
     parentheses because they no longer name a single field. Alternation inside a group is left
     alone for the same reason: `(password|city)` is not simply `password`.
     """
-    previous = None
-    current = pattern
-    while current != previous:
-        previous = current
-        current = current.removeprefix("^").removesuffix("$")
-        if not (current.startswith("(") and current.endswith(")")):
-            continue
-        inner = current[1:-1].removeprefix("?:")
-        depth = 0
-        for character in inner:
-            if character == "(":
-                depth += 1
-            elif character == ")":
-                depth -= 1
-                if depth < 0:
-                    break
-        if depth == 0 and "|" not in inner:
-            current = inner
-    return _flatten_inner_groups(current)
+    # every parenthesis is matched, and every `|` counted, in ONE pass up front. asking per layer --
+    # slicing the remainder and rescanning it for balance and bars -- re-read the same characters
+    # once per level of nesting, so a pattern of redundant nesting, caller-controlled and inside the
+    # ingress limit, cost quadratic time: 16,000 groups took 7.8s during post-call trace
+    # persistence, which runs after the paid upstream call and occupies a worker. With the two
+    # lookups precomputed, each layer costs a constant amount and the loop becomes linear overall.
+    closes = _group_close_positions(pattern)
+    preceding_bars = _preceding_bar_counts(pattern)
+    start, end = 0, len(pattern)
+    while True:
+        # one anchor at each end per pass, repeated: a doubled `^^name$$` peels down to the name it
+        # spells, exactly as the repeated `removeprefix`/`removesuffix` did.
+        stripped = False
+        if start < end and pattern[start] == "^":
+            start += 1
+            stripped = True
+        if end > start and pattern[end - 1] == "$":
+            end -= 1
+            stripped = True
+        peeled = False
+        # the group opening the span must close exactly at its end, or it wraps only part of the
+        # expression: `(a)x(b)` keeps its parentheses because they no longer name a single field.
+        if end - start >= 2 and pattern[start] == "(" and closes[start] == end - 1:
+            inner_start = start + 1
+            if pattern.startswith("?:", inner_start, end - 1):
+                inner_start += 2
+            # a bar anywhere inside makes the group a branch set rather than a name:
+            # `(password|city)` is not simply `password`.
+            if preceding_bars[end - 1] == preceding_bars[inner_start]:
+                start, end = inner_start, end - 1
+                peeled = True
+        if not (stripped or peeled):
+            break
+    return _flatten_inner_groups(pattern[start:end])
+
+
+def _group_close_positions(pattern: str) -> list[int]:
+    """For each `(`, the index of the `)` that closes it -- or -1 when it is never closed.
+
+    Escapes are deliberately NOT honoured: the balance test this replaces read the group's raw
+    text, where `\\(` counts as an opening parenthesis like any other. Honouring them here would
+    unwrap a group the previous form refused, changing which patterns name a credential.
+    """
+    closes = [-1] * len(pattern)
+    open_indices: list[int] = []
+    for index, character in enumerate(pattern):
+        if character == "(":
+            open_indices.append(index)
+        elif character == ")" and open_indices:
+            closes[open_indices.pop()] = index
+    return closes
+
+
+def _preceding_bar_counts(pattern: str) -> list[int]:
+    """How many `|` appear before each index, so any span's count is the difference of two reads.
+
+    Escapes are not honoured here either, for the same reason: the containment test this replaces
+    asked `"|" in inner` of the raw text, where an escaped bar counts.
+    """
+    counts = [0] * (len(pattern) + 1)
+    for index, character in enumerate(pattern):
+        counts[index + 1] = counts[index] + (character == "|")
+    return counts
 
 
 _QUANTIFIERS = frozenset({"?", "*", "+", "{"})
@@ -531,59 +575,92 @@ def _flatten_inner_groups(pattern: str) -> str:
     than guessed at; a lookaround consumes nothing; alternation is a branch set handled separately.
     Anything left unspliced simply fails the name test, which is the safe direction.
 
-    Splicing repeats until it changes nothing, because one pass only removes the OUTERMOST layer:
-    `pass(?:wo(?:rd))` became `passwo(?:rd)`, still a regex rather than `password`, so a name
-    bracketed more than one level deep kept its schema's credential literals in the raw export.
+    A level is spliced only when EVERY group at that level can be -- one that cannot leaves the
+    expression as the previous level left it -- so the shallowest unspliceable group decides how
+    far the splicing reaches. Finding that depth takes one pass over the extents, where repeating a
+    whole pass per level rescanned and rebuilt the expression once per level of nesting: `pass`
+    followed by 8,000 nested `(?:` cost 9.6s during post-call trace persistence, which runs after
+    the paid upstream call and occupies a worker.
     """
-    previous = None
-    while pattern != previous:
-        previous = pattern
-        pattern = _splice_outer_groups(pattern)
-    return pattern
+    extents = _pattern_group_extents(pattern)
+    if extents is None:
+        # a `(` that is never closed leaves the extents unknowable, so the expression is judged
+        # whole rather than on a splice that may not reflect what it matches.
+        return pattern
+    # the shallowest group that cannot be spliced stops the splicing one level above itself. with
+    # none, every level splices -- the ordinary case, and the one a `default=0` would silently turn
+    # into "splice nothing".
+    deepest = max((depth for _, _, depth, _ in extents), default=0)
+    limit = min((depth for _, _, depth, splices in extents if not splices), default=deepest + 1) - 1
+    if limit < 1:
+        return pattern
+    dropped = bytearray(len(pattern))
+    for start, end, depth, _ in extents:
+        if depth > limit:
+            continue
+        dropped[start] = dropped[end] = 1
+        if pattern.startswith("?:", start + 1, end):
+            dropped[start + 1] = dropped[start + 2] = 1
+    return "".join(character for index, character in enumerate(pattern) if not dropped[index])
 
 
-def _splice_outer_groups(pattern: str) -> str:
-    """One splicing pass: remove the outermost layer of plainly-consuming groups."""
-    result: list[str] = []
+def _pattern_group_extents(pattern: str) -> list[tuple[int, int, int, bool]] | None:
+    """Each group's start, end, nesting depth, and whether it splices plainly -- in one pass.
+
+    None when some `(` is never closed. Every ancestor of an unclosed group is unclosed too, so the
+    outermost scan reached one and judged the expression whole; reporting it here says the same.
+    """
+    open_groups: list[tuple[int, int]] = []
+    extents: list[tuple[int, int, int, bool]] = []
+    matched_closers = bytearray(len(pattern))
+    bars = 0
     index = 0
     while index < len(pattern):
         character = pattern[index]
-        if character == "\\" and index + 1 < len(pattern):
-            result.append(pattern[index : index + 2])
-            index += 2
-            continue
-        if character != "(":
-            result.append(character)
-            index += 1
-            continue
-        end = _group_end(pattern, index)
-        if end is None:
-            return pattern
-        inner = pattern[index + 1 : end]
-        quantified = end + 1 < len(pattern) and pattern[end + 1] in _QUANTIFIERS
-        if inner.startswith("?") and not inner.startswith("?:"):
-            return pattern
-        if quantified or "|" in inner:
-            return pattern
-        result.append(inner.removeprefix("?:"))
-        index = end + 1
-    return "".join(result)
-
-
-def _group_end(pattern: str, start: int) -> int | None:
-    """Index of the `)` closing the group opened at `start`, or None if it is never closed."""
-    depth = 0
-    index = start
-    while index < len(pattern):
-        character = pattern[index]
         if character == "\\":
+            # an ESCAPED bar counts: the containment test this replaces read the group's raw text,
+            # where `\|` holds a `|` like any other. stepping over the escape without counting it
+            # would splice a group the previous form refused.
+            bars += index + 1 < len(pattern) and pattern[index + 1] == "|"
             index += 2
             continue
-        if character == "(":
-            depth += 1
-        elif character == ")":
-            depth -= 1
-            if depth == 0:
-                return index
+        if character == "|":
+            bars += 1
+        elif character == "(":
+            open_groups.append((index, bars))
+        elif character == ")" and open_groups:
+            start, bars_before = open_groups.pop()
+            extents.append((start, index, len(open_groups) + 1, bars > bars_before))
+            matched_closers[index] = 1
         index += 1
-    return None
+    if open_groups:
+        return None
+    return _with_splice_verdicts(pattern, extents, matched_closers)
+
+
+def _with_splice_verdicts(
+    pattern: str, extents: list[tuple[int, int, int, bool]], matched_closers: bytearray
+) -> list[tuple[int, int, int, bool]]:
+    """Replace each extent's `|` flag with whether that group splices plainly.
+
+    A group is left alone when it does not plainly consume its contents: `?` opens a lookaround or
+    a flag group, a quantifier makes the contents optional or repeated, and `|` makes it a branch
+    set. The quantifier sits after the group's `)` in the string AS IT WILL BE when this group is
+    the outermost one, which is the original with its ancestors' closers gone -- so the closers are
+    stepped over, and only those of groups that actually matched, since a stray `)` is a literal
+    that stays put. That lookup is precomputed once; walking the run per group would restore the
+    quadratic cost on the deeply nested patterns this exists to bound.
+    """
+    following_index = list(range(len(pattern) + 1))
+    for index in range(len(pattern) - 1, -1, -1):
+        if matched_closers[index]:
+            following_index[index] = following_index[index + 1]
+    verdicts = []
+    for start, end, depth, contains_bar in extents:
+        lookaround = pattern.startswith("?", start + 1, end) and not pattern.startswith(
+            "?:", start + 1, end
+        )
+        following = following_index[end + 1]
+        quantified = following < len(pattern) and pattern[following] in _QUANTIFIERS
+        verdicts.append((start, end, depth, not (lookaround or quantified or contains_bar)))
+    return verdicts

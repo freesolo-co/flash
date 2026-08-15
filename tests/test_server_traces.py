@@ -11838,3 +11838,118 @@ def test_an_upstream_rejection_reaches_the_export_with_its_quoted_request_redact
     span = exported["records"][0]["spans"][0]
     assert span["error"] == "upstream returned status 400"
     assert "THIRDPARTY" not in json.dumps(span["output_payload"])
+
+
+def test_enclosing_group_unwrapping_cost_grows_with_the_pattern_not_its_square() -> None:
+    """A fully anchored `patternProperties` key of deeply nested redundant groups made unwrapping
+    peel ONE layer per pass and rescan the rest for balance and alternation, so classification cost
+    grew quadratically: 16,000 groups took 7.8s, at ~4x per doubling. It runs during post-call trace
+    persistence, after the caller has already been billed, so one authenticated request could
+    monopolize a worker.
+
+    Eight times the input costs a linear scan roughly 8x and a quadratic one roughly 64x. The 16x
+    bar sits well clear of both, so the ratio separates them without asserting a wall-clock budget
+    that would flake on a busy machine.
+    """
+    timings = []
+    for groups in (2_000, 16_000):
+        pattern = "^" + ("(" * groups) + "password" + (")" * groups) + "$"
+        started = time.perf_counter()
+        trace_secret_names._is_secret_property_pattern(pattern)
+        timings.append(time.perf_counter() - started)
+
+    assert timings[1] < timings[0] * 16
+
+
+def test_inner_group_flattening_cost_grows_with_the_pattern_not_its_square() -> None:
+    """The same defect sat in the sibling that splices INNER groups: it re-ran a whole pass per
+    level of nesting, which is quadratic for the same reason and measured worse -- 8,000 nested
+    `(?:` took 9.6s. A pattern with a literal prefix takes this path rather than the enclosing one,
+    so fixing only the reported shape would have left the defect reachable."""
+    timings = []
+    for groups in (1_000, 8_000):
+        pattern = "^pass" + ("(?:" * groups) + "word" + (")" * groups) + "$"
+        started = time.perf_counter()
+        trace_secret_names._is_secret_property_pattern(pattern)
+        timings.append(time.perf_counter() - started)
+
+    assert timings[1] < timings[0] * 16
+
+
+@pytest.mark.parametrize(
+    ("pattern", "secret"),
+    [
+        ("^(((password)))$", True),
+        ("^(?:(?:(?:password)))$", True),
+        ("^pass(?:(?:(?:word)))$", True),
+        ("^((api_key))$", True),
+        # a group that does not wrap the WHOLE expression still names more than one field.
+        ("^(a)password(b)$", False),
+        # alternation is a branch set, however deeply it is bracketed.
+        ("^((password|city))$", False),
+        ("^(pass(?:word|phrase))$", False),
+        # a quantified group matches with or without its contents, so it names two fields.
+        ("^(?:password)?$", False),
+        ("^pass(?:word)?$", False),
+        # a lookaround consumes nothing.
+        ("^(?=x)password$", False),
+        # unbalanced input is judged whole rather than on a guessed split.
+        ("^((password)$", False),
+        ("^(password))$", False),
+        ("^()password$", True),
+        ("^(((city)))$", False),
+    ],
+    ids=[
+        "enclosing",
+        "non-capturing",
+        "inner",
+        "two-layer",
+        "partial-wrap",
+        "alternation",
+        "nested-alternation",
+        "quantified",
+        "quantified-inner",
+        "lookaround",
+        "unclosed",
+        "unopened",
+        "empty-group",
+        "benign",
+    ],
+)
+def test_scanning_the_nesting_once_does_not_change_what_a_pattern_names(
+    pattern: str, secret: bool
+) -> None:
+    """The one-pass form must classify exactly what the peel-and-rescan form did. Redacting more
+    would corrupt an ordinary field's recorded schema; redacting less would leak a credential."""
+
+    assert trace_secret_names._is_secret_property_pattern(pattern) is secret
+
+
+def test_a_deeply_bracketed_credential_still_loses_its_schema_literals() -> None:
+    """The end the performance work must not disturb: the pattern still names a credential, so the
+    literals underneath it are still redacted."""
+
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "patternProperties": {
+                            "^(((password)))$": {"default": "THIRDPARTY"},
+                            "^(((city)))$": {"default": "Boston"},
+                        },
+                    },
+                },
+            }
+        ]
+    }
+
+    patterns = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"][
+        "patternProperties"
+    ]
+
+    assert patterns["^(((password)))$"]["default"] == "[redacted]"
+    assert patterns["^(((city)))$"]["default"] == "Boston"
