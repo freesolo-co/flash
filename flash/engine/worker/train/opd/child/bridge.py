@@ -76,6 +76,14 @@ _SECRET_UNKNOWN_SCHEME = r"(?!(?:bearer|basic|token|digest)(?![\w-]))[A-Za-z][\w
 _SECRET_URL_PARAM = (
     r"x-(?:amz|goog)-(?:signature|credential|security-token)|signature|(?<![\w-])sig"
 )
+# a URL carries its password in USERINFO -- `scheme://user:password@host` -- where no key name
+# precedes it, so the key-anchored pattern above cannot see it at all. A connection string built at
+# runtime (a broker dsn, a database url) is in no environment variable, so the value pass misses it
+# too. Only the password is replaced: the scheme, user and host say WHICH endpoint failed and are
+# the diagnostic. The password stops at `@`, and `[^\s/?#@]` keeps a later `@` in a path or query
+# from extending the match past the authority. The user is required to be non-empty so a bare
+# `scheme://:@host` or a `//` in prose cannot match.
+_SECRET_URL_USERINFO = re.compile(r"(?i)\b([a-z][\w+.-]*://[^\s:/?#@]+:)[^\s/?#@]+(?=@)")
 # a KEY-suffixed field is a credential only when a qualifier says so. `key` alone cannot join the
 # list above: `cache_key`, `partition_key` and `idempotency_key` are ordinary diagnostic fields, and
 # redacting them eats the message this record exists to carry. So the qualifier is required and
@@ -461,6 +469,7 @@ def _safe_child_failure_detail(error: Exception) -> str:
             right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
             message = re.sub(f"{left}{pattern}{right}", "<redacted>", message)
     message = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", message)
+    message = _SECRET_URL_USERINFO.sub(r"\1<redacted>", message)
     # shape redaction stays as the fail-closed net for a credential this process cannot know by
     # value -- one minted at runtime (a presigned url, a broker capability) is in neither the
     # environment nor any payload, so it contributes no needle above.

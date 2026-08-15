@@ -4981,6 +4981,71 @@ def test_child_failure_sanitizer_redacts_a_key_passphrase(monkeypatch):
         assert _safe_child_failure_detail(ValueError(message)) == message, message
 
 
+def test_child_failure_sanitizer_redacts_a_password_in_url_userinfo(monkeypatch):
+    """A connection string carries its password positionally, where no key name precedes it.
+
+    ``scheme://user:password@host`` names the field by POSITION, so every key-anchored rule above is
+    blind to it -- there is no ``password=`` to anchor on. The value pass is blind too: a dsn built
+    at runtime from parts (a broker url, a database url assembled by a driver) is in no environment
+    variable and no payload, so it contributes no needle. This is the sanitizer's only positional
+    credential, and a driver that cannot connect echoes the whole url into its exception.
+
+    Only the password is replaced. The scheme, user and host say WHICH endpoint failed, which is the
+    diagnostic this record exists to carry -- redacting the url whole would answer the question the
+    reader opened it for. Asserted in both directions: a url without userinfo is untouched, so an
+    ordinary endpoint in a message survives intact.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message in (
+        "child failed: could not connect to postgresql://flash:runtimepw123@db.example:5432/runs",
+        "child failed: amqp://broker-user:runtimepw123@rabbit.internal:5672/%2f refused",
+        "child failed: redis://default:runtimepw123@cache.internal:6379",
+        "child failed: https://svc:runtimepw123@api.example.com/v1/runs returned 503",
+        "child failed: MONGODB://svc:runtimepw123@mongo.internal/db",  # scheme case-insensitive
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "runtimepw123" not in redacted, f"leaked: {redacted!r}"
+        assert "<redacted>" in redacted, message
+
+    # the password stops at the FIRST `@`. A later one -- in a path, or a query carrying an address
+    # -- must not extend the match, which would swallow the host with it. Asserting only that the
+    # password is gone cannot see this: a greedier rule removes it too, along with the endpoint the
+    # reader needs, so the host is asserted explicitly.
+    for message, expected in (
+        (
+            "child failed: https://svc:runtimepw123@api.example.com/a@b/c",
+            "child failed: https://svc:<redacted>@api.example.com/a@b/c",
+        ),
+        (
+            "child failed: https://svc:runtimepw123@a.example/x?to=admin@example.com",
+            "child failed: https://svc:<redacted>@a.example/x?to=admin@example.com",
+        ),
+    ):
+        assert _safe_child_failure_detail(ValueError(message)) == expected, message
+
+    # the host and user survive: they are the diagnostic, and the run cannot be debugged without
+    # knowing which endpoint refused it.
+    assert (
+        _safe_child_failure_detail(
+            ValueError("child failed: postgresql://flash:runtimepw123@db.example:5432/runs")
+        )
+        == "child failed: postgresql://flash:<redacted>@db.example:5432/runs"
+    )
+
+    # the other direction: no userinfo means no credential, and a colon in a path, a port or prose
+    # must not be read as one. Redacting these would eat ordinary diagnostics.
+    for message in (
+        "child failed: https://api.example.com/v1/runs?attempt=1 returned 503",
+        "child failed: could not reach http://db.example:5432/health",
+        "child failed: see https://docs.example.com/errors/a:b/c",
+        "child failed: user:pass was not supplied",  # no scheme, so not a url at all
+        "child failed: bare //host:1234 is not a url",
+    ):
+        assert _safe_child_failure_detail(ValueError(message)) == message, message
+
+
 def test_child_failure_sanitizer_redacts_every_percent_encoding_casing(monkeypatch):
     """A secret's percent-escapes are matched whatever hex casing the exception rendered.
 

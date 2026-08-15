@@ -271,11 +271,14 @@ def _console_upload_loop(
     free; committing is not (the heartbeat spends 4 of this repo's 5 commits/hour), and the stall
     classifier kills a wedged run at 1200s/3000s -- long before an hourly snapshot would capture the
     hang. So commit only on un-uploaded bytes AND either the interval elapsing or sustained silence
-    (``_console_progress`` explains why bytes cannot serve as the signal). QUIET_POLLS is sized so
+    (``_console_progress`` explains why bytes cannot be the signal). QUIET_POLLS is sized so
     (it + 1) * poll stays under poll_job's 1200s stall.
 
-    ``armed`` is the wedge latch. A wedge is progress that STOPPED, so it arms only after a staged
+    ``armed`` is the wedge latch. A wedge is progress that STOPPED, so it arms only after a
     heartbeat: startup is quiet by nature and counting it would spend a credit on an empty console.
+    WHICH of `_console_progress`'s two counts drives it switches at the first COMMITTED heartbeat
+    (``ever``), for the reason that function's docstring gives: until one lands, a ``pending``
+    heartbeat is the only evidence the run exists, and counts as progress.
     It RE-ARMS on progress, because a healthy slow stage -- one transition, then only liveness pings,
     which ``_console_progress`` subtracts -- reads as silence and buys a snapshot; with a single
     permanent credit that run could never buy another, so a genuine hang later would wait for the
@@ -287,18 +290,20 @@ def _console_upload_loop(
 
     A setup that NEVER reaches a heartbeat stays uncovered on purpose: holding the first-snapshot
     cadence until progress starts costs a commit in the SUSTAINED rate (5.25/hr against a hard 5.0,
-    measured by ..._keeps_a_slow_starting_run_in_budget), so it is left to the 3000s setup grace. A
-    FAILED upload advances neither ``sent`` nor the deadline: hf_upload swallows its exception and
-    returns falsy, so resetting ``since`` books a snapshot that reached no repo and puts the retry an
+    measured by ..._keeps_a_slow_starting_run_in_budget), so it is left to the 3000s grace. A FAILED
+    upload advances neither ``sent`` nor the deadline: hf_upload swallows its exception and returns
+    falsy, so resetting ``since`` books a snapshot that reached no repo and puts the retry an
     interval out, past both teardowns. Staying due retries until one lands."""
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
-    sent, size, since, quiet, armed, spent = -1, -1, 0.0, 0.0, False, 0
+    sent, size, since, quiet, armed, spent, ever = -1, -1, 0.0, 0.0, False, 0, False
     while not stop_upload.wait(poll_s):
         since += poll_s
-        size, staged = _console_progress(console, max(size, 0))
-        armed = armed or bool(staged)
-        quiet = 0.0 if staged else quiet + 1
+        size, staged, beats = _console_progress(console, max(size, 0))
+        ever = ever or bool(staged)
+        progress = staged if ever else beats
+        armed = armed or bool(progress)
+        quiet = 0.0 if progress else quiet + 1
         due = since >= due_s
         ok = armed and not due and spent < _CONSOLE_UPLOAD_CREDITS
         wedged = ok and quiet >= _CONSOLE_UPLOAD_QUIET_POLLS

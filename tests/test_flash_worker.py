@@ -1163,35 +1163,43 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # the latch arms only after real progress: a cold image is quiet through startup and would
     # otherwise spend it on an empty console, leaving a later hang with no snapshot before teardown
     # (test_..._keeps_its_wedge_credit_through_a_slow_startup covers the behavior on the twin loop).
-    assert "armed = armed or bool(staged)" in body
     assert "wedged = armed and quiet_polls" in body
-    assert "quiet_spent, armed = -1, -1, 0, False" in body
+    assert "quiet_spent, armed, committed = -1, -1, 0, False, False" in body
     assert "uploaded_size = size if ok else uploaded_size" in body
     # the wedge signal is STAGED HEARTBEATS, not console bytes: a stuck worker still logs, so a
     # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
-    assert "quiet_polls = 0 if staged else quiet_polls + 1" in body
+    assert "quiet_polls = 0 if progress else quiet_polls + 1" in body
     # the count is ANCHORED at the start of a heartbeat line rather than scanning for a bare
     # "stage" key: any third-party line carrying it (a structured log from ray, verl or a library)
     # would otherwise read as progress, and those keep printing from a wedged worker -- so the
-    # wedge this loop exists to catch would never be detected at all. Liveness pings and
-    # UNCOMMITTED ("pending") heartbeats are excluded in the same expression: the first prints
-    # every 30s from a daemon, and the second never reached HF, so neither is progress the
-    # provider's stall clock can see.
-    assert "rb'(?m)^HEARTBEAT (?!.*\"(?:liveness|pending)\":).*$'" in body
+    # wedge this loop exists to catch would never be detected at all. Liveness pings are excluded
+    # in the expression itself: they print every 30s from a daemon whether or not the training loop
+    # is alive, so they are never progress the provider's stall clock can see.
+    assert "rb'(?m)^HEARTBEAT (?!.*\"liveness\":).*$'" in body
     # and the scan is bounded to WHOLE lines: the offset stops at the last newline, never at EOF.
     # Both halves of a line split by a poll boundary must be inert alone or the split decides the
     # run -- the head carries the prefix but not yet the "liveness" that disqualifies it (a wedge
     # read as progress), and a tail measured from EOF would have lost its prefix and dropped a real
     # heartbeat (a wedge faked the other way). It is also what lets `^` mean what it says.
     assert 'cut = buf.rfind(b"\\n") + 1' in body
-    assert "size, staged = at + cut, len(re.findall(pat, buf[:cut]))" in body
+    # ONE scan yields both counts: the committed one drops "pending" lines (an uploaded heartbeat
+    # that never reached HF), the arming one keeps them. Which drives the timer switches at the
+    # first COMMITTED heartbeat. A run whose uploads all fail emits nothing but pending lines: on
+    # the committed count it never arms, buys no wedge snapshot, and the next scheduled upload is
+    # an interval out, past the setup teardown. After a commit exists the provider's stall clock is
+    # anchored and counting down, so only committed ones may count.
+    assert "staged = sum(b'\"pending\":' not in b for b in beats)" in body
+    assert "committed = committed or bool(staged)" in body
+    assert "progress = staged if committed else len(beats)" in body
+    assert "armed = armed or bool(progress)" in body
+    assert "quiet_polls = 0 if progress else quiet_polls + 1" in body
     # a counting rule cannot go negative now that it counts whole matching lines instead of
     # subtracting key occurrences, so the old floor is gone rather than silently dropped.
     assert "max(0, buf.count" not in body
 
 
 def _drive_instance_upload_loop(
-    monkeypatch, sizes: list[int], cycles: int, *, succeed=True, staged=None
+    monkeypatch, sizes: list[int], cycles: int, *, succeed=True, staged=None, beats=None
 ) -> tuple[list, list]:
     """Run the real instance loop over a scripted console-size series. Returns (waits, uploads).
 
@@ -1202,6 +1210,12 @@ def _drive_instance_upload_loop(
     the loop keys on. It defaults to "a heartbeat whenever the console grew", the shape of a
     healthy run, so a frozen console still reads as wedged. A test covering a worker that keeps
     logging without making progress passes its own series.
+
+    ``beats`` scripts the ARMING count separately. The real ``_console_progress`` returns both
+    because they answer different questions: only a committed heartbeat resets the wedge timer,
+    but any heartbeat -- ``pending`` included -- proves the loop was reached and may arm it. It
+    defaults to ``staged``, so a test that does not care about the distinction sees the old
+    behaviour; a test covering failed heartbeat uploads scripts arming beats with zero staged.
     """
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
 
@@ -1214,14 +1228,15 @@ def _drive_instance_upload_loop(
             waits.append(seconds)
             return len(waits) > cycles
 
-    def _progress(_console: str, _offset: int) -> tuple[int, int]:
+    def _progress(_console: str, _offset: int) -> tuple[int, int, int]:
         index = min(clock["i"], len(sizes) - 1)
         clock["i"] += 1
         if staged is not None:
-            beats = staged[min(index, len(staged) - 1)]
+            progressed = staged[min(index, len(staged) - 1)]
         else:  # grew since the previous poll -> one staged heartbeat
-            beats = 1 if index == 0 or sizes[index] != sizes[index - 1] else 0
-        return sizes[index], beats
+            progressed = 1 if index == 0 or sizes[index] != sizes[index - 1] else 0
+        arming = progressed if beats is None else beats[min(index, len(beats) - 1)]
+        return sizes[index], progressed, arming
 
     def _upload(_payload, _console, _mode) -> bool:
         uploads.append(clock["i"])
@@ -1650,13 +1665,13 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     pings = _hb(liveness=True) + b"ray warning: worker is idle\n"
     console.write_bytes(progress + pings)
 
-    size, beats = _instance_bootstrap._console_progress(str(console), 0)
+    size, beats, _any = _instance_bootstrap._console_progress(str(console), 0)
     assert (size, beats) == (len(progress) + len(pings), 1)
 
     # the wedge: heartbeats keep arriving, but every one is a liveness ping.
     with open(console, "ab") as f:
         f.write(pings * 3)
-    size2, beats2 = _instance_bootstrap._console_progress(str(console), size)
+    size2, beats2, _any2 = _instance_bootstrap._console_progress(str(console), size)
     assert beats2 == 0, "liveness pings after the last real heartbeat must not read as progress"
     assert size2 == size + len(pings) * 3
 
@@ -1670,7 +1685,7 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     cut = ping.index(b'"liveness":') - 5  # past "stage", before "liveness"
     assert b'"stage":' not in ping[cut:]
     assert b'"liveness":' in ping[cut:]
-    assert _instance_bootstrap._console_progress(str(solo), cut) == (len(ping), 0)
+    assert _instance_bootstrap._console_progress(str(solo), cut) == (len(ping), 0, 0)
 
     # an UNCOMMITTED heartbeat (upload attempted, did not land) is excluded for the same reason
     # as a liveness ping: the provider's stall clock reads heartbeat.json from HF, so one that
@@ -1680,6 +1695,17 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     pend = tmp_path / "console_pending.txt"
     pend.write_bytes(_hb(step=8, pending=True) * 2)
     assert _instance_bootstrap._console_progress(str(pend), 0)[1] == 0
+    # but it DOES count toward arming, the third value: the line exists because a heartbeat was
+    # produced, so the training loop was reached. If arming used the progress count instead, a run
+    # whose heartbeat uploads all fail would never arm and could never buy a wedge snapshot -- the
+    # next scheduled one is an interval out, past the setup teardown, so the console is lost.
+    assert _instance_bootstrap._console_progress(str(pend), 0)[2] == 2
+
+    # a liveness ping arms nothing: it prints from a daemon whether or not the training loop is
+    # alive, so unlike a pending heartbeat it is not evidence the run ever reached the loop.
+    lv_only = tmp_path / "console_liveness_only.txt"
+    lv_only.write_bytes(_hb(liveness=True) * 3)
+    assert _instance_bootstrap._console_progress(str(lv_only), 0)[1:] == (0, 0)
 
     # a THIRD-PARTY line carrying "stage" is not a heartbeat and must not read as progress. ray,
     # verl and any library are free to emit structured json, and a wedged worker keeps emitting it
@@ -1696,10 +1722,10 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     split = tmp_path / "console_split_beat.txt"
     beat = _hb(step=11)
     split.write_bytes(beat[:20])
-    head_size, head_beats = _instance_bootstrap._console_progress(str(split), 0)
+    head_size, head_beats, _ = _instance_bootstrap._console_progress(str(split), 0)
     with open(split, "ab") as f:
         f.write(beat[20:])
-    tail_size, tail_beats = _instance_bootstrap._console_progress(str(split), head_size)
+    tail_size, tail_beats, _ = _instance_bootstrap._console_progress(str(split), head_size)
     assert head_beats + tail_beats == 1, "a split heartbeat is counted once, not zero or twice"
     assert tail_size == len(beat)
     assert _instance_bootstrap._console_progress(str(split), tail_size)[1] == 0, "no recount"
@@ -1722,9 +1748,71 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     part = tmp_path / "console_partial.txt"
     whole = _hb(step=3)
     part.write_bytes(whole + _hb(step=4)[:20])
-    assert _instance_bootstrap._console_progress(str(part), 0) == (len(whole), 1)
+    assert _instance_bootstrap._console_progress(str(part), 0) == (len(whole), 1, 1)
 
-    assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (-1, 0)
+    assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (-1, 0, 0)
+
+
+def test_instance_console_upload_loop_arms_on_a_heartbeat_whose_upload_failed(monkeypatch):
+    """A run whose heartbeat uploads all fail must still be able to buy a wedge snapshot.
+
+    Every heartbeat then prints ``"pending": true``, so the STAGED count is zero forever. Arming on
+    that count leaves the latch permanently false: no wedge snapshot is ever bought, and the only
+    other upload is the scheduled cadence -- an interval (3600s) after the 600s one, so 4200s, past
+    the 3000s no-heartbeat setup teardown. The console covering the hang is lost entirely.
+
+    So the counts are separate, and which one drives the timer depends on whether this run has EVER
+    committed a heartbeat. Until it has, a ``pending`` one counts: nothing else exists to contradict
+    it, and teardown is the fixed setup grace. Once one has committed, only committed ones count --
+    the provider's stall clock is anchored to that commit and already counting down, so treating a
+    later pending line as progress would push the snapshot past the box's own death.
+
+    Asserted in three directions, because the failure modes point opposite ways: the pending run
+    buys a wedge snapshot AFTER its hang (not burned on the healthy stretch before it); a run with
+    no heartbeat at all buys none; and a run that committed and then stopped still buys one.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    hang_polls = 14  # heartbeats stop here; the console keeps growing on ray chatter
+    cycles = hang_polls + 12
+    # the console never stops growing, so a size-only rule cannot separate these cases: the
+    # heartbeat counts are the whole signal.
+    sizes = [1000 * (i + 1) for i in range(cycles + 2)]
+    # scheduled snapshot at first_s, then an hour out -- past the 3000s setup teardown.
+    scheduled_at = {first_s}
+
+    # every heartbeat is pending (uploads all failing), then the worker hangs at hang_polls.
+    beats = [1] * hang_polls + [0] * (cycles - hang_polls)
+    _waits, uploads = _drive_instance_upload_loop(
+        monkeypatch, sizes, cycles=cycles, staged=[0] * cycles, beats=beats
+    )
+    at_s = {n * poll_s for n in uploads}
+    wedge_at = sorted(at_s - scheduled_at)
+    assert wedge_at, "a run whose heartbeat uploads all fail must still buy a wedge snapshot"
+    # and it must be bought AFTER the hang, not burned on the healthy stretch before it. That is
+    # the direction that makes the snapshot worth its credit: an early one shows a working run.
+    assert all(t > hang_polls * poll_s for t in wedge_at), wedge_at
+    assert all(t < 3000.0 for t in wedge_at), "must land before the setup teardown"
+
+    # the other direction: no heartbeat of ANY kind (liveness pings alone, or startup noise) must
+    # not arm, or a slow start spends a credit on a console that has nothing in it yet.
+    _w2, uploads2 = _drive_instance_upload_loop(
+        monkeypatch, sizes, cycles=cycles, staged=[0] * cycles, beats=[0] * cycles
+    )
+    assert {n * poll_s for n in uploads2} <= scheduled_at, "unarmed run bought a wedge snapshot"
+
+    # once a heartbeat has COMMITTED, pending ones must stop counting as progress: the provider's
+    # stall clock is anchored to that commit and is already counting down to a teardown, so a
+    # pending line must not reset this timer past the box's own death.
+    staged3 = [1] * 4 + [0] * (cycles - 4)
+    _w3, uploads3 = _drive_instance_upload_loop(
+        monkeypatch, sizes, cycles=cycles, staged=staged3, beats=[1] * cycles
+    )
+    assert sorted({n * poll_s for n in uploads3} - scheduled_at), (
+        "a run that stopped committing must still buy a wedge snapshot"
+    )
 
 
 def test_instance_console_upload_loop_retries_when_an_upload_fails(monkeypatch):

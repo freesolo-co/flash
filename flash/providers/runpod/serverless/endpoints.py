@@ -280,12 +280,11 @@ def _train_body(input_data: dict) -> dict:
                 r"|returned error: (?:429|5\d\d)|could not resolve (?:host|proxy)"
             )
             # Build/resolution failures, which name the cause and outrank a transient warning pip
-            # already recovered from in the same tail; without that precedence one early
-            # "Retrying (Retry(" makes a deterministic failure look retriable and this ladder
-            # repeats it for nothing. Kept identical to the instance bootstrap's _PIP_TERMINAL_RE:
-            # the two classifiers must agree on what is retriable, including excluding the bare
-            # subprocess-exited-with-error marker that a network-interrupted VCS `git clone` also
-            # prints.
+            # already recovered from in the same tail; without that precedence one early "Retrying
+            # (Retry(" makes a deterministic failure look retriable and this ladder repeats it for
+            # nothing. Kept identical to the instance bootstrap's _PIP_TERMINAL_RE: the two
+            # classifiers must agree on what is retriable, including excluding the bare
+            # subprocess-exited-with-error marker a network-interrupted VCS `git clone` also prints.
             pip_terminal_re = re.compile(
                 r"(?i)failed building wheel|metadata-generation-failed|could not build wheels"
                 r"|no matching distribution|could not find a version|resolutionimpossible"
@@ -633,17 +632,15 @@ def _train_body(input_data: dict) -> dict:
 
             def _upload_loop() -> None:
                 # literals, not the module-level constants: only this function's SOURCE ships to the
-                # worker, so a name reference is a NameError before training. Pinned against drift by
-                # test_first_console_snapshot_precedes_the_stall_teardown. Mirrors
-                # bootstrap._console_upload_loop, whose docstring carries the rules.
+                # worker, so a name reference is a NameError before training. Mirrors
+                # bootstrap._console_upload_loop, whose docstring has the rules; pinned against
+                # drift by test_first_console_snapshot_precedes_the_stall_teardown.
                 due_s, since, quiet_polls = 600.0, 0.0, 0
-                uploaded_size, size, quiet_spent, armed = -1, -1, 0, False
+                uploaded_size, size, quiet_spent, armed, committed = -1, -1, 0, False, False
                 while not stop_upload.wait(120.0):
                     since += 120.0
                     try:
-                        # count STAGED heartbeats, not bytes: a wedged worker still prints ray
-                        # warnings, so a size-only rule never fires. mirrors _console_progress,
-                        # whose docstring carries the anchor, exclusion and whole-line rules.
+                        # mirrors _console_progress: heartbeats not bytes, plus its rules.
                         at = max(size, 0)
                         with open(console, "rb") as hf:
                             hf.seek(at)
@@ -651,12 +648,16 @@ def _train_body(input_data: dict) -> dict:
                     except OSError:
                         buf, at = b"", -1
                     cut = buf.rfind(b"\n") + 1  # whole lines only; the offset stays a line start
-                    pat = rb'(?m)^HEARTBEAT (?!.*"(?:liveness|pending)":).*$'
-                    size, staged = at + cut, len(re.findall(pat, buf[:cut]))
-                    # a wedge is progress that STOPPED: arm on a heartbeat, re-arm on progress,
-                    # spend only on a stall that BOUGHT an upload. 2 credits per RUN.
-                    armed = armed or bool(staged)
-                    quiet_polls = 0 if staged else quiet_polls + 1
+                    buf, size = buf[:cut], at + cut
+                    pat = rb'(?m)^HEARTBEAT (?!.*"liveness":).*$'
+                    beats = re.findall(pat, buf)
+                    staged = sum(b'"pending":' not in b for b in beats)
+                    committed = committed or bool(staged)
+                    # a wedge is progress that STOPPED: re-arm on it, spend only on a stall that
+                    # BOUGHT an upload. 2 credits per RUN. `pending` counts until the first commit.
+                    progress = staged if committed else len(beats)
+                    armed = armed or bool(progress)
+                    quiet_polls = 0 if progress else quiet_polls + 1
                     due = since >= due_s
                     wedged = armed and quiet_polls >= 4 and quiet_spent < 2 and not due
                     if size == uploaded_size or not (due or wedged):
@@ -665,8 +666,8 @@ def _train_body(input_data: dict) -> dict:
                     uploaded_size = size if ok else uploaded_size
                     quiet_spent += 1 if wedged and ok else 0
                     armed = armed and not (wedged and ok)
-                    # only a LANDED upload advances the deadline: resetting on a swallowed
-                    # failure puts the retry an interval out, past the stall teardown.
+                    # only a LANDED upload advances the deadline: resetting on a swallowed failure
+                    # puts the retry an interval out, past the stall teardown.
                     if ok:
                         since, due_s = 0.0, 3600.0
 

@@ -120,6 +120,10 @@ def _safe_detail(
     root cause is the last thing written -- the end of a native stack, a json blob, or a progress
     stream -- and cutting the front is what preserves it. An unknown value raises rather than
     silently keeping the front: a typo would quietly cut the side the caller asked to keep.
+
+    Redaction happens on the WHOLE text first, so a credential cannot be split by this bound. The
+    zero case is spelled out because ``text[-0:]`` is ``text[0:]`` -- the whole string, the exact
+    opposite of a zero bound.
     """
     if keep not in ("start", "end"):
         raise ValueError(f"keep must be 'start' or 'end', got {keep!r}")
@@ -134,9 +138,6 @@ def _safe_detail(
     text = _redact_values(text, values)
     text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
     text = _SECRET_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", text)
-    # redaction happens on the WHOLE text first, so a credential cannot be split by this bound.
-    # the zero case is spelled out because ``text[-0:]`` is ``text[0:]`` -- the whole string, the
-    # exact opposite of a zero bound.
     bound = max(0, int(limit))
     if not bound:
         return ""
@@ -177,8 +178,20 @@ def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> st
     return tail[cut + 1 :] if cut >= 0 else ""
 
 
-def _console_progress(console: str, offset: int) -> tuple[int, int]:
-    """``(size, progress heartbeats after ``offset``)``; size -1 if unreadable. Bytes cannot tell a
+def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
+    """``(size, progress heartbeats, any heartbeats)`` after ``offset``; size -1 if unreadable.
+
+    The two counts answer different questions and must not be collapsed. The first is the COMMITTED
+    count: a heartbeat that reached HF, the only thing the provider's stall clock advances on. The
+    second additionally counts ``pending`` ones -- produced, but whose upload failed. Which one the
+    uploader's wedge timer keys on switches at the first COMMITTED heartbeat. After one, only
+    committed ones may count: the stall clock is anchored to it and already counting down to a
+    teardown, so treating a later ``pending`` line as progress would push the wedge snapshot past
+    the box's own death. Before one there is no such clock to contradict -- teardown is the fixed
+    setup grace -- and a run whose heartbeat uploads ALL fail emits nothing but ``pending`` lines,
+    indistinguishable on the committed count from a worker that never reached the training loop. It
+    would never arm, buy no wedge snapshot, and reach only the hourly cadence at 4200s: past the
+    3000s grace, with the console covering the hang lost entirely. Bytes cannot tell a
     wedge from a noisy one: a stuck worker keeps printing Ray warnings, so the size grows every poll
     and a size-only rule never fires. The stall classifier advances only on a progress heartbeat,
     echoed here as ``HEARTBEAT {...}``, so counting those tracks the signal that decides teardown.
@@ -204,7 +217,7 @@ def _console_progress(console: str, offset: int) -> tuple[int, int]:
             f.seek(offset)
             buf = f.read()
     except OSError:
-        return -1, 0
+        return -1, 0, 0
     cut = buf.rfind(b"\n") + 1
-    pat = rb'(?m)^HEARTBEAT (?!.*"(?:liveness|pending)":).*$'
-    return offset + cut, len(re.findall(pat, buf[:cut]))
+    hb = re.findall(rb'(?m)^HEARTBEAT (?!.*"liveness":).*$', buf[:cut])
+    return offset + cut, sum(b'"pending":' not in b for b in hb), len(hb)
