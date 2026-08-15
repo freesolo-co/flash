@@ -56,11 +56,7 @@ from flash.engine.worker.train.rl.shims import (
     render_stop_sequences_shim,
     render_structured_outputs_shim,
 )
-from flash.engine.worker.train.rl.single_turn import (
-    _log_reward_profile,
-    score_single_turn,
-    score_single_turn_batch,
-)
+from flash.engine.worker.train.rl.single_turn import score_single_turn, score_single_turn_batch
 
 
 def _rl_train():
@@ -87,7 +83,6 @@ class _StepMetricState:
 class _RewardRuntime:
     observability: RewardObservabilityBuffer
     wandb_link: dict[str, str | None]
-    reward_profile: object
     multi_turn_bridge: object
     server: object
     reward_url: str
@@ -292,10 +287,7 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
         return results
 
     def _score_for_profile(index: int, solution_str: str) -> float:
-        """score for profiling without training observability side effects.
-
-        do not seed rollout buffers. errors propagate so a broken grader is not measured as fast.
-        """
+        """score one bridge request without training observability side effects."""
         return score_single_turn(
             env,
             solution_str,
@@ -307,19 +299,6 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
             raise_on_error=True,
         )
 
-    # the profiler times the single-turn grading path (env.reward / env.scores_breakdown on one
-    # completion). a multi-turn env scores a terminal episode instead, so that timing would neither
-    # describe nor even validly reach its reward path.
-    reward_profile = (
-        None
-        if inp["multi_turn"]
-        else _log_reward_profile(
-            env,
-            _score_for_profile,
-            rollout_examples,
-            int(inp["prompts_per_step"]) * int(inp["group_size"]),
-        )
-    )
     multi_turn_bridge = (
         MultiTurnBridge(
             env,
@@ -344,7 +323,6 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
         observability=observability,
         # filled from the child's marker line; stays empty when wandb is off.
         wandb_link={},
-        reward_profile=reward_profile,
         multi_turn_bridge=multi_turn_bridge,
         server=server,
         reward_url=reward_url,
