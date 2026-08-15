@@ -6968,7 +6968,11 @@ def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
     # and the entry point wires the files dict (marker path + expected set) into both the loop
     # and the final verdict.
     entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    assert "_reward_observability=_reward_observability, files=files," in entry
+    # asserted per-kwarg rather than as one contiguous literal: the call takes other keywords too
+    # (the shared step-timing reader among them), and pinning their exact order made ADDING one a
+    # failure here without anything having regressed.
+    assert "_reward_observability=_reward_observability," in entry
+    assert "files=files," in entry
     assert 'rc, state, files["resume_step"], expected_steps, resume_uploader, files=files' in entry
 
 

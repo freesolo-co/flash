@@ -1103,6 +1103,108 @@ def test_a_validation_pass_is_not_charged_to_the_step_that_follows_it():
     assert timed_under_the_gate, "the RL clock is no longer driven by the shared step gate"
 
 
+def test_a_call_that_blocks_for_several_steps_is_caught_on_a_sub_second_run():
+    """ "Did the reader wait" cannot be answered by an absolute duration alone.
+
+    A fixed 1s threshold only asks whether a call is slow in absolute terms. On a sub-second
+    workload -- which the clock and the renderer both support -- a call can stall the reader for
+    SEVERAL steps while staying under it: a 0.9s upload on a 0.1s run queues ~9 lines, and with the
+    span left intact they drain in as ordinary intervals at pipe speed.
+
+    This is the same question ``_draining`` answers, so it takes the same pace-relative floor. The
+    two halves disagreeing is what let this through: the drain was scaled to the measured pace while
+    the detector that ARMS it was not, so on a fast run the drain was never entered at all.
+    """
+    real, block, pipe = 0.1, 0.9, 0.001
+
+    def run(clean_steps_first: int) -> step_timing.StepClock:
+        clock = step_timing.StepClock()
+        timeline, t, step = [], 0.0, 1
+        for _ in range(clean_steps_first):
+            timeline.append((t, step, 0.001))
+            t += real
+            step += 1
+        # the forced first-metrics upload: long enough to stall the reader for nine steps, but
+        # under the absolute threshold.
+        timeline.append((t, step, block))
+        t += block
+        step += 1
+        for _ in range(int(block / real)):
+            timeline.append((t, step, 0.001))
+            t += pipe
+            step += 1
+        for _ in range(5):
+            timeline.append((t, step, 0.001))
+            t += real
+            step += 1
+        _replay(clock, timeline)
+        return clock
+
+    for clean_first in (1, 2, 3, 10):
+        clock = run(clean_first)
+        assert clock.step_seconds() == pytest.approx(real, abs=0.02), (
+            f"{clean_first} clean steps before the block published {clock.step_seconds()}s "
+            f"against a true {real}s"
+        )
+        assert not [gap for gap in clock.intervals() if gap < real / 2], (
+            f"{clean_first} clean steps before the block left pipe-speed intervals in the window"
+        )
+
+    # and the floor must not become so tight that ordinary call overhead splits a normal run.
+    ordinary = step_timing.StepClock()
+    _replay(ordinary, [(i * 92.0, i, 0.002) for i in range(6)])
+    assert ordinary.step_seconds() == 92.0
+    assert not ordinary._segments, "2ms of call overhead broke a 92s span"
+
+
+def test_the_forced_first_metrics_upload_carries_the_pace_when_it_retries():
+    """That upload RETRIES, so it can commit at a step where a pace already exists.
+
+    It is force=True and arms the shared 900s throttle when it commits. Publishing it without the
+    timing fields therefore does not merely omit them once -- it blocks the next publisher for 15
+    minutes, so the first measurement an operator could have seen is hidden behind a snapshot that
+    was taken after it was available.
+    """
+    import ast
+    from pathlib import Path
+
+    import flash
+
+    worker = Path(flash.__file__).parent / "engine" / "worker"
+    tree = ast.parse((worker / "rl_train_runner.py").read_text())
+    ingest = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_ingest_step_metrics"
+    )
+    forced = [
+        node
+        for node in ast.walk(ingest)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "heartbeat"
+        and any(kw.arg == "force" for kw in node.keywords)
+    ]
+    assert len(forced) == 1, f"{len(forced)} forced heartbeats in _ingest_step_metrics"
+    # merged as **timing rather than a named field, the way the liveness hook does it.
+    merged = [kw for kw in forced[0].keywords if kw.arg is None]
+    assert any("_step_timing" in ast.unparse(kw.value) for kw in merged), (
+        "the forced first-metrics upload publishes without the measured pace, so a retry that "
+        "commits arms the 900s throttle behind a pace-less snapshot"
+    )
+
+    # and the reader really is threaded in from the caller rather than rebuilt here: one reader
+    # shared with the liveness publisher, so the two cannot disagree about what was measured.
+    caller = ast.parse((worker / "rl_train.py").read_text())
+    child_calls = [
+        node
+        for node in ast.walk(caller)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "_execute_rl_child"
+        and any(kw.arg == "_step_timing" for kw in node.keywords)
+    ]
+    assert child_calls, "the child executor is not given the shared timing reader"
+
+
 def test_the_child_stream_heartbeat_is_timed_like_the_step_one():
     """Both uploads run inside run_verl_training's reader loop, so both defer the next timestamp.
 

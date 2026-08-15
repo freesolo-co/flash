@@ -417,6 +417,7 @@ def run_rl_train():
                     state=state,
                     reward_runtime=reward_runtime,
                     _reward_observability=_reward_observability,
+                    _step_timing=_step_timing,
                     files=files,
                 )
             _validate_rl_child(

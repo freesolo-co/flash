@@ -137,10 +137,26 @@ class StepClock:
         separates them without asking ``heartbeat()`` to report why it declined -- and it also covers
         a slow upload that DID commit.
 
-        The threshold is deliberately well below a plausible step so that ordinary call overhead
-        never splits a segment; anything above it is long enough to distort an interval either way.
+        Sized against the measured pace when there is one, for the same reason ``_draining`` is: a
+        fixed 1s threshold only ever asks "is this call slow in absolute terms", and on a sub-second
+        workload a call can stall the reader for SEVERAL steps while staying under it. A 0.9s upload
+        on a 0.1s run queues ~9 lines, and with the span left intact they drain in as ordinary
+        intervals -- 0.001s published against a true 0.1s. That is worst early in a run, which is
+        exactly when RL's forced first-metrics upload fires and when the median has nothing clean to
+        outvote it.
+
+        Half the measured pace is the same floor the drain uses, so both halves of this mechanism
+        answer "did the reader wait" the same way. Falling back to the fixed threshold before any
+        pace exists keeps ordinary call overhead from splitting a segment on a run that has not yet
+        shown what a step costs.
         """
-        if elapsed_s >= _BLOCKING_CALL_THRESHOLD_S:
+        measured = steady_state_step_seconds(self.intervals())
+        threshold = (
+            _BLOCKING_CALL_THRESHOLD_S
+            if measured is None
+            else min(_BLOCKING_CALL_THRESHOLD_S, measured / 2)
+        )
+        if elapsed_s >= threshold:
             self.note_blocking_work()
 
     def record(self, now: float, step: int | None = None) -> None:

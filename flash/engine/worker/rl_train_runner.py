@@ -503,6 +503,7 @@ def _ingest_step_metrics(
     inp,
     state: _StepMetricState,
     _reward_observability: Callable[[], dict],
+    _step_timing: Callable[[], dict] | None = None,
 ) -> None:
     sent_first_metrics = state.sent_first_metrics
     step_metrics = parse_verl_step_metrics(line)
@@ -526,6 +527,11 @@ def _ingest_step_metrics(
             # whose steps are shorter than the drain threshold reads every following line as
             # backlog: at 0.4s/step a spurious block suppressed 37 of 37 lines and left the pace
             # published from one stale interval.
+            # carries the timing too. this path RETRIES on a failed upload, so a later step can
+            # reach it with a pace already measured -- and publishing without it would commit a
+            # pace-less snapshot and arm the shared 900s throttle behind it, hiding the measurement
+            # until another publisher wins a slot. the liveness hook merges the same reader, so both
+            # publishers describe one view rather than disagreeing about what was measured.
             started = time.monotonic()
             sent_first_metrics = _w.heartbeat(
                 "rl_step",
@@ -533,6 +539,7 @@ def _ingest_step_metrics(
                 step=step_metrics["step"],
                 metrics_last=list(state.metrics_last),
                 **_reward_observability(),
+                **(_step_timing() if _step_timing is not None else {}),
                 gpu=gpu_diagnostics(include_torch=False),
             )
             state.step_clock.note_if_blocked(time.monotonic() - started)
@@ -567,6 +574,7 @@ def _execute_rl_child(
     state,
     reward_runtime,
     _reward_observability,
+    _step_timing=None,
     files=None,
 ) -> int:
     # claimed before the child exists, so a grandchild it orphans reparents here and can be
@@ -636,7 +644,7 @@ def _execute_rl_child(
                             f"(reward={reward:.3f}): {preview}",
                             flush=True,
                         )
-            _ingest_step_metrics(line, inp, state, _reward_observability)
+            _ingest_step_metrics(line, inp, state, _reward_observability, _step_timing)
         return child_stream.wait_and_classify()
     except BaseException:
         # the stream loop died (upload error, cancel, oom in the parent): a still-running
