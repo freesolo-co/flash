@@ -187,7 +187,7 @@ class FreesoloEnvironment(BaseEnvironment):
         Whether that broke was luck, not design: ``task_example_from_record`` passes a record's
         ``metadata`` dict through BY REFERENCE but substitutes a fresh ``{}`` when the record has
         none, so an env stashing its choice in ``example.metadata`` survived only for rows whose
-        source data happened to carry a metadata field. Memoizing per row makes it uniform.
+        source data happened to carry a metadata field. One task per row makes it uniform.
 
         This is the contract the multi-turn path already has -- ``new_rollout_state`` builds the
         task once and ``_score_episode`` grades with that same ``state["task"]``. Single-turn now
