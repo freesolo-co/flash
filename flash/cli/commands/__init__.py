@@ -399,6 +399,7 @@ def cmd_train(args) -> int:
         # equally not a verification -- so treat anything but an explicit True as unverified.
         affordability_verified = status.pop("affordability_verified", None) is True
         cost = "and cost" if affordability_verified else "but NOT cost"
+        budget_validated = prompt_budget_validation_suffix(status)
         environment = (
             "it did NOT import or run your environment.py. packaged input/output fields and the "
             "statically readable training contract were tokenized together; tokens, retention, "
@@ -411,8 +412,8 @@ def cmd_train(args) -> int:
         )
         print(
             "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
-            f"runtime-secret presence, warm-start source, serving context cap, {cost}. "
-            f"{environment}",
+            f"runtime-secret presence, warm-start source, serving context cap{budget_validated}, "
+            f"{cost}. {environment}",
             file=sys.stderr,
         )
         if not affordability_verified:
@@ -430,8 +431,10 @@ def cmd_train(args) -> int:
         else:
             print(json.dumps(status, indent=2))
         _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
+        print_status_prompt_budget_warning(status)
         _print_reasoning_loss_warning(status)
         return 0
+    local_budget = warn_before_paid_submit(client, spec)
     status = client.create_run(
         payload,
         runtime_secrets=runtime_secrets,
@@ -440,6 +443,7 @@ def cmd_train(args) -> int:
     run_id = status["run_id"]
     _print_unpacked_batch_warning(status, spec)  # a real submit overrides batch_size the same way
     _print_reasoning_loss_warning(status)  # and trains on whatever reasoning the template kept
+    print_warmstart_context_supplement(local_budget, status)
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
@@ -963,9 +967,13 @@ from flash.cli.commands.deploy import (  # noqa: E402,F401
     cmd_undeploy,
 )
 
-# re-exported at the bottom rather than imported at the top: `train_cost` resolves names back
-# through this package, so a top import would be circular. `cmd_train` below calls these, and the
-# estimate tests import `_warn_if_wandb_requested_without_key` from this package by name.
+# imported at the bottom because the train helpers resolve patched command-package names lazily.
+from flash.cli.commands.prompt_budget import (  # noqa: E402
+    print_status_prompt_budget_warning,
+    print_warmstart_context_supplement,
+    prompt_budget_validation_suffix,
+    warn_before_paid_submit,
+)
 from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _client_train_schema,
     _cmd_train_cost,

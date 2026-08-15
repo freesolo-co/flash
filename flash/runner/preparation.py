@@ -143,7 +143,7 @@ def _prepare_init_from_adapter(
     owner_org_id: str = "",
     owner_key_id: int | None = None,
     token: str | None = None,
-) -> tuple[JobSpec, JobSpec, dict | None]:
+) -> tuple[JobSpec, JobSpec, dict | None, int | None]:
     """prepare public and worker specs with source-authoritative adapter metadata.
 
     Failures here are genuinely about the warm-start source, so they are tagged
@@ -168,11 +168,11 @@ def _prepare_init_from_adapter_inner(
     owner_org_id: str = "",
     owner_key_id: int | None = None,
     token: str | None = None,
-) -> tuple[JobSpec, JobSpec, dict | None]:
+) -> tuple[JobSpec, JobSpec, dict | None, int | None]:
     _runner()._require_supported_adapter_continuation(spec)
     ref = spec.train.init_from_adapter
     if not ref:
-        return spec, spec, None
+        return spec, spec, None, None
     from flash.adapters.lora_rank import (
         adapter_artifact_identity,
         load_hf_adapter_config,
@@ -265,7 +265,8 @@ def _prepare_init_from_adapter_inner(
         worker_spec,
         train=replace(worker_spec.train, lora_rank=metadata.rank, lora_alpha=metadata.alpha),
     )
-    return public_spec, worker_spec, identity
+    source_context = int(getattr(src_spec.train, "max_context_tokens", 0) or 0) or None
+    return public_spec, worker_spec, identity, source_context
 
 
 def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
