@@ -16,14 +16,14 @@ from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
 from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
     horizon_row_count,
+    marked_reasoning_end,
     reasoned_assistant_turns,
     reasoning_marker_prefix,
     reasoning_markers,
-    reasoning_span_end_offsets,
-    reasoning_span_texts,
     reasoning_warning_rows,
     rendered_reasoning_loss_warning,
     sft_sample_policy,
+    strip_reasoning_markers,
     unpacked_batch_warning,
     with_marked_reasoning,
 )
@@ -346,99 +346,42 @@ def _row_reasoning(
     prompt_messages: list[dict],
     completion_messages: list[dict],
     *,
-    full_text: str,
     render: Callable[[list[dict]], str],
     tokenizer,
     max_length: int,
 ) -> _RowReasoning:
-    """One row's (authored reasoning turns, reasoning spans that survive into the SUPERVISED span).
+    """One row's authored reasoning, and how much of it reaches the loss.
 
-    Survival is answered by IDENTITY, not by counting: the row is rendered a second time with each
-    reasoning-authoring turn's reasoning stamped with a marker naming that turn, and a turn survives
-    when its marker appears in a rendered span. Counting spans across renders cannot answer it,
-    because two different things are indistinguishable by count:
-
-    * a ``<think>`` tag an ANSWER merely quotes renders a real non-empty span. It is never this
-      turn's reasoning, but it is counted like one, so quoted tags could cover dropped turns.
-    * the template's reasoning split is assistant-only, so a literal span written into a system or
-      user message renders a span that is never supervised at all.
-
-    A marker rides inside the reasoning itself, so neither can ever be credited: only text the
-    template chose to keep as THIS turn's reasoning carries THIS turn's marker.
-
-    Only reasoning text differs between the two renders, so the template's ``last_query_index`` rule
-    sees identical roles in identical positions and both renders carry the same span sequence. That
-    pairing is what lets the marked render say WHICH turn owns each span while the real render says
-    where that span ends -- offsets are only ever read from the render they belong to, never carried
-    across.
+    The row is rendered once with each reasoning-authoring turn's reasoning marked. A turn survives
+    exactly when its marker reaches the render: a marker rides only inside text the template chose
+    to keep as THIS turn's reasoning, so a ``<think>`` an answer merely quotes carries none and a
+    span in a system or user message -- never supervised, since the split is assistant-only -- cannot
+    be credited either. Counting rendered tags instead gets both wrong, and scores the total-loss
+    case as one survivor because the template injects an empty block on trailing assistant turns.
 
     A survivor also has to fit inside ``max_length``: the cap slices the token row, so a block past
-    it never reaches the loss. A turn counts only when the render THROUGH its own span still
-    tokenizes within the cap. Truncation is judged per span rather than per row because the cap
-    usually cuts the answer tail while leaving an earlier reasoning block whole, and discarding
-    every span on a truncated row would warn that reasoning was dropped from a row whose reasoning
-    the template kept.
+    it never reaches the loss. Truncation is judged per turn rather than per row, because the cap
+    usually cuts the answer tail while leaving an earlier reasoning block whole.
+
+    Markers are stripped before measuring, so the length charged against the cap is the real render's
+    rather than one inflated by the measurement's own bytes.
     """
     authored = reasoned_assistant_turns(completion_messages)
     if not authored:
         # nothing authored means nothing to lose, and the marked render would equal the full one.
         # skipped rather than rendered so a dataset with no reasoning pays nothing for this check.
         return _RowReasoning(0, 0, 0)
-    ends = reasoning_span_end_offsets(full_text)
-    prefix = reasoning_marker_prefix(full_text)
-    marked_render = render([*prompt_messages, *with_marked_reasoning(completion_messages, prefix)])
-    marked_spans = reasoning_span_texts(marked_render)
-    # materialized because both the unjudgeable count and the survivor loop ask the same per-turn
-    # question of it, and they have to agree on the answer.
-    markers = list(reasoning_markers(completion_messages, prefix))
-    unjudgeable = sum(
-        1
-        for head, tail in markers
-        if head in marked_render and not any(head in span and tail in span for span in marked_spans)
-    )
-    if unjudgeable:
-        # the template KEPT reasoning the span scan could not locate: a marker rides only inside
-        # text the template chose to keep, so a marker in the render with no span containing it
-        # means the scan failed to bound a block that survived -- not that the template dropped it.
-        # reporting a drop here would tell the user to split a transcript that lost nothing.
-        # reachable when reasoning quotes a turn boundary verbatim (see ``reasoning_spans``); a row
-        # the template really stripped keeps no marker at all.
-        #
-        # asked PER TURN, because turns in one row are answered differently. only the unjudgeable
-        # TURN leaves the accounting, never its whole row: a neighbour whose marker is absent from
-        # the render was definitively stripped, and zeroing the row to stay quiet about the turn
-        # that cannot be judged would bury that known loss with it.
-        #
-        # BOTH ends have to sit in the span. a span holding only the head stopped at a closer the
-        # reasoning quotes rather than the template's own, so its end offset is too early -- and
-        # measuring truncation against it scores a block the cap cuts as fully retained.
-        authored -= unjudgeable
-        if not authored:
-            # every authored turn was unjudgeable, so the row supports no claim either way.
-            return _RowReasoning(0, 0, 0)
-    if len(marked_spans) != len(ends):
-        # marking changed the span sequence, so the two renders no longer address the same spans.
-        # unreachable by construction; treated as "cannot tell" rather than guessed at, because a
-        # wrong survivor count here silently mis-states how much reasoning reaches the loss.
-        return _RowReasoning(authored, 0, 0)
+    prefix = reasoning_marker_prefix(render([*prompt_messages, *completion_messages]))
+    marked = render([*prompt_messages, *with_marked_reasoning(completion_messages, prefix)])
     rendered = 0
     truncated = 0
-    for span, end in zip(marked_spans, ends, strict=True):
-        # ONE turn's head and tail, both inside this span -- the same question ``unjudgeable`` asks
-        # above, so a turn cannot be dropped there and credited here.
-        #
-        # Substring tests on the shared stem cannot express that. ``tail`` is ``{prefix}e{index}``,
-        # which contains ``{prefix}`` and ``{prefix}e`` outright, so a span holding only a tail
-        # satisfies both and is credited: a turn whose markers the parser split across two spans is
-        # already counted unjudgeable, and crediting its tail here can lift ``rendered`` to equal
-        # ``authored`` beside a genuinely stripped neighbour, silencing the warning entirely.
-        # A head without its tail is the mirror case: that span stopped at a closer the reasoning
-        # quotes, so ``end`` precedes the block's real close and measuring the cap against it scores
-        # a cut block as fully retained.
-        if not any(head in span and tail in span for head, tail in markers):
+    for marker in reasoning_markers(completion_messages, prefix):
+        end = marked_reasoning_end(marked, marker)
+        if end is None:
             continue
         rendered += 1
-        if _encoded_length(tokenizer, full_text[:end]) > max_length:
+        through = strip_reasoning_markers(marked[:end], prefix)
+        if _encoded_length(tokenizer, through) > max_length:
             truncated += 1
     return _RowReasoning(authored, rendered, truncated)
 
@@ -532,7 +475,6 @@ def _tokenize_prompt_rows(
             reasoning_by_index[row_index] = _row_reasoning(
                 normalized.messages,
                 completion_messages,
-                full_text=text,
                 render=render_transcript,
                 tokenizer=tokenizer,
                 max_length=max_length - visual_inflation,
@@ -549,7 +491,6 @@ def _tokenize_prompt_rows(
             reasoning_by_index[row_index] = _row_reasoning(
                 prompt_messages,
                 completion_messages,
-                full_text=text,
                 render=render_transcript,
                 tokenizer=tokenizer,
                 max_length=max_length,

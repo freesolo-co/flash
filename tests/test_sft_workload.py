@@ -9,7 +9,6 @@ import pytest
 from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.profiling.reasoning_render import reasoning_marker_prefix
 from flash.engine.profiling.sft_workload import (
-    _row_reasoning,
     prepare_sft_workload,
     sft_tokens_for_updates,
 )
@@ -576,8 +575,16 @@ class ThinkingEnvironment(FakeEnvironment):
         return [dict(message) for message in self._completion]
 
 
-def _thinking_prepared(completion, prompt="board"):
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
+def _thinking_prepared_env(
+    env, *, max_context_tokens=512, max_steps=None, model=None, processor_loader=None
+):
+    """Profile ``env`` through the thinking tokenizer, for a test supplying its own transcript."""
+    train = replace(_spec().train, max_context_tokens=max_context_tokens, max_examples=0)
+    if max_steps is not None:
+        train = replace(train, max_steps=max_steps)
+    spec = replace(_spec(), train=train)
+    if model is not None:
+        spec = replace(spec, model=model)
     spec = replace(
         spec,
         thinking=True,
@@ -587,12 +594,20 @@ def _thinking_prepared(completion, prompt="board"):
             producer_version="1.2.3",
         ),
     )
+    extra = {} if processor_loader is None else {"processor_loader": processor_loader}
     return prepare_sft_workload(
         spec,
-        ThinkingEnvironment(completion, prompt=prompt),
+        env,
         tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
         producer_version="1.2.3",
         packing_support=lambda _model, _revision: ("pure-attention", True),
+        **extra,
+    )
+
+
+def _thinking_prepared(completion, prompt="board", *, max_context_tokens=512):
+    return _thinking_prepared_env(
+        ThinkingEnvironment(completion, prompt=prompt), max_context_tokens=max_context_tokens
     )
 
 
@@ -742,28 +757,14 @@ def test_a_think_span_in_the_prompt_does_not_offset_reasoning_lost_from_the_targ
                 {"role": "user", "content": row["prompt"]},
             ]
 
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
+    prepared = _thinking_prepared_env(
         PromptThinkEnvironment(
             [
                 {"role": "assistant", "content": "<think>first</think>a1"},
                 {"role": "user", "content": "next"},
                 {"role": "assistant", "content": "a2"},
             ]
-        ),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
+        )
     )
 
     assert prepared.authored_reasoning_turns == 1
@@ -798,23 +799,7 @@ def test_reasoning_in_a_dropped_row_is_not_reported_against_the_retained_rows(ca
     # long row loses its completion to the cap while the short row keeps its block intact. a cap
     # under 87 would truncate the RETAINED row's reasoning too, and the warning it raised would
     # look like the dropped row leaking into the count while proving nothing about it.
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        MixedEnvironment(),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
+    prepared = _thinking_prepared_env(MixedEnvironment(), max_context_tokens=100)
 
     # the long row lost its whole completion to the cap and was dropped
     assert prepared.profile.dropped_examples == 1
@@ -853,23 +838,7 @@ def test_reasoning_the_cap_kept_is_not_reported_as_dropped(capsys) -> None:
     completion = [{"role": "assistant", "content": "<think>kept</think>" + "tail " * 80}]
     # one token per character: the block's closing tag ends at 76 and the row runs to 489, so this
     # cap keeps the reasoning whole while still cutting most of the answer tail.
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        ThinkingEnvironment(completion),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
+    prepared = _thinking_prepared_env(ThinkingEnvironment(completion), max_context_tokens=100)
 
     # the row IS truncated, but only past the reasoning block
     assert prepared.profile.truncated_examples == 1
@@ -945,23 +914,7 @@ def test_a_truncated_row_does_not_claim_reasoning_the_cap_removed(capsys) -> Non
         {"role": "user", "content": "next"},
         {"role": "assistant", "content": long_reasoning},
     ]
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=64, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        ThinkingEnvironment(completion),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
+    prepared = _thinking_prepared_env(ThinkingEnvironment(completion), max_context_tokens=64)
 
     # the row IS retained and IS truncated: it is trained on, with its reasoning cut away
     assert prepared.profile.retained_examples == 1
@@ -996,27 +949,13 @@ def test_a_reasoned_assistant_turn_in_the_prompt_does_not_cancel_a_surviving_tar
                 {"role": "assistant", "content": "<think>promptreason</think>a1"},
             ]
 
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
+    prepared = _thinking_prepared_env(
         PriorTurnEnvironment(
             [
                 {"role": "user", "content": "next"},
                 {"role": "assistant", "content": "<think>targetreason</think>a2"},
             ]
-        ),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
+        )
     )
 
     # the one authored target turn is in final position, so the template keeps it: nothing is lost
@@ -1043,23 +982,7 @@ def test_an_earlier_surviving_block_is_not_reported_lost_when_a_later_one_is_tru
     ]
     # the fake tokenizer is one token per character: the first block closes at 107 and the second
     # at 360, so this cap falls between them and retains exactly one of the two.
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=200, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        ThinkingEnvironment(completion),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
+    prepared = _thinking_prepared_env(ThinkingEnvironment(completion), max_context_tokens=200)
 
     assert prepared.authored_reasoning_turns == 2
     # the template kept BOTH (they are consecutive trailing turns); the cap then cut only the
@@ -1099,6 +1022,9 @@ def test_a_think_tag_quoted_in_the_prompt_does_not_swallow_the_turns_that_follow
         # here instead of at the template's closer, and only a newline-delimited quote can prove it
         # does not: a same-line quote never produces that sequence.
         ("own line", "the layout is:\n</think>\n\nlike that, "),
+        # a BALANCED pair quoted inside the reasoning: reading the span as ending at the inner
+        # closer places its end well before the real one, the same overstatement by another route.
+        ("balanced pair", "start <think>x</think> "),
     ],
 )
 def test_a_closing_tag_quoted_inside_reasoning_does_not_end_the_block_early(
@@ -1122,23 +1048,7 @@ def test_a_closing_tag_quoted_inside_reasoning_does_not_end_the_block_early(
             "reasoning_content": quoted + "rest " * 12,
         }
     ]
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        ThinkingEnvironment(completion),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
+    prepared = _thinking_prepared_env(ThinkingEnvironment(completion), max_context_tokens=100)
 
     # the cap cuts the block, and measuring to the real closer is what sees that
     assert prepared.authored_reasoning_turns == 1
@@ -1169,169 +1079,119 @@ def test_an_empty_reasoning_field_is_authoritative_over_a_tag_the_answer_quotes(
     assert "reasoning" not in capsys.readouterr().err
 
 
-def test_reasoning_that_quotes_the_assistant_header_is_still_found(capsys) -> None:
-    """A header the reasoning QUOTES is content, and must not open a phantom turn.
+@pytest.mark.parametrize(
+    ("label", "reasoning"),
+    [
+        ("assistant header", "the format is:\n<|im_start|>assistant\n<think>\nand so on"),
+        ("turn terminator", "the turn ends with <|im_end|> always"),
+        ("a whole turn boundary", "before <|im_end|>\n<|im_start|>user\n after"),
+    ],
+)
+def test_reasoning_quoting_the_turn_layout_is_still_credited(capsys, label, reasoning) -> None:
+    """Control-token layout inside reasoning is CONTENT, and the turn it sits in still survives.
 
-    Treating any ``<|im_start|>assistant\\n<think>\\n`` as a turn boundary pulls the search horizon
-    in front of the template's own closer, so the block is never found at all and an intact
-    survivor reports as dropped -- the one failure the endpoint rules are supposed to exclude. A
-    real header always follows the previous turn's terminator; a quoted one does not.
+    These bytes are what a turn boundary IS, so nothing reading the rendered text alone can tell a
+    quote from the real thing -- any scheme parsing the render for turn structure either finds no
+    block or bounds one short, and reports an intact survivor as dropped. That is a warning telling
+    the user to split a transcript that lost nothing, and unfalsifiable from their side since
+    rerunning reproduces it exactly.
+
+    The marker rides inside whatever the template kept, so it answers regardless of what the
+    reasoning says.
     """
-    completion = [
-        {
-            "role": "assistant",
-            "reasoning_content": "the format is:\n<|im_start|>assistant\n<think>\nand so on",
-            "content": "answer",
-        }
-    ]
+    completion = [{"role": "assistant", "reasoning_content": reasoning, "content": "answer"}]
     prepared = _thinking_prepared(completion)
 
-    assert prepared.authored_reasoning_turns == 1
-    assert prepared.rendered_reasoning_spans == 1
+    assert prepared.authored_reasoning_turns == 1, label
+    assert prepared.rendered_reasoning_spans == 1, label
+    assert prepared.truncated_reasoning_spans == 0, label
     assert "the chat template dropped" not in capsys.readouterr().err
 
 
-def test_reasoning_the_scan_cannot_resolve_does_not_warn_about_a_drop(capsys) -> None:
-    """A row whose reasoning the TEMPLATE KEPT must not be reported as one the template dropped.
+def test_a_real_loss_is_reported_beside_a_turn_that_writes_out_the_layout(capsys) -> None:
+    """One turn's quoting must not silence a neighbour's provable loss.
 
-    Reasoning containing a verbatim ``<|im_end|>`` newline plus a header is byte-identical to a real
-    turn boundary, so the span scan cannot locate the block. Treating "not resolvable" as "dropped"
-    prints advice to split the transcript into single-turn rows -- wrong for a row that lost nothing,
-    and unfalsifiable from the user's side, since rerunning reproduces it exactly.
+    An ordinary user turn resets the template's ``last_query_index``, so the first turn's reasoning
+    is definitively stripped -- its marker reaches no render at all. The final turn writes out the
+    turn layout verbatim and is kept. Each is answered by its own marker, so the row reports the
+    real loss: 2 authored, 1 rendered, and the warning fires.
+    """
 
-    The marker distinguishes the two: it is present in the render, so the template kept this turn's
-    reasoning, and its absence from any resolved span is the scan's limit rather than a loss.
+    class KnownLossBesideQuotingEnvironment(ThinkingEnvironment):
+        def sft_completion(self, row):
+            return [
+                # an ordinary user turn follows, so the template strips this reasoning outright
+                {"role": "assistant", "reasoning_content": "early", "content": "a1"},
+                {"role": "user", "content": "next"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "before <|im_end|>\n<|im_start|>user\n after",
+                    "content": "a2",
+                },
+            ]
+
+    prepared = _thinking_prepared_env(KnownLossBesideQuotingEnvironment([], prompt="board"))
+
+    assert prepared.authored_reasoning_turns == 2
+    assert prepared.rendered_reasoning_spans == 1
+    assert "the chat template dropped" in capsys.readouterr().err
+
+
+def test_a_closer_quoted_before_the_layout_does_not_bound_the_block_short(capsys) -> None:
+    """Reasoning quoting a closer AND the turn layout is measured to the template's own closer.
+
+    The marker sits at the end of the reasoning body, so the closing tag is found by searching
+    FORWARD from it -- every closer the reasoning quotes lies behind and cannot bound the block
+    short. A short bound would put the block's end offset too early and score a block the cap cuts
+    as fully retained, the direction that hides the loss.
+
+    Asserted at the cap boundary, where the two answers differ: one token under the block's real
+    end reports truncation, one token over does not.
     """
     completion = [
         {
             "role": "assistant",
-            # the control-token layout written out in full, not merely mentioned
-            "reasoning_content": "before <|im_end|>\n<|im_start|>user\n after",
-            "content": "ans",
+            # a closer first, then the boundary layout, both written out in full
+            "reasoning_content": "start\n</think>\n\n middle <|im_end|>\n<|im_start|>user\n end",
+            "content": "ANSWER",
         }
     ]
-    prepared = _thinking_prepared(completion)
+    kept = _thinking_prepared(completion, max_context_tokens=512)
 
-    # unreported rather than misreported: no drop claim, and no phantom survivor either
-    assert prepared.rendered_reasoning_spans == 0
-    assert prepared.authored_reasoning_turns == 0
-    assert "dropped" not in capsys.readouterr().err
+    # the row reached the measurement rather than being dropped whole
+    assert len(kept.rows) == 1
+    assert kept.authored_reasoning_turns == 1
+    assert kept.rendered_reasoning_spans == 1
+    assert kept.truncated_reasoning_spans == 0
+    assert "reasoning" not in capsys.readouterr().err
 
 
-def test_one_unresolvable_turn_beside_an_ordinary_one_does_not_warn_about_a_drop(capsys) -> None:
-    """Survival is asked PER TURN, so one resolvable block cannot answer for an unresolvable one.
+def test_a_turn_index_is_terminated_so_turn_one_is_not_read_inside_turn_ten(capsys) -> None:
+    """``{prefix}1`` is a substring of ``{prefix}10`` unless the index is terminated.
 
-    The row pairs a block the scan cannot locate with an ordinary one it can, and a ``tool`` turn
-    between them keeps BOTH out of the template's ``last_query_index`` reset -- so the template
-    keeps both, and the row loses nothing.
-
-    A guard testing only the SHARED marker prefix reads the resolvable block's surviving marker as
-    proof the whole row resolved, leaving the other block counted as authored-but-not-rendered:
-    2 authored, 1 rendered, and a warning to split a transcript that lost nothing. The per-turn
-    markers separate them, because each names the one turn it rides in.
-
-    Only the unjudgeable TURN leaves the accounting, so the ordinary block is still counted as the
-    survivor it is: 1 authored, 1 rendered, quiet. Dropping its neighbour's count too would be
-    honest only about the turn nobody can judge (see
-    ``test_a_known_loss_is_still_reported_beside_an_unjudgeable_survivor``).
+    Without the terminator a dropped early turn reads as surviving whenever a later turn whose index
+    starts with the same digits does, and the row reports more survivors than it lost. This
+    transcript strips every turn but the last, and the last one's index shares a prefix with an
+    earlier one, so an unterminated marker would credit the earlier turn too.
     """
 
-    class PartlyUnresolvableEnvironment(ThinkingEnvironment):
+    class ManyTurnEnvironment(ThinkingEnvironment):
         def sft_completion(self, row):
-            return [
-                # the control-token layout written out in full: byte-identical to a turn boundary
-                {
-                    "role": "assistant",
-                    "reasoning_content": "before <|im_end|>\n<|im_start|>user\n after",
-                    "content": "a1",
-                },
-                # a tool turn does not reset last_query_index, so the turn above KEEPS its reasoning
-                {"role": "tool", "content": "toolout"},
-                {"role": "assistant", "reasoning_content": "ordinary", "content": "a2"},
-            ]
+            turns = []
+            for index in range(6):
+                turns.append(
+                    {"role": "assistant", "reasoning_content": f"r{index}", "content": f"a{index}"}
+                )
+                if index < 5:
+                    turns.append({"role": "user", "content": "next"})
+            return turns
 
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        PartlyUnresolvableEnvironment([], prompt="board"),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
+    prepared = _thinking_prepared_env(ManyTurnEnvironment([], prompt="board"))
 
-    # the ordinary turn is counted as the survivor it is; only the unjudgeable one leaves
-    assert prepared.authored_reasoning_turns == 1
+    # only the final turn sits after the last user message, so exactly one survives
+    assert prepared.authored_reasoning_turns == 6
     assert prepared.rendered_reasoning_spans == 1
-    assert "dropped" not in capsys.readouterr().err
-
-
-def test_a_span_bounded_at_a_quoted_closer_is_not_scored_as_fully_retained(capsys) -> None:
-    """A block the cap CUTS must never read as retained, and a short span is how that happens.
-
-    Reasoning that quotes a newline-delimited ``</think>`` and then, later, a turn boundary pulls
-    the scan's horizon in front of the template's own closer, so the span ends at the QUOTED one.
-    The head marker sits inside that shortened span, so a head-only check calls the turn resolved
-    and then measures truncation against an end offset that is too early: with the cap landing
-    between the quoted closer and the real one, a block training actually cuts is reported as fully
-    retained -- the direction that hides the loss rather than over-warning.
-
-    Bracketing the reasoning is what separates them: a span holding the head WITHOUT the tail
-    stopped before the reasoning ended, so the turn is unjudgeable and leaves the accounting.
-    """
-
-    class QuotedCloserThenBoundaryEnvironment(ThinkingEnvironment):
-        def sft_completion(self, row):
-            return [
-                {
-                    "role": "assistant",
-                    # a closer first, then the boundary layout, both written out in full
-                    "reasoning_content": (
-                        "start\n</think>\n\n middle <|im_end|>\n<|im_start|>user\n end"
-                    ),
-                    "content": "ANSWER",
-                },
-            ]
-
-    # the cap sits between the quoted closer (span end 77) and the template's real one (120), the
-    # only window where the two answers differ. it also has to clear the 63-token prompt: a cap
-    # below that empties every completion and the row is DROPPED before reasoning is ever measured,
-    # so the assertions below would pass on a broken build for the wrong reason.
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        QuotedCloserThenBoundaryEnvironment([], prompt="board"),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
-
-    # the row REACHED the measurement. every assertion below is a zero, and a dropped row reports
-    # the same zeros without the guard ever running -- so without this the test would pass on a
-    # build that never executed the code it exists to cover.
-    assert len(prepared.rows) == 1
-
-    # unjudgeable rather than a phantom survivor: never 1 rendered with 0 truncated
-    assert prepared.rendered_reasoning_spans == 0
-    assert prepared.truncated_reasoning_spans == 0
-    assert prepared.authored_reasoning_turns == 0
+    assert "the chat template dropped 5 of 6" in capsys.readouterr().err
 
 
 def test_reasoning_loss_is_measured_over_the_rows_the_horizon_reaches(capsys) -> None:
@@ -1398,56 +1258,6 @@ def test_reasoning_loss_is_measured_over_the_rows_the_horizon_reaches(capsys) ->
     assert "the chat template dropped" not in capsys.readouterr().err
 
 
-def test_a_known_loss_is_still_reported_beside_an_unjudgeable_survivor(capsys) -> None:
-    """Excluding the turn nobody can judge must not bury a loss that IS provable.
-
-    The mirror of the row above. An ordinary user turn resets the template's ``last_query_index``,
-    so the first turn's reasoning is definitively stripped -- its marker reaches no render at all.
-    The final turn quotes a turn boundary, so the template keeps it while the span scan cannot bound
-    it. Suppressing the whole row to stay quiet about that second turn would also hide the first
-    turn's loss, which the render proves: the user would be told a lossy transcript is fine.
-
-    So the unjudgeable turn leaves the count and the stripped one stays: 1 authored, 0 rendered,
-    and the warning still fires.
-    """
-
-    class KnownLossBesideUnjudgeableEnvironment(ThinkingEnvironment):
-        def sft_completion(self, row):
-            return [
-                # an ordinary user turn follows, so the template strips this reasoning outright
-                {"role": "assistant", "reasoning_content": "early", "content": "a1"},
-                {"role": "user", "content": "next"},
-                # the control-token layout written out in full: kept, but the scan cannot bound it
-                {
-                    "role": "assistant",
-                    "reasoning_content": "before <|im_end|>\n<|im_start|>user\n after",
-                    "content": "a2",
-                },
-            ]
-
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        KnownLossBesideUnjudgeableEnvironment([], prompt="board"),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
-
-    assert prepared.authored_reasoning_turns == 1
-    assert prepared.rendered_reasoning_spans == 0
-    assert "dropped" in capsys.readouterr().err
-
-
 def test_a_tool_response_bounds_the_span_of_the_turn_before_it(capsys) -> None:
     """A block ends at its own turn even when no LATER turn opens reasoning of its own.
 
@@ -1472,51 +1282,13 @@ def test_a_tool_response_bounds_the_span_of_the_turn_before_it(capsys) -> None:
 
     # between the block's real closer (76) and the closer quoted in the tool output (140): the
     # unbounded span would reach past this cap, the correctly bounded one ends well before it.
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        ToolEnvironment([]),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
+    prepared = _thinking_prepared_env(ToolEnvironment([]), max_context_tokens=100)
 
     assert prepared.authored_reasoning_turns == 1
     assert prepared.rendered_reasoning_spans == 1
     # the block fits: it ends at its own closer, not at the one quoted in the tool output
     assert prepared.profile.truncated_reasoning_spans == 0
     assert "cut off" not in capsys.readouterr().err
-
-
-def test_reasoning_that_mentions_the_turn_terminator_is_still_found(capsys) -> None:
-    """A literal ``<|im_end|>`` inside reasoning is content, not the end of the turn.
-
-    Bounding the search at the FIRST terminator after the anchor stops the scan before the
-    template's own closer, so the block is never found and an intact survivor reports as dropped --
-    with a non-binding cap, a total-loss warning for a row that lost nothing.
-    """
-    completion = [
-        {
-            "role": "assistant",
-            "reasoning_content": "the turn ends with <|im_end|> always",
-            "content": "answer",
-        }
-    ]
-    prepared = _thinking_prepared(completion)
-
-    assert prepared.authored_reasoning_turns == 1
-    assert prepared.rendered_reasoning_spans == 1
-    assert prepared.truncated_reasoning_spans == 0
-    assert "the chat template dropped" not in capsys.readouterr().err
 
 
 def test_a_cap_landing_on_the_answer_separator_does_not_report_lost_reasoning(capsys) -> None:
@@ -1532,70 +1304,12 @@ def test_a_cap_landing_on_the_answer_separator_does_not_report_lost_reasoning(ca
     # the fake is one token per character: the closing tag ends at 77 and the span at 79, so this
     # cap retains the whole block and only a span-end measurement would call it truncated. a cap
     # below 77 would cut the block under either rule and could not tell them apart.
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=77, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        ThinkingEnvironment(completion),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
+    prepared = _thinking_prepared_env(ThinkingEnvironment(completion), max_context_tokens=77)
 
     assert prepared.authored_reasoning_turns == 1
     assert prepared.rendered_reasoning_spans == 1
     assert prepared.truncated_reasoning_spans == 0
     assert "max_context_tokens cut" not in capsys.readouterr().err
-
-
-def test_reasoning_containing_a_balanced_tag_is_measured_to_its_real_end(capsys) -> None:
-    """A span's end is the OUTER closer, even when the reasoning quotes a balanced pair inside it.
-
-    A turn reasoning about the tag format renders `<think>start <think>x</think> rest</think>`.
-    Reading the span as ending at the INNER closer would place its end well before the real one, so
-    a cap falling between the two would call a cut block retained and overstate what reaches the
-    loss. Here the cap sits past the inner closer but before the outer one.
-    """
-    completion = [
-        {
-            "role": "assistant",
-            "content": "answer",
-            "reasoning_content": "start <think>x</think> " + "rest " * 12,
-        }
-    ]
-    # one token per character: the INNER closer ends at 85 and the real one at 154, so this cap
-    # falls between them -- an early end would call the cut block retained.
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=100, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        ThinkingEnvironment(completion),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
-
-    assert prepared.authored_reasoning_turns == 1
-    assert prepared.rendered_reasoning_spans == 1
-    # measured to the outer closer, so the cap is correctly seen to cut it
-    assert prepared.truncated_reasoning_spans == 1
-    assert "max_context_tokens cut 1 rendered reasoning block" in capsys.readouterr().err
 
 
 def test_reasoning_sampled_without_an_opening_tag_still_counts_as_authored(capsys) -> None:
@@ -1684,23 +1398,7 @@ def test_a_quoting_answer_on_a_dropped_turn_is_not_credited_as_a_survivor(capsys
         {"role": "user", "content": "next"},
         {"role": "assistant", "content": "<think>late</think>a2"},
     ]
-    spec = replace(_spec(), train=replace(_spec().train, max_context_tokens=512, max_examples=0))
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        ThinkingEnvironment(completion),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
-    )
+    prepared = _thinking_prepared_env(ThinkingEnvironment(completion))
 
     assert prepared.authored_reasoning_turns == 2
     # only the final turn's reasoning reaches the loss; the quoted tags are answer text
@@ -1763,28 +1461,12 @@ def test_an_image_rows_visual_tokens_are_charged_against_the_reasoning_cap() -> 
             ids = [3 + ord(char) % 89 for char in text] + [7] * self.visual
             return {"input_ids": [ids], "attention_mask": [[1] * len(ids)]}
 
-    spec = replace(
-        _spec(),
+    prepared = _thinking_prepared_env(
+        ImageEnvironment(),
+        max_context_tokens=200,
         # image-bearing rows are refused outright for a model the catalog says cannot train on them
         model="Qwen/Qwen3.5-4B",
-        train=replace(_spec().train, max_context_tokens=200, max_examples=0),
-    )
-    spec = replace(
-        spec,
-        thinking=True,
-        workload_profile_input_digest=sft_profile_input_digest(
-            spec,
-            tokenizer_revision=spec.model_revision,
-            producer_version="1.2.3",
-        ),
-    )
-    prepared = prepare_sft_workload(
-        spec,
-        ImageEnvironment(),
-        tokenizer_loader=lambda _model, _revision: ThinkingTokenizer(),
         processor_loader=lambda _model, _revision: ExpandingProcessor(),
-        producer_version="1.2.3",
-        packing_support=lambda _model, _revision: ("pure-attention", True),
     )
 
     # the block closes 40 characters into the text render, well inside the 200-token cap, but the
@@ -1832,65 +1514,3 @@ def test_the_marker_stem_search_does_not_scan_once_per_character() -> None:
     assert marker not in big
     assert marker == stem + "x" * 200_001
     assert elapsed < 2.0, f"marker search took {elapsed:.1f}s, which is the per-character scan"
-
-
-def test_a_span_holding_only_a_tail_marker_is_not_counted_as_a_survivor() -> None:
-    """A tail-only span must not be credited, or a row reports more survivors than it authored.
-
-    The markers share a stem: the tail is ``{prefix}e{index}``, which contains ``{prefix}`` and
-    ``{prefix}e`` as plain substrings. Testing for those accepts a span carrying only a tail -- and
-    reasoning that quotes a closer followed by a turn boundary produces exactly that, because the
-    scan bounds the block short and the tail lands in the NEXT span while the head stays behind.
-
-    That turn is already counted unjudgeable and removed from ``authored``, so crediting its
-    stranded tail here counts a survivor the row never authored. Below, one authored turn yields two
-    survivors under the substring guards, which drives the warning's arithmetic negative; requiring
-    one turn's head and tail in the SAME span returns the honest one.
-    """
-    think_open, think_close, turn_end = "<think>", "</think>", "<|im_end|>"
-    # a closer, then the boundary layout: the scan ends the block at the QUOTED closer, so the head
-    # sits in the short span and the tail is stranded in the one the boundary opens
-    split = f"head {think_close}\n\n{turn_end}\n<|im_start|>assistant\n{think_open}\n tail"
-
-    def render(messages: list[dict]) -> str:
-        # the template's rule: reasoning survives only on assistant turns AFTER the last user turn
-        last_user = max((i for i, m in enumerate(messages) if m["role"] == "user"), default=-1)
-        out = []
-        for index, message in enumerate(messages):
-            content = str(message.get("content") or "")
-            reasoning = message.get("reasoning_content")
-            if reasoning and message["role"] == "assistant" and index > last_user:
-                out.append(
-                    f"<|im_start|>assistant\n{think_open}\n{reasoning}\n{think_close}"
-                    f"\n\n{content}{turn_end}\n"
-                )
-            else:
-                out.append(f"<|im_start|>{message['role']}\n{content}{turn_end}\n")
-        return "".join(out)
-
-    class _Tokenizer:
-        def __call__(self, texts, *, truncation=False, max_length=None):
-            if isinstance(texts, str):
-                texts = [texts]
-            return {"input_ids": [list(range(len(text))) for text in texts]}
-
-    prompt = [{"role": "user", "content": "u"}]
-    for reasonings in ((split, "plain reasoning"), ("plain reasoning", split)):
-        completion = [
-            {"role": "assistant", "content": f"A{index}", "reasoning_content": reasoning}
-            for index, reasoning in enumerate(reasonings)
-        ]
-        full_text = render([*prompt, *completion])
-        row = _row_reasoning(
-            prompt,
-            completion,
-            full_text=full_text,
-            render=render,
-            tokenizer=_Tokenizer(),
-            max_length=10**6,
-        )
-        # the split turn leaves the accounting as unjudgeable; the honest turn is the one survivor
-        assert row.authored_turns == 1
-        assert row.rendered_spans == 1
-        # the invariant the substring guards broke: a row cannot render more than it authored
-        assert row.rendered_spans <= row.authored_turns

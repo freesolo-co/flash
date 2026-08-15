@@ -11,16 +11,14 @@ from typing import Any
 # re-exported: identifying reasoning in a render is its own problem and lives in a sibling module,
 # but the profile's callers import these from here.
 from flash.engine.profiling.reasoning_render import (  # noqa: F401
-    count_rendered_reasoning_spans,
     horizon_row_count,
+    marked_reasoning_end,
     reasoned_assistant_turns,
     reasoning_marker_prefix,
     reasoning_markers,
-    reasoning_span_end_offsets,
-    reasoning_span_texts,
-    reasoning_spans,
     reasoning_warning_rows,
     rendered_reasoning_loss_warning,
+    strip_reasoning_markers,
     with_marked_reasoning,
 )
 
