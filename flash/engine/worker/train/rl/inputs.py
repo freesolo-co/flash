@@ -344,13 +344,13 @@ def _resolve_grpo_schedule(train_spec, rl, prompts, prompts_per_step, lengths, m
         steps=int(steps),
     )
     save_every = int(train_spec.save_every) if (train_spec and train_spec.save_every) else 20
-    # exact save steps: verl only saves when global_step % save_freq == 0, so it cannot hit an
-    # arbitrary set directly. the gcd is the largest interval every required step is a multiple of,
-    # so verl saves a superset and the uploader publishes the deployables at exactly the required
-    # ones. same derivation the sft verl backend already uses.
+    # periodic saves land on multiples of save_freq. clamp the default interval to the horizon so a
+    # short derived run still lands a periodic save on its final step. exact save steps can be
+    # arbitrary, so their gcd produces a superset that includes every requested step; the uploader
+    # publishes only those deployables. pinned verl additionally saves the last step.
     save_at_steps = tuple(int(step) for step in (getattr(train_spec, "save_at_steps", ()) or ()))
     validate_save_steps(save_at_steps, int(steps))
-    save_freq = reduce(gcd, save_at_steps) if save_at_steps else save_every
+    save_freq = reduce(gcd, save_at_steps) if save_at_steps else max(1, min(save_every, int(steps)))
     # keep checkpoints long enough for asynchronous export. verl prunes only after the next save, but
     # consecutive required steps can leave a short merger window; a small history prevents a slow
     # export from losing a requested step.
