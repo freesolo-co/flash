@@ -22,6 +22,7 @@ import time
 from http.server import BaseHTTPRequestHandler
 from typing import TYPE_CHECKING
 
+from flash._internal.diagnostics import sanitize_diagnostic
 from flash.engine.worker.entry.opd import _drop_fully_forced_groups
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.teacher.client import TeacherError
@@ -924,7 +925,11 @@ class _TeacherAlignmentBridge:
                         {
                             "error": {
                                 "classification": classification,
-                                "message": str(error),
+                                # This parent has every declared runtime secret and
+                                # FLASH_SECRET_ENV_KEYS; the child deliberately does not. Sanitize
+                                # before crossing that boundary or an unlabeled parent-only secret
+                                # cannot be recovered by the child's shape-based fallback.
+                                "message": sanitize_diagnostic(str(error), limit=16_000),
                             }
                         },
                     )

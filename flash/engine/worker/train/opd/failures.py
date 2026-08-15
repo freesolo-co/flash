@@ -210,9 +210,12 @@ def _raise_verl_failure(
     # reported as a fatal completion-cap error, telling the user to raise max_completion_tokens.
     if child_failure is not None:
         classification, message = child_failure
+        # This generic channel covers local template validation and rollout generation as well as
+        # bridge calls. Calling every record a teacher-bridge failure sends the user to the wrong
+        # subsystem even when the stage says `template` or `generate`.
         if classification == "transient":
-            raise _w.RetriableInfraError(f"transient teacher bridge failure: {message}")
-        raise RuntimeError(f"permanent teacher bridge failure: {message}")
+            raise _w.RetriableInfraError(f"transient OPD child failure: {message}")
+        raise RuntimeError(f"permanent OPD child failure: {message}")
     if return_code == _TRANSIENT_TEACHER_EXIT:
         raise _w.RetriableInfraError("transient teacher bridge failure")
     if return_code == _PERMANENT_TEACHER_EXIT:

@@ -5410,6 +5410,82 @@ def test_child_failure_sanitizer_redacts_a_runtime_credential_quoted_in_json_or_
         assert "<redacted>" in redacted
 
 
+def test_child_failure_sanitizer_redacts_multiline_quoted_credentials():
+    """A quoted PEM-style value is one field even though it spans lines.
+
+    Runtime-generated keys are not guaranteed to exist in the child's environment, so stopping the
+    shape match at the first newline persists the key body and closing lines verbatim.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    secret_body = "MIIruntimeSecretABC123"
+    message = (
+        "private_key='-----BEGIN PRIVATE KEY-----\n"
+        f"{secret_body}\n"
+        "-----END PRIVATE KEY-----' while creating the signer"
+    )
+    redacted = _safe_child_failure_detail(ValueError(message))
+
+    assert secret_body not in redacted
+    assert redacted == "private_key='<redacted>' while creating the signer"
+
+
+def test_child_failure_sanitizer_keeps_punctuation_inside_unquoted_credentials():
+    """Comma and semicolon are valid credential characters, not safe redaction boundaries."""
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    message = (
+        "password=abc,runtime-secret and api_key=def;another-runtime-secret while authenticating"
+    )
+    redacted = _safe_child_failure_detail(ValueError(message))
+
+    assert "runtime-secret" not in redacted
+    assert redacted == "password=<redacted> and api_key=<redacted> while authenticating"
+
+
+def test_child_failure_sanitizer_redacts_pwd_fields_without_treating_pwd_env_as_a_secret(
+    monkeypatch,
+):
+    """ODBC's `PWD` is credential SHAPE; the process `PWD` env value is not a secret VALUE."""
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    monkeypatch.setenv("PWD", "/workspace/ordinary-path")
+    messages = (
+        "DRIVER=x;UID=bob;PWD=runtime-password-abc123;SERVER=db",
+        '{"pwd":"runtime-password-xyz789"}',
+    )
+    for message in messages:
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "runtime-password" not in redacted
+        assert "<redacted>" in redacted
+
+    assert _safe_child_failure_detail(ValueError("failed under /workspace/ordinary-path")) == (
+        "failed under /workspace/ordinary-path"
+    )
+
+
+def test_parent_redacts_declared_secret_before_returning_bridge_error_to_child(monkeypatch):
+    """The parent owns arbitrary declared-secret values; the isolated child deliberately does not."""
+    secret = "runtime-aws-key-abc123"
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
+    monkeypatch.setenv("FLASH_SECRET_ENV_KEYS", "AWS_SECRET_ACCESS_KEY")
+
+    def fail_mutation():
+        raise ValueError(f"upstream rejected {secret}")
+
+    bridge = _text_bridge(_MergedBridgeTeacher(), mutation_callback=fail_mutation)
+    bridge.start()
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as error:
+            _post_json(bridge.url, bridge.token, "/mutation", {})
+    finally:
+        bridge.close()
+
+    assert error.value.classification == "permanent"
+    assert secret not in str(error.value)
+    assert str(error.value) == "upstream rejected <redacted>"
+
+
 def test_explicit_multiturn_score_rejection_bypasses_delivery_handler():
     from flash.engine.worker.train.opd.child.multiturn import _post_multiturn_score
 
@@ -6414,6 +6490,7 @@ def test_parent_surfaces_child_failure_record_with_classification(
             truncation_window=None,
         )
 
+    assert f"{classification} OPD child failure: " in str(error.value)
     assert "[stage=generate] ValueError: invalid rollout state" in str(error.value)
     # RetriableInfraError SUBCLASSES RuntimeError, so `pytest.raises(RuntimeError)` alone accepts a
     # retriable exception and cannot prove a permanent failure stays permanent. assert retriability

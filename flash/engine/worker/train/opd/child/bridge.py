@@ -37,8 +37,8 @@ _FAILURE_FALLBACK_MAX_CHARS = 8192
 #   - key and value may each be quoted, and either quote may be backslash-escaped: a diagnostic
 #     embedding serialized json carries `{\"password\":\"secret\"}`, which an unquoted-only
 #     pattern cannot cross.
-#   - a quoted value runs to its matching quote, so whitespace inside it stays part of the value;
-#     an unquoted one stops at whitespace so the sentence around the credential survives.
+#   - a quoted value runs to its matching quote even across lines, so a PEM or serialized multiline
+#     secret is one value; an unquoted one stops at whitespace so the sentence around it survives.
 #   - a known auth scheme (bearer/basic/token) is consumed, not captured, or `Basic dXNlcjpwYXNz`
 #     redacts the scheme and prints the credential. An UNRECOGNISED scheme runs to end of line:
 #     the bare branch would otherwise treat the vendor word as the value.
@@ -67,24 +67,29 @@ _SECRET_KEY_FIELD = (
 )
 # unanchored, so `Set-Cookie` matches through the `Cookie` inside it.
 _SECRET_COOKIE_KEY = r"(?P<cookie>cookie)"
+# comma and semicolon delimit another field only when a key follows (`;SERVER=` / `, scope=`).
+# Otherwise they are credential characters: stopping at `password=abc,runtime-secret` leaks the
+# suffix. This keeps benign connection-string fields while failing closed on ambiguous punctuation.
+_SECRET_NEXT_FIELD = r"[,;](?=[A-Za-z][\w.-]*(?: [A-Za-z][\w.-]*)?\s*=)"
 _SECRET_DETAIL = re.compile(
     rf"(?i)(?P<key>{_SECRET_AUTH_KEY}|api[-_ ]?key|access[-_ ]?token|token|secret"
-    rf"|pass(?:[-_ ]?phrase|word|wd)"
+    rf"|pass(?:[-_ ]?phrase|word|wd)|pwd"
     rf"|credentials?|{_SECRET_COOKIE_KEY}|{_SECRET_KEY_FIELD}|{_SECRET_URL_PARAM})"
     r"(?P<sep>(?:\\?['\"])?\s*[:=]\s*)"
     # escaped-quote branch first: `\"secret\"` starts with a backslash, so `quote` misses it and
     # `bare` would stop dead there. `\\\\.` consumes a doubled backslash before the delimiter test.
-    rf"(?:\\(?P<eq>['\"])(?P<escaped>(?:\\\\.|(?!\\(?P=eq))[^\r\n])*)"
+    # `\s\S` rather than `.` keeps multiline values independent of the regex's global flags.
+    rf"(?:\\(?P<eq>['\"])(?P<escaped>(?:\\\\.|(?!\\(?P=eq))[\s\S])*)"
     rf"|(?P<quote>['\"])(?:digest\s+(?P<qdigest>[^\r\n]+)"
-    rf"|{_SECRET_SCHEME}(?P<quoted>(?:\\.|(?!(?P=quote))[^\r\n])*))"
+    rf"|{_SECRET_SCHEME}(?P<quoted>(?:\\.|(?!(?P=quote))[\s\S])*))"
     r"|digest\s+(?P<digest>[^\r\n]+)"
     # `(?=...)`-style conditional, not `(?(auth)yes|no)` as the outer else: that would make the bare
     # branch unreachable for the very key that needs it.
     rf"|(?(auth){_SECRET_UNKNOWN_SCHEME}[^\r\n]+|(?!))"
     r"|(?(cookie)[^\r\n]+|(?!))"
-    # `&` terminates an unquoted value so each signed-url parameter is redacted on its own, keeping
-    # the benign `X-Amz-Expires` that says WHY a capability failed.
-    rf"|{_SECRET_SCHEME}(?P<bare>[^\s,;&'\"}}]+))"
+    # `&` always terminates a signed-url parameter. Comma and semicolon terminate only before a
+    # next `field=`; otherwise they are part of the issued credential and must be consumed.
+    rf"|{_SECRET_SCHEME}(?P<bare>(?:(?!{_SECRET_NEXT_FIELD})[^\s&'\"}}])+))"
 )
 _MIN_SECRET_COMPONENT = 8
 # vocabulary ids run to ~7 digits at today's sizes; longer digit runs are not ids. see _is_token_id.
