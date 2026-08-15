@@ -647,12 +647,16 @@ def liveness_heartbeat(
     ``child_tail_stall_event`` is SET (never raised) once ``fields`` reports a child that has gone
     ``CHILD_TAIL_STALL_S`` seconds without new output: this runs on a daemon thread, so an
     exception here would die with the thread while the main thread stayed blocked on a dead child.
-    The deadline is additionally re-checked from a second thread that never emits, so a heartbeat
-    upload wedged inside this loop cannot also suppress the verdict (see ``_ChildTailStallClock``).
+    That watch runs entirely on its OWN thread -- it samples ``fields`` and decides on what it read
+    -- so a heartbeat upload wedged inside this loop can suppress neither half of the verdict.
     """
     done = threading.Event()
     spawner = threading.current_thread()
     stall_clock = _ChildTailStallClock()
+    # the watch thread's most recent `fields()` sample, handed to the emitting loop so `fields` is
+    # called once per tick in total. only meaningful when that thread exists.
+    latest_fields: list[dict] = [{}]
+    watcher_samples = child_tail_stall_event is not None and fields is not None
 
     def _watch_loop() -> None:
         # same inline-stub guard as `_loop` below, for the same reason: a test that runs thread
@@ -665,11 +669,19 @@ def liveness_heartbeat(
         # already-open silence window could never be cleared by new output and the deadline killed a
         # HEALTHY child. `fields()` is the same cheap callback the emitter uses (it reads a line
         # counter); it performs no io, and its exceptions are suppressed exactly as there.
+        #
+        # it is also the ONLY caller once this thread exists. `fields` is not a pure read: it drives
+        # `ChildTailStaleness.observe`, which advances the silent-tick counter once per call. two
+        # threads calling it per tick made the counter climb at double rate, so the deadline fired
+        # at half the intended time on a healthy run AND the number published in the heartbeat --
+        # the diagnostic this whole change exists to make trustworthy -- was wrong. the emitter
+        # reads the sample this thread took instead of taking its own.
         while not done.wait(_LIVENESS_TICK_S):
             sample: dict = {}
             if fields is not None:
                 with contextlib.suppress(Exception):
                     sample = fields() or {}
+            latest_fields[0] = sample
             stall_clock.observe(sample.get("child_tail_silent_ticks"), child_tail_stall_event)
 
     def _loop() -> None:
@@ -698,7 +710,13 @@ def liveness_heartbeat(
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
             extra = {}
-            if fields is not None:
+            if watcher_samples:
+                # the watch thread is the sole caller of `fields` (see `_watch_loop`): calling it
+                # here too would advance the silent-tick counter a second time per tick. take its
+                # most recent sample instead. a dict store is atomic under the GIL, so this reads
+                # either the previous tick's fields or this tick's, never a torn mixture.
+                extra = dict(latest_fields[0])
+            elif fields is not None:
                 with contextlib.suppress(Exception):
                     extra = fields() or {}
             if progress_step and last_val is not None:

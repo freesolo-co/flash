@@ -468,6 +468,45 @@ def test_the_watchdog_samples_on_a_thread_that_cannot_be_blocked_by_uploads(monk
     )
 
 
+def test_fields_is_sampled_once_per_tick_not_once_per_thread(monkeypatch):
+    """`fields` is not a pure read -- it ADVANCES the silent-tick counter on every call.
+
+    `stall_tail_fields` drives `ChildTailStaleness.observe`, which increments the consecutive-silent
+    count each time it runs. Once the watchdog got its own thread, two threads calling `fields` per
+    tick made that counter climb at double rate: the deadline then fires at half the intended time
+    on a healthy run, and the `child_tail_silent_ticks` published in the heartbeat -- the number
+    this whole change exists to make trustworthy -- is simply wrong.
+    """
+    hb, w, _ = _liveness_env(monkeypatch)
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_S", 3600.0)  # never fire; this is about call counts
+    emitted: list = []
+    monkeypatch.setattr(
+        w, "heartbeat", lambda s, **k: emitted.append(k.get("child_tail_silent_ticks"))
+    )
+
+    calls = [0]
+
+    def counting_fields():
+        # models the real callback: each call advances a counter and returns the new value.
+        calls[0] += 1
+        return {"child_tail_silent_ticks": calls[0]}
+
+    with hb.liveness_heartbeat(
+        "opd_step",
+        fields=counting_fields,
+        child_tail_stall_event=threading.Event(),
+    ):
+        time.sleep(0.25)
+
+    ticks = len(emitted)
+    assert ticks >= 2, f"too few ticks to measure ({ticks}); the loop barely ran"
+    assert calls[0] <= ticks + 1, (
+        f"fields() was called {calls[0]} times across {ticks} emitted ticks: the counter is being "
+        "advanced more than once per tick, so the deadline fires early and the published "
+        "silent-tick count is wrong"
+    )
+
+
 def test_elapse_survives_the_window_being_cleared_underneath_it(monkeypatch):
     """`elapse` and `observe` run on DIFFERENT threads, so the window can vanish mid-call.
 
