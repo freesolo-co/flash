@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import ClassVar
 
 import pytest
 
 from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-from flash.engine.profiling.sft_workload import prepare_sft_workload, sft_tokens_for_updates
+from flash.engine.profiling.reasoning_render import reasoning_marker_prefix
+from flash.engine.profiling.sft_workload import (
+    _row_reasoning,
+    prepare_sft_workload,
+    sft_tokens_for_updates,
+)
 from flash.engine.profiling.workload_profile import (
     sft_profile_input_digest,
     unpacked_batch_warning,
@@ -1787,3 +1793,104 @@ def test_an_image_rows_visual_tokens_are_charged_against_the_reasoning_cap() -> 
     assert prepared.authored_reasoning_turns == 1
     assert prepared.rendered_reasoning_spans == 1
     assert prepared.truncated_reasoning_spans == 1
+
+
+def test_the_marker_stem_search_does_not_scan_once_per_character() -> None:
+    """A valid row must not cost quadratic time before tokenization even begins.
+
+    Text holding the stem followed by N filler characters keeps every one-character extension a
+    substring, so growing the stem one at a time walks the whole row N times. Profiling runs on the
+    control plane ahead of tokenization, so a large packaged row stalls it rather than failing
+    anything -- and the row is perfectly valid, so nothing else reports a problem.
+
+    Two assertions, because either alone passes on a broken implementation. The equivalence cases
+    fix WHAT is returned -- the shortest absent stem, exactly what the one-at-a-time loop produced,
+    so a faster search cannot quietly hand back a longer marker. The budget fixes what it COSTS: the
+    one-at-a-time loop needs 21s on the large input below and a scan-bounded one needs milliseconds,
+    so a generous ceiling separates them without being flaky on a loaded machine.
+    """
+    stem = "flashreasoningmark"
+
+    def shortest_absent(text: str) -> str:
+        prefix = stem
+        while prefix in text:
+            prefix += "x"
+        return prefix
+
+    for filler in (0, 1, 5, 37, 500):
+        text = f"a{stem}{'x' * filler}b"
+        assert reasoning_marker_prefix(text) == shortest_absent(text)
+
+    # a stem that appears more than once, at different run lengths, still resolves to the shortest
+    text = f"{stem}xxx {stem}xxxxxxxxx {stem}"
+    assert reasoning_marker_prefix(text) == shortest_absent(text)
+
+    big = stem + "x" * 200_000
+    started = time.perf_counter()
+    marker = reasoning_marker_prefix(big)
+    elapsed = time.perf_counter() - started
+    assert marker not in big
+    assert marker == stem + "x" * 200_001
+    assert elapsed < 2.0, f"marker search took {elapsed:.1f}s, which is the per-character scan"
+
+
+def test_a_span_holding_only_a_tail_marker_is_not_counted_as_a_survivor() -> None:
+    """A tail-only span must not be credited, or a row reports more survivors than it authored.
+
+    The markers share a stem: the tail is ``{prefix}e{index}``, which contains ``{prefix}`` and
+    ``{prefix}e`` as plain substrings. Testing for those accepts a span carrying only a tail -- and
+    reasoning that quotes a closer followed by a turn boundary produces exactly that, because the
+    scan bounds the block short and the tail lands in the NEXT span while the head stays behind.
+
+    That turn is already counted unjudgeable and removed from ``authored``, so crediting its
+    stranded tail here counts a survivor the row never authored. Below, one authored turn yields two
+    survivors under the substring guards, which drives the warning's arithmetic negative; requiring
+    one turn's head and tail in the SAME span returns the honest one.
+    """
+    think_open, think_close, turn_end = "<think>", "</think>", "<|im_end|>"
+    # a closer, then the boundary layout: the scan ends the block at the QUOTED closer, so the head
+    # sits in the short span and the tail is stranded in the one the boundary opens
+    split = f"head {think_close}\n\n{turn_end}\n<|im_start|>assistant\n{think_open}\n tail"
+
+    def render(messages: list[dict]) -> str:
+        # the template's rule: reasoning survives only on assistant turns AFTER the last user turn
+        last_user = max((i for i, m in enumerate(messages) if m["role"] == "user"), default=-1)
+        out = []
+        for index, message in enumerate(messages):
+            content = str(message.get("content") or "")
+            reasoning = message.get("reasoning_content")
+            if reasoning and message["role"] == "assistant" and index > last_user:
+                out.append(
+                    f"<|im_start|>assistant\n{think_open}\n{reasoning}\n{think_close}"
+                    f"\n\n{content}{turn_end}\n"
+                )
+            else:
+                out.append(f"<|im_start|>{message['role']}\n{content}{turn_end}\n")
+        return "".join(out)
+
+    class _Tokenizer:
+        def __call__(self, texts, *, truncation=False, max_length=None):
+            if isinstance(texts, str):
+                texts = [texts]
+            return {"input_ids": [list(range(len(text))) for text in texts]}
+
+    prompt = [{"role": "user", "content": "u"}]
+    for reasonings in ((split, "plain reasoning"), ("plain reasoning", split)):
+        completion = [
+            {"role": "assistant", "content": f"A{index}", "reasoning_content": reasoning}
+            for index, reasoning in enumerate(reasonings)
+        ]
+        full_text = render([*prompt, *completion])
+        row = _row_reasoning(
+            prompt,
+            completion,
+            full_text=full_text,
+            render=render,
+            tokenizer=_Tokenizer(),
+            max_length=10**6,
+        )
+        # the split turn leaves the accounting as unjudgeable; the honest turn is the one survivor
+        assert row.authored_turns == 1
+        assert row.rendered_spans == 1
+        # the invariant the substring guards broke: a row cannot render more than it authored
+        assert row.rendered_spans <= row.authored_turns

@@ -121,11 +121,32 @@ def reasoning_marker_prefix(text: str) -> str:
 
     Extended rather than assumed unique: a dataset that happens to contain the stem would otherwise
     let its own text answer "did this turn's reasoning survive?".
+
+    Growing the stem one character per scan is quadratic on the input that forces it: text holding
+    the stem followed by N filler characters keeps every extended candidate a substring, so each of
+    the N scans walks the whole row. A 50k-character run measured 1.4s in this helper alone, on a
+    row that is perfectly valid, and profiling runs before tokenization -- so a large packaged row
+    stalls the control plane rather than failing anything.
+
+    Doubling instead bounds it at a logarithmic number of scans. The stem is then trimmed back to
+    the shortest absent length by bisection, so the marker stays as short as the one-at-a-time loop
+    produced and callers see no change in what they get back.
     """
-    prefix = "flashreasoningmark"
-    while prefix in text:
-        prefix += "x"
-    return prefix
+    stem = "flashreasoningmark"
+    if stem not in text:
+        return stem
+    # smallest power-of-two run length that is absent, so the answer is bracketed in O(log n) scans
+    low, high = 0, 1
+    while stem + "x" * high in text:
+        low, high = high, high * 2
+    # then the shortest absent run in the bracket, keeping the marker minimal
+    while low + 1 < high:
+        mid = (low + high) // 2
+        if stem + "x" * mid in text:
+            low = mid
+        else:
+            high = mid
+    return stem + "x" * high
 
 
 def _reasoning_body_offset(text: str) -> tuple[int, int] | None:

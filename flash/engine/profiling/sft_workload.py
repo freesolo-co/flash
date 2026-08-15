@@ -388,9 +388,12 @@ def _row_reasoning(
     prefix = reasoning_marker_prefix(full_text)
     marked_render = render([*prompt_messages, *with_marked_reasoning(completion_messages, prefix)])
     marked_spans = reasoning_span_texts(marked_render)
+    # materialized because both the unjudgeable count and the survivor loop ask the same per-turn
+    # question of it, and they have to agree on the answer.
+    markers = list(reasoning_markers(completion_messages, prefix))
     unjudgeable = sum(
         1
-        for head, tail in reasoning_markers(completion_messages, prefix)
+        for head, tail in markers
         if head in marked_render and not any(head in span and tail in span for span in marked_spans)
     )
     if unjudgeable:
@@ -421,13 +424,18 @@ def _row_reasoning(
     rendered = 0
     truncated = 0
     for span, end in zip(marked_spans, ends, strict=True):
-        if prefix not in span:
-            continue  # the template dropped this turn's reasoning before the cap ever applied
-        if f"{prefix}e" not in span:
-            # the head without its tail: this span stopped at a closer the reasoning quotes, so
-            # ``end`` points before the block's real close. its turn already left ``authored`` as
-            # unjudgeable, and crediting it here would compare the cap against that early offset
-            # and call a cut block fully retained.
+        # ONE turn's head and tail, both inside this span -- the same question ``unjudgeable`` asks
+        # above, so a turn cannot be dropped there and credited here.
+        #
+        # Substring tests on the shared stem cannot express that. ``tail`` is ``{prefix}e{index}``,
+        # which contains ``{prefix}`` and ``{prefix}e`` outright, so a span holding only a tail
+        # satisfies both and is credited: a turn whose markers the parser split across two spans is
+        # already counted unjudgeable, and crediting its tail here can lift ``rendered`` to equal
+        # ``authored`` beside a genuinely stripped neighbour, silencing the warning entirely.
+        # A head without its tail is the mirror case: that span stopped at a closer the reasoning
+        # quotes, so ``end`` precedes the block's real close and measuring the cap against it scores
+        # a cut block as fully retained.
+        if not any(head in span and tail in span for head, tail in markers):
             continue
         rendered += 1
         if _encoded_length(tokenizer, full_text[:end]) > max_length:
