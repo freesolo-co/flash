@@ -418,19 +418,28 @@ def _image_sft_rejection(env, dataset: list, algorithm: str | None) -> str | Non
     from flash.content.multimodal import IMAGE_SFT_UNSUPPORTED, record_has_images
 
     build = getattr(env, "prompt_messages", None)
+    completion_of = getattr(env, "sft_completion", None)
     for example in dataset:
-        try:
-            messages = build(example) if callable(build) else []
-            if record_has_images(example, messages if isinstance(messages, list) else []):
-                return IMAGE_SFT_UNSUPPORTED
-            completion = env.sft_completion(example)
-            if record_has_images({}, completion if isinstance(completion, list) else []):
-                return "image-bearing SFT completions are not supported"
-        except (Exception, SystemExit):
-            # a prompt or completion that raises is not an image verdict. leave it to the episode
-            # loop below, which reports the real construction error against the failing case.
-            return None
+        # a hook that raises is not an image verdict -- the episode loop reports the real
+        # construction error against the failing case. keep scanning rather than returning: the
+        # loop only drives the first few rows, so abandoning the scan here would let an image row
+        # further down the dataset reach `overall: PASS`.
+        if record_has_images(example, _hook_messages(build, example)):
+            return IMAGE_SFT_UNSUPPORTED
+        if record_has_images({}, _hook_messages(completion_of, example)):
+            return "image-bearing SFT completions are not supported"
     return None
+
+
+def _hook_messages(hook, example: dict) -> list:
+    """Call an environment message hook, treating any failure as "nothing to inspect"."""
+    if not callable(hook):
+        return []
+    try:
+        messages = hook(example)
+    except (Exception, SystemExit):
+        return []
+    return messages if isinstance(messages, list) else []
 
 
 def _evaluation_response(env, case) -> tuple[str, str]:

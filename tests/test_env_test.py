@@ -639,6 +639,42 @@ def test_env_test_rejects_an_image_sft_completion(monkeypatch, tmp_path, capsys)
     assert "overall: PASS" not in captured.out
 
 
+class _LateImageEnv(_SingleTurnEnv):
+    """Text rows, then a row whose prompt raises, then an image row."""
+
+    def __init__(self):
+        super().__init__(
+            rows=[
+                {"input": "a", "output": "1"},
+                {"input": "b", "output": "2"},
+                {"input": "c", "output": "3"},
+                {"input": "boom", "output": "4"},
+                {"input": "d", "output": "5", "image": "dataset/red.png"},
+            ]
+        )
+
+    def prompt_messages(self, example):
+        if example["input"] == "boom":
+            raise ValueError("prompt construction exploded")
+        return super().prompt_messages(example)
+
+
+def test_env_test_finds_an_image_row_past_a_row_whose_prompt_raises(monkeypatch, tmp_path, capsys):
+    """A raising hook is not an image verdict, and must not end the scan.
+
+    The episode loop drives only the first few rows, so abandoning the scan at the first broken
+    row would let an image row further down the dataset reach `overall: PASS` -- the exact silent
+    approval this check exists to prevent.
+    """
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _LateImageEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 1
+    captured = capsys.readouterr()
+    assert "image-bearing SFT is not supported" in captured.err
+    assert "overall: PASS" not in captured.out
+
+
 def test_env_test_still_passes_an_image_environment_for_grpo(monkeypatch, tmp_path, capsys):
     """The limit is sft's, not the model's. grpo and opd tokenize on the worker and are unaffected.
 
