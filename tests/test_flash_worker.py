@@ -1169,26 +1169,16 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # the wedge signal is STAGED HEARTBEATS, not console bytes: a stuck worker still logs, so a
     # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
     assert "quiet_polls = 0 if progress else quiet_polls + 1" in body
-    # the count is ANCHORED at the start of a heartbeat line rather than scanning for a bare
-    # "stage" key: any third-party line carrying it (a structured log from ray, verl or a library)
-    # would otherwise read as progress, and those keep printing from a wedged worker -- so the
-    # wedge this loop exists to catch would never be detected at all. Liveness pings are excluded
-    # in the expression itself: they print every 30s from a daemon whether or not the training loop
-    # is alive, so they are never progress the provider's stall clock can see.
-    assert "rb'(?m)^HEARTBEAT (?!.*\"liveness\":).*$'" in body
-    # and the scan is bounded to WHOLE lines: the offset stops at the last newline, never at EOF.
-    # Both halves of a line split by a poll boundary must be inert alone or the split decides the
-    # run -- the head carries the prefix but not yet the "liveness" that disqualifies it (a wedge
-    # read as progress), and a tail measured from EOF would have lost its prefix and dropped a real
-    # heartbeat (a wedge faked the other way). It is also what lets `^` mean what it says.
+    # parse only producer-prefixed json and inspect top-level flags. nested user/model text carrying
+    # marker-shaped fragments must stay inert.
+    assert 're.findall(rb"(?m)^HEARTBEAT ({.*})$", buf)' in body
+    assert "json.loads(x)" in body
+    assert 'not x.get("liveness")' in body
+    # parse only whole lines. the offset remains before a partial heartbeat until its json completes.
     assert 'cut = buf.rfind(b"\\n") + 1' in body
-    # ONE scan yields both counts: the committed one drops "pending" lines (an uploaded heartbeat
-    # that never reached HF), the arming one keeps them. Which drives the timer switches at the
-    # first COMMITTED heartbeat. A run whose uploads all fail emits nothing but pending lines: on
-    # the committed count it never arms, buys no wedge snapshot, and the next scheduled upload is
-    # an interval out, past the setup teardown. After a commit exists the provider's stall clock is
-    # anchored and counting down, so only committed ones may count.
-    assert "b'\"pending\":' not in b and b'\"throttled\":' not in b" in body
+    # one parse yields both counts. top-level pending/throttled markers are uncommitted but remain
+    # available for pre-first-commit arming.
+    assert 'not {"pending", "throttled"} & set(x)' in body
     assert "if staged and not committed and since < due_s:" in body
     assert f"due_s = {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
     assert "committed = committed or bool(staged)" in body
@@ -1279,6 +1269,14 @@ def _drive_serverless_upload_loop(statuses: list[str], *, succeed=True) -> list[
             payload = {"stage": "train", "step": state["poll"]}
             if status in {"pending", "throttled"}:
                 payload[status] = True
+            elif status == "nested":
+                payload["sampled_completions"] = [
+                    {
+                        "liveness": 'model text: "liveness":',
+                        "pending": 'model text: "pending":',
+                        "throttled": 'model text: "throttled":',
+                    }
+                ]
             line = (
                 f"HEARTBEAT {json.dumps(payload)}\n"
                 if status != "none"
@@ -1295,6 +1293,7 @@ def _drive_serverless_upload_loop(statuses: list[str], *, succeed=True) -> list[
     namespace = {
         "console": console,
         "mode": mode,
+        "json": json,
         "re": re,
         "stop_upload": _Stop(),
         "_upload_console": _upload,
@@ -1313,13 +1312,14 @@ def _drive_serverless_upload_loop(statuses: list[str], *, succeed=True) -> list[
 def test_instance_and_source_shipped_console_upload_loops_stay_in_parity(monkeypatch):
     cases = [
         (["committed"] * 31, True),
+        (["nested"] * 31, True),
         (["none"] * 6, True),
         (["committed"] + ["none"] * 6, True),
         (["throttled"] * 14 + ["none"] * 6, True),
         (["none"] * 7, lambda attempt: attempt > 1),
     ]
     for statuses, succeed in cases:
-        staged = [int(status == "committed") for status in statuses]
+        staged = [int(status in {"committed", "nested"}) for status in statuses]
         beats = [int(status != "none") for status in statuses]
         sizes = [1000 * (n + 1) for n in range(len(statuses))]
         _waits, instance_uploads = _drive_instance_upload_loop(
@@ -1801,6 +1801,21 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     mixed = tmp_path / "console_mixed.txt"
     mixed.write_bytes(_hb(step=10) + _hb(step=11, pending=True) + _hb(step=12, throttled=True))
     assert _instance_bootstrap._console_progress(str(mixed), 0)[1:] == (1, 3)
+
+    nested = tmp_path / "console_nested_markers.txt"
+    nested.write_bytes(
+        _hb(
+            step=13,
+            sampled_completions=[
+                {
+                    "liveness": 'model text: "liveness":',
+                    "pending": 'model text: "pending":',
+                    "throttled": 'model text: "throttled":',
+                }
+            ],
+        )
+    )
+    assert _instance_bootstrap._console_progress(str(nested), 0)[1:] == (1, 1)
 
     # a liveness ping arms nothing: it prints from a daemon whether or not the training loop is
     # alive, so unlike a pending heartbeat it is not evidence the run ever reached the loop.

@@ -7,6 +7,7 @@ module locally (tests, tooling).
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import urllib.parse
@@ -178,7 +179,7 @@ def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> st
     return tail[cut + 1 :] if cut >= 0 else ""
 
 
-def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
+def _console_progress(p, at):
     """``(size, progress heartbeats, any heartbeats)`` after ``offset``; size -1 if unreadable.
 
     The two counts answer different questions and must not be collapsed. The first is the COMMITTED
@@ -213,15 +214,15 @@ def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
     what lets ``^`` mean what it says; re-reading one partial line is the whole cost. Only bytes
     past ``offset`` are read, so a scan costs one poll's output."""
     try:
-        with open(console, "rb") as f:
-            f.seek(offset)
-            buf = f.read()
+        with open(p, "rb") as f:
+            f.seek(at)
+            b = f.read()
     except OSError:
         return -1, 0, 0
-    cut = buf.rfind(b"\n") + 1
-    hb = re.findall(rb'(?m)^HEARTBEAT (?!.*"liveness":).*$', buf[:cut])
-    return (
-        offset + cut,
-        sum(b'"pending":' not in b and b'"throttled":' not in b for b in hb),
-        len(hb),
-    )
+    n = b.rfind(b"\n") + 1
+    try:
+        h = [json.loads(x) for x in re.findall(rb"(?m)^HEARTBEAT ({.*})$", b[:n])]
+    except ValueError:
+        h = []
+    h = [x for x in h if not x.get("liveness")]
+    return at + n, sum(not {"pending", "throttled"} & set(x) for x in h), len(h)
