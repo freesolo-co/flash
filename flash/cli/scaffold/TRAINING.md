@@ -25,7 +25,8 @@ command.
 
 ```bash
 pip install freesolo-flash          # installs the `flash` CLI (import name is also `flash`)
-flash login --api-key fslo_...       # or: export FREESOLO_API_KEY=fslo_...  (create a key at https://freesolo.co)
+export FREESOLO_API_KEY=fslo_...     # create a key at https://freesolo.co
+flash login                          # validates and stores the key without exposing it in argv
 flash whoami                         # confirm the identity behind your key
 flash projects create "my project"     # prints the canonical project UUID
 flash models list                     # supported base model ids
@@ -343,8 +344,13 @@ subset instead of erroring. Re-check it whenever the dataset or the params chang
 
 GPU allocation and HF artifacts are **managed by default**: leave `[gpu] type` unset to
 let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains
-platform-managed. For controlled experiments, `[gpu] provider` restricts allocation to one
-provider and `[gpu] type` pins one exact active validated GPU class. Run artifacts are stored in a
+platform-managed. `[gpu] providers` takes an ordered list of provider names and prefers them in
+that order: the preference ranks ahead of cost, so a preferred provider wins even when a cheaper
+one is offered, but providers you did not name stay eligible behind them, so a preference never
+costs you failover. `[gpu] provider` instead hard-pins allocation to one provider, which does
+remove that failover, and cannot be combined with `providers`. An unknown name is rejected at parse
+time and the error lists the names your plane accepts. `[gpu] type` pins one exact active
+validated GPU class. Run artifacts are stored in a
 private environment-scoped repo with content-addressed Flash code snapshots. Set `seed` only at the
 top level. Compose or tweak configs without editing files: `--config extra.toml` (deep-merge) and
 `--set key=value` (e.g. `--set train.epochs=3`). `--gpus N` is
@@ -539,12 +545,11 @@ current hub — both swallow paths are present in every version Flash supports.)
 
 Two more details that make the difference between a probe and a placebo:
 
-- **Pass the same token the export will use.** Flash resolves the export token as
-  `--api-key` > `HF_TOKEN` in the environment > a local `.env` / `.env.local`, and forwards
-  exactly that value. `huggingface_hub` does none of that — with no `token=` it falls back to
-  your ambient cached login, so the probe can pass on one credential while the export fails
-  on a different one. If you are exporting with `--api-key`, or with a token that lives only
-  in `.env`, pass that literal value here.
+- **Pass the same token the export will use.** Prefer `HF_TOKEN` in the environment or a local
+  `.env` / `.env.local`; `--api-key` still wins when supplied, but exposes the token in process
+  listings. Flash forwards exactly the resolved value. `huggingface_hub` does none of that; with
+  no `token=` it falls back to your ambient cached login, so the probe can pass on one credential
+  while the export fails on a different one. Pass the resolved token explicitly to the probe.
 - **Ask for `private=True`.** The real export creates the repo private and only flips it
   public afterwards if you passed `--public`. A probe that omits this can leave a brand-new
   repo publicly visible until the export catches up, and it fails outright under an org
@@ -678,7 +683,7 @@ spending another GPU run:
 | Wrong identity spends the money                              | Push/train lands in an org you did not expect, or a run id you know is valid comes back "unknown"                                                                                        | `FREESOLO_API_KEY` in the environment silently overrides `flash login`. Run `flash whoami` first. Run visibility is scoped to the key that created the run, so archive result baselines to disk rather than relying on `flash runs list` to find them later.                                                                                                                                                                    |
 | `flash env test` passes but the run trains on the wrong data | Local validation is green; the remote run loads a different split                                                                                                                        | `flash env test` loads `environment.py` with **no** `[environment.params]`, so a params-driven split selection is not exercised. Assert the split inside your own test, or default to the split you actually train on.                                                                                                                                                                                                          |
 | Final checkpoint regresses                                   | Last step is worse than an earlier checkpoint                                                                                                                                            | Run `flash runs checkpoint <run-id>`, deploy a specific step with `flash models deploy <run-id>/step-N`, and compare with held-out probes before exporting or relying on the final adapter.                                                                                                                                                                                                                                     |
-| Export fails before upload                                   | CLI says no HuggingFace token                                                                                                                                                            | Pass `flash models export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`.                                                                                                                                                                                                                                                                          |
+| Export fails before upload                                   | CLI says no HuggingFace token                                                                                                                                                            | Set `HF_TOKEN` in your shell, `.env`, or `.env.local`, then run `flash models export`; avoid `--api-key` because argument values are visible in process listings. Exports are private unless you pass `--public`.                                                                                                                                                                                                               |
 | Exported adapter is a silent no-op locally                   | peft warns about missing adapter keys and local eval matches the bare base model                                                                                                         | The adapter's key namespace does not match the loaded model class. `model.layers.*` keys pair with `AutoModelForCausalLM`; `model.language_model.layers.*` keys pair with `Qwen3_5ForConditionalGeneration` / `Qwen3_5MoeForConditionalGeneration` (via `AutoModelForImageTextToText`). See "Loading an exported adapter locally".                                                                                              |
 | SFT loss improves but quality does not                       | Train loss falls while held-out behavior stalls or degrades                                                                                                                              | Keep a held-out split outside training. Deploy and score that split; if quality drops, reduce epochs or improve data instead of adding more passes.                                                                                                                                                                                                                                                                             |
 | Cost surprises                                               | A quick experiment uses more GPU time than intended                                                                                                                                      | Start with `--dry-run` and `--cost`, keep `epochs` and `max_examples` small for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time.                                                                                                                                                                                     |
@@ -1072,7 +1077,7 @@ in a sensible value, so only override with a reason.
 | Knob                           | Convention                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `group_size`                   | Completions sampled per prompt (default 8). More = more signal and more cost; drop to 4 to trim cost. The group needs _within-group variance_ for an advantage to exist.                                                                                                                                                                                                                                          |
-| `max_completion_tokens`        | Completion budget per rollout. Size it to the expected output length; too small silently truncates good answers and poisons the reward, while too large just costs more.                                                                                                                                                                                                                                          |
+| `max_completion_tokens`        | Completion cap for each model turn, not the whole episode. In multi-turn runs every turn gets the full cap again, while the whole transcript (all model turns plus environment replies) must fit inside `max_context_tokens`. Size `max_context_tokens` for the whole episode, not just one turn; an undersized turn cap silently truncates good answers and poisons the reward.                                  |
 | `temperature`                  | Rollout sampling temperature. Keep it near 1.0 for GRPO — too low collapses diversity (and the model can collapse within a few steps); raise it to widen exploration against uniform-reward groups.                                                                                                                                                                                                               |
 | `kl_penalty_coef`              | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move.                                                                                                                                                                                                                                                                      |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy.                                                                                                                                                                                                                                                                                              |
@@ -1080,10 +1085,23 @@ in a sensible value, so only override with a reason.
 | `prompts_per_step`             | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
 | `structured_outputs`           | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
 
-For thinking models, `max_completion_tokens` is shared between `<think>` reasoning and the final
-answer or action, so undersizing it can truncate the action and teach the model to stop reasoning;
-watch `truncation_rate`, which counts completions not ending in EOS and is not strictly
-`finish_reason=length` when stop sequences or multi-turn rollouts are involved.
+For thinking models, each turn's `max_completion_tokens` is shared between `<think>` reasoning and
+its final answer or action, so undersizing it can truncate the action and teach the model to stop
+reasoning. In multi-turn runs, also size `max_context_tokens` for the accumulated transcript or later
+turns can run out of context. Watch `truncation_rate`, but know what it measures on each algorithm.
+In OPD it counts model turns that did not end in EOS or a configured stop, and OPD additionally
+reports a per-step `discarded_rollouts` count alongside it. In GRPO it comes from verl's
+episode-level clipping, so a single turn hitting the cap does not raise it on its own: that turn
+ends the episode early, which leaves the concatenated response short of the widened capacity verl
+measures against. On multi-turn GRPO, treat a zero rate as "no episode filled its response budget",
+not as "no turn was cut off", and read episode length against the environment's turn limit instead.
+
+Neither metric detects the other way `max_context_tokens` shortens an episode. When an environment
+reply would leave no room to generate, both multi-turn loops stop _before_ dispatching the next
+turn. The last model turn ended normally, so nothing is counted as truncated and the episode simply
+ends early. A run can therefore train on systematically shortened trajectories at
+`truncation_rate = 0`. If episodes are ending sooner than the environment's turn limit, suspect the
+context budget rather than the turn cap.
 
 > **On a derived horizon, `prompts_per_step` buys optimizer steps cheaply.** `prompts_per_step`
 > overrides the tuned prompts-per-step. Total generated tokens are
@@ -1098,8 +1116,11 @@ watch `truncation_rate`, which counts completions not ending in EOS and is not s
 > one; jumping straight to ~80 steps without reading the short run trades one uninformative
 > run for a longer, more expensive one.
 >
-> Two things break the flat-cost approximation, so treat it as a hypothesis to check, not a
-> rule. **`[train] max_steps` overrides the derived horizon**: with it set the step count is
+> Three things break the flat-cost approximation, so treat it as a hypothesis to check, not a
+> rule. **The equation counts one model turn per prompt**: in a multi-turn run every turn gets
+> the full `max_completion_tokens` again, so an episode generates up to that cap times its turn
+> count (bounded by `max_context_tokens`), and the real token bill is a multiple of the estimate.
+> **`[train] max_steps` overrides the derived horizon**: with it set the step count is
 > exactly what you asked for, lowering `prompts_per_step` does not add steps at all, and you
 > simply train on fewer prompts. And per-step cost is not purely token-proportional —
 > GRPO reward waves and OPD teacher calls add latency per step, so multiplying steps can
@@ -1147,11 +1168,14 @@ two cannot disagree:
 ```python
 import math
 
-# exactly one finite reward per GENERATED assistant turn - assert it here, because
-# nothing downstream checks the length and both mismatch directions are bad (see below).
+# exactly one finite reward per GENERATED assistant turn - assert it here as an early
+# author-side guard: downstream layers do check the length, but they react by silently
+# discarding the vector and falling back to episode credit (see below), so a mismatch
+# costs the per-turn signal rather than failing. this is where it surfaces loudly.
 # count episode.turns, NOT episode.messages: messages starts out holding everything
 # start_episode() returned, so any assistant few-shot demo in the prompt inflates the
-# count. turns starts empty and collects only what the rollout actually generated.
+# count. turns starts empty. it does collect your own env replies alongside the
+# generated turns, so this filter is exact only while those replies are not assistant-role.
 assistant_turns = sum(1 for t in episode.turns if t.role == "assistant")
 assert len(turn_scores) == assistant_turns, (len(turn_scores), assistant_turns)
 assert all(math.isfinite(s) for s in turn_scores)
@@ -1162,24 +1186,33 @@ return RewardResult(
 )
 ```
 
-**The length is a hard contract, and it is checked nowhere.** The extractor validates only
-that the value is a non-string iterable of floats; it never compares the count to the
-rollout's turns. The trainer then walks `range(len(turn_rewards))` and indexes
-`spans[turn_index]` for each one, so the two mismatch directions fail differently and
-neither is a safe fallback:
+**The length is a hard contract.** The extractor validates only that the value is a
+non-string iterable of floats; it never compares the count to the rollout's turns. The
+layers behind it do, and both mismatch directions take the same exit: a vector that does not
+match the turns cannot be aligned to tokens, so it is discarded and the rollout falls back to
+episode-level credit. `scoring.py` is normally the one that catches it and warns `per-turn
+rewards unavailable (received N reward(s) for M assistant turn(s))`; the verl child
+(`per-turn rewards (N) do not match emitted turns (M)`) and the advantage shim sit behind it
+as backstops. Nothing raises, and no turn is ever paired with another turn's reward.
 
-- **Too many rewards** — `IndexError: tuple index out of range`, mid-training, after you have
-  already paid for the rollouts.
-- **Too few rewards** — no error at all. The unmatched turns keep the zero they were
-  initialized with, so those tokens train on **zero advantage**: that part of the episode
-  silently contributes no learning signal, and the run looks healthy throughout.
+That fallback is not scoped to the episode that caused it. Per-turn advantages are centred
+turn by turn against the rest of the group, so one row that cannot be aligned takes its whole
+group back to episode credit rather than leaving the others centred against a smaller sample.
+**One short vector costs the per-turn signal for every episode that shares its example**,
+which is why a mismatch is worth ruling out even though it never fails loudly.
 
-The easiest way to get this wrong is the hard turn cap. The rollout loop breaks out before
-the final `env_reply`, so the last assistant turn is generated and recorded **without** a
-matching `step_episode` call — an environment that appends one reward per `step_episode`
-comes up exactly one short on precisely the episodes that hit the cap. Count the assistant
-entries in `episode.turns`, not the number of steps you took and not the assistant messages
-in `episode.messages` (those include any few-shot demo the prompt carried in).
+The hard turn cap is not the exception it looks like. `state["turn"]` is incremented inside
+`env_reply`, _after_ it calls `step_episode`, so on the capped turn the counter is still one
+below the cap when `rollout_done` is checked — the turn gets its `step_episode` call like any
+other, and one reward per `step_episode` is already the right count. Adding a compensating
+reward for a call that was never missing overshoots by one, and a too-long vector lands in the
+same fallback as a too-short one. Count the assistant entries in `episode.turns`, not the
+number of steps you took and not the assistant messages
+in `episode.messages` (those include any few-shot demo the prompt carried in). If your
+`step_episode` returns assistant-role observations, they land in `episode.turns` too and inflate
+this count, so tell them apart by something you control rather than by whether the turn parses.
+A malformed sampled turn is still a sampled turn: score it low, but score it, or you land in the
+same short-vector fallback by a different route.
 
 **Do not verify this by the absence of a warning** — a missing key produces no output at
 all. There are three distinct silent-fallback layers on this path, two of which emit
@@ -1191,15 +1224,279 @@ per-turn values rather than `None`.
 
 ### Scoring must not depend on state accumulated in `step_episode`
 
-The worker's turn loop breaks out **before** the final `env_reply` when an episode hits the
-hard turn cap. An environment that accumulates state inside `step_episode` therefore scores
-the second-to-last position on exactly those episodes, silently under- or over-crediting the
-model — and only on the capped ones, which is a hard bias to spot in aggregate.
+The capped turn does get its `step_episode` call, as above — but there is one turn the
+environment never sees at all. A turn that hit `max_completion_tokens`, decoded empty, or
+carried a replacement character is unusable, and the bridge returns **before**
+`record_model_turn`, so it enters neither the transcript nor `step_episode`. An environment
+that accumulates state inside `step_episode` therefore scores the position before that turn
+on exactly those episodes, silently under- or over-crediting the model — and only on the
+episodes that ended badly, which is a hard bias to spot in aggregate.
 
 Make scoring a pure function of the transcript: re-derive state from the assistant turns on
 every hook call. That is correct whether the episode ended by succeeding, by an env-signalled
-done, or by hitting the cap, and it also means concurrent rollouts sharing one environment
-instance cannot corrupt each other.
+done, by hitting the cap, or by a turn that never reached you, and it also means concurrent
+rollouts sharing one environment instance cannot corrupt each other.
+
+### `messages` already ends with the turn you are being asked to apply
+
+Replaying the transcript is the right pattern, but it has one sharp edge worth stating
+explicitly, because getting it wrong produces an environment that looks healthy in every
+check you are likely to run while quietly stepping the wrong state.
+
+In `step_episode(example, messages, assistant_response)`, the action to apply arrives in
+`assistant_response`, and `messages[-1]` is **that same turn, already appended**. The worker
+records the model's turn onto the transcript first, then steps the environment with the full
+list. The two arguments describe one action, not two.
+
+So a replaying environment must stop before the final message, and take the newest action
+from `assistant_response`. The simplest case is an environment whose opening prompt contains
+no assistant message and whose own replies never use the assistant role: every assistant
+message in the transcript is then a real action, and the newest turn is the only bound you
+need. Both halves matter, because Flash appends your `step_episode` replies to the same
+transcript, so an assistant-role observation comes back to you looking like a move.
+
+```python
+def step_episode(self, example, messages, assistant_response):
+    state = self.initial_state(example)
+    # every assistant turn EXCEPT the newest: messages[-1] is assistant_response
+    for message in messages[:-1]:
+        if message["role"] == "assistant":
+            state = self.apply(state, message["content"])
+    state = self.apply(state, assistant_response)  # the newest action, exactly once
+    ...
+```
+
+That version takes each turn's text as the action verbatim, which only holds if your
+environment runs without `thinking` and your models emit nothing but the action. Two things
+break it, and both are ordinary.
+
+If your `start_episode` **does** seed an assistant message (a worked example, a demonstration
+turn), that message is sitting in `messages` looking exactly like a move, and the loop above
+would apply your own demo to the real state. The cleanest fix is to not seed one: put worked
+examples in the **user** text of the prompt, where no replay loop can mistake them for actions.
+
+Prefer the user turn over a system one. Flash carries the training contract as the system
+prompt, and it yields to yours: `with_system_prompt` returns the list untouched the moment it
+finds a system message that already has content, so a non-empty system turn of your own
+replaces the contract rather than joining it, and the model loses its action and grading
+instructions. If you do want a system turn, `start_episode` is handed the contract text as its
+second argument — put it in yourself.
+
+Do not reach for a prompt length instead. Flash may prepend that system message, so
+`len(self.start_episode(...))` can come out one short of the real prefix, and the offset then
+leaks the demo back in silently.
+
+And once `thinking` is on, a turn arrives as reasoning wrapped around the action rather than
+the action alone, so the text is no longer something `apply` can take as given.
+
+Parse the transcript instead, and parse it the same way on both paths:
+
+```python
+import re
+
+ACTION = re.compile(r"<move>(.*?)</move>", re.DOTALL)  # your own action syntax
+FINAL_ACTION = re.compile(r"<move>(.*?)</move>\s*\Z", re.DOTALL)
+
+
+class MyEnv(EnvironmentMultiTurn):
+    # whether YOUR model's chat template pre-opens the reasoning block. this is not the
+    # same as `thinking = true`: Flash derives its own flag as (thinking AND the rendered
+    # prompt ends inside <think>), and does not pass it to your hook. render one prompt
+    # with your model's tokenizer to check, and keep this in step with the model you run.
+    PROMPT_OPENS_THINKING = True
+
+    def _answer_of(self, content: str) -> str:
+        """The committed answer, with any reasoning span removed.
+
+        Mirrors how Flash splits a turn for grading, including the flag: the LAST </think>
+        wins, text before an unclosed <think> is still an answer, and a wholly tagless turn
+        is "" only when the template pre-opened the block -- there it is unfinished
+        reasoning that Flash also grades as empty, so accepting an action from it would
+        advance state the scorer never credited. Under a template that does NOT pre-open,
+        the same turn is a genuine tagless answer and Flash grades it as one.
+        """
+        if "</think>" in content:
+            return content.rsplit("</think>", 1)[1]
+        if "<think>" in content:
+            return content.split("<think>", 1)[0]
+        return "" if self.PROMPT_OPENS_THINKING else content
+
+    def _action_of(self, content: str, state) -> Move | None:
+        """The action in a turn, or None if it carries none this state can use.
+
+        Exactly one action, and it has to be the last thing said: two tags is a model
+        talking itself out of a move, and a tag mid-sentence is a model still thinking.
+        A tag match is not a valid move either -- `<move>bad</move>` matches, and a
+        legal square may already be taken -- so validate before `apply` sees it.
+        """
+        answer = self._answer_of(content)
+        if len(ACTION.findall(answer)) != 1:
+            return None
+        found = FINAL_ACTION.search(answer)
+        return self.parse_move(found.group(1), state) if found else None
+
+    def step_episode(self, example, messages, assistant_response):
+        state = self.initial_state(example)
+        for message in messages[:-1]:
+            if message["role"] == "assistant":
+                action = self._action_of(message["content"], state)
+                if action is not None:  # unusable turns changed nothing then; keep it so
+                    state = self.apply(state, action)
+        newest = self._action_of(assistant_response, state)
+        if newest is None:
+            # nothing to apply. reply with the error and let the reward do the teaching
+            return EnvironmentStepResult(
+                done=False,
+                messages=[{"role": "user", "content": "Reply with one <move>(r,c)</move>."}],
+            )
+        state = self.apply(state, newest)  # the newest action, exactly once
+        ...
+```
+
+`parse_move` is yours: it returns the move when the payload names one this state can accept and
+`None` otherwise. That covers malformed payloads, out-of-range coordinates, and moves that are
+well-formed but illegal right now, which is why it takes the reconstructed `state` rather than
+the payload alone. Keeping validation there rather than inside `apply` is what makes both call
+sites safe at once, since a replayed turn gets the same verdict it got when it was live.
+
+**Parse the answer, not the raw turn.** With `thinking = true` the transcript keeps the turn
+exactly as the model emitted it, so a prior action reaches you as
+`<think>...</think><move>...</move>`. A start-anchored pattern matches none of those and the
+loop silently rebuilds nothing but the newest move. Searching the raw text is not the fix
+either: a model that weighs `<move>left</move>` in its reasoning before committing to
+`<move>right</move>` hands the first match to a plain search, and the wrong action is then
+replayed as history on every later call.
+
+`_answer_of` above mirrors how Flash itself splits a turn for grading: the **last** `</think>`
+wins, and text before an unclosed `<think>` is still an answer, so a turn that acted and then
+reopened a thought it never closed is read the same way the scorer reads it.
+
+A turn that simply ran out of budget mid-thought never reaches you at all, which is worth
+knowing before you write defenses against it. Both bridges classify a completion that hit
+`max_completion_tokens` as truncated and return **before** `record_model_turn`, so it enters
+neither the transcript nor `step_episode`. Its tokens are masked out of the loss and it takes no
+turn span. The tagless-answer rule above therefore matters for turns the model _finished_ while
+leaving a `<think>` open, not for the ones the cap cut off.
+
+One case does stay genuinely ambiguous, and it is the reason the parser above demands a
+`</think>`. When the chat template pre-opens the reasoning block, the model never emits
+`<think>` itself, so a turn that never closed one carries no tag at all and reads as a plain
+answer. Flash resolves this with a flag it derives from the rendered template and sets on the
+adapter; that flag is not passed through to your hook, so your environment cannot see it. Do
+not hardcode a guess either, because the same environment needs a different answer under a
+different model.
+
+That matters beyond the truncated case, because a turn can end this way and still reach you.
+A model that emits its action and then stops on EOS or an accepted stop without ever closing
+`</think>` is **not** truncated, so it passes the gate above and arrives at `step_episode`
+looking like a committed action. Flash grades that same turn with
+`strip_think(..., prompt_opened_thinking=True)`, which finds no `</think>` and returns an
+empty answer. Apply the trailing action and your state advances on a turn the scorer just
+graded as saying nothing: the board moves, the reward does not, and the episode continues from
+a position the reward never credited.
+
+Under a pre-opening template, therefore, require a visible `</think>` before you accept any
+action — that is what `_answer_of` returning `""` for a tagless turn buys you. It costs you the
+turn where a model skipped reasoning entirely, which under such a template cannot be told from
+unfinished reasoning anyway. Prefer that trade: an unparsed turn takes the error-observation
+path and the model can correct itself, while a wrongly-applied one desynchronises state from
+reward for the rest of the episode.
+
+Gate that on the template, not on `thinking`. Flash's own flag is `thinking` **and** "the
+rendered prompt ends inside `<think>`" (`flash/engine/worker/train/rl/inputs.py`), so under
+`thinking = true` with a template that does not pre-open, a tagless `<move>...</move>` is a
+valid answer that Flash grades as one — rejecting it there desynchronises state from reward in
+the opposite direction. Render one prompt with your model's tokenizer to see which case you are
+in, and set `PROMPT_OPENS_THINKING` to match the model you actually run.
+
+What the parser above does instead is require the action to be the **last** thing in the turn.
+That is why `FINAL_ACTION` is anchored: reasoning that was still weighing options usually runs
+on past the move it names, so `Maybe <move>left</move>, or maybe` fails the anchor and counts as
+no action. What survives is a turn that stopped immediately after a closing tag, which nothing
+available to an environment can tell from a committed answer. Ask for the action last in your
+prompt, and keep `max_completion_tokens` clear of your typical turn length so the model is not
+routinely cut off mid-decision.
+
+**Give `apply` one representation.** The replayed turns and `assistant_response` have to arrive
+in the same shape. Passing the unwrapped payload for replayed turns and the raw text for the
+newest one gives a single action two meanings, so the transition it produces depends on which
+call is looking at it.
+
+**Do not raise on a turn you cannot use.** A model emitting junk is ordinary, especially early
+in GRPO exploration, and it is the reward's job to teach otherwise. Nothing between your hook
+and the trainer catches the exception: `env_reply` calls `step_episode` without a guard, so a
+`ValueError` from your parser, your validator, or your transition leaves the multi-turn bridge
+and can take the run down over one malformed sample. Return an error observation, or end the
+episode with a low score, but let the episode reach the reward. That covers more than a missing
+tag: an action that parses but names something illegal has to land in the same branch, which is
+why validation belongs before `apply` rather than inside it.
+
+The same shape covers a seeded assistant demo: an unparsable turn is skipped on replay, which is
+exactly right, because a demo written in prose changed nothing when it was "played" either. That
+still leaves a demo written in your own action syntax indistinguishable from a move, so keep
+demos in prose or a visibly different form.
+
+Either shape rebuilds state from the actions alone, which is right when your observations are a
+deterministic function of them. If an observation carries information the actions do not (a
+sampled outcome, a tool result, anything external), replay it too, matching it the way you
+match actions rather than branching on role alone: the user-role messages include the entire
+opening prompt from `start_episode`, and a loop that treats every user message as an
+observation will try to fold your task description into the state.
+
+**`apply` must be pure.** Replay calls it once per earlier action on **every** step, so anything
+it does to the outside world happens again on each turn: an HTTP call is re-issued, a charge is
+re-charged, a file is rewritten. That is not the double-application bug below, it is the cost of
+reconstructing state from a transcript, and it does not go away by getting the bounds right.
+Keep `apply` a pure reducer over recorded actions and replay the recorded results alongside
+them. When a turn genuinely has to touch a real service, do that once for the newest action
+only, outside the replay loop, and make the call idempotent (an idempotency key, a
+conditional write) so a retried episode cannot double it.
+
+Replaying all of `messages` and then applying `assistant_response` again applies the **newest**
+action twice on every call. Earlier actions still appear once; it is the turn you were handed
+that gets duplicated. What that does to your state depends on the transition:
+
+- **Self-inverse** (a toggle, a parity or XOR update): the two applications cancel, so the
+  state `step_episode` works from is one action behind the transcript. The action does land on
+  the next call, where it is no longer the newest, so the episode advances but always trails by
+  one, and a terminal condition checked at the moment it should first hold is missed. A
+  `score_episode` that replays the finished transcript applies each action once and is not
+  itself off by one; what reaches the reward is the damage `step_episode` already did, an
+  episode that ran past the turn it should have ended on.
+- **Idempotent** (a set insert, an overwrite-with-the-same-value): the duplicate is absorbed
+  and the state is correct. This one is genuinely harmless.
+- **Anything else** (a counter, an append, a charge, a move that composes): the newest action
+  is over-applied, and the state runs ahead of the transcript.
+
+None of these raise. The self-inverse case is the one that bites hardest, because "off by one
+action, forever" reads as a model that never solves the task rather than as a broken
+environment: on a Lights Out board, where each press is its own inverse over GF(2), gold
+trajectories ran the full turn cap and scored 0.60-0.65 instead of 1.0.
+
+The usual checks do not catch this. `flash env test` does not require a gold trajectory to
+terminate or to score well; it checks that your hooks run to completion and returns finite
+rewards. Its blocking reward gate is narrow by design: it fires only for GRPO, and only when
+every **eligible** replayed gold episode scores exactly zero, and then, probing the first of
+those episodes, no per-turn signal separates it and a deliberately wrong answer scores at least
+as well. A single eligible gold episode collecting partial credit stops the gate before it ever
+reaches that comparison, so `overall: PASS` is expected here rather than surprising.
+
+Eligible is narrower than it sounds, and it cuts both ways. Two kinds of episode are left out
+of the gate's totals: a gold answer written in `<think>` markup, which this command replays
+verbatim and cannot grade the way a thinking run would, and a multi-turn replay whose reference
+turns run out before the rollout does, which is then part reference and part junk. Their rewards
+are still printed and still warned about. So an excluded episode scoring well does not save you
+from the gate, and if every zero-scoring reference happens to be excluded the gate has nothing
+left to judge and does not fire at all.
+Your own tests can miss it from the other side: one that calls `step_episode` directly with
+`messages[:-1]` is exercising a call shape the trainer never produces.
+
+So check the turn count, not just the verdict. A gold trajectory should terminate in about the
+number of turns the task needs, and one that always runs to the cap on a task with a short
+known solution is the symptom worth chasing; a `PASS` beside it does not make it less wrong.
+Drive that check through the real rollout path (`flash env test`, or the loader plus the
+adapter hooks) rather than by calling `step_episode` yourself, so the convention under test is
+the one training uses.
 
 **Measure efficiency against each example's own optimum, not the turn budget.** A reward
 like `1 - turns_taken / max_turns` makes perfect play unreachable: an example whose best
@@ -1259,6 +1556,15 @@ targeted fix rather than leaning on the reward gate to slowly select against it.
 | Uniform-reward groups                               | every rollout in a group scores the same → no gradient                                   | shape the reward for partial credit; raise `temperature`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Too-hard prompts                                    | the base never succeeds, reward stays at 0                                               | curriculum / easier prompts; warm-start with SFT                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Judge-rewarded degenerate output                    | short, templated answers a judge still rates well                                        | a minimum-substance zero-gate ahead of the judge                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+
+In OPD, a model turn that reaches its cap without EOS or a configured stop is classified as
+truncated, ends the episode, and is dropped before teacher scoring. If every rollout in a step is
+dropped, the step fails with `produced no aligned teacher signal`. Partial dropping is more dangerous:
+it can silently bias training toward shorter episodes, so monitor the per-step `truncation_rate` and
+`discarded_rollouts` metrics rather than relying on the loss alone. Read them as a sampled indicator,
+not a ledger: heartbeats are throttled, so a step that finishes shortly after the previous one does
+not publish its own values, and a nonzero reading means truncation pressure around that point in the
+run rather than an exact count for that step.
 
 ---
 
@@ -1366,8 +1672,11 @@ Set a count only when you want to pin the maximum:
 [gpu]
 type = "B200"
 count = 4
-# provider is optional: allocation compares fitting shapes across every configured provider.
 ```
+
+Add `providers = [...]` to that table to rank providers by preference ahead of cost; providers you
+leave out still follow as failover candidates. An unknown name is rejected at parse time, and the
+error names the accepted set.
 
 `flash train configs/grpo.toml --gpus 4` sets the same key from the command line. The flag is exactly
 `--set gpu.count=4`, and the same 1..8 bound rejects a bad value.
