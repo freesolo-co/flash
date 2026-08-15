@@ -15,7 +15,7 @@ import contextlib
 import inspect
 import sys
 
-from flash.cli.commands.env.test import _evaluation_example
+from flash.cli.commands.env.test_evaluations import _evaluation_example
 from flash.cli.ui import render
 from flash.envs.evaluations import EvalCase, EvalResult
 

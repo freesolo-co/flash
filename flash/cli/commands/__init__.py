@@ -560,6 +560,7 @@ _FOLLOW_METRIC_FIELDS = (
     ("frac_reward_zero_std", "frac_zero_std"),
     ("mean_completion_tokens", "comp_len"),
     ("truncation_rate", "trunc"),
+    ("discarded_rollouts", "discarded"),
     ("max_completion_tokens", "max_comp_tokens"),
 )
 

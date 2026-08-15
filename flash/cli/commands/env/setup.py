@@ -890,7 +890,7 @@ def cmd_env_setup(args) -> int:
     # the non-reasoning scaffold.
     thinking_line = "thinking = true\n" if reasoning else ""
     rl_reasoning_train = (
-        "max_completion_tokens = 2048  # reasoning shares this budget with the answer; raised so it isn't truncated\n"
+        "max_completion_tokens = 2048  # per model turn; reasoning shares it with the answer\n"
         if reasoning
         else ""
     )
