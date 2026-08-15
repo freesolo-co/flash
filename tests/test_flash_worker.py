@@ -1497,6 +1497,75 @@ def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots()
     assert len(set(tails)) == 2, f"both callers staged the same scratch file: {tails}"
 
 
+def test_serverless_terminal_console_upload_recommits_after_a_slow_holder_finishes():
+    """A periodic upload that outlives the acquire timeout must not be the last writer.
+
+    ``console_teardown`` is checked before the HF call, so it stops a periodic snapshot that has not
+    started -- but a request already inside ``upload_file`` cannot be recalled. If it held the lock
+    past 120s and completed afterwards, the terminal upload (which proceeds unsynchronized rather
+    than skip) commits FIRST and the older, pre-failure snapshot lands on top of it. That is the
+    exact evidence-destroying overwrite the serialization is for, arriving through the timeout.
+
+    So a terminal upload that ran without the lock re-acquires afterwards: getting it is proof the
+    slow request finished, and ``console_teardown`` blocks any later one, so one more commit ends
+    the sequence. The lock double here comes free on the second attempt, modelling a holder that
+    was slow rather than wedged (``..._never_yields_to_a_wedged_snapshot`` pins the wedged case,
+    where the re-commit must NOT fire).
+    """
+    import ast
+    import inspect
+    import textwrap
+    import threading
+    import types
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
+    )
+    order: list[str] = []
+
+    class _SlowHolder:
+        """Times out once (the holder is mid-``upload_file``), then frees."""
+
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def acquire(self, timeout: float) -> bool:
+            self.attempts += 1
+            if self.attempts == 1:
+                return False
+            order.append("holder finished")
+            return True
+
+        def release(self) -> None:
+            order.append("released")
+
+    def _locked(mode: str, _console: str, tail_path: str, final: bool) -> bool:
+        order.append(f"commit:{'final' if final else 'periodic'}:{tail_path}")
+        return True
+
+    lock = _SlowHolder()
+    namespace: dict = {
+        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
+        "console_upload_lock": lock,
+        "console_teardown": threading.Event(),
+        "_upload_console_locked": _locked,
+        "print": lambda *_a, **_k: None,
+    }
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+
+    assert namespace["_upload_console"]("train", final=True) is True
+    commits = [n for n, entry in enumerate(order) if entry.startswith("commit:")]
+    assert len(commits) == 2, f"the terminal upload must re-commit once the holder frees: {order}"
+    # positions, not values: both commits render identically, so comparing the strings would find
+    # the FIRST one and the assertion would hold however the calls were ordered. The re-commit must
+    # follow the holder freeing, or it is no better ordered than the first and the stale snapshot
+    # can still land last.
+    assert commits[1] > order.index("holder finished")
+
+
 def test_serverless_terminal_console_upload_never_yields_to_a_wedged_snapshot():
     """``final=True`` must upload even when the lock never comes free.
 
@@ -1548,6 +1617,9 @@ def test_serverless_terminal_console_upload_never_yields_to_a_wedged_snapshot():
 
     assert upload_console("periodic") is False, "a periodic snapshot must yield to the holder"
     assert upload_console("final", final=True) is True
+    # exactly one commit: the re-commit that makes an unsynchronized terminal upload last-writer
+    # is conditional on the lock coming free, and here it never does. a second commit would mean
+    # the re-commit fires blind, doubling every terminal upload on a genuinely wedged holder.
     assert uploaded == ["final"], "the terminal snapshot must not be skipped for a held lock"
     # bounded wait, so a wedged holder delays the terminal upload rather than suppressing it.
     assert timeouts

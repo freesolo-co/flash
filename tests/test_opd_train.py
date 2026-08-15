@@ -4725,6 +4725,64 @@ def test_child_failure_sanitizer_redacts_the_credential_not_the_auth_scheme(monk
     )
 
 
+def test_child_failure_sanitizer_redacts_a_quoted_credential_containing_spaces(monkeypatch):
+    """A quoted value runs to its closing quote, not to the first space.
+
+    `{"password":"correct horse battery staple"}` terminated the value capture at the first space,
+    so the record kept `<redacted> horse battery staple` -- most of the credential, printed into an
+    artifact the user can fetch. The value pass cannot clean up after it: a runtime-minted secret
+    (a presigned URL, a broker capability) is in no environment variable and contributes no needle,
+    which is the whole reason the shape rule exists.
+
+    The quotes are what delimit a serialized field, so whitespace inside them belongs to the value.
+    An UNQUOTED value must still stop at whitespace -- there the space is the delimiter and running
+    past it would eat the sentence around the credential, which is the diagnostic.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    leak = "correct horse battery staple"
+    for message in (
+        f'{{"password":"{leak}"}}',
+        f"api_key: '{leak}'",
+        f'{{"access_token": "{leak}"}}, retry_after=30',
+        f'api-key: "{leak}" plus trailing text',
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "<redacted>" in redacted
+        for word in leak.split():
+            assert word not in redacted, f"{message!r} leaked {word!r}: {redacted!r}"
+
+    # an unterminated quote runs to the end of the line rather than giving up: fail closed.
+    assert leak not in _safe_child_failure_detail(ValueError(f'{{"password":"{leak}'))
+
+    # unquoted values still end at whitespace, so the surrounding sentence survives.
+    unquoted = _safe_child_failure_detail(ValueError("password=hunter2 while loading the adapter"))
+    assert "hunter2" not in unquoted
+    assert "while loading the adapter" in unquoted
+
+    # and the vocabulary-id exemption still applies to the shape it was written for, while a
+    # QUOTED numeric value stays a serialized field and is redacted. `token: "151643"` is the case
+    # that matters: the exemption's other guard rejects a quote in the SEPARATOR (`{"token":`), so
+    # a json-style spelling is refused twice over and cannot show whether this one still works.
+    # Here the separator is a bare colon and only the quoted-branch check stands between a numeric
+    # credential and the artifact.
+    assert "151643" in _safe_child_failure_detail(ValueError("token: 151643 rejected at step 4"))
+    for quoted_id in (
+        'token: "151643"',
+        "token: '151643'",
+        'token="151643"',
+        '{"token": "151643"}',
+    ):
+        assert "151643" not in _safe_child_failure_detail(ValueError(quoted_id)), quoted_id
+
+    # the opening quote is reprinted, the closing one is not: it was never consumed, so emitting it
+    # again would double it and corrupt the surrounding json for anyone parsing the record.
+    assert _safe_child_failure_detail(ValueError('{"password":"hunter2"}')) == (
+        '{"password":"<redacted>"}'
+    )
+
+
 def test_child_failure_sanitizer_survives_a_non_utf8_credential_in_the_environment(monkeypatch):
     """A surrogate in an env value must not abort the sanitizer.
 

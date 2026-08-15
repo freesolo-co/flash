@@ -20,16 +20,19 @@ from flash.providers._lifecycle.worker import (
 from flash.providers.base import canonical_gpu, gpu_short
 from flash.providers.runpod.gpus import flash_gpu
 
+# re-exported: callers reach it as `endpoints._patch_runpod_backoff` and through the package.
+from flash.providers.runpod.serverless.backoff import _patch_runpod_backoff
+
 # runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
 
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-# an interval-only uploader can never fire for a wedged run: teardown comes at 1200s (training
-# stall) or 3000s (setup grace), both under the hour. one early snapshot, then the hourly cadence
-# -- one extra commit per RUN, not per hour, so the repo's rate budget is unchanged.
+# an interval-only uploader can never fire for a wedged run: teardown comes at 1200s (training stall)
+# or 3000s (setup grace), both under the hour. one early snapshot, then the hourly cadence -- one
+# extra commit per RUN, not per hour, so the repo's rate budget is unchanged.
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
-# how often the uploader LOOKS at the console, not how often it commits: a stat() is free against
-# the commit budget, and it is what notices a wedge before the next hourly boundary.
+# how often the uploader LOOKS at the console, not how often it commits: reading is free against the
+# commit budget, and it is what notices a wedge before the next hourly boundary.
 _CONSOLE_UPLOAD_POLL_S = 120.0
 
 _ENDPOINT_CACHE: dict[str, Any] = {}
@@ -517,36 +520,46 @@ def _train_body(input_data: dict) -> dict:
 
         def _upload_console(mode: str, final: bool = False) -> bool:
             """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
-            console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe from
-            both the subprocess-failure and missing-metrics crash paths: a worker killed without a
-            Python exception (OOM/SIGKILL, segfault, silent early exit) writes NO
-            ``error_<mode>.txt``, so the console is then the only root-cause record — and a crash
-            that exits 0 would otherwise skip the upload, leaving the failure opaque.
+            console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe from both
+            the subprocess-failure and missing-metrics crash paths: a worker killed without a Python
+            exception (OOM/SIGKILL, segfault, silent early exit) writes NO ``error_<mode>.txt``, so
+            the console is then the only root-cause record — and a crash that exits 0 would otherwise
+            skip the upload, leaving the failure opaque.
 
-            Serialized against itself: the periodic uploader is a daemon thread joined with a
-            timeout, so a slow snapshot can still run when the final one begins. ``final`` never
-            yields -- upload_file takes no timeout, so a wedged periodic snapshot holds the lock
-            forever and skipping the terminal upload leaves pre-failure bytes as the only console. A
-            periodic snapshot that sees ``console_teardown`` therefore drops its commit rather than
-            racing: captured BEFORE the terminal one, landing last, it would erase it. Returns
-            whether the tail landed: errors are swallowed, not raised, so a caller tracking what is
-            stored cannot read a normal return as success and skip the retry it earned."""
+            The terminal snapshot must be the LAST writer: every caller commits to the same repo
+            path, so an older periodic one landing after it restores a pre-failure console over the
+            bytes that explain the failure. ``final`` therefore never yields (upload_file takes no
+            timeout, so a wedged holder would suppress it forever), periodic callers drop their
+            commit once ``console_teardown`` is set, and a terminal upload forced through without the
+            lock re-commits once it frees. Each rule is pinned by a test_serverless_*console* case.
+
+            Returns whether the tail landed: errors are swallowed, not raised, so a caller tracking
+            what is stored cannot read a normal return as success and skip the retry it earned."""
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
                 return False
             if final:
                 console_teardown.set()
+            # per-caller scratch: sharing one .tail splices an unsynchronized final snapshot
+            tail = console + (".final.tail" if final else ".tail")
             held = console_upload_lock.acquire(timeout=120.0)
             try:
                 if not final and (console_teardown.is_set() or not held):
                     print(f"console upload skipped for {mode}; the terminal snapshot supersedes it")
                     return False
-                # per-caller scratch: sharing one .tail splices an unsynchronized final snapshot
-                suffix = ".final.tail" if final else ".tail"
-                return _upload_console_locked(mode, console, console + suffix, final)
+                ok = _upload_console_locked(mode, console, tail, final)
             finally:
                 if held:
                     console_upload_lock.release()
+            # `not held`: the commit above raced a holder still inside upload_file, whose older bytes
+            # can land after it. acquiring is proof that finished, so one more commit wins. ONE more,
+            # never a retry loop: a permanently wedged holder never frees and this must still return.
+            if final and not held and console_upload_lock.acquire(timeout=120.0):
+                try:
+                    ok = _upload_console_locked(mode, console, tail, True) or ok
+                finally:
+                    console_upload_lock.release()
+            return ok
 
         def _upload_console_locked(mode: str, console: str, tail_path: str, final: bool) -> bool:
             try:
@@ -570,17 +583,17 @@ def _train_body(input_data: dict) -> dict:
                 else:
                     tail = raw[1:].decode("utf-8", "replace")
                     # a truncated first line is dropped before sanitizing: a boundary landing inside
-                    # a one-line credential leaves a fragment that full-value redaction no longer
-                    # matches. duplicated rather than imported because only this function's SOURCE
-                    # ships to the worker; bootstrap_secrets._read_console_tail is canonical.
+                    # a one-line credential leaves a fragment full-value redaction no longer matches.
+                    # duplicated, not imported: only this function's SOURCE ships to the worker.
+                    # bootstrap_secrets._read_console_tail is canonical.
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""
                 with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
-                # re-checked after staging: teardown can begin mid-flight, and committing then
-                # would overwrite the terminal console with older bytes.
+                # re-checked after staging: teardown can begin mid-flight, and committing then would
+                # overwrite the terminal console with older bytes.
                 if not final and console_teardown.is_set():
                     print(f"console upload dropped for {mode}; superseded by the terminal snapshot")
                     return False
@@ -601,10 +614,10 @@ def _train_body(input_data: dict) -> dict:
             stop_upload = threading.Event()
 
             def _upload_loop() -> None:
-                # literals, not the module-level constants: only this function's SOURCE ships to
-                # the worker, so a name reference is a NameError before training.
-                # test_first_console_snapshot_precedes_the_stall_teardown pins them so this cannot
-                # drift. Mirrors bootstrap._console_upload_loop, whose docstring carries the rules.
+                # literals, not the module-level constants: only this function's SOURCE ships to the
+                # worker, so a name reference is a NameError before training. Pinned against drift by
+                # test_first_console_snapshot_precedes_the_stall_teardown. Mirrors
+                # bootstrap._console_upload_loop, whose docstring carries the rules.
                 due_s, since, quiet_polls = 600.0, 0.0, 0
                 uploaded_size, size, quiet_used = -1, -1, False
                 while not stop_upload.wait(120.0):
@@ -700,49 +713,6 @@ def isolate_flash_state(scope: str | None = None) -> None:
             _reset_flash_resource_manager(rm)
     except Exception as exc:
         logger.warning("flash state isolation skipped: %s", exc)
-
-
-def _patch_runpod_backoff() -> None:
-    """Cap the backoff exponent before the power to prevent OverflowError on long runs (~80 min+)."""
-    try:
-        import math
-        import random
-
-        from runpod_flash.core.utils import backoff as _bo
-
-        if getattr(_bo, "_flash_backoff_patched", False):
-            return
-
-        def _safe_get_backoff_delay(
-            attempt,
-            base=0.1,
-            max_seconds=10.0,
-            jitter=0.2,
-            strategy=_bo.BackoffStrategy.EXPONENTIAL,
-        ):
-            a = min(int(attempt), 30)
-            if strategy == _bo.BackoffStrategy.EXPONENTIAL:
-                delay = base * (2**a)
-            elif strategy == _bo.BackoffStrategy.LINEAR:
-                delay = base + (attempt * base)
-            elif strategy == _bo.BackoffStrategy.LOGARITHMIC:
-                delay = base * math.log2(attempt + 2)
-            else:
-                raise ValueError(f"Unsupported backoff strategy: {strategy}")
-            delay = min(delay, max_seconds)
-            return delay * random.uniform(1 - jitter, 1 + jitter)
-
-        _bo.get_backoff_delay = _safe_get_backoff_delay
-        _bo._flash_backoff_patched = True
-        # serverless.py imported the symbol directly; patch its ref too.
-        try:
-            from runpod_flash.core.resources import serverless as _sl
-
-            _sl.get_backoff_delay = _safe_get_backoff_delay
-        except Exception:
-            pass
-    except Exception as exc:
-        logger.warning("runpod backoff patch skipped: %s", exc)
 
 
 def min_cuda_for(friendly_gpu: str) -> str:

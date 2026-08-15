@@ -38,9 +38,17 @@ _FAILURE_FALLBACK_MAX_CHARS = 8192
 # the auth scheme is consumed, not captured: `Authorization: Basic dXNlcjpwYXNz` otherwise matches
 # `Basic` as the value and prints the credential after it verbatim -- redacting the one token in the
 # line that is not secret. every scheme here is a fixed word, so consuming it cannot hide a value.
+# a QUOTED value runs to its matching quote, not to the first space: `{"password":"correct horse
+# battery staple"}` otherwise redacts `correct` and prints the rest. the quotes are what delimit a
+# serialized field, so whitespace inside them is part of the value. an UNQUOTED value still ends at
+# whitespace -- there the space is the delimiter, and running past it would eat the sentence around
+# the credential. no closing quote on the line means the value runs to the end of it: fail closed.
+_SECRET_SCHEME = r"(?:(?:bearer|basic|digest|token)\s+)?"
 _SECRET_DETAIL = re.compile(
-    r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
-    r"(['\"]?\s*[:=]\s*)(['\"]?)(?:(?:bearer|basic|digest|token)\s+)?([^\s,;'\"}]+)"
+    r"(?i)(?P<key>authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
+    r"(?P<sep>['\"]?\s*[:=]\s*)"
+    rf"(?:(?P<quote>['\"]){_SECRET_SCHEME}(?P<quoted>(?:(?!(?P=quote))[^\r\n])*)"
+    rf"|{_SECRET_SCHEME}(?P<bare>[^\s,;'\"}}]+))"
 )
 # component lines of a multiline credential shorter than this are punctuation such as ``}``, not
 # secrets; redacting them would erase innocent text. Matches `bootstrap_secrets._MIN_SECRET_COMPONENT`.
@@ -285,11 +293,12 @@ def _is_token_id(match: re.Match[str]) -> bool:
     unquoted, and short enough to be one. A quoted value is a serialized field, not a number
     rendered into a sentence.
     """
-    key, separator, quote, value = match.group(1), match.group(2), match.group(3), match.group(4)
+    key, separator = match.group("key"), match.group("sep")
+    value = match.group("bare")
     return (
-        value.isdigit()
+        value is not None  # None means the quoted branch matched: a serialized field, not an id
+        and value.isdigit()
         and len(value) <= _MAX_TOKEN_ID_DIGITS
-        and not quote
         and "'" not in separator
         and '"' not in separator
         and key.lower() == "token"
@@ -329,7 +338,9 @@ def _safe_child_failure_detail(error: Exception) -> str:
         lambda match: (
             match.group(0)
             if _is_token_id(match)
-            else f"{match.group(1)}{match.group(2)}{match.group(3)}<redacted>"
+            # the opening quote is reprinted, never the closing one: it was not consumed, so it is
+            # still in the text after the match and reprinting it would double.
+            else f"{match.group('key')}{match.group('sep')}{match.group('quote') or ''}<redacted>"
         ),
         message,
     )
