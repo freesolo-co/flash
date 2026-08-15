@@ -205,8 +205,9 @@ def _raise_verl_failure(
     if return_code == SHIM_FRAGMENT_FAILED_EXIT_CODE:
         # permanent, not retriable infra: the same interpreter fails the same fragment on retry.
         raise RuntimeError(
-            f"verl OPD subprocess exited {return_code}: a required flash runtime patch failed to "
-            "apply in the child interpreter (its traceback names the fragment in the flash log). "
+            f"verl OPD subprocess exited with status {return_code}: a required flash runtime "
+            "patch failed to apply in the child interpreter (its traceback names the fragment in "
+            "the flash log). "
             "the verl/transformers stack at the child python is incompatible with this flash "
             "version; rebuild the worker image or fix FLASH_VERL_PYTHON rather than retrying."
         )

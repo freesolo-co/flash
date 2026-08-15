@@ -2800,7 +2800,7 @@ def _applied_shim_markers(tmp_path) -> str:
     the callbacks verify it on the first step line, so tests that drive steps need the real
     thing rather than a stub: a bare path would fail them for the reason the check exists.
     """
-    marker = tmp_path / "applied_shims.txt"
+    marker = Path(opd_train.shim_marker_file(str(tmp_path)))
     marker.write_text("lora-rollout-guard\n", encoding="utf-8")
     return str(marker)
 

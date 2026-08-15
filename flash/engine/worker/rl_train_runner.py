@@ -238,7 +238,10 @@ def _write_rl_shim(inp, files) -> list[str]:
             # into this process there is nothing left to fix.
             render_tilelang_cudart_shim(),
             render_shim_marker_prologue(files["shim_markers"]),
-            *(wrap_shim_fragment(name, source) for name, source in required_fragments),
+            *(
+                wrap_shim_fragment(name, source, record_immediately=name != "lora-rollout-guard")
+                for name, source in required_fragments
+            ),
             # gated on the key rather than the resolved logger list: that list needs python_bin,
             # which is resolved after this file is written. the shim is inert either way -- it only
             # fires when verl actually calls wandb.init, which requires wandb in the logger list.

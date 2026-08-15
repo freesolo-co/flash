@@ -5351,7 +5351,10 @@ def _apply_lora_rollout_guard(module, monkeypatch):
         stub.__path__ = []
         monkeypatch.setitem(_sys.modules, name, stub)
     monkeypatch.setitem(_sys.modules, module.__name__, module)
-    exec(compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+    exec(
+        compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"),
+        {"_flash_record_applied_shim": lambda _name: None},
+    )
 
 
 def test_the_lora_rollout_guard_refuses_to_generate_from_the_base_model(monkeypatch):
@@ -5417,7 +5420,7 @@ def test_the_lora_rollout_guard_adds_no_engine_round_trip_per_rollout(monkeypatc
 
 
 def test_the_lora_rollout_guard_passes_the_call_through_once_the_adapter_is_loaded(monkeypatch):
-    """the guard must be inert on the healthy path, preserving verl's real signature and return."""
+    """the guard must preserve verl's healthy-path arguments and return value."""
     import asyncio
 
     module = _lora_rollout_server_module({123})
@@ -5512,10 +5515,18 @@ def test_the_lora_rollout_guard_patches_the_module_on_a_real_deferred_import(tmp
     armed = list(_sys.meta_path)
     monkeypatch.setattr(_sys, "meta_path", armed)
 
-    exec(compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+    marker_file = str(tmp_path / "applied_shims.txt")
+    source = _child_io.render_shim_marker_prologue(marker_file) + _child_io.wrap_shim_fragment(
+        "lora-rollout-guard",
+        _child_io.render_lora_rollout_guard_shim(),
+        record_immediately=False,
+    )
+    exec(compile(source, "sitecustomize.py", "exec"), {})
+    assert _child_io.read_applied_shim_markers(marker_file) == set()
     try:
         module = importlib.import_module(target)
 
+        assert _child_io.read_applied_shim_markers(marker_file) == {"lora-rollout-guard"}
         with pytest.raises(RuntimeError, match="refusing to roll out from the base model"):
             asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-4"))
         # the finder removes itself once it has fired, so it never sits on later imports.
@@ -5532,7 +5543,10 @@ def test_the_lora_rollout_guard_imports_nothing_heavy_at_interpreter_startup():
     import sys as _sys
 
     before = set(_sys.modules)
-    exec(compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+    exec(
+        compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"),
+        {"_flash_record_applied_shim": lambda _name: None},
+    )
     heavy = {
         name
         for name in set(_sys.modules) - before

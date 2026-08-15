@@ -530,11 +530,12 @@ def _write_child_shims(
     )
     if gdn_reset_arch is not None:
         opd_shim_source += _opd_train.render_gdn_varlen_shim(gdn_reset_arch)
-    # wrapped fail-closed: a rollout that quietly falls back to the base model produces a run that
-    # completes with a descending loss while distilling the wrong policy, so a guard that failed to
-    # apply must stop the child rather than let it train unguarded.
+    # fail closed: base-model rollouts complete with descending loss while distilling the wrong
+    # policy, so a guard that failed to apply must stop the child rather than let it train unguarded.
     opd_shim_source += _opd_train.wrap_shim_fragment(
-        _LORA_ROLLOUT_GUARD_SHIM, _opd_train.render_lora_rollout_guard_shim()
+        _LORA_ROLLOUT_GUARD_SHIM,
+        _opd_train.render_lora_rollout_guard_shim(),
+        record_immediately=False,
     )
     if "wandb" in loggers:
         opd_shim_source += _opd_train.render_wandb_link_shim()

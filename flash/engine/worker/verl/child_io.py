@@ -511,6 +511,7 @@ def _flash_patch_lora_rollout(module):
 
     generate._flash_lora_guarded = True
     server.generate = generate
+    _flash_record_applied_shim('lora-rollout-guard')
     print({FLASH_LORA_ROLLOUT_MARKER!r}, flush=True)
 
 
@@ -762,21 +763,23 @@ def _flash_record_applied_shim(name):
 """
 
 
-def wrap_shim_fragment(name: str, source: str) -> str:
+def wrap_shim_fragment(name: str, source: str, *, record_immediately: bool = True) -> str:
     """wrap one required sitecustomize fragment so it fails closed and proves it applied.
 
     "" stays "": a feature that is off has nothing to prove. requires the prologue above earlier
-    in the same sitecustomize. optional fragments (tf32, the wandb link) stay unwrapped, since they
-    swallow their own failures by design and must never be able to kill a paid run.
+    in the same sitecustomize. deferred fragments set ``record_immediately=False`` and call the
+    recorder themselves only after their target module is actually patched. optional fragments
+    (tf32, the wandb link) stay unwrapped, since they swallow their own failures by design and must
+    never be able to kill a paid run.
     """
     if not source:
         return ""
+    record = f"    _flash_record_applied_shim({name!r})\n" if record_immediately else ""
     return f"""
 # --- flash required fragment: {name} (fails closed; see child_io.wrap_shim_fragment) ---
 try:
 {textwrap.indent(source, "    ")}
-    _flash_record_applied_shim({name!r})
-except BaseException:
+{record}except BaseException:
     import os as _flash_shim_os
     import sys as _flash_shim_sys
     import traceback as _flash_shim_traceback
