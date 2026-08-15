@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -779,7 +780,12 @@ class TeacherClient:
             turn_end_token_id=turn_end_tokens[0].token_id,
         )
 
-    def score_many(self, items: list[tuple[str, str]]) -> list[TeacherScore]:
+    def score_many(
+        self,
+        items: list[tuple[str, str]],
+        *,
+        on_scored: Callable[[], None] | None = None,
+    ) -> list[TeacherScore]:
         """Score each unique prompt and completion through one idempotent broker request.
 
         Bounded by `map_bounded`, which consumes completions as they arrive rather than in input
@@ -789,14 +795,21 @@ class TeacherClient:
         roughly in order -- with one slow leading request it bills the ENTIRE list (measured 64,
         128, 256 of 256 at width 32, against 37 here). Teacher latency varies with completion
         length, so that is the normal case.
+
+        `on_scored` is called once per request as it completes, so a caller tracking liveness sees
+        progress DURING a long batch rather than only when the whole list returns. It runs on the
+        pool thread, so it must stay cheap and must not raise.
         """
         if not items:
             return []
-        return map_bounded(
-            items,
-            lambda item: self._score_one(*item),
-            cap=OPD_TEACHER_SCORING_CONCURRENCY,
-        )
+
+        def score(item: tuple[str, str]) -> TeacherScore:
+            result = self._score_one(*item)
+            if on_scored is not None:
+                on_scored()
+            return result
+
+        return map_bounded(items, score, cap=OPD_TEACHER_SCORING_CONCURRENCY)
 
     def score_many_multimodal(
         self,

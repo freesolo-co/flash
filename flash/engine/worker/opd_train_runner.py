@@ -88,6 +88,7 @@ class _ChildCallbacks:
     on_step: Any
     child_heartbeat: Any
     liveness_fields: Any
+    silence_watchdog: Any
     progress: dict[str, Any]
     wandb_link: dict[str, str | None]
     child_tail: Any
@@ -629,20 +630,27 @@ def _build_child_callbacks(
         _opd_train._w.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
 
     child_tail = _opd_train.ChildOutputTail()
-    # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside
-    # the per-tick callback.
-    tail_staleness = _opd_train.ChildTailStaleness()
+    silence_watchdog = _opd_train.VerlChildSilenceWatchdog(
+        child_tail,
+        tick_s=_opd_train._heartbeat._LIVENESS_TICK_S,
+        baseline_step=resume_step,
+        parent_activity=getattr(bridge, "teacher_activity_count", None),
+        # the teacher counter covers scoring; this covers the env turns between scores, which run
+        # in the parent while the child blocks on the step response and advance no teacher total.
+        parent_busy=getattr(bridge, "env_work_in_flight", None),
+    )
 
     def liveness_fields() -> dict[str, object]:
-        return _opd_train.stall_tail_fields(
-            int(progress["step"] or 0), child_tail, staleness=tail_staleness
-        )
+        step = int(progress["step"] or 0)
+        silent_ticks = silence_watchdog.observe(step)
+        return _opd_train.stall_tail_fields(step, child_tail, silent_ticks=silent_ticks)
 
     return _ChildCallbacks(
         on_line,
         on_step,
         child_heartbeat,
         liveness_fields,
+        silence_watchdog,
         progress,
         wandb_link,
         child_tail,
@@ -684,6 +692,7 @@ def _run_child(
                     on_line=callbacks.on_line,
                     heartbeat=callbacks.child_heartbeat,
                     tail=callbacks.child_tail,
+                    silence_watchdog=callbacks.silence_watchdog,
                 )
                 training_completed = return_code == 0
     finally:

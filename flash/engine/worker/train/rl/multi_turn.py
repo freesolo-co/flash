@@ -10,6 +10,7 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -67,6 +68,7 @@ class MultiTurnBridge:
         max_turns: int,
         per_turn_credit: bool = False,
         on_episode_scored: Callable[[object, object, float], None] | None = None,
+        grading: Callable[[], contextlib.AbstractContextManager] | None = None,
         score_batch_size: int = _MULTI_TURN_SCORE_BATCH_SIZE,
         score_flush_wait_s: float = _MULTI_TURN_SCORE_FLUSH_WAIT_S,
         session_lease_s: float = _MULTI_TURN_SESSION_LEASE_S,
@@ -79,6 +81,8 @@ class MultiTurnBridge:
         self._max_turns = int(max_turns)
         self._per_turn_credit = bool(per_turn_credit)
         self._on_episode_scored = on_episode_scored
+        # defaults to a no-op so every non-training caller (tests, profiling) works unwired.
+        self._grading = grading if grading is not None else contextlib.nullcontext
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every stateful episode touch below happens under this lock.
         self._lock = threading.Lock()
@@ -151,7 +155,10 @@ class MultiTurnBridge:
             reaped = self._reap_abandoned_sessions()
             if session_id in self._sessions:
                 raise KeyError(f"duplicate multi-turn session {session_id}")
-            state = self._env.new_rollout_state(example)
+            # user code the child blocks on, same as the hooks in `step`: an env that builds its
+            # episode from a slow api spends that time here, recording nothing.
+            with self._grading():
+                state = self._env.new_rollout_state(example)
             # new_rollout_state calls start_episode again after dataset preparation. adopt the dataset's
             # prompt so randomized envs do not generate for episode a and score episode b; keep the
             # remaining state created by the env.
@@ -193,11 +200,18 @@ class MultiTurnBridge:
                     "content": str(payload.get("completion_text") or ""),
                 }
                 return {"terminal": True, "messages": []}
-            self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
-            if self._env.rollout_done(state, self._max_turns):
-                return {"terminal": True, "messages": []}
-            replies = self._env.env_reply(list(state.get("messages") or ()), state)
-            terminal = bool(self._env.rollout_done(state, self._max_turns))
+            # every env hook here is parent-side work the child is BLOCKED on, and none of them
+            # record anything: a slow tool call or api in ANY of them looks exactly like a wedge to
+            # the tail alone. `env_reply` is the usual offender, but `record_model_turn` and
+            # `rollout_done` run the same user code on the same critical path. marked busy for the
+            # same reason scoring is, and equally inside the lock so a thread queued behind someone
+            # else's slow turn does not report itself as working.
+            with self._grading():
+                self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
+                if self._env.rollout_done(state, self._max_turns):
+                    return {"terminal": True, "messages": []}
+                replies = self._env.env_reply(list(state.get("messages") or ()), state)
+                terminal = bool(self._env.rollout_done(state, self._max_turns))
         return {
             "terminal": terminal,
             "messages": [
@@ -211,8 +225,14 @@ class MultiTurnBridge:
 
         takes the same lock every other env touch takes, so scoring never overlaps a concurrent
         episode's ``env_reply``. the win is that one lock acquisition now covers a whole batch.
+
+        ``grading`` spans the call for the silence watchdog: episodes are recorded only after the
+        whole batch returns, so nothing else marks the parent alive while a slow judge runs. it goes
+        INSIDE the lock deliberately -- wrapping the acquisition too would report the parent busy
+        while this thread is merely queued behind a hung ``env_reply``, which is a wedge the watchdog
+        must still be able to name.
         """
-        with self._lock:
+        with self._lock, self._grading():
             return score_rollouts(self._env, requests)
 
     def score(self, payload: dict) -> dict:

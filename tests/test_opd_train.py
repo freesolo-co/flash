@@ -1024,11 +1024,13 @@ class _ScoreManyTeacherAdapter:
     def score(self, prompt_text, completion_text):
         return self._with_usage(self.teacher.score(prompt_text, completion_text))
 
-    def score_many(self, items):
-        return [
-            self._with_usage(self.teacher.score(prompt_text, completion_text))
-            for prompt_text, completion_text in items
-        ]
+    def score_many(self, items, *, on_scored=None):
+        scores = []
+        for prompt_text, completion_text in items:
+            scores.append(self._with_usage(self.teacher.score(prompt_text, completion_text)))
+            if on_scored is not None:
+                on_scored()
+        return scores
 
 
 def _text_bridge(teacher, *, mutation_callback=None):
@@ -2582,6 +2584,110 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
 
     assert env.recorded == ["A"]
     assert response["terminal"] is False
+
+
+def test_opd_marks_the_parent_busy_inside_every_environment_hook():
+    """OPD's activity counter covers TEACHER completions only, and the env hooks between them run
+    in the parent too. None of them advance a teacher total while the child blocks on the step
+    response, so a slow tool call or api inside ANY of them looks exactly like a wedge on the
+    child's tail -- the same gap the GRPO bridge closes with its own busy signal.
+
+    Asserted hook by hook rather than in aggregate: whichever one is left unwrapped is the one a
+    user's slow implementation will sit in, and a single-hook test passes while the rest are bare.
+    """
+    seen: dict[str, list[bool]] = {}
+
+    class ObservingEnv(_RecordingEnv):
+        """each hook reports what the gauge said from INSIDE its own call."""
+
+        def _note(self, hook):
+            seen.setdefault(hook, []).append(bridge.env_work_in_flight())
+
+        def new_rollout_state(self, example):
+            self._note("new_rollout_state")
+            return super().new_rollout_state(example)
+
+        def record_model_turn(self, state, text):
+            self._note("record_model_turn")
+            return super().record_model_turn(state, text)
+
+        def rollout_done(self, state, turn_limit):
+            self._note("rollout_done")
+            return super().rollout_done(state, turn_limit)
+
+        def env_reply(self, messages, state):
+            self._note("env_reply")
+            return super().env_reply(messages, state)
+
+    bridge = _multiturn_bridge(ObservingEnv())
+    bridge.start_multiturn(
+        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+    )
+
+    bridge.step_multiturn(
+        {
+            "session_id": "s1",
+            "turn_ordinal": 0,
+            "accepted_prefix": [10, 11],
+            "raw_response_ids": [65],
+            "response_ids": [65],
+            "completion_text": "A",
+            "termination": "stop",
+            "stop_reason": "stop",
+            "truncated": False,
+            "skip_reason": "",
+        }
+    )
+
+    for hook in ("new_rollout_state", "record_model_turn", "rollout_done", "env_reply"):
+        assert seen.get(hook), f"{hook} never ran, so this asserts nothing about it"
+        assert all(seen[hook]), (
+            f"the parent was not marked busy inside {hook}; a slow user implementation there "
+            "would read as child silence and the watchdog would kill a healthy run"
+        )
+    # and it is released, or the watchdog stays disarmed for the rest of the run.
+    assert not bridge.env_work_in_flight()
+
+
+def test_an_opd_env_hook_that_raises_still_releases_the_parent_busy_mark():
+    """A leaked busy mark is worse than a missing one: it disarms the watchdog permanently.
+
+    User env code raising is ordinary -- a tool call 500s, a parse error on a malformed action. If
+    the guard released only on the success path, that one raise would pin the parent "busy" for the
+    rest of the run and no wedge could ever be named again. Asserted on this bridge too rather than
+    inferred from the shared gauge: the guard placement is per call site, and a `finally` in the
+    gauge cannot save a hook whose guard was never entered.
+    """
+
+    class ExplodingEnv(_RecordingEnv):
+        def env_reply(self, messages, state):
+            raise ValueError("the user's tool call blew up")
+
+    bridge = _multiturn_bridge(ExplodingEnv())
+    bridge.start_multiturn(
+        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+    )
+
+    with pytest.raises(ValueError, match="blew up"):
+        bridge.step_multiturn(
+            {
+                "session_id": "s1",
+                "turn_ordinal": 0,
+                "accepted_prefix": [10, 11],
+                "raw_response_ids": [65],
+                "response_ids": [65],
+                "completion_text": "A",
+                "termination": "stop",
+                "stop_reason": "stop",
+                "truncated": False,
+                "skip_reason": "",
+            }
+        )
+
+    assert not bridge.env_work_in_flight(), (
+        "a raising env hook leaked the busy mark; the parent would report busy forever and the "
+        "silence watchdog could never name another wedge"
+    )
 
 
 def test_multimodal_bridge_scores_frozen_images_through_structured_teacher_messages(
@@ -4223,7 +4329,7 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
             self.batch_sizes = []
             self.next_index = 0
 
-        def score_many(self, items):
+        def score_many(self, items, *, on_scored=None):
             self.batch_sizes.append(len(items))
             results = []
             for _item in items:
@@ -4240,6 +4346,8 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
                         ]
                     )
                 )
+                if on_scored is not None:
+                    on_scored()
             return results
 
     # turn count is derived from the measured concurrency ceiling so the case stays MEANINGFUL if
@@ -4277,6 +4385,53 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
     assert [_teacher_logsum(turn) for turn in result["turns"]] == [
         -float(index) for index in range(1, turns + 1)
     ]
+
+
+def test_multiturn_teacher_progress_is_visible_before_the_batch_returns(monkeypatch):
+    # the silence watchdog reads `teacher_ok` to tell a child blocked on a slow teacher from a child
+    # that has wedged. multi-turn hands its whole turn list to score_many in ONE call, so counting
+    # the batch after it returned froze that number for the length of the batch: at the teacher's
+    # 434s worst case per request, three waves is 1302s of apparent silence and the watchdog would
+    # tear down a healthy run. asserting the final total cannot catch that -- it is identical either
+    # way -- so this samples the counter WHILE the batch is still running.
+    observed: list[int] = []
+
+    class WatchedTeacher:
+        def score_many(self, items, *, on_scored=None):
+            results = []
+            for _item in items:
+                results.append(
+                    _teacher_score([TeacherToken(text="AB", logprob=-1.0, start=0, end=2)])
+                )
+                if on_scored is not None:
+                    on_scored()
+                observed.append(bridge.teacher_ok)
+            return results
+
+    turns = 4
+    bridge = _text_bridge(WatchedTeacher())
+    monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
+    bridge._sessions["session-1"] = {
+        "turns": [
+            {
+                "prompt_ids": [10, 11],
+                "response_ids": [65, 66],
+                "completion_text": "AB",
+                "context_messages": [{"role": "user", "content": "question"}],
+                "truncated": False,
+                "skip_reason": "",
+            }
+            for _index in range(turns)
+        ],
+        "score_cache": None,
+        "score_lock": threading.Lock(),
+        "lease_deadline": time.monotonic() + 60,
+    }
+
+    bridge.score_multiturn("session-1")
+
+    assert observed == [1, 2, 3, 4]
+    assert bridge.teacher_ok == turns
 
 
 def test_multiturn_transient_bridge_failure_latches_terminal_cause():
@@ -5289,6 +5444,7 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
         child_heartbeat=lambda: None,
         liveness_fields=dict,
         child_tail=None,
+        silence_watchdog=None,
         wandb_link={"wandb_url": None, "wandb_id": None},
     )
     reconciled = []

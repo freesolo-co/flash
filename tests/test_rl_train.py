@@ -281,7 +281,12 @@ def test_grpo_classified_exit_drains_group_after_leader_is_reaped(tmp_path, monk
 def test_run_rl_train_reaches_the_executable_grpo_subprocess_stream():
     source = inspect.getsource(rl_train._execute_rl_child)
 
-    assert "child_stream = _rl_train()._GrpoSubprocessStream(proc)" in source
+    # the tail and its watchdog ride on the per-run state, so the stream reads the same objects the
+    # rl_step heartbeat observes rather than constructing a second pair nobody is watching.
+    assert (
+        "_GrpoSubprocessStream( proc, tail=state.child_tail, "
+        "silence_watchdog=state.silence_watchdog )" in " ".join(source.split())
+    )
     assert "for line in child_stream" in source
     assert "return child_stream.wait_and_classify()" in source
 
@@ -4638,6 +4643,30 @@ def test_bridge_step_stops_before_asking_a_finished_env_for_a_reply():
     }
 
 
+def test_an_env_hook_that_raises_still_releases_the_parent_busy_mark():
+    """A leaked busy mark is worse than a missing one: it disarms the watchdog permanently.
+
+    User env code raising is ordinary -- a tool call 500s, a parse error on a malformed action. If
+    the guard released only on the success path, that one raise would pin the parent "busy" for the
+    rest of the run, silence would reset on every tick, and no wedge could ever be named again.
+    """
+    observability = RewardObservabilityBuffer()
+
+    class ExplodingEnv(_BridgeEnv):
+        def env_reply(self, messages, state):
+            raise ValueError("the user's tool call blew up")
+
+    bridge = _bridge(ExplodingEnv(done_after=99), grading=observability.grading)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="blew up"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+    assert not observability.reward_grading_in_flight(), (
+        "a raising env hook leaked the busy mark; the parent would report busy forever and the "
+        "silence watchdog could never name another wedge"
+    )
+
+
 def test_bridge_step_on_an_unknown_session_raises_rather_than_scoring_a_blank_episode():
     with pytest.raises(KeyError, match="unknown multi-turn session"):
         _bridge(_BridgeEnv()).step({"session_id": "ghost", "completion_text": "x"})
@@ -4651,6 +4680,117 @@ def test_bridge_score_returns_the_episode_reward_for_that_session():
     assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.75}
     # scored against the state the turns accumulated into, not a fresh one.
     assert env.scored[0]["messages"][0]["content"] == "answer"
+
+
+def test_bridge_marks_the_parent_busy_while_a_slow_judge_scores_a_batch():
+    """Multi-turn scores a whole batch of terminal episodes in ONE env call and records them only
+    after it returns, exactly like the single-turn path. Without the `grading` guard around that
+    call the silence watchdog sees no parent activity for its whole duration and tears down a
+    healthy run mid-judge.
+    """
+    observability = RewardObservabilityBuffer()
+    seen = []
+
+    class SlowJudgeEnv(_BridgeEnv):
+        def rollout_rewards_many(self, items):
+            # observed from INSIDE the env call, which is the window the guard has to cover.
+            seen.append(observability.reward_grading_in_flight())
+            return super().rollout_rewards_many(items)
+
+    bridge = _bridge(SlowJudgeEnv(episode=0.5), grading=observability.grading)
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.5}
+
+    assert seen == [True], "the parent was not marked busy while the env scored the batch"
+    # and the mark is released, or the watchdog stays disarmed for the rest of the run.
+    assert not observability.reward_grading_in_flight()
+
+
+def test_bridge_marks_the_parent_busy_inside_every_env_hook():
+    """Every env hook is parent-side work the child is BLOCKED on, and none of them record anything.
+
+    A slow tool call or api inside ANY of them is indistinguishable from a wedge on the child's tail
+    alone, exactly like a slow judge, so they all need the same busy mark. Scoring is not reached on
+    this path: the episode is still mid-rollout.
+
+    Asserted hook by hook rather than in aggregate: whichever one is left unwrapped is the one a
+    user's slow implementation will sit in, and a single-hook test passes while the rest are bare.
+    """
+    observability = RewardObservabilityBuffer()
+    seen: dict[str, list[bool]] = {}
+
+    class ObservingEnv(_BridgeEnv):
+        """each hook reports what the gauge said from INSIDE its own call."""
+
+        def _note(self, hook):
+            seen.setdefault(hook, []).append(observability.reward_grading_in_flight())
+
+        def new_rollout_state(self, example):
+            self._note("new_rollout_state")
+            return super().new_rollout_state(example)
+
+        def record_model_turn(self, state, text):
+            self._note("record_model_turn")
+            return super().record_model_turn(state, text)
+
+        def rollout_done(self, state, max_turns):
+            self._note("rollout_done")
+            return super().rollout_done(state, max_turns)
+
+        def env_reply(self, messages, state):
+            self._note("env_reply")
+            return super().env_reply(messages, state)
+
+    bridge = _bridge(ObservingEnv(done_after=99), grading=observability.grading)
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+
+    for hook in ("new_rollout_state", "record_model_turn", "rollout_done", "env_reply"):
+        assert seen.get(hook), f"{hook} never ran, so this asserts nothing about it"
+        assert all(seen[hook]), (
+            f"the parent was not marked busy inside {hook}; a slow user implementation there "
+            "would read as child silence and the watchdog would kill a healthy run"
+        )
+    assert not observability.reward_grading_in_flight()
+
+
+def test_a_thread_queued_behind_a_hung_env_turn_does_not_report_itself_busy():
+    """The busy mark must cover the env CALL, not the wait to be allowed to make it.
+
+    Marking the parent busy while merely queued on `_lock` inverts the fix: a genuinely hung
+    `env_reply` would hold every other thread in a "busy" state forever, silence would reset every
+    tick, and the watchdog could never name the wedge -- teardown would fall back to the slower
+    provider timer, which is the behaviour this whole PR exists to improve on.
+    """
+    observability = RewardObservabilityBuffer()
+    bridge = _bridge(_BridgeEnv(), grading=observability.grading)
+
+    # hold the env lock the way a hung `env_reply` would, then drive the batcher's scoring callback
+    # directly. going through `score()` would not reach it: that method takes the same lock first,
+    # so the thread would block before `_score_batch` ever ran and the assertion below could not
+    # tell the two orderings apart.
+    bridge._lock.acquire()
+    try:
+        queued = threading.Thread(
+            target=lambda: bridge._score_batch([]),
+            daemon=True,
+        )
+        queued.start()
+        time.sleep(0.3)
+
+        # it is waiting for the lock, doing NO env work. marking it busy here would mean a hung env
+        # keeps resetting silence on every tick, and the watchdog could never name the wedge.
+        assert observability._grading_work._depth == 0, (
+            "a thread queued on the env lock counted itself as busy, which would disarm the "
+            "watchdog for as long as the env stays hung"
+        )
+        assert not observability.reward_grading_in_flight()
+    finally:
+        bridge._lock.release()
+
+    queued.join(timeout=10)
+    assert not observability.reward_grading_in_flight()
 
 
 def test_bridge_score_converts_an_unscorable_episode_to_zero(capsys):
@@ -5164,7 +5304,7 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
         "# index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order. "
         'env_prompts=[p["env_prompt"] for p in prompts], max_turns=int(inp["max_turns"]), '
         'per_turn_credit=bool(inp["per_turn_credit"]), '
-        "on_episode_scored=observability.record, )" in src
+        "on_episode_scored=observability.record, grading=observability.grading, )" in src
     )
     assert 'if inp["multi_turn"] else None' in src
 
@@ -5856,6 +5996,90 @@ def test_the_step_preview_reads_the_generation_that_step_published():
     assert [s["completion"] for s in fields["sampled_completions"]] == ["gen1-a", "gen1-b"]
 
 
+def test_the_silence_watchdogs_reward_counter_survives_a_generation_boundary():
+    """The silence watchdog compares this count ACROSS ticks, so it must never go backwards.
+
+    `_scored_this_generation` resets at every boundary, and reusing it would make the watchdog read
+    a reset as "no progress" -- worse, a run whose generation closed between two ticks could report
+    a LOWER count and look wedged at the exact moment it was busiest.
+    """
+    buffer = RewardObservabilityBuffer(generation_size=2)
+
+    counts = []
+    for completion in ("gen1-a", "gen1-b", "gen2-a", "gen2-b", "gen3-a"):
+        buffer.record("p", completion, 1.0)
+        counts.append(buffer.reward_activity_count())
+
+    assert counts == [1, 2, 3, 4, 5]
+
+
+def test_grpo_hands_the_silence_watchdog_its_parent_side_reward_counter():
+    """grpo grades rewards in the PARENT over the localhost bridge, so a child waiting on a slow
+    user scorer is silent while real work happens. Without this wiring the watchdog sees only the
+    child's tail and tears down a healthy run -- the opd teacher counter closes the same gap on the
+    other rl path. The state object builds the watchdog, so the callback has to arrive with it.
+    """
+    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+
+    assert "_StepMetricState.for_reward_runtime(reward_runtime)" in src
+
+    # the factory binds BOTH parent-side probes. asserting on the call site alone would not notice
+    # one of them going missing, and either one alone leaves a blind spot the other covers.
+    factory = " ".join(inspect.getsource(rl_train._StepMetricState.for_reward_runtime).split())
+    assert "reward_activity=reward_runtime.observability.reward_activity_count" in factory
+    assert "reward_busy=reward_runtime.observability.reward_grading_in_flight" in factory
+
+    # and the field is not merely stored: it reaches the watchdog that consumes it.
+    scored = [0]
+    state = rl_train._StepMetricState(reward_activity=lambda: scored[0])
+    state.child_tail.record("step: 1\n")
+    torn_down = []
+    state.silence_watchdog.bind_process(
+        teardown=lambda: torn_down.append(True), is_running=lambda: True
+    )
+
+    from flash.engine.worker.verl import diagnostics as vc
+
+    for tick in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0) * 2):
+        if tick % 10 == 0:
+            scored[0] += 1
+        state.silence_watchdog.observe(2)
+
+    assert torn_down == [], "grpo's parent-side grading did not reach the silence watchdog"
+
+
+def test_one_grading_call_longer_than_the_silence_budget_is_not_a_wedge():
+    """The counter only moves BETWEEN units of parent work, and single-turn coalesces up to 64
+    completions into ONE `scores_breakdown_many`. Nothing is recorded until that call returns, so a
+    judge slower than the silence budget leaves `_scored_ever` flat for the entire batch and the run
+    is torn down mid-grade -- the same mid-batch blind spot the OPD `on_scored` path closed.
+    """
+    from flash.engine.worker.verl import diagnostics as vc
+
+    buffer = RewardObservabilityBuffer()
+    state = rl_train._StepMetricState(
+        reward_activity=buffer.reward_activity_count,
+        reward_busy=buffer.reward_grading_in_flight,
+    )
+    state.child_tail.record("step: 1\n")
+    torn_down = []
+    state.silence_watchdog.bind_process(
+        teardown=lambda: torn_down.append(True), is_running=lambda: True
+    )
+
+    ticks = int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0)
+    with buffer.grading():
+        # one batch, three times the whole budget, recording nothing until it returns.
+        for _ in range(ticks * 3):
+            state.silence_watchdog.observe(2)
+        assert torn_down == [], "a run inside a single long grading call was torn down"
+
+    # once the call returns the exemption ends: a child that stays silent after it is still a wedge.
+    for _ in range(ticks + 1):
+        state.silence_watchdog.observe(2)
+    assert torn_down == [True], "the busy gate kept the watchdog disarmed after grading finished"
+
+
 def test_a_preview_before_the_first_boundary_still_shows_a_rollout():
     # the fallback direction: with nothing published yet, the open generation is all there is, and
     # blanking the preview would read as "no rollouts" rather than "no boundary yet".
@@ -6164,8 +6388,14 @@ def test_the_first_sample_bearing_heartbeat_is_forced():
 def test_the_liveness_fields_hook_carries_reward_observability():
     # the rl_step liveness wrap is what publishes between stdout lines. without the fields hook
     # merging it, samples would only ever reach the wire on the one forced first-metrics heartbeat.
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    assert 'fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()}' in src
+    entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    assert '"metrics_last": list(metrics_last), ' in entry
+    assert "**_reward_observability()," in entry
+    # and the watchdog's own field is merged BEFORE the reward diagnostics: those call user reward
+    # code, so a raising observability read must not skip the tick that advances the silence timer.
+    assert entry.index("silence_watchdog.heartbeat_fields(") < entry.index(
+        "**_reward_observability("
+    )
 
 
 def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains():

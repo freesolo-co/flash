@@ -17,6 +17,8 @@ from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.result.rollout_samples import sample_completion_text, sanitize_rollout_text
 from flash.engine.worker.backend_common import (
     SHIM_FRAGMENT_FAILED_EXIT_CODE,
+    ChildOutputTail,
+    VerlChildSilenceWatchdog,
     adopt_orphaned_descendants,
     append_step_metrics,
     latest_global_step_dir,
@@ -33,6 +35,7 @@ from flash.engine.worker.backend_common import (
     wrap_shim_fragment,
 )
 from flash.engine.worker.io.heartbeat import (
+    _LIVENESS_TICK_S,
     GRPO_METRIC_HISTORY_LIMIT,
     LATEST_GRPO_METRICS_LAST,
     RewardObservabilityBuffer,
@@ -81,6 +84,38 @@ class _StepMetricState:
     step_line_times: list[float] = field(default_factory=list)
     metrics_last: list[dict] = field(default_factory=list)
     sent_first_metrics: bool = False
+    # the child's output tail and the watchdog reading it are per-run state like everything above,
+    # so they travel with it rather than as two more parameters through the child call.
+    child_tail: ChildOutputTail = field(default_factory=ChildOutputTail)
+    silence_watchdog: VerlChildSilenceWatchdog | None = None
+    # grpo's rewards are scored PARENT-side over the localhost bridge, so a child waiting on a slow
+    # user scorer or a judge api prints nothing while real work is happening. without this the
+    # watchdog cannot tell that from a wedge, exactly as opd cannot without its teacher counter.
+    reward_activity: Callable[[], int] | None = None
+    # and the counter alone is not enough: one coalesced grading call can outlast the silence budget
+    # with nothing recorded until it returns, so the watchdog also asks whether one is in flight.
+    reward_busy: Callable[[], bool] | None = None
+
+    def __post_init__(self) -> None:
+        self.silence_watchdog = VerlChildSilenceWatchdog(
+            self.child_tail,
+            tick_s=_LIVENESS_TICK_S,
+            parent_activity=self.reward_activity,
+            parent_busy=self.reward_busy,
+        )
+
+    @classmethod
+    def for_reward_runtime(cls, reward_runtime: _RewardRuntime) -> _StepMetricState:
+        """build the per-run state wired to the parent-side reward signals the watchdog needs.
+
+        both probes come from the same buffer and are only ever passed together, so binding them
+        here keeps the pair from being split up -- supplying one without the other reintroduces
+        exactly the blind spot the other closes.
+        """
+        return cls(
+            reward_activity=reward_runtime.observability.reward_activity_count,
+            reward_busy=reward_runtime.observability.reward_grading_in_flight,
+        )
 
 
 @dataclass
@@ -277,14 +312,17 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
     def _score_batch(requests: list[tuple[int, str]]) -> list[float]:
         # grade the whole batch before touching the observability lock. the env's scorer may block on
         # judge i/o, while record is intentionally a short per-result critical section.
-        scored = score_single_turn_batch(
-            env,
-            [(solution_str, rollout_examples[int(index)]) for index, solution_str in requests],
-            tok=tok,
-            thinking=bool(_w.THINKING),
-            prompt_opened_thinking=inp["prompt_opened_thinking"],
-            think_penalty=inp["think_penalty"],
-        )
+        # `grading` spans that blocking call so the silence watchdog can see the batch is running:
+        # no completion is recorded until it returns, so this is the only liveness edge in between.
+        with observability.grading():
+            scored = score_single_turn_batch(
+                env,
+                [(solution_str, rollout_examples[int(index)]) for index, solution_str in requests],
+                tok=tok,
+                thinking=bool(_w.THINKING),
+                prompt_opened_thinking=inp["prompt_opened_thinking"],
+                think_penalty=inp["think_penalty"],
+            )
         results = []
         for (index, solution_str), (score, breakdowns) in zip(requests, scored, strict=True):
             observability.record(message_prompts[int(index)], solution_str, score, breakdowns)
@@ -329,6 +367,7 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
             max_turns=int(inp["max_turns"]),
             per_turn_credit=bool(inp["per_turn_credit"]),
             on_episode_scored=observability.record,
+            grading=observability.grading,
         )
         if inp["multi_turn"]
         else None
@@ -515,7 +554,9 @@ def _execute_rl_child(
         env=env_for_verl,
         start_new_session=True,
     )
-    child_stream = _rl_train()._GrpoSubprocessStream(proc)
+    child_stream = _rl_train()._GrpoSubprocessStream(
+        proc, tail=state.child_tail, silence_watchdog=state.silence_watchdog
+    )
     step_re = re.compile(r"step:\s*(\d+)")
     progress, last_dump_step = state.progress, state.last_dump_step
     shim_markers = (files or {}).get("shim_markers")

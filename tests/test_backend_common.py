@@ -2400,7 +2400,7 @@ def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     assert tail.tail() == ["filler-68", "filler-69", "filler-70"]
 
 
-def test_stall_tail_fields_reports_only_before_the_first_step():
+def test_stall_tail_fields_gates_lines_but_not_silence_after_the_first_step():
     tail = vc.ChildOutputTail()
     tail.record("ray: placement group pending\n")
 
@@ -2408,16 +2408,294 @@ def test_stall_tail_fields_reports_only_before_the_first_step():
     fields = vc.stall_tail_fields(0, tail)
     assert fields == {"child_tail": ["ray: placement group pending"]}
 
-    # once training progresses the step/loss stream is the diagnostic; the tail would be pure
-    # payload bloat on every tick.
-    assert vc.stall_tail_fields(1, tail) == {}
-    assert vc.stall_tail_fields(500, tail) == {}
+    # once training progresses the step/loss stream is the diagnostic, so the retained lines stay
+    # gated. the cheap counter must still be published because mid-training silence is the wedge.
+    assert vc.stall_tail_fields(1, tail, silent_ticks=7) == {"child_tail_silent_ticks": 7}
+    assert vc.stall_tail_fields(500, tail, silent_ticks=8) == {"child_tail_silent_ticks": 8}
 
 
 def test_stall_tail_fields_is_empty_when_the_child_has_said_nothing():
     # an empty key would claim the child spoke and said nothing, which is a different fact from
     # "the child has produced no output at all".
     assert vc.stall_tail_fields(0, vc.ChildOutputTail()) == {}
+
+
+def _bound_silence_watchdog(
+    tail, *, tick_s=30.0, baseline_step=0, parent_activity=None, clock=None
+):
+    kwargs = {} if clock is None else {"clock": clock}
+    watchdog = vc.VerlChildSilenceWatchdog(
+        tail,
+        tick_s=tick_s,
+        baseline_step=baseline_step,
+        parent_activity=parent_activity,
+        **kwargs,
+    )
+    torn_down = []
+    watchdog.bind_process(teardown=lambda: torn_down.append(True), is_running=lambda: True)
+    return watchdog, torn_down
+
+
+def test_a_tick_that_costs_more_than_its_sleep_still_fires_before_the_provider_window():
+    """The deadline the provider enforces is ELAPSED time, so this watchdog must measure the same.
+
+    A tick is not a fixed cost: the liveness loop sleeps `tick_s` and THEN runs `gpu_diagnostics`,
+    which permits two 8s `nvidia-smi` subprocess timeouts. Counting nominal ticks alone, 40 x 30s
+    reads as 1200s while really taking up to 1886s -- past the 1500s stall window, where the
+    provider tears the run down first and this watchdog never classifies the wedge at all.
+    """
+    now = [0.0]
+    tail = vc.ChildOutputTail()
+    tail.record("training has started")
+    watchdog, torn_down = _bound_silence_watchdog(tail, clock=lambda: now[0])
+
+    # each tick costs its 30s sleep PLUS both nvidia-smi timeouts, the real worst case.
+    per_tick = 30.0 + 16.0
+    fired_at = None
+    for _ in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0) + 5):
+        now[0] += per_tick
+        watchdog.observe(step=1)
+        if torn_down and fired_at is None:
+            fired_at = now[0]
+            break
+
+    assert fired_at is not None, "the watchdog never fired"
+    assert fired_at <= 1500.0, (
+        f"fired at {fired_at:.0f}s, past the provider's 1500s stall window: the provider tears the "
+        "run down first and the wedge is never classified"
+    )
+
+
+def test_verl_child_silence_timeout_stays_under_the_provider_stall_deadline():
+    """The worker only gets to CLASSIFY a wedge if it fires before the provider kills the run.
+
+    The deadline is `stall_after_s` ALONE, and it is the value production passes, not the default in
+    `poll_until_complete`'s signature -- no caller uses that default. The heartbeat throttle window
+    does not extend it either: `surface_heartbeat` returns stage None for a liveness ping and never
+    advances the stall key, so the clock runs from the last real heartbeat. A silence timeout above
+    that never names anything, which is this watchdog's entire purpose.
+    """
+    from flash.providers.runpod.jobs import stall_kwargs
+
+    provider_deadline = float(stall_kwargs()["stall_after_s"])
+    assert provider_deadline > vc.VERL_CHILD_SILENCE_TIMEOUT_S
+
+    # and it must still clear the longest LEGITIMATE silence: one teacher request that exhausts its
+    # retry budget is 105s x 4 attempts + (2 + 4 + 8)s backoff, and opd batches them serially.
+    assert vc.VERL_CHILD_SILENCE_TIMEOUT_S > 105.0 * 4 + 14.0
+
+
+def test_verl_child_silence_watchdog_kills_a_child_that_wedges_on_its_very_first_step():
+    """The baseline is the step the child STARTED from, not the first one sampled.
+
+    The liveness thread samples one tick after launch, so a child that prints `step: 1` inside that
+    first window and then wedges would make 1 its own baseline. `step > baseline` would be false
+    forever and the wedge -- the exact case this watchdog exists for -- would bill the gpu
+    untouched. Supplying the pre-launch step closes that.
+    """
+    tail = vc.ChildOutputTail()
+    tail.record("step: 1\n")
+    watchdog, torn_down = _bound_silence_watchdog(tail, baseline_step=0)
+
+    # every observation reports step 1: the child advanced once, then went silent for good.
+    for _ in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0) + 1):
+        watchdog.observe(1)
+
+    assert torn_down == [True]
+
+
+def test_verl_child_silence_watchdog_gives_a_resumed_run_the_same_setup_exemption():
+    """A resumed opd run seeds `progress["step"]` from resume_step (opd_train_runner.py), so a
+    bare `step > 0` test reads as "training is running" while ray and the model are still loading
+    and the child has produced no output at all. That armed the kill path during a setup phase a
+    fresh run is exempt from, so a slow resume could be torn down for being slow.
+    """
+    resumed = vc.ChildOutputTail()
+    resumed.record("ray: loading model\n")
+    resumed_watchdog, resumed_torn_down = _bound_silence_watchdog(resumed, baseline_step=40)
+
+    fresh = vc.ChildOutputTail()
+    fresh.record("ray: loading model\n")
+    fresh_watchdog, fresh_torn_down = _bound_silence_watchdog(fresh)
+
+    for _ in range(130):
+        resumed_watchdog.observe(40)
+        fresh_watchdog.observe(0)
+
+    # neither has completed a step under THIS process, so both are still in setup.
+    assert resumed_torn_down == fresh_torn_down == []
+
+    # and the exemption ends the moment either advances: a wedge after real progress still fires.
+    for _ in range(130):
+        resumed_watchdog.observe(41)
+        fresh_watchdog.observe(1)
+    assert resumed_torn_down == fresh_torn_down == [True]
+
+
+def test_a_child_blocked_on_a_slow_parent_side_scorer_is_not_read_as_a_wedge():
+    """Both rl paths score OUTSIDE the child: grpo's rewards and opd's teacher both run in the
+    parent over the localhost bridge. A child waiting on a slow user scorer or a judge api prints
+    nothing at all, so on the tail alone it is indistinguishable from a wedge -- and the threshold
+    is now tight enough that a genuinely slow scorer would cross it. The parent's completed-work
+    counter is the only signal that separates them.
+    """
+    scored = 0
+
+    tail = vc.ChildOutputTail()
+    tail.record("step: 1\n")
+    watchdog, torn_down = _bound_silence_watchdog(tail, parent_activity=lambda: scored)
+
+    # a scorer slow enough to outlast the threshold several times over, but still making progress.
+    peak = 0
+    for tick in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0) * 4):
+        if tick % 10 == 0:  # one completion graded every 10 ticks, child silent throughout
+            scored += 1
+        peak = max(peak, watchdog.observe(2))
+
+    assert torn_down == [], "a run whose parent was still grading completions was torn down"
+    assert peak < int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0)
+
+    # and the gate is progress, not merely having a counter: once grading stops, silence resumes.
+    for _ in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0) + 1):
+        watchdog.observe(2)
+    assert torn_down == [True]
+
+
+def test_verl_child_silence_watchdog_tears_down_and_raises_at_the_threshold():
+    tail = vc.ChildOutputTail()
+    tail.record("step: 1\n")
+    watchdog, torn_down = _bound_silence_watchdog(tail)
+
+    # the first observation latches the baseline, so the child must advance past it before the
+    # watchdog considers a step to be running. this is the state a real wedge is in.
+    assert watchdog.observe(1) == 0
+    for _ in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0)):
+        watchdog.observe(2)
+
+    assert torn_down == [True]
+    expected = f"no output for {vc.VERL_CHILD_SILENCE_TIMEOUT_S:.0f}s while training was running"
+    with pytest.raises(RuntimeError, match=expected):
+        watchdog.raise_if_failed()
+
+
+def test_run_verl_training_tears_down_a_silent_child_and_raises_the_named_failure():
+    tail = vc.ChildOutputTail()
+    # one tick IS the whole timeout, so the second silent observation trips it.
+    watchdog = vc.VerlChildSilenceWatchdog(tail, tick_s=vc.VERL_CHILD_SILENCE_TIMEOUT_S)
+
+    def trip_after_first_output():
+        deadline = time.monotonic() + 5.0
+        while tail.written == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert tail.written > 0
+        assert watchdog.observe(1) == 0
+        assert watchdog.observe(2) == 1
+
+    observer = threading.Thread(target=trip_after_first_output)
+    observer.start()
+    expected = f"no output for {vc.VERL_CHILD_SILENCE_TIMEOUT_S:.0f}s while training was running"
+    try:
+        with pytest.raises(RuntimeError, match=expected):
+            vc.run_verl_training(
+                ["bash", "-c", "echo 'step: 1'; sleep 30"],
+                env=dict(os.environ),
+                tail=tail,
+                silence_watchdog=watchdog,
+            )
+    finally:
+        observer.join(timeout=5.0)
+    assert not observer.is_alive()
+
+
+def test_a_silenced_child_that_reported_infra_trouble_still_raises_the_retriable_failure():
+    """Teardown makes the exit nonzero, so the tail's own classification must be read FIRST.
+
+    A child that printed `cudaErrorDevicesUnavailable` and then wedged has already earned a
+    RetriableInfraError, which is what moves the run to a healthy worker. Raising the generic
+    silence failure ahead of the classifier downgrades that to a terminal error and the run loses
+    the retry its evidence justified.
+    """
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    tail = vc.ChildOutputTail()
+    watchdog = vc.VerlChildSilenceWatchdog(tail, tick_s=vc.VERL_CHILD_SILENCE_TIMEOUT_S)
+
+    def trip_after_first_output():
+        deadline = time.monotonic() + 5.0
+        while tail.written == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert tail.written > 0
+        watchdog.observe(1)
+        watchdog.observe(2)
+
+    observer = threading.Thread(target=trip_after_first_output)
+    observer.start()
+    try:
+        # the signature is authoritative evidence the gpu was unavailable, so it must win over the
+        # silence message even though the silence watchdog is what actually stopped the child.
+        with pytest.raises(RetriableInfraError):
+            vc.run_verl_training(
+                [
+                    "bash",
+                    "-c",
+                    "echo 'step: 1'; echo 'cudaErrorDevicesUnavailable'; sleep 30",
+                ],
+                env=dict(os.environ),
+                tail=tail,
+                silence_watchdog=watchdog,
+            )
+    finally:
+        observer.join(timeout=5.0)
+    assert not observer.is_alive()
+
+
+def test_verl_child_silence_watchdog_resets_on_parent_activity_and_probe_failure_counts():
+    tail = vc.ChildOutputTail()
+    tail.record("step: 1\n")
+    activity = [9]
+
+    def parent_activity():
+        value = activity[0]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    watchdog, torn_down = _bound_silence_watchdog(tail, parent_activity=parent_activity)
+    assert watchdog.observe(1) == 0
+    assert watchdog.observe(1) == 1
+    activity[0] = 10
+    assert watchdog.observe(1) == 0
+    activity[0] = RuntimeError("bridge shutting down")
+    assert watchdog.observe(1) == 1
+    assert torn_down == []
+
+
+def test_verl_child_silence_watchdog_resets_when_the_child_keeps_talking():
+    tail = vc.ChildOutputTail()
+    watchdog, torn_down = _bound_silence_watchdog(tail)
+
+    for tick in range(240):
+        tail.record(f"working-{tick}\n")
+        assert watchdog.observe(7) == 0
+
+    watchdog.raise_if_failed()
+    assert torn_down == []
+
+
+def test_verl_child_silence_watchdog_allows_long_silence_below_the_threshold():
+    tail = vc.ChildOutputTail()
+    tail.record("step: 1\n")
+    watchdog, torn_down = _bound_silence_watchdog(tail)
+
+    # one tick short of the limit: the count keeps climbing and nothing is torn down. derived from
+    # the timeout so a change to it retunes this rather than silently making the test vacuous.
+    limit = int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0)
+    assert watchdog.observe(1) == 0
+    for expected in range(1, limit):
+        assert watchdog.observe(1) == expected
+
+    watchdog.raise_if_failed()
+    assert torn_down == []
 
 
 def test_stall_tail_fields_reports_how_long_the_child_has_been_silent():
@@ -2428,16 +2706,16 @@ def test_stall_tail_fields_reports_how_long_the_child_has_been_silent():
     staleness = vc.ChildTailStaleness()
     tail.record("Started a local Ray instance\n")
 
-    first = vc.stall_tail_fields(0, tail, staleness=staleness)
+    first = vc.stall_tail_fields(0, tail, silent_ticks=staleness.observe(tail.written))
     assert first["child_tail_silent_ticks"] == 0
 
     # two more ticks with the child saying nothing new: same tail, rising silence.
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 1
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 2
+    assert staleness.observe(tail.written) == 1
+    assert staleness.observe(tail.written) == 2
 
     # the child speaks again, so it is slow rather than stuck and the counter resets.
     tail.record("loading checkpoint shards 1/4\n")
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+    assert staleness.observe(tail.written) == 0
 
 
 def test_child_tail_silence_survives_the_retention_limit():
@@ -2448,10 +2726,10 @@ def test_child_tail_silence_survives_the_retention_limit():
     staleness = vc.ChildTailStaleness()
     for i in range(3):
         tail.record(f"line{i}\n")
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+    assert staleness.observe(tail.written) == 0
     tail.record("line3\n")  # evicts line0; the deque stays length 3
     assert len(tail.tail()) == 3
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+    assert staleness.observe(tail.written) == 0
 
 
 def test_child_tail_silence_is_measured_from_the_childs_first_line():
@@ -2460,9 +2738,10 @@ def test_child_tail_silence_is_measured_from_the_childs_first_line():
     tail = vc.ChildOutputTail()
     staleness = vc.ChildTailStaleness()
     for _ in range(4):
-        assert vc.stall_tail_fields(0, tail, staleness=staleness) == {}
+        silent_ticks = staleness.observe(tail.written)
+        assert vc.stall_tail_fields(0, tail, silent_ticks=silent_ticks) == {}
     tail.record("first words\n")
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
+    assert staleness.observe(tail.written) == 0
 
 
 def test_stall_tail_fields_omits_silence_when_no_tracker_is_supplied():

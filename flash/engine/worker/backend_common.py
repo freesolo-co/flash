@@ -24,7 +24,6 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import thread as _thread_module
 from http.server import ThreadingHTTPServer
-from typing import Self
 
 # verl 0.8.0 exactly, plus the truncation-mask, 3d position-id, and ulysses fused-label fixes.
 # it must stay on the 0.8.0 base: the opd plugin patches 0.8.0 internals and imports
@@ -481,6 +480,7 @@ def run_verl_training(
     step_pattern: str = r"step:\s*(\d+)",
     heartbeat_interval_s: float = 20.0,
     tail: ChildOutputTail | None = None,
+    silence_watchdog: VerlChildSilenceWatchdog | None = None,
 ) -> int:
     """run a verl trainer subprocess, streaming stdout and surfacing step progress.
 
@@ -506,6 +506,11 @@ def run_verl_training(
     )
     # start_new_session makes the leader pid the stable group id even after that leader is reaped.
     process_group_id = proc.pid
+    if silence_watchdog is not None:
+        silence_watchdog.bind_process(
+            teardown=lambda: kill_process_group(proc, process_group_id=process_group_id),
+            is_running=lambda: proc.poll() is None,
+        )
     last_hb = 0.0
     try:
         # the child's exit is watched independently of pipe EOF. a grandchild holding the inherited
@@ -573,6 +578,12 @@ def run_verl_training(
     except BaseException:
         kill_process_group(proc, process_group_id=process_group_id)
         raise
+    # AFTER the classifier, never before: teardown makes the exit nonzero, and a child that printed
+    # `cudaErrorDevicesUnavailable` before wedging still deserves the RetriableInfraError its own
+    # evidence earns. raising the generic silence failure first would downgrade that to a terminal
+    # error and cost the run the retry the tail already justified.
+    if silence_watchdog is not None:
+        silence_watchdog.raise_if_failed()
     if return_code != 0:
         # a nonzero exit that carried no recognized signature RETURNS from the classifier rather
         # than raising, so this is the one failing path that reached neither teardown above. the
@@ -580,93 +591,6 @@ def run_verl_training(
         # context, and a reusable worker then hands the next attempt an occupied gpu.
         kill_process_group(proc, process_group_id=process_group_id)
     return return_code
-
-
-_TEARDOWN_GRACE_S = 10.0
-
-# grace for a descendant holding stdout open after the trainer exits. observe child exit separately
-# from EOF because EngineCore can retain the pipe; allow final flushing before group teardown.
-_ORPHANED_PIPE_GRACE_S = 30.0
-
-
-class _ChildExitWatchdog:
-    """Tears the group down when the direct child exits but a descendant holds the pipe open.
-
-    this prevents an EngineCore-held pipe from blocking teardown forever (PR #730). it arms only after
-    child exit, so ordinary trainer silence remains ``ChildTailStaleness``'s responsibility.
-    """
-
-    def __init__(self, proc: subprocess.Popen, *, process_group_id: int, grace_s: float) -> None:
-        self._proc = proc
-        self._process_group_id = process_group_id
-        self._grace_s = grace_s
-        self._done = threading.Event()
-        self._thread: threading.Thread | None = None
-        # bumped by the reader for every line it takes off the pipe. the exit of the child alone is
-        # NOT sufficient evidence of a leak: a child can exit having left a full pipe behind, and a
-        # reader working through that backlog -- an on_step callback uploading a checkpoint takes
-        # minutes -- would otherwise be killed mid-upload and its successful run reported as failed.
-        # a stuck reader cannot advance this; a busy one does, which is exactly the distinction.
-        self._lines_read = 0
-        # how many lines are being HANDLED right now, not merely taken off the pipe. counting only
-        # arrivals makes one long callback look identical to a stuck reader -- the counter cannot
-        # advance while an upload runs, because the next line is not read until it returns. so
-        # progress is "a line arrived OR one is still in hand", and the two together mean the
-        # watchdog only ever fires on a reader that is neither receiving nor working.
-        self._lines_in_flight = 0
-        # read by the caller after the loop ends, to distinguish "the child closed its own pipe" from
-        # "we closed it by killing the group out from under a survivor".
-        self.tore_down = False
-
-    @contextlib.contextmanager
-    def handling_line(self):
-        """Wraps the reader's whole per-line body, not just the moment the line arrives.
-
-        Entered once per line and held until that line's callbacks return, so an `on_step` upload
-        that outlasts the grace still reads as progress. Plain int stores, so no lock is needed: the
-        watchdog only ever compares them, and either order of the two writes below leaves the reader
-        looking busy rather than idle.
-        """
-        self._lines_read += 1
-        self._lines_in_flight += 1
-        try:
-            yield
-        finally:
-            self._lines_in_flight -= 1
-
-    def __enter__(self) -> Self:
-        self._thread = threading.Thread(
-            target=self._watch, name="verl-child-exit-watchdog", daemon=True
-        )
-        self._thread.start()
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self._done.set()
-        if self._thread is not None:
-            # bounded: the thread only ever sleeps on `_done`, so this is a handoff, not a wait on
-            # the child. the thread is a daemon regardless, so it can never hold the worker open.
-            self._thread.join(timeout=_TEARDOWN_GRACE_S)
-
-    def _watch(self) -> None:
-        # `poll` rather than `wait`: this thread must stay responsive to `_done` instead of blocking
-        # on the child. both collect the status, and CPython guards that with `_waitpid_lock`, so
-        # whichever of the two threads gets there first is the one that sets `returncode`.
-        while not self._done.wait(0.5):
-            if self._proc.poll() is None:
-                continue
-            # the child is gone. that is necessary but not sufficient: require the reader to also be
-            # making no progress across the grace, so a backlog being worked through is never killed.
-            before = self._lines_read
-            if self._done.wait(self._grace_s):
-                return
-            if self._lines_read != before or self._lines_in_flight:
-                # the reader is still draining real output, or is inside a callback for a line it
-                # already took. either way it is working, so keep watching rather than tearing down.
-                continue
-            self.tore_down = True
-            kill_process_group(self._proc, process_group_id=self._process_group_id)
-            return
 
 
 def _process_is_zombie(pid: int) -> bool:
@@ -987,12 +911,17 @@ from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
 # `backend_common.<name>`: the trainers and the tests both read them from here.
 from flash.engine.worker.verl.diagnostics import (  # noqa: E402,F401
     _CHILD_TAIL_LINE_CHARS,
+    _ORPHANED_PIPE_GRACE_S,
+    _TEARDOWN_GRACE_S,
     CHILD_TAIL_LINES,
     RAY_FAILURE_LOGS,
     RAY_LOG_TAIL_BYTES,
     STALL_TAIL_LINES,
+    VERL_CHILD_SILENCE_TIMEOUT_S,
     ChildOutputTail,
     ChildTailStaleness,
+    VerlChildSilenceWatchdog,
+    _ChildExitWatchdog,
     collect_ray_failure_logs,
     latest_ray_session_dir,
     raise_for_classified_verl_exit,

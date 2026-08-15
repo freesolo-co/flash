@@ -25,6 +25,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     _TEARDOWN_GRACE_S,
     VERL_REQUIREMENT,
     ChildOutputTail,
+    VerlChildSilenceWatchdog,
     _ChildExitWatchdog,
     clamp_engine_len,
     export_peft_adapter,
@@ -48,7 +49,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     verl_device_capability,
     wrap_shim_fragment,
 )
-from flash.engine.worker.io.heartbeat import liveness_heartbeat
+from flash.engine.worker.io.heartbeat import _LIVENESS_TICK_S, liveness_heartbeat
 
 # no call site in this module since the uploader moved to `.train.rl.checkpoints`, but it is kept
 # imported here on purpose: the resume tests patch `rl_train._deployable_adapter_on_hf`, and the
@@ -97,13 +98,19 @@ DATA_SOURCE = "flash_env"
 class _GrpoSubprocessStream:
     """one grpo child stream and the evidence latched from that same stream."""
 
-    def __init__(self, proc) -> None:
+    def __init__(self, proc, *, tail=None, silence_watchdog=None) -> None:
         self._proc = proc
         # the caller uses start_new_session, so the leader pid remains the group's stable identity.
         self._process_group_id = proc.pid
-        self._tail = ChildOutputTail()
+        self._tail = tail if tail is not None else ChildOutputTail()
         self._terminated = False
         self._orphaned_pipe = False
+        self.silence_watchdog = silence_watchdog or VerlChildSilenceWatchdog(
+            self._tail, tick_s=_LIVENESS_TICK_S
+        )
+        self.silence_watchdog.bind_process(
+            teardown=self.terminate, is_running=lambda: self._proc.poll() is None
+        )
 
     def __iter__(self):
         assert self._proc.stdout is not None
@@ -153,6 +160,10 @@ class _GrpoSubprocessStream:
         except BaseException:
             self.terminate()
             raise
+        # AFTER the classifier, never before: teardown makes the exit nonzero, and a child that
+        # printed `cudaErrorDevicesUnavailable` before wedging still deserves the RetriableInfraError
+        # its own evidence earns rather than the generic silence failure.
+        self.silence_watchdog.raise_if_failed()
         if return_code != 0:
             # an unclassified nonzero exit RETURNS from the classifier rather than raising, so this
             # is the failing path that reached no teardown. the direct child is gone but its group
@@ -365,7 +376,7 @@ def run_rl_train():
         )
         expected_steps, loggers = configured["expected_steps"], configured["loggers"]
         _w.heartbeat("rl_step", step=0, initial=True)
-        state = _StepMetricState()
+        state = _StepMetricState.for_reward_runtime(reward_runtime)
         # equal within-group rewards produce zero advantages and gradients. collect per-step spread;
         # reward mean and pg_loss cannot prove a signal. declare this before the uploader because its
         # publication gate closes over the histories.
@@ -392,7 +403,12 @@ def run_rl_train():
         with liveness_heartbeat(
             "rl_step",
             progress=_progress,
-            fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
+            # silence first: a failure in the optional reward diagnostics must not skip a tick.
+            fields=lambda: {
+                "metrics_last": list(metrics_last),
+                **state.silence_watchdog.heartbeat_fields(int(_progress() or 0)),
+                **_reward_observability(),
+            },
             progress_step=True,
         ):
             rc = _execute_rl_child(
