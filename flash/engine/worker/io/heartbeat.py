@@ -663,6 +663,7 @@ def liveness_heartbeat(
         # targets on .start() would otherwise never return from this one.
         if threading.current_thread() is spawner:
             return
+
         # the watchdog OWNS the whole verdict: it samples the counter and decides on it, on a thread
         # that never uploads. an earlier revision sampled on the emitting loop and only decided
         # here, which was worse than the bug it fixed -- a wedged upload froze sampling, so an
@@ -676,13 +677,23 @@ def liveness_heartbeat(
         # at half the intended time on a healthy run AND the number published in the heartbeat --
         # the diagnostic this whole change exists to make trustworthy -- was wrong. the emitter
         # reads the sample this thread took instead of taking its own.
-        while not done.wait(_LIVENESS_TICK_S):
+        def _sample() -> None:
             sample: dict = {}
             if fields is not None:
                 with contextlib.suppress(Exception):
                     sample = fields() or {}
             latest_fields[0] = sample
             stall_clock.observe(sample.get("child_tail_silent_ticks"), child_tail_stall_event)
+
+        # sample BEFORE the first sleep. both loops wait the same interval from starts microseconds
+        # apart, so without this the emitter's first heartbeat can win the race and publish with no
+        # child_tail and no silent-tick count -- exactly the tick a child that dies during import
+        # is judged by, since a run torn down at the deadline has no later heartbeat to correct it.
+        # this costs nothing: the first `observe` on a fresh counter BASELINES (returns 0) rather
+        # than counting a silent tick, so it cannot pull the deadline forward.
+        _sample()
+        while not done.wait(_LIVENESS_TICK_S):
+            _sample()
 
     def _loop() -> None:
         if threading.current_thread() is spawner:

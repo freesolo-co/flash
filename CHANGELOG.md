@@ -53,8 +53,11 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   reported the retriable `stalled` first. Detection runs entirely on a thread that never uploads --
   it samples the counter and decides on it -- because the heartbeat upload has no timeout, and a
   detector that only advances between uploads can see neither a child going quiet nor one coming
-  back. The window is cleared as soon as the child stops reporting the counter at all, which is how
-  a completed first optimizer step announces that silence is no longer evidence of anything.
+  back. It takes its first sample before its first sleep, so the earliest heartbeat already carries
+  the tail and the silent-tick count rather than racing the emitting loop for them; a child that
+  dies during import is judged by that first payload and a torn-down run publishes no later one to
+  correct it. The window is cleared as soon as the child stops reporting the counter at all, which
+  is how a completed first optimizer step announces that silence is no longer evidence of anything.
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always

@@ -507,6 +507,39 @@ def test_fields_is_sampled_once_per_tick_not_once_per_thread(monkeypatch):
     )
 
 
+def test_the_first_heartbeat_already_carries_the_stall_diagnostic(monkeypatch):
+    """The FIRST tick must not publish without `child_tail` / `child_tail_silent_ticks`.
+
+    Once the emitter stopped calling `fields()` itself and started reading the watch thread's most
+    recent sample, the two loops were racing: both wait the same interval from starts microseconds
+    apart, so the emitter can reach its first heartbeat while `latest_fields` is still the empty
+    dict it was initialised to. That first heartbeat is the one that matters most -- a child that
+    dies during import is judged by it, and a run torn down at the deadline never emits a later
+    heartbeat to correct the record. Taking an eager sample before the first sleep is free: the
+    first `observe` on a fresh counter baselines rather than counting a silent tick.
+    """
+    hb, w, _ = _liveness_env(monkeypatch)
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_S", 3600.0)  # never fire; this is about payloads
+    emitted: list = []
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(dict(k)))
+
+    with hb.liveness_heartbeat(
+        "opd_step",
+        fields=lambda: {"child_tail": ["loading shards"], "child_tail_silent_ticks": 0},
+        child_tail_stall_event=threading.Event(),
+    ):
+        time.sleep(0.25)
+
+    assert emitted, "the loop never emitted, so this proves nothing"
+    first = emitted[0]
+    why = (
+        f"the first heartbeat published without the stall diagnostic (keys: {sorted(first)}): a "
+        "child that wedges during import is judged by exactly this payload"
+    )
+    assert "child_tail_silent_ticks" in first, why
+    assert "child_tail" in first, why
+
+
 def test_elapse_survives_the_window_being_cleared_underneath_it(monkeypatch):
     """`elapse` and `observe` run on DIFFERENT threads, so the window can vanish mid-call.
 
