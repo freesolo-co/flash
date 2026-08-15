@@ -1093,6 +1093,52 @@ def test_a_cleared_loader_failure_is_not_reported_after_the_timeout(monkeypatch)
     assert "retrying this deploy is the correct response" in message
 
 
+def test_a_loader_failure_survives_later_transient_read_errors(monkeypatch):
+    """A transient 5xx is not an authoritative record, so it withdraws nothing.
+
+    When the loader named a failure and every later poll 5xxs until the deadline, reporting only
+    the read error points at serving -- but serving already said the artifact is wrong, and that
+    survives a warm engine. The deterministic complaint is the actionable half and must be kept.
+    """
+    import flash.serve.deploy as d
+
+    revision = "run-1@final." + "a" * 40
+    clock = [100.0]
+    reads = [0]
+
+    def registered(adapter_id, *, timeout_s=None):
+        clock[0] += 1.0
+        reads[0] += 1
+        # the FIRST read is authoritative and names the loader's complaint; every later poll is a
+        # retryable 5xx that lasts until the budget is spent.
+        if reads[0] == 1:
+            return (
+                {
+                    "subfolder": "sft/run-1/seed0/adapter",
+                    "metadata": {
+                        "lifecycle_state": "queued",
+                        "failure": "adapter tensors truncated",
+                    },
+                },
+                types.SimpleNamespace(headers={}),
+            )
+        raise d.ServingError("serving backend error (HTTP 503)", status_code=503)
+
+    monkeypatch.setattr(d, "_registered_adapter_response", registered)
+    monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+
+    with pytest.raises(d.ServingError) as excinfo:
+        d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
+
+    message = str(excinfo.value)
+    assert reads[0] > 1, "the test needs the transient errors to follow the authoritative record"
+    # the transient error is still reported: it is why readiness could not be confirmed.
+    assert "transient" in message
+    # but the loader's deterministic complaint must not be dropped on the floor.
+    assert "adapter tensors truncated" in message
+
+
 def test_rejected_adapter_still_fails_distinctly_from_a_timeout(monkeypatch):
     """The rejection path must keep its own message: retrying it is wrong."""
     import flash.serve.deploy as d

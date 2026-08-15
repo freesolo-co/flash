@@ -26,6 +26,18 @@ from flash.serve.errors import (  # noqa: F401 -- re-exported: callers import th
     RetryableServingUnavailable,
     ServingError,
 )
+from flash.serve.responses import (
+    active_alias_target as _active_alias_target,
+)
+from flash.serve.responses import (
+    matches_revision_identity as _matches_revision_identity,
+)
+from flash.serve.responses import (
+    serving_status_error as _serving_status_error,
+)
+from flash.serve.responses import (
+    validate_activation_response as _validate_activation_response,
+)
 from flash.serve.urls import is_freesolo_hosted_url, openai_base_url, serving_control_url
 
 logger = get_logger(__name__)
@@ -208,31 +220,6 @@ def _serving_request(
         raise _serving_status_error(url, exc) from exc
     except httpx.RequestError as exc:
         raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
-
-
-def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
-    """Build a ServingError from an upstream HTTP failure with a tailored hint."""
-    resp = exc.response
-    status = resp.status_code if resp is not None else None
-    detail = ((resp.text if resp is not None else "") or "").strip()[:500]
-    msg = f"serving backend error for {url}"
-    if status is not None:
-        msg += f" (HTTP {status})"
-    if detail:
-        msg += f": {detail}"
-    if status is not None and status < 500:
-        msg += (
-            " — the serving backend rejected the request (4xx); check FREESOLO_INTERNAL_KEY "
-            "and the request payload (this is a client/auth error, not a serving outage)"
-        )
-    else:
-        msg += (
-            " — the serving backend is unavailable or has no engine for this base model; "
-            "an operator must check the freesolo serving deployment"
-        )
-    headers = getattr(resp, "headers", {}) if resp is not None else {}
-    retry_after = headers.get("Retry-After")
-    return ServingError(msg, status_code=status, retry_after=retry_after)
 
 
 def serving_base_url() -> str:
@@ -488,36 +475,6 @@ def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> d
     return record
 
 
-def _matches_revision_identity(
-    record: dict, expected: dict, *, require_provenance: bool = True
-) -> bool:
-    scalar_fields = (
-        "adapter_id",
-        "repo_id",
-        "repo_type",
-        "subfolder",
-        "base_model",
-        "checkpoint",
-        "thinking",
-    )
-    if any(record.get(field) != expected.get(field) for field in scalar_fields):
-        return False
-    if (record.get("org_id") or None) != (expected.get("org_id") or None):
-        return False
-    if (record.get("structured_outputs") or None) != (expected.get("structured_outputs") or None):
-        return False
-    if not require_provenance:
-        # backends without revision_provenance do not echo provenance metadata; the immutable
-        # adapter_id already pins the artifact, so this cross-check is best effort here.
-        return True
-    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    expected_metadata = expected["metadata"]
-    return all(
-        metadata.get(field) == expected_metadata.get(field)
-        for field in ("record_type", "run_id", "checkpoint_step", "hf_revision")
-    )
-
-
 def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) -> set[str]:
     # SAFETY-CRITICAL capabilities the deploy correctness contract genuinely depends on: immutable
     # revisions (a revision id always maps to one artifact) and an atomic alias compare-and-swap
@@ -686,10 +643,20 @@ def _wait_revision_ready(
             if record_subfolder == subfolder:
                 return record
     if last_read_error is not None:
-        raise ServingError(
+        # a transient read error is not an authoritative record, so it withdraws nothing. when an
+        # earlier authoritative record named a loader failure, that complaint still stands and is
+        # the more actionable half: reporting only the read error would send the reader to retry
+        # against serving when serving already said the artifact itself is wrong.
+        message = (
             f"adapter revision {revision} readiness could not be confirmed after transient "
             f"serving errors: {last_read_error}"
-        ) from last_read_error
+        )
+        if last_failure:
+            message += (
+                f". before those errors the loader reported: {last_failure} -- that is not "
+                "transient and survives a warm engine, so fix it before retrying"
+            )
+        raise ServingError(message) from last_read_error
     # a TIMEOUT, not a rejection. the two are distinguishable in code (a rejected adapter raises
     # "serving failed to load adapter revision" above) but the old message said only that the
     # revision "remained 'registered'", which reads as a serving fault and sent readers to the wrong
@@ -737,15 +704,6 @@ def _wait_revision_ready(
     )
 
 
-def _active_alias_target(record: dict | None) -> str | None:
-    if not isinstance(record, dict) or record.get("status") == "disabled":
-        return None
-    metadata = record.get("metadata")
-    if isinstance(metadata, dict) and isinstance(metadata.get("alias_of"), str):
-        return metadata["alias_of"]
-    return None
-
-
 def adapter_alias_target(run_id: str) -> str | None:
     """Read the authoritative immutable revision targeted by a mutable run alias."""
     record = _registered_adapter(run_id)
@@ -757,27 +715,6 @@ def adapter_alias_target(run_id: str) -> str | None:
             f"serving alias {run_id} is not an immutable alias record; legacy aliases are unsupported"
         )
     return target
-
-
-def _validate_activation_response(
-    response: object,
-    *,
-    run_id: str,
-    revision: str,
-    checkpoint: str,
-    expected_adapter_revision: str | None,
-) -> dict:
-    if not isinstance(response, dict):
-        raise ServingError("serving returned an invalid alias activation response")
-    if response.get("adapter_id") != run_id or response.get("target_adapter_revision") != revision:
-        raise ServingError("serving returned mismatched committed alias activation provenance")
-    if response.get("previous_adapter_revision") != expected_adapter_revision:
-        raise ServingError("serving returned mismatched previous alias revision")
-    if response.get("checkpoint") != checkpoint:
-        raise ServingError("serving returned mismatched committed alias checkpoint")
-    if not isinstance(response.get("updated_at"), str) or not response["updated_at"].strip():
-        raise ServingError("serving returned committed alias activation without updated_at")
-    return response
 
 
 def _activate_revision(
