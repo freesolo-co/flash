@@ -47,6 +47,18 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   rollout now records the failure before exiting, the wait is bounded by an actor-liveness probe
   and a no-progress deadline, and the dying actor leaves a durable record so the run reports which
   teacher or template failure killed it rather than a bare non-zero exit.
+
+- `flash models deploy` now warns before it moves the shared `<run-id>` model id onto a
+  different checkpoint. Every checkpoint of a run is served under that one id, so deploying
+  `<run-id>/step-50` while `step-100` was live silently changed what `<run-id>` served for
+  everyone using it - which made "deploy a second checkpoint to compare" destructive to the
+  first and looked like a serving regression rather than the deploy that caused it. The warning
+  names both checkpoints and points at `flash models chat <run-id>/step-N`, which addresses a
+  checkpoint directly and does not depend on where the id points. It is advisory: the deploy
+  still proceeds, the pre-deploy read is abandoned once it exceeds a few seconds, and a control
+  plane that cannot answer does not fail the command. If activation never settled, the warning
+  says the live checkpoint cannot be determined and points at `flash models deployments`.
+
 - `flash env test` reported `overall: PASS` on environments that could not have trained anything,
   because a well-formed hook return was the only thing it checked. Three silent-pass classes now
   speak up. It still exits 0 for all three - they are warnings, not new blocking gates - but a run
