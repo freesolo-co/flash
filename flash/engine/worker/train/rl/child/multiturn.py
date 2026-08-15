@@ -62,11 +62,23 @@ def post_json(url: str, path: str, payload: dict) -> dict:
         with urllib.request.urlopen(request) as response:
             body = response.read()
     except urllib.error.HTTPError as error:
+        # decode inside the guard, raise outside it: `suppress(Exception)` around the raise as well
+        # swallowed the detail-bearing RuntimeError it was meant to let through, so the bridge's own
+        # error text ("can't start new thread") could never reach the user and every failure read as
+        # a bare "returned HTTP 400".
+        detail = None
         with contextlib.suppress(Exception):
-            detail = json.loads(error.read().decode("utf-8"))["error"]
-            raise RuntimeError(f"flash multi-turn bridge rejected {path}: {detail}") from error
+            detail = str(json.loads(error.read().decode("utf-8"))["error"])
+        # 5xx is the bridge failing to serve a valid request (resource exhaustion); 4xx is this
+        # request being rejected. naming which one it was stops a server fault from being read as a
+        # malformed payload.
+        fault = "could not serve" if error.code >= 500 else "rejected"
+        if detail:
+            raise RuntimeError(
+                f"flash multi-turn bridge {fault} {path} (HTTP {error.code}): {detail}"
+            ) from error
         raise RuntimeError(
-            f"flash multi-turn bridge returned HTTP {error.code} for {path}"
+            f"flash multi-turn bridge {fault} {path}: HTTP {error.code} with no error detail"
         ) from error
     except (OSError, http.client.HTTPException) as error:
         raise RuntimeError(
