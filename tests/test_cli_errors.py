@@ -94,6 +94,66 @@ def test_debug_flag_shows_traceback():
     assert "Traceback (most recent call last)" in proc.stderr
 
 
+def test_unexpected_error_suggestion_does_not_replay_a_credential():
+    """The `run ... --debug` suggestion echoes argv, so it must not echo the key inside it.
+
+    Both argv spellings matter: argparse accepts `--api-key secret` as two entries and
+    `--api-key=secret` as one, and only the first is caught by looking at the following element.
+    """
+    from flash.cli import _redacted_args
+
+    separate = _redacted_args(
+        ["models", "export", "--repository", "alice/model", "--api-key", "hf_SUPERSECRET"]
+    )
+    assert "hf_SUPERSECRET" not in separate
+    assert separate == [
+        "models",
+        "export",
+        "--repository",
+        "alice/model",
+        "--api-key",
+        "<redacted>",
+    ]
+
+    joined = _redacted_args(["login", "--api-key=fs_SUPERSECRET"])
+    assert "fs_SUPERSECRET" not in joined
+    assert joined == ["login", "--api-key=<redacted>"]
+
+    # a non-credential flag keeps its value: the suggestion is only useful if it stays runnable.
+    assert _redacted_args(["runs", "status", "--json"]) == ["runs", "status", "--json"]
+    assert _redacted_args(["login", "--api-url", "https://x"]) == [
+        "login",
+        "--api-url",
+        "https://x",
+    ]
+
+
+def test_unexpected_error_suggestion_redacts_abbreviated_credential_flags():
+    """argparse accepts any unambiguous prefix of a long option, and those bind the value too.
+
+    `flash login --api-k SECRET` and `--api-ke=SECRET` both populate `api_key`, so matching only the
+    full `--api-key` spelling leaves every abbreviated invocation printing the credential. The
+    parser is asserted here alongside the redaction: the point is that these spellings are real,
+    not hypothetical.
+    """
+    from flash.cli import _build_parser, _redacted_args
+
+    parser = _build_parser()
+    for argv in (["login", "--api-k", "fs_SUPERSECRET"], ["login", "--api-ke=fs_SUPERSECRET"]):
+        assert parser.parse_args(argv).api_key == "fs_SUPERSECRET", "abbreviation must be real"
+        assert not any("fs_SUPERSECRET" in part for part in _redacted_args(argv))
+
+    # which prefixes are ambiguous depends on the SUBPARSER. `flash login` also defines --api-url,
+    # so `--api` is refused there; `flash models export` does not, so `--ap`, `--api` and `--api-`
+    # are all accepted and bind the HuggingFace token. the required args are supplied because an
+    # incomplete command exits on those first, which hides whether the abbreviation was accepted.
+    export = ["models", "export", "--adapter-id", "a1", "--repository", "alice/m"]
+    for flag in ("--ap", "--api", "--api-", "--api-k", "--api-key"):
+        for argv in ([*export, flag, "hf_SUPERSECRET"], [*export, f"{flag}=hf_SUPERSECRET"]):
+            assert parser.parse_args(argv).api_key == "hf_SUPERSECRET", f"{flag} must bind"
+            assert not any("hf_SUPERSECRET" in part for part in _redacted_args(argv))
+
+
 def test_train_without_login_fails_fast():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = os.path.join(tmp, "run.toml")

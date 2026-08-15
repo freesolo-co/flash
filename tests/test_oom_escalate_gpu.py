@@ -8,6 +8,19 @@ import types
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _cuda_untouched(monkeypatch):
+    """Assert the boot condition unless a test says otherwise: no CUDA context in this process.
+
+    `preflight_free_vram` declines to run once one exists, so without this every occupancy assertion
+    below would pass for the wrong reason -- silently, and identically on a CI box with no torch and
+    a developer box with a live one.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "cuda_is_initialized", lambda: False)
+
+
 def test_is_cuda_oom_is_structured(monkeypatch):
     # torch-free (the offline CI image has no torch): is_cuda_oom imports torch internally under a
     # try/except, so the counter + MemoryError paths classify without it.
@@ -323,6 +336,7 @@ def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
         retry_budget=_RetryBudget(0, 1, 0),
         failed_providers=set(),
         tried_classes=set(),
+        capacity_refusals={},
         seed=1,
         log=io.StringIO(),
     )
@@ -520,3 +534,211 @@ def test_worker_failure_flags_prioritize_retriable_over_oom(monkeypatch):
         "retriable": True,
         "oom": False,
     }
+
+
+def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
+    """A co-tenanted card must retry on a FRESH instance, not escalate to a bigger one.
+
+    The observed failure: Flash sized the run at >=19 GB, RunPod handed over a 4090 reporting
+    total=22.5 used=18.6 free=3.4, with only 0.486 GB owned by any process in our container. The
+    sizing was right and the card was dirty, but the run trained anyway and died on an OOM ~80s of
+    paid GPU later -- classified `oom`, which escalates to a larger card and spends the small OOM
+    retry budget. Both are the wrong recovery for a card that was merely occupied.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (3.4, 22.5))
+    with pytest.raises(lc.DirtyGpuError) as excinfo:
+        lc.preflight_free_vram()
+
+    assert "19.1 GB of 22.5 GB (85%) already in use before this run has touched it" in str(
+        excinfo.value
+    )
+    # the whole point: infra retry, NOT an oom escalation onto a bigger (equally dirty) card.
+    monkeypatch.setattr(worker, "is_cuda_oom", lambda _exc: False)
+    assert worker._worker_failure_flags(excinfo.value) == {"retriable": True, "oom": False}
+
+
+@pytest.mark.parametrize(
+    ("free_gb", "total_gb"),
+    [
+        (22.5, 22.5),  # nothing on it at all
+        (22.1, 22.5),  # a clean card: only the driver's own reserve is gone (1.8%)
+        (174.0, 180.0),  # same 3.3% reserve on a big card, which is more absolute GB
+    ],
+)
+def test_preflight_accepts_a_card_nobody_else_is_using(monkeypatch, free_gb, total_gb):
+    """The gate catches a grossly occupied card and nothing else.
+
+    It measures occupancy, so it has no opinion about whether the run FITS -- that is the
+    allocator's call and it already made it at submit. Re-litigating fit here would reject clean
+    cards two ways: a run sized from profile-measured knobs needs far less than its authored spec
+    implies, and a run sized exactly at a catalog tier (24 GB) can never fit a real 4090's usable
+    22.5 GB no matter how empty it is.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (free_gb, total_gb))
+    lc.preflight_free_vram()
+
+
+def test_preflight_is_inert_when_the_driver_will_not_answer(monkeypatch):
+    """No CUDA, or a driver that will not answer, is not evidence of a dirty card."""
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: None)
+    lc.preflight_free_vram()
+
+    # a total of 0 is a nonsense reading, not a 100%-occupied card. dividing by it would raise.
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (0.0, 0.0))
+    lc.preflight_free_vram()
+
+
+def test_the_check_declines_once_this_process_holds_a_cuda_context(monkeypatch):
+    """Our own context is indistinguishable from a co-tenant's, so a late reading is not usable.
+
+    Attribution cannot rescue it. `nvidia-smi --query-compute-apps` reports HOST pids while the
+    worker container has a PRIVATE pid namespace (`docker run` in providers/_lifecycle/instance
+    passes no `--pid=host`), so a `/proc/<pid>` test inside the container fails in both directions:
+    our own rows do not resolve and get counted as a stranger's (false reject on a clean card), and
+    under `--pid=host` a real co-tenant's row DOES resolve and gets credited to us (silently waving
+    through the dirty card this exists to refuse).
+
+    So the guarantee is temporal, not analytical: read the card before we have touched it, and
+    decline afterwards. 18.6 GB of somebody else's work on the card is not enough to raise here.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (3.4, 22.5))
+    monkeypatch.setattr(lc, "cuda_is_initialized", lambda: True)
+    lc.preflight_free_vram()  # no raise: the reading would include our own context
+
+
+def test_boot_reads_the_card_before_anything_initializes_cuda():
+    """The check must run before `_force_fla_triton_gdn_on_sm100`, which creates a context.
+
+    That function calls `torch.cuda.get_device_capability`, and from that moment `preflight_free_vram`
+    correctly declines to judge the card -- so ordering it after would not weaken the check, it would
+    silently disable it. Asserted on the source because the alternative is booting a worker.
+    """
+    import inspect
+
+    import flash.engine.worker as worker
+
+    # the boot function specifically, not the module: at module scope the DEFINITION of
+    # `_preflight_free_vram_for_spec` precedes everything, so the ordering assertion would hold no
+    # matter how the calls were arranged and the test would pass while the check was disabled.
+    body = inspect.getsource(worker._run_worker_mode)
+    preflight = body.index("_preflight_free_vram_for_spec()")
+    forcer = body.index("_force_fla_triton_gdn_on_sm100()")
+    assert preflight < forcer, "the occupancy read must precede the first CUDA context"
+
+
+def test_a_small_co_tenant_that_still_breaks_a_close_fitting_run_is_refused(monkeypatch):
+    """A tenant does not have to be large to be fatal, so the threshold cannot be sized to a run.
+
+    5 GB held on a 22.5 GB card leaves 17.5 GB, which OOMs a 20 GB run -- exactly the delayed OOM
+    this exists to prevent -- while being only 22% occupancy. Any threshold loose enough to call
+    that acceptable is implicitly asserting what the run needs, which is the sizing model this
+    check refuses to own. Refusing every card with a stranger on it needs no such assertion.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (17.5, 22.5))
+    with pytest.raises(lc.DirtyGpuError):
+        lc.preflight_free_vram()
+
+
+def test_cuda_is_initialized_is_false_before_any_cuda_call(monkeypatch):
+    """The gate that decides whether the reading is usable must not itself import or start torch.
+
+    Reading `sys.modules` rather than importing means a boot where torch has not loaded yet answers
+    "untouched" instead of loading torch to find out -- and an unimportable torch does not silently
+    flip the answer to "clean card".
+    """
+    import sys
+    import types
+
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.undo()  # this test is about `cuda_is_initialized` itself, not its stub
+
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    assert lc.cuda_is_initialized() is False  # torch not even imported: nothing of ours on the card
+
+    torch = types.ModuleType("torch")
+    torch.cuda = types.SimpleNamespace(is_initialized=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    assert lc.cuda_is_initialized() is False  # imported, but no context yet
+
+    torch.cuda = types.SimpleNamespace(is_initialized=lambda: True)
+    assert lc.cuda_is_initialized() is True
+
+    # unanswerable -> assume touched, so the check declines rather than judging a reading it cannot
+    # trust. the conservative direction here is silence, not a DirtyGpuError.
+    def _boom():
+        raise RuntimeError("no")
+
+    torch.cuda = types.SimpleNamespace(is_initialized=_boom)
+    assert lc.cuda_is_initialized() is True
+
+
+def test_preflight_never_re_derives_what_the_run_needs(monkeypatch):
+    """The worker-side gate must not reach for the allocator's sizing model.
+
+    Two sizing models that disagree is the failure this guards. ``allocate()`` sizes SFT from
+    profile-measured overrides (``_overridden_train`` turns an authored batch 8 into the executed
+    batch 1), so recomputing from ``JOB_SPEC.train`` here demands more VRAM than the card was
+    rented for and rejects the instance the allocator correctly picked.
+    """
+    import flash.providers.allocator as allocator
+    from flash.engine.worker import _preflight_free_vram_for_spec
+    from flash.engine.worker.perf import lifecycle as lc
+
+    def _fail(*_a, **_k):
+        raise AssertionError("the free-vram preflight must not re-size the run")
+
+    monkeypatch.setattr(allocator, "required_vram_gb", _fail)
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (22.1, 22.5))
+    _preflight_free_vram_for_spec()
+
+
+def test_free_vram_reads_nvml_and_never_starts_cuda(monkeypatch):
+    """The source must be the driver, and reading it must not create the context it would then count.
+
+    Two failures in one: `memory_allocated`/`memory_reserved` only count what THIS process reserved,
+    so a card holding 18 GB of another container's work reads as entirely free; and
+    `torch.cuda.mem_get_info` needs a context and CREATES one, so measuring with it adds our own
+    memory to the number being measured and trips `cuda_is_initialized` for everything after.
+    """
+    import sys
+    import types
+
+    from flash.engine.worker.perf import lifecycle as lc
+
+    torch = types.ModuleType("torch")
+
+    def _forbidden(*_a, **_k):
+        raise AssertionError("the vram reading must not go through torch")
+
+    torch.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        mem_get_info=_forbidden,
+        memory_allocated=_forbidden,
+        memory_reserved=_forbidden,
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+    pynvml = types.ModuleType("pynvml")
+    pynvml.nvmlInit = lambda: None
+    pynvml.nvmlShutdown = lambda: None
+    pynvml.nvmlDeviceGetHandleByIndex = lambda _i: object()
+    # driver: 3.4 GB free of 22.5 GB, which the torch allocator would have reported as 0 reserved.
+    pynvml.nvmlDeviceGetMemoryInfo = lambda _h: types.SimpleNamespace(
+        free=int(3.4 * 1024**3), total=int(22.5 * 1024**3)
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", pynvml)
+
+    assert lc.free_vram_gb() == pytest.approx(3.4, abs=0.05)
+    assert lc.total_vram_gb() == pytest.approx(22.5, abs=0.05)

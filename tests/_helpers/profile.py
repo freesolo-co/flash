@@ -184,7 +184,11 @@ def satisfy_sft_profile(runner, monkeypatch, spec: Any):
     # Hub/model round-trips are replaced in place. Each has dedicated coverage; reaching the network
     # here would make every sft submit test an integration test.
     monkeypatch.setattr(runner, "_resolve_model_revision", lambda s, **_kw: _pin_model_revision(s))
-    monkeypatch.setattr(runner, "_assign_resolved_env_sha", _pin_env_revision)
+    # both pinning policies now share the loader resolver, so one stub covers every caller without
+    # teaching this helper which wrapper each submission path uses.
+    import flash.envs.loader as env_loader
+
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", lambda *_a, **_k: _ENV_REVISION)
     stub_revision_geometry(monkeypatch)
 
     pinned = _pin_env_revision(_pin_model_revision(spec))
