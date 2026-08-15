@@ -127,6 +127,7 @@ class _GrpoSubprocessStream:
                 # long step look exactly like a reader blocked on a dead pipe.
                 with watchdog.handling_line():
                     self._tail.record(line)
+                    self.silence_watchdog.observe_line(line)
                     yield line
         if watchdog.tore_down:
             self._orphaned_pipe = True

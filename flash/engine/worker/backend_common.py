@@ -526,6 +526,8 @@ def run_verl_training(
                 with watchdog.handling_line():
                     print(line, end="", flush=True)
                     child_tail.record(line)
+                    if silence_watchdog is not None:
+                        silence_watchdog.observe_line(line)
                     if on_line is not None:
                         on_line(line)
                     m = step_re.search(line)

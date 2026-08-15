@@ -439,7 +439,7 @@ async def _mark_prompt_failed(kwargs: dict[str, Any]) -> None:
         await tq.async_kv_put(
             key=kwargs["uid"],
             partition_id="train",
-            tag={"status": "failure"},
+            tag={"global_steps": kwargs["global_steps"], "status": "failure"},
         )
     except Exception:  # pragma: no cover - defensive, the exit code is the real diagnosis
         pass

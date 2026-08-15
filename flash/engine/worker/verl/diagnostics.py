@@ -346,7 +346,15 @@ class VerlChildSilenceWatchdog:
         # count as training again. a resumed run passes its resume_step, which is what keeps ray and
         # model loading exempt without giving a wedged child the same free pass.
         self._baseline_step = int(baseline_step)
+        self._training_started = False
         self._lock = threading.Lock()
+
+    def observe_line(self, line: str) -> None:
+        """arm on verl's fit-loop banner, before its first generation or optimizer step."""
+        if "Training Progress" not in line:
+            return
+        with self._lock:
+            self._training_started = True
 
     def bind_process(self, *, teardown: Callable[[], None], is_running: Callable[[], bool]) -> None:
         """bind the child only after it exists, without holding this lock across teardown."""
@@ -387,9 +395,10 @@ class VerlChildSilenceWatchdog:
                 with contextlib.suppress(Exception):
                     parent_active = bool(self._parent_busy())
             silent_ticks = self._staleness.observe(self._tail.written, active=parent_active)
-            # "this child has completed a step", not "step is positive": measured against the
-            # baseline it started from, so a resume gets the same setup exemption a fresh run gets.
-            training = step > self._baseline_step
+            # verl creates its fit-loop progress bar before the first generation. that banner arms
+            # the first in-flight step; completed-step progress remains the fallback for callers that
+            # do not expose the banner and preserves the pre-fit setup exemption on fresh and resumed runs.
+            training = self._training_started or step > self._baseline_step
             # bind_process runs immediately after popen. before that there is no paid child to kill;
             # afterwards this check keeps normal exit and teardown from being reclassified as silence.
             running = self._is_running is not None and self._is_running()

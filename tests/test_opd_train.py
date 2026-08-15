@@ -7482,14 +7482,34 @@ def test_multi_turn_rollout_marks_its_prompt_failed_before_hard_exiting(monkeypa
     loop._run = boom
 
     with pytest.raises(ChildExit) as exit_info:
-        asyncio.run(loop.run({}, uid="prompt-7"))
+        asyncio.run(loop.run({}, uid="prompt-7", global_steps=3))
 
     assert exit_info.value.code == 86
-    # the marker must be written BEFORE the exit, not merely attempted at some point
-    assert marked == [{"uid": "prompt-7"}], (
+    # the marker must be written before the exit and retain the step that the replay buffer samples.
+    assert marked == [{"uid": "prompt-7", "global_steps": 3}], (
         "the rollout hard-exited without marking its prompt failed; the trainer's "
         "ReplayBuffer.sample would poll a 'running' marker nobody will ever clear"
     )
+
+
+def test_prompt_failure_marker_retains_the_sampled_global_step(monkeypatch):
+    from flash.engine.worker.train.opd.child import multiturn as opd_multiturn
+
+    writes = []
+
+    async def async_kv_put(**kwargs):
+        writes.append(kwargs)
+
+    monkeypatch.setitem(sys.modules, "transfer_queue", SimpleNamespace(async_kv_put=async_kv_put))
+    asyncio.run(opd_multiturn._mark_prompt_failed({"uid": "prompt-7", "global_steps": 3}))
+
+    assert writes == [
+        {
+            "key": "prompt-7",
+            "partition_id": "train",
+            "tag": {"global_steps": 3, "status": "failure"},
+        }
+    ]
 
 
 def test_replay_buffer_refuses_to_train_on_a_batch_a_failed_rollout_shrank():

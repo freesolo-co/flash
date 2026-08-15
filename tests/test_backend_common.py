@@ -2506,6 +2506,29 @@ def test_verl_child_silence_watchdog_kills_a_child_that_wedges_on_its_very_first
     assert torn_down == [True]
 
 
+def test_verl_child_silence_watchdog_arms_before_the_first_step_completes():
+    """verl renders this fit-loop banner before its first generation, while step stays at baseline."""
+    tail = vc.ChildOutputTail()
+    banner = "Training Progress:   0%|          | 0/4 [00:00<?, ?it/s]\n"
+    tail.record(banner)
+    watchdog, torn_down = _bound_silence_watchdog(tail, baseline_step=0)
+    watchdog.observe_line(banner)
+
+    for _ in range(int(vc.VERL_CHILD_SILENCE_TIMEOUT_S // 30.0) + 1):
+        watchdog.observe(0)
+
+    assert torn_down == [True]
+
+
+def test_both_verl_streams_forward_the_training_start_banner_to_the_watchdog():
+    from flash.engine.worker.rl_train import _GrpoSubprocessStream
+
+    assert "silence_watchdog.observe_line(line)" in inspect.getsource(vc.run_verl_training)
+    assert "silence_watchdog.observe_line(line)" in inspect.getsource(
+        _GrpoSubprocessStream.__iter__
+    )
+
+
 def test_verl_child_silence_watchdog_gives_a_resumed_run_the_same_setup_exemption():
     """A resumed opd run seeds `progress["step"]` from resume_step (opd_train_runner.py), so a
     bare `step > 0` test reads as "training is running" while ray and the model are still loading
