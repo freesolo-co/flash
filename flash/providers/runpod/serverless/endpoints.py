@@ -516,7 +516,7 @@ def _train_body(input_data: dict) -> dict:
 
         console_upload_lock = threading.Lock()
 
-        def _upload_console(mode: str) -> bool:
+        def _upload_console(mode: str, final: bool = False) -> bool:
             """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
             console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
             from both the subprocess-failure path and the missing-metrics crash path: a worker killed
@@ -525,29 +525,29 @@ def _train_body(input_data: dict) -> dict:
             crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque.
 
             Serialized against itself: the periodic uploader is a daemon thread joined with a
-            timeout, so a slow snapshot can still run when the final one begins. Both write the same
-            ``.tail`` and commit to the same path; if the older landed last it would replace the
-            terminal console with pre-failure bytes. The lock makes the last caller the last writer.
-
-            The wait is BOUNDED: an unbounded acquire would let a wedged network request block
-            ``run_mode`` until the deadline timer hard-exits the process, costing the terminal
-            snapshot. On timeout the upload is skipped, not run concurrently -- overlapping is what
-            overwrites newer bytes with older, and the in-flight snapshot already sends a superset.
+            timeout, so a slow snapshot can still run when the final one begins, and whichever
+            commits last wins. ``final`` never yields: upload_file takes no timeout, so a wedged
+            periodic snapshot holds the lock forever, and skipping the terminal upload there leaves
+            pre-failure bytes as the only console on the repo.
 
             Returns whether the tail landed: errors are swallowed, not raised, so a caller tracking
             what is stored cannot read a normal return as success and skip the retry it earned."""
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
                 return False
-            if not console_upload_lock.acquire(timeout=120.0):
-                print(f"console upload skipped for {mode}; a snapshot is still in flight")
-                return False
+            held = console_upload_lock.acquire(timeout=120.0)
             try:
-                return _upload_console_locked(mode, console)
+                if not held and not final:
+                    print(f"console upload skipped for {mode}; a snapshot is still in flight")
+                    return False
+                # per-caller scratch: sharing one .tail splices an unsynchronized final snapshot
+                suffix = ".final.tail" if final else ".tail"
+                return _upload_console_locked(mode, console, console + suffix)
             finally:
-                console_upload_lock.release()
+                if held:
+                    console_upload_lock.release()
 
-        def _upload_console_locked(mode: str, console: str) -> bool:
+        def _upload_console_locked(mode: str, console: str, tail_path: str) -> bool:
             try:
                 from huggingface_hub import HfApi
 
@@ -582,11 +582,11 @@ def _train_body(input_data: dict) -> dict:
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""
-                with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
+                with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
                 HfApi(token=env.get("HF_TOKEN")).upload_file(
-                    path_or_fileobj=console + ".tail",
+                    path_or_fileobj=tail_path,
                     path_in_repo=f"{prefix}/console_{mode}.txt",
                     repo_id=input_data["hf_repo"],
                     repo_type="dataset",
@@ -653,7 +653,7 @@ def _train_body(input_data: dict) -> dict:
                 finally:
                     stop_upload.set()
                     uploader.join(timeout=10)
-            _upload_console(mode)
+            _upload_console(mode, final=True)
             if proc.returncode != 0 and check:
                 raise RuntimeError(
                     f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
@@ -669,7 +669,7 @@ def _train_body(input_data: dict) -> dict:
         run_mode(input_data["phase"], check=False)
         if not os.path.exists("/tmp/metrics.json"):
             phase = input_data["phase"]
-            _upload_console(phase)
+            _upload_console(phase, final=True)
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
                 f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "

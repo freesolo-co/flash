@@ -4682,6 +4682,30 @@ def test_child_failure_sanitizer_redacts_digit_only_credentials():
         assert _safe_child_failure_detail(ValueError(kept)) == kept
 
 
+def test_child_failure_sanitizer_survives_a_non_utf8_credential_in_the_environment(monkeypatch):
+    """A surrogate in an env value must not abort the sanitizer.
+
+    ``os.environ`` decodes non-UTF-8 bytes with surrogateescape, and ``quote()`` raises on a
+    surrogate. Since the sanitizer runs inside the handler that writes the failure record, letting
+    that propagate replaces the real exception with a UnicodeEncodeError and leaves no record at
+    all -- reproducing the opaque death this PR exists to remove, and doing it for EVERY failure on
+    the run, not just one mentioning the odd variable. The raw form is registered before encoding,
+    so the secret is still redacted; only its percent-encoded spelling is lost.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    monkeypatch.setenv("WANDB_API_KEY", "tok-\udcff-abcdef")
+    monkeypatch.setenv("FLASH_TEST_API_KEY", "plain-secret-value")
+
+    detail = _safe_child_failure_detail(ValueError("auth failed for tok-\udcff-abcdef here"))
+    assert "tok-\udcff-abcdef" not in detail
+    assert "<redacted>" in detail
+    # the undecodable value must not disarm redaction for every OTHER credential in the same env.
+    assert "plain-secret-value" not in _safe_child_failure_detail(
+        ValueError("auth failed for plain-secret-value")
+    )
+
+
 def test_child_failure_sanitizer_redacts_a_runtime_credential_quoted_in_json_or_a_dict():
     """A credential minted at runtime is in NO environment variable, so shape is the only net.
 
@@ -5775,6 +5799,37 @@ def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
         _raise_verl_failure(86, None)
     with pytest.raises(RuntimeError, match="subprocess exited with status 9"):
         _raise_verl_failure(9, None)
+
+
+def test_parent_takes_retriability_from_the_child_record_not_the_exit_status():
+    """A recorded permanent failure must stay fatal under a transient exit status.
+
+    Each multi-turn actor writes its own pid-stamped record, but only the one that reaches
+    ``os._exit`` first sets the return code, and the reader deliberately returns the most SEVERE
+    record across all of them. So the two disagree whenever actors fail differently -- and taking
+    the message from the record while taking retriability from the exit code reports a permanent
+    auth failure under a transient headline. That is retried on paid GPUs until the attempt budget
+    is gone, every attempt dying on the same bad credential.
+    """
+    from flash.engine.worker.perf import RetriableInfraError
+
+    with pytest.raises(RuntimeError) as fatal:
+        _raise_verl_failure(
+            87,  # a peer actor won the exit race with a transient status
+            None,
+            child_failure=("permanent", "[stage=teacher] ValueError: bad credentials"),
+        )
+    assert "bad credentials" in str(fatal.value)
+    assert not isinstance(fatal.value, RetriableInfraError), "a permanent record must not retry"
+
+    # and the converse: a transient record must not be made fatal by a permanent exit status.
+    with pytest.raises(RetriableInfraError) as retriable:
+        _raise_verl_failure(
+            86,
+            None,
+            child_failure=("transient", "[stage=generate] TimeoutError: bridge timed out"),
+        )
+    assert "bridge timed out" in str(retriable.value)
 
 
 def _config(**overrides):

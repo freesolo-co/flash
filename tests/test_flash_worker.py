@@ -1283,6 +1283,10 @@ def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots()
     repo path; if the older call landed last it would REPLACE the terminal console with bytes
     captured before the failure -- destroying the evidence. Moving the first snapshot to 600s made
     this reachable for an ordinary run, where the hourly-only cadence had made it rare.
+
+    Both callers pass the SAME ``mode``, as the loop and the terminal call sites do. Driving them
+    with different modes would be the easy mistake: ``console_{mode}.txt`` already differs, so the
+    scratch paths could never collide and the test would pass however the file is named.
     """
     import ast
     import inspect
@@ -1297,13 +1301,16 @@ def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots()
         n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
     )
     order: list[str] = []
+    tails: list[str] = []
     started = threading.Event()
 
-    def _upload_console_locked(mode: str, _console: str) -> None:
+    def _upload_console_locked(_mode: str, _console: str, tail_path: str) -> bool:
         started.set()
-        order.append(f"begin:{mode}")
+        order.append(f"begin:{tail_path}")
+        tails.append(tail_path)
         time.sleep(0.3)
-        order.append(f"end:{mode}")
+        order.append(f"end:{tail_path}")
+        return True
 
     namespace: dict = {
         "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
@@ -1313,14 +1320,72 @@ def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots()
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
     upload_console = namespace["_upload_console"]
 
-    periodic = threading.Thread(target=upload_console, args=("periodic",), daemon=True)
+    periodic = threading.Thread(target=upload_console, args=("train",), daemon=True)
     periodic.start()
     started.wait(5.0)
-    upload_console("final")  # the terminal snapshot, racing the one already in flight
+    upload_console("train", final=True)  # the terminal snapshot, racing the one in flight
     periodic.join(timeout=5.0)
 
     # never interleaved: each upload completes before the next begins, so the last call wins.
-    assert order == ["begin:periodic", "end:periodic", "begin:final", "end:final"]
+    assert [entry.split(":")[0] for entry in order] == ["begin", "end", "begin", "end"]
+    # and each caller staged its own bytes: one shared .tail would let the periodic snapshot
+    # overwrite the file the final upload is reading, splicing pre-failure bytes into it.
+    assert len(set(tails)) == 2, f"both callers staged the same scratch file: {tails}"
+
+
+def test_serverless_terminal_console_upload_never_yields_to_a_wedged_snapshot():
+    """``final=True`` must upload even when the lock never comes free.
+
+    ``upload_file`` takes no timeout, so a periodic snapshot wedged on a hung HF request holds the
+    lock past the acquire timeout and forever after. Skipping the terminal upload there is the worst
+    case, not a safe one: the run is failing, and the bytes explaining WHY are exactly the ones that
+    never reach the repo, leaving the pre-failure console as the only record. A periodic snapshot
+    still yields -- another is in flight and it has nothing new to say.
+
+    The wait is bounded, not skipped: a HEALTHY in-flight snapshot finishes inside the timeout and
+    the terminal one commits after it, which is what
+    ``test_serverless_console_upload_serializes_the_periodic_and_final_snapshots`` pins. So the lock
+    here is a double that reports the timeout expiring, rather than a real one held for 120s.
+    """
+    import ast
+    import inspect
+    import textwrap
+    import types
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
+    )
+    uploaded: list[str] = []
+    timeouts: list[float] = []
+
+    class _NeverFree:
+        """Acquire always times out; releasing a lock we never took would raise."""
+
+        def acquire(self, timeout: float) -> bool:
+            timeouts.append(timeout)
+            return False
+
+        def release(self) -> None:
+            raise AssertionError("released a lock that was never acquired")
+
+    namespace: dict = {
+        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
+        "console_upload_lock": _NeverFree(),
+        "_upload_console_locked": lambda mode, _console, _tail: uploaded.append(mode) or True,
+        "print": lambda *_a, **_k: None,
+    }
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    upload_console = namespace["_upload_console"]
+
+    assert upload_console("periodic") is False, "a periodic snapshot must yield to the holder"
+    assert upload_console("final", final=True) is True
+    assert uploaded == ["final"], "the terminal snapshot must not be skipped for a held lock"
+    # bounded wait, so a wedged holder delays the terminal upload rather than suppressing it.
+    assert timeouts
+    assert all(0 < t <= 120.0 for t in timeouts)
 
 
 def test_instance_console_upload_loop_never_waits_longer_than_the_interval():

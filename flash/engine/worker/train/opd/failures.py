@@ -198,22 +198,25 @@ def _raise_verl_failure(
                 f"transient teacher failure after bounded retries: {message}"
             )
         raise RuntimeError(f"permanent teacher failure: {message}")
-    if return_code == _TRANSIENT_TEACHER_EXIT:
-        detail = f": {child_failure[1]}" if child_failure is not None else ""
-        raise _w.RetriableInfraError(f"transient teacher bridge failure{detail}")
-    if return_code == _PERMANENT_TEACHER_EXIT:
-        detail = f": {child_failure[1]}" if child_failure is not None else ""
-        raise RuntimeError(f"permanent teacher bridge failure{detail}")
-    # ahead of the truncation heuristic: the record is direct evidence of why the child died,
-    # while `indicates_completion_cap` is an inference drawn from an EARLIER no-signal batch. a
-    # child that recorded a transient bridge failure and then exited with a generic status would
-    # otherwise be reported as a fatal completion-cap error -- telling the user to raise
-    # max_completion_tokens, and losing the retry a transient classification is what earns.
+    # the record decides, not the exit status. every actor writes its own pid-stamped record but
+    # only one reaches os._exit first, and the reader deliberately returns the most SEVERE record
+    # across all of them. taking the headline from the record and the retry decision from the exit
+    # code splits them: a permanent auth failure recorded by one actor, reported under the
+    # transient exit another actor happened to win with, is retried on paid GPUs until the attempt
+    # budget runs out -- every attempt failing on the same bad credential.
+    #
+    # it also outranks the truncation heuristic below, which is an inference drawn from an EARLIER
+    # no-signal batch: a child that recorded a failure and exited with a generic status would be
+    # reported as a fatal completion-cap error, telling the user to raise max_completion_tokens.
     if child_failure is not None:
         classification, message = child_failure
         if classification == "transient":
             raise _w.RetriableInfraError(f"transient teacher bridge failure: {message}")
         raise RuntimeError(f"permanent teacher bridge failure: {message}")
+    if return_code == _TRANSIENT_TEACHER_EXIT:
+        raise _w.RetriableInfraError("transient teacher bridge failure")
+    if return_code == _PERMANENT_TEACHER_EXIT:
+        raise RuntimeError("permanent teacher bridge failure")
     if truncation_window is not None and truncation_window.indicates_completion_cap:
         raise RuntimeError(
             f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "

@@ -254,10 +254,17 @@ def _secret_needles(secret: str) -> set[str]:
         )
     needles: set[str] = set()
     for form in forms:
-        encoded = urllib.parse.quote(form, safe="")
-        needles.update(
-            {form, encoded, re.sub(r"%[0-9A-Fa-f]{2}", lambda m: m.group(0).lower(), encoded)}
-        )
+        needles.add(form)
+        # os.environ decodes non-UTF-8 bytes with surrogateescape, and quote() cannot encode a
+        # surrogate. letting that raise would abort the sanitizer -- documented as never raising --
+        # from inside the handler writing the failure record, replacing the real exception with a
+        # UnicodeEncodeError and leaving no record at all: the opaque death this PR removes. the
+        # raw form is already registered above, so only the percent-encoded spelling is lost.
+        try:
+            encoded = urllib.parse.quote(form, safe="")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        needles.update({encoded, re.sub(r"%[0-9A-Fa-f]{2}", lambda m: m.group(0).lower(), encoded)})
     return needles
 
 
