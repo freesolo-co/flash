@@ -24,8 +24,12 @@ from flash.engine.worker.perf.diagnostics import (
     gpu_diagnostics,
 )
 from flash.engine.worker.perf.lifecycle import (
+    DirtyGpuError,
     RetriableInfraError,
+    free_vram_gb,
     is_cuda_oom,
+    preflight_free_vram,
+    total_vram_gb,
     wait_for_gpu,
 )
 from flash.engine.worker.perf.liger import (
@@ -378,6 +382,7 @@ def _ensure_fla_fastpath_on_hopper() -> None:
 
 
 __all__ = [
+    "DirtyGpuError",
     "RetriableInfraError",
     "_clean_diag",
     "_ensure_fla_fastpath_on_hopper",
@@ -393,9 +398,12 @@ __all__ = [
     "_remove_fla_from_disk",
     "_restrict_fla_gdn_autotune_on_blackwell",
     "_round_gb_from_mib",
+    "free_vram_gb",
     "gpu_diagnostics",
     "grad_checkpointing_on",
     "grpo_use_reentrant",
     "is_cuda_oom",
+    "preflight_free_vram",
+    "total_vram_gb",
     "wait_for_gpu",
 ]
