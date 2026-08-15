@@ -4374,6 +4374,54 @@ def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(monk
         )
 
 
+def test_child_secret_name_rule_matches_the_bootstrap_one():
+    """The child's credential-name rule must stay identical to `bootstrap_secrets`'.
+
+    The child cannot import it: `bridge.py` is copied flat into the verl workdir as
+    `flash_opd_bridge.py`, where `flash` is not on the path, so the rule is duplicated by necessity.
+    Its docstring says "mirrors bootstrap_secrets", but a comment cannot fail. The two drift in
+    opposite, equally bad directions: widen the child's and an ordinary env value like
+    `TOKENIZERS_PARALLELISM=false` starts rewriting the word "false" out of every diagnostic;
+    narrow it and a real credential reaches an artifact the user can fetch. Both sides are checked
+    so a change to EITHER file fails here.
+    """
+    import importlib.util
+    import pathlib
+
+    from flash.providers._lifecycle.bootstrap_secrets import _secret_env_name as canonical
+
+    specification = importlib.util.spec_from_file_location(
+        "_flash_opd_bridge_parity",
+        pathlib.Path(__file__).resolve().parents[1]
+        / "flash/engine/worker/train/opd/child/bridge.py",
+    )
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+
+    for name in (
+        "HF_TOKEN",
+        "AUTHORIZATION",
+        "FLASH_OPD_BRIDGE_TOKEN",
+        "MY_API_KEY",
+        "SOME_SECRET",
+        "DB_PASSWORD",
+        # the near misses: an exact word, and names whose VALUES are ordinary diagnostic content.
+        "TOKEN",
+        "SECRET",
+        "KEYRING",
+        "PATH",
+        "TOKENIZERS_PARALLELISM",
+        "FLASH_OPD_EOS_TOKEN_IDS",
+        # case is not part of the rule: both upper-case before comparing.
+        "hf_token",
+        "My_Api_Key",
+    ):
+        assert module._secret_env_name(name) == canonical(name), (
+            f"{name!r}: child says {module._secret_env_name(name)}, "
+            f"bootstrap_secrets says {canonical(name)}"
+        )
+
+
 def test_child_failure_sanitizer_redacts_credentials_without_eating_ordinary_values(monkeypatch):
     """Redaction must not corrupt the diagnostic it exists to carry.
 
