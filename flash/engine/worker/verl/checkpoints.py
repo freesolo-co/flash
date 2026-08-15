@@ -21,7 +21,7 @@ from flash.adapters.fused_experts import (
     normalize_verl_fused_expert_export,
     validate_fused_expert_adapter_config,
 )
-from flash.engine.worker.model.lora import _read_adapter_tensor_keys
+from flash.engine.worker.model.lora import _read_adapter_tensor_metadata
 
 
 class MergeDiskHeadroomError(RuntimeError):
@@ -368,16 +368,16 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
     current_rev = str(cfg.get("revision", "") or "").strip()
     if current_rev and model_revision and current_rev != model_revision:
         raise RuntimeError("adapter base revision does not match the validated target commit")
-    if lora_target_parameters(model_id):
-        keys = _read_adapter_tensor_keys(adapter_dir) or []
-        if not has_complete_fused_expert_tensors(keys, model_id):
-            raise RuntimeError(
-                f"exported adapter for {model_id} does not contain complete fused expert LoRA "
-                "weights; refusing to stamp it as warm-start compatible"
-            )
     cfg["base_model_name_or_path"] = model_id
     cfg["revision"] = model_revision or None
     normalize_verl_fused_expert_export(cfg, model_id)
     validate_fused_expert_adapter_config(cfg, model_id)
+    if lora_target_parameters(model_id):
+        tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
+        if not has_complete_fused_expert_tensors(tensors, cfg, model_id):
+            raise RuntimeError(
+                f"exported adapter for {model_id} does not contain complete fused expert LoRA "
+                "weights; refusing to stamp it as warm-start compatible"
+            )
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)

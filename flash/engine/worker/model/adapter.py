@@ -24,6 +24,7 @@ from flash.engine.worker.io.hf import (
 )
 from flash.engine.worker.model.lora import (
     _read_adapter_tensor_keys,
+    _read_adapter_tensor_metadata,
 )
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 
@@ -36,8 +37,8 @@ def validate_warmstart_adapter(config: Mapping[str, Any], model_id: str, adapter
     validate_fused_expert_adapter_config(config, model_id)
     if not lora_target_parameters(model_id):
         return
-    keys = _read_adapter_tensor_keys(adapter_dir) or []
-    if not has_complete_fused_expert_tensors(keys, model_id):
+    tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
+    if not has_complete_fused_expert_tensors(tensors, config, model_id):
         raise ValueError(
             f"warm-start adapter for {model_id} does not contain complete fused expert LoRA weights"
         )

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections import Counter
+from collections.abc import Mapping
 from typing import Any
 
+from flash.adapters.lora_rank import declared_lora_ranks
 from flash.core.catalog import get_model
 
 _QWEN35_EXPERT_TARGET_PARAMETERS = (
@@ -44,20 +46,28 @@ def validate_fused_expert_adapter_config(config: Mapping[str, Any], model_id: st
         raise ValueError(
             f"adapter for {model_id} must declare exactly the fused expert targets {required}"
         )
+    rank_pattern = config.get("rank_pattern")
+    if rank_pattern is not None and rank_pattern != {}:
+        raise ValueError(
+            f"adapter for {model_id} uses unsupported rank_pattern for fused target_parameters"
+        )
 
     modules = config.get("target_modules")
     if modules is None:
+        # peft uses null for valid direct-parameter-only configs.
         return
     if isinstance(modules, str):
         if modules != "all-linear":
             raise ValueError(f"adapter for {model_id} string target_modules must be 'all-linear'")
         return
-    if not isinstance(modules, list) or any(
-        not isinstance(module, str) or not module for module in modules
+    if (
+        not isinstance(modules, list)
+        or not modules
+        or any(not isinstance(module, str) or not module for module in modules)
     ):
         raise ValueError(
-            f"adapter for {model_id} target_modules must be null, 'all-linear', or a list of "
-            "non-empty strings"
+            f"adapter for {model_id} target_modules must be null, 'all-linear', or a non-empty "
+            "list of non-empty strings"
         )
     synthetic = [module for module in modules if _targets_fused_expert_wrapper(module)]
     if synthetic:
@@ -81,6 +91,10 @@ def normalize_verl_fused_expert_export(config: dict[str, Any], model_id: str) ->
         return
     config["target_parameters"] = targets
     modules = config.get("target_modules")
+    if modules is None:
+        raise ValueError(
+            f"exported adapter for {model_id} must retain ordinary LoRA target_modules"
+        )
     if isinstance(modules, list):
         config["target_modules"] = [
             module
@@ -89,25 +103,21 @@ def normalize_verl_fused_expert_export(config: dict[str, Any], model_id: str) ->
         ]
 
 
-def has_complete_fused_expert_tensors(keys: Iterable[str], model_id: str) -> bool:
-    """Return whether every fused-expert instance has every PEFT wrapper and LoRA factor.
+def has_complete_fused_expert_tensors(
+    tensors: Mapping[str, tuple[int, ...]], config: Mapping[str, Any], model_id: str
+) -> bool:
+    """Return whether every fused-expert owner has the exact catalog-backed PEFT factor shapes.
 
-    PEFT names a wrapped ``nn.Parameter`` after its owning module, not after the parameter itself.
-    Wrapping another parameter on that module nests another wrapper under ``base_layer``. Thus N
-    targeted parameters yield a fixed ladder of N wrapper paths, while each trained LoRA wrapper
-    contributes both ``lora_A`` and ``lora_B`` tensors.
-
-    Coverage is checked per concrete module instance and against the model catalog's authoritative
-    transformer-layer count. Deriving expected layers from the artifact itself would accept a
-    truncated file that omitted every LoRA tensor for one layer. Pooling wrapper paths across the
-    adapter would likewise accept two incomplete layers whose union looks complete. Matching only
-    the owner's final segment would also count an unrelated module such as ``router.experts``.
+    PEFT serializes each fused target parameter as one 2-D A/B pair under its owning module. Multiple
+    targets on that owner form the nested ``base_layer`` ladder, but PEFT does not promise which target
+    occupies which rung. Each concrete owner must therefore expose the multiset of target-specific
+    pairs derived from the adapter rank, catalog expert count, and catalog target dimensions.
     """
     targets = lora_target_parameters(model_id)
-    if not targets:
+    expected_pairs = _expected_fused_expert_pairs(config, model_id, len(targets or ()))
+    if not targets or expected_pairs is None:
         return False
-    tensor_keys = list(keys)
-    expected_layer_count = get_model(model_id).num_layers
+    model = get_model(model_id)
     required_per_owner: dict[str, int] = {}
     for target in targets:
         if "." in target:
@@ -117,12 +127,17 @@ def has_complete_fused_expert_tensors(keys: Iterable[str], model_id: str) -> boo
         return False
     for owner, needed in required_per_owner.items():
         ladder = tuple(".".join(["base_layer"] * depth) for depth in range(needed))
-        factors: dict[str, dict[str, set[str]]] = {}
-        for key in tensor_keys:
+        factors: dict[str, dict[str, dict[str, tuple[int, ...]]]] = {}
+        for key, shape in tensors.items():
             if ".lora_" not in key:
                 continue
             path, _, tail = key.partition(".lora_")
-            factor = tail.split(".")[0]
+            leaf = tail.split(".")
+            if len(leaf) != 3:
+                continue
+            factor, adapter_name, parameter = leaf
+            if factor not in {"A", "B"} or not adapter_name or parameter != "weight":
+                continue
             marker = f".{owner}."
             if path.endswith(f".{owner}"):
                 instance, suffix = path[: -len(owner) - 1], ""
@@ -132,12 +147,16 @@ def has_complete_fused_expert_tensors(keys: Iterable[str], model_id: str) -> boo
                 continue
             if suffix not in ladder:
                 continue
+            layer_prefix = _layer_prefix(instance)
+            if layer_prefix is None or instance != layer_prefix:
+                return False
             full_instance = f"{instance}.{owner}"
-            factors.setdefault(full_instance, {}).setdefault(suffix, set()).add(factor)
+            factors.setdefault(full_instance, {}).setdefault(suffix, {})[factor] = shape
         if not factors:
             return False
         for seen in factors.values():
-            if any(seen.get(rung, set()) < {"A", "B"} for rung in ladder):
+            observed = Counter(_lora_pair_shapes(seen.get(rung, {})) for rung in ladder)
+            if None in observed or observed != expected_pairs:
                 return False
         expert_layers = {
             prefix
@@ -149,10 +168,52 @@ def has_complete_fused_expert_tensors(keys: Iterable[str], model_id: str) -> boo
         if len(layer_roots) != 1:
             return False
         layer_root = next(iter(layer_roots))
-        expected_layers = {f"{layer_root}.{index}" for index in range(expected_layer_count)}
+        expected_layers = {f"{layer_root}.{index}" for index in range(model.num_layers)}
         if expert_layers != expected_layers:
             return False
     return True
+
+
+def _expected_fused_expert_pairs(
+    config: Mapping[str, Any], model_id: str, target_count: int
+) -> Counter[tuple[tuple[int, ...], tuple[int, ...]]] | None:
+    """Return the exact unordered factor pairs PEFT must serialize for one fused owner."""
+    rank_pattern = config.get("rank_pattern")
+    if rank_pattern is not None and rank_pattern != {}:
+        return None
+    rank = declared_lora_ranks(config).default
+    model = get_model(model_id)
+    experts = model.lora_expert_count
+    if rank is None or experts <= 0 or model.num_layers <= 0:
+        return None
+    fused_count = model.num_layers * experts
+    dimensions = [
+        (input_dim, output_dim)
+        for input_dim, output_dim, count in model.lora_target_shapes
+        if count == fused_count
+    ]
+    if len(dimensions) != target_count:
+        return None
+    stacked_rank = rank * experts
+    return Counter(
+        (
+            ((stacked_rank, input_dim), (output_dim, stacked_rank))
+            for input_dim, output_dim in dimensions
+        )
+    )
+
+
+def _lora_pair_shapes(
+    factors: Mapping[str, tuple[int, ...]],
+) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    """Return one complete 2-D A/B shape pair without claiming model compatibility."""
+    if not {"A", "B"} <= factors.keys():
+        return None
+    shape_a = factors["A"]
+    shape_b = factors["B"]
+    if len(shape_a) != 2 or len(shape_b) != 2:
+        return None
+    return shape_a, shape_b
 
 
 def _layer_prefix(path: str) -> str | None:

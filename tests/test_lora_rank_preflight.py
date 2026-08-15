@@ -381,6 +381,7 @@ def test_fused_expert_config_accepts_supported_target_module_shapes(modules):
         pytest.param(["mlp.experts"], id="synthetic-list-owner"),
         pytest.param(["experts.base_layer"], id="synthetic-list-nested"),
         pytest.param(["model.layers.0.mlp.experts"], id="synthetic-list-qualified"),
+        pytest.param([], id="empty-list"),
         pytest.param(["q_proj", ""], id="empty-list-entry"),
         pytest.param(7, id="integer"),
         pytest.param({"q_proj"}, id="set"),
@@ -394,6 +395,21 @@ def test_fused_expert_config_rejects_synthetic_or_malformed_target_modules(modul
     with pytest.raises(ValueError, match="target_modules"):
         validate_fused_expert_adapter_config(
             {"target_parameters": list(_FUSED_TARGETS), "target_modules": modules},
+            _FUSED_MODEL,
+        )
+
+
+@pytest.mark.parametrize("rank_pattern", [{"mlp.experts": 16}, [], "mlp.experts"])
+def test_fused_expert_config_rejects_unsupported_rank_patterns(rank_pattern):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match="unsupported rank_pattern"):
+        validate_fused_expert_adapter_config(
+            {
+                "target_parameters": list(_FUSED_TARGETS),
+                "target_modules": ["q_proj"],
+                "rank_pattern": rank_pattern,
+            },
             _FUSED_MODEL,
         )
 
