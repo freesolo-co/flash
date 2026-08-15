@@ -1477,6 +1477,47 @@ def test_an_image_rows_visual_tokens_are_charged_against_the_reasoning_cap() -> 
     assert prepared.truncated_reasoning_spans == 1
 
 
+@pytest.mark.parametrize(
+    ("label", "completion"),
+    [
+        (
+            "reasoning_content",
+            [{"role": "assistant", "reasoning_content": "reason" + " " * 64, "content": "answer"}],
+        ),
+        (
+            "inline span",
+            [{"role": "assistant", "content": "<think>reason" + " " * 64 + "</think>answer"}],
+        ),
+        (
+            "trailing newline",
+            [{"role": "assistant", "reasoning_content": "reason\n", "content": "answer"}],
+        ),
+    ],
+)
+def test_trailing_whitespace_in_reasoning_is_not_charged_against_the_cap(
+    capsys, label, completion
+) -> None:
+    """The template ``|trim``s the reasoning, so the marker must land on the TRIMMED body.
+
+    Appended after trailing whitespace, the marker shields that whitespace from the trim: the
+    marked render then carries a run the real render drops, and tokenizes longer through the closing
+    tag. A cap landing exactly at the real block's end reports a block that fully fits as cut by
+    ``max_context_tokens`` -- the measurement's own bytes deciding the answer.
+
+    The cap is the real block's exact token end, the only value where the two rules differ: one
+    token higher and neither reports truncation.
+    """
+    # the fake is one token per character; the trimmed block closes at 78 for every shape here, so
+    # this cap retains it exactly. an untrimmed marker pushes the measured end past the cap while
+    # the real block still fits, which is the misreport this pins.
+    prepared = _thinking_prepared_env(ThinkingEnvironment(completion), max_context_tokens=78)
+
+    assert prepared.authored_reasoning_turns == 1, label
+    assert prepared.rendered_reasoning_spans == 1, label
+    assert prepared.truncated_reasoning_spans == 0, label
+    assert "max_context_tokens cut" not in capsys.readouterr().err
+
+
 def test_the_marker_stem_search_does_not_scan_once_per_character() -> None:
     """A valid row must not cost quadratic time before tokenization even begins.
 

@@ -224,6 +224,22 @@ def test_a_marked_render_differs_from_the_real_one_only_by_its_markers(tokenizer
             {"role": "user", "content": "u"},
             {"role": "assistant", "reasoning_content": "r", "content": "a"},
         ],
+        # the template renders the reasoning through `|trim`. a marker appended AFTER trailing
+        # whitespace shields that run from the trim, so the marked render keeps bytes the real one
+        # drops and tokenizes longer through the closing tag -- a cap at the real block's end then
+        # reports a block that fits as cut. these are the shapes that catch it.
+        [
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "reasoning_content": "r" + " " * 64, "content": "a"},
+        ],
+        [
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "reasoning_content": "r\n", "content": "a"},
+        ],
+        [
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "<think>r" + " " * 8 + "</think>a"},
+        ],
     ):
         full = _render(tokenizer, messages)
         prefix = reasoning_marker_prefix(full)

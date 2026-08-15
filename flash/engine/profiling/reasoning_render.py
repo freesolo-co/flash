@@ -52,13 +52,19 @@ def _reasoning_body_end(text: str) -> int | None:
     One rule for both jobs: it decides whether a turn authored reasoning and where that turn's
     marker goes. Were the two to disagree, a turn would enter the denominator with no way to prove
     it survived, and report a drop that never happened.
+
+    The end is the last NON-WHITESPACE character, because the template renders the reasoning through
+    ``|trim``. A marker placed after trailing whitespace shields that whitespace from the trim, so
+    the marked render keeps a run the real one drops -- the measurement's own bytes changing the row
+    it measures. It tokenizes one token longer through the closing tag, and a cap landing exactly at
+    the real block's end then reports a block that fully fits as cut by ``max_context_tokens``.
     """
     close = text.find(_THINK_CLOSE)
     if close < 0:
         return None
     open_at = text.rfind(_THINK_OPEN, 0, close)
     body = 0 if open_at < 0 else open_at + len(_THINK_OPEN)
-    return close if text[body:close].strip() else None
+    return len(text[:close].rstrip()) if text[body:close].strip() else None
 
 
 def reasoned_assistant_turns(messages: list[dict[str, Any]]) -> int:
@@ -187,6 +193,10 @@ def with_marked_reasoning(messages: list[dict], prefix: str) -> list[dict]:
 
     Only reasoning TEXT changes, so the template's ``last_query_index`` rule sees identical roles in
     identical positions and keeps every turn's reasoning exactly where it would have anyway.
+
+    The marker lands on the ``|trim``-ed reasoning in both shapes. Appended after trailing
+    whitespace it would shield that whitespace from the template's trim, so the marked render would
+    carry a run the real one drops (see ``_reasoning_body_end``).
     """
     marked: list[dict] = []
     for index, message in enumerate(messages):
@@ -197,7 +207,7 @@ def with_marked_reasoning(messages: list[dict], prefix: str) -> list[dict]:
             if isinstance(reasoning, str) and reasoning.strip():
                 # the template reads this field in preference to an inline span, so it is the
                 # reasoning and the marker belongs in it
-                copied["reasoning_content"] = reasoning + marker
+                copied["reasoning_content"] = reasoning.rstrip() + marker
             else:
                 copied["content"] = _marked_inline_reasoning(copied.get("content"), marker)
         marked.append(copied)
