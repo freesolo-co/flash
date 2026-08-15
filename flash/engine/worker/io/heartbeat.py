@@ -591,6 +591,14 @@ class _ChildTailStallClock:
         # bool is an int subclass, and this value arrives from a caller-supplied ``fields`` callback:
         # a malformed counter must not be able to tear down a paid run.
         if isinstance(silent_ticks, bool) or not isinstance(silent_ticks, int):
+            # NO COUNTER IS A DISARM, NOT A NO-OP. `stall_tail_fields` returns {} the moment the
+            # child completes its first real optimizer step, so the counter vanishing is the
+            # signal that this watchdog's job is over -- the run is training and silence is no
+            # longer evidence of anything. leaving an already-open window intact here let the
+            # deadline fire on a HEALTHY long-running job, which is strictly worse than the wedge
+            # this exists to catch. a malformed value disarms for the same reason: refusing to
+            # decide is always the safe direction for a detector that kills paid runs.
+            self._silent_since = None
             return
         if silent_ticks <= 0:
             # new output this tick (or the child has not started producing any yet): the clock only
@@ -646,17 +654,23 @@ def liveness_heartbeat(
     spawner = threading.current_thread()
     stall_clock = _ChildTailStallClock()
 
-    def _elapse_loop() -> None:
+    def _watch_loop() -> None:
         # same inline-stub guard as `_loop` below, for the same reason: a test that runs thread
         # targets on .start() would otherwise never return from this one.
         if threading.current_thread() is spawner:
             return
-        # deliberately does nothing but read a clock and compare it. it shares no lock with the
-        # emitting loop, calls nothing that can block, and only ever ACTS on a silence run that
-        # loop already opened -- so it cannot condemn a child on its own, and cannot be stopped by
-        # whatever the emitting loop is stuck in.
+        # the watchdog OWNS the whole verdict: it samples the counter and decides on it, on a thread
+        # that never uploads. an earlier revision sampled on the emitting loop and only decided
+        # here, which was worse than the bug it fixed -- a wedged upload froze sampling, so an
+        # already-open silence window could never be cleared by new output and the deadline killed a
+        # HEALTHY child. `fields()` is the same cheap callback the emitter uses (it reads a line
+        # counter); it performs no io, and its exceptions are suppressed exactly as there.
         while not done.wait(_LIVENESS_TICK_S):
-            stall_clock.elapse(child_tail_stall_event)
+            sample: dict = {}
+            if fields is not None:
+                with contextlib.suppress(Exception):
+                    sample = fields() or {}
+            stall_clock.observe(sample.get("child_tail_silent_ticks"), child_tail_stall_event)
 
     def _loop() -> None:
         if threading.current_thread() is spawner:
@@ -689,7 +703,9 @@ def liveness_heartbeat(
                     extra = fields() or {}
             if progress_step and last_val is not None:
                 extra["step"] = int(last_val)
-            stall_clock.observe(extra.get("child_tail_silent_ticks"), child_tail_stall_event)
+            # the stall verdict is NOT taken here: this thread can block for minutes inside the
+            # upload below, and a detector that only advances between uploads cannot see a child
+            # go quiet OR come back. `_watch_loop` owns it end to end.
             # keepalive: a legitimate blocking upload IS progress the daemon can't sample per-step, so
             # force a REAL heartbeat every tick to keep the provider's stall clock fed (see docstring).
             _w.heartbeat(stage, liveness=(not made_progress) and not keepalive, gpu=gpu, **extra)
@@ -700,20 +716,20 @@ def liveness_heartbeat(
 
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
-    elapser: threading.Thread | None = None
+    watcher: threading.Thread | None = None
     if child_tail_stall_event is not None:
         # only when there is a child to condemn: every other liveness wrap in the worker keeps the
         # single thread it has always had.
-        elapser = threading.Thread(target=_elapse_loop, daemon=True)
-        elapser.start()
+        watcher = threading.Thread(target=_watch_loop, daemon=True)
+        watcher.start()
     try:
         yield
     finally:
         done.set()
         t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
-        if elapser is not None:
+        if watcher is not None:
             # bounded like the join above, and this thread only ever sleeps on `done`.
-            elapser.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
+            watcher.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
 
 
 # checkpoint drain time scales with model size and network throughput; a fixed timeout killed a

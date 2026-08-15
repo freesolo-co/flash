@@ -50,9 +50,11 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   the provider's own stall clock restarts alongside the child's: it advances only on staged pings,
   and the whole setup span before the child is held open by liveness pings it does not credit, so
   ~20 minutes of ordinary setup previously left less grace than the watchdog needs and the provider
-  reported the retriable `stalled` first. The deadline is also re-checked from a thread that never
-  uploads, because the heartbeat upload has no timeout and a wedged one would otherwise freeze the
-  detector on the same thread -- the combined child-plus-upload failure a sick host produces.
+  reported the retriable `stalled` first. Detection runs entirely on a thread that never uploads --
+  it samples the counter and decides on it -- because the heartbeat upload has no timeout, and a
+  detector that only advances between uploads can see neither a child going quiet nor one coming
+  back. The window is cleared as soon as the child stops reporting the counter at all, which is how
+  a completed first optimizer step announces that silence is no longer evidence of anything.
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always

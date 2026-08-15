@@ -6762,6 +6762,33 @@ def test_opd_child_shares_one_stall_event_between_detector_and_teardown(monkeypa
     )
 
 
+def test_the_arming_heartbeat_is_retried_when_it_does_not_commit(monkeypatch):
+    """Only a COMMITTED heartbeat moves the provider's clock, so the return value matters.
+
+    `heartbeat` returns False when the upload lock stayed busy or the upload itself failed. The
+    poller only ever sees snapshots that actually landed, so a dropped commit leaves the provider's
+    3000s grace running from before the model load while the child's fresh 1800s clock starts --
+    the exact split this arming call exists to close, silently reintroduced.
+    """
+    import flash.engine.worker.opd_train as opd_train
+
+    calls: list[str] = []
+    results = [False, True]
+
+    def flaky_heartbeat(stage, **_kw):
+        calls.append(stage)
+        return results.pop(0) if results else True
+
+    monkeypatch.setattr(opd_train._w, "heartbeat", flaky_heartbeat)
+    monkeypatch.setattr(opd_train._w, "gpu_diagnostics", lambda include_torch=True: {})
+
+    opd_train.arm_provider_stall_clock()
+
+    assert calls == ["opd_initializing", "opd_initializing"], (
+        f"a dropped commit was accepted as success, so the provider's clock was never reset: {calls}"
+    )
+
+
 def test_arming_the_watchdog_restarts_the_providers_stall_clock(monkeypatch):
     """The two clocks must start from the same origin, or the provider gives up first.
 

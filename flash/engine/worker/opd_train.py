@@ -252,8 +252,22 @@ def arm_provider_stall_clock() -> None:
     SETUP_HEARTBEAT_STAGES), so it advances the clock without tightening the window to
     STALL_AFTER_S the way a step-bearing `opd_step` would, and it is exempted from the throttle
     (_HB_MODEL_LOAD_STAGES) so the setup pings that just ran cannot coalesce the commit away.
+
+    the COMMIT is what advances the provider's clock, not the call: `heartbeat` returns False when
+    the upload lock stayed busy or the upload failed, and the poller only ever sees a snapshot that
+    actually landed. discarding that result would arm the child's fresh 1800s clock against a
+    provider clock still running from before the model load -- the exact split this function exists
+    to close. retried once rather than raised: failing the attempt here would destroy a run that is
+    about to train perfectly well over a heartbeat that is only ever an optimisation of WHEN the
+    provider gives up, and the run stays no worse off than before this function existed.
     """
-    _w.heartbeat("opd_initializing", gpu=_w.gpu_diagnostics(include_torch=False))
+    for attempt in range(2):
+        if _w.heartbeat("opd_initializing", gpu=_w.gpu_diagnostics(include_torch=False)):
+            return
+        print(
+            f"arming heartbeat did not commit (attempt {attempt + 1}/2); the provider's stall clock "
+            "still runs from the last committed setup heartbeat"
+        )
 
 
 def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[float, list]:

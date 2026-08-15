@@ -385,6 +385,89 @@ def test_child_tail_stall_clock_restarts_after_new_output(monkeypatch):
     assert not stall.is_set(), "repeated quiet phases accumulated into a false kill"
 
 
+def test_a_child_that_starts_training_is_never_condemned_by_an_open_window(monkeypatch):
+    """The counter DISAPPEARING means training started, which must disarm -- not be ignored.
+
+    `stall_tail_fields` returns {} the moment its step argument goes positive, so a child that goes
+    quiet during its warmup-dominated first step (opening a silence window) and then completes that
+    step stops reporting the counter entirely. Treating the missing counter as "nothing to do"
+    leaves the window open, and the deadline then fires on a run that is training normally. That is
+    strictly worse than the wedge this watchdog exists to catch: it burns a healthy paid job.
+    """
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_S", 100.0)
+    clock = hb._ChildTailStallClock()
+    stall = threading.Event()
+    now = [0.0]
+    monkeypatch.setattr(hb.time, "monotonic", lambda: now[0])
+
+    clock.observe(1, stall)  # quiet during the first step: window opens
+    now[0] += 10.0
+    clock.observe(2, stall)
+    assert clock._silent_since is not None, "no window opened, so this test proves nothing"
+
+    # the first optimizer step lands: stall_tail_fields returns {} forever after, so every later
+    # tick reads `None` out of the payload. drive BOTH halves of a real tick -- the sample and the
+    # deadline check -- because a stale window only kills through the latter, and a test that calls
+    # `observe` alone passes with the window still open and proves nothing.
+    for _ in range(30):
+        now[0] += 10.0
+        clock.observe(None, stall)
+        clock.elapse(stall)
+    assert clock._silent_since is None, (
+        "the silence window survived the first optimizer step, so the deadline is still armed "
+        "against a run that is training normally"
+    )
+    assert not stall.is_set(), (
+        "a healthy training run was condemned: the silence window survived the first optimizer "
+        "step, and the deadline fired on a child that was doing exactly what it should"
+    )
+
+
+def test_the_watchdog_samples_on_a_thread_that_cannot_be_blocked_by_uploads(monkeypatch):
+    """Sampling AND deciding must live on the non-emitting thread.
+
+    Splitting them -- sample on the emitting loop, decide on an independent one -- is worse than
+    not splitting at all: a wedged upload freezes sampling, so an already-open window can never be
+    cleared by new output, and the independent loop faithfully expires it. The healthy child dies
+    at the deadline. So the watchdog thread must call `fields()` itself.
+    """
+    hb, w, _ = _liveness_env(monkeypatch)
+    monkeypatch.setattr(hb, "CHILD_TAIL_STALL_S", 0.15)
+    emitting = threading.Event()
+
+    def wedged_emit(_stage, **_kw):
+        emitting.set()
+        time.sleep(30)  # HfApi with no timeout
+
+    monkeypatch.setattr(w, "heartbeat", wedged_emit)
+    monkeypatch.setattr(hb, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.2)
+    stall = threading.Event()
+
+    # THE SEQUENCE THAT COSTS A HEALTHY RUN. the child is quiet first (a window opens), then starts
+    # talking again -- and the emitter wedges in its very first upload. if that wedged thread is
+    # the only sampler, the recovery is never seen: the open window is faithfully expired and a
+    # child that is now producing output is killed. reporting silence FIRST is what makes this a
+    # real reproduction rather than a test of the trivial case.
+    samples = [1, 1]
+
+    def fields():
+        return {"child_tail_silent_ticks": samples.pop(0) if samples else 0}
+
+    with hb.liveness_heartbeat(
+        "opd_step",
+        fields=fields,
+        child_tail_stall_event=stall,
+    ):
+        assert emitting.wait(5), "the emitting loop never ran, so this proves nothing"
+        time.sleep(0.8)
+
+    assert not stall.is_set(), (
+        "a child that went quiet and then RECOVERED was condemned: the wedged emitter was the only "
+        "thing sampling it, so its new output never reached the clock and the stale window fired"
+    )
+
+
 def test_elapse_survives_the_window_being_cleared_underneath_it(monkeypatch):
     """`elapse` and `observe` run on DIFFERENT threads, so the window can vanish mid-call.
 
