@@ -139,23 +139,29 @@ def _console_heartbeat_snapshot(payload: dict, payload_committed: bool = True) -
 
 
 def heartbeat(
-    stage: str, *, liveness: bool = False, force: bool = False, initial: bool = False, **kw
+    stage: str,
+    *,
+    liveness: bool = False,
+    force: bool = False,
+    initial: bool = False,
+    first_timing: bool = False,
+    **kw,
 ):
     global _HB_CLAIM_SEQ
-    ts = time.time()
-    # liveness pings don't count as progress; provider stall detection skips them.
-    if not liveness:
-        _w._HB_LAST_PROGRESS_TS = ts
+    genuine_progress = not liveness
     with _HB_LOCK:
-        if not liveness:
+        ts = time.time()
+        if genuine_progress:
+            _w._HB_LAST_PROGRESS_TS = ts
             _w._HB_PROGRESS_SEQ += 1
         elif _w._HB_PROGRESS_SEQ > _w._HB_PROGRESS_UPLOADED_SEQ:
             # progress-carry: a real heartbeat since the last committed snapshot never reached HF
             # (throttled away or its upload failed). upgrade this ping to a real heartbeat so the
             # control plane's stall clock sees that progress instead of killing a healthy run.
-            # deliberately after the _HB_LAST_PROGRESS_TS bump above: carried progress is not NEW
-            # progress, so the worker's own stall-dump timer keeps its original reference point.
+            # carried progress is not new progress, so do not advance _HB_LAST_PROGRESS_TS: the
+            # worker's own stall-dump timer and the published age keep the original reference point.
             liveness = False
+        latest_progress_ts = float(_w._HB_LAST_PROGRESS_TS or 0.0)
         my_progress_seq = _w._HB_PROGRESS_SEQ
     payload = {
         "stage": stage,
@@ -167,6 +173,12 @@ def heartbeat(
         **({"liveness": True} if liveness else {}),
         **kw,
     }
+    if genuine_progress:
+        payload["progress_age_s"] = 0.0
+    elif latest_progress_ts:
+        payload["progress_age_s"] = round(max(0.0, ts - latest_progress_ts), 1)
+    else:
+        payload.pop("progress_age_s", None)
     _dc = os.environ.get("RUNPOD_DC_ID") or ""
     if _dc:
         payload.setdefault("dc", _dc)
@@ -198,18 +210,19 @@ def heartbeat(
             # requires a step advance, but a sample-bearing payload may match the committed step because
             # the liveness daemon can commit that step first without the samples. the per-force floor still
             # coalesces fast bursts to protect the hf commit cap, while an unrelated liveness commit does
-            # not arm the floor and therefore cannot suppress the first sample-bearing payload.
+            # not arm the floor and therefore cannot suppress the first sample-bearing payload. the first
+            # timing payload gets one dedicated floor bypass because the forced metrics-only payload just
+            # before it armed that clock; its caller retries this flag until the timing upload succeeds.
             if force and not upload_due:
                 fstep = kw.get("step")
                 has_samples = bool(kw.get("sampled_completions"))
+                first_timing_due = first_timing and "step_duration_s" in kw
                 force_step_due = isinstance(fstep, (int, float)) and (
                     fstep > _w._HB_LAST_COMMITTED_STEP
                     or (has_samples and fstep == _w._HB_LAST_COMMITTED_STEP)
                 )
-                if (
-                    force_step_due
-                    and (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
-                ):
+                force_floor_due = (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
+                if force_step_due and (first_timing_due or force_floor_due):
                     upload_due = True
         # the initial training snapshot must land before the shared throttle can hide it.
         if initial:
