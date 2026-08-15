@@ -16,6 +16,7 @@ from flash.engine.worker.model import packing
 from flash.engine.worker.model.packing import (
     completion_mask_from_ids,
     model_is_gdn_hybrid,
+    packing_appends_eos,
     tokenize_for_packing,
     untruncated_lengths_for_packing,
 )
@@ -43,6 +44,8 @@ def test_tokenize_for_packing_eos_and_bos_parity():
     # row WITHOUT eos -> eos appended (model learns to stop, matching TRL add_eos); WITH eos -> not
     # doubled; default add_special_tokens prepends BOS (id 1), matching TRL's text-field _tokenize.
     ids = tokenize_for_packing(["ab", "cd!"], tok, max_length=100)
+    assert packing_appends_eos("ab", tok) is True
+    assert packing_appends_eos("cd!", tok) is False
     assert ids[0] == [1, ord("a"), ord("b"), ord("!")]
     assert ids[1] == [1, ord("c"), ord("d"), ord("!")]
 

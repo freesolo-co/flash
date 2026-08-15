@@ -175,6 +175,11 @@ def gdn_packing_contract_available(model_id: str | None = None, revision: str = 
         return False
 
 
+def packing_appends_eos(text: str, tokenizer) -> bool:
+    eos = tokenizer.eos_token or ""
+    return bool(eos and not text.endswith(eos))
+
+
 def _eos_terminated(texts: list[str], tokenizer) -> list[str]:
     """Append EOS (once) to each text.
 
@@ -183,7 +188,7 @@ def _eos_terminated(texts: list[str], tokenizer) -> list[str]:
     answer into the next one.
     """
     eos = tokenizer.eos_token or ""
-    return [t if (eos and t.endswith(eos)) else t + eos for t in texts]
+    return [text + eos if packing_appends_eos(text, tokenizer) else text for text in texts]
 
 
 def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[list[int]]:
@@ -238,6 +243,30 @@ def _chatml_control_ids(tokenizer) -> tuple[int, int] | None:
     return im_start, im_end
 
 
+def _appended_eos_index(
+    full_ids: list[int], tokenizer, after: int, *, appended_eos: bool
+) -> int | None:
+    if not appended_eos or not full_ids or len(full_ids) <= after:
+        return None
+    eos_token = getattr(tokenizer, "eos_token", None)
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is None and isinstance(eos_token, str) and eos_token:
+        to_id = getattr(tokenizer, "convert_tokens_to_ids", None)
+        if callable(to_id):
+            eos_id = to_id(eos_token)
+    if isinstance(eos_id, int) and full_ids[-1] == eos_id:
+        return len(full_ids) - 1
+    decode = getattr(tokenizer, "decode", None)
+    if (
+        isinstance(eos_token, str)
+        and eos_token
+        and callable(decode)
+        and decode([full_ids[-1]]) == eos_token
+    ):
+        return len(full_ids) - 1
+    return None
+
+
 def _active_chat_template(source) -> str | None:
     """Return the metadata-selected template without rendering user-controlled messages."""
     get_template = getattr(source, "get_chat_template", None)
@@ -275,7 +304,16 @@ class _RenderedTargetFields:
     adjacent_runs: tuple[tuple[_MessagePath, ...], ...]
 
 
+@dataclass(frozen=True)
+class _RenderedMessageProbe:
+    target_fields: tuple[_RenderedTargetFields, ...]
+    source_span_indexes: tuple[frozenset[int], ...] | None
+    span_roles: tuple[str, ...]
+
+
 def _probed_text(text: str, path: _MessagePath, sentinels_for) -> str:
+    if not text:
+        return text
     start, end = sentinels_for(path)
     return f"{start}{_sanitized_probe_text(text)}{end}"
 
@@ -316,14 +354,42 @@ def _probe_value(value, path: _MessagePath, sentinels_for):
     return value
 
 
-def _rendered_target_body_fields(
+def _chatml_text_spans(rendered: str) -> list[tuple[int, int, int, int, str]] | None:
+    spans: list[tuple[int, int, int, int, str]] = []
+    index = 0
+    while (start := rendered.find("<|im_start|>", index)) >= 0:
+        header_start = start + len("<|im_start|>")
+        body_start = rendered.find("\n", header_start)
+        if body_start < 0:
+            return None
+        body_start += 1
+        body_end = rendered.find("<|im_end|>", body_start)
+        if body_end < 0:
+            return None
+        message_end = body_end + len("<|im_end|>")
+        if rendered.startswith("\n", message_end):
+            message_end += 1
+        spans.append(
+            (
+                start,
+                body_start,
+                body_end,
+                message_end,
+                rendered[header_start : body_start - 1].strip().lower(),
+            )
+        )
+        index = message_end
+    return spans or None
+
+
+def _rendered_message_probe(
     template_source,
     template: str,
     source_messages: list[dict],
     target_messages: list[dict],
     template_kwargs: dict,
-) -> list[_RenderedTargetFields]:
-    """Probe rendered source leaves and preserve their exact output adjacency."""
+) -> _RenderedMessageProbe:
+    """Probe rendered source leaves, their adjacency, and their structural message spans."""
     target_start = len(source_messages) - len(target_messages)
     if target_start < 0:
         raise ValueError("SFT target messages cannot outnumber the full source transcript")
@@ -332,18 +398,20 @@ def _rendered_target_body_fields(
     while prefix in haystack:
         prefix += "x"
 
-    sentinels: list[tuple[int, _MessagePath, str, str]] = []
+    sentinels: list[tuple[int, int, _MessagePath, str, str]] = []
     probed: list[dict] = []
-    for index, message in enumerate(source_messages):
-        target_index = index - target_start
+    for source_index, message in enumerate(source_messages):
+        target_index = source_index - target_start
 
-        def sentinels_for(path: _MessagePath, target_index=target_index) -> tuple[str, str]:
-            if target_index < 0:
-                return "", ""
+        def sentinels_for(
+            path: _MessagePath,
+            source_index=source_index,
+            target_index=target_index,
+        ) -> tuple[str, str]:
             marker_index = len(sentinels)
             start = f"{prefix}s{marker_index}x"
             end = f"{prefix}e{marker_index}x"
-            sentinels.append((target_index, path, start, end))
+            sentinels.append((source_index, target_index, path, start, end))
             return start, end
 
         copied = {}
@@ -365,15 +433,15 @@ def _rendered_target_body_fields(
     if not isinstance(rendered, str):
         raise TypeError("chat template field probe must return rendered text")
 
-    occurrences: list[tuple[int, int, int, _MessagePath]] = []
-    for target_index, path, start, end in sentinels:
+    occurrences: list[tuple[int, int, int, int, _MessagePath]] = []
+    for source_index, target_index, path, start, end in sentinels:
         offset = 0
         while (start_at := rendered.find(start, offset)) >= 0:
             end_at = rendered.find(end, start_at + len(start))
             if end_at < 0:
                 raise ValueError("chat template field probe lost an end sentinel")
             after_end = end_at + len(end)
-            occurrences.append((start_at, after_end, target_index, path))
+            occurrences.append((start_at, after_end, source_index, target_index, path))
             offset = after_end
     occurrences.sort()
 
@@ -381,7 +449,9 @@ def _rendered_target_body_fields(
     runs: list[list[list[_MessagePath]]] = [[] for _ in target_messages]
     previous_target = -1
     previous_end = -1
-    for start_at, after_end, target_index, path in occurrences:
+    for start_at, after_end, _source_index, target_index, path in occurrences:
+        if target_index < 0:
+            continue
         paths[target_index].add(path)
         if target_index == previous_target and start_at == previous_end:
             runs[target_index][-1].append(path)
@@ -389,13 +459,36 @@ def _rendered_target_body_fields(
             runs[target_index].append([path])
         previous_target = target_index
         previous_end = after_end
-    return [
+    target_fields = tuple(
         _RenderedTargetFields(
             paths=frozenset(message_paths),
             adjacent_runs=tuple(tuple(run) for run in message_runs),
         )
         for message_paths, message_runs in zip(paths, runs, strict=True)
-    ]
+    )
+
+    text_spans = _chatml_text_spans(rendered)
+    if text_spans is None:
+        return _RenderedMessageProbe(target_fields, None, ())
+    source_span_indexes = [set() for _ in source_messages]
+    for start_at, after_end, source_index, _target_index, _path in occurrences:
+        containing = [
+            span_index
+            for span_index, (_start, body_start, body_end, _end, _role) in enumerate(text_spans)
+            if body_start <= start_at and after_end <= body_end
+        ]
+        if len(containing) != 1:
+            return _RenderedMessageProbe(
+                target_fields,
+                None,
+                tuple(span[4] for span in text_spans),
+            )
+        source_span_indexes[source_index].add(containing[0])
+    return _RenderedMessageProbe(
+        target_fields,
+        tuple(frozenset(indexes) for indexes in source_span_indexes),
+        tuple(span[4] for span in text_spans),
+    )
 
 
 def _path_value(message: dict, path: _MessagePath):
@@ -425,6 +518,67 @@ def _has_authored_assistant_body(message: dict, fields: _RenderedTargetFields) -
         isinstance((value := _path_value(message, path)), str) and bool(value.strip())
         for path in fields.paths
     )
+
+
+def _source_span_association(
+    source_messages: list[dict],
+    direct_span_indexes: tuple[frozenset[int], ...],
+    span_roles: tuple[str, ...],
+) -> tuple[int, ...] | None:
+    if len(direct_span_indexes) != len(source_messages) or not span_roles:
+        return None
+    fixed: list[int | None] = []
+    for indexes in direct_span_indexes:
+        if len(indexes) > 1:
+            return None
+        fixed.append(next(iter(indexes)) if indexes else None)
+
+    association: list[int] = []
+    for source_index, message in enumerate(source_messages):
+        source_role = str(message.get("role")).strip().lower()
+        expected_assistant = source_role == "assistant"
+        if fixed[source_index] is not None:
+            candidates = [fixed[source_index]]
+        else:
+            lower = next(
+                (
+                    fixed[index]
+                    for index in range(source_index - 1, -1, -1)
+                    if fixed[index] is not None
+                ),
+                0,
+            )
+            upper = next(
+                (
+                    fixed[index]
+                    for index in range(source_index + 1, len(fixed))
+                    if fixed[index] is not None
+                ),
+                len(span_roles) - 1,
+            )
+            candidates = [
+                span_index
+                for span_index in range(lower, upper + 1)
+                if (span_roles[span_index] == "assistant") == expected_assistant
+            ]
+        if len(candidates) != 1:
+            return None
+        span_index = candidates[0]
+        if (span_roles[span_index] == "assistant") != expected_assistant:
+            return None
+        association.append(span_index)
+
+    if any(association[index] > association[index + 1] for index in range(len(association) - 1)):
+        return None
+    span_sources = [[] for _ in span_roles]
+    for source_index, span_index in enumerate(association):
+        span_sources[span_index].append(source_index)
+    if any(not sources for sources in span_sources):
+        return None
+    for span_index, sources in enumerate(span_sources):
+        if span_roles[span_index] == "assistant" and len(sources) != 1:
+            return None
+    return tuple(association)
 
 
 def _chatml_message_spans(
@@ -491,6 +645,8 @@ def assistant_only_mask(
     full_ids: list[int],
     tokenizer,
     target_messages: list[dict],
+    *,
+    appended_eos: bool,
     template_source=None,
     source_messages: list[dict] | None = None,
     template_kwargs: dict | None = None,
@@ -503,15 +659,17 @@ def assistant_only_mask(
     the model to emit the environment's replies.
 
     Strictly subtractive: it only ever turns a 1 into a 0, so the prompt boundary, the truncation
-    behaviour, and the pre-opened ``<think>\\n`` handling stay intact. ChatML role headers and
-    structural delimiters are never targets; assistant body tokens are. When the transcript does not
-    parse as ChatML the mask is returned unchanged and ``role_aware`` is false rather than narrowing
-    supervision on a guess.
+    behaviour, and the pre-opened ``<think>\\n`` handling stay intact. ChatML role headers and static
+    template separators are never targets; authored assistant bodies and their original turn closers are.
+    When the transcript does not parse as ChatML the mask is returned unchanged and ``role_aware`` is
+    false rather than narrowing supervision on a guess.
 
     ChatML control strings are reserved in every template-rendered target body field. Their token ids
     are identical to structural delimiters after rendering, so accepting a literal would make the
     boundary ambiguous and could either expose an observation or hide real assistant supervision.
-    Non-ChatML targets keep their prior behavior.
+    Non-ChatML targets keep their prior behavior. ``appended_eos`` is caller-supplied provenance, not
+    an inference from the final token value: text packing sets it from ``_eos_terminated`` semantics,
+    while processor tokenization leaves it false because that path appends nothing.
     """
     template_source = tokenizer if template_source is None else template_source
     template = _chatml_template(template_source)
@@ -519,13 +677,14 @@ def assistant_only_mask(
         return AssistantOnlyMask(loss_mask, False)
     source_messages_supplied = source_messages is not None
     source_messages = target_messages if source_messages is None else source_messages
-    rendered_fields = _rendered_target_body_fields(
+    rendered_probe = _rendered_message_probe(
         template_source,
         template,
         source_messages,
         target_messages,
         template_kwargs or {},
     )
+    rendered_fields = rendered_probe.target_fields
     _reject_chatml_control_bodies(target_messages, rendered_fields)
     if not full_ids or not any(loss_mask):
         return AssistantOnlyMask(loss_mask, False)
@@ -536,18 +695,28 @@ def assistant_only_mask(
     authored_assistant = [False] * len(spans)
     target_span_indexes: set[int] = set()
     if source_messages_supplied:
-        if len(spans) > len(source_messages):
-            return AssistantOnlyMask(loss_mask, False)
-        source_roles = [str(message.get("role")).strip().lower() for message in source_messages]
-        if any(span[4] != source_roles[index] for index, span in enumerate(spans)):
+        actual_roles = tuple(span[4] for span in spans)
+        if (
+            rendered_probe.source_span_indexes is None
+            or rendered_probe.span_roles != actual_roles
+            or (
+                source_span_indexes := _source_span_association(
+                    source_messages,
+                    rendered_probe.source_span_indexes,
+                    actual_roles,
+                )
+            )
+            is None
+        ):
             return AssistantOnlyMask(loss_mask, False)
         target_start = len(source_messages) - len(target_messages)
-        for source_index in range(max(0, target_start), len(spans)):
+        for source_index in range(max(0, target_start), len(source_messages)):
             target_index = source_index - target_start
+            span_index = source_span_indexes[source_index]
             message = target_messages[target_index]
-            target_span_indexes.add(source_index)
+            target_span_indexes.add(span_index)
             if str(message.get("role")).strip().lower() == "assistant":
-                authored_assistant[source_index] = _has_authored_assistant_body(
+                authored_assistant[span_index] = _has_authored_assistant_body(
                     message, rendered_fields[target_index]
                 )
     else:
@@ -568,21 +737,29 @@ def assistant_only_mask(
                     message, rendered_fields[target_index]
                 )
 
-    masked = list(loss_mask)
-    last_target_span: tuple[int, str, bool] | None = None
-    for source_index, (start, body_start, body_end, end, role) in enumerate(spans):
+    control_ids = _chatml_control_ids(tokenizer)
+    if control_ids is None:
+        return AssistantOnlyMask(loss_mask, False)
+    im_end = control_ids[1]
+    masked = [0] * len(loss_mask)
+    last_target_span: tuple[str, bool] | None = None
+    for span_index, (start, body_start, body_end, end, role) in enumerate(spans):
         bounded_end = min(end, len(masked))
-        authored = authored_assistant[source_index]
-        if source_index in target_span_indexes and any(loss_mask[start:bounded_end]):
-            last_target_span = (bounded_end, role, authored)
-        for position in range(start, bounded_end):
-            masked[position] = 0
+        authored = authored_assistant[span_index]
+        if span_index in target_span_indexes and any(loss_mask[start:bounded_end]):
+            last_target_span = (role, authored)
         if role == "assistant" and authored:
             for position in range(min(body_start, len(masked)), min(body_end, len(masked))):
                 masked[position] = loss_mask[position]
-    if last_target_span is not None and (
-        last_target_span[1] != "assistant" or not last_target_span[2]
-    ):
-        for position in range(last_target_span[0], len(masked)):
-            masked[position] = 0
+            if body_end < bounded_end and full_ids[body_end] == im_end:
+                masked[body_end] = loss_mask[body_end]
+    if last_target_span == ("assistant", True):
+        eos_index = _appended_eos_index(
+            full_ids,
+            tokenizer,
+            spans[-1][3],
+            appended_eos=appended_eos,
+        )
+        if eos_index is not None:
+            masked[eos_index] = loss_mask[eos_index]
     return AssistantOnlyMask(masked, True)

@@ -151,6 +151,7 @@ def _processor_tokenized_row(
         input_ids,
         getattr(processor, "tokenizer", processor),
         completion_messages,
+        appended_eos=False,
         template_source=processor,
         source_messages=full_messages,
         template_kwargs={"enable_thinking": thinking},

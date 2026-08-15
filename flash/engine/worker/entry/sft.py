@@ -13,6 +13,7 @@ import random
 from flash.engine.worker.model.packing import (
     assistant_only_mask,
     completion_mask_from_ids,
+    packing_appends_eos,
     tokenize_for_packing,
     untruncated_lengths_for_packing,
 )
@@ -52,6 +53,7 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
             ids,
             tokenizer,
             text["target_messages"],
+            appended_eos=packing_appends_eos(text["text"], tokenizer) and len(ids) == length,
             source_messages=text.get("source_messages"),
             template_kwargs=text.get("template_kwargs"),
         )
