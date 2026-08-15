@@ -96,6 +96,149 @@ def test_child_output_that_merely_mentions_memory_is_not_an_oom():
         raise_for_classified_verl_exit(1, tail)  # must not raise
 
 
+RAY_HOST_RAM_KILL = (
+    "ray.exceptions.OutOfMemoryError: 6 worker(s) were killed due to the node running low on "
+    "memory. Memory on the node was 42.45GB / 42.84GB (0.991)"
+)
+
+
+def test_ray_host_ram_kill_is_not_a_cuda_oom(monkeypatch):
+    """A ray host-RAM kill must never escalate the GPU.
+
+    `OutOfMemoryError` is ALSO ray's class name, so a matcher whose `torch.`/`cuda.` prefixes were
+    both optional degenerated to bare `outofmemoryerror` and matched `ray.exceptions.OutOfMemoryError`
+    verbatim. That classified a node whose SYSTEM memory was exhausted as a CUDA OOM and retried on a
+    larger-VRAM card ("retrying on a larger GPU (> 24 GB)") while the GPU sat idle at 0.9/24.0 GB --
+    the wrong resource, at a higher hourly rate, failing identically on the bigger card.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "cuda_oom_count", lambda: 0)
+    assert lc.cuda_oom_message_evidence(RAY_HOST_RAM_KILL) is None
+    assert lc.is_cuda_oom(RuntimeError(RAY_HOST_RAM_KILL)) is False
+    # the qualified torch spellings must keep classifying, or training OOMs stop escalating at all
+    assert lc.cuda_oom_message_evidence("torch.OutOfMemoryError: CUDA out of memory") is not None
+    assert lc.cuda_oom_message_evidence("torch.cuda.OutOfMemoryError: boom") is not None
+
+
+def test_ray_host_ram_kill_is_classified_and_named(monkeypatch):
+    """The run's reported cause must name host RAM, and must not read back as a CUDA OOM.
+
+    The ray kill line sits ~988 lines deep in the log, behind the thread-pool and bridge errors it
+    CAUSED, and the operator-visible message ("train phase 'rl' produced no /tmp/metrics.json")
+    names neither. Classifying at the child boundary is what puts the scarce resource in the failure
+    the supervisor prints.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+    from flash.engine.worker.verl.diagnostics import ChildOutputTail, raise_for_classified_verl_exit
+
+    monkeypatch.setattr(lc, "cuda_oom_count", lambda: 0)
+    tail = ChildOutputTail()
+    tail.record(RAY_HOST_RAM_KILL + "\n")
+    # the cascade the kill caused prints after it; the kill is still what gets reported
+    tail.record("RuntimeError: can't start new thread\n")
+    assert tail.host_ram_kill_evidence is not None
+    assert tail.cuda_oom_evidence is None
+
+    with pytest.raises(RuntimeError, match="HOST RAM") as raised:
+        raise_for_classified_verl_exit(1, tail)
+    assert "system RAM" in str(raised.value), "the remedy does not name the resource to select on"
+    assert lc.is_cuda_oom(raised.value) is False, (
+        "the host-RAM kill reads back as a cuda oom, so the run would still escalate VRAM"
+    )
+
+
+def test_cuda_oom_still_wins_when_no_host_ram_kill_is_present(monkeypatch):
+    """Ordering guard: adding the host-RAM branch must not shadow genuine CUDA OOM escalation."""
+    from flash.engine.worker.perf import lifecycle as lc
+    from flash.engine.worker.verl.diagnostics import ChildOutputTail, raise_for_classified_verl_exit
+
+    monkeypatch.setattr(lc, "cuda_oom_count", lambda: 0)
+    tail = ChildOutputTail()
+    tail.record("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n")
+    assert tail.host_ram_kill_evidence is None
+    with pytest.raises(RuntimeError, match="outofmemoryerror") as raised:
+        raise_for_classified_verl_exit(1, tail)
+    assert lc.is_cuda_oom(raised.value) is True
+
+
+def test_host_ram_evidence_outranks_a_stale_allocator_counter(monkeypatch):
+    """A prior allocator OOM must not re-classify a later host-RAM kill.
+
+    `cuda_oom_count()` is CUMULATIVE and process-wide, so one recovered allocator OOM earlier in the
+    run leaves it above zero for every later failure. Without this precedence the explicit host-RAM
+    error falls through to `return cuda_oom_count() > 0` and reads back as a CUDA OOM again --
+    re-arming the exact VRAM escalation this fix removes, on the runs most likely to have touched
+    the allocator. A failure that named its own cause must not be diagnosed by a stale counter.
+    """
+    from flash.engine.worker import _worker_failure_flags
+    from flash.engine.worker.perf import lifecycle as lc
+    from flash.engine.worker.verl.diagnostics import ChildOutputTail, raise_for_classified_verl_exit
+
+    tail = ChildOutputTail()
+    tail.record(RAY_HOST_RAM_KILL + "\n")
+    with pytest.raises(RuntimeError) as raised:
+        raise_for_classified_verl_exit(1, tail)
+
+    monkeypatch.setattr(lc, "cuda_oom_count", lambda: 1)  # poisoned by an earlier allocator OOM
+    assert lc.is_cuda_oom(raised.value) is False
+    assert _worker_failure_flags(raised.value) == {"retriable": False, "oom": False}
+    # the counter must still classify a failure that carries NO host-RAM evidence
+    assert lc.is_cuda_oom(RuntimeError("some unrelated worker failure")) is True
+
+
+def test_mixed_evidence_reports_both_without_quoting_the_cuda_token(monkeypatch):
+    """With both signals the message must name both, yet still not read back as a CUDA OOM.
+
+    `is_cuda_oom` classifies this very string, so echoing the matched token (`torch.OutOfMemoryError`)
+    would make the message re-match and re-enable the VRAM escalation the branch exists to prevent.
+    The CUDA signal is therefore described, never quoted -- and the text must not overclaim that GPU
+    memory was fine, because the tail keeps only the first of each category and cannot say which
+    resource ended the run.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+    from flash.engine.worker.verl.diagnostics import ChildOutputTail, raise_for_classified_verl_exit
+
+    monkeypatch.setattr(lc, "cuda_oom_count", lambda: 0)
+    tail = ChildOutputTail()
+    tail.record(RAY_HOST_RAM_KILL + "\n")
+    tail.record("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n")
+
+    with pytest.raises(RuntimeError, match="HOST RAM") as raised:
+        raise_for_classified_verl_exit(1, tail)
+    message = str(raised.value)
+    assert "ALSO reported" in message, "the mixed case hides the cuda signal from the operator"
+    assert "gpu memory was not the scarce resource" not in message, "overclaims with both signals"
+    assert lc.cuda_oom_message_evidence(message) is None, (
+        "the message quotes a matchable cuda token"
+    )
+    assert lc.is_cuda_oom(raised.value) is False
+
+
+@pytest.mark.parametrize("ray_first", [True, False])
+def test_host_ram_wins_when_both_signals_are_present(monkeypatch, ray_first):
+    """When BOTH signals appear, the host-RAM kill is the cause and must win either print order.
+
+    A node dying of system memory kills the workers holding the GPU, so a torch OOM can be printed
+    by a worker on its way down -- BEFORE or AFTER ray's kill line, depending on which process
+    flushed first. Escalating VRAM on that torch line buys a bigger card for a node whose RAM is
+    what ran out, so the verdict must not depend on interleaving.
+    """
+    from flash.engine.worker.perf import lifecycle as lc
+    from flash.engine.worker.verl.diagnostics import ChildOutputTail, raise_for_classified_verl_exit
+
+    monkeypatch.setattr(lc, "cuda_oom_count", lambda: 0)
+    torch_line = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
+    lines = [RAY_HOST_RAM_KILL + "\n", torch_line]
+    tail = ChildOutputTail()
+    for line in lines if ray_first else reversed(lines):
+        tail.record(line)
+
+    with pytest.raises(RuntimeError, match="HOST RAM") as raised:
+        raise_for_classified_verl_exit(1, tail)
+    assert lc.is_cuda_oom(raised.value) is False
+
+
 def test_is_cuda_oom_typed_torch_error():
     torch = pytest.importorskip("torch")  # skipped on the torch-less offline CI image
     from flash.engine.worker.perf.lifecycle import is_cuda_oom

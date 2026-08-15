@@ -12,7 +12,18 @@ _CUDA_OOM_PREFLIGHT_RE = re.compile(
 _CUDA_OOM_CACHE_BLOCKS = "no available memory for the cache blocks"
 # verl child processes lose the torch exception type and allocator counter. match torch's exact cuda
 # OOM wording so training OOMs retry on larger GPUs without misclassifying host RAM or env errors.
-_CUDA_OOM_TORCH_RE = re.compile(r"(?:torch\.)?(?:cuda\.)?outofmemoryerror|cuda out of memory")
+#
+# the `torch.` qualifier is REQUIRED, not optional. `OutOfMemoryError` is also RAY's class name, so
+# a pattern whose prefixes were both optional degenerated to bare `outofmemoryerror` and matched
+# `ray.exceptions.OutOfMemoryError` -- a HOST-RAM kill -- escalating to a larger card while the gpu
+# sat idle. torch prints `torch.OutOfMemoryError` or `torch.cuda.OutOfMemoryError`, never unqualified.
+_CUDA_OOM_TORCH_RE = re.compile(r"torch\.(?:cuda\.)?outofmemoryerror|cuda out of memory")
+# ray's host-memory monitor kills workers when NODE ram is exhausted. the gpu can be idle at the
+# moment of death, so this is the opposite remedy from a cuda oom: the scarce resource is system ram.
+_HOST_RAM_KILL_RE = re.compile(
+    r"(?:worker\(s\) were killed due to the node running low on memory"
+    r"|task was killed due to the node running low on memory)"
+)
 
 
 class RetriableInfraError(RuntimeError):
@@ -196,6 +207,16 @@ def cuda_oom_message_evidence(message: str) -> str | None:
     return None
 
 
+def host_ram_kill_evidence(message: str) -> str | None:
+    """The authoritative text evidence for a ray host-RAM kill, if present.
+
+    Kept distinct from `cuda_oom_message_evidence` because the two failures need OPPOSITE remedies:
+    a CUDA OOM retries on a larger-VRAM class, while a host-RAM kill needs more SYSTEM ram and would
+    fail identically on a bigger card whose node ships the same memory.
+    """
+    return match.group(0) if (match := _HOST_RAM_KILL_RE.search(message.lower())) else None
+
+
 def is_cuda_oom(exc: BaseException | None) -> bool:
     """Return whether a failure was a CUDA OOM.
 
@@ -211,8 +232,15 @@ def is_cuda_oom(exc: BaseException | None) -> bool:
             return True
     except Exception:
         pass
-    if cuda_oom_message_evidence(str(exc)) is not None:
+    message = str(exc)
+    if cuda_oom_message_evidence(message) is not None:
         return True
+    # explicit host-RAM evidence outranks the allocator counter. `cuda_oom_count()` is CUMULATIVE
+    # and process-wide: one recovered allocator OOM earlier in the run leaves it above zero for
+    # every later failure, which would re-classify a known ray host-RAM kill as a cuda OOM and
+    # escalate VRAM again. a failure that named its own cause is not diagnosed by a stale counter.
+    if host_ram_kill_evidence(message) is not None:
+        return False
     return cuda_oom_count() > 0
 
 
