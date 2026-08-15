@@ -239,6 +239,8 @@ class TestImageGeometrySubmissionFailures:
             (401, False, 400),
             (403, False, 400),
             (404, False, 400),
+            (408, True, 503),
+            (425, True, 503),
             (429, True, 503),
             (500, True, 503),
             (503, True, 503),

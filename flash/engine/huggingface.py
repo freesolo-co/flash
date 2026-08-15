@@ -45,7 +45,11 @@ def hub_error_transience(exc: BaseException) -> bool | None:
         status = getattr(response, "status_code", None)
         if status in {401, 403, 404}:
             return False
-        return status is None or status == 429 or (isinstance(status, int) and 500 <= status <= 599)
+        return (
+            status is None
+            or status in {408, 425, 429}
+            or (isinstance(status, int) and 500 <= status <= 599)
+        )
     if isinstance(exc, RequestException):
         return False
     return None
