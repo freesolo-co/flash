@@ -388,19 +388,7 @@ def publish_deployable_checkpoint(
                 ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
             )
             if _emit_heartbeat:
-                # carries the pace for the same reason the upload pings do: this stage is
-                # unthrottled but ARMS the throttle the step stages share, so publishing a snapshot
-                # without timing blanks the measured pace and then blocks every ping that could
-                # restore it. an intermediate save is followed immediately by the resume upload, so
-                # the gap is the length of that save -- minutes on a large model.
-                from flash.engine.worker.io.heartbeat import step_timing_fields_now
-
-                _w.heartbeat(
-                    "checkpoint_deployable",
-                    step=step,
-                    subfolder=subfolder,
-                    **step_timing_fields_now(),
-                )
+                _w.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
             return subfolder
         except Exception as e:
             last_error = e
@@ -499,7 +487,6 @@ def upload_resume_checkpoint(
         return True
 
     from flash.engine.worker.io.heartbeat import liveness_heartbeat
-    from flash.engine.worker.io.heartbeat import step_timing_fields_now as _step_timing_fields_now
 
     before_completed = before_upload is None
     resume_completed = False
@@ -512,15 +499,7 @@ def upload_resume_checkpoint(
             return True
         heartbeat_context = (
             liveness_heartbeat(
-                "checkpoint_uploading",
-                progress=lambda: step,
-                progress_step=True,
-                keepalive=True,
-                # the same reason the final ping below carries them, for longer: this daemon is
-                # keepalive, so it commits a REAL heartbeat every tick for the whole upload. an
-                # upload that outlasts one tick would otherwise replace the snapshot with a pace-less
-                # one and hold it there until the save finishes, on a big model for minutes.
-                fields=_step_timing_fields_now,
+                "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
             )
             if emit_heartbeat
             else contextlib.nullcontext()
@@ -552,11 +531,7 @@ def upload_resume_checkpoint(
                         after_completed = True
                     if emit_heartbeat:
                         failure_stage = "heartbeat"
-                        # carries the step timing because this ping is unthrottled AND arms the
-                        # throttle the step stages share: publishing it without them would blank the
-                        # measured pace off live status for up to the throttle interval after every
-                        # save, exactly when a long run is most worth watching.
-                        _w.heartbeat("checkpoint_uploaded", step=step, **_step_timing_fields_now())
+                        _w.heartbeat("checkpoint_uploaded", step=step)
                     return True
                 except RequiredSaveError:
                     raise
@@ -578,16 +553,7 @@ def upload_resume_checkpoint(
                         )
                         if emit_heartbeat:
                             with contextlib.suppress(Exception):
-                                # same reason as the success ping above: this stage is unthrottled
-                                # too, so it also arms the throttle the step stages share. an
-                                # optional checkpoint that failed does not stop the run, and
-                                # publishing without the timing would blank the pace of a run that
-                                # is still training.
-                                _w.heartbeat(
-                                    "checkpoint_upload_failed",
-                                    step=step,
-                                    **_step_timing_fields_now(),
-                                )
+                                _w.heartbeat("checkpoint_upload_failed", step=step)
                         if failure_stage in {"before", "after"}:
                             raise
     return False

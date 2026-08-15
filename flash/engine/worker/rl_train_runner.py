@@ -6,6 +6,7 @@ Split out of ``flash.engine.worker.rl_train`` to keep that module under the file
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -29,7 +30,6 @@ from flash.engine.worker.backend_common import (
     shim_marker_file,
     verify_applied_shim_markers,
     verl_device_capability,
-    verl_step_number,
     wrap_shim_fragment,
 )
 from flash.engine.worker.io.heartbeat import (
@@ -39,7 +39,7 @@ from flash.engine.worker.io.heartbeat import (
 )
 from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.train.core import step_timing
+from flash.engine.worker.train.core.step_timing import StepTiming
 from flash.engine.worker.train.rl.multi_turn import (
     MultiTurnBridge,
     copy_multi_turn_child_modules,
@@ -76,16 +76,8 @@ class _StepMetricState:
     adv_spread_history: list[float] = field(default_factory=list)
     last_dump_step: list[int] = field(default_factory=lambda: [-1])
     metrics_last: list[dict] = field(default_factory=list)
+    step_timing: StepTiming = field(default_factory=StepTiming)
     sent_first_metrics: bool = False
-    # the sole record of when step lines arrived, read both live and at teardown. one clock rather
-    # than a parallel raw list: the exclusions it applies (warmup, reprints, spans containing a
-    # blocking upload) are what makes an interval a step, so a second unfiltered record would let the
-    # post-run metadata and the live heartbeat publish different answers for the same run.
-    step_clock: step_timing.StepClock = field(default_factory=step_timing.StepClock)
-    # the one reader over that clock, shared by every publisher: the liveness hook, the checkpoint
-    # ping and the forced first-metrics upload. it lives beside the clock rather than being threaded
-    # through each call so the publishers cannot end up describing different views of one run.
-    step_timing_fields: Callable[[], dict] | None = None
 
 
 @dataclass
@@ -428,55 +420,11 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
     return env_for_verl
 
 
-class _DeferredStepTiming:
-    """A step-timing reader that can be registered before the run has one.
-
-    ``publishing_step_timing`` has to be opened around the whole training try/finally, because the
-    uploader drains in that finally publish the final checkpoint and its unthrottled ping reads the
-    registry. But the real reader needs the step state and horizon, which only exist once the child
-    is configured -- well inside the block. This stands in until ``bind`` supplies it.
-
-    Reading empty before then is correct rather than a fallback: no step has been measured yet, so
-    {} is exactly what a ping at that point should carry.
-    """
-
-    def __init__(self) -> None:
-        self._read: Callable[[], dict] | None = None
-
-    def bind(self, read: Callable[[], dict]) -> None:
-        self._read = read
-
-    def __call__(self) -> dict:
-        return self._read() if self._read is not None else {}
-
-
-def _rl_step_timing_publisher(state: _StepMetricState, total_steps: int) -> Callable[[], dict]:
-    """A no-argument reader of this run's step timing, for the hooks that publish it.
-
-    Both the liveness daemon and ``publishing_step_timing`` (which lets the unthrottled checkpoint
-    heartbeat carry the pace it would otherwise blank) need the same live view, so they share one
-    reader rather than each closing over the state separately.
-    """
-
-    def read() -> dict:
-        return _rl_step_timing_fields(state, total_steps)
-
-    return read
-
-
-def _rl_step_timing_fields(state: _StepMetricState, total_steps: int) -> dict:
-    """The step-timing fragment of one rl_step heartbeat, empty until a whole step is measured.
-
-    Read on the liveness path as well as the stdout one because that daemon shares the step
-    heartbeat's upload slot: a tick that wins it and dropped these fields would publish a step with
-    no timing beside one that had it, which reads as the measurement having been lost rather than
-    simply not re-sent.
-    """
-    return step_timing.step_timing_fields(
-        state.step_clock,
+def _step_timing_fields(inp, state: _StepMetricState) -> dict:
+    return state.step_timing.heartbeat_fields(
         current_step=state.progress["step"],
-        total_steps=total_steps,
-        remaining_wall_seconds=_w._remaining_worker_wall_seconds(),
+        total_steps=int(inp["steps"]),
+        remaining_wall_s=_w._remaining_worker_wall_seconds(),
     )
 
 
@@ -489,6 +437,7 @@ def _ingest_step_metrics(
     sent_first_metrics = state.sent_first_metrics
     step_metrics = parse_verl_step_metrics(line)
     if step_metrics is not None:
+        state.step_timing.record_duration(parse_verl_metric(line, "timing_s/step"))
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]
@@ -500,31 +449,14 @@ def _ingest_step_metrics(
         # heartbeat.py force_first_samples and retry until committed. later emissions remain
         # throttled to protect the hf commit cap.
         if not sent_first_metrics:
-            # this upload is synchronous and retries until it commits, so it CAN stall the stdout
-            # consumer that timestamps the NEXT step line -- but it does not always: with no
-            # HF_REPO, or on a fast commit, it returns in microseconds. so it is MEASURED and the
-            # span is broken only when it really blocked, the same way the SFT and OPD callbacks
-            # do it. declaring the block unconditionally also entered the drain, which on a run
-            # whose steps are shorter than the drain threshold reads every following line as
-            # backlog: at 0.4s/step a spurious block suppressed 37 of 37 lines and left the pace
-            # published from one stale interval.
-            # carries the timing too. this path RETRIES on a failed upload, so a later step can
-            # reach it with a pace already measured -- and publishing without it would commit a
-            # pace-less snapshot and arm the shared 900s throttle behind it, hiding the measurement
-            # until another publisher wins a slot. the liveness hook merges the same reader, so both
-            # publishers describe one view rather than disagreeing about what was measured.
-            started = time.monotonic()
             sent_first_metrics = _w.heartbeat(
                 "rl_step",
                 force=True,
                 step=step_metrics["step"],
                 metrics_last=list(state.metrics_last),
                 **_reward_observability(),
-                **(state.step_timing_fields() if state.step_timing_fields else {}),
                 gpu=gpu_diagnostics(include_torch=False),
             )
-            ended = time.monotonic()
-            state.step_clock.note_if_blocked(ended - started, ended)
             state.sent_first_metrics = sent_first_metrics
         # per-step series for train_meta observability parity. these live on the same
         # line as everything else: verl's only console metric sink is LocalLogger,
@@ -571,6 +503,7 @@ def _execute_rl_child(
         start_new_session=True,
     )
     child_stream = _rl_train()._GrpoSubprocessStream(proc)
+    step_re = re.compile(r"step:\s*(\d+)")
     progress, last_dump_step = state.progress, state.last_dump_step
     shim_markers = (files or {}).get("shim_markers")
     expected_shims = (files or {}).get("expected_shims", ())
@@ -581,22 +514,9 @@ def _execute_rl_child(
             link = parse_wandb_link(line)
             if link is not None:
                 reward_runtime.wandb_link.update(link)
-            # the shared gate, not a looser scan of its own. this value is what the projection
-            # reports as the current step, and a scan that also matched `timing/step:1.25` or a
-            # `global_step:9` checkpoint path would reset it to 1 after a real step 20 -- which
-            # publishes an inflated remaining time and a false wall-limit warning beside it.
-            parsed_step = verl_step_number(line)
-            if parsed_step is not None:
-                progress["step"] = parsed_step
-                # timed off the SHARED gate, like SFT's and OPD's on_step, rather than off the
-                # metrics parse below. verl tags a validation pass with the step it just finished,
-                # and `parse_verl_step_metrics` returns None for that line by design -- it carries
-                # only val-* fields and must not displace the step's training row. Gating the clock
-                # on it too meant the reprint the clock exists to exclude never reached the clock on
-                # RL: the validation pass stayed inside the next optimizer interval and was
-                # published as what a step costs. That is the same class of error as counting
-                # warmup, and `record` already holds the rule -- it just has to see the line.
-                state.step_clock.record(time.monotonic(), parsed_step)
+            m = step_re.search(line)
+            if m:
+                progress["step"] = int(m.group(1))
                 # the first step line is the training-start boundary: sitecustomize import is long
                 # finished by then, so a marker still missing means this child is training with no
                 # flash patch at all, so fail now rather than after the whole run is paid for. not
@@ -677,18 +597,6 @@ def _validate_rl_child(rc, state, resume_step, expected_steps, resume_uploader, 
     if resume_uploader is not None and resume_uploader.required_steps:
         resume_uploader.stop()
         resume_uploader.raise_if_incomplete()
-
-
-def _require_complete_rl_run(steps_run: int, expected_steps: int) -> None:
-    """Fail a run that trained fewer optimizer updates than were asked for.
-
-    A short run still leaves a loadable adapter on disk, so without this the worker would publish it
-    as a completed run of the requested length.
-    """
-    if steps_run < expected_steps:
-        raise RuntimeError(
-            f"grpo completed {steps_run}/{expected_steps} requested optimizer updates"
-        )
 
 
 def _prepare_final_adapter(local_dir: str, t_train: float):

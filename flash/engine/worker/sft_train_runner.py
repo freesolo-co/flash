@@ -9,13 +9,12 @@ import math
 import os
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
 from flash.engine.worker import sft_train as _sft_train
-from flash.engine.worker.train.core import step_timing
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 from flash.providers.base import rentable_gpu_counts
 
@@ -145,12 +144,6 @@ class _SftProgress:
     shim_markers: str = ""
     expected_shims: tuple[str, ...] = ()
     shims_verified: bool = False
-    # when each optimizer step landed, so the heartbeat can publish what a step COSTS rather than
-    # only which one is current. sft measured whole-child wall time alone before this, which cannot
-    # be read mid-run and folds warmup into the average.
-    step_clock: step_timing.StepClock = field(default_factory=step_timing.StepClock)
-    # the update horizon this run is training toward, for the remaining-time projection.
-    total_steps: int = 0
 
 
 @dataclass(frozen=True)
@@ -744,7 +737,6 @@ def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, child: _SftChil
         # like loraplus_applied above: a resume already at the horizon never launches the child,
         # so there is no marker file to verify and nothing left for the shims to patch.
         shims_verified=resume_step >= model.update_horizon,
-        total_steps=model.update_horizon,
     )
 
 
@@ -754,61 +746,18 @@ class _SftProgressCallbacks:
 
     def on_step(self, step: int) -> None:
         self.progress.values["step"] = step
-        self.progress.step_clock.record(time.monotonic(), step)
         payload = {
             "step": step,
             "loss": self.progress.values["loss"],
             "grad_norm": self.progress.values["grad_norm"],
             "learning_rate": self.progress.values["lr"],
         }
-        # this runs inside run_verl_training's stdout loop, so a heartbeat that blocks defers the
-        # timestamp of the next step line into the following span. time the call rather than read its
-        # result: an uncommitted heartbeat may have skipped instantly under the throttle or waited
-        # out the upload lock and failed, and only the second is a block.
-        started = time.monotonic()
         _w.heartbeat(
-            "sft_step",
-            **{key: value for key, value in payload.items() if value is not None},
-            **self.step_timing_fields(),
-        )
-        ended = time.monotonic()
-        self.progress.step_clock.note_if_blocked(ended - started, ended)
-
-    def step_timing_fields(self) -> dict[str, float | bool]:
-        """Steady-state step timing for one heartbeat; empty until a whole step has been measured.
-
-        Read by three publishers, all for the same reason: an upload REPLACES the published snapshot
-        rather than merging into it. The liveness daemon and the child ping share this stage's
-        throttled slot, and the checkpoint heartbeat is unthrottled while arming that same throttle.
-        A publisher that omitted these fields would blank a measured pace off live status, reading
-        as the measurement having been lost rather than simply not re-sent.
-        """
-        return step_timing.step_timing_fields(
-            self.progress.step_clock,
-            current_step=int(self.progress.values["step"] or 0),
-            total_steps=self.progress.total_steps,
-            remaining_wall_seconds=_w._remaining_worker_wall_seconds(),
+            "sft_step", **{key: value for key, value in payload.items() if value is not None}
         )
 
     def child_heartbeat(self) -> None:
-        # carries the timing for the same reason the liveness daemon does: an upload REPLACES the
-        # published snapshot, and this ping shares the step heartbeat's throttled slot. one that won
-        # it without these fields would blank a measured pace off live status, which reads as the
-        # measurement having been lost rather than simply not re-sent.
-        #
-        # timed like the on_step upload: this one runs inside run_verl_training's reader loop too,
-        # so an upload that blocks here defers the NEXT step line's timestamp just the same. it is
-        # reached from a non-step line, which is exactly why it needs its own guard -- the on_step
-        # path never sees this call.
-        started = time.monotonic()
-        _w.heartbeat(
-            "sft_step",
-            liveness=True,
-            step=int(self.progress.values["step"] or 0),
-            **self.step_timing_fields(),
-        )
-        ended = time.monotonic()
-        self.progress.step_clock.note_if_blocked(ended - started, ended)
+        _w.heartbeat("sft_step", liveness=True, step=int(self.progress.values["step"] or 0))
 
 
 def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_line) -> int:

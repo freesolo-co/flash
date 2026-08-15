@@ -302,17 +302,8 @@ def test_first_backlog_is_forced_past_the_rl_step_throttle():
         for node in ast.walk(tree)
         if isinstance(node, ast.If) and "sent_first_metrics" in ast.unparse(node.test)
     )
-    # the assignment need not be the guard's FIRST statement -- the clock is told about the blocking
-    # upload before it starts -- but the flag must still take the heartbeat's own return value.
-    commit = next(
-        (
-            node
-            for node in guard.body
-            if isinstance(node, ast.Assign) and "heartbeat" in ast.unparse(node.value)
-        ),
-        None,
-    )
-    assert commit is not None, "retry until a forced ping actually commits"
+    assert isinstance(guard.body[0], ast.Assign), "retry until a forced ping actually commits"
+    assert "heartbeat" in ast.unparse(guard.body[0].value)
 
 
 def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():

@@ -303,8 +303,8 @@ def test_sft_under_ran_only_fails_a_genuine_under_run():
 
 
 def test_grpo_under_ran_only_fails_a_genuine_under_run():
-    # verl has no grpo_under_ran helper: _require_complete_rl_run compares the checkpoint dir's step
-    # count to expected_steps. same invariant, so assert on the comparison rather than a symbol --
+    # verl has no grpo_under_ran helper: run_rl_train compares the checkpoint dir's step count to
+    # expected_steps inline. same invariant, so assert on the comparison rather than a symbol --
     # STRICTLY less-than, so a resume that overshoots a lowered horizon (12 >= 10) still finalizes
     # instead of failing a fully-trained policy.
     import ast
@@ -313,7 +313,7 @@ def test_grpo_under_ran_only_fails_a_genuine_under_run():
 
     from flash.engine.worker import rl_train
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train._require_complete_rl_run)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
     compares = [
         node
         for node in ast.walk(tree)
@@ -325,10 +325,6 @@ def test_grpo_under_ran_only_fails_a_genuine_under_run():
     ]
     assert len(compares) == 1
     assert isinstance(compares[0].ops[0], ast.Lt)
-    # and run_rl_train must still call it: a helper nothing invokes checks nothing.
-    assert "_require_complete_rl_run(steps_run, expected_steps)" in inspect.getsource(
-        rl_train.run_rl_train
-    )
 
 
 @pytest.mark.parametrize("bad", [[], False, "", 0])

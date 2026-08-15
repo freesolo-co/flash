@@ -2173,7 +2173,7 @@ def test_run_verl_training_streams_steps_and_returns_code():
     lines: list[str] = []
     beats: list[int] = []
     code = vc.run_verl_training(
-        ["bash", "-c", "echo 'foo step:1 bar'; echo 'step:2'; echo done"],
+        ["bash", "-c", "echo 'foo step: 1 bar'; echo 'step: 2'; echo done"],
         env=dict(os.environ),
         on_step=seen.append,
         on_line=lines.append,
@@ -2189,7 +2189,7 @@ def test_run_verl_training_streams_steps_and_returns_code():
 
 def test_run_verl_training_propagates_nonzero_exit():
     code = vc.run_verl_training(
-        ["bash", "-c", "echo 'step:1'; exit 7"],
+        ["bash", "-c", "echo 'step: 1'; exit 7"],
         env=dict(os.environ),
         on_step=lambda _s: None,
     )
@@ -2274,7 +2274,7 @@ def test_run_verl_training_records_child_output_into_the_tail():
     """the child's words must reach the tail, because the parent's stdout reaches no log stream."""
     tail = vc.ChildOutputTail()
     code = vc.run_verl_training(
-        ["bash", "-c", "echo 'ray placement group pending'; echo 'step:1'; echo 'wedged here'"],
+        ["bash", "-c", "echo 'ray placement group pending'; echo 'step: 1'; echo 'wedged here'"],
         env=dict(os.environ),
         tail=tail,
     )
@@ -2290,12 +2290,12 @@ def test_run_verl_training_without_a_tail_is_unchanged():
     """tail is opt-in; omitting it must not alter streaming or the exit code."""
     lines: list[str] = []
     code = vc.run_verl_training(
-        ["bash", "-c", "echo 'step:4'; exit 3"],
+        ["bash", "-c", "echo 'step: 4'; exit 3"],
         env=dict(os.environ),
         on_line=lines.append,
     )
     assert code == 3
-    assert lines == ["step:4\n"]
+    assert lines == ["step: 4\n"]
 
 
 @pytest.mark.parametrize(
@@ -2795,7 +2795,7 @@ def _outlives_its_stdout_command() -> list[str]:
     leader = (
         "import os,signal,sys,time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        "print('step:1', flush=True)\n"
+        "print('step: 1', flush=True)\n"
         # BOTH descriptors. the parent merges the child's stderr into stdout, so fd 1 and fd 2 are
         # the same pipe: closing only fd 1 leaves the write end open and the parent never sees EOF,
         # which makes this the wrong scenario (a live child holding its own pipe) rather than the
@@ -2938,7 +2938,7 @@ def test_child_exit_watchdog_does_not_kill_a_reader_still_draining_a_backlog(mon
     monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 0.2)
     # the child writes its whole backlog and exits immediately, so every line below is read AFTER
     # the direct child is already gone -- exactly the state that arms the watchdog.
-    script = "import sys\nfor i in range(8): print(f'step:{i}', flush=True)\nsys.exit(0)"
+    script = "import sys\nfor i in range(8): print(f'step: {i}', flush=True)\nsys.exit(0)"
     seen = []
 
     def slow_step(step: int) -> None:
@@ -2966,7 +2966,7 @@ def test_child_exit_watchdog_does_not_kill_a_reader_inside_one_long_callback(mon
     """
     monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 0.2)
     # the child exits immediately, so the callback below runs with the watchdog already armed.
-    script = "import sys\nprint('step:1', flush=True)\nsys.exit(0)"
+    script = "import sys\nprint('step: 1', flush=True)\nsys.exit(0)"
     finished = []
 
     def one_slow_step(step: int) -> None:
@@ -2993,7 +2993,7 @@ def test_child_exit_watchdog_leaves_a_healthy_quiet_child_alone(quick_teardown_g
     """
     # a grace of 0 would fire the instant the child exits, so any teardown observed here is
     # attributable to quiet alone.
-    script = "import time,sys; time.sleep(2); print('step:1', flush=True); sys.exit(0)"
+    script = "import time,sys; time.sleep(2); print('step: 1', flush=True); sys.exit(0)"
     code = vc.run_verl_training(
         [sys.executable, "-c", script],
         env=dict(os.environ),
@@ -3233,7 +3233,7 @@ def test_a_production_entry_point_does_not_leave_this_process_adopting_orphans()
         libc.prctl(_PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0)
         assert _child_subreaper_setting() == 0
 
-        code = vc.run_verl_training(["bash", "-c", "echo 'step:1'"], env=dict(os.environ))
+        code = vc.run_verl_training(["bash", "-c", "echo 'step: 1'"], env=dict(os.environ))
         assert code == 0
         # inside the test the claim is expected: the entry point needs it to reap its own orphans.
         assert _child_subreaper_setting() == 1, "the entry point never claimed adoption at all"
@@ -3258,7 +3258,7 @@ def test_the_conftest_fixture_restores_the_flag_the_entry_point_set():
         "import os\n"
         "from flash.engine.worker import backend_common as vc\n"
         "def test_claims_adoption():\n"
-        "    vc.run_verl_training(['bash', '-c', \"echo 'step:1'\"], env=dict(os.environ))\n"
+        "    vc.run_verl_training(['bash', '-c', \"echo 'step: 1'\"], env=dict(os.environ))\n"
         "    assert flag() == 1\n"
         "def test_zz_sees_it_restored():\n"
         "    assert flag() == 0, 'PR_SET_CHILD_SUBREAPER leaked into a later test'\n"
@@ -3442,7 +3442,7 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
         # a job that runs to completion and exits 0 -- no callback failure, no nonzero code, nothing
         # that routes through the error teardown. drive the real entry point rather than the sweep,
         # or this passes just as well with the sweep never wired into the success path.
-        code = vc.run_verl_training(["bash", "-c", "echo 'step:1'"], env=dict(os.environ))
+        code = vc.run_verl_training(["bash", "-c", "echo 'step: 1'"], env=dict(os.environ))
 
         assert code == 0
         assert not os.path.exists(f"/proc/{pid}"), (

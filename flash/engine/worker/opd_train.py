@@ -45,10 +45,7 @@ from flash.engine.worker.entry.opd import (  # noqa: F401
     _resolve_opd_knobs,
     _thinking_prefill_text,
 )
-from flash.engine.worker.io.heartbeat import (  # noqa: F401
-    liveness_heartbeat,
-    publishing_step_timing,
-)
+from flash.engine.worker.io.heartbeat import liveness_heartbeat
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.runtime.rng import seed_training_rngs  # noqa: F401
 from flash.engine.worker.sft_train import (  # noqa: F401

@@ -13,6 +13,7 @@ CLI tests reach them.
 
 from __future__ import annotations
 
+import math
 import time
 
 from flash.cli.ui.render import _dim
@@ -232,132 +233,6 @@ def _stale_setup_hint(
     )
 
 
-def _humanize_duration(seconds: float) -> str:
-    """A compact spoken duration ("92s", "13m", "4.8h") for a projected or remaining span."""
-    if seconds < 90:
-        return f"{seconds:.0f}s"
-    if seconds < 5400:
-        return f"{seconds / 60:.0f}m"
-    return f"{seconds / 3600:.1f}h"
-
-
-def _humanize_step_cost(seconds: float) -> str:
-    """A per-step cost, kept in seconds far longer than a span would be.
-
-    This number's whole use is comparison -- against another run, another config, or the horizon
-    being multiplied by it -- and the minute rounding a span can afford would print 92s and 149s
-    identically as "2m", hiding a 60% difference in what the run costs.
-
-    A sub-second pace keeps a decimal for the same reason: whole-second rounding would print a
-    measured step as "0s/step", which reads as no measurement at all beside a nonzero projection.
-    """
-    if seconds < 10:
-        return f"{seconds:.1f}s"
-    if seconds < 600:
-        return f"{seconds:.0f}s"
-    return f"{seconds / 60:.1f}m"
-
-
-def _finite_positive(value: object) -> float | None:
-    """A strictly positive finite float, or None -- the worker's field may be absent or junk."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    try:
-        number = float(value)
-    except OverflowError:
-        # json keeps an arbitrarily large literal as an int, where float() raises rather than
-        # returning inf. this helper's whole job is to answer "usable number or not", so a value
-        # too large to convert is junk like any other -- and letting it raise crashed the whole
-        # status view instead of dropping one row.
-        return None
-    if number <= 0 or number != number or number in (float("inf"), float("-inf")):
-        return None
-    return number
-
-
-def _snapshot_is_stale(heartbeat_age_seconds: float | None) -> bool:
-    """True when a stored countdown is old enough to no longer describe now.
-
-    Same threshold the panel already uses to flag a quiet heartbeat, so the pace row and the age row
-    agree about when a snapshot stopped being current instead of each drawing its own line.
-    """
-    return heartbeat_age_seconds is not None and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S
-
-
-def step_timing_pairs(
-    heartbeat: dict,
-    *,
-    running: bool,
-    heartbeat_age_seconds: float | None = None,
-) -> list[tuple[str, str]]:
-    """Rows for measured per-step cost and what it projects, when the worker has measured one.
-
-    Absent until a whole step has been timed, which is deliberate and is the entire point: the first
-    step carries engine init, the first weight sync and cache population, and extrapolating from it
-    over-estimated a measured run by 5.6x -- predicting 26.9h for a run that took 4.9h, and arguing
-    to cut ``max_examples`` on a run that fit comfortably. Showing nothing until there is a
-    steady-state number to show is what keeps that reading off the panel.
-
-    Only for a running run. On a finished one the real duration is on the record, so a projection
-    would be a worse answer to a question already settled.
-    """
-    if not running:
-        return []
-    per_step = _finite_positive(heartbeat.get("step_duration_s"))
-    if per_step is None:
-        return []
-    row = f"{_humanize_step_cost(per_step)}/step"
-    remaining = _finite_positive(heartbeat.get("projected_remaining_s"))
-    if remaining is not None:
-        # the projection is a SNAPSHOT taken when the worker published, and mid-training uploads are
-        # held for up to 900s. rendering a stored "~10m left" as current still reads ~10m eight
-        # minutes later, which is the one direction that matters: it understates how far along the
-        # run is and invites cancelling something that is nearly done. the pace itself does not go
-        # stale the same way -- it is a rate, not a countdown -- so only the countdown is qualified.
-        as_of = " when last reported" if _snapshot_is_stale(heartbeat_age_seconds) else ""
-        row += f" · ~{_humanize_duration(remaining)} left at this rate{as_of}"
-    pairs = [("pace", row)]
-    if heartbeat.get("wall_deadline_at_risk"):
-        wall = _finite_positive(heartbeat.get("remaining_wall_s"))
-        # the wall is named only when the worker sent it, so the warning never cites a number the
-        # panel cannot show. without it the warning still stands on the projection alone.
-        # both sides of this comparison were measured at the same instant on the worker, so the
-        # verdict stays valid as it ages -- but the wall figure it QUOTES is a countdown like the
-        # projection, and naming it as current would overstate the remaining allowance by however
-        # long the upload was held.
-        as_of = " when last reported" if _snapshot_is_stale(heartbeat_age_seconds) else ""
-        against = f" against {_humanize_duration(wall)} of wall time left{as_of}" if wall else ""
-        # the worker warns from 90% of the allowance, so the flag covers two different situations
-        # and they deserve different words. a projection that still FITS is a headroom warning: the
-        # final checkpoint upload runs after the last step and can take minutes on a large model,
-        # which is what eats a thin margin. saying "expected to be cut off" there would assert a
-        # cutoff the measurement does not show, and a warning that overstates its case on the runs
-        # that go on to finish is how a row gets ignored on the runs that do not.
-        # the advice names the STEP horizon only. `max_steps`, when set, is the authoritative
-        # optimizer-update count and `resolve_update_horizon` ignores the derived one -- so telling
-        # an operator to cut `max_examples` on such a run buys a relaunch that is projected to hit
-        # the same cutoff. the panel cannot tell the two configurations apart (the heartbeat carries
-        # no horizon provenance), so it recommends the knob that shortens the run either way.
-        fits = remaining is not None and wall is not None and remaining <= wall
-        if fits:
-            warning = (
-                f"at this rate the remaining steps only just fit the run's wall limit{against}, "
-                "leaving little room for the final checkpoint upload, which runs after the last "
-                "step and can take minutes on a large model. if the margin matters, relaunch with "
-                "a shorter [train] step horizon rather than risking the last save"
-            )
-        else:
-            warning = (
-                f"at this rate the remaining steps do not fit the run's wall limit{against}, so "
-                "training is expected to be cut off before the last step. checkpoints already "
-                "published at your save steps survive, but the steps after the cutoff never run - "
-                "so if you need the full horizon, relaunch with a shorter [train] step horizon "
-                "rather than paying out the rest of this one"
-            )
-        pairs.append(("wall limit", warning))
-    return pairs
-
-
 def _stale_step_hint(
     heartbeat: dict,
     heartbeat_age_seconds: float | None,
@@ -433,6 +308,62 @@ def _superseded_hint(
     )
 
 
+def _finite_positive(value: object) -> float | None:
+    """return a finite positive number from an untrusted heartbeat field."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if number > 0 and math.isfinite(number) else None
+
+
+def _humanize_duration(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def _humanize_step_duration(seconds: float) -> str:
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    if seconds < 600:
+        return f"{seconds:.0f}s"
+    return f"{seconds / 60:.1f}m"
+
+
+def _step_timing_pairs(
+    heartbeat: dict,
+    *,
+    running: bool,
+    current_attempt: bool,
+) -> list[tuple[str, str]]:
+    """render measured RL pace only for the live running attempt."""
+    if not running or not current_attempt or heartbeat.get("stage") != "rl_step":
+        return []
+    step_duration_s = _finite_positive(heartbeat.get("step_duration_s"))
+    if step_duration_s is None:
+        return []
+
+    projected_remaining_s = _finite_positive(heartbeat.get("projected_remaining_s"))
+    pace = f"{_humanize_step_duration(step_duration_s)}/step"
+    if projected_remaining_s is not None:
+        pace += f" · ~{_humanize_duration(projected_remaining_s)} left"
+
+    pairs = [("pace", pace)]
+    if heartbeat.get("wall_deadline_at_risk") is True and projected_remaining_s is not None:
+        pairs.append(
+            (
+                "warning",
+                "at this pace the projected remaining training exceeds the run's wall time left",
+            )
+        )
+    return pairs
+
+
 def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     """Worker heartbeat rows for the status panel: stage, step, age, and a quiet-is-normal hint."""
     hb = obj.get("last_heartbeat")
@@ -464,6 +395,13 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     if datacenter:
         label = "datacenter" if from_current_attempt else "datacenter (previous attempt)"
         pairs.append((label, str(datacenter)[:64]))
+    pairs.extend(
+        _step_timing_pairs(
+            hb,
+            running=running,
+            current_attempt=from_current_attempt,
+        )
+    )
     stale_step = _stale_step_hint(
         hb,
         heartbeat_age_seconds,
@@ -500,15 +438,6 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         )
         if warmup:
             pairs.append(("warmup", warmup))
-    # measured pace, and what it projects. only for the live attempt: a superseded ping's rate was
-    # measured on a worker that no longer exists, and the replacement may be on different hardware
-    # entirely, so presenting it as this run's pace would be a confident wrong number.
-    if from_current_attempt:
-        pairs += step_timing_pairs(
-            hb,
-            running=running,
-            heartbeat_age_seconds=heartbeat_age_seconds,
-        )
     age = _humanize_age_seconds(heartbeat_age_seconds)
     if age:
         # the progress row already explains this silence, and does it more precisely. show one or

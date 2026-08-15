@@ -5297,7 +5297,6 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
         on_line=lambda _line: None,
         child_heartbeat=lambda: None,
         liveness_fields=dict,
-        step_timing_fields=dict,
         child_tail=None,
         wandb_link={"wandb_url": None, "wandb_id": None},
     )
@@ -5305,7 +5304,7 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
     monkeypatch.setattr(opd_runner._opd_train, "build_opd_overrides", lambda _config: [])
     monkeypatch.setattr(opd_runner._opd_train, "_OpdProgressState", ProgressState)
     monkeypatch.setattr(opd_runner, "_build_checkpoint_watcher", lambda *_args: Watcher())
-    monkeypatch.setattr(opd_runner, "_build_child_callbacks", lambda *_args, **_kw: callbacks)
+    monkeypatch.setattr(opd_runner, "_build_child_callbacks", lambda *_args: callbacks)
     monkeypatch.setattr(opd_runner, "_build_child_env", lambda *_args: {})
     monkeypatch.setattr(opd_runner._opd_train, "_NvidiaSmiPeakSampler", GpuSampler)
     monkeypatch.setattr(
@@ -6693,14 +6692,15 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
 def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch):
     """the step-match guard must not silently disable the rate in production.
 
-    on_line and on_step now gate on the SAME ``verl_step_number``. They used to use two different
-    parsers, and a shape where those disagreed would omit the rate on every heartbeat and leave the
-    feature dead without failing anything. These are the shapes verl actually emits: ray tags worker
-    stdout with a pid prefix, and LocalLogger shares its stream with tqdm, which ends a bar with "]"
-    and no newline so the metric line arrives glued to it.
+    on_line gates on verl_step_number, on_step on backend_common's own step_pattern. the two
+    parsers are different, so a shape where they disagree would omit the rate on every heartbeat
+    and leave the feature dead without failing anything. these are the shapes verl actually
+    emits: ray tags worker stdout with a pid prefix, and LocalLogger shares its stream with tqdm,
+    which ends a bar with "]" and no newline so the metric line arrives glued to it.
     """
+    import re
+
     import flash.engine.worker.opd_train_runner as opd_runner
-    from flash.engine.worker.backend_common import verl_step_number
 
     emitted = []
     monkeypatch.setattr(
@@ -6715,13 +6715,14 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
         0,
     )
 
-    # the step number reaching on_step is the one run_verl_training parses, not a hand-picked int.
+    # the step number reaching on_step is the one backend_common parses, not a hand-picked int.
+    step_re = re.compile(r"step:\s*(\d+)")
     for line in (
         "(TaskRunner pid=3125) step:1 - actor/distillation/loss:0.5",
         "Epoch 1/1:  25%|##   | 1/4 [01:21<04:04, 81.49s/it]step:2 - actor/distillation/loss:0.4",
     ):
         callbacks.on_line(line)
-        callbacks.on_step(verl_step_number(line))
+        callbacks.on_step(int(step_re.search(line).group(1)))
 
     assert [payload["step"] for _, payload in emitted] == [1, 2]
     assert all("truncation_rate" in payload for _, payload in emitted)
