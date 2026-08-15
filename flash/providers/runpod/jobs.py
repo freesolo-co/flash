@@ -342,7 +342,7 @@ def _health_deadline_in(
     probe_at: float | None,
     cadence: float,
     classifier_remaining: float,
-) -> float:
+) -> tuple[float, bool]:
     """When a health grace can actually FIRE, not when it nominally runs out.
 
     `_classify_queue_state` evaluates the unhealthy/throttled timers only on the probe cadence, so a
@@ -365,18 +365,23 @@ def _health_deadline_in(
     cannot also EXPIRE on the pass that arms it, which is what dropping that first check from its
     candidate list expresses. `expired()` fires on `now - since > grace`, strictly, so a probe
     landing exactly ON the deadline does not fire it and the one after does.
+    Returns (fires_in, on_this_pass). `fires_in` alone cannot express the difference between "the
+    call below fires it now" and "a future probe is already overdue and fires the instant it runs":
+    both are zero seconds away, but only the first happens before `_classify_stall`. The flag keeps
+    the second behind the checks that still run this iteration.
     """
     # the call below this note is the only chance to fire on THIS pass, and it reads the classifier
     # clock -- not the post-request one this note is stamped with.
     if armed and classifier_remaining < 0.0:
-        return 0.0
-    # when the next probe is due, relative to `now`; never negative, and 0 when already due.
+        return 0.0, True
+    # when the next probe is due, relative to `now`; never negative, and 0 when already due. A
+    # request longer than a whole cadence leaves it at 0 -- due, but on the NEXT iteration.
     next_probe_in = 0.0 if probe_at is None else max(probe_at + cadence - now, 0.0)
     if next_probe_in > raw_remaining:
-        return next_probe_in
+        return next_probe_in, False
     # the first probe strictly beyond the grace's own deadline
     extra = math.floor((raw_remaining - next_probe_in) / cadence) + 1
-    return next_probe_in + extra * cadence
+    return next_probe_in + extra * cadence, False
 
 
 def queue_wait_note(
@@ -431,7 +436,11 @@ def queue_wait_note(
     # slow health request pushed both them and the no-progress limit past due, _classify_stall is the
     # next check to run and `stalled` is what the operator will see. Ranking "most overdue" first
     # would name a deadline this iteration has already declined to act on.
-    health_order, stall_order, wall_order, capacity_order = 0, 1, 2, 3
+    # this iteration: the expired() calls below, then _classify_stall. Then the next iteration: the
+    # wall check, the capacity timer inside _classify_queue_state, and only after it the health
+    # timers again -- so a health probe that is due but has not run yet sorts LAST, not first.
+    health_order, stall_order = 0, 1
+    wall_order, capacity_order, next_iteration_health_order = 2, 3, 4
     # whether the `expired()` calls below fire on THIS pass depends on the clock the classifier
     # handed them, which a slow health request leaves behind the one this note is stamped with.
     # Defaults to `now` for callers that do not separate the two.
@@ -445,7 +454,7 @@ def queue_wait_note(
         if not active:
             continue
         waited = 0.0 if since is None else now - since
-        remaining = _health_deadline_in(
+        remaining, on_this_pass = _health_deadline_in(
             grace - waited,
             armed=since is not None,
             now=now,
@@ -453,7 +462,10 @@ def queue_wait_note(
             cadence=cadence,
             classifier_remaining=grace if since is None else grace - (pass_now - since),
         )
-        candidates.append((remaining, health_order, waited, grace, label, ""))
+        # a probe that is overdue but has not run yet fires on the NEXT iteration, after
+        # _classify_stall and the wall check. Only a timer the call below fires keeps health_order.
+        order = health_order if on_this_pass else next_iteration_health_order
+        candidates.append((remaining, order, waited, grace, label, ""))
     # the caller only asks for a note when it has just confirmed no usable or recovering worker, so
     # the capacity timer is either running or about to re-arm on the next poll. a cleared `since`
     # therefore means zero elapsed, not "not applicable": _classify_queue_state clears it via the

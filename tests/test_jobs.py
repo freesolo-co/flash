@@ -932,17 +932,16 @@ def test_a_timer_armed_on_this_probe_is_not_charged_the_arming_delay_twice():
     assert HEALTH_PROBE_GATE_S == 90.0
     # 240s of grace armed at this probe, at a cadence of 90: probes land at +90, +180, +270, and
     # only the last is past the deadline. Three cadences, not four.
-    assert (
-        _health_deadline_in(
-            240.0,
-            armed=False,
-            now=0.0,
-            probe_at=0.0,
-            cadence=90.0,
-            classifier_remaining=240.0,
-        )
-        == 270.0
+    fires_in, on_this_pass = _health_deadline_in(
+        240.0,
+        armed=False,
+        now=0.0,
+        probe_at=0.0,
+        cadence=90.0,
+        classifier_remaining=240.0,
     )
+    assert fires_in == 270.0
+    assert not on_this_pass  # a future probe, so it ranks behind this iteration's checks
 
     # which is what makes the note pick the deadline that actually fires, at the production pairing
     # of a 240s unhealthy grace against a 300s capacity grace.
@@ -1038,6 +1037,103 @@ def test_a_health_timer_within_grace_at_the_classifier_clock_is_not_reported_as_
         stall_limit_s=3000.0,
     )
     assert "unhealthy grace" in really_due, really_due
+
+
+def test_an_overdue_probe_that_has_not_run_yet_ranks_behind_this_iterations_checks():
+    # "Fires in 0s" hides two different things. A timer the expired() call below fires happens
+    # before _classify_stall; an overdue probe that has not RUN yet happens on the next iteration,
+    # after the stall check and the wall check. When a health request outlasts a whole cadence,
+    # `next_probe_in` collapses to 0 and the raw remainder goes negative, so the health candidate
+    # looked immediately due and won on health_order -- while expired() reads the earlier classifier
+    # clock and cannot fire, and a newly spent no-progress limit fires moments later.
+    long_request = _note(
+        400.0,  # the request took 170s, longer than the 100s cadence
+        classifier_now=230.0,  # expired() sees 230s of a 240s grace: it cannot fire
+        probe_at=230.0,
+        interval_s=10.0,
+        unhealthy=True,
+        unhealthy_since=0.0,
+        unhealthy_grace_s=240.0,
+        queued_since=0.0,
+        queue_grace_s=100_000.0,
+        stall_since=0.0,
+        stall_limit_s=350.0,  # spent at the fresh clock: this is what fires next
+    )
+    assert "no-progress limit" in long_request, long_request
+    assert "unhealthy" not in long_request, long_request
+
+    # the ordering only applies to a probe that has not run: a timer genuinely spent at the
+    # classifier clock is fired by the call below the note and is still reported first.
+    fires_here = _note(
+        400.0,
+        classifier_now=400.0,
+        probe_at=230.0,
+        interval_s=10.0,
+        unhealthy=True,
+        unhealthy_since=0.0,
+        unhealthy_grace_s=240.0,
+        queued_since=0.0,
+        queue_grace_s=100_000.0,
+        stall_since=0.0,
+        stall_limit_s=350.0,
+    )
+    assert "unhealthy grace" in fires_here, fires_here
+
+
+def test_a_spent_health_grace_is_not_delayed_by_a_blocking_heartbeat_read(monkeypatch):
+    # Same argument as the capacity grace: once an armed health timer is past its grace AND a probe
+    # is due to check it, this poll returns a terminal verdict regardless -- `stalled` for unhealthy,
+    # `no_capacity` for throttled. The heartbeat reader is an HF artifact download on real runs, so
+    # reading it first puts network I/O in front of a retry or GPU-class escalation already decided.
+    import importlib
+    import io
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    # imported separately and AFTER `jobs`: job_execution and jobs import each other, so pulling
+    # job_execution in first leaves `jobs` half-initialised and raises ImportError.
+    job_execution = importlib.import_module("flash.providers.runpod.job_execution")
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fp, **_kw: {"workers": {"unhealthy": 1}},
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+
+    # record the unhealthy-timer age at each reader call: the deciding poll is the one whose age has
+    # passed the grace with a probe due, and the reader must not be called on it.
+    ages = []
+    real_update = job_execution._update_heartbeat
+
+    def _spy_update(context, state):
+        since = state.unhealthy_timer.since
+        ages.append(None if since is None else jobs.time.time() - since)
+        return real_update(context, state)
+
+    monkeypatch.setattr(job_execution, "_update_heartbeat", _spy_update)
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        log=io.StringIO(),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=100_000.0,
+        stall_after_s=100_000.0,
+        queue_grace_s=100_000.0,  # keep capacity wide open so only the health timer can end this
+        unhealthy_grace_s=240.0,
+        on_last_gpu=False,
+    )
+    assert res.failure == "stalled", res
+    spent = [a for a in ages if a is not None and a > 240.0]
+    assert not spent, (
+        f"the heartbeat was read on a poll whose unhealthy grace was already spent: {ages}"
+    )
 
 
 def test_a_deadline_already_declined_this_iteration_does_not_outrank_the_next_check():

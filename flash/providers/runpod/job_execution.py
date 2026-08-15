@@ -438,19 +438,38 @@ def _probe_worker_coming_up_at(context: _PollContext, now: float) -> float | Non
 def _queue_deadline_already_spent(
     context: _PollContext, state: _PollState, status: Any, now: float
 ) -> bool:
-    """True when the capacity grace is spent, so this poll will return `no_capacity` regardless.
+    """True when a queue deadline is spent, so this poll returns a terminal verdict regardless.
+
+    Three timers can end the wait here and none of them can be changed by a heartbeat: the capacity
+    grace (`no_capacity`), and the unhealthy and throttled graces once a probe is due to check them
+    (`stalled` / `no_capacity`). The heartbeat reader is an HF artifact download on real runs, so
+    reading it first would put network I/O in front of a retry or a GPU-class escalation that is
+    already decided -- and in front of a line that is never printed on those paths.
 
     Read-only and side-effect free, unlike `_classify_queue_state`: it must not consume the health
     probe budget or arm anything. Deliberately conservative -- the classifier may still re-probe at
-    the boundary and find a worker coming up, in which case the run continues and the heartbeat is
-    read on the next poll. Being wrong here only defers a heartbeat by one iteration; being wrong
-    the other way blocks a capacity escalation behind a network read that cannot change its verdict.
+    the boundary and find a worker coming up, or a fresh health read may clear a spent health timer,
+    in which case the run continues and `poll_job` reads the heartbeat right after. Being wrong here
+    only defers a heartbeat within the same iteration; being wrong the other way blocks a terminal
+    verdict behind a network read that cannot change it.
     """
-    return (
-        status == "IN_QUEUE"
-        and state.queued_timer.since is not None
+    if status != "IN_QUEUE" or _worker_is_coming_up(state.worker_coming_up_at, now):
+        return False
+    if (
+        state.queued_timer.since is not None
         and now - state.queued_timer.since > context.queue_grace_s
-        and not _worker_is_coming_up(state.worker_coming_up_at, now)
+    ):
+        return True
+    # a health grace is only actionable on a poll that will actually re-read health: the classifier
+    # returns early otherwise, leaving the timer untouched and the verdict unchanged.
+    if now - state.last_health_probe <= _jobs.HEALTH_PROBE_GATE_S:
+        return False
+    return any(
+        timer.since is not None and now - timer.since > grace
+        for timer, grace in (
+            (state.unhealthy_timer, context.unhealthy_grace_s),
+            (state.throttled_timer, context.throttled_grace_s),
+        )
     )
 
 
@@ -492,7 +511,7 @@ def _classify_queue_state(
         state.unhealthy_timer.since = None
         state.throttled_timer.since = None
         return None
-    if now - state.last_health_probe <= 90:
+    if now - state.last_health_probe <= _jobs.HEALTH_PROBE_GATE_S:
         return None
     state.last_health_probe = now
     try:
