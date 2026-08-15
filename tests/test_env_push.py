@@ -10429,6 +10429,101 @@ def test_png_compressed_text_chunks_are_decoded(tmp_path):
     assert credential_in_file(clean) is None
 
 
+def test_png_iccp_profiles_are_decoded(tmp_path):
+    """png iccp profiles are scanned, while an ordinary colour profile stays publishable."""
+    import struct
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            len(payload).to_bytes(4, "big")
+            + kind
+            + payload
+            + zlib.crc32(kind + payload).to_bytes(4, "big")
+        )
+
+    def image(packed_profile: bytes) -> bytes:
+        ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+        built = (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"iCCP", b"ICC Profile\x00\x00" + packed_profile)
+            + chunk(b"IDAT", zlib.compress(b"\x00\xff\xff\xff"))
+            + chunk(b"IEND", b"")
+        )
+        at, kinds = 8, []
+        while at < len(built):
+            size = int.from_bytes(built[at : at + 4], "big")
+            kind = built[at + 4 : at + 8]
+            payload = built[at + 8 : at + 8 + size]
+            crc = built[at + 8 + size : at + 12 + size]
+            assert zlib.crc32(kind + payload).to_bytes(4, "big") == crc
+            kinds.append(kind)
+            at += 12 + size
+        assert kinds == [b"IHDR", b"iCCP", b"IDAT", b"IEND"]
+        return built
+
+    secret = tmp_path / "secret-profile.png"
+    secret.write_bytes(image(zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())))
+    assert credential_in_file(secret) == "a Freesolo API key"
+
+    harmless = tmp_path / "ordinary-profile.png"
+    harmless.write_bytes(image(zlib.compress(b"an ordinary colour profile " * 40)))
+    assert credential_in_file(harmless) is None
+
+    malformed = tmp_path / "malformed-profile.png"
+    malformed.write_bytes(image(b"not a zlib stream"))
+    with pytest.raises(_Unscannable, match="filter this cannot undo"):
+        credential_in_file(malformed)
+
+
+def test_png_compressed_metadata_is_scanned_inside_zip(tmp_path):
+    """a nested png gets the same compressed-metadata scan as the identical top-level image."""
+    import struct
+    import zipfile
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            len(payload).to_bytes(4, "big")
+            + kind
+            + payload
+            + zlib.crc32(kind + payload).to_bytes(4, "big")
+        )
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    image = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"zTXt", b"Comment\x00\x00" + zlib.compress(key))
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\xff\xff"))
+        + chunk(b"IEND", b"")
+    )
+    at = 8
+    while at < len(image):
+        size = int.from_bytes(image[at : at + 4], "big")
+        kind = image[at + 4 : at + 8]
+        payload = image[at + 8 : at + 8 + size]
+        assert (
+            zlib.crc32(kind + payload).to_bytes(4, "big") == image[at + 8 + size : at + 12 + size]
+        )
+        at += 12 + size
+
+    top_level = tmp_path / "profile.png"
+    top_level.write_bytes(image)
+    assert credential_in_file(top_level) == "a Freesolo API key"
+
+    nested = tmp_path / "images.zip"
+    with zipfile.ZipFile(nested, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("profile.png", image)
+    assert credential_in_file(nested) == "a Freesolo API key"
+
+
 def test_cpio_symlink_targets_are_scanned_like_names(tmp_path):
     """a cpio symlink body is a published target path, not only generic content."""
     import shutil
@@ -10463,3 +10558,47 @@ def test_cpio_symlink_targets_are_scanned_like_names(tmp_path):
     published.write_bytes(built.stdout)
     with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
         credential_in_file(published)
+
+
+def test_cpio_shell_members_preserve_filename_context(tmp_path):
+    """a cpio sh member has the same shell verdict as its identical standalone bytes."""
+    import shutil
+    import subprocess
+
+    from flash.env_secrets import credential_in_file
+
+    if shutil.which("cpio") is None:
+        pytest.skip("cpio is not installed")
+
+    work = tmp_path / "cpio-shell"
+    work.mkdir()
+    script = work / "member.sh"
+
+    def archive_current(label: str) -> Path:
+        built = subprocess.run(
+            ["cpio", "-o", "-H", "newc"],
+            input=b"member.sh\n",
+            cwd=work,
+            check=True,
+            capture_output=True,
+        )
+        listed = subprocess.run(
+            ["cpio", "-it"], input=built.stdout, check=True, capture_output=True
+        )
+        assert listed.stdout.splitlines() == [b"member.sh"]
+        archive = tmp_path / f"{label}.cpio"
+        archive.write_bytes(built.stdout)
+        return archive
+
+    key = f"fslo_{_FAKE_KEY_BODY}"
+    escaped = f"#!/bin/sh\nexport K='{key[:20]}\\x42{key[20:]}'\n".encode()
+    script.write_bytes(escaped)
+    assert script.read_bytes() == escaped
+    assert credential_in_file(script) is None
+    assert credential_in_file(archive_current("escaped")) is None
+
+    intact = f"#!/bin/sh\nexport K='{key}'\n".encode()
+    script.write_bytes(intact)
+    assert script.read_bytes() == intact
+    assert credential_in_file(script) == "a Freesolo API key"
+    assert credential_in_file(archive_current("intact")) == "a Freesolo API key"

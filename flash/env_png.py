@@ -1,8 +1,8 @@
 """Compressed textual metadata extraction from PNG images.
 
-PNG stores zTXt text and optionally iTXt text in zlib streams inside typed chunks. Those streams
-start after the PNG and chunk framing, so the head-anchored compressed-stream scanner cannot see
-them. This module only recovers the declared textual metadata. Pixel data remains image content.
+PNG stores zTXt and iTXt text plus iCCP colour profiles in zlib streams inside typed chunks.
+Those streams start after the PNG and chunk framing, so the head-anchored compressed-stream scanner
+cannot see them. This module only recovers the declared metadata. Pixel data remains image content.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _inflate_png_text(payload: bytes, budget: int, unreadable: type[Exception]) 
 
 
 def _ztxt_payload(payload: bytes, budget: int, unreadable: type[Exception]) -> bytes | None:
-    """The decoded text in one zTXt chunk."""
+    """The decoded value in one zTXt or iCCP chunk."""
     end = _png_keyword_end(payload, unreadable)
     if len(payload) <= end + 1 or payload[end + 1] != 0:
         raise unreadable("unsupported PNG text compression method")
@@ -67,7 +67,7 @@ def _itxt_payload(payload: bytes, budget: int, unreadable: type[Exception]) -> b
 def _png_text_payloads(
     data: bytes, budget: int, unreadable: type[Exception]
 ) -> Iterator[bytes | None]:
-    """Every decoded zTXt and iTXt value in a structurally complete PNG."""
+    """Every decoded zTXt, iTXt, and iCCP value in a structurally complete PNG."""
     if not data.startswith(_PNG_SIGNATURE):
         return
     at = len(_PNG_SIGNATURE)
@@ -85,7 +85,7 @@ def _png_text_payloads(
             raise unreadable("PNG does not begin with IHDR")
         first = False
         payload = data[payload_at : payload_at + size]
-        if kind == b"zTXt":
+        if kind in (b"zTXt", b"iCCP"):
             yield _ztxt_payload(payload, budget, unreadable)
         elif kind == b"iTXt":
             yield _itxt_payload(payload, budget, unreadable)

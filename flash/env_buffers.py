@@ -23,6 +23,7 @@ from flash.env_patterns import (
     _RecordHalves,
     _RecordSplitter,
 )
+from flash.env_png import _PNG_SIGNATURE
 
 # Read in bounded chunks so a large dataset member is never held in memory whole. This costs no
 # more I/O than the publish already pays: `_tar_b64` reads every one of these bytes to gzip them.
@@ -141,8 +142,8 @@ def _looks_like_container(data: bytes) -> bool:
         or _looks_like_tar(data)
         # ar has no nested predicate elsewhere: a top-level archive was walked by its handler, while
         # the same bytes inside a zip were treated as final content and hid a compressed key member.
-        # pdf object streams need the same dispatch as ar members when either sits one layer in.
-        or data.startswith((b"!<arch>\n", b"!<thin>\n", b"%PDF-"))
+        # pdf and png metadata need the same dispatch when either sits one layer in.
+        or data.startswith((b"!<arch>\n", b"!<thin>\n", b"%PDF-", _PNG_SIGNATURE))
         # use the shared structural gate so crc, odc, and binary cpio cannot become top-level-only
         # formats. each walker still validates every member boundary before trusting its payload.
         or _looks_like_cpio_header(data)

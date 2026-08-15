@@ -633,7 +633,9 @@ def _scan_cpio_member(
     body = data[body_at:body_end]
     if stat.S_ISLNK(mode) and (kind := named(body.decode("utf-8", "replace"))):
         return kind, False
-    return scan(io.BytesIO(body), deadline, depth), False
+    member = io.BytesIO(body)
+    member.name = name
+    return scan(member, deadline, depth), False
 
 
 def _credential_in_newc(
