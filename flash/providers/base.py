@@ -234,6 +234,10 @@ class CapacityLookupError(RuntimeError):
     """
 
 
+class CapacityUnavailableError(CapacityLookupError):
+    """A live provider answered successfully but currently offers no fitting capacity."""
+
+
 class UnreconciledCreateError(RuntimeError):
     """An ambiguous non-idempotent create could not be reconciled.
 

@@ -697,8 +697,8 @@ def _read_json_records(path: Path) -> list[dict]:
     return value
 
 
-def preflight_validate_image_opd(spec) -> None:
-    """Validate statically discoverable image OPD datasets before GPU allocation."""
+def preflight_validate_image_opd(spec, *, scan_packaged_environment: bool = True) -> None:
+    """validate statically discoverable image opd datasets before gpu allocation."""
     if getattr(spec, "algorithm", "") != "opd":
         return
     environment = getattr(spec, "environment", None)
@@ -708,6 +708,8 @@ def preflight_validate_image_opd(spec) -> None:
         if not isinstance(records, list) or not all(isinstance(row, dict) for row in records):
             return
     else:
+        if not scan_packaged_environment:
+            return
         from flash.envs.loader import (
             _packaged_dataset_file,
             _resolve_environment_reference,
