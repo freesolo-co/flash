@@ -51,20 +51,28 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     scores at most three offline gold replays, never a group of policy samples, so it cannot know
     what a real rollout group would pay.
     The end-of-run advantage-spread guard catches that only after the GPUs are paid for. An
-    all-`echo` run is reported differently and more weakly, because zero is the _correct_ score for
+    For a non-GRPO run the warning says what is actually true of it: SFT and OPD never read
+    `env.reward`, so an all-zero scorer costs that run nothing and a placeholder `reward()` on an
+    SFT-only environment is a legitimate choice. It reports that the run is no evidence the grader
+    works - so the PASS is not clearance to train GRPO on the same environment later - instead of
+    sending the author to debug a function this algorithm never calls.
+    An all-`echo` run is reported differently and more weakly, because zero is the _correct_ score for
     the deliberate junk echo replays - what is wrong there is that no gold text was ever scored,
     which includes a real gold completion whose payload sits outside `content`: a native tool call
     keeps its arguments in `tool_calls` and leaves `content` null. That row is a correct SFT target,
     so it gets the opposite remedy - the warning says explicitly not to add assistant text to
     satisfy the check, and to exercise the reward function against a sampled rollout instead, rather
     than sending the author to corrupt a working target. It stays silent when the grader was proven
-    to separate - a
-    centered scale paying gold 0.0 and junk -1.0, or a per-turn vector that separates while the
-    scalar is only a placeholder - since both have a real gradient and calling them unmeasured
-    would be false. Both probes behind that judgement are spent only where their answer can change
-    what the command prints, and neither is free: the junk probe drives a whole extra episode, and
-    the per-turn probe runs the environment's own `score_episodes`, which may be a paid judge. A
-    healthy environment reaches neither, so it is billed exactly what it was before this change.
+    to separate - a centered scale paying gold 0.0 and junk -1.0, or a per-turn vector that
+    separates while the scalar is only a placeholder - since both have a real gradient and calling
+    them unmeasured would be false. Neither probe behind that judgement is free: the junk probe
+    drives a whole extra episode through user code, and the per-turn probe runs the environment's
+    own `score_episodes`, which may be the same paid judge the episodes just used. Both are spent
+    only where their answer can change what the command prints _and_ the algorithm trains from the
+    reward, since for SFT and OPD the answer could only soften a warning about a number that is
+    never read. Billing is therefore unchanged from the previous release in every case measured
+    against a counting grader: a healthy environment costs one call under both SFT and GRPO, and an
+    all-zero environment costs one under SFT and OPD and three under GRPO, exactly as before.
   - **A gold replay that never terminates.** An environment applying every move twice can solve no
     board, yet gold scored 0.60-0.65, beat a junk answer, and burned the full turn cap - clearing
     every existing check. What exposed it in the field was reading `turns=12` on a board with a
@@ -82,7 +90,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     that ran out before the cap names both explanations and puts the cheaper one first, since
     extending a dataset row costs less than auditing termination logic that works. Only a reference
     that covered every turn and still never finished leaves the environment as the sole
-    explanation. The ceiling compared against is the
+    explanation - and even then the wording stops short of a verdict, because `rollout_done`
+    returns True at `turn >= cap` regardless of `state["done"]`, so a fixed-length episode that ends
+    purely by using its whole budget is a supported shape that never sets `done` and is
+    indistinguishable from a dead one here. Both are reported, the reward that separates them in
+    practice is quoted on the line, and the reader is told which reading applies to which. The
+    ceiling compared against is the
     _effective_ one: a row setting `max_episode_turns` below the dataset-wide `max_turns` is stopped
     by its own budget, which `rollout_done` gives precedence, so measuring exhaustion against
     `max_turns` alone silenced this warning for exactly the rows whose budget is tightest.
