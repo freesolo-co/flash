@@ -1154,7 +1154,10 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # the wedge signal is STAGED HEARTBEATS, not console bytes: a stuck worker still logs, so a
     # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
     assert "quiet_polls = 0 if staged else quiet_polls + 1" in body
-    assert "count(b'\"stage\":')" in body
+    # and liveness pings are SUBTRACTED, not counted: they carry "stage" like every other payload
+    # and print every 30s from a daemon, so counting them reads a wedge as progress forever.
+    assert "count(b'\"stage\":') - buf.count(b'\"liveness\":')" in body
+    assert "max(0, buf.count" in body  # floored: a negative count is truthy and reads as progress
 
 
 def _drive_instance_upload_loop(
@@ -1386,28 +1389,51 @@ def test_instance_console_upload_loop_detects_a_wedge_that_keeps_logging(monkeyp
 def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     """The wedge signal itself, unmocked: every loop test above patches _console_progress out.
 
-    Two properties, both load-bearing. It must count only STAGED heartbeats -- an unstaged liveness
-    ping carries no ``"stage"`` key and is exactly what a wedged worker keeps emitting, so counting
-    every heartbeat line would report progress for a run making none. And it must count only bytes
-    past ``offset``: a console reaching hundreds of MB is rescanned every poll otherwise, and a
-    heartbeat from the healthy prefix would be recounted forever, so the wedge never registers.
+    Three properties, all load-bearing. It must count only heartbeats that REPRESENT progress: every
+    payload carries ``"stage"``, liveness pings included (``heartbeat.py`` adds ``"liveness": True``
+    to the same flat object), and those print every 30s from a daemon thread -- so a worker wedged
+    inside a liveness block would look busy forever. ``poll`` refuses to advance its stall key on
+    them for exactly this reason, and disagreeing means the run is torn down with no console. It
+    must not report a negative count either, since a bare negative is truthy and reads as progress.
+    And it must count only bytes past ``offset``: a console reaching hundreds of MB is rescanned
+    every poll otherwise, and a heartbeat from the healthy prefix would be recounted forever.
     """
+    import json
+
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
 
+    def _hb(**kw) -> bytes:
+        # the real console line: heartbeat.py prints "HEARTBEAT " + json.dumps(payload).
+        payload = {"stage": "train", "ts": 1.0, "run_id": "r", "mode": "train", **kw}
+        return f"HEARTBEAT {json.dumps(payload)}\n".encode()
+
     console = tmp_path / "console_train.txt"
-    staged = b'HEARTBEAT {"stage": "train", "step": 1}\n'
-    unstaged = b'HEARTBEAT {"beat": 7}\nray warning: worker is idle\n'
-    console.write_bytes(staged + unstaged)
+    progress = _hb(step=7)
+    pings = _hb(liveness=True) + b"ray warning: worker is idle\n"
+    console.write_bytes(progress + pings)
 
     size, beats = _instance_bootstrap._console_progress(str(console), 0)
-    assert (size, beats) == (len(staged) + len(unstaged), 1)
+    assert (size, beats) == (len(progress) + len(pings), 1)
 
-    # the wedge: bytes keep arriving, no staged heartbeat among them.
+    # the wedge: heartbeats keep arriving, but every one is a liveness ping.
     with open(console, "ab") as f:
-        f.write(unstaged * 3)
+        f.write(pings * 3)
     size2, beats2 = _instance_bootstrap._console_progress(str(console), size)
-    assert beats2 == 0, "chatter after the last staged heartbeat must not read as progress"
-    assert size2 == size + len(unstaged) * 3
+    assert beats2 == 0, "liveness pings after the last real heartbeat must not read as progress"
+    assert size2 == size + len(pings) * 3
+
+    # a poll boundary can split a line and leave the "liveness" half alone in the chunk, so the
+    # subtraction goes to -1. It must floor at zero: a bare negative is TRUTHY in python, so it
+    # would reset quiet_polls and read the wedge as progress -- the exact bug being fixed, arriving
+    # through the fix. The offset is computed from the line, not guessed: a guessed one that
+    # happens to include both keys makes this assertion vacuous.
+    solo = tmp_path / "console_split.txt"
+    ping = _hb(liveness=True)
+    solo.write_bytes(ping)
+    cut = ping.index(b'"liveness":') - 5  # past "stage", before "liveness"
+    assert b'"stage":' not in ping[cut:]
+    assert b'"liveness":' in ping[cut:]
+    assert _instance_bootstrap._console_progress(str(solo), cut) == (len(ping), 0)
 
     assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (-1, 0)
 

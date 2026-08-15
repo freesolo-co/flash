@@ -22,6 +22,7 @@ from email.utils import parsedate_to_datetime
 if __package__:
     from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
+        _console_progress,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
@@ -31,6 +32,7 @@ else:
     # same directory, and the script directory leads sys.path.
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
+        _console_progress,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
@@ -262,22 +264,6 @@ def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str 
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
         f.write(_safe_detail(tail, 64_000, secrets=secrets))
     return hf_upload(payload, tail_path, f"console_{mode}.txt")
-
-
-def _console_progress(console: str, offset: int) -> tuple[int, int]:
-    """``(size, staged heartbeats after ``offset``)``; size -1 if unreadable. Bytes alone cannot tell
-    a wedge from a noisy one: a worker stuck after its last staged heartbeat keeps printing Ray
-    warnings, so the size grows every poll and a size-only rule never fires. The stall classifier
-    advances only on a STAGED heartbeat, echoed here as ``HEARTBEAT {...}`` with a stage, so counting
-    those tracks the signal that decides teardown. Only bytes past ``offset`` are read, so a scan
-    costs one poll's output, not a console that reaches hundreds of MB."""
-    try:
-        with open(console, "rb") as f:
-            f.seek(offset)
-            staged = f.read().count(b'"stage":')  # before tell(): the read is what advances it
-            return f.tell(), staged
-    except OSError:
-        return -1, 0
 
 
 def _console_upload_loop(

@@ -625,9 +625,12 @@ def _train_body(input_data: dict) -> dict:
                     try:
                         # count STAGED heartbeats, not bytes: a wedged worker still prints ray
                         # warnings, so a size-only rule never fires. reads only new bytes.
+                        # liveness pings carry "stage" too and print every 30s from a daemon, so
+                        # they are subtracted -- counting them reads a wedge as progress forever.
                         with open(console, "rb") as hf:
                             hf.seek(max(size, 0))
-                            staged = hf.read().count(b'"stage":')
+                            buf = hf.read()
+                            staged = max(0, buf.count(b'"stage":') - buf.count(b'"liveness":'))
                             size = hf.tell()
                     except OSError:
                         size, staged = -1, 0

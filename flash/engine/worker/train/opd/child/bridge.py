@@ -43,11 +43,19 @@ _FAILURE_FALLBACK_MAX_CHARS = 8192
 # serialized field, so whitespace inside them is part of the value. an UNQUOTED value still ends at
 # whitespace -- there the space is the delimiter, and running past it would eat the sentence around
 # the credential. no closing quote on the line means the value runs to the end of it: fail closed.
-_SECRET_SCHEME = r"(?:(?:bearer|basic|digest|token)\s+)?"
+# DIGEST is the exception to all of that: its value is a comma-separated parameter list, not one
+# token, so both rules above stop inside it and print the `nonce` and `response` that are the actual
+# secrets. it gets its own branch running to end of line. over-redacting the tail of a digest line
+# costs a `username=` and an `algorithm=`; under-redacting it publishes a live credential.
+# digest is absent by design: its own branches below run first and consume the whole line, so
+# listing it here too would be dead alternation.
+_SECRET_SCHEME = r"(?:(?:bearer|basic|token)\s+)?"
 _SECRET_DETAIL = re.compile(
     r"(?i)(?P<key>authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
     r"(?P<sep>['\"]?\s*[:=]\s*)"
-    rf"(?:(?P<quote>['\"]){_SECRET_SCHEME}(?P<quoted>(?:(?!(?P=quote))[^\r\n])*)"
+    rf"(?:(?P<quote>['\"])(?:digest\s+(?P<qdigest>[^\r\n]+)"
+    rf"|{_SECRET_SCHEME}(?P<quoted>(?:(?!(?P=quote))[^\r\n])*))"
+    r"|digest\s+(?P<digest>[^\r\n]+)"
     rf"|{_SECRET_SCHEME}(?P<bare>[^\s,;'\"}}]+))"
 )
 # component lines of a multiline credential shorter than this are punctuation such as ``}``, not

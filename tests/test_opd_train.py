@@ -4725,6 +4725,44 @@ def test_child_failure_sanitizer_redacts_the_credential_not_the_auth_scheme(monk
     )
 
 
+def test_child_failure_sanitizer_redacts_every_digest_parameter(monkeypatch):
+    """A Digest value is a parameter LIST, so single-token capture leaves the secrets behind.
+
+    `Authorization: Digest username="bob", nonce="...", response="..."` has its credential in the
+    `nonce` and `response` fields, not the first token. Both of the other rules stop before them:
+    the bare branch ends at the first quote or comma, and the quoted branch ends at `username`'s
+    opening quote. The record then carried most of the header verbatim, and a nonce minted at
+    runtime is in no environment variable, so the value pass cannot clean up after it.
+
+    Digest therefore consumes to end of line. That over-redacts a `username=` and an `algorithm=`,
+    which is the correct direction to be wrong in: those cost a diagnostic detail, the alternative
+    publishes a live credential into an artifact the user can fetch.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    nonce, response = "runtime-nonce-value", "runtime-response-hash"
+    secrets = (nonce, response)
+    for message in (
+        f'Authorization: Digest username="bob", nonce="{nonce}", response="{response}"',
+        f"Authorization: Digest username=bob, nonce={nonce}, response={response}",
+        f'{{"Authorization": "Digest username=\\"bob\\", nonce=\\"{nonce}\\""}}',
+        f"{{'authorization': 'Digest nonce={nonce}, response={response}'}}",
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "<redacted>" in redacted
+        for secret in secrets:
+            assert secret not in redacted, f"{message!r} leaked {secret!r}: {redacted!r}"
+
+    # the other schemes are unchanged: they carry ONE token, and consuming the rest of the line
+    # there would eat the diagnostic around a credential that was already fully redacted.
+    unaffected = _safe_child_failure_detail(
+        ValueError("Authorization: Bearer tok123 while calling the teacher")
+    )
+    assert "tok123" not in unaffected
+    assert "while calling the teacher" in unaffected
+
+
 def test_child_failure_sanitizer_redacts_a_quoted_credential_containing_spaces(monkeypatch):
     """A quoted value runs to its closing quote, not to the first space.
 

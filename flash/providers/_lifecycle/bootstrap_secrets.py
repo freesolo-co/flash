@@ -175,3 +175,25 @@ def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> st
         return tail
     cut = tail.find("\n")
     return tail[cut + 1 :] if cut >= 0 else ""
+
+
+def _console_progress(console: str, offset: int) -> tuple[int, int]:
+    """``(size, progress heartbeats after ``offset``)``; size -1 if unreadable. Bytes cannot tell a
+    wedge from a noisy one: a stuck worker keeps printing Ray warnings, so the size grows every poll
+    and a size-only rule never fires. The stall classifier advances only on a progress heartbeat,
+    echoed here as ``HEARTBEAT {...}``, so counting those tracks the signal that decides teardown.
+    Liveness pings are subtracted, not counted: EVERY payload carries ``"stage"`` and those print
+    every 30s from a daemon, so counting the key alone reads a worker wedged inside a liveness block
+    as busy forever -- ``poll`` refuses to advance on them for the same reason, and this must agree
+    or the run dies with no console. Both keys sit in one flat json object per line, so the
+    subtraction is exact except where a poll boundary splits a line and leaves the ``"liveness"``
+    half alone here; hence the clamp, since a bare negative is TRUTHY and would read as progress.
+    Only bytes past ``offset`` are read, so a scan costs one poll's output, not a whole console.
+    The read happens before ``tell()`` because the read is what advances it."""
+    try:
+        with open(console, "rb") as f:
+            f.seek(offset)
+            buf = f.read()
+            return f.tell(), max(0, buf.count(b'"stage":') - buf.count(b'"liveness":'))
+    except OSError:
+        return -1, 0
