@@ -669,7 +669,9 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
         except _GzipHeaderTooLarge:
             raise _Unscannable("contains a gzip header too large to inspect") from None
         for value in metadata:
-            if kind := credential_in_name(value.decode("latin-1"), deadline=deadline):
+            if kind := credential_in_name(
+                value.decode("latin-1"), deadline=deadline
+            ) or _scan_stream(io.BytesIO(value), deadline=deadline, depth=depth):
                 return kind
     # A raw zlib stream (RFC 1950) is deflate with a 2-byte header instead of gzip's 10, so none of
     # the openers above read it. `decompressobj` with the zlib window size does, and it is the same

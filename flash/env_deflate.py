@@ -542,17 +542,84 @@ def _filter_value(tokens: list[bytes], at: int) -> tuple[list[bytes], int]:
     return names, at + 1
 
 
+def _inline_predictors(tokens: list[bytes], at: int) -> list[int] | None:
+    """Direct inline-image decode parameters as one predictor per filter, or defaults."""
+
+    def dictionary(start: int) -> tuple[int, int]:
+        depth, predictor, seen = 1, 1, False
+        index = start + 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token == b"<<":
+                depth += 1
+            elif token == b">>":
+                depth -= 1
+                if not depth:
+                    return predictor, index + 1
+            elif depth == 1 and token == b"/Predictor":
+                if seen or index + 1 >= len(tokens) or not tokens[index + 1].isdigit():
+                    raise _UnreadableFilterChain
+                if (
+                    index + 3 < len(tokens)
+                    and tokens[index + 2].isdigit()
+                    and tokens[index + 3] == b"R"
+                ):
+                    raise _UnreadableFilterChain
+                predictor, seen = int(tokens[index + 1]), True
+                index += 1
+            index += 1
+        raise _UnreadableFilterChain
+
+    if at >= len(tokens):
+        raise _UnreadableFilterChain
+    if tokens[at] == b"null":
+        return None
+    if tokens[at] == b"<<":
+        predictor, _after = dictionary(at)
+        return [predictor]
+    if tokens[at] != b"[":
+        raise _UnreadableFilterChain
+    predictors: list[int] = []
+    at += 1
+    while at < len(tokens) and tokens[at] != b"]":
+        if tokens[at] == b"null":
+            predictors.append(1)
+            at += 1
+        elif tokens[at] == b"<<":
+            predictor, at = dictionary(at)
+            predictors.append(predictor)
+        else:
+            raise _UnreadableFilterChain
+    if at >= len(tokens):
+        raise _UnreadableFilterChain
+    return predictors
+
+
 def _inline_filters(header: bytes, deadline: float | None) -> list[bytes]:
-    """The normalized direct filter chain in one inline-image header."""
+    """The normalized direct filter chain with readable, identity decode parameters."""
     tokens = [token for token, _start, _end in pdf_tokens(header, _document_checker(deadline))]
     declared: list[bytes] | None = None
+    params_at: int | None = None
+    depth = 0
     for at, token in enumerate(tokens):
-        if token in (b"/F", b"/Filter"):
+        if token in (b"<<", b"["):
+            depth += 1
+        elif token in (b">>", b"]"):
+            depth = max(0, depth - 1)
+        elif depth == 0 and token in (b"/F", b"/Filter"):
             declared, _after = _filter_value(tokens, at + 1)
+        elif depth == 0 and token in (b"/DP", b"/DecodeParms"):
+            params_at = at + 1
     if declared is None:
         return []
     if any(name not in _INLINE_FILTER_ALIASES for name in declared):
         raise _UnreadableFilterChain
+    if params_at is not None:
+        predictors = _inline_predictors(tokens, params_at)
+        if predictors is not None and (
+            len(predictors) != len(declared) or any(predictor != 1 for predictor in predictors)
+        ):
+            raise _UnreadableFilterChain
     return [_INLINE_FILTER_ALIASES[name] for name in declared]
 
 

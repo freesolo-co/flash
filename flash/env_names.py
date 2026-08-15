@@ -11,14 +11,16 @@ from collections.abc import Iterator
 
 
 def exact_name_values(name: bytes) -> Iterator[bytes]:
-    """`name`, each complete path component, and each component without its final extension."""
+    """`name`, each complete path component, and every complete extension-stripped stem."""
     seen: set[bytes] = set()
     for component in (name, *name.split(b"/")):
-        candidates = [component]
-        stem, dot, extension = component.rpartition(b".")
-        if dot and stem and extension:
-            candidates.append(stem)
-        for candidate in candidates:
-            if candidate and candidate not in seen:
+        candidate = component
+        while candidate:
+            if candidate not in seen:
                 seen.add(candidate)
                 yield candidate
+            slash = candidate.rfind(b"/")
+            dot = candidate.rfind(b".")
+            if dot <= slash + 1 or dot == len(candidate) - 1:
+                break
+            candidate = candidate[:dot]

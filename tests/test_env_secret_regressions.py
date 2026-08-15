@@ -89,6 +89,34 @@ def _avro_ocf(value: bytes) -> bytes:
     return b"Obj\x01" + metadata + sync + _avro_long(1) + _avro_bytes(block) + sync
 
 
+def _gzip_with_extra(extra: bytes, payload: bytes = b"harmless\n") -> bytes:
+    packed = gzip.compress(payload, mtime=0)
+    header = bytearray(packed[:10])
+    header[3] |= 0x04
+    field = b"ZZ" + len(extra).to_bytes(2, "little") + extra
+    return bytes(header) + len(field).to_bytes(2, "little") + field + packed[10:]
+
+
+def _crc32c(value: bytes) -> int:
+    crc = 0xFFFFFFFF
+    for byte in value:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+    return crc ^ 0xFFFFFFFF
+
+
+def _snappy_key_frame() -> bytes:
+    literal = b"fslo_a1B2c3D4"
+    copy_length = len(_KEY) - len(literal)
+    raw = bytes((len(_KEY), (len(literal) - 1) << 2)) + literal
+    raw += bytes((((copy_length - 1) << 2) | 2, 8, 0))
+    checksum = _crc32c(_KEY)
+    masked = ((checksum >> 15) | (checksum << 17) & 0xFFFFFFFF) + 0xA282EAD8
+    chunk = (masked & 0xFFFFFFFF).to_bytes(4, "little") + raw
+    return b"\xff\x06\x00\x00sNaPpY\x00" + len(chunk).to_bytes(3, "little") + chunk
+
+
 def test_pdf_dictionary_index_is_single_pass_and_deadline_bounded(tmp_path, monkeypatch):
     from flash import env_deflate
     from flash.env_secrets import credential_in_file
@@ -244,6 +272,50 @@ def test_pdf_inline_image_markers_ignore_strings_and_comments(tmp_path):
     assert credential_in_file(real) == "a Freesolo API key"
 
 
+def test_pdf_inline_image_decode_parameters_are_lexically_paired(tmp_path):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    def document(name: str, header: bytes, payload: bytes):
+        path = tmp_path / name
+        path.write_bytes(_pdf_stream(b"", b"BI /W 1 /H 1 " + header + b" ID " + payload + b" EI\n"))
+        return path
+
+    packed = zlib.compress(_KEY)
+    identities = (
+        (b"/F /Fl", packed),
+        (b"/F /Fl /DP null", packed),
+        (b"/F /Fl /DP << /Predictor 1 >>", packed),
+        (b"/Filter /FlateDecode /DecodeParms << /Predictor 1 >>", packed),
+        (b"/#46 /Fl /#44P << /#50redictor 1 >>", packed),
+        (b"/Filter /FlateDecode /#44ecodeParms << /#50redictor 1 >>", packed),
+        (
+            b"/F [/A85 /Fl] /DP [null << /Predictor 1 >>]",
+            base64.a85encode(packed) + b"~>",
+        ),
+        (
+            b"/Note (/DP << /Predictor 12 >>) % /DP << /Predictor 12 >>\n /F /Fl",
+            packed,
+        ),
+    )
+    for index, (header, payload) in enumerate(identities):
+        assert credential_in_file(document(f"inline-identity-{index}.pdf", header, payload)) == (
+            "a Freesolo API key"
+        )
+
+    unreadable = (
+        b"/F /Fl /DP << /Predictor 12 >>",
+        b"/F /Fl /DP 2 0 R",
+        b"/F /Fl /DP << /Predictor /One >>",
+        b"/F /Fl /DP [",
+        b"/F [/A85 /Fl] /DP [null]",
+        b"/F [/A85 /Fl] /DP [null << /Predictor 12 >>]",
+    )
+    for index, header in enumerate(unreadable):
+        payload = base64.a85encode(packed) + b"~>" if b"/A85" in header else packed
+        with pytest.raises(_Unscannable, match="filter this cannot undo"):
+            credential_in_file(document(f"inline-unreadable-{index}.pdf", header, payload))
+
+
 def test_ar_members_preserve_resolved_filename_context(tmp_path):
     from flash.env_secrets import credential_in_file
 
@@ -303,6 +375,25 @@ def test_avro_ocf_fails_closed_only_at_the_anchored_magic(tmp_path):
     fake_name = tmp_path / "dataset.avro"
     fake_name.write_text("ordinary rows with no credential\n")
     assert credential_in_file(fake_name) is None
+
+
+def test_framed_snappy_streams_fail_closed_on_the_complete_identifier(tmp_path):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    framed = _snappy_key_frame()
+    assert _KEY not in framed
+    stream = tmp_path / "snappy.bin"
+    stream.write_bytes(framed)
+    with pytest.raises(_Unscannable, match="Snappy"):
+        credential_in_file(stream)
+
+    incomplete = tmp_path / "incomplete-snappy.bin"
+    incomplete.write_bytes(b"\xff\x06\x00\x00sNaPp")
+    assert credential_in_file(incomplete) is None
+
+    prose = tmp_path / "snappy.txt"
+    prose.write_bytes(b"the standard stream identifier spells sNaPpY in documentation\n")
+    assert credential_in_file(prose) is None
 
 
 def test_wrapped_container_newline_at_chunk_boundary_is_not_clean(tmp_path):
@@ -384,6 +475,84 @@ def test_gitlab_personal_access_tokens_use_the_issued_body_contract(tmp_path):
         candidate = tmp_path / f"gitlab-control-{index}.txt"
         candidate.write_bytes(control)
         assert credential_in_file(candidate) is None
+
+
+def test_npm_access_tokens_require_exact_issued_boundaries(tmp_path):
+    from flash.env_secrets import credential_in_file
+
+    body = b"Ab3dE5fG7hJ9kLmN2pQr4sTu6vWx8yZ01aB2"
+    assert len(body) == 36
+    token = b"npm_" + body
+    valid = tmp_path / "npm-token.txt"
+    valid.write_bytes(token)
+    assert credential_in_file(valid) == "an npm access token"
+
+    punctuated = tmp_path / "npm-punctuated.txt"
+    punctuated.write_bytes(token + b",")
+    assert credential_in_file(punctuated) == "an npm access token"
+
+    controls = (
+        b"npm_" + b"A" * 36,
+        b"npm_" + b"a" * 36,
+        b"npm_" + b"1" * 36,
+        b"npm_" + body[:-1],
+        b"npm_" + body + b"X",
+        b"x" + token,
+        b"_" + token,
+        token + b"_",
+    )
+    for index, content in enumerate(controls):
+        control = tmp_path / f"npm-control-{index}.txt"
+        control.write_bytes(content)
+        assert credential_in_file(control) is None
+
+
+def test_compound_filename_extensions_preserve_exact_container_values(tmp_path):
+    from flash.env_secrets import _Unscannable, credential_in_name
+
+    envelope = b"Salted__12345678ciphertext"
+    encoded = base64.urlsafe_b64encode(envelope).rstrip(b"=").decode()
+    for name in (
+        f"{encoded}.tar.gz",
+        f"{encoded}.backup.tar.gz.sig",
+        f"parent.dir/nested/{encoded}.tar.gz",
+    ):
+        with pytest.raises(_Unscannable, match="OpenSSL"):
+            credential_in_name(name)
+
+    split = len(encoded) // 2
+    controls = (
+        f".{encoded}.tar.gz",
+        f"prefix~{encoded}.tar.gz",
+        f"{encoded}~suffix.tar.gz",
+        f"{encoded}.",
+        f"{encoded}..tar.gz",
+        f"parent.dir/{encoded[:split]}/{encoded[split:]}.tar.gz",
+        ".env",
+        "trailing.",
+        "repeated..dots",
+    )
+    for name in controls:
+        assert credential_in_name(name) is None
+
+
+def test_compound_extensions_allow_slashes_inside_exact_base64_values():
+    from flash.env_secrets import _Unscannable, credential_in_name
+
+    encoded = "KLUv/QABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f"
+    assert base64.b64decode(encoded).startswith(b"\x28\xb5\x2f\xfd")
+    for name in (encoded, f"{encoded}.gz", f"{encoded}.tar.gz"):
+        with pytest.raises(_Unscannable, match="zstd"):
+            credential_in_name(name)
+
+    split = encoded.index("/")
+    controls = (
+        f"{encoded}.gz/ordinary.txt",
+        f"parent.dir/{encoded[:split]}/{encoded[split + 1 :]}.tar.gz",
+        "parent.dir/ordinary.tar.gz",
+    )
+    for name in controls:
+        assert credential_in_name(name) is None
 
 
 def test_ansible_vault_requires_a_supported_header_and_hex_body(tmp_path):
@@ -593,6 +762,22 @@ def test_oversized_base64_refusal_is_limited_to_containers(tmp_path):
     zlib_container.write_bytes(zlib_encoded)
     with pytest.raises(_Unscannable, match="base64 run too long"):
         credential_in_file(zlib_container)
+
+
+def test_gzip_metadata_uses_name_and_raw_container_scanning(tmp_path):
+    from flash.env_secrets import credential_in_file
+
+    nested = tmp_path / "nested-extra.gz"
+    nested.write_bytes(_gzip_with_extra(zlib.compress(_KEY)))
+    assert credential_in_file(nested) == "a Freesolo API key"
+
+    named = tmp_path / "named-extra.gz"
+    named.write_bytes(_gzip_with_extra(_KEY))
+    assert credential_in_file(named) == "a Freesolo API key"
+
+    harmless = tmp_path / "harmless-extra.gz"
+    harmless.write_bytes(_gzip_with_extra(zlib.compress(b"ordinary metadata\n")))
+    assert credential_in_file(harmless) is None
 
 
 @pytest.mark.parametrize("location", ["comment", "extra"])

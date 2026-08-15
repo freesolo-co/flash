@@ -99,6 +99,9 @@ _UNEXPANDABLE_MAGIC = (
     # avro ocf starts with this four-byte marker. codecs such as snappy and zstd are optional
     # dependencies, so recognising the container must fail closed before any codec is required.
     (b"Obj\x01", "Avro"),
+    # the complete framed snappy stream identifier. the binary prefix and declared six-byte payload
+    # distinguish a stream from prose mentioning snappy, while the stdlib has no decoder for it.
+    (b"\xff\x06\x00\x00sNaPpY", "Snappy"),
 )
 
 # Formats recognised ONLY at byte zero, kept apart from the list above rather than added to it.
