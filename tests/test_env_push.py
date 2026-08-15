@@ -7763,6 +7763,48 @@ def test_a_tar_entry_that_is_not_a_file_still_has_its_name_checked(tmp_path):
     assert credential_in_file(plain) is None
 
 
+def test_a_zip_directory_entry_still_has_its_name_checked(tmp_path):
+    """The same hole in the other format, which the trailing slash hides twice over.
+
+    `ZipInfo.is_dir` IS the trailing `/`, so a directory entry skipped the name scanner -- and the
+    slash also lands inside the base64 run, which stops the raw pass over the archive's own bytes
+    from recovering the encoded stream. A directory named with base64 of a gzipped key returned
+    clean while the name scanner refused that same string on its own.
+    """
+    import base64
+    import gzip
+    import io
+    import zipfile
+
+    from flash.env_secrets import credential_in_file, credential_in_name
+
+    def archive(path, name):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zipped:
+            zipped.writestr(name + "/", b"")
+            zipped.writestr("readme.txt", b"hello\n")
+        path.write_bytes(buffer.getvalue())
+
+    encoded = (
+        base64.b64encode(gzip.compress(f"fslo_{_FAKE_KEY_BODY}".encode())).decode().rstrip("=")
+    )
+    assert credential_in_name(encoded) == "a Freesolo API key"  # the control the zip has to match
+
+    keyed = tmp_path / "dir.zip"
+    archive(keyed, encoded)
+    assert credential_in_file(keyed) == "a Freesolo API key"
+
+    # the plain spelling too, which needs no decoding to be visible in the listing
+    named = tmp_path / "named.zip"
+    archive(named, f"fslo_{_FAKE_KEY_BODY}")
+    assert credential_in_file(named) == "a Freesolo API key"
+
+    # an ordinary directory entry is still not a refusal
+    plain = tmp_path / "plain.zip"
+    archive(plain, "checkpoints")
+    assert credential_in_file(plain) is None
+
+
 def test_a_pdf_dictionary_is_read_to_its_own_opening_bracket(tmp_path):
     """The object's `<<` bounds its dictionary, not a fixed 512 bytes.
 

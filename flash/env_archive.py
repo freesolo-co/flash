@@ -75,16 +75,23 @@ def credential_in_zip(
                 raise refusal("contains an archive with too many members to inspect")
             if time.monotonic() > deadline:
                 raise refusal("takes too long to decompress")
-            if info.is_dir():
-                continue
             # the member NAME is checked too, exactly as the tar walk checks it: a zip entry called
             # `fslo_<key>.json` publishes the key in the archive's listing whatever its contents
             # are, and a name that is itself an encoded container is refused rather than decoded
             # speculatively -- the raw scan over the archive's own bytes swallows that refusal,
             # so a member named with base64 of an OpenSSL-encrypted file returned clean here while
             # the same name passed to the name scanner refused it.
-            if kind := named(info.filename):
+            #
+            # Checked BEFORE the directory filter, as in the tar walk. A directory entry has no
+            # contents to scan but its name is in the central directory exactly as a file's is, and
+            # `ZipInfo.is_dir` is the trailing `/` alone -- which also stops the raw pass from
+            # recovering the encoded stream, since the slash lands inside the base64 run. A
+            # directory named with base64 of a gzipped key returned clean while the name scanner
+            # refused that same string on its own.
+            if kind := named(info.filename.rstrip("/")):
                 return kind
+            if info.is_dir():
+                continue
             # Bit 0 of the general-purpose flags marks an encrypted member. Its bytes cannot be
             # read without the password, so treating it as clean approved a package whose only copy
             # of a credential was inside -- `zip -P` around a key file published intact.
