@@ -642,20 +642,19 @@ def _train_body(input_data: dict) -> dict:
                     since += 120.0
                     try:
                         # count STAGED heartbeats, not bytes: a wedged worker still prints ray
-                        # warnings, so a size-only rule never fires. reads only new bytes. liveness
-                        # pings and "pending" (uncommitted) heartbeats are subtracted: neither is
-                        # progress the stall clock can see. mirrors _console_progress.
+                        # warnings, so a size-only rule never fires. mirrors _console_progress,
+                        # whose docstring carries the anchor, exclusion and whole-line rules.
+                        at = max(size, 0)
                         with open(console, "rb") as hf:
-                            hf.seek(max(size, 0))
-                            buf, size = hf.read(), hf.tell()
-                        unseen = buf.count(b'"liveness":') + buf.count(b'"pending":')
-                        staged = max(0, buf.count(b'"stage":') - unseen)
+                            hf.seek(at)
+                            buf = hf.read()
                     except OSError:
-                        size, staged = -1, 0
-                    # a wedge is progress that STOPPED: a heartbeat arms, a spend disarms, progress
-                    # RE-arms (or a slow stage reading as silence spends the only credit and a real
-                    # hang later dies uncaptured), and only a stall that BOUGHT an upload spends
-                    # one. the 2 is per RUN. _console_wedge_credit's docstring carries the rules.
+                        buf, at = b"", -1
+                    cut = buf.rfind(b"\n") + 1  # whole lines only; the offset stays a line start
+                    pat = rb'(?m)^HEARTBEAT (?!.*"(?:liveness|pending)":).*$'
+                    size, staged = at + cut, len(re.findall(pat, buf[:cut]))
+                    # a wedge is progress that STOPPED: arm on a heartbeat, re-arm on progress,
+                    # spend only on a stall that BOUGHT an upload. 2 credits per RUN.
                     armed = armed or bool(staged)
                     quiet_polls = 0 if staged else quiet_polls + 1
                     due = since >= due_s

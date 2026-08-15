@@ -1170,13 +1170,24 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # the wedge signal is STAGED HEARTBEATS, not console bytes: a stuck worker still logs, so a
     # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
     assert "quiet_polls = 0 if staged else quiet_polls + 1" in body
-    # and liveness pings are SUBTRACTED, not counted: they carry "stage" like every other payload
-    # and print every 30s from a daemon, so counting them reads a wedge as progress forever. an
-    # UNCOMMITTED heartbeat ("pending") is subtracted for the same reason: the provider's stall
-    # clock reads the heartbeat from HF, so one that never landed there is not progress it can see.
-    assert "unseen = buf.count(b'\"liveness\":') + buf.count(b'\"pending\":')" in body
-    assert "buf.count(b'\"stage\":') - unseen" in body
-    assert "max(0, buf.count" in body  # floored: a negative count is truthy and reads as progress
+    # the count is ANCHORED at the start of a heartbeat line rather than scanning for a bare
+    # "stage" key: any third-party line carrying it (a structured log from ray, verl or a library)
+    # would otherwise read as progress, and those keep printing from a wedged worker -- so the
+    # wedge this loop exists to catch would never be detected at all. Liveness pings and
+    # UNCOMMITTED ("pending") heartbeats are excluded in the same expression: the first prints
+    # every 30s from a daemon, and the second never reached HF, so neither is progress the
+    # provider's stall clock can see.
+    assert "rb'(?m)^HEARTBEAT (?!.*\"(?:liveness|pending)\":).*$'" in body
+    # and the scan is bounded to WHOLE lines: the offset stops at the last newline, never at EOF.
+    # Both halves of a line split by a poll boundary must be inert alone or the split decides the
+    # run -- the head carries the prefix but not yet the "liveness" that disqualifies it (a wedge
+    # read as progress), and a tail measured from EOF would have lost its prefix and dropped a real
+    # heartbeat (a wedge faked the other way). It is also what lets `^` mean what it says.
+    assert 'cut = buf.rfind(b"\\n") + 1' in body
+    assert "size, staged = at + cut, len(re.findall(pat, buf[:cut]))" in body
+    # a counting rule cannot go negative now that it counts whole matching lines instead of
+    # subtracting key occurrences, so the old floor is gone rather than silently dropped.
+    assert "max(0, buf.count" not in body
 
 
 def _drive_instance_upload_loop(
@@ -1620,9 +1631,10 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     to the same flat object), and those print every 30s from a daemon thread -- so a worker wedged
     inside a liveness block would look busy forever. ``poll`` refuses to advance its stall key on
     them for exactly this reason, and disagreeing means the run is torn down with no console. It
-    must not report a negative count either, since a bare negative is truthy and reads as progress.
-    And it must count only bytes past ``offset``: a console reaching hundreds of MB is rescanned
-    every poll otherwise, and a heartbeat from the healthy prefix would be recounted forever.
+    must count only lines a heartbeat actually WROTE, since ray, verl and any library are free to
+    emit structured json carrying the same key -- and a wedged worker keeps printing those. And it
+    must count only bytes past ``offset``: a console reaching hundreds of MB is rescanned every
+    poll otherwise, and a heartbeat from the healthy prefix would be recounted forever.
     """
     import json
 
@@ -1648,11 +1660,10 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     assert beats2 == 0, "liveness pings after the last real heartbeat must not read as progress"
     assert size2 == size + len(pings) * 3
 
-    # a poll boundary can split a line and leave the "liveness" half alone in the chunk, so the
-    # subtraction goes to -1. It must floor at zero: a bare negative is TRUTHY in python, so it
-    # would reset quiet_polls and read the wedge as progress -- the exact bug being fixed, arriving
-    # through the fix. The offset is computed from the line, not guessed: a guessed one that
-    # happens to include both keys makes this assertion vacuous.
+    # a poll boundary can split a line, leaving a chunk that starts mid-payload. Neither half may
+    # read as progress on its own: the tail has the disqualifying key but no prefix, and the head
+    # has the prefix but not yet the key. The offsets are computed from the line, not guessed: a
+    # guessed one that happens to include both keys makes these assertions vacuous.
     solo = tmp_path / "console_split.txt"
     ping = _hb(liveness=True)
     solo.write_bytes(ping)
@@ -1661,7 +1672,7 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     assert b'"liveness":' in ping[cut:]
     assert _instance_bootstrap._console_progress(str(solo), cut) == (len(ping), 0)
 
-    # an UNCOMMITTED heartbeat (upload attempted, did not land) is subtracted for the same reason
+    # an UNCOMMITTED heartbeat (upload attempted, did not land) is excluded for the same reason
     # as a liveness ping: the provider's stall clock reads heartbeat.json from HF, so one that
     # never reached HF is not progress it can observe. Counting it resets the wedge timer against a
     # stall clock still anchored to the older committed heartbeat, and the snapshot this whole path
@@ -1669,6 +1680,49 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     pend = tmp_path / "console_pending.txt"
     pend.write_bytes(_hb(step=8, pending=True) * 2)
     assert _instance_bootstrap._console_progress(str(pend), 0)[1] == 0
+
+    # a THIRD-PARTY line carrying "stage" is not a heartbeat and must not read as progress. ray,
+    # verl and any library are free to emit structured json, and a wedged worker keeps emitting it
+    # -- so a bare-substring count would see progress forever and the wedge would never fire. The
+    # `HEARTBEAT ` prefix names the producer instead of inferring it from a shared key.
+    foreign = tmp_path / "console_foreign.txt"
+    foreign.write_bytes(b'(raylet) {"ts":"t","level":"WARN","stage":"rollout","msg":"idle"}\n' * 5)
+    assert _instance_bootstrap._console_progress(str(foreign), 0)[1] == 0
+
+    # a line split by the poll boundary is counted EXACTLY ONCE, in whichever chunk carries its
+    # `HEARTBEAT` prefix. The old subtraction could see the tail half alone, count its "stage" and
+    # miss the "liveness" that qualified it; the anchor sits at the start of the line, so the half
+    # without it matches nothing rather than being judged on the keys it happens to carry.
+    split = tmp_path / "console_split_beat.txt"
+    beat = _hb(step=11)
+    split.write_bytes(beat[:20])
+    head_size, head_beats = _instance_bootstrap._console_progress(str(split), 0)
+    with open(split, "ab") as f:
+        f.write(beat[20:])
+    tail_size, tail_beats = _instance_bootstrap._console_progress(str(split), head_size)
+    assert head_beats + tail_beats == 1, "a split heartbeat is counted once, not zero or twice"
+    assert tail_size == len(beat)
+    assert _instance_bootstrap._console_progress(str(split), tail_size)[1] == 0, "no recount"
+
+    # and the tail half of a split LIVENESS ping is never counted: the old rule saw its "stage"
+    # without the "liveness" that disqualified it, so a wedge read as progress forever.
+    lv_split = tmp_path / "console_split_liveness.txt"
+    ping = _hb(step=12, liveness=True)
+    cut = ping.index(b'"liveness":') - 5
+    lv_split.write_bytes(ping[:cut])
+    lv_head = _instance_bootstrap._console_progress(str(lv_split), 0)
+    with open(lv_split, "ab") as f:
+        f.write(ping[cut:])
+    lv_tail = _instance_bootstrap._console_progress(str(lv_split), lv_head[0])
+    assert lv_head[1] + lv_tail[1] == 0, "a split liveness ping must never read as progress"
+
+    # the offset itself stops at the last NEWLINE, not at EOF. Returning EOF strands the partial
+    # line behind the offset: its completing bytes arrive on the next poll without the `HEARTBEAT `
+    # prefix that identifies them, so a real heartbeat is dropped and a healthy run reads as wedged.
+    part = tmp_path / "console_partial.txt"
+    whole = _hb(step=3)
+    part.write_bytes(whole + _hb(step=4)[:20])
+    assert _instance_bootstrap._console_progress(str(part), 0) == (len(whole), 1)
 
     assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (-1, 0)
 

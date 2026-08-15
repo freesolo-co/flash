@@ -182,21 +182,29 @@ def _console_progress(console: str, offset: int) -> tuple[int, int]:
     wedge from a noisy one: a stuck worker keeps printing Ray warnings, so the size grows every poll
     and a size-only rule never fires. The stall classifier advances only on a progress heartbeat,
     echoed here as ``HEARTBEAT {...}``, so counting those tracks the signal that decides teardown.
-    Liveness pings are subtracted, not counted: EVERY payload carries ``"stage"`` and those print
-    every 30s from a daemon, so counting the key alone reads a worker wedged inside a liveness block
-    as busy forever -- ``poll`` refuses to advance on them for the same reason, and this must agree
-    or the run dies with no console. ``"pending"`` heartbeats are subtracted for the same reason:
-    their upload did not land, so the provider's stall clock is still anchored to the older
-    committed one, and counting them would reset this timer against a teardown already counting
-    down. The keys sit in one flat json object per line, so the subtraction is exact except where a
-    poll boundary splits a line and leaves the ``"liveness"`` half alone here; hence the clamp,
-    since a bare negative is TRUTHY and would read as progress. Only bytes past ``offset`` are
-    read, so a scan costs one poll's output. The read precedes ``tell()`` because it advances it."""
+    Only a line that IS one counts, hence the ``HEARTBEAT `` anchor rather than a bare ``"stage":``
+    scan: any third-party line carrying that key -- structured json from ray, verl or a library --
+    would otherwise read as progress, and a wedged worker keeps printing those, so the wedge would
+    never be detected at all. Liveness pings are excluded: EVERY payload carries ``"stage"`` and
+    those print every 30s from a daemon, so counting them reads a worker wedged inside a liveness
+    block as busy forever -- ``poll`` refuses to advance on them for the same reason, and this must
+    agree or the run dies with no console. ``"pending"`` heartbeats are excluded too: their upload
+    did not land, so the provider's stall clock is still anchored to the older committed one, and
+    counting them would reset this timer against a teardown already counting down. A match spans
+    a WHOLE line and the offset stops at the last newline, not at EOF, so a line split across two
+    polls is judged exactly once, on the poll completing it. Both halves must be inert alone or the
+    split decides the run: the head carries the prefix but not yet the ``"liveness"`` disqualifying
+    it, so counting it there reads a wedge as progress -- the exact bug, arriving through the fix --
+    while a tail measured from EOF would have lost its prefix and dropped a real heartbeat, faking a
+    wedge the other way. Stopping at the newline also keeps ``offset`` on a line start, which is
+    what lets ``^`` mean what it says; re-reading one partial line is the whole cost. Only bytes
+    past ``offset`` are read, so a scan costs one poll's output."""
     try:
         with open(console, "rb") as f:
             f.seek(offset)
             buf = f.read()
-            seen = buf.count(b'"stage":') - buf.count(b'"liveness":') - buf.count(b'"pending":')
-            return f.tell(), max(0, seen)
     except OSError:
         return -1, 0
+    cut = buf.rfind(b"\n") + 1
+    pat = rb'(?m)^HEARTBEAT (?!.*"(?:liveness|pending)":).*$'
+    return offset + cut, len(re.findall(pat, buf[:cut]))
