@@ -90,14 +90,32 @@ def _warn_on_unfinished_replay(record: dict) -> None:
     partial-credit grader pays a respectable score for the capped attempt, and gold-vs-junk still
     clears its bar, so the run reads PASS. What exposes it is the turn count, which is why it is
     printed as a comparison.
+
+    How far the reference got decides what may be CLAIMED. When it covered the whole episode and the
+    env still never reported done, the env is the only remaining explanation. When it ran out first
+    the driver padded the tail with junk, and junk cannot drive even a healthy env to termination --
+    so a short reference on a working env looks identical from here. Both are worth surfacing and
+    neither is worth misdiagnosing, so the incomplete case names both explanations and puts the
+    cheaper one first: extending a dataset row costs less than auditing termination logic.
     """
     if not record["hit_turn_cap"]:
         return
-    _emit(
+    opening = (
         f"replay gold answer never finished: it used all {record['turns']} turn(s) and the "
-        "environment never reported the episode done. a reference answer that cannot complete an "
-        "episode means no rollout can either; check the episode termination condition and whether "
-        "each turn is applied exactly once"
+        "environment never reported the episode done"
+    )
+    if record["replay_incomplete"]:
+        _emit(
+            f"{opening}, but the reference ran out before the cap and the remaining turns were "
+            "filler, which cannot finish an episode either. so this is either a reference that "
+            "covers only part of a trajectory or an environment that never terminates; check "
+            "whether the dataset row is complete first, then the episode termination condition"
+        )
+        return
+    _emit(
+        f"{opening}. a reference answer that cannot complete an episode means no rollout can "
+        "either; check the episode termination condition and whether each turn is applied exactly "
+        "once"
     )
 
 
@@ -238,7 +256,12 @@ def _repeated_roles_message(repeated: list[tuple[int, str]], boundary: int) -> s
 
 
 def _warn_on_uniformly_zero_rewards(
-    rewards: list[float], *, algorithm: str, replayed_any: bool, separates: bool = False
+    rewards: list[float],
+    *,
+    algorithm: str,
+    replayed_any: bool,
+    gold_without_replayable_text: bool = False,
+    separates: bool = False,
 ) -> None:
     """Warn when every episode this run scored came back exactly zero.
 
@@ -279,17 +302,30 @@ def _warn_on_uniformly_zero_rewards(
         return
     count = len(rewards)
     if not replayed_any:
-        # deliberately says "no replayable gold answer" rather than "no gold answer": echo is also
-        # chosen for a gold completion that exists but carries no replayable TEXT (an image-only
-        # content block, a native tool-call turn with null content). telling that author to supply
-        # an answer they already supplied sends them in a circle.
-        message = (
+        opening = (
             f"all {count} scored episode(s) returned reward 0.000000, and every one of them "
-            "replayed a deliberately wrong answer because no row supplied a replayable gold one. "
+            "replayed a deliberately wrong answer because no row supplied gold text to replay. "
             "a zero is the correct score for that, so this run is not evidence the reward function "
-            "works. give the rows a gold answer whose assistant turns carry text "
-            "(`sft_completion`, or the row's `output`) and re-run"
+            "works"
         )
+        if gold_without_replayable_text:
+            # a gold answer IS present -- it just carries no text this command can send, because
+            # the payload is in `tool_calls` or an image block. that target is correct as authored
+            # and SFT trains on it fine; telling this author to give the assistant turns text would
+            # have them corrupt a working row to satisfy a check. the honest statement is that the
+            # offline harness cannot replay it, so the grader has to be exercised elsewhere.
+            message = (
+                f"{opening}. the rows do carry a gold answer, but its assistant turns hold their "
+                "payload outside `content` (a native tool call keeps the arguments in `tool_calls` "
+                "and leaves `content` null), so this command had nothing to send and fell back to "
+                "junk. that target is fine for SFT as written -- do NOT add assistant text to "
+                "satisfy this check. exercise the reward function against a sampled rollout instead"
+            )
+        else:
+            message = (
+                f"{opening}. give the rows a gold answer whose assistant turns carry text "
+                "(`sft_completion`, or the row's `output`) and re-run"
+            )
     else:
         # phrased as a RISK, not a prediction. this command scored at most three offline gold
         # replays, never a group of policy samples, so it cannot know what a real rollout group

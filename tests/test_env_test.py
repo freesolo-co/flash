@@ -426,11 +426,61 @@ def test_env_test_auto_falls_back_to_echo_for_empty_reference(monkeypatch, tmp_p
     # the CORRECT score for the deliberate junk echo replays. what is reported is the weaker, true
     # statement -- no gold answer was ever scored, so the run is evidence of nothing.
     assert "check the reward function, its runtime dependencies" not in captured.err
-    assert "no row supplied a replayable gold one" in captured.err
+    assert "no row supplied gold text to replay" in captured.err
+    # an absent answer must get the remedy that ASKS for one. paired with the tool-call test below,
+    # which reaches this same branch and must get the opposite advice.
+    assert "give the rows a gold answer whose assistant turns carry text" in captured.err
+    assert "do NOT add assistant text" not in captured.err
     # exactly ONE warning, keeping the half of this test's original invariant that still holds: the
     # clean echo path emits nothing else. asserting only the expected wording would let a future
     # spurious warning (a role check or cap check misfiring on this shape) reach users unnoticed.
     assert captured.err.count("warning:") == 1
+
+
+class _ToolCallGoldEnv(_SingleTurnEnv):
+    """A gold completion whose payload is a native tool call, so `content` is null by construction.
+
+    Not an authoring mistake: `freesolo.datasets.target_messages` produces exactly this from a
+    record whose `output` carries tool calls, and SFT trains on it end to end. This command has no
+    text to replay, so it echoes junk and scores zero -- the same observable path as a row with no
+    gold answer at all, which is why the remedy has to be chosen on more than the policy.
+    """
+
+    def sft_completion(self, example):
+        return [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city": "paris"}'},
+                    }
+                ],
+            }
+        ]
+
+
+def test_env_test_does_not_tell_a_tool_call_target_to_add_assistant_text(
+    monkeypatch, tmp_path, capsys
+):
+    """The remedy must not ask an author to corrupt a correct target to satisfy a check.
+
+    Adding assistant text to a native tool-call row changes what SFT trains on, so advice to do
+    that is worse than silence. The run still deserves the warning -- nothing was measured -- but
+    the action has to be "exercise the grader elsewhere", not "edit the row".
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _ToolCallGoldEnv(rows=[{"input": "weather in paris?", "output": "x"}], reward=0.0)
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=echo turns=1 reward=0.000000" in captured.out
+    assert "payload outside `content`" in captured.err
+    assert "do NOT add assistant text" in captured.err
+    assert "give the rows a gold answer whose assistant turns carry text" not in captured.err
 
 
 def test_env_test_fails_when_every_replayed_gold_answer_scores_zero(monkeypatch, tmp_path, capsys):
@@ -2350,7 +2400,7 @@ def test_env_test_says_replayable_when_the_gold_answer_carries_no_text(
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    assert "no row supplied a replayable gold one" in captured.err
+    assert "no row supplied gold text to replay" in captured.err
     # the remedy must name the actual fault: the turns carry no text to replay.
     assert "whose assistant turns carry text" in captured.err
 
@@ -2405,6 +2455,50 @@ def test_env_test_warns_on_a_dead_environment_whose_gold_answer_is_short(
     captured = capsys.readouterr()
     assert "episode 1: policy=replay turns=12" in captured.out
     assert "replay gold answer never finished: it used all 12 turn(s)" in captured.err
+    # the gold answer ran out at move 5 and the driver padded to 12, so the env is not the only
+    # possible cause and must not be named as one. asserting the opening alone would pass on either
+    # wording, which is how an over-strong claim survives a green suite.
+    assert "either a reference that covers only part of a trajectory" in captured.err
+    assert "check whether the dataset row is complete first" in captured.err
+    assert "means no rollout can either" not in captured.err
+
+
+class _CompleteGoldNonTerminatingEnv(_DeadEnvWithShortGoldEnv):
+    """A non-terminating env whose gold answer covers EVERY turn up to the cap.
+
+    The counterpart to the fixture above and the only shape that licenses blaming the environment:
+    no junk padding ran, so the reference itself drove every turn and the episode still never
+    ended. Same env, same cap, same grader -- only the dataset row's length differs, which is
+    precisely the fact the two messages are allowed to distinguish.
+    """
+
+    def dataset(self):
+        return [
+            {
+                "input": "solve the board",
+                "output": [{"role": "assistant", "content": f"move {n}"} for n in range(1, 13)],
+            }
+        ]
+
+
+def test_env_test_blames_the_environment_only_when_gold_covered_every_turn(
+    monkeypatch, tmp_path, capsys
+):
+    """A complete reference that still never finishes leaves the environment as the explanation.
+
+    Paired with the short-gold case above: identical environment and cap, opposite dataset
+    coverage. Without this pair a fix could emit one message unconditionally and stay green.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _CompleteGoldNonTerminatingEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    captured = capsys.readouterr()
+    assert "episode 1: policy=replay turns=12" in captured.out
+    assert "replay gold answer never finished: it used all 12 turn(s)" in captured.err
+    assert "means no rollout can either" in captured.err
+    assert "covers only part of a trajectory" not in captured.err
 
 
 class _RealRolloutDoneDeadEnv(_DeadEnvWithShortGoldEnv):
