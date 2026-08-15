@@ -87,7 +87,7 @@ def _message_text(content: object) -> str:
     return message_content_text(content)
 
 
-def _reference_turns(env, example: dict) -> list[str]:
+def _reference_turns(env, example: dict, record: dict | None = None) -> list[str]:
     # the sft_completion gold answer stands in for the missing policy model. validate its
     # envelope like the prompt so a malformed completion (scalar content, missing role)
     # fails the episode instead of silently falling back to echo. text is extracted the
@@ -95,6 +95,10 @@ def _reference_turns(env, example: dict) -> list[str]:
     # openai-style text blocks is replayed instead of echoed; text-free turns (null content
     # or image-only blocks) yield an empty replay string that is kept in place.
     messages = _check_messages(env.sft_completion(example), "sft_completion")
+    # keep the rendered gold so the image-sft check can read it without calling the hook a second
+    # time; a stateful hook renders differently on a second call.
+    if record is not None:
+        record["reference_messages"] = messages
     # only assistant turns stand in for the policy model; a gold completion with no assistant
     # message must NOT replay user/system text as the model response -- yield no replay text so
     # _resolve_policy falls back to echo.
@@ -227,7 +231,7 @@ def _new_record() -> dict:
 def _drive_single_turn(env, example: dict, record: dict, *, force_echo: bool = False) -> None:
     prompt = _check_messages(env.prompt_messages(example), "prompt")
     record["prompt"] = prompt
-    reference_turns = _reference_turns(env, example)
+    reference_turns = _reference_turns(env, example, record)
     policy = "echo" if force_echo else _resolve_policy(reference_turns)
     record["policy"] = policy
     record["thinking_markup"] = _carries_thinking_markup(reference_turns)
@@ -246,7 +250,7 @@ def _drive_single_turn(env, example: dict, record: dict, *, force_echo: bool = F
 def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = False) -> None:
     state = env.new_rollout_state(example)
     record["prompt"] = _check_messages(state.get("prompt") or state.get("messages"), "prompt")
-    reference_turns = _reference_turns(env, example)
+    reference_turns = _reference_turns(env, example, record)
     policy = "echo" if force_echo else _resolve_policy(reference_turns)
     record["policy"] = policy
     record["thinking_markup"] = _carries_thinking_markup(reference_turns)
@@ -412,6 +416,12 @@ def _image_sft_rejection(env, dataset: list, algorithm: str | None) -> str | Non
     the capability gate, the completion through `_reject_image_completion`. Reporting only the
     prompt would pass an environment whose images live in `output`, which is the shape that
     otherwise survives every offline check and fails after the run is submitted.
+
+    Rows the episode loop is about to drive are judged on their raw fields alone. Rendering them
+    here too would call user hooks twice per row, and a stateful or one-shot hook renders
+    differently the second time -- so the verdict could describe a rendering the reported episode
+    never ran. Later rows are never driven, so rendering them costs nothing that would otherwise
+    happen and is the only way to see an image they build rather than declare.
     """
     if (algorithm or _REWARD_DRIVEN_ALGORITHM) != "sft":
         return None
@@ -419,15 +429,39 @@ def _image_sft_rejection(env, dataset: list, algorithm: str | None) -> str | Non
 
     build = getattr(env, "prompt_messages", None)
     completion_of = getattr(env, "sft_completion", None)
-    for example in dataset:
+    driven = min(_DEFAULT_EPISODES, len(dataset))
+    for index, example in enumerate(dataset):
         # a hook that raises is not an image verdict -- the episode loop reports the real
         # construction error against the failing case. keep scanning rather than returning: the
         # loop only drives the first few rows, so abandoning the scan here would let an image row
         # further down the dataset reach `overall: PASS`.
-        if record_has_images(example, _hook_messages(build, example)):
+        rendered = [] if index < driven else _hook_messages(build, example)
+        if record_has_images(example, rendered):
             return IMAGE_SFT_UNSUPPORTED
-        if record_has_images({}, _hook_messages(completion_of, example)):
+        completion = [] if index < driven else _hook_messages(completion_of, example)
+        if record_has_images({}, completion):
             return "image-bearing SFT completions are not supported"
+    return None
+
+
+def _image_sft_episode_rejection(record: dict, algorithm: str | None) -> str | None:
+    """Judge an episode's ALREADY-rendered prompt and gold completion, rendering nothing itself.
+
+    The preflight scan reads only raw fields for the rows this loop drives, so an image the
+    environment builds in `prompt_messages` or `sft_completion` rather than declaring on the record
+    is caught here instead -- off the renders the episode already performed, so a stateful hook is
+    still called exactly once per row.
+    """
+    if (algorithm or _REWARD_DRIVEN_ALGORITHM) != "sft":
+        return None
+    from flash.content.multimodal import IMAGE_SFT_UNSUPPORTED, record_has_images
+
+    prompt = record.get("prompt")
+    if record_has_images({}, prompt if isinstance(prompt, list) else []):
+        return IMAGE_SFT_UNSUPPORTED
+    completion = record.get("reference_messages")
+    if record_has_images({}, completion if isinstance(completion, list) else []):
+        return "image-bearing SFT completions are not supported"
     return None
 
 
@@ -815,6 +849,13 @@ def cmd_env_test(args) -> int:
                 raise ValueError(f"reward is not finite: {reward}")
         except (Exception, SystemExit) as exc:
             failure = str(exc) or exc.__class__.__name__
+
+        # the preflight scan judged this row on its raw fields only, to avoid rendering it twice.
+        # the prompt it built is available now, so an image the environment constructs rather than
+        # declares is caught here -- still before any episode is reported as passing.
+        unsupported = _image_sft_episode_rejection(record, getattr(args, "algorithm", None))
+        if unsupported:
+            return _err(unsupported)
 
         reward = record["reward"]
         reward_text = "n/a" if reward is None else f"{reward:.6f}"

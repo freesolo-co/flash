@@ -639,6 +639,54 @@ def test_env_test_rejects_an_image_sft_completion(monkeypatch, tmp_path, capsys)
     assert "overall: PASS" not in captured.out
 
 
+class _CountingImageEnv(_SingleTurnEnv):
+    """Builds the image in the hook rather than declaring it on the record, and counts renders."""
+
+    def __init__(self):
+        super().__init__(rows=[{"input": "what is shown?", "output": "red"}])
+        self.prompt_calls = 0
+
+    def prompt_messages(self, example):
+        self.prompt_calls += 1
+        return [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": example["input"]}, {"type": "image"}],
+            }
+        ]
+
+
+def test_env_test_rejects_an_image_built_by_the_prompt_hook(monkeypatch, tmp_path, capsys):
+    """An image the environment CONSTRUCTS is not visible on the raw record.
+
+    The preflight reads raw fields only for rows the episode loop drives, so this shape is caught
+    off the prompt the episode itself rendered -- and must still be caught.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _CountingImageEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 1
+    captured = capsys.readouterr()
+    assert "image-bearing SFT is not supported" in captured.err
+    assert "overall: PASS" not in captured.out
+
+
+def test_env_test_renders_a_driven_row_once_for_sft(monkeypatch, tmp_path, capsys):
+    """Rendering a driven row twice would let a stateful hook report a different episode.
+
+    The image verdict must come off the same render the episode reports, so the preflight leaves
+    driven rows to the loop instead of calling their hooks a second time.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _CountingImageEnv()
+    _patch_loader(monkeypatch, env)
+
+    cmd_env_test(_args(env_dir, algorithm="sft"))
+    capsys.readouterr()
+    assert env.prompt_calls == 1
+
+
 class _LateImageEnv(_SingleTurnEnv):
     """Text rows, then a row whose prompt raises, then an image row."""
 
