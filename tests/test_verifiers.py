@@ -265,31 +265,38 @@ def test_per_episode_state_survives_every_single_turn_scoring_entry_point(monkey
     assert sdk_env._picks == []
 
 
-def test_a_rebuilt_dataset_reusing_a_positional_id_is_not_graded_through_a_stale_task(monkeypatch):
-    """Ids are POSITIONAL (example_000000 ...), so a rebuilt dataset reuses them for different
-    rows. Keying the per-row task on the id alone would grade the new row through the old row's
-    task -- the retained episode of a row that is no longer in the dataset."""
+def test_each_row_keeps_its_own_episode_and_non_dataset_rows_are_not_retained(monkeypatch):
+    """Rows must not share a task with each other, and only dataset rows get a stable one.
+
+    Ids are POSITIONAL (example_000000 ...), so keying on the id rather than the row would let two
+    rows collide on one task. And a caller that mints a row per call -- `flash env eval` builds one
+    per case -- must not have every one of them pinned for the life of the environment.
+    """
     _install_fake_freesolo(monkeypatch)
 
     from flash.envs.adapter import FreesoloEnvironment
 
     sdk_env = _PerEpisodeImageEnv(picks=["pool/red.png", "pool/blue.png"])
     env = FreesoloEnvironment(
-        sdk_env, "owner/env", source=[{"input": "what color?"}], contract_text=""
+        sdk_env,
+        "owner/env",
+        source=[{"input": "what color?"}, {"input": "and this one?"}],
+        contract_text="",
     )
-    (first,) = env.dataset()
+    first, second = env.dataset()
     env.prompt_messages(first)
-
-    # a fresh dataset generation: same positional id, different row.
-    env._dataset_cache = None
-    env._source = [{"input": "what color now?"}]
-    (second,) = env.dataset()
     env.prompt_messages(second)
 
+    # each row grades against the episode IT generated, not the other's.
+    assert env.reward("it is red", first) == 1.0
     assert env.reward("it is blue", second) == 1.0
-    assert sdk_env.graded_against[-1] == "pool/blue.png"
-    # the superseded row's task is not retained: the dataset it belonged to is gone.
-    assert len(env._row_tasks) == 1
+
+    # one entry per dataset row, and nothing more: scoring rows the dataset never produced adds
+    # no entries, so an eval suite cannot grow this map.
+    assert len(env._row_tasks) == 2
+    for index in range(50):
+        env.reward("x", {"id": f"case_{index}", "input": "held out"})
+    assert len(env._row_tasks) == 2
 
 
 def test_single_turn_reward_many_batches_by_example_value_identical(monkeypatch):

@@ -7,7 +7,6 @@ public names are re-exported here so existing ``flash.envs.adapter`` import path
 from __future__ import annotations
 
 import json
-import threading
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -136,16 +135,11 @@ class FreesoloEnvironment(BaseEnvironment):
         self.is_tool_env = False
         self._max_turns_cache: int | None = None
         self._dataset_cache: list[dict] | None = None
-        # id(row) -> (row, its one TaskExample), for the rows of the live dataset only. see
+        # id(row) -> that row's one TaskExample, filled by dataset() as it builds the rows. see
         # _task_example for why every hook that touches a row must be handed the same object.
-        # GRPO grades rollouts concurrently, so writes are locked; the read is a plain dict
-        # lookup, which is atomic under the GIL and re-validated by identity.
-        self._row_tasks: dict[int, tuple[dict, Any]] = {}
-        self._row_tasks_lock = threading.Lock()
-        # id()s of the rows dataset() built, so a row can be recognized as one of ITS OWN without
-        # an O(n) scan per lookup. only meaningful together with _dataset_cache, which keeps
-        # those rows alive for as long as these ids are consulted.
-        self._dataset_row_ids: frozenset[int] = frozenset()
+        # written once, before any rollout can run, so concurrent GRPO grading only ever reads it.
+        # keyed on id() and kept exactly as long as _dataset_cache, whose rows own those ids.
+        self._row_tasks: dict[int, Any] = {}
         # whether this run samples <think> blocks. the worker sets it from the JobSpec once the
         # env is loaded; off by default so a CLI-side load (flash env test) grades raw text, which
         # is what an echo/replay harness feeds it.
@@ -199,28 +193,16 @@ class FreesoloEnvironment(BaseEnvironment):
         task once and ``_score_episode`` grades with that same ``state["task"]``. Single-turn now
         matches it rather than being the odd one out.
 
-        Keyed on the row OBJECT, not its id: ids are positional (``example_000000``), so a
-        reloaded or rebuilt dataset reuses them across different rows, and an id key would hand
-        row B the task built for row A.
-
-        Only rows the DATASET owns are memoized, which bounds the map to one dataset and is
-        exactly the population that needs a stable task: a rollout generates from a dataset row
-        and is graded on that same row. A caller that mints a row per call (``flash env eval``
-        builds one per case) would otherwise pin every one of them for the life of the env; those
-        get a per-call task, exactly as before, since nothing generated from them either.
+        The tasks are built by :meth:`dataset` alongside the rows themselves, keyed by row
+        IDENTITY, so this is a lookup rather than a cache: there is no fill, no eviction and no
+        lock, and a row can never be graded through a task built for a different one. Anything
+        that is not a dataset row -- an eval case, a bare ``{"output": ...}`` -- has no episode to
+        preserve and gets a per-call task, exactly as before.
         """
-        cached = self._row_tasks.get(id(example))
-        if cached is not None and cached[0] is example:
-            return cached[1]
-        task = self._task_example_from_record(self._canonical_record(example))
-        if self._dataset_row_ids and id(example) in self._dataset_row_ids:
-            with self._row_tasks_lock:
-                # the row is stored ALONGSIDE its task for two reasons: it keeps the row alive so
-                # its id() cannot be recycled by a later object (which would alias two unrelated
-                # rows onto one task), and it makes the identity check above compare against a
-                # live object.
-                self._row_tasks[id(example)] = (example, task)
-        return task
+        task = self._row_tasks.get(id(example))
+        if task is not None:
+            return task
+        return self._task_example_from_record(self._canonical_record(example))
 
     def _with_system_prompt(self, messages: list[dict]) -> list[dict]:
         return with_system_prompt(messages, self._contract_text)
@@ -311,6 +293,7 @@ class FreesoloEnvironment(BaseEnvironment):
                     f"not the packaged file {self._source} ({file_rows} rows)"
                 )
         records = []
+        row_tasks: dict[int, Any] = {}
         for example in examples:
             raw = dict(getattr(example, "record", {}) or {})
             if _CANONICAL_INPUT_KEY not in raw and getattr(example, "input", None) is not None:
@@ -325,13 +308,14 @@ class FreesoloEnvironment(BaseEnvironment):
                 raw["id"] = example_id
             record = self._canonical_record(raw)
             records.append(record)
-        # the previous generation's rows are gone, so their memoized tasks are too: nothing can be
-        # graded through a task built for a row this dataset no longer contains. _dataset_cache is
-        # assigned FIRST so the rows backing these ids are reachable before any of them is.
+            # build this row's ONE task here, next to the row itself: every later hook --
+            # start_episode, sft_completion, scoring -- looks it up instead of minting its own.
+            # see _task_example.
+            row_tasks[id(record)] = self._task_example_from_record(record)
+        # assigned together: the rows own the ids the task map is keyed on, so neither may be
+        # visible without the other.
         self._dataset_cache = records
-        with self._row_tasks_lock:
-            self._row_tasks.clear()
-            self._dataset_row_ids = frozenset(id(record) for record in records)
+        self._row_tasks = row_tasks
         return records
 
     def prompt_messages(self, example: dict) -> list[dict]:
