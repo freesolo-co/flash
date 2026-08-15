@@ -125,9 +125,10 @@ def has_complete_fused_expert_tensors(
             required_per_owner[owner] = required_per_owner.get(owner, 0) + 1
     if not required_per_owner:
         return False
+    adapter_namespace: str | None = None
     for owner, needed in required_per_owner.items():
         ladder = tuple(".".join(["base_layer"] * depth) for depth in range(needed))
-        factors: dict[str, dict[str, dict[str, tuple[int, ...]]]] = {}
+        factors: dict[str, dict[str, dict[str, dict[str, tuple[int, ...]]]]] = {}
         for key, shape in tensors.items():
             if ".lora_" not in key:
                 continue
@@ -151,12 +152,26 @@ def has_complete_fused_expert_tensors(
             if layer_prefix is None or instance != layer_prefix:
                 return False
             full_instance = f"{instance}.{owner}"
-            factors.setdefault(full_instance, {}).setdefault(suffix, {})[factor] = shape
+            namespace_factors = factors.setdefault(full_instance, {}).setdefault(suffix, {})
+            namespace_factors.setdefault(adapter_name, {})[factor] = shape
         if not factors:
             return False
         for seen in factors.values():
-            observed = Counter(_lora_pair_shapes(seen.get(rung, {})) for rung in ladder)
-            if None in observed or observed != expected_pairs:
+            observed = Counter()
+            for rung in ladder:
+                namespaces = seen.get(rung, {})
+                if len(namespaces) != 1:
+                    return False
+                namespace, namespace_factors = next(iter(namespaces.items()))
+                if adapter_namespace is None:
+                    adapter_namespace = namespace
+                elif namespace != adapter_namespace:
+                    return False
+                pair = _lora_pair_shapes(namespace_factors)
+                if pair is None:
+                    return False
+                observed[pair] += 1
+            if observed != expected_pairs:
                 return False
         expert_layers = {
             prefix

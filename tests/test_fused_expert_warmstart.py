@@ -338,6 +338,46 @@ def test_tensor_analyzer_accepts_exact_catalog_shapes_and_unordered_rungs():
     )
 
 
+def test_tensor_analyzer_requires_matching_adapter_namespaces_across_all_exact_owners():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    config = _valid_config()
+    assert has_complete_fused_expert_tensors(
+        _complete_expert_tensors(factor_leaves=("foo.weight", "foo.weight")),
+        config,
+        _MODEL_ID,
+    )
+    assert not has_complete_fused_expert_tensors(
+        _complete_expert_tensors(factor_leaves=("foo.weight", "bar.weight")),
+        config,
+        _MODEL_ID,
+    )
+
+
+def test_tensor_analyzer_rejects_namespace_changes_across_wrapper_rungs():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _complete_expert_tensors(factor_leaves=("foo.weight", "foo.weight"))
+    tensors = {
+        key.replace(".foo.weight", ".bar.weight") if ".base_layer.lora_" in key else key: shape
+        for key, shape in tensors.items()
+    }
+
+    assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+
+
+def test_tensor_analyzer_rejects_namespace_changes_across_catalog_layers():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _complete_expert_tensors(factor_leaves=("foo.weight", "foo.weight"))
+    tensors = {
+        key.replace(".foo.weight", ".bar.weight") if ".layers.17." in key else key: shape
+        for key, shape in tensors.items()
+    }
+
+    assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+
+
 @pytest.mark.parametrize(
     "factor_leaves",
     [
