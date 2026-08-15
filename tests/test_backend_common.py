@@ -2732,6 +2732,32 @@ def test_child_tail_silence_survives_the_retention_limit():
     assert staleness.observe(tail.written) == 0
 
 
+def test_a_reprinted_frozen_line_is_not_counted_as_progress():
+    """The observed wedge was NOT silent, which is why counting bytes could never catch it.
+
+    A verl TransferQueue timer re-printed a frozen `Total success requests: 299` every ~5 minutes,
+    forever, while nothing advanced. Counting each reprint as output reset the staleness counter, so
+    the published silent-tick count never climbed past single digits on runs that were already dead
+    -- no threshold could separate the wedge from ordinary quiet. Only NEW content may reset it.
+    """
+    tail = vc.ChildOutputTail()
+    staleness = vc.ChildTailStaleness()
+    tail.record("Total success requests: 299\n")
+    assert staleness.observe(tail.written) == 0
+    # the reprint cadence that was actually observed, against a 30s tick: one line every ten ticks.
+    silent = 0
+    for tick in range(1, 61):
+        if tick % 10 == 0:
+            tail.record("Total success requests: 299\n")
+        silent = staleness.observe(tail.written)
+    assert silent == 60, f"a frozen reprint must not reset the clock, got {silent}"
+    # and the tail still RETAINS both copies: the repetition is the finding, not a reason to drop it.
+    assert tail.tail()[-1] == "Total success requests: 299"
+    # genuinely new content still clears it, so a slow-but-working child is never condemned.
+    tail.record("step 7: loss 0.41\n")
+    assert staleness.observe(tail.written) == 0
+
+
 def test_child_tail_silence_is_measured_from_the_childs_first_line():
     # a child silent for the first ticks then talking must not be credited with the silence that
     # preceded its first line -- otherwise a slow starter reports as long-wedged the moment it speaks.

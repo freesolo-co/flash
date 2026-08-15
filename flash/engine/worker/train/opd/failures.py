@@ -198,19 +198,35 @@ def _raise_verl_failure(
                 f"transient teacher failure after bounded retries: {message}"
             )
         raise RuntimeError(f"permanent teacher failure: {message}")
+    # the record decides, not the exit status. every actor writes its own pid-stamped record but
+    # only one reaches os._exit first, and the reader deliberately returns the most SEVERE record
+    # across all of them. taking the headline from the record and the retry decision from the exit
+    # code splits them: a permanent auth failure recorded by one actor, reported under the
+    # transient exit another actor happened to win with, is retried on paid GPUs until the attempt
+    # budget runs out -- every attempt failing on the same bad credential.
+    #
+    # it also outranks the truncation heuristic below, which is an inference drawn from an EARLIER
+    # no-signal batch: a child that recorded a failure and exited with a generic status would be
+    # reported as a fatal completion-cap error, telling the user to raise max_completion_tokens.
+    #
+    # this is why the record is consulted BEFORE the two exit-code branches below rather than after
+    # them: those branches name a classification without carrying the recorded detail, so reaching
+    # them first would discard both the message and the record's own verdict on retriability.
+    if teacher_worker_failure is not None:
+        classification, message = teacher_worker_failure
+        # "worker", not "bridge": the record is written by a dying ray agent-loop ACTOR, and saying
+        # so is what tells the reader the child driver is not the process that failed.
+        if classification == "transient":
+            raise _w.RetriableInfraError(f"transient teacher worker failure: {message}")
+        raise RuntimeError(f"permanent teacher worker failure: {message}")
+    # these fire only when the *child driver* exits with a teacher code and left no record. when the
+    # teacher path runs inside a ray agent-loop actor -- which is the normal case -- os._exit kills
+    # the actor and the driver exits some other way, so these codes never arrive and the fallback
+    # record above is the only thing that carries the classification.
     if return_code == _TRANSIENT_TEACHER_EXIT:
         raise _w.RetriableInfraError("transient teacher bridge failure")
     if return_code == _PERMANENT_TEACHER_EXIT:
         raise RuntimeError("permanent teacher bridge failure")
-    # the two branches above only fire when the *child driver* exits with a teacher code. when the
-    # teacher path runs inside a ray agent-loop actor -- which is the normal case -- os._exit kills
-    # the actor and the driver exits some other way, so those codes never arrive. the fallback
-    # record the dying actor left behind is what carries the classification instead.
-    if teacher_worker_failure is not None:
-        classification, message = teacher_worker_failure
-        if classification == "transient":
-            raise _w.RetriableInfraError(f"transient teacher worker failure: {message}")
-        raise RuntimeError(f"permanent teacher worker failure: {message}")
     if truncation_window is not None and truncation_window.indicates_completion_cap:
         raise RuntimeError(
             f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "

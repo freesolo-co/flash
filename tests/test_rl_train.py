@@ -34,6 +34,21 @@ from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
 from flash.engine.worker.train.rl import shims as verl_shims
 
 
+def _entry_source() -> str:
+    """The GRPO entry path's source: ``run_rl_train`` plus the helper it delegates the child to.
+
+    ``run_rl_train`` hit the 150-line function gate, so the rl_step liveness wrap and the child
+    launch moved into ``_run_rl_child_under_liveness``. The contracts asserted against this text
+    (fields-hook ordering, marker wiring, teardown ordering) span both halves, so reading only the
+    entry function would silently stop checking the half that moved rather than fail loudly.
+    """
+    from flash.engine.worker import rl_train_runner
+
+    return inspect.getsource(rl_train.run_rl_train) + inspect.getsource(
+        rl_train_runner._run_rl_child_under_liveness
+    )
+
+
 # ------------------------------- dispatch -------------------------------
 @pytest.mark.parametrize("stale", [None, "verl", "trl", "megatron"])
 def test_run_rl_always_delegates_to_verl(monkeypatch, stale):
@@ -1625,7 +1640,7 @@ def test_verl_uses_canonical_heartbeat_stage_contracts():
     from flash.providers._lifecycle.poll import STEP_GATED_STAGES
     from flash.runner import _TRAINING_STAGES
 
-    src = inspect.getsource(rl_train.run_rl_train)
+    src = _entry_source()
     # the stage names are a cross-process contract: the poller, the throttle table and the runner
     # all key off "rl_step"/"rl_finalizing". the tempting mistake is to coin a module-prefixed
     # variant, which reports a stage none of those three recognise. assert against the spelling the
@@ -1635,28 +1650,43 @@ def test_verl_uses_canonical_heartbeat_stage_contracts():
     assert "rl_train_finalizing" not in src
     initial_heartbeat = '_w.heartbeat("rl_step", step=0, initial=True)'
     assert initial_heartbeat in src
+
     # ordering is read off the ast, not off substring offsets: the liveness call spans several lines
     # once it carries keywords, and a text search for the one-line spelling would report "missing"
     # for a call that is present and correctly placed.
-    tree = ast.parse(textwrap.dedent(src))
-    stage_linenos = {}
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and node.args):
-            continue
-        first = node.args[0]
-        if not (isinstance(first, ast.Constant) and first.value == "rl_step"):
-            continue
-        if isinstance(node.func, ast.Name) and node.func.id == "liveness_heartbeat":
-            stage_linenos["liveness"] = node.lineno
-        elif (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "heartbeat"
-            and any(kw.arg == "initial" for kw in node.keywords)
-        ):
-            stage_linenos["initial"] = node.lineno
-    assert "initial" in stage_linenos
-    assert "liveness" in stage_linenos
-    assert stage_linenos["initial"] < stage_linenos["liveness"]
+    # the two calls now live in different functions -- the liveness wrap moved into
+    # `_run_rl_child_under_liveness` when `run_rl_train` hit the function-size gate -- so line
+    # numbers are not comparable across them. locate each in the function that owns it, and pin the
+    # ordering by that structure: the initial heartbeat is emitted by the entry function BEFORE it
+    # delegates to the helper that opens the wrap, so "initial precedes liveness" is what the call
+    # graph asserts rather than what two line numbers happen to say.
+    def _rl_step_calls(func):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+        found = set()
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and node.args):
+                continue
+            first = node.args[0]
+            if not (isinstance(first, ast.Constant) and first.value == "rl_step"):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id == "liveness_heartbeat":
+                found.add("liveness")
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "heartbeat"
+                and any(kw.arg == "initial" for kw in node.keywords)
+            ):
+                found.add("initial")
+        return found
+
+    from flash.engine.worker import rl_train_runner
+
+    assert "initial" in _rl_step_calls(rl_train.run_rl_train)
+    assert "liveness" in _rl_step_calls(rl_train_runner._run_rl_child_under_liveness)
+    # and the entry function is what reaches the wrap, so the initial ping cannot drift after it.
+    assert "_run_rl_child_under_liveness(" in " ".join(
+        inspect.getsource(rl_train.run_rl_train).split()
+    )
     assert '"rl_finalizing"' in src
     assert "rl_step" in _HB_THROTTLED_STAGES
     assert "rl_step" in STEP_GATED_STAGES
@@ -5186,7 +5216,7 @@ def test_bridge_shutdown_stops_the_scoring_thread():
 def test_the_run_shuts_the_bridge_down_before_the_server_it_is_mounted_on():
     # ordering matters: the server's routes block on the scoring thread, so stopping the server
     # first would strand a scoring episode on an event nothing will ever set.
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    src = " ".join(_entry_source().split())
     assert "multi_turn_bridge.shutdown()" in src
     assert src.index("multi_turn_bridge.shutdown()") < src.index("server.shutdown()")
 
@@ -6019,7 +6049,7 @@ def test_grpo_hands_the_silence_watchdog_its_parent_side_reward_counter():
     child's tail and tears down a healthy run -- the opd teacher counter closes the same gap on the
     other rl path. The state object builds the watchdog, so the callback has to arrive with it.
     """
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    src = " ".join(_entry_source().split())
 
     assert "_StepMetricState.for_reward_runtime(reward_runtime)" in src
 
@@ -6388,7 +6418,7 @@ def test_the_first_sample_bearing_heartbeat_is_forced():
 def test_the_liveness_fields_hook_carries_reward_observability():
     # the rl_step liveness wrap is what publishes between stdout lines. without the fields hook
     # merging it, samples would only ever reach the wire on the one forced first-metrics heartbeat.
-    entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    entry = " ".join(_entry_source().split())
     assert '"metrics_last": list(metrics_last), ' in entry
     assert "**_reward_observability()," in entry
     # and the watchdog's own field is merged BEFORE the reward diagnostics: those call user reward
@@ -6407,7 +6437,7 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
     had finished by then. If the step line did not close the generation, nothing ever would, and the
     buffer would report its first generation for the whole run.
     """
-    entry_src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    entry_src = " ".join(_entry_source().split())
 
     hook = entry_src[entry_src.index("def _reward_observability()") :]
     hook = hook[: hook.index("with liveness_heartbeat(")]
@@ -7182,7 +7212,7 @@ def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
     assert step_at < verify_at < stdout_loop.index("close_generation")
     # and the entry point wires the files dict (marker path + expected set) into both the loop
     # and the final verdict.
-    entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    entry = " ".join(_entry_source().split())
     assert "_reward_observability=_reward_observability, files=files," in entry
     assert 'rc, state, files["resume_step"], expected_steps, resume_uploader, files=files' in entry
 

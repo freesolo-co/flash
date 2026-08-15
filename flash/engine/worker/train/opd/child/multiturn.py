@@ -185,23 +185,27 @@ async def _opd_run(
     permanent_teacher_exit: int,
     transient_teacher_exit: int,
     exit_process,
+    child_failure_handler,
     **kwargs,
 ):
-    raw_prompt = validate_transcript_messages(
-        [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
-    )
-    prompt_ids = await self.apply_chat_template(raw_prompt)
-    settings = _OpdEpisodeSettings()
-    bridge_url = settings.bridge_url
-    bridge_token = settings.bridge_token
-    global_step = int(kwargs["global_steps"])
-    example_index = int(kwargs["index"])
-    rollout_ordinal = int(kwargs.get("session_id", 0))
-    session_id = f"{uuid4().hex}-{global_step}-{example_index}-{rollout_ordinal}"
-    outputs = []
-    start_attempted = False
+    failure_stage = "template"
+    failure_error = None
     failure_exit_code = None
+    start_attempted = False
     try:
+        raw_prompt = validate_transcript_messages(
+            [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
+        )
+        prompt_ids = await self.apply_chat_template(raw_prompt)
+        settings = _OpdEpisodeSettings()
+        bridge_url = settings.bridge_url
+        bridge_token = settings.bridge_token
+        global_step = int(kwargs["global_steps"])
+        example_index = int(kwargs["index"])
+        rollout_ordinal = int(kwargs.get("session_id", 0))
+        session_id = f"{uuid4().hex}-{global_step}-{example_index}-{rollout_ordinal}"
+        outputs = []
+        failure_stage = "multiturn_start"
         start_attempted = True
         start = await run_executor_call(
             self.loop,
@@ -220,6 +224,7 @@ async def _opd_run(
         turn_limit = int(start["max_turns"])
         if turn_limit <= 0 or turn_limit > settings.max_turns:
             raise RuntimeError("multi-turn bridge returned an invalid per-example turn limit")
+        failure_stage = "generate"
         await self._run_turns(
             sampling_params,
             outputs,
@@ -232,6 +237,7 @@ async def _opd_run(
             rollout_ordinal=rollout_ordinal,
             no_signal_attempt_ordinal=int(kwargs.get("flash_no_signal_attempt", 0)),
         )
+        failure_stage = "score"
         score_payload = await run_executor_call(
             self.loop,
             lambda: _post_multiturn_score(
@@ -244,10 +250,22 @@ async def _opd_run(
         )
         _attach_teacher_rows(outputs, score_payload)
     except Exception as error:
+        failure_error = error
         failure_exit_code = (
             transient_teacher_exit
             if getattr(error, "classification", None) == "transient"
             else permanent_teacher_exit
+        )
+        # recorded HERE rather than beside the exit below, because the exit is not guaranteed to
+        # run. cancelling this Ray task raises CancelledError out of the close request in the
+        # `finally` -- a BaseException, so neither this `except` nor that `suppress(Exception)`
+        # catches it -- and the block after the `finally` is then skipped entirely. a close that
+        # merely stalls delays it just as long. both are precisely the runs whose console upload is
+        # also lost, so the record has to be on disk before any awaited cleanup begins.
+        child_failure_handler(
+            "transient" if failure_exit_code == transient_teacher_exit else "permanent",
+            failure_stage,
+            failure_error,
         )
     finally:
         if start_attempted:
@@ -261,7 +279,7 @@ async def _opd_run(
                         {"session_id": session_id},
                     ),
                 )
-    if failure_exit_code is not None:
+    if failure_error is not None and failure_exit_code is not None:
         exit_process(failure_exit_code)
         raise AssertionError("multi-turn OPD process exit returned unexpectedly")
     return outputs
@@ -465,6 +483,7 @@ def build_flash_multi_turn_agent_loop(
     agent_loop_output,
     post_json,
     score_failure_handler,
+    child_failure_handler,
     deterministic_seed,
     permanent_teacher_exit: int = 86,
     transient_teacher_exit: int = 87,
@@ -488,9 +507,14 @@ def build_flash_multi_turn_agent_loop(
             try:
                 return await self._run(sampling_params, **kwargs)
             except Exception as error:
+                classification = (
+                    "transient"
+                    if getattr(error, "classification", None) == "transient"
+                    else "permanent"
+                )
                 exit_code = (
                     transient_teacher_exit
-                    if getattr(error, "classification", None) == "transient"
+                    if classification == "transient"
                     else permanent_teacher_exit
                 )
                 # this loop runs inside a ray AgentLoopWorkerTQ ACTOR, not the driver, so the exit
@@ -501,6 +525,11 @@ def build_flash_multi_turn_agent_loop(
                 # `while True` with no deadline or actor-health check -- polls a marker nobody will
                 # ever clear. mark the prompt BEFORE exiting so the trainer wakes and fails.
                 await mark_failed(kwargs)
+                # and record WHY on the way out. the two are complementary: the marker above ends
+                # the wedge, this names it. without the marker the parent waits forever with a
+                # perfect diagnosis it never gets to read; without this the run fails promptly as a
+                # generic non-zero exit and the actual teacher/template cause is lost with the actor.
+                child_failure_handler(classification, "template", error)
                 exit_process(exit_code)
                 raise AssertionError("multi-turn OPD process exit returned unexpectedly") from error
 
@@ -513,6 +542,7 @@ def build_flash_multi_turn_agent_loop(
                 permanent_teacher_exit=permanent_teacher_exit,
                 transient_teacher_exit=transient_teacher_exit,
                 exit_process=exit_process,
+                child_failure_handler=child_failure_handler,
                 **kwargs,
             )
 

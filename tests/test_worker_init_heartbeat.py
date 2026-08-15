@@ -279,6 +279,61 @@ def test_liveness_heartbeat_join_is_bounded_even_if_emit_wedges(monkeypatch):
     )
 
 
+def test_sample_off_thread_keeps_sampling_while_the_upload_is_wedged(monkeypatch):
+    """A wedged upload must not freeze the watchdog's counter.
+
+    ``fields`` is what advances the silence watchdog, and the emitting loop can block for minutes
+    inside ``heartbeat`` (HfApi takes no timeout -- the test above requires callers to survive
+    exactly that). Sampling from that loop makes a child that dies WHILE an upload is stuck
+    unkillable: the counter stops advancing at the moment it matters most, and a dead run holds a
+    paid gpu. ``sample_off_thread`` moves sampling to a thread that never uploads.
+    """
+    hb, w, _ = _liveness_env(monkeypatch)
+    monkeypatch.setattr(hb, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.2)
+    calls: list[int] = []
+
+    def _fields() -> dict:
+        calls.append(1)
+        return {"child_tail_silent_ticks": len(calls)}
+
+    # first emit wedges forever, exactly like a commit with no timeout
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: time.sleep(30))
+    with hb.liveness_heartbeat("opd_step", fields=_fields, sample_off_thread=True):
+        time.sleep(0.3)
+    off_thread = len(calls)
+
+    calls.clear()
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: time.sleep(30))
+    with hb.liveness_heartbeat("opd_step", fields=_fields, sample_off_thread=False):
+        time.sleep(0.3)
+    on_thread = len(calls)
+
+    # on the emitting loop the wedge stops sampling after the first tick; off it, sampling continues.
+    assert on_thread <= 2, f"expected sampling to stall on the uploading thread, got {on_thread}"
+    assert off_thread > on_thread + 2, (
+        f"off-thread sampling must survive a wedged upload: {off_thread} vs {on_thread}"
+    )
+
+
+def test_the_watchdog_paths_sample_off_the_uploading_thread():
+    """Both training paths must pass ``sample_off_thread``: their ``fields`` drives the watchdog.
+
+    Asserted at the call sites because the flag is what makes the test above's property hold in
+    production -- the helper can be correct while nothing opts into it.
+    """
+    # opd_train first: the runner is imported back by it, so reaching the runner directly on a cold
+    # interpreter trips the module's circular-import guard.
+    from flash.engine.worker import opd_train as _opd_train  # noqa: F401
+    from flash.engine.worker import opd_train_runner, rl_train_runner
+
+    for func in (
+        rl_train_runner._run_rl_child_under_liveness,
+        opd_train_runner._run_child,
+    ):
+        src = " ".join(inspect.getsource(func).split())
+        assert "sample_off_thread=True" in src, f"{func.__name__} samples on the uploading thread"
+
+
 def test_liveness_heartbeat_rechecks_done_after_diagnostics():
     """gpu_diagnostics shells out to nvidia-smi (seconds); the wrapped call can finish during it. The
     daemon must re-check done BETWEEN diagnostics and the emit, so no stale stage lands afterward."""
@@ -315,6 +370,53 @@ def test_heartbeat_marks_progress_only_for_real_heartbeats(monkeypatch):
     ne.heartbeat("rl_step", liveness=True, step=1)  # liveness ping
     assert after_real == ne._HB_LAST_PROGRESS_TS, "a liveness ping must NOT advance progress"
     assert seen[-1].get("liveness") is True, "a liveness ping is stamped liveness=True"
+
+
+def test_heartbeat_console_marks_only_an_attempted_upload_that_failed(monkeypatch):
+    """The console line must distinguish progress the PROVIDER can see from progress only we saw.
+
+    The provider's stall clock reads heartbeat.json from HF, so a heartbeat whose upload failed is
+    invisible to it. The console uploader keys its wedge timer on these lines, so an unmarked
+    failed heartbeat resets that timer while the stall clock keeps counting from the older
+    committed one -- and the wedge snapshot gets scheduled past the teardown it exists to beat.
+
+    The exemption is as load-bearing as the mark. A THROTTLED heartbeat is uncommitted too, but
+    marking it would fire the wedge path on every healthy run: the step stages coalesce at
+    _HB_MIN_INTERVAL_S (900s), nearly double the uploader's 480s quiet threshold. Both directions
+    are asserted here because a fix for either one alone reads as correct in isolation.
+    """
+    import json
+
+    import flash.engine.worker as ne
+
+    lines: list = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: lines.append(" ".join(map(str, a))))
+
+    def _console(index: int) -> dict:
+        return json.loads([ln for ln in lines if ln.startswith("HEARTBEAT {")][index][10:])
+
+    # a committed heartbeat is byte-identical to before: no marker at all.
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: True)
+    ne._HB_LAST_UPLOAD = 0.0
+    ne.heartbeat("rl_step", step=1)
+    assert "pending" not in _console(0)
+
+    # the upload was attempted and reported failure -> marked, because HF does not have it.
+    monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: False)
+    ne._HB_LAST_UPLOAD = 0.0
+    ne.heartbeat("rl_step", step=2)
+    assert _console(-1)["pending"] is True
+
+    # THROTTLED, not failed: uncommitted, but the last commit is recent BY CONSTRUCTION, so this
+    # is real progress the provider's clock already has. Marking it is the false-wedge bug.
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: True)
+    ne._HB_LAST_UPLOAD = time.time()
+    ne.heartbeat("rl_step", liveness=True, step=3)
+    throttled = _console(-1)
+    assert "pending" not in throttled, "a throttled heartbeat is not a failed one"
+    assert throttled["step"] == 3, "the throttled heartbeat still reaches the console"
 
 
 def test_heartbeat_console_summarizes_metric_backlog():

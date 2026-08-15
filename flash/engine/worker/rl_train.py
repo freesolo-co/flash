@@ -396,35 +396,17 @@ def run_rl_train():
         def _progress():
             return state.progress["step"]
 
-        def _reward_observability() -> dict:
-            """return reward metrics and sampled completions for one heartbeat."""
-            return reward_runtime.observability.heartbeat_fields()
-
-        with liveness_heartbeat(
-            "rl_step",
+        rc = _run_rl_child_under_liveness(
+            python_bin=python_bin,
+            overrides=configured["overrides"],
+            env_for_verl=env_for_verl,
+            inp=inp,
+            state=state,
+            reward_runtime=reward_runtime,
+            files=files,
             progress=_progress,
-            # silence first: a failure in the optional reward diagnostics must not skip a tick.
-            fields=lambda: {
-                "metrics_last": list(metrics_last),
-                **state.silence_watchdog.heartbeat_fields(int(_progress() or 0)),
-                **_reward_observability(),
-            },
-            progress_step=True,
-            # `fields` drives the silence watchdog above, so it must not be sampled from the thread
-            # that uploads: a wedged commit would freeze the counter and a child that died while
-            # the upload was stuck would never be condemned.
-            sample_off_thread=True,
-        ):
-            rc = _execute_rl_child(
-                python_bin=python_bin,
-                overrides=configured["overrides"],
-                env_for_verl=env_for_verl,
-                inp=inp,
-                state=state,
-                reward_runtime=reward_runtime,
-                _reward_observability=_reward_observability,
-                files=files,
-            )
+            metrics_last=metrics_last,
+        )
         _validate_rl_child(
             rc, state, files["resume_step"], expected_steps, resume_uploader, files=files
         )
@@ -516,6 +498,7 @@ from flash.engine.worker.rl_train_runner import (  # noqa: E402,F401
     _prepare_rl_runtime,
     _resolve_training_settings,
     _RewardRuntime,
+    _run_rl_child_under_liveness,
     _start_resume_uploader,
     _start_reward_runtime,
     _StepMetricState,

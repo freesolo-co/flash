@@ -531,6 +531,57 @@ def _ingest_step_metrics(
             state.adv_spread_history.append(adv_max - adv_min)
 
 
+def _run_rl_child_under_liveness(
+    *,
+    python_bin,
+    overrides,
+    env_for_verl,
+    inp,
+    state,
+    reward_runtime,
+    files,
+    progress,
+    metrics_last,
+) -> int:
+    """Run the verl child inside the rl_step liveness wrap and return its exit code.
+
+    The wrap and the child belong together: the heartbeat's ``fields`` callback is what advances the
+    silence watchdog, so the child must be launched INSIDE it or a wedge during training is measured
+    by nothing.
+    """
+    from flash.engine.worker.io.heartbeat import liveness_heartbeat
+
+    def _reward_observability() -> dict:
+        """return reward metrics and sampled completions for one heartbeat."""
+        return reward_runtime.observability.heartbeat_fields()
+
+    with liveness_heartbeat(
+        "rl_step",
+        progress=progress,
+        # silence first: a failure in the optional reward diagnostics must not skip a tick.
+        fields=lambda: {
+            "metrics_last": list(metrics_last),
+            **state.silence_watchdog.heartbeat_fields(int(progress() or 0)),
+            **_reward_observability(),
+        },
+        progress_step=True,
+        # `fields` drives the silence watchdog above, so it must not be sampled from the thread that
+        # uploads: a wedged commit would freeze the counter and a child that died while the upload
+        # was stuck would never be condemned.
+        sample_off_thread=True,
+    ):
+        return _execute_rl_child(
+            python_bin=python_bin,
+            overrides=overrides,
+            env_for_verl=env_for_verl,
+            inp=inp,
+            state=state,
+            reward_runtime=reward_runtime,
+            _reward_observability=_reward_observability,
+            files=files,
+        )
+
+
 def _execute_rl_child(
     *,
     python_bin,

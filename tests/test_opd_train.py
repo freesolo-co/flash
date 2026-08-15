@@ -4530,6 +4530,994 @@ def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(monk
         )
 
 
+def test_child_failure_sanitizer_redacts_credentials_without_eating_ordinary_values(monkeypatch):
+    """Redaction must not corrupt the diagnostic it exists to carry.
+
+    The child's environment holds `TOKENIZERS_PARALLELISM=false` and `FLASH_OPD_EOS_TOKEN_IDS`, so a
+    substring rule over KEY/TOKEN/SECRET/PASSWORD classifies both as credentials and rewrites every
+    occurrence of `false` and of the id list. Match the suffix/exact rule `bootstrap_secrets` uses:
+    `FLASH_OPD_BRIDGE_TOKEN` still redacts because it ENDS with `_TOKEN`.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    secret = "s3cr3t-bridge-token-abcdef123456"
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", secret)
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
+    monkeypatch.setenv("FLASH_OPD_EOS_TOKEN_IDS", "[151643,151645]")
+
+    kept = _safe_child_failure_detail(
+        ValueError("parallelism was false and eos ids [151643,151645] mismatched")
+    )
+    assert kept == "parallelism was false and eos ids [151643,151645] mismatched"
+
+    for error in (
+        ValueError(f"HTTP 403 Authorization: Bearer {secret}"),
+        RuntimeError(f"token={secret} rejected"),
+    ):
+        redacted = _safe_child_failure_detail(error)
+        assert secret not in redacted
+        assert "<redacted>" in redacted
+
+
+def test_teacher_manager_catch_all_records_its_stage_before_exit(monkeypatch, tmp_path):
+    """The teacher-manager catch-all is the last `os._exit` that could still exit silently.
+
+    It sits on the single-turn teacher path, the same blindness this PR removes elsewhere, so it
+    must record a `teacher`-stage record before exiting rather than leaving the parent with only a
+    return code.
+    """
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.child.plugin import _write_child_failure_fallback
+
+    child_failure_path = str(tmp_path / "child-failure")
+    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKER_FAILURE_PATH", child_failure_path)
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", "bridge-secret-token")
+
+    _write_child_failure_fallback(
+        "permanent", "teacher", ConnectionResetError("upstream closed the scoring socket")
+    )
+
+    assert _read_classified_failure_fallback(child_failure_path) == (
+        "permanent",
+        "[stage=teacher] ConnectionResetError: upstream closed the scoring socket",
+    )
+
+
+@pytest.mark.parametrize(
+    ("stage", "failure_path"),
+    [
+        ("multiturn_start", "/multiturn/start"),
+        ("generate", None),
+        ("score", "/multiturn/score"),
+    ],
+)
+def test_multiturn_catch_all_writes_stage_type_and_message_before_exit(
+    monkeypatch, tmp_path, stage, failure_path
+):
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.child.multiturn import build_flash_multi_turn_agent_loop
+    from flash.engine.worker.train.opd.child.plugin import _write_child_failure_fallback
+
+    child_failure_path = str(tmp_path / "child-failure")
+    bridge_token = "bridge-secret-token"
+    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKER_FAILURE_PATH", child_failure_path)
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_URL", "http://127.0.0.1:4444")
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", bridge_token)
+    monkeypatch.setenv("FLASH_OPD_SEED", "42")
+    monkeypatch.setenv("FLASH_OPD_MAX_TURNS", "2")
+    monkeypatch.setenv("FLASH_OPD_MAX_MODEL_LEN", "128")
+    monkeypatch.setenv(
+        "FLASH_OPD_ENV_CAPABILITIES",
+        json.dumps(["new_rollout_state", "record_model_turn", "env_reply", "rollout_done"]),
+    )
+
+    class ChildExit(BaseException):
+        def __init__(self, code):
+            super().__init__(code)
+            self.code = code
+
+    def child_exit(code):
+        raise ChildExit(code)
+
+    def post_json(_url, _token, path, _payload):
+        if path == failure_path:
+            raise ValueError(f"invalid payload token={bridge_token}")
+        if path == "/multiturn/start":
+            return {"max_turns": 1}
+        if path == "/multiturn/close":
+            return {"ok": True}
+        raise AssertionError(path)
+
+    registered = {}
+
+    def register(name):
+        return lambda cls: registered.setdefault(name, cls) or cls
+
+    class AgentLoopBase:
+        def __init__(self):
+            self.loop = asyncio.get_running_loop()
+
+        async def apply_chat_template(self, _messages):
+            return [10, 11]
+
+        async def _run_turns(self, _sampling_params, outputs, **_kwargs):
+            # the `generate` stage has no bridge route to fail, so the turn loop itself raises.
+            if stage == "generate":
+                raise ValueError(f"invalid payload token={bridge_token}")
+            outputs.append(SimpleNamespace(prompt_ids=[10], response_ids=[11], extra_fields={}))
+
+    loop_type = build_flash_multi_turn_agent_loop(
+        register=register,
+        agent_loop_base=AgentLoopBase,
+        agent_loop_output=SimpleNamespace,
+        post_json=post_json,
+        score_failure_handler=lambda error: (_ for _ in ()).throw(error),
+        child_failure_handler=_write_child_failure_fallback,
+        deterministic_seed=lambda *_args, **_kwargs: 1,
+        process_exit=child_exit,
+    )
+    loop_type._run_turns = AgentLoopBase._run_turns
+
+    async def run_loop():
+        return await loop_type().run(
+            {},
+            raw_prompt=[{"role": "user", "content": "q"}],
+            global_steps=1,
+            index=0,
+            session_id=0,
+        )
+
+    with pytest.raises(ChildExit) as exit_error:
+        asyncio.run(run_loop())
+
+    assert exit_error.value.code == 86
+    fallback = _read_classified_failure_fallback(child_failure_path)
+    assert fallback == (
+        "permanent",
+        f"[stage={stage}] ValueError: invalid payload token=<redacted>",
+    )
+    record = next(tmp_path.glob("child-failure.*.permanent.json")).read_text()
+    assert bridge_token not in record
+
+
+def test_child_failure_record_survives_cancellation_during_the_close_request(monkeypatch, tmp_path):
+    """Cancelling the rollout task must not cost us the reason it was failing.
+
+    `CancelledError` is a BaseException, so it escapes both the catch-all and the
+    `suppress(Exception)` around the close request, and the exit block after the `finally` never
+    runs. A close that merely stalls delays it just as long. Recording before cleanup is what makes
+    the evidence survive -- and a cancelled or stalled run is exactly the one whose console upload
+    is also lost, so this record is then the only account of the failure.
+    """
+    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.child.multiturn import build_flash_multi_turn_agent_loop
+    from flash.engine.worker.train.opd.child.plugin import _write_child_failure_fallback
+
+    child_failure_path = str(tmp_path / "child-failure")
+    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKER_FAILURE_PATH", child_failure_path)
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_URL", "http://127.0.0.1:4444")
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", "bridge-secret-token")
+    monkeypatch.setenv("FLASH_OPD_SEED", "42")
+    monkeypatch.setenv("FLASH_OPD_MAX_TURNS", "2")
+    monkeypatch.setenv("FLASH_OPD_MAX_MODEL_LEN", "128")
+    monkeypatch.setenv(
+        "FLASH_OPD_ENV_CAPABILITIES",
+        json.dumps(["new_rollout_state", "record_model_turn", "env_reply", "rollout_done"]),
+    )
+
+    close_started = threading.Event()
+    exits = []
+
+    def post_json(_url, _token, path, _payload):
+        if path == "/multiturn/start":
+            return {"max_turns": 1}
+        if path == "/multiturn/close":
+            # the close the task is cancelled inside of.
+            close_started.set()
+            time.sleep(3)
+            return {"ok": True}
+        raise AssertionError(path)
+
+    def register(name):
+        return lambda cls: cls
+
+    class AgentLoopBase:
+        def __init__(self):
+            self.loop = asyncio.get_running_loop()
+
+        async def apply_chat_template(self, _messages):
+            return [10, 11]
+
+        async def _run_turns(self, _sampling_params, _outputs, **_kwargs):
+            raise ValueError("multi-turn rollout prompt ids do not match the frozen flash prompt")
+
+    loop_type = build_flash_multi_turn_agent_loop(
+        register=register,
+        agent_loop_base=AgentLoopBase,
+        agent_loop_output=SimpleNamespace,
+        post_json=post_json,
+        score_failure_handler=lambda error: (_ for _ in ()).throw(error),
+        child_failure_handler=_write_child_failure_fallback,
+        deterministic_seed=lambda *_args, **_kwargs: 1,
+        process_exit=exits.append,
+    )
+    loop_type._run_turns = AgentLoopBase._run_turns
+
+    async def run_loop():
+        task = asyncio.ensure_future(
+            loop_type().run(
+                {},
+                raw_prompt=[{"role": "user", "content": "q"}],
+                global_steps=1,
+                index=0,
+                session_id=0,
+            )
+        )
+        await asyncio.get_running_loop().run_in_executor(None, close_started.wait, 5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run_loop())
+
+    # the exit never runs on this path -- that is the point: the record is the only survivor.
+    assert exits == []
+    assert _read_classified_failure_fallback(child_failure_path) == (
+        "permanent",
+        (
+            "[stage=generate] ValueError: multi-turn rollout prompt ids do not match "
+            "the frozen flash prompt"
+        ),
+    )
+
+
+def test_child_failure_detail_survives_an_exception_whose_str_raises():
+    """A broken ``__str__`` must not replace the real failure with its own.
+
+    ``str(error)`` runs user code. If it raises inside the recorder, the outer catch-all treats the
+    stringification error as the child failure, relabels the stage, and the true type, message and
+    stage are gone -- the exact evidence this record exists to preserve.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    class Unrenderable:
+        def __str__(self):
+            raise RuntimeError("stringification broke")
+
+    assert _safe_child_failure_detail(ValueError(Unrenderable())) == "<unrenderable message>"
+
+    # BaseException too: KeyboardInterrupt and SystemExit are not Exception subclasses, so an
+    # `except Exception` here would let them abort a function documented as never raising -- and
+    # the caller would never reach its os._exit, restoring the opaque death this path removes.
+    for escaping in (KeyboardInterrupt, SystemExit, BaseException):
+
+        class Hostile:
+            def __init__(self, exc):
+                self._exc = exc
+
+            def __str__(self):
+                raise self._exc("stringification escaped")
+
+        assert _safe_child_failure_detail(ValueError(Hostile(escaping))) == "<unrenderable message>"
+
+
+def test_child_failure_sanitizer_keeps_token_ids_and_redacts_encoded_and_multiline_secrets(
+    monkeypatch,
+):
+    """Shape redaction must not eat vocabulary ids, and value redaction must cover every form."""
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    monkeypatch.setenv("WANDB_API_KEY", "first-component-123\nsecond-component-456")
+    monkeypatch.setenv("FLASH_TEST_API_KEY", "abc/defghijkl")
+
+    # a bad eos or token-boundary id is often the whole diagnostic; a bare integer is not a secret.
+    kept = _safe_child_failure_detail(ValueError("unexpected token: 151643 while decoding"))
+    assert kept == "unexpected token: 151643 while decoding"
+    # a non-numeric value in credential shape is still redacted.
+    shaped = _safe_child_failure_detail(ValueError("expected access token: hunter2 but got verb"))
+    assert "hunter2" not in shaped
+
+    # a multiline credential reaches a diagnostic one component line at a time.
+    multiline = _safe_child_failure_detail(ValueError("auth failed for second-component-456"))
+    assert "second-component-456" not in multiline
+
+    # percent escapes are case-insensitive and either case is emitted in the wild.
+    for encoded in ("abc%2Fdefghijkl", "abc%2fdefghijkl"):
+        assert "defghijkl" not in _safe_child_failure_detail(ValueError(f"url ?auth={encoded}"))
+
+
+def test_child_failure_sanitizer_redacts_digit_only_credentials():
+    """The token-id exemption must not become a hole for a numeric credential.
+
+    Exempting every digit-only value attached to a credential key lets `{"access_token":
+    "123456789012"}` and `password=123456` through verbatim. A numeric credential minted at runtime
+    is in no environment variable either, so the value pass cannot catch it and shape redaction is
+    the only net there is. Only the shape a vocabulary id actually has is exempt.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, secret in (
+        ('auth failed: {"access_token":"123456789012"}', "123456789012"),
+        ("password=123456", "123456"),
+        ("api_key: 987654321098", "987654321098"),
+        ('{"token": "123456789"}', "123456789"),  # quoted -> a serialized field, not an id
+        ("access_token=1234567", "1234567"),  # id-length, but not the bare word `token`
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert secret not in redacted, redacted
+        assert "<redacted>" in redacted
+
+    # the diagnostic the exemption exists for still survives.
+    for kept in ("unexpected token: 151643 while decoding", "eos token: 99 mismatch"):
+        assert _safe_child_failure_detail(ValueError(kept)) == kept
+
+
+def test_child_failure_sanitizer_redacts_the_credential_not_the_auth_scheme(monkeypatch):
+    """`Authorization: Basic <cred>` must lose the credential, not the word `Basic`.
+
+    The shape rule captures the first token after the separator, so an unconsumed scheme IS that
+    token: `Basic` was redacted and the credential after it printed verbatim -- redacting the one
+    word in the line that is not secret. Only `bearer` was consumed. A scheme is a fixed word, so
+    consuming the others cannot hide a value, and a runtime-minted credential is in no environment
+    variable, which makes this shape rule the only net it ever meets.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for scheme in ("Basic", "Bearer", "Digest", "Token", "basic"):
+        credential = "dXNlcjpwYXNzd29yZA"
+        for message in (
+            f"auth failed: Authorization: {scheme} {credential}",
+            f'denied {{"Authorization": "{scheme} {credential}"}}',  # json repr: quoted value
+            f"denied {{'authorization': '{scheme} {credential}'}}",  # dict repr: single quotes
+        ):
+            redacted = _safe_child_failure_detail(ValueError(message))
+            assert credential not in redacted, redacted
+            assert "<redacted>" in redacted
+
+    # the scheme is consumed, never treated as the secret, so it stays readable in the diagnostic.
+    assert "Authorization" in _safe_child_failure_detail(
+        ValueError("auth failed: Authorization: Basic dXNlcjpwYXNzd29yZA")
+    )
+
+
+def test_child_failure_sanitizer_redacts_presigned_url_signatures(monkeypatch):
+    """A presigned URL carries a complete capability in its QUERY PARAMETERS.
+
+    `?X-Amz-Credential=...&X-Amz-Signature=...` is immediately usable by anyone holding it, and none
+    of those parameter names resembles the credential words the shape rule matched -- so the whole
+    URL was written to the failure record verbatim. The value pass cannot help: a signature is
+    minted per request and appears in no environment variable, which is precisely the case the
+    shape rule exists to catch.
+
+    Each parameter is redacted on its own rather than swallowing the rest of the query string. An
+    unquoted value ending only at whitespace would take `X-Amz-Expires` with it, and that field is
+    often the whole diagnostic -- it says the capability EXPIRED rather than was malformed.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, secrets in (
+        (
+            (
+                "upload failed: https://b.s3.amazonaws.com/k?X-Amz-Credential=AKIA123%2F20260815"
+                "&X-Amz-Signature=abc123deadbeef&X-Amz-Expires=3600"
+            ),
+            ("AKIA123", "abc123deadbeef"),
+        ),
+        ("GET https://s.blob.core.windows.net/c/b?sig=aBcD%2F123&se=2026-08-15", ("aBcD",)),
+        (
+            "https://storage.googleapis.com/b/o?X-Goog-Signature=deadbeef&X-Goog-Credential=svc",
+            ("deadbeef",),
+        ),
+        ("https://host/path?signature=abc123&other=1", ("abc123",)),
+        ("?X-Amz-Security-Token=FwoGZXIvYXdz&X-Amz-Expires=60", ("FwoGZXIvYXdz",)),
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "<redacted>" in redacted
+        for secret in secrets:
+            assert secret not in redacted, f"{message!r} leaked {secret!r}: {redacted!r}"
+
+    # the non-secret query fields survive: `&` ends an unquoted value, so one signed parameter does
+    # not swallow the rest of the string. losing X-Amz-Expires would hide WHY the capability failed.
+    kept = _safe_child_failure_detail(
+        ValueError("https://b/k?X-Amz-Signature=abc&X-Amz-Expires=3600&X-Amz-Date=20260815")
+    )
+    assert "X-Amz-Expires=3600" in kept
+    assert "X-Amz-Date=20260815" in kept
+
+    # `sig` is guarded on its LEFT edge. The case that matters is a key ENDING in those letters
+    # immediately before the separator: unguarded, `basig=7` matches and the value is redacted.
+    # A `sig` with a space before it passes either way, so asserting only that proves nothing.
+    for innocent in ("basig=7", "model_basig=qwen3", "config=big sig word"):
+        assert _safe_child_failure_detail(ValueError(innocent)) == innocent, innocent
+
+
+def test_child_failure_sanitizer_redacts_key_named_credential_fields(monkeypatch):
+    """A ``*_key`` field naming a credential must be redacted, and an ordinary one must not.
+
+    A runtime-generated private key reaches the record as ``{"private_key":"..."}``. It is minted at
+    runtime, so it is in no environment variable and the value pass cannot see it -- the shape rule
+    is the only thing in front of it, and none of its key words matched, so it was persisted
+    verbatim and served as an artifact.
+
+    ``key`` alone cannot join that list, which is why this is a qualifier set rather than a suffix
+    rule: ``cache_key``, ``partition_key`` and ``idempotency_key`` are ordinary diagnostic fields,
+    and redacting them eats the message the record exists to carry. Both directions are asserted
+    because widening the pattern is the obvious fix and silently destroys the diagnostic.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for field in (
+        "private_key",
+        "privateKey",
+        "private-key",
+        "secret_key",
+        "signing_key",
+        "encryption_key",
+        "session_key",
+        "access_key",
+        "access_key_id",  # an AWS key id is half a credential pair, not an identifier
+        "account_key",  # azure storage; `AccountKey=` is the separator-less spelling below
+        "accountKey",
+        "passwd",
+    ):
+        message = f'child failed: {{"{field}":"runtime-minted-abc123"}}'
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "runtime-minted-abc123" not in redacted, f"{field} leaked: {redacted!r}"
+        assert "<redacted>" in redacted, field
+
+    # an azure storage connection string carries the credential as one `;`-delimited field among
+    # several benign ones. Only the key goes: the surrounding fields say WHICH account and endpoint
+    # failed, and redacting the whole string would replace the diagnostic with one <redacted>.
+    conn = (
+        "child failed: DefaultEndpointsProtocol=https;AccountName=x;"
+        "AccountKey=runtime-minted-abc123;EndpointSuffix=core.windows.net"
+    )
+    redacted_conn = _safe_child_failure_detail(ValueError(conn))
+    assert "runtime-minted-abc123" not in redacted_conn, redacted_conn
+    assert "AccountName=x" in redacted_conn, redacted_conn
+    assert "EndpointSuffix=core.windows.net" in redacted_conn, redacted_conn
+
+    # the other direction: an ordinary key-suffixed field keeps its value, or the failure reason
+    # this record carries is destroyed by its own sanitizer. `account_id`/`account_name` matter
+    # here specifically: adding `account` as a KEY qualifier must not make the whole account
+    # namespace secret, or the record stops saying which account failed.
+    for field in (
+        "cache_key",
+        "idempotency_key",
+        "partition_key",
+        "primary_key",
+        "row_key",
+        "key",
+        "account_id",
+        "account_name",
+    ):
+        message = f'child failed: {{"{field}":"user-visible-value"}}'
+        assert _safe_child_failure_detail(ValueError(message)) == message, field
+
+
+def test_child_failure_sanitizer_redacts_a_generically_labelled_credential(monkeypatch):
+    """``credential``/``credentials`` is the generic label, and it needs no qualifier.
+
+    Unlike ``key``, which qualifies something else and is ordinary on its own (``cache_key``), this
+    word names the value outright: a field called ``credentials`` holds one. It is what a library
+    reaches for when the value has no more specific name, so it is the likeliest spelling to arrive
+    from code this repo does not own -- and a runtime-minted value is in no environment variable, so
+    the value pass cannot reach it. Both spellings are covered: the plural is the commoner json
+    form. Prose is asserted in the other direction, since the fix is a bare word in an alternation
+    and over-redaction would eat the sentence explaining why the child died.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message in (
+        'child failed: {"credentials":"runtime-minted-abc123"}',
+        'child failed: {"credential": "runtime-minted-abc123"}',
+        "child failed: credential=runtime-minted-abc123",
+        "child failed: credentials: runtime-minted-abc123",
+        "child failed: CREDENTIAL=runtime-minted-abc123",  # the field is matched case-insensitively
+        'child failed: {"aws_credentials":"runtime-minted-abc123"}',  # a prefixed spelling
+        # and the serialized-json spelling, where the quotes arrive backslash-escaped
+        r"child failed: {\"credentials\":\"runtime-minted-abc123\"}",
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "runtime-minted-abc123" not in redacted, f"leaked: {redacted!r}"
+        assert "<redacted>" in redacted, message
+
+    # the other direction: the word in PROSE carries no value, and a field merely describing a
+    # credential is not one. Redacting these would delete the failure reason itself.
+    for message in (
+        "child failed: missing credentials for the run",
+        "child failed: invalid credential format detected",
+        "child failed: credentials expired",
+        'child failed: {"credential_type": "oauth"}',
+    ):
+        assert _safe_child_failure_detail(ValueError(message)) == message, message
+
+
+def test_child_failure_sanitizer_redacts_a_whole_cookie_header(monkeypatch):
+    """A cookie header is credential-bearing as a WHOLE value, not at one inner name.
+
+    `Cookie: a=1; sessionid=X; b=2` carries the session in a semicolon-delimited list. The bare
+    value branch stops at `;` -- the very delimiter that list uses -- so matching the inner name
+    would redact `sessionid=X` and print the rest of the header, including anything else it
+    carries, verbatim. So an unquoted cookie runs to end of line, like an unrecognised auth scheme.
+
+    `Set-Cookie` is the response spelling of the same credential. A runtime-issued cookie need not
+    exist in ``os.environ``, so the value pass cannot remove it and this shape rule is the only
+    thing in front of it.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message in (
+        "child failed: Cookie: sessionid=runtime-cookie-abc123",
+        "child failed: Set-Cookie: sessionid=runtime-cookie-abc123; Path=/; HttpOnly",
+        # the delimited list: every field after the first must go too, not just the matched one
+        "child failed: Cookie: a=1; sessionid=runtime-cookie-abc123; b=2",
+        'child failed: {"Cookie":"sessionid=runtime-cookie-abc123"}',
+        "child failed: set_cookie=runtime-cookie-abc123",
+        "child failed: COOKIE: runtime-cookie-abc123",  # matched case-insensitively
+        r"child failed: {\"cookie\":\"sessionid=runtime-cookie-abc123\"}",
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "runtime-cookie-abc123" not in redacted, f"leaked: {redacted!r}"
+        assert "<redacted>" in redacted, message
+
+    # a JSON-embedded cookie still ends at its closing quote: the end-of-line branch sits after the
+    # quoted ones, so the object structure around it survives and the record stays readable.
+    assert (
+        _safe_child_failure_detail(ValueError('child failed: {"Cookie":"sessionid=abc"} at step 3'))
+        == 'child failed: {"Cookie":"<redacted>"} at step 3'
+    )
+
+    # the other direction: the word in prose carries no credential, and a field merely describing
+    # cookie handling is not one.
+    for message in (
+        "child failed: cookie jar is empty",
+        "child failed: failed to parse cookie header",
+        'child failed: {"cookie_policy": "strict"}',
+    ):
+        assert _safe_child_failure_detail(ValueError(message)) == message, message
+
+
+def test_child_failure_sanitizer_redacts_a_key_passphrase(monkeypatch):
+    """``passphrase`` is not covered by ``password``/``passwd``: no prefix of one spells the other.
+
+    It is the standard field name for the phrase unlocking a generated private key, and that phrase
+    is minted at runtime, so it is in no environment variable and the value pass cannot remove it --
+    the shape rule is the only thing in front of it. Separator spellings are covered because a
+    ``pass_phrase``/``pass-phrase`` field is the same credential.
+
+    The value stop matches ``password``'s deliberately: a quoted value redacts whole, an unquoted
+    one ends at whitespace. A passphrase is a single field, not a delimited list like a cookie
+    header, so consuming to end of line would eat the diagnostic around it instead.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message in (
+        'child failed: {"passphrase":"runtimephrase123"}',
+        'child failed: {"passphrase": "runtimephrase123"}',
+        "child failed: passphrase=runtimephrase123",
+        "child failed: passphrase: runtimephrase123",
+        'child failed: {"key_passphrase":"runtimephrase123"}',  # a prefixed spelling
+        'child failed: {"pass_phrase":"runtimephrase123"}',
+        'child failed: {"pass-phrase":"runtimephrase123"}',
+        "child failed: PASSPHRASE=runtimephrase123",  # matched case-insensitively
+        r"child failed: {\"passphrase\":\"runtimephrase123\"}",  # serialized json
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "runtimephrase123" not in redacted, f"leaked: {redacted!r}"
+        assert "<redacted>" in redacted, message
+
+    # a QUOTED passphrase containing spaces redacts whole, the same as a quoted password: the
+    # closing quote ends it, so a multi-word phrase does not survive past the first space.
+    assert (
+        _safe_child_failure_detail(
+            ValueError('child failed: {"passphrase":"runtime private-key phrase"}')
+        )
+        == 'child failed: {"passphrase":"<redacted>"}'
+    )
+
+    # the neighbouring words must keep working: this alternative folded them into one branch.
+    for field in ("password", "passwd"):
+        message = f'child failed: {{"{field}":"runtimephrase123"}}'
+        assert "runtimephrase123" not in _safe_child_failure_detail(ValueError(message)), field
+
+    # the other direction: the word in prose carries no value, and a field describing whether a
+    # passphrase is needed is not the passphrase itself.
+    for message in (
+        "child failed: passphrase prompt was cancelled",
+        "child failed: failed to read passphrase from tty",
+        'child failed: {"passphrase_required": true}',
+    ):
+        assert _safe_child_failure_detail(ValueError(message)) == message, message
+
+
+def test_child_failure_sanitizer_redacts_a_password_in_url_userinfo(monkeypatch):
+    """A connection string carries its password positionally, where no key name precedes it.
+
+    ``scheme://user:password@host`` names the field by POSITION, so every key-anchored rule above is
+    blind to it -- there is no ``password=`` to anchor on. The value pass is blind too: a dsn built
+    at runtime from parts (a broker url, a database url assembled by a driver) is in no environment
+    variable and no payload, so it contributes no needle. This is the sanitizer's only positional
+    credential, and a driver that cannot connect echoes the whole url into its exception.
+
+    Only the password is replaced. The scheme, user and host say WHICH endpoint failed, which is the
+    diagnostic this record exists to carry -- redacting the url whole would answer the question the
+    reader opened it for. Asserted in both directions: a url without userinfo is untouched, so an
+    ordinary endpoint in a message survives intact.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message in (
+        "child failed: could not connect to postgresql://flash:runtimepw123@db.example:5432/runs",
+        "child failed: amqp://broker-user:runtimepw123@rabbit.internal:5672/%2f refused",
+        "child failed: redis://default:runtimepw123@cache.internal:6379",
+        "child failed: https://svc:runtimepw123@api.example.com/v1/runs returned 503",
+        "child failed: MONGODB://svc:runtimepw123@mongo.internal/db",  # scheme case-insensitive
+        # the user is OPTIONAL. `redis://:password@host` is the ordinary shape for a password-only
+        # dsn, and it is exactly the runtime-built credential the value pass cannot see, so a rule
+        # that required a user would leak the one case it was written for.
+        "child failed: redis://:runtimepw123@cache.internal:6379/0",
+        "child failed: postgres://:runtimepw123@db.example.com/app",
+        "child failed: amqp://:runtimepw123@rabbit.internal:5672/%2f",
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "runtimepw123" not in redacted, f"leaked: {redacted!r}"
+        assert "<redacted>" in redacted, message
+
+    # the password stops at the FIRST `@`. A later one -- in a path, or a query carrying an address
+    # -- must not extend the match, which would swallow the host with it. Asserting only that the
+    # password is gone cannot see this: a greedier rule removes it too, along with the endpoint the
+    # reader needs, so the host is asserted explicitly.
+    for message, expected in (
+        (
+            "child failed: https://svc:runtimepw123@api.example.com/a@b/c",
+            "child failed: https://svc:<redacted>@api.example.com/a@b/c",
+        ),
+        (
+            "child failed: https://svc:runtimepw123@a.example/x?to=admin@example.com",
+            "child failed: https://svc:<redacted>@a.example/x?to=admin@example.com",
+        ),
+    ):
+        assert _safe_child_failure_detail(ValueError(message)) == expected, message
+
+    # the host and user survive: they are the diagnostic, and the run cannot be debugged without
+    # knowing which endpoint refused it.
+    assert (
+        _safe_child_failure_detail(
+            ValueError("child failed: postgresql://flash:runtimepw123@db.example:5432/runs")
+        )
+        == "child failed: postgresql://flash:<redacted>@db.example:5432/runs"
+    )
+    # the same for the userless form: the empty user is preserved, so the reader can still tell a
+    # password-only dsn from one whose user was redacted away.
+    assert (
+        _safe_child_failure_detail(
+            ValueError("child failed: redis://:runtimepw123@cache.internal:6379/0")
+        )
+        == "child failed: redis://:<redacted>@cache.internal:6379/0"
+    )
+
+    # the other direction: no userinfo means no credential, and a colon in a path, a port or prose
+    # must not be read as one. Redacting these would eat ordinary diagnostics.
+    for message in (
+        "child failed: https://api.example.com/v1/runs?attempt=1 returned 503",
+        "child failed: could not reach http://db.example:5432/health",
+        "child failed: see https://docs.example.com/errors/a:b/c",
+        "child failed: user:pass was not supplied",  # no scheme, so not a url at all
+        "child failed: bare //host:1234 is not a url",
+        # an EMPTY password is not a credential. Allowing an empty user (above) means the password
+        # is now the only thing keeping these out, so both empty-userinfo forms are pinned here --
+        # a rule that dropped the password's `+` would redact a url that carries no secret at all.
+        "child failed: scheme://:@host refused the connection",
+        "child failed: redis://:@cache.internal:6379 has no password",
+    ):
+        assert _safe_child_failure_detail(ValueError(message)) == message, message
+
+
+def test_child_failure_sanitizer_redacts_every_percent_encoding_casing(monkeypatch):
+    """A secret's percent-escapes are matched whatever hex casing the exception rendered.
+
+    RFC 3986 makes triplet hex case-insensitive, so ``abc%2Fdef%3aghi`` and ``abc%2fdef%3Aghi`` are
+    the same credential. Registering extra spellings cannot close this: a value with n escaped
+    characters has 2**n of them, so a canonical form plus an all-lowercase one still misses every
+    MIXED casing. The fold is applied per triplet at MATCH time, so one registered form covers all
+    of them -- this asserts the full combinatorial set rather than one hand-picked variant.
+
+    The rest of the needle stays case-SENSITIVE. A credential is case-sensitive, and folding it
+    whole would let an unrelated word differing only in case erase itself from the diagnostic.
+    """
+    import itertools
+    import re
+    import urllib.parse
+
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    monkeypatch.setenv("RUNTIME_API_KEY", "a/b:c?d=e&f+g")
+    secret = "a/b:c?d=e&f+g"
+    canonical = urllib.parse.quote(secret, safe="")
+    spans = [m.span() for m in re.finditer(r"%[0-9A-Fa-f]{2}", canonical)]
+    assert len(spans) >= 6, "the point is the combinatorial set; a 1-escape value proves nothing"
+
+    for combo in itertools.product(*[[str.lower, str.upper]] * len(spans)):
+        chars = list(canonical)
+        for (start, end), fold in zip(spans, combo, strict=True):
+            chars[start:end] = list(fold(canonical[start:end]))
+        variant = "".join(chars)
+        redacted = _safe_child_failure_detail(ValueError(f"POST https://h/p?k={variant} -> 403"))
+        assert variant not in redacted, f"casing {variant!r} leaked: {redacted!r}"
+        assert "<redacted>" in redacted
+
+    # a percent sequence that is NOT the secret survives: the fold applies to the needle, not to
+    # every triplet in the message.
+    benign = "progress 100%2Fdone and 50%3Aok"
+    assert _safe_child_failure_detail(ValueError(benign)) == benign
+
+    # and the fold reaches ONLY the triplets. Applying `(?i)` to the whole needle also passes every
+    # assertion above, so without this the cheapest wrong fix looks correct: a case-sensitive
+    # credential would then erase any text differing from it only in case, and the failure reason
+    # this record exists to carry is destroyed by its own sanitizer.
+    monkeypatch.setenv("RUNTIME_API_KEY", "MixedCaseSecret123")
+    other_case = "the env var was mixedcasesecret123 in the manifest"
+    assert _safe_child_failure_detail(ValueError(other_case)) == other_case
+    assert "<redacted>" in _safe_child_failure_detail(ValueError("k=MixedCaseSecret123"))
+
+
+def test_child_failure_sanitizer_redacts_every_digest_parameter(monkeypatch):
+    """A Digest value is a parameter LIST, so single-token capture leaves the secrets behind.
+
+    `Authorization: Digest username="bob", nonce="...", response="..."` has its credential in the
+    `nonce` and `response` fields, not the first token. Both of the other rules stop before them:
+    the bare branch ends at the first quote or comma, and the quoted branch ends at `username`'s
+    opening quote. The record then carried most of the header verbatim, and a nonce minted at
+    runtime is in no environment variable, so the value pass cannot clean up after it.
+
+    Digest therefore consumes to end of line. That over-redacts a `username=` and an `algorithm=`,
+    which is the correct direction to be wrong in: those cost a diagnostic detail, the alternative
+    publishes a live credential into an artifact the user can fetch.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    nonce, response = "runtime-nonce-value", "runtime-response-hash"
+    secrets = (nonce, response)
+    for message in (
+        f'Authorization: Digest username="bob", nonce="{nonce}", response="{response}"',
+        f"Authorization: Digest username=bob, nonce={nonce}, response={response}",
+        f'{{"Authorization": "Digest username=\\"bob\\", nonce=\\"{nonce}\\""}}',
+        f"{{'authorization': 'Digest nonce={nonce}, response={response}'}}",
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "<redacted>" in redacted
+        for secret in secrets:
+            assert secret not in redacted, f"{message!r} leaked {secret!r}: {redacted!r}"
+
+    # the other schemes are unchanged: they carry ONE token, and consuming the rest of the line
+    # there would eat the diagnostic around a credential that was already fully redacted.
+    unaffected = _safe_child_failure_detail(
+        ValueError("Authorization: Bearer tok123 while calling the teacher")
+    )
+    assert "tok123" not in unaffected
+    assert "while calling the teacher" in unaffected
+
+
+def test_child_failure_sanitizer_redacts_a_quoted_credential_containing_spaces(monkeypatch):
+    """A quoted value runs to its closing quote, not to the first space.
+
+    `{"password":"correct horse battery staple"}` terminated the value capture at the first space,
+    so the record kept `<redacted> horse battery staple` -- most of the credential, printed into an
+    artifact the user can fetch. The value pass cannot clean up after it: a runtime-minted secret
+    (a presigned URL, a broker capability) is in no environment variable and contributes no needle,
+    which is the whole reason the shape rule exists.
+
+    The quotes are what delimit a serialized field, so whitespace inside them belongs to the value.
+    An UNQUOTED value must still stop at whitespace -- there the space is the delimiter and running
+    past it would eat the sentence around the credential, which is the diagnostic.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    leak = "correct horse battery staple"
+    for message in (
+        f'{{"password":"{leak}"}}',
+        f"api_key: '{leak}'",
+        f'{{"access_token": "{leak}"}}, retry_after=30',
+        f'api-key: "{leak}" plus trailing text',
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "<redacted>" in redacted
+        for word in leak.split():
+            assert word not in redacted, f"{message!r} leaked {word!r}: {redacted!r}"
+
+    # an unterminated quote runs to the end of the line rather than giving up: fail closed.
+    assert leak not in _safe_child_failure_detail(ValueError(f'{{"password":"{leak}'))
+
+    # unquoted values still end at whitespace, so the surrounding sentence survives.
+    unquoted = _safe_child_failure_detail(ValueError("password=hunter2 while loading the adapter"))
+    assert "hunter2" not in unquoted
+    assert "while loading the adapter" in unquoted
+
+    # and the vocabulary-id exemption still applies to the shape it was written for, while a
+    # QUOTED numeric value stays a serialized field and is redacted. `token: "151643"` is the case
+    # that matters: the exemption's other guard rejects a quote in the SEPARATOR (`{"token":`), so
+    # a json-style spelling is refused twice over and cannot show whether this one still works.
+    # Here the separator is a bare colon and only the quoted-branch check stands between a numeric
+    # credential and the artifact.
+    assert "151643" in _safe_child_failure_detail(ValueError("token: 151643 rejected at step 4"))
+    for quoted_id in (
+        'token: "151643"',
+        "token: '151643'",
+        'token="151643"',
+        '{"token": "151643"}',
+    ):
+        assert "151643" not in _safe_child_failure_detail(ValueError(quoted_id)), quoted_id
+
+    # the opening quote is reprinted, the closing one is not: it was never consumed, so emitting it
+    # again would double it and corrupt the surrounding json for anyone parsing the record.
+    assert _safe_child_failure_detail(ValueError('{"password":"hunter2"}')) == (
+        '{"password":"<redacted>"}'
+    )
+
+
+def test_child_failure_sanitizer_redacts_every_authorization_scheme():
+    """An Authorization value is redacted through its credential, whatever the scheme is called.
+
+    The scheme space is open-ended -- Negotiate, NTLM, AWS4-HMAC-SHA256, any vendor word -- so a
+    closed whitelist does not merely miss one case: the pattern matches the SCHEME as the value and
+    prints the credential after it, redacting the single word on the line that is NOT secret while
+    publishing the one that is. That is worse than no rule at all, and the value pass cannot save it
+    because a runtime-minted Negotiate/NTLM token is in no environment variable.
+
+    So an unquoted Authorization value runs to end of line, the same fail-closed rule digest uses.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, leak in (
+        ("Authorization: Negotiate YIIFruntime-token-leak", "YIIFruntime-token-leak"),
+        ("Authorization: NTLM TlRMTVNTUAABleak", "TlRMTVNTUAABleak"),
+        ("authorization: AWS4-HMAC-SHA256 Credential=AKIA-leak", "AKIA-leak"),
+        ("Authorization: Digest-Custom abc-leak", "abc-leak"),
+        ('Authorization: "Negotiate YIIF-quoted-leak"', "YIIF-quoted-leak"),
+    ):
+        detail = _safe_child_failure_detail(ValueError(message))
+        assert leak not in detail, f"{message!r} leaked its credential: {detail!r}"
+        assert "<redacted>" in detail, message
+
+    # the whitelisted schemes keep working -- the scheme word is still consumed, not printed as the
+    # value, so the line does not degrade to redacting `Bearer` and publishing the token.
+    assert _safe_child_failure_detail(ValueError("Authorization: Bearer sk-live-x")) == (
+        "Authorization: <redacted>"
+    )
+    # and running to end of line is scoped to authorization: every OTHER key still stops at
+    # whitespace, or one credential in a sentence would erase the diagnostic around it.
+    assert _safe_child_failure_detail(ValueError("api_key=zzz failed at step 4")) == (
+        "api_key=<redacted> failed at step 4"
+    )
+
+
+def test_child_failure_sanitizer_redacts_a_credential_containing_an_escaped_quote():
+    """A quoted value whose credential contains the delimiter must be consumed whole.
+
+    A credential is arbitrary bytes and may contain a quote. Serialized into a diagnostic it comes
+    back escaped -- ``{"password":"abc\\"tail"}`` -- and a quoted branch that stops at the first
+    unescaped-looking quote treats that ESCAPE as the terminator: it redacts ``abc`` and prints
+    ``tail`` verbatim, publishing the remainder of a live credential. The value is runtime-minted,
+    so it is in no environment variable and the value pass cannot remove the leaked suffix before
+    the record is persisted and served as an artifact. This shape rule is the only thing in front
+    of it, so it must treat ``\\"`` as one unit and run on to the true closing quote.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, leak in (
+        (r'{"password":"abc\"runtime-secret"}', "runtime-secret"),
+        (r'{"api_key":"pre\"post-leak"}', "post-leak"),
+        (r"{'token': 'aa\'bb-leak'}", "bb-leak"),
+        (r'Authorization: "Bearer ab\"cd-leak"', "cd-leak"),
+    ):
+        detail = _safe_child_failure_detail(ValueError(message))
+        assert leak not in detail, f"{message!r} leaked past the escaped quote: {detail!r}"
+        assert "<redacted>" in detail, message
+
+    # the ordinary quoted value is unaffected: consuming escapes must not change where an
+    # unescaped value ends, or every serialized field would over-redact to end of line.
+    assert _safe_child_failure_detail(ValueError('{"password":"hunter2"}')) == (
+        '{"password":"<redacted>"}'
+    )
+
+
+def test_child_failure_sanitizer_redacts_a_double_serialized_credential_field():
+    """A field whose own DELIMITERS are backslash-escaped must still be redacted.
+
+    An exception that embeds serialized json inside another serialized string carries the field as
+    ``{\\"password\\":\\"secret\\"}``: the quotes around both the key and the value are escaped. A
+    separator accepting only a bare optional quote stops at that backslash, and the value branch
+    then sees a leading ``\\`` rather than a quote -- so the quoted branch does not match and the
+    bare branch halts on the backslash, printing the entire credential verbatim.
+
+    This is distinct from an escaped quote INSIDE a value (covered by
+    ``..._redacts_a_credential_containing_an_escaped_quote``): there the delimiters are intact and
+    only the content is escaped. A double-serialized value is runtime-minted, so it appears in no
+    environment variable and the value pass cannot remove it before the record is persisted and
+    served as an artifact.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, leak in (
+        (r"child failed: {\"password\":\"runtime-secret\"}", "runtime-secret"),
+        (r"{\"api_key\":\"sk-runtime-abc123\"}", "sk-runtime-abc123"),
+        (r"{\"access_token\":\"at-runtime-99\"} while calling the teacher", "at-runtime-99"),
+        (r"{\'secret\':\'sq-runtime-value\'}", "sq-runtime-value"),
+        # the INTERSECTION of the two shapes above, and the one neither covers: escaped delimiters
+        # AND an escaped quote inside the value. Each shape alone was handled -- the escaped branch
+        # ran to the closing `\"`, and the bare-delimiter branch consumed `\"` as one unit -- but
+        # here the value's own `\\\"` looks exactly like this branch's closer, so the match ended
+        # early and everything after it printed verbatim. Consuming a doubled backslash as one unit
+        # before the delimiter test is what separates the two.
+        (r"{\"password\":\"abc\\\"runtime-nested\"}", "runtime-nested"),
+        (r"{\"api_key\":\"k\\\"sk-runtime-nested-2\"} at step 9", "sk-runtime-nested-2"),
+    ):
+        detail = _safe_child_failure_detail(ValueError(message))
+        assert leak not in detail, f"{message!r} leaked its credential: {detail!r}"
+        assert "<redacted>" in detail, message
+
+    # the escaped delimiters are reprinted, so the surrounding json stays readable and the
+    # diagnostic AFTER the field survives -- over-redacting to end of line would eat the reason.
+    assert _safe_child_failure_detail(ValueError(r"{\"password\":\"hunter2\"} at step 4")) == (
+        r"{\"password\":\"<redacted>\"} at step 4"
+    )
+
+
+def test_child_failure_sanitizer_survives_a_non_utf8_credential_in_the_environment(monkeypatch):
+    """A surrogate in an env value must not abort the sanitizer.
+
+    ``os.environ`` decodes non-UTF-8 bytes with surrogateescape, and ``quote()`` raises on a
+    surrogate. Since the sanitizer runs inside the handler that writes the failure record, letting
+    that propagate replaces the real exception with a UnicodeEncodeError and leaves no record at
+    all -- reproducing the opaque death this PR exists to remove, and doing it for EVERY failure on
+    the run, not just one mentioning the odd variable. The raw form is registered before encoding,
+    so the secret is still redacted; only its percent-encoded spelling is lost.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    monkeypatch.setenv("WANDB_API_KEY", "tok-\udcff-abcdef")
+    monkeypatch.setenv("FLASH_TEST_API_KEY", "plain-secret-value")
+
+    detail = _safe_child_failure_detail(ValueError("auth failed for tok-\udcff-abcdef here"))
+    assert "tok-\udcff-abcdef" not in detail
+    assert "<redacted>" in detail
+    # the undecodable value must not disarm redaction for every OTHER credential in the same env.
+    assert "plain-secret-value" not in _safe_child_failure_detail(
+        ValueError("auth failed for plain-secret-value")
+    )
+
+
+def test_child_failure_sanitizer_redacts_a_runtime_credential_quoted_in_json_or_a_dict():
+    """A credential minted at runtime is in NO environment variable, so shape is the only net.
+
+    It reaches a diagnostic inside a json body or a dict repr, where the closing quote after the key
+    sits between the name and the `:` separator. An unquoted-only pattern cannot cross that, so the
+    value was persisted verbatim into the fallback record and then into the uploaded failure
+    artifact -- which the user can fetch with `flash runs log`.
+    """
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, secret in (
+        ('auth failed: {"access_token":"runtime-secret-abc123"}', "runtime-secret-abc123"),
+        ("auth failed: {'api_key': 'runtime-secret-xyz'}", "runtime-secret-xyz"),
+        ('{"password": "runtime-pw-4471"}', "runtime-pw-4471"),
+        ('headers={"Authorization":"Bearer runtime-tok-999"}', "runtime-tok-999"),
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert secret not in redacted, redacted
+        assert "<redacted>" in redacted
+
+
 def test_explicit_multiturn_score_rejection_bypasses_delivery_handler():
     from flash.engine.worker.train.opd.child.multiturn import _post_multiturn_score
 
@@ -5498,6 +6486,101 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
     assert result.final_accounting["loss_curve"] == [0.5]
 
 
+@pytest.mark.parametrize(
+    ("classification", "return_code", "error_type"),
+    [("transient", 87, "RetriableInfraError"), ("permanent", 86, "RuntimeError")],
+)
+def test_parent_surfaces_child_failure_record_with_classification(
+    monkeypatch, tmp_path, classification, return_code, error_type
+):
+    import flash.engine.worker.opd_train_runner as opd_runner
+    from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.child.plugin import _write_child_failure_fallback
+
+    child_failure_path = str(tmp_path / "child-failure")
+    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKER_FAILURE_PATH", child_failure_path)
+    _write_child_failure_fallback(classification, "generate", ValueError("invalid rollout state"))
+    expected_type = RetriableInfraError if error_type == "RetriableInfraError" else RuntimeError
+    workload = SimpleNamespace(
+        score_delivery_failure_path="",
+        resample_failure_path="",
+        abandonment_failure_path="",
+        mutation_failure_path="",
+        cycle_commit_failure_path="",
+        teacher_worker_failure_path=child_failure_path,
+    )
+    bridge = SimpleNamespace(
+        teacher_failure=None,
+        mutation_failure=None,
+        _record_mutation_failure=lambda *_args: None,
+    )
+
+    with pytest.raises(expected_type) as error:
+        opd_runner._reconcile_child_failures(
+            workload,
+            bridge,
+            return_code,
+            truncation_window=None,
+        )
+
+    assert "[stage=generate] ValueError: invalid rollout state" in str(error.value)
+    # RetriableInfraError SUBCLASSES RuntimeError, so `pytest.raises(RuntimeError)` alone accepts a
+    # retriable exception and cannot prove a permanent failure stays permanent. assert retriability
+    # directly: a permanent teacher failure that starts being retried burns allocations silently.
+    assert isinstance(error.value, RetriableInfraError) is (expected_type is RetriableInfraError)
+
+
+def test_specific_failure_wins_over_generic_child_failure():
+    with pytest.raises(RuntimeError) as error:
+        _raise_verl_failure(
+            86,
+            None,
+            mutation_failure=("permanent", "marker rejected"),
+            teacher_worker_failure=(
+                "permanent",
+                "[stage=generate] ValueError: hidden generic detail",
+            ),
+        )
+
+    assert str(error.value) == "permanent optimizer marker failure: marker rejected"
+
+
+def test_recorded_child_failure_beats_the_completion_cap_heuristic():
+    """Direct evidence must outrank an inference drawn from an earlier batch.
+
+    The truncation window says "rollouts were truncated, so max_completion_tokens is probably too
+    small" -- a guess about a PRIOR no-signal batch. A recorded child failure says exactly why the
+    child died. When a child records a TRANSIENT failure and then exits with a generic status, the
+    heuristic used to win: the user was told to raise their completion cap, and a retriable failure
+    became fatal, burning the run instead of retrying it.
+    """
+    from flash.engine.worker.perf import RetriableInfraError
+
+    class _Window:
+        indicates_completion_cap = True
+        truncated_rollouts = 7
+        samples_seen = 8
+        max_completion = 512
+
+    with pytest.raises(RetriableInfraError) as error:
+        _raise_verl_failure(
+            1,  # generic status, NOT 86/87 -- so only the ordering decides
+            None,
+            teacher_worker_failure=("transient", "[stage=generate] ValueError: bridge died"),
+            truncation_window=_Window(),
+        )
+
+    assert "bridge died" in str(error.value)
+    assert "max_completion_tokens" not in str(error.value)
+    # the retry a transient classification earns must survive.
+    assert isinstance(error.value, RetriableInfraError)
+
+    # with no recorded child failure the heuristic is still the best available explanation.
+    with pytest.raises(RuntimeError, match="completion cap is likely too small") as fallback:
+        _raise_verl_failure(1, None, truncation_window=_Window())
+    assert not isinstance(fallback.value, RetriableInfraError)
+
+
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -5511,6 +6594,37 @@ def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
         _raise_verl_failure(86, None)
     with pytest.raises(RuntimeError, match="subprocess exited with status 9"):
         _raise_verl_failure(9, None)
+
+
+def test_parent_takes_retriability_from_the_child_record_not_the_exit_status():
+    """A recorded permanent failure must stay fatal under a transient exit status.
+
+    Each multi-turn actor writes its own pid-stamped record, but only the one that reaches
+    ``os._exit`` first sets the return code, and the reader deliberately returns the most SEVERE
+    record across all of them. So the two disagree whenever actors fail differently -- and taking
+    the message from the record while taking retriability from the exit code reports a permanent
+    auth failure under a transient headline. That is retried on paid GPUs until the attempt budget
+    is gone, every attempt dying on the same bad credential.
+    """
+    from flash.engine.worker.perf import RetriableInfraError
+
+    with pytest.raises(RuntimeError) as fatal:
+        _raise_verl_failure(
+            87,  # a peer actor won the exit race with a transient status
+            None,
+            teacher_worker_failure=("permanent", "[stage=teacher] ValueError: bad credentials"),
+        )
+    assert "bad credentials" in str(fatal.value)
+    assert not isinstance(fatal.value, RetriableInfraError), "a permanent record must not retry"
+
+    # and the converse: a transient record must not be made fatal by a permanent exit status.
+    with pytest.raises(RetriableInfraError) as retriable:
+        _raise_verl_failure(
+            86,
+            None,
+            teacher_worker_failure=("transient", "[stage=generate] TimeoutError: bridge timed out"),
+        )
+    assert "bridge timed out" in str(retriable.value)
 
 
 def _config(**overrides):
@@ -6113,6 +7227,7 @@ def test_multi_turn_rollout_marks_its_prompt_failed_before_hard_exiting(monkeypa
         deterministic_seed=lambda *a, **k: 0,
         process_exit=lambda code: (_ for _ in ()).throw(ChildExit(code)),
         mark_prompt_failed=fake_mark,
+        child_failure_handler=lambda *_args: None,
     )
 
     loop = loop_cls()
