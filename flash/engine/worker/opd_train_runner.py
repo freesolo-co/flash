@@ -23,6 +23,7 @@ from flash.engine.worker.verl.child_io import (
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
     resolve_reshard_after_forward,
+    spec_gpu_type,
 )
 
 
@@ -546,16 +547,6 @@ def _write_child_shims(
     return entry_path, reward_path
 
 
-def _spec_gpu_type(spec: Any) -> str:
-    """The card class the run landed on, from the spec the caller passed.
-
-    Absent spec or absent gpu table answers "", which the zero-2 gate reads as "unknown hardware"
-    and falls closed to zero-3 on. Guessing a card here would price the gate off hardware the run
-    may not have.
-    """
-    return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
-
-
 def _build_base_config(
     request: _OpdRequest,
     prompt_state: _PromptState,
@@ -593,7 +584,7 @@ def _build_base_config(
         "reshard_after_forward": resolve_reshard_after_forward(
             model_id=request.model_id,
             algorithm="opd",
-            gpu_type=_spec_gpu_type(getattr(request, "spec", None)),
+            gpu_type=spec_gpu_type(getattr(request, "spec", None)),
             n_gpus=int(runtime.gpu_count),
             train=getattr(getattr(request, "spec", None), "train", None),
             thinking=bool(_opd_train._w.THINKING),
