@@ -14,6 +14,7 @@ from flash.runner.supervise import lifecycle as _lifecycle
 from flash.runner.supervise.retry_decision import (
     _EXHAUSTED_CAPACITY_ACTION,
     _capacity_exhausted,
+    _capacity_refusal_key,
     _retry_target,
 )
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
@@ -403,7 +404,7 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
 
 def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
     from flash.providers.allocator import allocate
-    from flash.providers.base import PollResult, UnsupportedGpuError
+    from flash.providers.base import CapacityUnavailableError, PollResult, UnsupportedGpuError
     from flash.runner import _load_run_deadline_at, get_status
 
     # a cancel can land after _run_training's pre-submit check but while
@@ -448,9 +449,11 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
             # silently collapses back to one card after the preparation round trips.
             max_gpu_count=prepared.attempt_spec.authored_gpu_count,
         )
+    except UnsupportedGpuError:
+        raise  # config-shaped: no gpu anywhere can run this job
+    except CapacityUnavailableError as exc:
+        return None, PollResult(False, failure="no_capacity", detail=str(exc))
     except Exception as exc:
-        if isinstance(exc, UnsupportedGpuError):
-            raise  # config-shaped: no gpu anywhere can run this job
         return None, PollResult(
             False,
             failure="poll_error",
@@ -866,9 +869,10 @@ def _handle_failure(
     # in-memory and per-process on purpose: _build_context starts this empty every time, so a run
     # resumed after a control-plane restart gets a fresh pair of looks at the market rather than
     # inheriting a verdict from minutes ago. capacity is exactly the thing that changes in between.
-    if result.failure == "no_capacity" and outcome.chosen is not None:
-        refused_key = _lifecycle._shape_key(outcome.chosen)
-        ctx.capacity_refusals[refused_key] = ctx.capacity_refusals.get(refused_key, 0) + 1
+    if result.failure == "no_capacity":
+        refused_key = _capacity_refusal_key(ctx, outcome)
+        if refused_key is not None:
+            ctx.capacity_refusals[refused_key] = ctx.capacity_refusals.get(refused_key, 0) + 1
     retry_target = _retry_target(
         ctx,
         outcome,

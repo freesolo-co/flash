@@ -2479,6 +2479,98 @@ def test_dynamic_provider_search_keeps_the_full_capacity_retry_budget(orch, monk
     assert "drop the gpu.type pin" not in log.getvalue()
 
 
+def test_multi_count_pin_keeps_retry_budget_when_another_width_can_reappear(orch, monkeypatch):
+    """A count ceiling admits several shapes, even when the current market exposes only one."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner.supervise.lifecycle import INFRA_RETRY_FLOOR
+
+    candidates = (Candidate("runpod", "H200", 4.0, 141, gpu_count=1),)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
+
+    submissions = []
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submissions.append(run_spec.gpu.count)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        return PollResult(False, failure="no_capacity", detail="only one width is visible")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(
+        run_id="flash-pinned-multi-count-capacity",
+        type="H200",
+        provider="runpod",
+        count=2,
+    )
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert submissions == [1] * (INFRA_RETRY_FLOOR + 1)
+    assert "has already refused capacity twice" not in log.getvalue()
+
+
+def test_allocation_time_sellout_counts_for_a_fixed_shape(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import CapacityUnavailableError
+
+    calls = 0
+
+    def sold_out(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise CapacityUnavailableError("exact GPU 'H100' currently has no capacity")
+
+    monkeypatch.setattr(allocator, "allocate", sold_out)
+    spec = _spec(
+        run_id="flash-pinned-allocation-capacity",
+        type="H100",
+        provider="lambda",
+        count=1,
+        max_retries=4,
+    )
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert calls == 2
+    assert "has already refused capacity twice" in log.getvalue()
+
+
+def test_allocation_lookup_outage_keeps_the_full_retry_budget(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import CapacityLookupError
+    from flash.runner.supervise.lifecycle import INFRA_RETRY_FLOOR
+
+    calls = 0
+
+    def lookup_failed(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise CapacityLookupError("lambda live capacity lookup failed")
+
+    monkeypatch.setattr(allocator, "allocate", lookup_failed)
+    spec = _spec(
+        run_id="flash-pinned-allocation-lookup",
+        type="H100",
+        provider="lambda",
+        count=1,
+    )
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert calls == INFRA_RETRY_FLOOR + 1
+    assert "has already refused capacity twice" not in log.getvalue()
+
+
 def test_a_provisioned_attempt_resets_the_class_capacity_refusals(orch, monkeypatch):
     """A worker-side failure proves the class admitted the run, so an older shortage is stale."""
     from flash.providers import allocator
