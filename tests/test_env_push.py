@@ -2056,6 +2056,7 @@ def test_a_credential_cannot_hide_behind_a_wall_of_padding(tmp_path):
     expands past any such cap, and a key after the cutoff published with exit 0.
     """
     import gzip
+    import time
 
     from flash.env_secrets import credential_in_file
 
@@ -2068,7 +2069,7 @@ def test_a_credential_cannot_hide_behind_a_wall_of_padding(tmp_path):
 
     # the published artifact is small; only its expansion is large
     assert padded.stat().st_size < 8 << 20
-    assert credential_in_file(padded) == "a Freesolo API key"
+    assert credential_in_file(padded, deadline=time.monotonic() + 300.0) == "a Freesolo API key"
 
 
 def test_push_refuses_an_archive_too_expensive_to_scan(monkeypatch, tmp_path, capsys):

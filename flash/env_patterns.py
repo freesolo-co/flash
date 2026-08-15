@@ -54,6 +54,10 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
         ),
     ),
     ("a Prime Intellect key", re.compile(rb"pit_([A-Za-z0-9]{16,%d})" % _MAX_BODY)),
+    (
+        "a GitLab personal access token",
+        re.compile(rb"(?<![A-Za-z0-9_-])glpat-([A-Za-z0-9_-]{20})(?![A-Za-z0-9_-])"),
+    ),
     ("an Anthropic API key", re.compile(rb"sk-ant-([A-Za-z0-9_-]{20,%d})" % _MAX_BODY)),
     ("an OpenRouter API key", re.compile(rb"sk-or-v1-([A-Za-z0-9]{20,%d})" % _MAX_BODY)),
     # every currently-issued OpenAI family is named explicitly. `sk-svcacct-` and `sk-admin-` keys

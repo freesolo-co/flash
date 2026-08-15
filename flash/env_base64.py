@@ -158,12 +158,19 @@ _STANDARD_ALPHABET = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01234
 # `zlib.compress(data, 9)` writes `x\xda`. Listing the one literal meant a level-9 stream whose
 # base64 crossed a scan chunk was not recognised as a container and published clean, so the
 # structural predicate is applied alongside these instead of a byte of it being spelled out here.
-_CONTAINER_MAGIC = (b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00", b"PK\x03\x04", b"PK\x05\x06")
+_CONTAINER_MAGIC = (
+    b"\x1f\x8b",
+    b"BZh",
+    b"\xfd7zXZ\x00",
+    b"PK\x03\x04",
+    b"PK\x05\x06",
+    b"Obj\x01",
+)
 _CONTAINER_SNIFF_CHARS = 64
 # gzip, bzip2, xz and zip begin with H, Q, / and U after base64 encoding. zlib's valid
 # `cinfo << 4 | 8` first byte yields exactly C, G, K, O, S, W, a or e. this byte gate avoids a
 # decode and assignment regex for the millions of ordinary csv fields beginning with anything else.
-_CONTAINER_BASE64_FIRST = frozenset(b"HQ/UCGKOSWae")
+_CONTAINER_BASE64_FIRST = frozenset(b"HQ/TUCGKOSWae")
 
 
 def _visible_zlib_container(decoded: bytes) -> bool:
@@ -301,10 +308,11 @@ def _match_base64(
         # gzip whose base64 crossed the 1 MiB chunk boundary was published clean, while the same
         # blob one byte shorter was caught. Only the tail run can be affected, and only when the
         # caller says more bytes follow.
+        terminal = joined[run.end() :]
         if (
             truncated
             and inspect is not None
-            and run.end() == len(joined)
+            and (not terminal or terminal in (b"\n", b"\r\n"))
             and _decodes_to_container(candidate)
         ):
             raise _RunTooLongToExpand

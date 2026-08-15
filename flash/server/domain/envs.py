@@ -395,6 +395,22 @@ def _github_publish_once(
             _push_environment_commit(checkout=checkout, token=token)
 
 
+def _reject_credential_slug_segments(*segments: str) -> None:
+    """Refuse credential-bearing resolved path segments under one shared scan deadline."""
+    deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
+    for segment in segments:
+        try:
+            kind = credential_in_name(segment, deadline=deadline)
+        except _Unscannable as exc:
+            raise EnvPublishError(
+                f"env destination {exc}, so it cannot be checked for credentials"
+            ) from None
+        if kind:
+            raise EnvPublishError(
+                f"env destination contains {kind}; rotate it and use different path segments"
+            )
+
+
 def _github_publish(
     dest: Path,
     *,
@@ -410,6 +426,7 @@ def _github_publish(
         )
     repo = _DEFAULT_GITHUB_REPO
     ns, project, clean = publish_slug_for_name(name, key, project_slug)
+    _reject_credential_slug_segments(ns, project, clean)
     publish_root = f"{ns}/{project}/{clean}"
     if not (dest / _DEFAULT_ENVIRONMENT_FILE).is_file():
         raise EnvPublishError("env package must contain environment.py")

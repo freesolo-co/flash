@@ -141,6 +141,59 @@ def test_publish_uploads_to_github_and_returns_slug(monkeypatch):
     assert captured["files"] == ["environment.py", "pyproject.toml"]
 
 
+@pytest.mark.parametrize(
+    ("key", "project_slug"),
+    [
+        ({"org_slug": "gl" + "pat-" + "a1b2c3d4e5f6g7h8i9j0"}, "ordinary"),
+        ({"org_slug": "ordinary"}, "gl" + "pat-" + "a1b2c3d4e5f6g7h8i9j0"),
+    ],
+)
+def test_publish_rejects_credentials_in_resolved_hub_segments(monkeypatch, key, project_slug):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    reached = False
+
+    def fail_publish(**_kwargs):
+        nonlocal reached
+        reached = True
+
+    monkeypatch.setattr(envs, "_github_publish_once", fail_publish)
+    with pytest.raises(envs.EnvPublishError, match="GitLab personal access token") as excinfo:
+        envs.publish_package(
+            package_b64=_pkg_b64(_MINIMAL),
+            name="example",
+            key=key,
+            project_slug=project_slug,
+        )
+    assert not reached
+    assert "gl" + "pat-" + "a1b2c3d4e5f6g7h8i9j0" not in str(excinfo.value)
+
+
+def test_publish_scans_resolved_hub_segments_separately(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    published: list[str] = []
+    monkeypatch.setattr(
+        envs,
+        "_github_publish_once",
+        lambda *, publish_root, **_kwargs: published.append(publish_root),
+    )
+
+    ordinary = envs.publish_package(
+        package_b64=_pkg_b64(_MINIMAL),
+        name="example",
+        key={"org_slug": "ordinary"},
+        project_slug="project",
+    )
+    split = envs.publish_package(
+        package_b64=_pkg_b64(_MINIMAL),
+        name="example",
+        key={"org_slug": "glpat-"},
+        project_slug="a1b2c3d4e5f6g7h8i9j0",
+    )
+    assert ordinary == "ordinary/project/example"
+    assert split == "glpat-/a1b2c3d4e5f6g7h8i9j0/example"
+    assert published == [ordinary, split]
+
+
 def test_same_name_in_two_projects_publishes_to_separate_roots(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     published_roots: list[str] = []

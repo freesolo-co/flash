@@ -96,6 +96,9 @@ _UNEXPANDABLE_MAGIC = (
     # was neither expanded nor refused: the compressed bytes were scanned as if they were content
     # and the archive published intact.
     (b"7z\xbc\xaf\x27\x1c", "7-zip"),
+    # avro ocf starts with this four-byte marker. codecs such as snappy and zstd are optional
+    # dependencies, so recognising the container must fail closed before any codec is required.
+    (b"Obj\x01", "Avro"),
 )
 
 # Formats recognised ONLY at byte zero, kept apart from the list above rather than added to it.
@@ -198,6 +201,57 @@ _STREAM_WINDOW_BYTES = 1 << 20
 # 4 KiB boundary and the decode error is tolerated as "not text" -- which is the safe direction:
 # it only ever costs a refusal that the heuristic already justified.
 _TEXT_SAMPLE_BYTES = 4096
+
+_ANSIBLE_VAULT_GUARD = b"$ANSIBLE_VAULT;"
+_ANSIBLE_VAULT_HEX = frozenset(b"0123456789abcdefABCDEF")
+_ANSIBLE_VAULT_PAYLOAD_HEX = frozenset(b"0123456789abcdef")
+_ANSIBLE_VAULT_FIXED_FIELD_HEX = 64
+
+
+def _has_ansible_vault(data: bytes) -> bool:
+    """Whether `data` carries a supported Ansible Vault header and ciphertext body."""
+    if _ANSIBLE_VAULT_GUARD not in data:
+        return False
+    lines = data.splitlines()
+    for index, raw in enumerate(lines):
+        header = raw.strip()
+        if not header.startswith(_ANSIBLE_VAULT_GUARD):
+            continue
+        parts = header.split(b";")
+        valid = parts in (
+            [b"$ANSIBLE_VAULT", b"1.1", b"AES256"],
+            [b"$ANSIBLE_VAULT", b"1.2", b"AES256"],
+        )
+        valid = valid or (
+            len(parts) == 4
+            and parts[:3] == [b"$ANSIBLE_VAULT", b"1.2", b"AES256"]
+            and bool(parts[3])
+        )
+        if not valid:
+            continue
+        wrapped = bytearray()
+        for body_line in lines[index + 1 :]:
+            body = body_line.strip()
+            if not body or len(body) % 2 or any(byte not in _ANSIBLE_VAULT_HEX for byte in body):
+                break
+            wrapped.extend(body)
+        try:
+            payload = bytes.fromhex(wrapped.decode("ascii"))
+        except ValueError:
+            continue
+        fields = payload.split(b"\n")
+        if len(fields) != 3:
+            continue
+        salt, digest, ciphertext = fields
+        if (
+            len(salt) == _ANSIBLE_VAULT_FIXED_FIELD_HEX
+            and len(digest) == _ANSIBLE_VAULT_FIXED_FIELD_HEX
+            and ciphertext
+            and len(ciphertext) % 2 == 0
+            and all(byte in _ANSIBLE_VAULT_PAYLOAD_HEX for field in fields for byte in field)
+        ):
+            return True
+    return False
 
 
 def _after_skippable_frames(head: bytes) -> tuple[bytes, bool]:

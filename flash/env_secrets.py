@@ -94,8 +94,7 @@ from flash.env_keystores import (
 )
 from flash.env_names import exact_name_values
 from flash.env_openpgp import (
-    _has_age_file_armor,
-    _has_age_native_document,
+    _encrypted_text_format,
     _has_openpgp_message_armor,
     _unfinished_openpgp_message_armor,
 )
@@ -442,9 +441,9 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
             raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
         if bool(upcoming) and _unfinished_openpgp_message_armor(window):
             raise _Unscannable("contains an OpenPGP message armor header too long to read past")
-        # search nested age armor or native headers; both require body structure, not documentation.
-        if _has_age_file_armor(window) or _has_age_native_document(window):
-            raise _Unscannable("contains a age-encrypted file this check cannot read")
+        # encrypted text containers require body structure, not documentation markers alone.
+        if encrypted := _encrypted_text_format(window):
+            raise _Unscannable(f"contains a {encrypted} file this check cannot read")
         # A private-key armor whose HEADER runs past this window. The PEM pattern requires the
         # BEGIN line and the start of the base64 body in one buffer, and RFC 4880 armor headers sit
         # between them with no length limit -- so a 1.1 MB `Comment:` pushed the body into the next
@@ -561,6 +560,8 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
         _credential_in_raw_deflate,
         _credential_in_pdf,
     ):
+        if time.monotonic() > deadline:
+            raise _Unscannable("takes too long to decompress")
         try:
             if kind := handler(source, deadline=deadline, depth=depth):
                 return kind
@@ -570,9 +571,13 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
                 _credential_in_ar,
             )
         except _Unscannable as unscannable:
+            if time.monotonic() > deadline:
+                raise
             refusal = refusal or unscannable
         except _UNREADABLE_ARCHIVE:
             continue  # not this format, or corrupt in it; the remaining formats still get a turn
+    if time.monotonic() > deadline:
+        raise _Unscannable("takes too long to decompress")
     if refusal is not None and not settled:
         raise refusal
     return None

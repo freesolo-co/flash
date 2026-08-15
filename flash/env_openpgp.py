@@ -14,6 +14,8 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 
+from flash.env_formats import _has_ansible_vault
+
 _MAX_OPENPGP_MARKERS = 8
 
 # How many packets of an OpenPGP sequence are walked looking for secret key material. A public key
@@ -165,6 +167,15 @@ def _has_age_file_armor(window: bytes) -> bool:
 def _has_age_native_document(window: bytes) -> bool:
     """whether `window` carries a native age header and recipient stanza at any offset."""
     return _AGE_NATIVE_HEADER in window and _AGE_NATIVE_BODY.search(window) is not None
+
+
+def _encrypted_text_format(window: bytes) -> str | None:
+    """The supported encrypted text container carried by `window`, if any."""
+    if _has_age_file_armor(window) or _has_age_native_document(window):
+        return "age-encrypted"
+    if _has_ansible_vault(window):
+        return "Ansible Vault encrypted"
+    return None
 
 
 def _is_openpgp_encrypted(head: bytes) -> bool | None:

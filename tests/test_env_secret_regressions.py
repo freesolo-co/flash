@@ -58,6 +58,37 @@ def _jks(*tags: int, magic: bytes = b"\xfe\xed\xfe\xed") -> bytes:
     return magic + struct.pack(">II", 2, len(tags)) + body + bytes(20)
 
 
+def _avro_long(value: int) -> bytes:
+    encoded = bytearray()
+    value <<= 1
+    while value > 0x7F:
+        encoded.append((value & 0x7F) | 0x80)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
+def _avro_bytes(value: bytes) -> bytes:
+    return _avro_long(len(value)) + value
+
+
+def _avro_ocf(value: bytes) -> bytes:
+    schema = b'{"type":"bytes"}'
+    metadata = (
+        _avro_long(2)
+        + _avro_bytes(b"avro.schema")
+        + _avro_bytes(schema)
+        + _avro_bytes(b"avro.codec")
+        + _avro_bytes(b"deflate")
+        + _avro_long(0)
+    )
+    sync = b"0123456789abcdef"
+    plain = _avro_bytes(value)
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    block = compressor.compress(plain) + compressor.flush()
+    return b"Obj\x01" + metadata + sync + _avro_long(1) + _avro_bytes(block) + sync
+
+
 def test_pdf_dictionary_index_is_single_pass_and_deadline_bounded(tmp_path, monkeypatch):
     from flash import env_deflate
     from flash.env_secrets import credential_in_file
@@ -246,6 +277,160 @@ def test_parquet_magic_fails_closed_without_using_the_filename(tmp_path):
     assert credential_in_file(fake) is None
 
 
+def test_avro_ocf_fails_closed_only_at_the_anchored_magic(tmp_path):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    avro = _avro_ocf(_KEY)
+    standalone = tmp_path / "dataset.bin"
+    standalone.write_bytes(avro)
+    with pytest.raises(_Unscannable, match="Avro"):
+        credential_in_file(standalone)
+
+    exact = tmp_path / "dataset.b64"
+    exact.write_bytes(base64.b64encode(avro))
+    with pytest.raises(_Unscannable, match="Avro"):
+        credential_in_file(exact)
+
+    wrapped = tmp_path / "dataset-wrapped.b64"
+    wrapped.write_bytes(base64.encodebytes(avro))
+    with pytest.raises(_Unscannable, match="Avro"):
+        credential_in_file(wrapped)
+
+    offset = tmp_path / "offset.bin"
+    offset.write_bytes(b"prefix Obj\x01" + avro[4:])
+    assert credential_in_file(offset) is None
+
+    fake_name = tmp_path / "dataset.avro"
+    fake_name.write_text("ordinary rows with no credential\n")
+    assert credential_in_file(fake_name) is None
+
+
+def test_wrapped_container_newline_at_chunk_boundary_is_not_clean(tmp_path):
+    from flash.env_buffers import _SCAN_CHUNK_BYTES
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    avro = _avro_ocf(_KEY)
+    encoded = base64.b64encode(avro)
+    assert len(encoded) > 76
+    label = b"value: "
+    for ending, name in ((b"\n", "lf"), (b"\r\n", "crlf")):
+        padding = _SCAN_CHUNK_BYTES - len(label) - 76 - len(ending)
+        boundary = tmp_path / f"boundary-{name}.txt"
+        boundary.write_bytes(b"#" * padding + label + encoded[:76] + ending + encoded[76:])
+        with pytest.raises(_Unscannable, match="base64 run too long"):
+            credential_in_file(boundary)
+
+    harmless_encoded = base64.b64encode(b"ordinary harmless bytes " * 20)
+    gap = b"#" * 33
+    padding = _SCAN_CHUNK_BYTES - len(label) - 76 - 1 - len(gap)
+    shifted = tmp_path / "shifted-control.txt"
+    shifted.write_bytes(
+        b"#" * padding + label + harmless_encoded[:76] + b"\n" + gap + harmless_encoded[76:]
+    )
+    assert credential_in_file(shifted) is None
+
+    harmless = tmp_path / "harmless-wrapped.txt"
+    harmless.write_bytes(base64.encodebytes(b"ordinary harmless bytes " * 20))
+    assert credential_in_file(harmless) is None
+
+    adjacent = tmp_path / "adjacent-lines.txt"
+    adjacent.write_bytes(base64.b64encode(b"A" * 57) + b"\n" + base64.b64encode(b"B" * 57))
+    assert credential_in_file(adjacent) is None
+
+
+def test_gitlab_personal_access_tokens_use_the_issued_body_contract(tmp_path):
+    from flash.env_secrets import credential_in_file
+
+    prefix = b"gl" + b"pat-"
+    token = prefix + b"Ab3dE5fG7hJ9kLmN2pQr"
+    assert len(token.removeprefix(prefix)) == 20
+    plain = tmp_path / "gitlab.txt"
+    plain.write_bytes(token)
+    assert credential_in_file(plain) == "a GitLab personal access token"
+
+    encoded = tmp_path / "gitlab.b64"
+    encoded.write_bytes(base64.b64encode(token))
+    assert credential_in_file(encoded) == "a GitLab personal access token"
+
+    wide = tmp_path / "gitlab-wide.bin"
+    wide.write_bytes(token.decode().encode("utf-16-le"))
+    assert credential_in_file(wide) == "a GitLab personal access token"
+
+    assignment = tmp_path / "gitlab.env"
+    assignment.write_bytes(b"GITLAB_TOKEN=" + token)
+    assert credential_in_file(assignment) == "a GitLab personal access token"
+
+    near = b"x" + token
+    near_plain = tmp_path / "gitlab-near.txt"
+    near_plain.write_bytes(near)
+    assert credential_in_file(near_plain) is None
+
+    near_encoded = tmp_path / "gitlab-near.b64"
+    near_encoded.write_bytes(base64.b64encode(near))
+    assert credential_in_file(near_encoded) is None
+
+    near_wide = tmp_path / "gitlab-near-wide.bin"
+    near_wide.write_bytes(near.decode().encode("utf-16-le"))
+    assert credential_in_file(near_wide) is None
+
+    for index, control in enumerate(
+        (
+            prefix + b"Ab3dE5fG7hJ9kLmN2pQ",
+            prefix + b"AAAAAAAAAAAAAAAAAAAA",
+            b"glpatt-Ab3dE5fG7hJ9kLmN2pQr",
+            prefix + b"Ab3dE5fG7hJ9kLmN2pQrX",
+        )
+    ):
+        candidate = tmp_path / f"gitlab-control-{index}.txt"
+        candidate.write_bytes(control)
+        assert credential_in_file(candidate) is None
+
+
+def test_ansible_vault_requires_a_supported_header_and_hex_body(tmp_path):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    def vault_body(ciphertext: bytes = b"c" * 64) -> bytes:
+        payload = b"a" * 64 + b"\n" + b"b" * 64 + b"\n" + ciphertext
+        wrapped = payload.hex().encode()
+        return (
+            b"\n".join(wrapped[index : index + 80] for index in range(0, len(wrapped), 80)) + b"\n"
+        )
+
+    ciphertext = vault_body()
+    standalone = tmp_path / "secrets.txt"
+    standalone.write_bytes(b"$ANSIBLE_VAULT;1.1;AES256\n" + ciphertext)
+    with pytest.raises(_Unscannable, match="Ansible Vault"):
+        credential_in_file(standalone)
+
+    embedded = tmp_path / "secrets.yaml"
+    embedded.write_bytes(
+        b"password: !vault |\n  $ANSIBLE_VAULT;1.2;AES256;production\n  "
+        + ciphertext.replace(b"\n", b"\n  ")
+    )
+    with pytest.raises(_Unscannable, match="Ansible Vault"):
+        credential_in_file(embedded)
+
+    arbitrary_hex = b"0123456789abcdef" * 4 + b"\n"
+    uppercase_payload = vault_body(b"C" * 64)
+    controls = (
+        b"documentation mentions $ANSIBLE_VAULT;1.1;AES256 inline\n",
+        b"$ANSIBLE_VAULT;1.1;AES256\n",
+        b"$ANSIBLE_VAULT;1.1;AES256\n" + arbitrary_hex,
+        b"$ANSIBLE_VAULT;1.3;AES256\n" + ciphertext,
+        b"$ANSIBLE_VAULT;1.2;AES256;\n" + ciphertext,
+        b"$ANSIBLE_VAULT;1.1;AES256\n0123456789abcdef-not-hex\n",
+        b"$ANSIBLE_VAULT;1.1;AES256\n" + uppercase_payload,
+    )
+    for index, content in enumerate(controls):
+        control = tmp_path / f"ansible-control-{index}.txt"
+        control.write_bytes(content)
+        assert credential_in_file(control) is None
+
+    fake_name = tmp_path / "ordinary.vault"
+    fake_name.write_text("ordinary rows with no credential\n")
+    assert credential_in_file(fake_name) is None
+
+
 @pytest.mark.parametrize(
     ("name", "contents"),
     [
@@ -331,6 +516,47 @@ def test_nested_overflow_retains_overlay_refusal(tmp_path, monkeypatch, suffix, 
     with zipfile.ZipFile(plain, "w", zipfile.ZIP_DEFLATED) as zipped:
         zipped.writestr("large.txt", (b"ordinary text and numbers 12345\n" * 3000)[: 70 << 10])
     assert env_secrets.credential_in_file(plain) is None
+
+
+def test_container_timeout_cannot_be_suppressed_by_a_settled_handler(tmp_path, monkeypatch):
+    from flash import env_secrets
+
+    keyed = tmp_path / "keyed.gz"
+    keyed.write_bytes(gzip.compress(_KEY, mtime=0))
+    assert env_secrets.credential_in_file(keyed) == "a Freesolo API key"
+
+    harmless = tmp_path / "harmless.gz"
+    harmless.write_bytes(gzip.compress(b"ordinary rows\n", mtime=0))
+    assert env_secrets.credential_in_file(harmless) is None
+
+    expired = False
+
+    def settled(*_args, **_kwargs):
+        return None
+
+    def timeout(*_args, **_kwargs):
+        nonlocal expired
+        expired = True
+        raise env_secrets._Unscannable("takes too long to decompress")
+
+    monkeypatch.setattr(env_secrets, "_credential_in_zip", settled)
+    monkeypatch.setattr(env_secrets, "_credential_in_tar", settled)
+    monkeypatch.setattr(env_secrets, "_credential_in_ar", settled)
+    monkeypatch.setattr(env_secrets, "_credential_in_compressed", timeout)
+    monkeypatch.setattr(env_secrets, "_credential_in_overlay", settled)
+    monkeypatch.setattr(env_secrets, "_credential_in_raw_deflate", settled)
+    monkeypatch.setattr(env_secrets, "_credential_in_pdf", settled)
+    monkeypatch.setattr(env_secrets.time, "monotonic", lambda: 2.0 if expired else 0.0)
+    with pytest.raises(env_secrets._Unscannable, match="too long"):
+        env_secrets._credential_in_container(b"not a container", deadline=1.0, depth=1)
+
+    expired = False
+
+    def format_refusal(*_args, **_kwargs):
+        raise env_secrets._Unscannable("not this speculative format")
+
+    monkeypatch.setattr(env_secrets, "_credential_in_compressed", format_refusal)
+    assert env_secrets._credential_in_container(b"not a container", deadline=1.0, depth=1) is None
 
 
 def test_oversized_base64_refusal_is_limited_to_containers(tmp_path):
