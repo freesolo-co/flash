@@ -6789,42 +6789,67 @@ def test_the_arming_heartbeat_is_retried_when_it_does_not_commit(monkeypatch):
     )
 
 
-def test_a_wedged_arming_upload_does_not_block_the_child_launch(monkeypatch):
-    """A hung arming upload must not hold the run at `opd_initializing` forever.
+def test_the_arming_heartbeat_never_abandons_the_shared_upload_lock(monkeypatch):
+    """A hung arming upload must not be walked away from while it holds `_HB_UPLOAD_LOCK`.
 
-    This call is synchronous and sits between "setup finished" and "the child, which carries the
-    watchdog, starts". `heartbeat` bounds its wait for the upload LOCK, but the commit itself goes
-    through an `HfApi` built with no timeout, so a hung connection blocks its caller indefinitely.
-    Blocking HERE is the worst place to block: the watchdog does not exist yet, so nothing local can
-    condemn the run and it strands until the provider reports the retriable "stalled" -- the
-    retry-and-rebill path this change exists to cut off, reached through the code added to prevent
-    it. The upload cannot be cancelled, so it is abandoned on a daemon thread and the run proceeds.
+    An earlier revision bounded this call and ABANDONED the upload on a daemon thread, so the child
+    launch could not be delayed. That was strictly worse than blocking. `heartbeat` holds the
+    process-wide `_HB_UPLOAD_LOCK` across the commit, and the commit is unbounded because `HfApi`
+    accepts no timeout — so the orphan kept that lock forever, and every later liveness, progress
+    and terminal heartbeat could then only time out acquiring it and return False. A perfectly
+    healthy long-running child went invisible to the provider and was failed as `stalled` anyway,
+    which is the outcome this PR exists to prevent, reached through the code added to prevent it.
+
+    Blocking is the lesser failure: bounded in practice by the upload's own retry budget, confined
+    to this run, with the provider's 3000s setup grace still the backstop — the same contract every
+    other setup heartbeat in the worker already has.
     """
     import flash.engine.worker.opd_train as opd_train
+    from flash.engine.worker.io import heartbeat as hb
 
-    monkeypatch.setattr(opd_train, "_ARM_HEARTBEAT_BUDGET_S", 0.2)
     entered = threading.Event()
     release = threading.Event()
+    calls: list = []
 
-    def wedged_heartbeat(_stage, **_kw):
-        entered.set()
-        release.wait(30)  # HfApi with no timeout
-        return True
+    def wedged_upload_holding_the_lock(_stage, **_kw):
+        # models the real `heartbeat`: it takes the process-wide lock and is STILL INSIDE it while
+        # the commit hangs. this is the state a caller that walks away leaves behind.
+        acquired = hb._HB_UPLOAD_LOCK.acquire(timeout=5)
+        calls.append(acquired)
+        try:
+            entered.set()
+            release.wait(20)  # HfApi with no timeout
+            return True
+        finally:
+            if acquired:
+                hb._HB_UPLOAD_LOCK.release()
 
-    monkeypatch.setattr(opd_train._w, "heartbeat", wedged_heartbeat)
+    monkeypatch.setattr(opd_train._w, "heartbeat", wedged_upload_holding_the_lock)
     monkeypatch.setattr(opd_train._w, "gpu_diagnostics", lambda include_torch=True: {})
 
-    started = time.monotonic()
+    # run arming on a helper thread so this test can inspect the lock WHILE the commit hangs --
+    # which is exactly the window an abandoning implementation returns to its caller in.
+    done = threading.Event()
+    worker = threading.Thread(target=lambda: (opd_train.arm_provider_stall_clock(), done.set()))
+    worker.daemon = True
+    worker.start()
     try:
-        opd_train.arm_provider_stall_clock()
-        elapsed = time.monotonic() - started
-        assert entered.is_set(), "the arming heartbeat never ran, so this proves nothing"
-        assert elapsed < 5, (
-            f"the wedged arming upload held the child launch for {elapsed:.1f}s: the run is stuck "
-            "at opd_initializing with no watchdog yet armed, billing until the provider gives up"
+        assert entered.wait(10), "the arming heartbeat never ran, so this proves nothing"
+        # an implementation that abandons the upload returns here with the lock still held.
+        returned_early = done.wait(2)
+        assert not returned_early, (
+            "arming returned while its upload was still holding the shared _HB_UPLOAD_LOCK: the "
+            "orphan keeps that lock, so every later heartbeat can only time out acquiring it and a "
+            "healthy child goes invisible to the provider"
         )
     finally:
         release.set()
+        worker.join(timeout=10)
+
+    assert calls == [True], f"the arming heartbeat did not run as expected: {calls}"
+    assert not hb._HB_UPLOAD_LOCK.locked(), "the shared upload lock was left held"
+    assert hb._HB_UPLOAD_LOCK.acquire(timeout=1), "a later heartbeat could not acquire the lock"
+    hb._HB_UPLOAD_LOCK.release()
 
 
 def test_arming_the_watchdog_restarts_the_providers_stall_clock(monkeypatch):

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
 import threading
 import time
@@ -250,16 +249,6 @@ CHILD_STALL_ABORT_REASON = (
     "the gpu"
 )
 
-# how long the arming heartbeat may hold the child launch. `heartbeat` bounds its wait for the
-# upload LOCK, but the commit itself runs through an HfApi built with no timeout, so a hung
-# connection blocks its caller forever. this call sits between "setup finished" and "the child, with
-# its own watchdog, starts", so blocking here strands the run at opd_initializing until the provider
-# reports the retriable "stalled" -- the retry-and-rebill path this change exists to cut off, reached
-# by the code added to prevent it. generous next to a small json commit and small next to the 1800s
-# watchdog: past this the ping has already failed at being a clock-restart, and launching the child
-# is worth more than landing it.
-_ARM_HEARTBEAT_BUDGET_S = 60.0
-
 
 def arm_provider_stall_clock() -> None:
     """Restart the PROVIDER's stall clock at the moment the child's own watchdog arms.
@@ -284,51 +273,23 @@ def arm_provider_stall_clock() -> None:
     about to train perfectly well over a heartbeat that is only ever an optimisation of WHEN the
     provider gives up, and the run stays no worse off than before this function existed.
 
-    the whole thing is bounded by ``_ARM_HEARTBEAT_BUDGET_S`` and ABANDONED rather than cancelled:
-    a wedged HF upload cannot be interrupted, so it is left to a daemon thread and the run proceeds
-    without it. an abandoned upload cannot wedge what follows either -- every later heartbeat bounds
-    its own wait for the upload lock and returns False instead of blocking on the orphan.
+    emitted SYNCHRONOUSLY, and deliberately not on a bounded-then-abandoned thread. `heartbeat`
+    holds the process-wide ``_HB_UPLOAD_LOCK`` across the commit, and the commit itself is unbounded
+    (`HfApi` accepts no timeout). Walking away from a thread mid-commit therefore leaves that lock
+    held forever: every later liveness, progress and terminal heartbeat then merely times out
+    acquiring it and returns False, so a HEALTHY long-running child goes invisible to the provider
+    and is failed as "stalled" anyway. Blocking here is the lesser failure -- it is bounded in
+    practice by the upload's own retry budget, it blocks only this run, and the provider's existing
+    3000s setup grace remains the backstop, exactly as it is for every other setup heartbeat the
+    worker already emits this way.
     """
-    deadline = time.monotonic() + _ARM_HEARTBEAT_BUDGET_S
     for attempt in range(2):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        committed, wedged = _arm_once(remaining)
-        if committed:
+        if _w.heartbeat("opd_initializing", gpu=_w.gpu_diagnostics(include_torch=False)):
             return
-        why = "is still running" if wedged else "did not commit"
         print(
-            f"arming heartbeat {why} (attempt {attempt + 1}/2); the provider's stall clock still "
-            "runs from the last committed setup heartbeat"
+            f"arming heartbeat did not commit (attempt {attempt + 1}/2); the provider's stall clock "
+            "still runs from the last committed setup heartbeat"
         )
-        if wedged:
-            # a second attempt would only queue behind this one on the upload lock and spend the
-            # rest of the budget learning that. launch the child instead: it carries the watchdog.
-            break
-
-
-def _arm_once(budget_s: float) -> tuple[bool, bool]:
-    """Emit one arming heartbeat within ``budget_s``; return (committed, still running).
-
-    the upload runs on a daemon thread because an HF commit cannot be cancelled: over budget it is
-    ABANDONED, not stopped, and the caller proceeds to launch the child. module level rather than a
-    closure so the result list cannot be captured across loop iterations.
-    """
-    committed: list[bool] = []
-
-    def _arm() -> None:
-        # the nvidia-smi probe is collected HERE rather than by the caller so a hung probe is
-        # bounded by the same budget as the upload it decorates. it reports its own failures as
-        # payload keys rather than raising, so it needs no separate guard.
-        with contextlib.suppress(Exception):
-            gpu = _w.gpu_diagnostics(include_torch=False)
-            committed.append(bool(_w.heartbeat("opd_initializing", gpu=gpu)))
-
-    pinger = threading.Thread(target=_arm, daemon=True)
-    pinger.start()
-    pinger.join(timeout=budget_s)
-    return bool(committed and committed[0]), pinger.is_alive()
 
 
 def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[float, list]:

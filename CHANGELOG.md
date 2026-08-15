@@ -54,10 +54,14 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   the provider's own stall clock restarts alongside the child's: it advances only on staged pings,
   and the whole setup span before the child is held open by liveness pings it does not credit, so
   ~20 minutes of ordinary setup previously left less grace than the watchdog needs and the provider
-  reported the retriable `stalled` first. That staged heartbeat is bounded and abandoned rather than
-  awaited, because it runs synchronously before the child (and therefore the watchdog) exists and
-  the underlying upload has no timeout: a hung connection there would strand the run in the very
-  state this change exists to end. Detection runs entirely on a thread that never uploads --
+  reported the retriable `stalled` first. That staged heartbeat is awaited rather than bounded and
+  abandoned on a thread: the upload holds a process-wide lock across its commit, so walking away
+  from one mid-commit leaves that lock held for the life of the process and every later liveness,
+  progress and terminal heartbeat can then only time out acquiring it, which makes a healthy
+  long-running child invisible to the provider and fails it as `stalled` anyway. Blocking is the
+  lesser failure: it blocks only this run, and the provider's 3000s setup grace remains the
+  backstop, exactly as it already is for every other setup heartbeat the worker emits this way.
+  Detection runs entirely on a thread that never uploads --
   it samples the counter and decides on it -- because the heartbeat upload has no timeout, and a
   detector that only advances between uploads can see neither a child going quiet nor one coming
   back. It takes its first sample before its first sleep, so the earliest heartbeat already carries
