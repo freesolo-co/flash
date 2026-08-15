@@ -16,14 +16,14 @@ from typing import Any
 
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
+from flash.engine.worker.verl.child_io import (
+    LORA_ROLLOUT_GUARD_SHIM,
+    render_lora_rollout_guard_fragment,
+)
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
     resolve_reshard_after_forward,
 )
-
-# the one fragment opd wraps fail-closed and verifies. named here because both the writer and the
-# post-run verification need it.
-_LORA_ROLLOUT_GUARD_SHIM = "lora-rollout-guard"
 
 
 @dataclass(frozen=True)
@@ -532,11 +532,7 @@ def _write_child_shims(
         opd_shim_source += _opd_train.render_gdn_varlen_shim(gdn_reset_arch)
     # fail closed: base-model rollouts complete with descending loss while distilling the wrong
     # policy, so a guard that failed to apply must stop the child rather than let it train unguarded.
-    opd_shim_source += _opd_train.wrap_shim_fragment(
-        _LORA_ROLLOUT_GUARD_SHIM,
-        _opd_train.render_lora_rollout_guard_shim(),
-        record_immediately=False,
-    )
+    opd_shim_source += render_lora_rollout_guard_fragment()
     if "wandb" in loggers:
         opd_shim_source += _opd_train.render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
@@ -656,7 +652,7 @@ def _build_child_callbacks(
         # whole gpu and teacher budget. not on the first output line: fragments print while later
         # ones are still applying.
         if not shims_verified:
-            _opd_train.verify_applied_shim_markers(shim_markers, (_LORA_ROLLOUT_GUARD_SHIM,))
+            _opd_train.verify_applied_shim_markers(shim_markers, (LORA_ROLLOUT_GUARD_SHIM,))
             shims_verified = True
         # use parse_verl_metric because numpy 2 pprint emits np.float64(...); float() would drop
         # every step and leave a trained run with an empty loss curve.

@@ -1317,8 +1317,9 @@ def test_the_flash_qla_fragment_is_wrapped_fail_closed_for_a_gdn_run():
         "the flashqla fragment must sit inside the same gdn gate as the boundary resets"
     )
     wrapped = vc.wrap_shim_fragment("flashqla-gdn", vc.render_flash_qla_shim("qwen3_5"))
-    ast.parse(wrapped)
-    assert str(vc.SHIM_FRAGMENT_FAILED_EXIT_CODE) in wrapped
+    assembled = vc.render_shim_marker_prologue("/unused") + wrapped
+    ast.parse(assembled)
+    assert str(vc.SHIM_FRAGMENT_FAILED_EXIT_CODE) in assembled
 
 
 @pytest.mark.parametrize("flashqla_first", [False, True])
@@ -5161,15 +5162,16 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
 # ---------------------- fail-closed sitecustomize fragments (child_io) ----------------------
 
 
-def _compose_wrapped_sitecustomize(tmp_path, *fragments):
-    """write a sitecustomize from the real prologue + wrapper; return (shim_dir, marker_file)."""
+def _compose_wrapped_sitecustomize(tmp_path, *fragments, wrapped_fragments=()):
+    """write a sitecustomize from the real prologue + wrappers; return its paths."""
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir(exist_ok=True)
     marker_file = vc.shim_marker_file(str(shim_dir))
     source = vc.render_shim_marker_prologue(marker_file)
     for name, fragment in fragments:
         source += vc.wrap_shim_fragment(name, fragment)
-    (shim_dir / "sitecustomize.py").write_text(source)
+    source += "".join(wrapped_fragments)
+    (shim_dir / "sitecustomize.py").write_text(source, encoding="utf-8")
     return shim_dir, marker_file
 
 
@@ -5337,8 +5339,7 @@ def _lora_rollout_server_module(loaded, *, lora_as_adapter=True):
     return module
 
 
-def _apply_lora_rollout_guard(module, monkeypatch):
-    """exec the fragment against an already-imported module, the way a ray actor re-import hits it."""
+def _install_lora_rollout_module(module, monkeypatch):
     import sys as _sys
 
     for name in (
@@ -5351,10 +5352,35 @@ def _apply_lora_rollout_guard(module, monkeypatch):
         stub.__path__ = []
         monkeypatch.setitem(_sys.modules, name, stub)
     monkeypatch.setitem(_sys.modules, module.__name__, module)
-    exec(
-        compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"),
-        {"_flash_record_applied_shim": lambda _name: None},
-    )
+
+
+def _apply_lora_rollout_guard(module, monkeypatch):
+    """exec the fragment against an already-imported module, the way a ray actor re-import hits it."""
+    _install_lora_rollout_module(module, monkeypatch)
+    exec(compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
+
+
+def test_the_lora_rollout_guard_routes_patch_errors_to_the_fail_closed_handler(
+    tmp_path, monkeypatch
+):
+    module = _lora_rollout_server_module({123})
+    del module.vLLMHttpServer
+    _install_lora_rollout_module(module, monkeypatch)
+
+    marker_file = _child_io.shim_marker_file(str(tmp_path))
+    namespace = {}
+    exec(_child_io.render_shim_marker_prologue(marker_file), namespace)
+    failures = []
+
+    def fail_closed(name):
+        failures.append(name)
+        raise RuntimeError("failed closed")
+
+    namespace["_flash_required_shim_failed"] = fail_closed
+    with pytest.raises(RuntimeError, match="failed closed"):
+        exec(_child_io.render_lora_rollout_guard_fragment(), namespace)
+    # the fake raises instead of exiting, so the outer wrapper catches it and reports again.
+    assert failures == [_child_io.LORA_ROLLOUT_GUARD_SHIM] * 2
 
 
 def test_the_lora_rollout_guard_refuses_to_generate_from_the_base_model(monkeypatch):
@@ -5515,12 +5541,11 @@ def test_the_lora_rollout_guard_patches_the_module_on_a_real_deferred_import(tmp
     armed = list(_sys.meta_path)
     monkeypatch.setattr(_sys, "meta_path", armed)
 
-    marker_file = str(tmp_path / "applied_shims.txt")
-    source = _child_io.render_shim_marker_prologue(marker_file) + _child_io.wrap_shim_fragment(
-        "lora-rollout-guard",
-        _child_io.render_lora_rollout_guard_shim(),
-        record_immediately=False,
+    shim_dir, marker_file = _compose_wrapped_sitecustomize(
+        tmp_path,
+        wrapped_fragments=(_child_io.render_lora_rollout_guard_fragment(),),
     )
+    source = (shim_dir / "sitecustomize.py").read_text(encoding="utf-8")
     exec(compile(source, "sitecustomize.py", "exec"), {})
     assert _child_io.read_applied_shim_markers(marker_file) == set()
     try:
@@ -5543,10 +5568,7 @@ def test_the_lora_rollout_guard_imports_nothing_heavy_at_interpreter_startup():
     import sys as _sys
 
     before = set(_sys.modules)
-    exec(
-        compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"),
-        {"_flash_record_applied_shim": lambda _name: None},
-    )
+    exec(compile(_child_io.render_lora_rollout_guard_shim(), "sitecustomize.py", "exec"), {})
     heavy = {
         name
         for name in set(_sys.modules) - before

@@ -5892,7 +5892,7 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
     # sealed on the new-step branch, and BEFORE the preview reads the published rows so the logged
     # sample and the heartbeat describe the same generation.
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = int(m.group(1))') :]
+    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = step_number') :]
     assert 'reward_runtime.observability.close_generation(progress["step"])' in stdout_loop
     assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
         'samp = reward_runtime.observability.latest_for_step(progress["step"])'
@@ -6634,6 +6634,9 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
     compile(source, "sitecustomize.py", "exec")
     for name in expected:
         assert f"_flash_record_applied_shim({name!r})" in source
+    # the canonical fragment records once through its deferred hook, never at wrapper startup.
+    assert source.count("_flash_record_applied_shim('lora-rollout-guard')") == 1
+    assert "_flash_lora_rollout_guard_applied()" in source
     assert "per-turn-credit" not in source
     # tf32 stays first and unwrapped: it swallows its own failures by design and a later fragment
     # that raised must not be able to cost the run its tensor-core throughput.
@@ -6655,7 +6658,7 @@ def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
     provably finished (fragments print while later ones are still applying, so the first OUTPUT
     line would race the file). a missing marker there means the child trains unpatched."""
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    step_at = stdout_loop.index('progress["step"] = int(m.group(1))')
+    step_at = stdout_loop.index("step_number = verl_step_number(line)")
     verify_at = stdout_loop.index("verify_applied_shim_markers(shim_markers, expected_shims)")
     assert step_at < verify_at < stdout_loop.index("close_generation")
     # and the entry point wires the files dict (marker path + expected set) into both the loop

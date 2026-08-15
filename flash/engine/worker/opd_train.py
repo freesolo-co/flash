@@ -68,7 +68,6 @@ from flash.engine.worker.train.core.child.glue import (  # noqa: F401
 from flash.engine.worker.train.opd.gkd import (
     generation_eos_from_cached_config,
 )
-from flash.engine.worker.verl.child_io import render_lora_rollout_guard_shim  # noqa: F401
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
 _PERMANENT_TEACHER_EXIT = 86

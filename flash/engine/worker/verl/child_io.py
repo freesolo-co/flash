@@ -426,6 +426,7 @@ else:
 FLASH_GDN_VARLEN_MARKER = "[flash-verl] gdn packed-boundary resets active"
 
 FLASH_LORA_ROLLOUT_MARKER = "[flash-verl] lora rollout guard active"
+LORA_ROLLOUT_GUARD_SHIM = "lora-rollout-guard"
 
 _LORA_ROLLOUT_TARGET = "verl.workers.rollout.vllm_rollout.vllm_async_server"
 
@@ -461,13 +462,24 @@ _LORA_ROLLOUT_TARGET = "verl.workers.rollout.vllm_rollout.vllm_async_server"
 # `lora_as_adapter` is false for a merged-lora rollout, which serves the adapter through the base
 # weights and legitimately carries no LoRARequest, so mirroring that flag keeps the guard off the
 # one path where generating without a LoRARequest is correct.
-def render_lora_rollout_guard_shim() -> str:
-    """child-side sitecustomize fragment that fails a rollout whose lora never reached the engine.
+def render_lora_rollout_guard_shim(
+    *, applied_hook: str | None = None, failure_hook: str | None = None
+) -> str:
+    """child-side patch for a rollout whose lora never reached the engine.
 
     deferred through a meta_path finder for the same reason as the gdn shim: importing the target at
     interpreter startup pulls in vllm and torch, initializing cuda against every visible gpu before
-    ray narrows the actor to its own card.
+    ray narrows the actor to its own card. the optional hook names let the canonical wrapped fragment
+    report deferred success or failure without coupling the raw renderer to marker infrastructure.
     """
+    applied = f"    {applied_hook}()\n" if applied_hook else ""
+    apply_patch = "    _flash_patch_lora_rollout(module)\n"
+    if failure_hook:
+        apply_patch = f"""    try:
+        _flash_patch_lora_rollout(module)
+    except BaseException:
+        {failure_hook}()
+"""
     return f'''
 import sys as _flash_lora_sys
 
@@ -511,8 +523,11 @@ def _flash_patch_lora_rollout(module):
 
     generate._flash_lora_guarded = True
     server.generate = generate
-    _flash_record_applied_shim('lora-rollout-guard')
-    print({FLASH_LORA_ROLLOUT_MARKER!r}, flush=True)
+{applied}    print({FLASH_LORA_ROLLOUT_MARKER!r}, flush=True)
+
+
+def _flash_apply_lora_patch(module):
+{apply_patch}
 
 
 class _FlashLoraLoader:
@@ -527,7 +542,7 @@ class _FlashLoraLoader:
     def exec_module(self, module):
         self._inner.exec_module(module)
         _flash_lora_uninstall()
-        _flash_patch_lora_rollout(module)
+        _flash_apply_lora_patch(module)
 
     def __getattr__(self, name):  # keep the rest of the loader protocol intact
         return getattr(self._inner, name)
@@ -563,10 +578,28 @@ def _flash_lora_uninstall():
 
 _flash_lora_loaded = _flash_lora_sys.modules.get(_FLASH_LORA_TARGET)
 if _flash_lora_loaded is not None:
-    _flash_patch_lora_rollout(_flash_lora_loaded)
+    _flash_apply_lora_patch(_flash_lora_loaded)
 else:
     _flash_lora_sys.meta_path.insert(0, _FlashLoraFinder())
 '''
+
+
+def render_lora_rollout_guard_fragment() -> str:
+    """canonical wrapped lora guard, including deferred marker and failure reporting."""
+    applied_hook = "_flash_lora_rollout_guard_applied"
+    failure_hook = "_flash_lora_rollout_guard_failed"
+    lifecycle = f"""
+def {applied_hook}():
+    _flash_record_applied_shim({LORA_ROLLOUT_GUARD_SHIM!r})
+
+
+def {failure_hook}():
+    _flash_required_shim_failed({LORA_ROLLOUT_GUARD_SHIM!r})
+"""
+    source = lifecycle + render_lora_rollout_guard_shim(
+        applied_hook=applied_hook, failure_hook=failure_hook
+    )
+    return wrap_shim_fragment(LORA_ROLLOUT_GUARD_SHIM, source, record_immediately=False)
 
 
 # Why the shim below defers every import to the moment the child imports the modeling module.
@@ -760,6 +793,22 @@ def _flash_record_applied_shim(name):
     # and short O_APPEND writes keep each line intact. the parent reads the file as a set.
     with open(_FLASH_SHIM_MARKER_FILE, "a") as _flash_shim_handle:
         _flash_shim_handle.write(name + "\\n")
+
+
+def _flash_required_shim_failed(name):
+    import os as _flash_shim_os
+    import sys as _flash_shim_sys
+    import traceback as _flash_shim_traceback
+
+    _flash_shim_traceback.print_exc()
+    print(
+        f"[flash-verl] required shim fragment {{name}} failed to apply; "
+        "exiting {SHIM_FRAGMENT_FAILED_EXIT_CODE} rather than training unpatched",
+        file=_flash_shim_sys.stderr,
+        flush=True,
+    )
+    _flash_shim_sys.stderr.flush()
+    _flash_shim_os._exit({SHIM_FRAGMENT_FAILED_EXIT_CODE})
 """
 
 
@@ -780,19 +829,7 @@ def wrap_shim_fragment(name: str, source: str, *, record_immediately: bool = Tru
 try:
 {textwrap.indent(source, "    ")}
 {record}except BaseException:
-    import os as _flash_shim_os
-    import sys as _flash_shim_sys
-    import traceback as _flash_shim_traceback
-
-    _flash_shim_traceback.print_exc()
-    print(
-        "[flash-verl] required shim fragment {name} failed to apply; "
-        "exiting {SHIM_FRAGMENT_FAILED_EXIT_CODE} rather than training unpatched",
-        file=_flash_shim_sys.stderr,
-        flush=True,
-    )
-    _flash_shim_sys.stderr.flush()
-    _flash_shim_os._exit({SHIM_FRAGMENT_FAILED_EXIT_CODE})
+    _flash_required_shim_failed({name!r})
 """
 
 

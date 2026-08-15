@@ -6,7 +6,6 @@ Split out of ``flash.engine.worker.rl_train`` to keep that module under the file
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -30,6 +29,7 @@ from flash.engine.worker.backend_common import (
     shim_marker_file,
     verify_applied_shim_markers,
     verl_device_capability,
+    verl_step_number,
     wrap_shim_fragment,
 )
 from flash.engine.worker.io.heartbeat import (
@@ -57,7 +57,10 @@ from flash.engine.worker.train.rl.shims import (
     render_structured_outputs_shim,
 )
 from flash.engine.worker.train.rl.single_turn import score_single_turn, score_single_turn_batch
-from flash.engine.worker.verl.child_io import render_lora_rollout_guard_shim
+from flash.engine.worker.verl.child_io import (
+    LORA_ROLLOUT_GUARD_SHIM,
+    render_lora_rollout_guard_fragment,
+)
 
 
 def _rl_train():
@@ -219,9 +222,6 @@ def _write_rl_shim(inp, files) -> list[str]:
                 bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0
             ),
         ),
-        # unconditional: every flash rollout is a lora rollout, and a rollout that silently falls
-        # back to the base model is indistinguishable from a working run in the metrics.
-        ("lora-rollout-guard", render_lora_rollout_guard_shim()),
     ]
     shim_source = "".join(
         part
@@ -238,10 +238,10 @@ def _write_rl_shim(inp, files) -> list[str]:
             # into this process there is nothing left to fix.
             render_tilelang_cudart_shim(),
             render_shim_marker_prologue(files["shim_markers"]),
-            *(
-                wrap_shim_fragment(name, source, record_immediately=name != "lora-rollout-guard")
-                for name, source in required_fragments
-            ),
+            *(wrap_shim_fragment(name, source) for name, source in required_fragments),
+            # unconditional: every flash rollout is a lora rollout, and a base-model fallback is
+            # indistinguishable from a working run in the metrics.
+            render_lora_rollout_guard_fragment(),
             # gated on the key rather than the resolved logger list: that list needs python_bin,
             # which is resolved after this file is written. the shim is inert either way -- it only
             # fires when verl actually calls wandb.init, which requires wandb in the logger list.
@@ -256,7 +256,7 @@ def _write_rl_shim(inp, files) -> list[str]:
     # import it (see copy_multi_turn_child_modules for why it is a copy and not an import).
     if inp["multi_turn"]:
         copy_multi_turn_child_modules(files["shim_dir"])
-    return [name for name, source in required_fragments if source]
+    return [name for name, source in required_fragments if source] + [LORA_ROLLOUT_GUARD_SHIM]
 
 
 def _prepare_rl_runtime(inp, env, tok, prompts):
@@ -501,7 +501,6 @@ def _execute_rl_child(
         start_new_session=True,
     )
     child_stream = _rl_train()._GrpoSubprocessStream(proc)
-    step_re = re.compile(r"step:\s*(\d+)")
     progress, last_dump_step = state.progress, state.last_dump_step
     shim_markers = (files or {}).get("shim_markers")
     expected_shims = (files or {}).get("expected_shims", ())
@@ -512,9 +511,9 @@ def _execute_rl_child(
             link = parse_wandb_link(line)
             if link is not None:
                 reward_runtime.wandb_link.update(link)
-            m = step_re.search(line)
-            if m:
-                progress["step"] = int(m.group(1))
+            step_number = verl_step_number(line)
+            if step_number is not None:
+                progress["step"] = step_number
                 # the first step line is the training-start boundary: sitecustomize import is long
                 # finished by then, so a marker still missing means this child is training with no
                 # flash patch at all, so fail now rather than after the whole run is paid for. not

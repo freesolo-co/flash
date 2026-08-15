@@ -7200,7 +7200,9 @@ def test_opd_sitecustomize_composes_into_valid_python_with_the_guard(tmp_path, m
 
     source = (shim_dir / "sitecustomize.py").read_text()
     compile(source, "sitecustomize.py", "exec")
-    assert "_flash_record_applied_shim('lora-rollout-guard')" in source
+    # the canonical fragment records once through its deferred hook, never at wrapper startup.
+    assert source.count("_flash_record_applied_shim('lora-rollout-guard')") == 1
+    assert "_flash_lora_rollout_guard_applied()" in source
     assert f"_flash_shim_os._exit({backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE})" in source
 
 
