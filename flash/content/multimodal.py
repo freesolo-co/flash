@@ -555,9 +555,10 @@ def _decode_image_bytes(data: bytes):
         raise ValueError("image source is not a valid image") from exc
 
 
-def decode_image_descriptors(
+def validate_image_descriptors(
     descriptors: list[str], package_root: str | Path | None
 ) -> list[object]:
+    """Validate one row under worker limits and return fully loaded RGB images."""
     if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
         raise ValueError(
             f"example contains {len(descriptors)} images, exceeding the {MAX_IMAGES_PER_EXAMPLE}-image limit"
@@ -578,7 +579,20 @@ def decode_image_descriptors(
                 f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
             )
         prepared.append(data)
-    return [_decode_image_bytes(data) for data in prepared]
+    images = []
+    try:
+        images.extend(_decode_image_bytes(data) for data in prepared)
+    except Exception:
+        for image in images:
+            image.close()
+        raise
+    return images
+
+
+def decode_image_descriptors(
+    descriptors: list[str], package_root: str | Path | None
+) -> list[object]:
+    return validate_image_descriptors(descriptors, package_root)
 
 
 def resolve_image_pad_token_id(processor, tok) -> int:

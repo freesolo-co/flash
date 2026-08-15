@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 from types import SimpleNamespace
@@ -30,6 +31,13 @@ def _png_bytes(width: int, height: int) -> bytes:
     out = io.BytesIO()
     image_module.new("RGB", (width, height), (12, 34, 56)).save(out, format="PNG")
     return out.getvalue()
+
+
+def _truncated_bmp_bytes(width: int, height: int) -> bytes:
+    image_module = pytest.importorskip("PIL.Image")
+    out = io.BytesIO()
+    image_module.new("RGB", (width, height), (12, 34, 56)).save(out, format="BMP")
+    return out.getvalue()[:-10]
 
 
 class TestSmartResizeMatchesTransformers:
@@ -324,7 +332,7 @@ class TestExpandImagePadRuns:
 
 
 class TestDescriptorPadTokens:
-    def test_counts_each_descriptor_without_decoding_pixels(self):
+    def test_counts_each_fully_validated_descriptor(self):
         from flash.content.multimodal import normalize_image_source
 
         descriptors = [
@@ -337,3 +345,24 @@ class TestDescriptorPadTokens:
         descriptor = json.dumps({"kind": "bytes", "value": "bm90YW5pbWFnZQ=="})
         with pytest.raises(ValueError, match="not a valid image"):
             descriptor_pad_tokens([descriptor], None, QWEN_GEOMETRY)
+
+    def test_rejects_a_truncated_payload_that_still_has_valid_dimensions(self):
+        image_module = pytest.importorskip("PIL.Image")
+        data = _truncated_bmp_bytes(64, 64)
+        with image_module.open(io.BytesIO(data)) as image:
+            assert image.size == (64, 64)
+        descriptor = json.dumps({"kind": "bytes", "value": base64.b64encode(data).decode("ascii")})
+
+        with pytest.raises(ValueError, match="not a valid image"):
+            descriptor_pad_tokens([descriptor], None, QWEN_GEOMETRY)
+
+    def test_rejects_aggregate_decoded_bytes_before_counting_tokens(self, monkeypatch):
+        from flash.content import multimodal
+
+        data = _png_bytes(10, 10)
+        descriptors = [multimodal.normalize_image_source(data, None) for _ in range(2)]
+        monkeypatch.setattr(multimodal, "MAX_TOTAL_DECODED_BYTES", 599)
+
+        assert descriptor_pad_tokens(descriptors[:1], None, QWEN_GEOMETRY) == [64]
+        with pytest.raises(ValueError, match="decoded images"):
+            descriptor_pad_tokens(descriptors, None, QWEN_GEOMETRY)

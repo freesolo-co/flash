@@ -223,8 +223,7 @@ def test_pad_run_length_equals_the_processors_grid(processor, geometry):
         )
 
 
-def test_a_packaged_png_is_measured_without_decoding_its_pixels(geometry, monkeypatch):
-    """Dimensions come from the header; a full decode would make large images expensive to quote."""
+def test_a_packaged_png_is_fully_loaded_before_its_dimensions_are_counted(geometry, monkeypatch):
     from flash.content.multimodal import normalize_image_source
     from flash.engine.profiling.image_tokens import descriptor_pad_tokens
 
@@ -232,14 +231,14 @@ def test_a_packaged_png_is_measured_without_decoding_its_pixels(geometry, monkey
     buffer = io.BytesIO()
     image_module.new("RGB", (1024, 768), (5, 5, 5)).save(buffer, format="PNG")
     descriptor = normalize_image_source(buffer.getvalue(), None)
-
     real_load = image_module.Image.load
+    load_calls = []
 
-    def fail_on_load(self, *args, **kwargs):
-        raise AssertionError("pixels were decoded while counting tokens")
+    def record_load(self, *args, **kwargs):
+        load_calls.append(self.size)
+        return real_load(self, *args, **kwargs)
 
-    monkeypatch.setattr(image_module.Image, "load", fail_on_load)
-    try:
-        assert descriptor_pad_tokens([descriptor], None, geometry) == [768]
-    finally:
-        monkeypatch.setattr(image_module.Image, "load", real_load)
+    monkeypatch.setattr(image_module.Image, "load", record_load)
+
+    assert descriptor_pad_tokens([descriptor], None, geometry) == [768]
+    assert load_calls

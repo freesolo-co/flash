@@ -5,11 +5,12 @@ installs transformers and pillow but not torch. the VL `AutoProcessor` cannot lo
 transformers resolves it through a torchvision-backed image processor, so importing it raises
 `ImportError: ... requires the Torchvision library` before any tokenization happens.
 
-a quote does not need pixels, only token counts. the plain tokenizer renders an image content
-block into `<|vision_start|><|image_pad|><|vision_end|>` and emits exactly ONE `<|image_pad|>` per
-image; the processor differs only in expanding that single placeholder into the run of pad tokens
-the vision tower will actually occupy. that run length is arithmetic over the image's dimensions,
-which pillow reads from the header alone:
+a quote does not need tensors or pixel resampling, only token counts. it still fully decodes each
+bounded payload through the worker's shared validator so corrupt input and cumulative row limits fail
+before persistence or gpu allocation. the plain tokenizer renders an image content block into
+`<|vision_start|><|image_pad|><|vision_end|>` and emits exactly ONE `<|image_pad|>` per image; the
+processor differs only in expanding that placeholder into a run whose length is arithmetic over the
+validated image dimensions:
 
     resized  = smart_resize(height, width, patch_size * merge_size, min_pixels, max_pixels)
     patches  = (resized_h // patch_size) * (resized_w // patch_size)
@@ -17,7 +18,7 @@ which pillow reads from the header alone:
 
 `smart_resize` is the qwen VL resize policy, reimplemented here as pure ``math``. it is duplicated
 rather than imported because the upstream module that defines it is the same one that pulls in
-torchvision -- the dependency there is for resampling PIXELS, which this module never does.
+torchvision. the control plane validates pixels with pillow but never resamples them or imports torch.
 `test_image_tokens.py` pins this implementation against transformers' own `smart_resize` so the
 copy cannot drift silently.
 
@@ -27,7 +28,6 @@ checkpoint that changes its patch or merge size changes the quote with it.
 
 from __future__ import annotations
 
-import io
 import json
 import math
 from dataclasses import dataclass
@@ -221,32 +221,20 @@ def image_pad_tokens(width: int, height: int, geometry: ImageGeometry) -> int:
     return patches // (geometry.merge_size * geometry.merge_size)
 
 
-def image_dimensions(data: bytes) -> tuple[int, int]:
-    """Read one image's (width, height) from its bytes without decoding the pixels."""
-    try:
-        from PIL import Image
-    except ImportError as exc:  # pragma: no cover - pillow is a [server] dependency
-        raise RuntimeError("Pillow is required for multimodal image training") from exc
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            return int(image.width), int(image.height)
-    except Exception as exc:
-        raise ValueError("image source is not a valid image") from exc
-
-
 def descriptor_pad_tokens(
     descriptors: list[str],
     package_root: str | Path | None,
     geometry: ImageGeometry,
 ) -> list[int]:
-    """The pad-token run length each normalized descriptor expands to, in order."""
-    from flash.content.multimodal import read_descriptor_source
+    """The pad-token run length each validated descriptor expands to, in order."""
+    from flash.content.multimodal import validate_image_descriptors
 
-    counts = []
-    for descriptor in descriptors:
-        width, height = image_dimensions(read_descriptor_source(descriptor, package_root))
-        counts.append(image_pad_tokens(width, height, geometry))
-    return counts
+    images = validate_image_descriptors(descriptors, package_root)
+    try:
+        return [image_pad_tokens(image.width, image.height, geometry) for image in images]
+    finally:
+        for image in images:
+            image.close()
 
 
 def expand_image_pad_runs(
