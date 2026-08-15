@@ -126,21 +126,106 @@ def _pdf_name(raw: bytes) -> bytes:
 _ASCII85_FILTER = b"ASCII85Decode"
 _FLATE_FILTER = b"FlateDecode"
 
-# The document's encryption dictionary. Present exactly when stream bodies are ciphertext, and
-# named in the trailer rather than in any stream's own dictionary, so it is searched document-wide.
-#
-# A name ENDS at whitespace, at a delimiter, or at the `%` that opens a comment -- all three are
-# legal separators, and a reader that sees any of them has read the name `Encrypt`. Requiring
-# whitespace alone meant `/Encrypt%c\n2 0 R` named no encryption dictionary here, so the ciphertext
-# went to the declared filters, failed to inflate, and was skipped as "not really a stream": the
-# document published clean while its streams were, by construction, unreadable to this check.
-#
-# Written character by character like `_FLATE_NAME` above, and for the same reason -- every one of
-# them may be spelled `#XX`, so `/Encryp#74` is the same name to every reader. Matching the escaped
-# forms here rather than resolving them across the document keeps stream bytes untouched: a `#` in
-# a compressed body means nothing, and rewriting it could invent a name that is not there.
-_ENCRYPT_NAME = b"".join(rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for letter in b"Encrypt")
-_PDF_ENCRYPT = re.compile(rb"/%s(?:[\s/<>\[\]()%%]|$)" % _ENCRYPT_NAME)
+# the document's encryption dictionary belongs in a classic trailer or a cross-reference stream
+# dictionary. pdf names may use `#xx` escapes, so the lexer below resolves each name before the
+# structural check compares it. scanning the whole document for this name refused harmless page
+# strings and comments that merely contained `/Encrypt`.
+_ENCRYPT_NAME = b"Encrypt"
+
+# pdf lexical delimiters. strings and comments are skipped before names are yielded, so `/Encrypt`
+# in page text is not confused with the trailer key that makes stream bytes unreadable.
+_PDF_WHITESPACE = frozenset(b"\x00\t\n\x0c\r ")
+_PDF_DELIMITERS = frozenset(b"()<>[]{}/%")
+_PDF_TOKEN_END = _PDF_WHITESPACE | _PDF_DELIMITERS
+
+
+def _pdf_tokens(data: bytes) -> Iterator[bytes]:
+    """Syntactic PDF tokens with literal strings, hex strings, and comments omitted."""
+    at = 0
+    while at < len(data):
+        byte = data[at]
+        if byte in _PDF_WHITESPACE:
+            at += 1
+            continue
+        if byte == ord("%"):
+            end = min(
+                (found for found in (data.find(b"\r", at), data.find(b"\n", at)) if found >= 0),
+                default=len(data),
+            )
+            at = end
+            continue
+        if byte == ord("("):
+            depth = 1
+            at += 1
+            while at < len(data) and depth:
+                if data[at] == ord("\\"):
+                    at += 2
+                    continue
+                depth += data[at] == ord("(")
+                depth -= data[at] == ord(")")
+                at += 1
+            continue
+        if byte == ord("<"):
+            if data[at : at + 2] == b"<<":
+                yield b"<<"
+                at += 2
+            else:
+                end = data.find(b">", at + 1)
+                at = len(data) if end < 0 else end + 1
+            continue
+        if data[at : at + 2] == b">>":
+            yield b">>"
+            at += 2
+            continue
+        if byte == ord("/"):
+            end = at + 1
+            while end < len(data) and data[end] not in _PDF_TOKEN_END:
+                end += 1
+            raw = data[at + 1 : end]
+            yield b"/" + (_pdf_name(raw) if len(raw) <= 64 else b"")
+            at = end
+            continue
+        if byte in _PDF_DELIMITERS:
+            yield bytes((byte,))
+            at += 1
+            continue
+        end = at + 1
+        while end < len(data) and data[end] not in _PDF_TOKEN_END:
+            end += 1
+        yield data[at:end] if end - at <= 64 else b""
+        at = end
+
+
+def _pdf_has_encryption_dictionary(data: bytes) -> bool:
+    """Whether a trailer or cross-reference stream dictionary declares `/Encrypt`."""
+    frames: list[tuple[bool, list[bytes]]] = []
+    trailer = False
+    for token in _pdf_tokens(data):
+        if token == b"trailer" and not frames:
+            trailer = True
+            continue
+        if token == b"<<":
+            frames.append((trailer, []))
+            trailer = False
+            continue
+        if token == b">>":
+            if not frames:
+                trailer = False
+                continue
+            is_trailer, direct = frames.pop()
+            is_xref = any(
+                direct[index : index + 2] == [b"/Type", b"/XRef"]
+                for index in range(len(direct) - 1)
+            )
+            if b"/Encrypt" in direct and (is_trailer or is_xref):
+                return True
+            continue
+        if frames:
+            frames[-1][1].append(token)
+        elif trailer:
+            trailer = False
+    return False
+
 
 # A `/Filter` whose value is an indirect reference (`2 0 R`) rather than a name or an array of
 # names. Resolving it means following the xref table into another object. PDF comments are token
@@ -478,7 +563,7 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     # stream" and the document passes as clean. That made an encrypted PDF the one container shape
     # this let through, while encrypted zip, OpenSSL and OpenPGP payloads are all refused. The
     # passphrase is not ours to have, so the only honest answer is undecided.
-    if _PDF_ENCRYPT.search(data):
+    if _pdf_has_encryption_dictionary(data):
         raise _EncryptedDocument
     # A dictionary too long for the gap is undecided, not clean. Raised before the walk so a
     # document carrying one such object refuses whatever its other streams inflate to. Compared

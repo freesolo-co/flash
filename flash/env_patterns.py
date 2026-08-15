@@ -245,12 +245,19 @@ class _Searchable(Protocol):
 # only the `kty` half left the pair unmatched even when the private member was spelled plainly.
 
 
+def _jwk_quoted(pattern: bytes) -> bytes:
+    """`pattern` inside either quote delimiter accepted by JSON or Python mappings."""
+    return rb'(?:"' + pattern + rb'"|\'' + pattern + rb"\')"
+
+
 _JWK_KTY = re.compile(
-    rb"\""
-    + _json_escapable(b"kty")
-    + rb"\"\s*:\s*\"(?:"
-    + b"|".join(_json_escapable(kind) for kind in (b"RSA", b"EC", b"OKP", b"oct"))
-    + rb")\""
+    _jwk_quoted(_json_escapable(b"kty"))
+    + rb"\s*:\s*"
+    + _jwk_quoted(
+        rb"(?:"
+        + b"|".join(_json_escapable(kind) for kind in (b"RSA", b"EC", b"OKP", b"oct"))
+        + rb")"
+    )
 )
 # `d` is the private exponent or scalar in every key type; for RSA the CRT parameters accompany it.
 # `k` is the symmetric case: an `oct` JWK holds its whole secret there and has no `d` at all, so
@@ -280,17 +287,20 @@ _JWK_ESCAPED = {
 # than bytes, so escaping cannot shrink a value below it either.
 _JWK_VALUE_CHAR = rb"(?:[A-Za-z0-9+/\-_]|(?i:\\[uU]00[0-9a-f]{2}))"
 _JWK_PRIVATE = re.compile(
-    rb"\"(?:"
-    + b"|".join(_JWK_ESCAPED[name] for name in (b"dp", b"dq", b"qi", b"d", b"k"))
-    # longest first: `d` would otherwise win against `dp` and leave the `p` outside the quote
-    + rb")\"\s*:\s*\"("
-    # CAPTURED so the value goes through `_is_high_entropy` like every other pattern's body. An
-    # uncaptured value made the pair fire on any long string under a private member name, so a
-    # JSONL dataset with `{"d":"documentation-document"}` in one row and an ordinary public JWK in
-    # another was refused as a private key -- the halves pair across the whole stream, so unrelated
-    # rows combined. A real `d` is a base64url scalar and passes; an English word does not.
-    + _JWK_VALUE_CHAR
-    + rb"{20,})={0,2}\""
+    _jwk_quoted(
+        rb"(?:"
+        + b"|".join(_JWK_ESCAPED[name] for name in (b"dp", b"dq", b"qi", b"d", b"k"))
+        # longest first: `d` would otherwise win against `dp` and leave the `p` outside the quote
+        + rb")"
+    )
+    + rb"\s*:\s*"
+    + _jwk_quoted(
+        # captured so the value goes through `_is_high_entropy` like every other pattern's body. an
+        # uncaptured value made the pair fire on any long string under a private member name, so a
+        # jsonl dataset with `{"d":"documentation-document"}` in one row and an ordinary public jwk
+        # in another was refused as a private key. a real `d` is base64url; english prose is not.
+        b"(" + _JWK_VALUE_CHAR + rb"{20,})={0,2}"
+    )
 )
 
 

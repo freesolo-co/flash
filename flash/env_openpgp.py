@@ -99,6 +99,14 @@ _OPENPGP_ARMORED_BODY = re.compile(
     rb"-----BEGIN PGP MESSAGE-----[^\n]*\n(?:[!-9;-~][^\n]*\n)*\s*\n?[A-Za-z0-9+/]{32}"
 )
 
+# age armor is text and is commonly embedded after a yaml scalar header, so byte-zero recognition
+# misses it. the body requirement keeps a readme that merely names the marker publishable, matching
+# the openpgp rule above rather than treating prose as ciphertext.
+_AGE_FILE_ARMOR = b"-----BEGIN AGE ENCRYPTED FILE-----"
+_AGE_ARMORED_BODY = re.compile(
+    rb"-----BEGIN AGE ENCRYPTED FILE-----[^\r\n]*\r?\n[ \t]*[A-Za-z0-9+/]{32}"
+)
+
 # How much of a stream `_looks_like_textual` reads. A multi-byte UTF-8 character straddling the cut
 # would decode-fail on the truncation rather than on the content, so the sample is taken at a
 # 4 KiB boundary and the decode error is tolerated as "not text" -- which is the safe direction:
@@ -121,6 +129,11 @@ def _has_openpgp_message_armor(window: bytes) -> bool:
     window has no armor line at all and pays only the fast test.
     """
     return _OPENPGP_MESSAGE_ARMOR in window and _OPENPGP_ARMORED_BODY.search(window) is not None
+
+
+def _has_age_file_armor(window: bytes) -> bool:
+    """Whether `window` carries age armor with a plausible ciphertext body at any offset."""
+    return _AGE_FILE_ARMOR in window and _AGE_ARMORED_BODY.search(window) is not None
 
 
 def _is_openpgp_encrypted(head: bytes) -> bool | None:

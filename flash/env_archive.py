@@ -56,7 +56,9 @@ _UNREADABLE_MEMBER = (
 # as arguments is what keeps the import one-way -- the alternative is importing the scan module,
 # which imports this one.
 Scanner = Callable[[IO[bytes], float, int], str | None]
+ContainerScanner = Callable[..., str | None]
 Namer = Callable[[str], str | None]
+MetadataScanner = Callable[[bytes], str | None]
 
 
 def credential_in_zip(
@@ -67,6 +69,7 @@ def credential_in_zip(
     scan: Scanner,
     refusal: type[Exception],
     named: Namer,
+    metadata: MetadataScanner,
     member_limit: int,
 ) -> str | None:
     """The kind of credential in any readable member of a zip, or None."""
@@ -79,6 +82,10 @@ def credential_in_zip(
         raise refusal("contains an archive with too many members to inspect")
     unreadable = ""
     with zipfile.ZipFile(source if isinstance(source, Path) else io.BytesIO(source)) as archive:
+        # archive comments are published metadata just like member names. scanning the exact value is
+        # decisive for encoded ciphertext, whose refusal a speculative raw-byte pass suppresses.
+        if archive.comment and (kind := metadata(archive.comment)):
+            return kind
         for count, info in enumerate(archive.infolist(), 1):
             if count > member_limit:
                 raise refusal("contains an archive with too many members to inspect")
@@ -98,6 +105,10 @@ def credential_in_zip(
             # directory named with base64 of a gzipped key returned clean while the name scanner
             # refused that same string on its own.
             if kind := named(info.filename.rstrip("/")):
+                return kind
+            # each entry comment is another exact central-directory value. checking it before the
+            # directory shortcut covers comments attached to directory entries as well as files.
+            if info.comment and (kind := metadata(info.comment)):
                 return kind
             if info.is_dir():
                 continue
@@ -192,6 +203,7 @@ def credential_in_tar(
     deadline: float,
     depth: int,
     scan: Scanner,
+    dispatch: ContainerScanner,
     refusal: type[Exception],
     named: Namer,
     member_limit: int,
@@ -282,11 +294,12 @@ def credential_in_tar(
         # zero blocks preserves a real suffix whose first header byte happens to be zero.
         while tail.startswith(bytes(512)):
             tail = tail[512:]
-        # every recursive pass starts strictly later than its parent. This is both the concatenated
-        # tar fix and the recursion guard: a remainder that did not advance is never dispatched.
+        # every recursive pass starts strictly later than its parent. concatenation is sequential,
+        # not nested, so the next tar is dispatched at the current depth instead of spending one of
+        # the four genuine-container layers. a remainder that did not advance is never dispatched.
         if tail and len(tail) < source_size:
             try:
-                if kind := scan(io.BytesIO(tail), deadline, depth):
+                if kind := dispatch(tail, deadline=deadline, depth=depth):
                     return kind
             except _UNREADABLE_MEMBER:
                 raise refusal("contains an archive member this check cannot read") from None

@@ -8876,8 +8876,8 @@ def test_recognising_lzma_alone_does_not_probe_a_third_of_a_spreadsheet(tmp_path
     left the properties byte as the only test, and that accepts 35.6% of the bytes in a CSV. Each
     acceptance costs a decompression probe, which took an 87 MB spreadsheet from a 57 second scan
     to the 60 second budget -- a file that had always published was refused for taking too long.
-    The declared uncompressed size is what separates them: a real length larger than a package may
-    be is not a stream inside a package.
+    A high declared-output ceiling keeps chance 64-bit fields out without excluding a legitimate
+    expansion merely because its plaintext is larger than the package carrying it.
     """
     from flash.env_formats import _looks_like_lzma_alone
 
@@ -8886,18 +8886,19 @@ def test_recognising_lzma_alone_does_not_probe_a_third_of_a_spreadsheet(tmp_path
             bytes([properties]) + dictionary.to_bytes(4, "little") + declared.to_bytes(8, "little")
         )
 
-    # the unknown-size marker and a plausible length are both accepted
+    # the unknown-size marker and legitimate expanded lengths are accepted
     assert _looks_like_lzma_alone(_header(0x5D, 4095, (1 << 64) - 1))
     assert _looks_like_lzma_alone(_header(0x5D, 1 << 23, 4096))
+    assert _looks_like_lzma_alone(_header(0x5D, 1 << 23, 1 << 40))
 
-    # a declared length no package can hold is not a stream this package carries
-    assert not _looks_like_lzma_alone(_header(0x5D, 1 << 23, 1 << 40))
+    # arbitrary high 64-bit fields still stay out of the decompression probe
+    assert not _looks_like_lzma_alone(_header(0x5D, 1 << 23, 1 << 60))
 
     # the bound has to actually thin the chance traffic, not merely exist
     accepted = sum(
         1
         for properties in range(256)
-        for declared in (0x0123456789ABCDEF, 0xFEDCBA9876543210)
+        for declared in (0xFEDCBA9876543210, 0x7EDCBA9876543210)
         if _looks_like_lzma_alone(_header(properties, 1 << 23, declared))
     )
     assert accepted == 0, "arbitrary size fields still pass, so the probe cost returns"
@@ -9063,6 +9064,32 @@ def test_shell_assignment_words_join_quoted_and_unquoted_segments(tmp_path):
         assert credential_in_file(script) == "a Freesolo API key", name
 
 
+def test_rejoining_skips_passes_whose_required_bytes_are_absent(monkeypatch):
+    """quote-free padding cannot contain either seam, so neither full-buffer pass should run.
+
+    walking both regexes over a 300 mib expansion added about eight seconds and left too little of the
+    60-second budget under two ci workers. this structural check pins the skip without timing noise.
+    """
+    from flash import env_joined
+
+    padding = b"\0" * (8 << 20)
+    entered: list[str] = []
+
+    def adjacent(data: bytes) -> bytes:
+        entered.append("adjacent")
+        return data
+
+    def assignments(data: bytes) -> bytes:
+        entered.append("assignments")
+        return data
+
+    monkeypatch.setattr(env_joined, "_join_adjacent_literals", adjacent)
+    monkeypatch.setattr(env_joined, "_join_shell_assignments", assignments)
+
+    assert env_joined._rejoined(padding) is padding
+    assert entered == []
+
+
 def test_an_overlay_payload_uses_the_same_depth_as_its_standalone_stream(tmp_path):
     """A self-extracting stub is not another compressed layer.
 
@@ -9113,3 +9140,228 @@ def test_trailing_streams_after_bzip2_xz_and_lzma_alone_are_scanned(tmp_path):
         published = tmp_path / name
         published.write_bytes(first + trailing)
         assert credential_in_file(published) == "a Freesolo API key", name
+
+
+def test_a_large_declared_lzma_expansion_is_still_recognised(tmp_path):
+    """the size field describes plaintext, so a small valid stream may expand past 256 mib.
+
+    using the package-size limit skipped a valid 38 kib stream solely because it declared a
+    268,435,477-byte expansion, publishing the key at the start. the high ceiling must still reject
+    arbitrary 64-bit fields or ordinary csv windows return to the decompression probe.
+    """
+    import lzma
+
+    from flash.env_formats import _looks_like_lzma_alone
+    from flash.env_secrets import credential_in_file
+
+    target = 268_435_477
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    compressor = lzma.LZMACompressor(format=lzma.FORMAT_ALONE)
+    stream = bytearray(compressor.compress(key + b"\n"))
+    remaining = target - len(key) - 1
+    block = b"A" * (1 << 20)
+    while remaining:
+        part = block[: min(remaining, len(block))]
+        stream += compressor.compress(part)
+        remaining -= len(part)
+    stream += compressor.flush()
+    assert len(stream) < 64 << 10
+
+    sentinel = tmp_path / "sentinel.lzma"
+    sentinel.write_bytes(stream)
+    assert credential_in_file(sentinel) == "a Freesolo API key"
+
+    stream[5:13] = target.to_bytes(8, "little")
+    assert _looks_like_lzma_alone(stream[:13])
+    declared = tmp_path / "declared.lzma"
+    declared.write_bytes(stream)
+    assert credential_in_file(declared) == "a Freesolo API key"
+
+    arbitrary = bytes(stream[:5]) + (0xFEDCBA9876543210).to_bytes(8, "little")
+    assert not _looks_like_lzma_alone(arbitrary)
+
+
+def test_concatenated_tars_do_not_consume_container_depth(tmp_path):
+    """sequential tar segments are siblings, so five harmless segments must not hit the depth cap.
+
+    reopening each remainder through the stream scanner charged another container layer and refused
+    the fifth segment. genuinely nested tar members still spend the documented nesting allowance.
+    """
+    import tarfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    def one(name: str, body: bytes) -> bytes:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(body))
+        return buffer.getvalue()
+
+    nested = b"harmless\n"
+    for layer in range(5):
+        nested = one(f"layer-{layer}.tar", nested)
+    control = tmp_path / "nested.tar"
+    control.write_bytes(nested)
+    with pytest.raises(_Unscannable, match="nests compressed containers too deeply"):
+        credential_in_file(control)
+
+    concatenated = tmp_path / "concatenated.tar"
+    concatenated.write_bytes(
+        b"".join(one(f"part-{index}.txt", b"harmless\n") for index in range(5))
+    )
+    assert credential_in_file(concatenated) is None
+
+
+def test_zip_comments_are_scanned_as_exact_metadata(tmp_path):
+    """zip comments are published metadata, and exact base64 ciphertext must refuse like a name.
+
+    the raw archive scan treats base64 candidates as speculative and suppresses their refusal, so
+    comments carrying an openssl envelope were approved while the byte-identical member name refused.
+    """
+    import base64
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    value = base64.b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    named = tmp_path / "named.zip"
+    with zipfile.ZipFile(named, "w") as archive:
+        archive.writestr(value.decode(), b"harmless\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(named)
+
+    global_comment = tmp_path / "global-comment.zip"
+    with zipfile.ZipFile(global_comment, "w") as archive:
+        archive.writestr("harmless.txt", b"harmless\n")
+        archive.comment = value
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(global_comment)
+
+    entry_comment = tmp_path / "entry-comment.zip"
+    with zipfile.ZipFile(entry_comment, "w") as archive:
+        archive.writestr("harmless.txt", b"harmless\n")
+        archive.infolist()[0].comment = value
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(entry_comment)
+
+
+def test_pdf_encrypt_names_are_limited_to_structural_dictionaries(tmp_path):
+    """a pdf name inside a literal string is page content, not an encryption dictionary.
+
+    the document-wide regex refused harmless text containing `/Encrypt`; only a trailer or xref
+    dictionary may declare that streams are ciphertext and therefore unreadable.
+    """
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    encrypted = tmp_path / "encrypted.pdf"
+    encrypted.write_bytes(b"%PDF-1.4\ntrailer\n<< /Root 1 0 R /Encrypt 3 0 R >>\n%%EOF\n")
+    with pytest.raises(_Unscannable, match="encrypted document"):
+        credential_in_file(encrypted)
+
+    body = b"BT (/Encrypt) Tj ET"
+    harmless = tmp_path / "harmless.pdf"
+    harmless.write_bytes(
+        b"%PDF-1.4\n1 0 obj\n<< /Length "
+        + str(len(body)).encode()
+        + b" >>\nstream\n"
+        + body
+        + b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+    )
+    assert credential_in_file(harmless) is None
+
+
+def test_single_quoted_jwk_mappings_are_recognised(tmp_path):
+    """python and jose accept single-quoted dicts, so quote style must not hide a private scalar.
+
+    the two markers remain paired by object scope; admitting a bare `d` field would refuse ordinary
+    mappings that are not keys.
+    """
+    from flash.env_secrets import credential_in_file
+
+    scalar = "AbCdEf0123456789AbCdEf"
+    double = tmp_path / "double.json"
+    double.write_text(f'{{"kty":"OKP","d":"{scalar}"}}\n')
+    assert credential_in_file(double) == "a private key"
+
+    single = tmp_path / "single.py"
+    single.write_text(f"JWK = {{'kty':'OKP','d':'{scalar}'}}\n")
+    assert credential_in_file(single) == "a private key"
+
+    ordinary = tmp_path / "ordinary.py"
+    ordinary.write_text(f"ROW = {{'d':'{scalar}', 'label':'artifact id'}}\n")
+    assert credential_in_file(ordinary) is None
+
+
+def test_embedded_age_armor_requires_and_scans_its_body(tmp_path):
+    """age armor commonly follows a yaml scalar, while documentation may mention only its marker.
+
+    anchoring at byte zero missed embedded ciphertext. searching for the marker alone would instead
+    refuse the readme most likely to explain the format, so a plausible armored body is required.
+    """
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    armor = (
+        "-----BEGIN AGE ENCRYPTED FILE-----\n"
+        "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBBYkNkRWYwMTIzNDU2Nzg5\n"
+        "QWJDZEVmMDEyMzQ1Njc4OUFiQ2RFZjAxMjM0NTY3ODkK\n"
+        "-----END AGE ENCRYPTED FILE-----\n"
+    )
+    control = tmp_path / "control.age"
+    control.write_text(armor)
+    with pytest.raises(_Unscannable, match="age-encrypted"):
+        credential_in_file(control)
+
+    embedded = tmp_path / "embedded.yaml"
+    embedded.write_text("secret: |\n" + armor)
+    with pytest.raises(_Unscannable, match="age-encrypted"):
+        credential_in_file(embedded)
+
+    mention = tmp_path / "README.md"
+    mention.write_text("the header is -----BEGIN AGE ENCRYPTED FILE----- in documentation.\n")
+    assert credential_in_file(mention) is None
+
+
+def test_rejoining_skips_both_joins_when_no_quote_can_close_a_seam(monkeypatch):
+    """Neither join can change a byte without a quote, so neither may walk one.
+
+    Both were called unconditionally while every other pass in `_rejoined` sat behind a
+    memchr-speed substring test. On the 300 MiB expansion the padding test builds, that cost
+    3.79 s and 4.28 s to prove a block of NULs holds no quote, taking the scan from 41 s to 53 s
+    against its 60 s budget. Under the two workers CI runs the suite with, the scan then missed
+    its deadline and reported a real key as clean.
+
+    Asserting that the passes are NOT ENTERED is what makes this a regression test. Both return
+    their input unchanged when they match nothing, so comparing the output cannot tell a skipped
+    pass from one that walked every byte and found nothing -- which is exactly the cost being
+    guarded against. Counting the calls separates them. Elapsed time is avoided deliberately:
+    this repository reserves the `wallclock` marker for tests whose assertion IS real time.
+    """
+    from flash import env_joined
+
+    entered = []
+    for name in ("_join_adjacent_literals", "_join_shell_assignments"):
+        original = getattr(env_joined, name)
+
+        def counted(data, _name=name, _original=original):
+            entered.append(_name)
+            return _original(data)
+
+        monkeypatch.setattr(env_joined, name, counted)
+
+    env_joined._rejoined(b"\0" * (1 << 20))
+    assert entered == [], "a quote-free block was walked by a join that cannot match in it"
+
+    env_joined._rejoined(b"no quotes here, just words and numbers 12345\n" * 100)
+    assert entered == [], "ordinary prose was walked by a join that cannot match in it"
+
+    # an equals sign alone must not buy the assignment walk either, since a seam needs a quote
+    env_joined._rejoined(b"threshold=12\nlimit=48\n" * 100)
+    assert entered == [], "an unquoted assignment was walked for a seam it cannot contain"
+
+    # and the joins must still run, and still work, once a quote IS present
+    body = _FAKE_KEY_BODY
+    welded = f'API_KEY=fslo_{body[:10]}"{body[10:]}"\n'.encode()
+    assert f"fslo_{body}".encode() in env_joined._rejoined(welded)
+    assert entered == ["_join_adjacent_literals", "_join_shell_assignments"]

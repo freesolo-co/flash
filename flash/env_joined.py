@@ -62,6 +62,12 @@ _CONTINUED_LINE = re.compile(rb"(?<!\\)((?:\\\\)*)\\\r?\n")
 # What a continuation looks like as a plain substring, for the guard below.
 _CONTINUATIONS = (b"\\\n", b"\\\r\n")
 
+# the bytes the two joins need before either can change anything: a seam is made of quotes, and a
+# shell assignment word is introduced by `=`. both guards below are plain substring tests for the
+# same reason the continuation is one, and they are what keeps a quote-free padding block cheap.
+_QUOTES = (b'"', b"'")
+_ASSIGNMENT_SIGN = b"="
+
 # A JSON `\uXXXX` escape naming a character the credential patterns would otherwise match. The
 # parser resolves it, so `{"key":"fslo_AbCdEf..."}` carries the SAME key as the plain spelling
 # and `json.loads` returns it verbatim -- while the raw bytes the patterns read are split by the
@@ -228,12 +234,22 @@ def _rejoined(data: bytes) -> bytes:
     which on a 300 MiB expansion is most of the scan's budget and pushed a real test past its
     deadline. A backslash before a newline is absent from almost every file, and `bytes.__contains__`
     settles it at memchr speed.
+
+    the two joins are guarded the same way, and for the same measured reason. neither can change a
+    byte without a quote to close: the literal join costs 101 ms per 8 mib and the assignment join
+    114 ms, which over a 300 mib expansion is 3.79s and 4.28s spent proving a padding block holds no
+    quote. running them unguarded took that expansion from 41s to 53s against a 60s budget, and under
+    `pytest -n 2` in ci the scan missed its deadline and reported a real key as clean. an assignment
+    additionally needs its `=`, so it is tested for both.
     """
     joined = data
     if any(marker in joined for marker in _CONTINUATIONS):
         joined = _CONTINUED_LINE.sub(rb"\1", joined)
-    joined = _join_adjacent_literals(joined)
-    joined = _join_shell_assignments(joined)
+    quoted = any(quote in joined for quote in _QUOTES)
+    if quoted:
+        joined = _join_adjacent_literals(joined)
+    if quoted and _ASSIGNMENT_SIGN in joined:
+        joined = _join_shell_assignments(joined)
     # Guarded by the same substring test as the continuation, for the same reason: `\u` is absent
     # from almost every file, and settling that at memchr speed keeps the ordinary scan free of a
     # substitution pass over every byte.

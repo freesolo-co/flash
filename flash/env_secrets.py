@@ -84,7 +84,11 @@ from flash.env_joined import _rejoined
 # them, so the other direction would be a cycle. Re-exported because every other raise site and
 # every test still reads all three from here.
 from flash.env_keystores import _keystore_undecided, _openpgp_kind, _Unscannable
-from flash.env_openpgp import _MAX_OPENPGP_MARKERS, _has_openpgp_message_armor
+from flash.env_openpgp import (
+    _MAX_OPENPGP_MARKERS,
+    _has_age_file_armor,
+    _has_openpgp_message_armor,
+)
 from flash.env_patterns import _MAX_BODY, _match, _unfinished_private_key_armor
 from flash.env_policy import _unexpandable_format, _uninspectable_reason
 from flash.env_redact import redacted_name
@@ -416,6 +420,10 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         # inside, and treating it as ordinary text published the message intact.
         if _has_openpgp_message_armor(window):
             raise _Unscannable("contains an encrypted OpenPGP message this check cannot read")
+        # age armor is commonly nested under a yaml scalar, so it must be searched rather than
+        # anchored. requiring its base64 body keeps a documentation-only marker publishable.
+        if _has_age_file_armor(window):
+            raise _Unscannable("contains a age-encrypted file this check cannot read")
         # A private-key armor whose HEADER runs past this window. The PEM pattern requires the
         # BEGIN line and the start of the base64 body in one buffer, and RFC 4880 armor headers sit
         # between them with no length limit -- so a 1.1 MB `Comment:` pushed the body into the next
@@ -797,6 +805,7 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
         scan=_scan_member,
         refusal=_Unscannable,
         named=functools.partial(credential_in_name, deadline=deadline),
+        metadata=functools.partial(_credential_kind, deadline=deadline),
         member_limit=_MAX_ARCHIVE_MEMBERS,
     )
 
@@ -839,6 +848,7 @@ def _credential_in_tar(source: Path | bytes, *, deadline: float, depth: int) -> 
         deadline=deadline,
         depth=depth,
         scan=_scan_member,
+        dispatch=_credential_in_container,
         refusal=_Unscannable,
         named=functools.partial(credential_in_name, deadline=deadline),
         member_limit=_MAX_ARCHIVE_MEMBERS,

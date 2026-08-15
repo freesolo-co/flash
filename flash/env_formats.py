@@ -58,12 +58,13 @@ _COMPRESSED_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7z
 # caller still requires the candidate to produce decompressed output before recognising it.
 _LZMA_ALONE_HEADER_BYTES = 13
 
-# The size an lzma-alone stream declares when the encoder did not know it: all bits set. Any other
-# value is a real length, and one larger than a package may be is not a stream inside a package.
+# The size an lzma-alone stream declares when the encoder did not know it: all bits set.
 _LZMA_ALONE_UNKNOWN_SIZE = (1 << 64) - 1
 
-# The largest file a package may carry, which bounds the length an lzma-alone header may declare.
-_MAX_PACKAGE_BYTES = 256 << 20
+# a ceiling still rejects chance headers before they trigger a decompression probe. it sits far above
+# the package size because the field declares expanded output: a valid 38 kib stream can legitimately
+# expand past 256 mib, while random 64-bit values overwhelmingly remain above this bound.
+_LZMA_ALONE_DECLARED_SIZE_CEILING = 1 << 56
 
 # Containers this scan can RECOGNISE but not expand, because the stdlib has no decompressor for
 # them. A `.jsonl.zst` -- the ordinary way a dataset shard ships -- holds its credential nowhere a
@@ -111,15 +112,10 @@ _ANCHORED_ONLY_MAGIC = (
     # encrypted it is not evidence the publish is safe, since the hub copy is readable by everyone
     # the environment is and the passphrase travels beside the file about as often as not.
     (b"Salted__", "OpenSSL-encrypted"),
-    # age, in both spellings it defines: the native header, which is the first line of the file, and
-    # the PEM-style armor `rage`/`age --armor` writes. `secrets.age` beside an environment is an
-    # ordinary thing to keep -- age is what several secret-management tools reach for -- and the
-    # body is ciphertext, so no pattern and no base64 decode can see the key inside. It scanned as
-    # ordinary clean content, which made it the one encryption this let through while OpenSSL,
-    # OpenPGP, PDF and ZIP encryption were all refused. Same answer as those: the passphrase or
-    # identity file is not ours to have, and unverifiable is not clean.
+    # age's native header defines the start of its binary form. the armored form is handled by a
+    # body-gated search because yaml commonly embeds it after a scalar header, while documentation
+    # may mention the armor marker without carrying ciphertext.
     (b"age-encryption.org/v1", "age-encrypted"),
-    (b"-----BEGIN AGE ENCRYPTED FILE-----", "age-encrypted"),
 )
 
 # Which recognised-but-uninspectable formats are ENCRYPTED rather than merely unexpandable. The
@@ -221,10 +217,10 @@ def _looks_like_lzma_alone(head: bytes) -> bool:
     size between them accept 35.6% of the bytes in an ordinary CSV, and every acceptance costs a
     decompression probe: widening the dictionary field alone took an 87 MB spreadsheet from a 57
     second scan to the 60 second budget, so a file that had always published was refused for
-    "takes too long to decompress". The size field is either the unknown marker or a real length,
-    and a real length above the 256 MiB package limit cannot be a stream this package carries --
-    which rejects almost all of that chance traffic without narrowing what a genuine `.lzma` file
-    may declare.
+    "takes too long to decompress". A ceiling still rejects almost all chance 64-bit values, but it
+    must bound expanded output rather than package size: a valid 38 KiB stream can legitimately
+    declare more than 256 MiB of plaintext. The 2^56 ceiling admits that expansion while preserving
+    the cheap discriminator that keeps ordinary CSV traffic out of the decompressor.
     """
     if len(head) < _LZMA_ALONE_HEADER_BYTES:
         return False
@@ -239,7 +235,7 @@ def _looks_like_lzma_alone(head: bytes) -> bool:
     # a small one up, so a stream declaring 4,095 decodes perfectly and rejecting it published the
     # key it holds.
     declared = int.from_bytes(head[5:_LZMA_ALONE_HEADER_BYTES], "little")
-    return declared == _LZMA_ALONE_UNKNOWN_SIZE or declared <= _MAX_PACKAGE_BYTES
+    return declared == _LZMA_ALONE_UNKNOWN_SIZE or declared < _LZMA_ALONE_DECLARED_SIZE_CEILING
 
 
 def _looks_compressed(head: bytes) -> bool:
