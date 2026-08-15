@@ -36,14 +36,23 @@ def lora_target_parameters(model_id: str | None) -> list[str] | None:
 
 
 def adapter_has_fused_expert_tensors(adapter_dir: str | None, model_id: str) -> bool:
-    """did this adapter actually train the model's fused routed experts?
+    """did this adapter train ALL of the model's fused routed experts?
 
     the weights, not the config, are the ground truth: peft wraps each targeted `nn.Parameter` in a
-    `ParamWrapper` whose lora tensors sit under the OWNING MODULE's path
-    (`...mlp.experts.lora_A.default.weight`, and `...mlp.experts.base_layer.lora_A.default.weight`
-    once a second parameter on the same module is wrapped). the targeted parameter's own name --
-    `gate_up_proj` / `down_proj` -- never appears in a tensor key, so the check is for the presence
-    of expert lora tensors, not for one key per required entry.
+    `ParamWrapper` whose lora tensors sit under the OWNING MODULE's path. the targeted parameter's
+    own name -- `gate_up_proj` / `down_proj` -- never appears in a tensor key, so a wrapper cannot
+    be matched to the specific parameter it adapts.
+
+    what it can be matched to is how MANY wrappers exist. peft nests them: wrapping a second
+    parameter on an already-wrapped module puts the new wrapper outside the first, so N parameters
+    targeted on one module yield N distinct lora paths (`...mlp.experts.lora_A`, then
+    `...mlp.experts.base_layer.lora_A`). counting distinct paths under an owner therefore counts
+    the parameters trained on it.
+
+    requiring the full count is what makes the recovery safe. "any expert tensor" would accept a
+    truncated adapter that trained only one of the two, and the caller would then write the
+    complete target list into its config -- at which point peft freshly initializes the parameter
+    that never trained, silently, instead of the load failing. a partial adapter must be rejected.
     """
     targets = lora_target_parameters(model_id)
     if not targets or not adapter_dir:
@@ -52,9 +61,27 @@ def adapter_has_fused_expert_tensors(adapter_dir: str | None, model_id: str) -> 
         keys = _read_adapter_tensor_keys(adapter_dir) or []
     except Exception:
         return False
-    # the owning-module segment shared by every targeted parameter ("mlp.experts.*" -> "experts").
-    owners = {t.split(".")[-2] for t in targets if "." in t}
-    return any("lora_" in key and any(f".{owner}." in key for owner in owners) for key in keys)
+    # how many parameters each owning module ("mlp.experts.*" -> "experts") must account for.
+    required_per_owner: dict[str, int] = {}
+    for target in targets:
+        if "." in target:
+            owner = target.split(".")[-2]
+            required_per_owner[owner] = required_per_owner.get(owner, 0) + 1
+    if not required_per_owner:
+        return False
+    for owner, needed in required_per_owner.items():
+        # the wrapper's identity is its path from the owner down ("experts", "experts.base_layer"),
+        # which is shared across layers, so the distinct set is the per-module wrapper count.
+        wrappers = set()
+        for key in keys:
+            if ".lora_" not in key:
+                continue
+            segments = key.split(".lora_")[0].split(".")
+            if owner in segments:
+                wrappers.add(".".join(segments[segments.index(owner) :]))
+        if len(wrappers) < needed:
+            return False
+    return True
 
 
 def validate_lora_target_parameters(

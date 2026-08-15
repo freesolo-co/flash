@@ -346,3 +346,29 @@ def test_submit_rejects_a_warmstart_source_that_never_trained_the_fused_experts(
         _require_warmstart_expert_targets(
             {"target_parameters": ["mlp.experts.gate_up_proj"], "target_modules": ["q_proj"]}, moe
         )
+
+
+def test_submit_and_worker_agree_on_which_sources_are_recoverable():
+    """the preflight must not pass a source the worker will kill after renting the gpus.
+
+    the recoverable case is target_parameters EMPTY plus the flattened-module fingerprint. a
+    PARTIAL list alongside that fingerprint is not recoverable: the worker's recovery only runs
+    when the field is empty, so accepting it at submit would defer the same rejection to
+    ``stage=rl_adapter_loading`` on allocated hardware -- the exact cost regression this preflight
+    exists to prevent.
+    """
+    import flash.engine.worker.model.adapter as adapter_mod
+    from flash.runner.preparation import _require_warmstart_expert_targets
+
+    moe = "Qwen/Qwen3.6-35B-A3B"
+    partial_with_fingerprint = {
+        "target_parameters": ["mlp.experts.gate_up_proj"],
+        "target_modules": ["q_proj", "experts", "base_layer"],
+    }
+
+    with pytest.raises(ValueError, match="fused routed experts"):
+        _require_warmstart_expert_targets(partial_with_fingerprint, moe)
+
+    # and the worker rejects the same config, which is why submit must not have accepted it.
+    with pytest.raises(ValueError, match="omits required expert targets"):
+        adapter_mod.validate_lora_target_parameters(dict(partial_with_fingerprint), moe, None)

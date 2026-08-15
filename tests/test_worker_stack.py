@@ -744,6 +744,51 @@ def test_warmstart_still_rejects_an_adapter_that_never_trained_the_experts(monke
         worker.validate_lora_target_parameters(dict(config), "Qwen/Qwen3.6-35B-A3B")
 
 
+@pytest.mark.parametrize(
+    "present",
+    [
+        pytest.param(["base_model.model.layers.0.mlp.experts.lora_A.weight"], id="outer-only"),
+        pytest.param(
+            ["base_model.model.layers.0.mlp.experts.base_layer.lora_A.weight"], id="inner-only"
+        ),
+    ],
+)
+def test_warmstart_rejects_an_adapter_that_trained_only_one_expert_parameter(
+    monkeypatch, tmp_path, present
+):
+    """a truncated adapter must not be recovered into claiming it trained both parameters.
+
+    peft NESTS its wrappers, so targeting two parameters on one module yields two distinct lora
+    paths. accepting a single one as proof of both would rewrite the config to declare the full
+    target set, and peft would then freshly initialize the parameter that never trained -- a
+    silently wrong warm start rather than a failed one.
+    """
+    import json
+    import struct
+
+    worker = _import_worker(monkeypatch)
+    keys = ["base_model.model.layers.0.self_attn.q_proj.lora_A.weight", *present]
+    header = {key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]} for key in keys}
+    encoded = json.dumps(header).encode("utf-8")
+    (tmp_path / "adapter_model.safetensors").write_bytes(
+        struct.pack("<Q", len(encoded)) + encoded + b"\x01\x02"
+    )
+    config = {
+        "peft_type": "LORA",
+        "r": 32,
+        "target_modules": ["q_proj", "experts", "base_layer"],
+        "target_parameters": None,
+    }
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="omits required expert targets"):
+        worker.validate_lora_target_parameters(config, "Qwen/Qwen3.6-35B-A3B", str(tmp_path))
+
+    # the rejected adapter's config is left exactly as found: no partial repair written back.
+    on_disk = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert on_disk["target_parameters"] is None
+
+
 def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
     import flash.engine.worker as worker
     from flash.core.spec import JobSpec

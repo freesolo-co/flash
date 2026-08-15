@@ -177,17 +177,25 @@ def _require_warmstart_expert_targets(config: Mapping[str, Any], model_id: str) 
     trained adapter with a lossy config, and the worker recovers it from the adapter's own tensors.
     only a config that shows neither the targets nor that fingerprint is genuinely missing the
     expert training, which no amount of retrying will fix.
+
+    the recoverable case is ``target_parameters`` EMPTY, not merely incomplete. verl's exporter
+    dropped the field wholesale, so a partial list is not something it can produce -- and the
+    worker's recovery only runs when the field is empty, rejecting a partial list outright. a
+    preflight that accepted partial lists would pass a source the worker then kills at
+    ``stage=rl_adapter_loading``, which is exactly the after-the-rental failure this exists to
+    prevent, so the two checks have to agree on what counts as recoverable.
     """
     from flash.engine.worker.model.adapter import lora_target_parameters
 
     required = set(lora_target_parameters(model_id) or ())
     if not required:
         return
-    if required <= {str(t) for t in (config.get("target_parameters") or ())}:
+    declared = {str(t) for t in (config.get("target_parameters") or ())}
+    if required <= declared:
         return
     modules = config.get("target_modules")
     owners = {t.split(".")[-2] for t in required if "." in t} | {"base_layer"}
-    if isinstance(modules, (list, tuple)) and owners & {str(m) for m in modules}:
+    if not declared and isinstance(modules, (list, tuple)) and owners & {str(m) for m in modules}:
         return  # lossy-but-recoverable legacy export; the worker restores it from the weights
     raise ValueError(
         f"train.init_from_adapter source did not train the fused routed experts required by "
