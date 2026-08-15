@@ -252,7 +252,6 @@ def _finish_deployment_unlocked(
         return
     current = dict(deployment)
     smoke_result: dict = {}
-    activated = False
 
     def _assert_activation_fence() -> None:
         _assert_deployment_activation_fence(run_id, deployment, is_checkpoint, prev_state)
@@ -260,8 +259,6 @@ def _finish_deployment_unlocked(
     def _before_activate(adapter_revision: str, checkpoint: str) -> None:
         nonlocal current
         _assert_activation_fence()
-        # smoke is unconditional for real deployments: alias activation only ever follows a
-        # verified generation against the immutable revision.
         current = _deployment_state(
             {**current, "adapter_revision": adapter_revision},
             "smoke_testing",
@@ -297,94 +294,92 @@ def _finish_deployment_unlocked(
 
     try:
         dep = _app.deploy_adapter(**deploy_kwargs, before_activate=_before_activate)
-        activated = True
-        _verify_activated_alias_thinking(run_id, spec, dep, smoke_result)
-        current = {**current, **dep.to_dict()}
-        current.pop("activation_outcome_unknown", None)
-        current["verify"] = True
-        current = _deployment_state(
+    except ActivationOutcomeUnknown as exc:
+        reconciling = _deployment_state(
             current,
-            "ready",
-            detail="immutable revision verified and alias activated",
-            **smoke_result,
+            "reconciling",
+            error=str(exc),
+            detail="alias activation outcome is unknown; authoritative reconciliation required",
+            activation_outcome_unknown=True,
         )
-        verification_generation = current.get("verification_generation")
-        current = _public_deployment(current)
+        previous = _app.get_status(run_id)
+        marked = _serving.mark_deployment_failed(run_id, reconciling)
+        _serving._report_persisted_transition(
+            previous, marked, persisted=marked.deployment == reconciling
+        )
+        return
+    except Exception as exc:
+        _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
+        return
 
-        def _commit_ready() -> bool:
-            return _commit_ready_deployment(
-                run_id, current, verification_generation, is_checkpoint, prev_state
-            )
+    try:
+        activated_current = {**current, **dep.to_dict()}
+    except Exception as exc:
+        _record_post_activation_failure(run_id, exc, current)
+        return
+    activated_current.pop("activation_outcome_unknown", None)
+    try:
+        _verify_activated_alias_thinking(
+            run_id, spec, dep, smoke_result, checkpoint_step=checkpoint_step
+        )
+    except Exception as exc:
+        _record_post_activation_failure(run_id, exc, activated_current)
+        return
 
-        def _reconcile_commit_miss() -> None:
+    current = dict(activated_current)
+    current["verify"] = True
+    current = _deployment_state(
+        current,
+        "ready",
+        detail="immutable revision verified and alias activated",
+        **smoke_result,
+    )
+    verification_generation = current.get("verification_generation")
+    current = _public_deployment(current)
+    try:
+        if not _commit_ready_deployment(
+            run_id, current, verification_generation, is_checkpoint, prev_state
+        ):
             _reconcile_ready_commit_miss(
                 run_id, current, verification_generation, is_checkpoint, deployment
             )
-
-        if not _commit_ready():
-            _reconcile_commit_miss()
-            return
     except Exception as exc:
-        if isinstance(exc, ActivationOutcomeUnknown):
-            reconciling = _deployment_state(
-                current,
-                "reconciling",
-                error=str(exc),
-                detail="alias activation outcome is unknown; authoritative reconciliation required",
-                activation_outcome_unknown=True,
-            )
-            previous = _app.get_status(run_id)
-            marked = _serving.mark_deployment_failed(run_id, reconciling)
-            _serving._report_persisted_transition(
-                previous, marked, persisted=marked.deployment == reconciling
-            )
+        latest = _app.get_status(run_id)
+        latest_deployment = latest.deployment or {}
+        if (
+            latest_deployment.get("adapter_revision") == current.get("adapter_revision")
+            and latest_deployment.get("state") in _DEPLOYMENT_READY_STATES
+        ):
             return
-        if isinstance(exc, AliasThinkingSilent):
-            # the alias is live and answering, so this is a degraded deployment rather than a failed
-            # one -- but a thinking run whose alias returns no reasoning is exactly the regression
-            # that previously committed `ready` unnoticed, so the record must not say ready.
-            _record_alias_thinking_failure(run_id, exc, current, deployment)
-            return
-        if activated:
-            try:
-                latest = _app.get_status(run_id)
-                latest_deployment = latest.deployment or {}
-                if (
-                    latest_deployment.get("adapter_revision") == current.get("adapter_revision")
-                    and latest_deployment.get("state") in _DEPLOYMENT_READY_STATES
-                ):
-                    return
-                if not _commit_ready():
-                    _reconcile_commit_miss()
-            except Exception as recovery_exc:
-                divergence = (
-                    "deployment_record_diverged: serving alias was activated for "
-                    f"{current.get('adapter_revision')} but ready-state recovery failed after "
-                    f"{exc!r}: {recovery_exc!r}"
+        try:
+            if not _commit_ready_deployment(
+                run_id, current, verification_generation, is_checkpoint, prev_state
+            ):
+                _reconcile_ready_commit_miss(
+                    run_id, current, verification_generation, is_checkpoint, deployment
                 )
-                print(f"deploy[{run_id}]: {divergence}", flush=True)
-            return
-        _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
+        except Exception as recovery_exc:
+            divergence = (
+                "deployment_record_diverged: serving alias was activated for "
+                f"{current.get('adapter_revision')} but ready-state recovery failed after "
+                f"{exc!r}: {recovery_exc!r}"
+            )
+            print(f"deploy[{run_id}]: {divergence}", flush=True)
 
 
-def _record_alias_thinking_failure(
-    run_id: str, exc: AliasThinkingSilent, current: dict, deployment: dict
-) -> None:
-    """Persist a `failed` record for an alias that activated without its reasoning channel.
-
-    `alias_thinking_tag` is recorded false rather than omitted: the field is what a client reads to
-    verify the resolved state, and absent would be indistinguishable from a deployment predating
-    the check.
-    """
+def _record_post_activation_failure(run_id: str, exc: Exception, current: dict) -> None:
+    failed_source = dict(current)
+    failed_source.pop("activation_outcome_unknown", None)
+    failed_source.pop("previous_deployment", None)
+    fields = {"alias_activation_confirmed": True}
+    if isinstance(exc, AliasThinkingSilent):
+        fields["alias_thinking_tag"] = False
     failed = _deployment_state(
-        current,
+        failed_source,
         "failed",
         error=str(exc),
-        detail=(
-            "alias activated but serves no reasoning; redeploy to re-apply the reasoning "
-            "configuration"
-        ),
-        alias_thinking_tag=False,
+        detail="alias activated but post-activation verification failed; redeploy to retry",
+        **fields,
     )
     previous = _app.get_status(run_id)
     marked = _serving.mark_deployment_failed(run_id, failed)
@@ -393,7 +388,14 @@ def _record_alias_thinking_failure(
     )
 
 
-def _verify_activated_alias_thinking(run_id: str, spec: JobSpec, dep, smoke_result: dict) -> None:
+def _verify_activated_alias_thinking(
+    run_id: str,
+    spec: JobSpec,
+    dep,
+    smoke_result: dict,
+    *,
+    checkpoint_step: int | None = None,
+) -> None:
     """Prove the freshly activated alias kept the reasoning channel the revision smoked with.
 
     Raises `ServingError` when it did not, which reaches the caller's failure path with the alias
@@ -410,7 +412,15 @@ def _verify_activated_alias_thinking(run_id: str, spec: JobSpec, dep, smoke_resu
     # read off the deployment only once the gate above has passed: a non-thinking run must reach
     # none of this, so the attribute is never required of a deployment that will not be checked.
     revision = str(getattr(dep, "adapter_revision", "") or "")
-    smoke_result.update(_serving._verify_alias_thinking(run_id, spec, revision))
+    expected_checkpoint = run_id if checkpoint_step is None else f"{run_id}/step-{checkpoint_step}"
+    smoke_result.update(
+        _serving._verify_alias_thinking(
+            run_id,
+            spec,
+            revision,
+            expected_checkpoint,
+        )
+    )
 
 
 def _record_deployment_failure(

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.teacher.retry_contract as retry_contract
 from flash.teacher.retry_contract import (
     OPD_RESUME_REVISION_ENV,
     OPD_RESUME_STATE_VERSION,
@@ -1207,6 +1208,14 @@ def test_resume_validator_rejects_a_half_present_alignment_pair(overrides, missi
 
     with pytest.raises(ValueError, match=missing):
         validate_opd_resume_state_metadata(state, expected_seed=42, checkpoint_step=2)
+
+
+def test_discarded_rollouts_is_not_part_of_the_resume_accounting_contract():
+    required = set(retry_contract._OPD_RESUME_ACCOUNTING_SCHEMA)
+    optional = set(retry_contract._OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA)
+
+    assert "truncated_rollouts" in required
+    assert "discarded_rollouts" not in required | optional
 
 
 def test_shared_resume_metadata_validator_returns_a_copy():

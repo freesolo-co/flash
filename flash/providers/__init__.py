@@ -25,6 +25,29 @@ from flash.providers.base import Provider
 # ties through Python's stable sort.
 PROVIDER_NAMES: tuple[str, ...] = ("runpod", "lambda", "vast")
 
+
+def validated_provider_preferences(value, *, allow_empty: bool = False) -> tuple[str, ...]:
+    """normalize an ordered provider preference, preserving the first occurrence."""
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise TypeError("gpu.providers must be a list of provider names")
+    if not value and not allow_empty:
+        raise ValueError("gpu.providers must name at least one provider")
+    result = []
+    seen = set()
+    for raw in value:
+        if not isinstance(raw, str):
+            raise TypeError("gpu.providers entries must be strings")
+        name = raw.strip().lower()
+        if name not in PROVIDER_NAMES:
+            raise ValueError(
+                f"gpu.providers entry {raw!r} must be one of {', '.join(PROVIDER_NAMES)}"
+            )
+        if name not in seen:
+            result.append(name)
+            seen.add(name)
+    return tuple(result)
+
+
 # Instance-billed providers: they rent a VM/container that BILLS UNTIL TERMINATED, so they need the
 # generic instance-cleanup paths (retry teardown, gc-by-label) that endpoint-based RunPod doesn't.
 # Single source of truth — keep cleanup/realization sites pointed here so a new instance provider is

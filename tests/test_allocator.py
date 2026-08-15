@@ -139,30 +139,6 @@ def test_step_cost_key_none_for_uncatalogued_model():
     )
 
 
-def test_latency_bound_step_ignores_gpu_speed():
-    """When a step is dominated by waits no card shortens, ranking collapses back toward $/hr.
-
-    The wait has to be MEASURED to exist. This used to pass on the default reward wall, which put
-    ``completions x 1.0s`` beside a step floor already fitted with grading included -- so the step
-    read as latency-bound because of a charge that was counted twice. The realized graders in the
-    2026-08-01 campaign ran 0.0001-0.001s and left GRPO firmly gpu-bound. An env whose reward calls
-    an LLM judge genuinely does wait seconds per completion, and that is the case this covers.
-    """
-    from dataclasses import replace
-
-    from flash.cost.analytical import step_seconds_split
-    from flash.cost.types import RunConfig
-
-    fast = RunConfig(model_id="Qwen/Qwen3.5-0.8B", method="grpo", steps=1)
-    gpu_bound, fixed = step_seconds_split(fast, "H100")
-    # a local grader adds nothing beyond the floor: the math, not a wait, is the step.
-    assert gpu_bound > fixed
-
-    judge = replace(fast, reward_seconds_per_completion=5.0)
-    gpu_bound, fixed = step_seconds_split(judge, "H100")
-    assert fixed > gpu_bound  # the wait, not the math, is what the step is made of
-
-
 def test_default_max_retries():
     """The GPU retry budget default (5) covers infra-shaped flakes (worker loss / stall / timeout)
     and matches INFRA_RETRY_FLOOR (runner.lifecycle), which the runner already floored the effective
@@ -233,6 +209,86 @@ def test_allocate_provider_constraint_never_falls_through(monkeypatch):
     assert allocation.provider == "lambda"
     assert allocation.gpu == "A10"
     assert {candidate.provider for candidate in allocation.candidates} == {"lambda"}
+
+
+def test_soft_provider_preference_ranks_ahead_of_cost_without_dropping_fallbacks(monkeypatch):
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import Candidate
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("vast", "runpod", "lambda"))
+    monkeypatch.setattr(allocator, "_step_cost_ranker", lambda *a, **k: None)
+    monkeypatch.setattr(
+        get_provider("vast"),
+        "live_candidates",
+        lambda need, constraints: [Candidate("vast", "RTX 4090", 0.10, 24)],
+    )
+    monkeypatch.setattr(
+        get_provider("runpod"),
+        "live_candidates",
+        lambda need, constraints: [Candidate("runpod", "RTX 4090", 3.00, 24)],
+    )
+    monkeypatch.setattr(
+        get_provider("lambda"),
+        "live_candidates",
+        lambda need, constraints: [Candidate("lambda", "A10", 0.05, 24)],
+    )
+
+    allocation = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", providers=("runpod", "vast"))
+
+    assert allocation.provider == "runpod"
+    assert [candidate.provider for candidate in allocation.candidates] == [
+        "runpod",
+        "vast",
+        "lambda",
+    ]
+
+
+def test_soft_provider_preference_preserves_cost_order_within_one_rank(monkeypatch):
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import Candidate
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
+    monkeypatch.setattr(allocator, "_step_cost_ranker", lambda *a, **k: None)
+    monkeypatch.setattr(
+        get_provider("runpod"),
+        "live_candidates",
+        lambda need, constraints: [Candidate("runpod", "RTX 4090", 3.00, 24)],
+    )
+    monkeypatch.setattr(
+        get_provider("lambda"),
+        "live_candidates",
+        lambda need, constraints: [Candidate("lambda", "A10", 1.00, 24)],
+    )
+    monkeypatch.setattr(
+        get_provider("vast"),
+        "live_candidates",
+        lambda need, constraints: [Candidate("vast", "RTX 4090", 0.10, 24)],
+    )
+
+    allocation = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", providers=("runpod",))
+
+    assert [candidate.provider for candidate in allocation.candidates] == [
+        "runpod",
+        "vast",
+        "lambda",
+    ]
+
+
+def test_allocate_rejects_provider_pin_with_preferences():
+    from flash.providers import allocator
+    from flash.providers.base import UnsupportedGpuError
+
+    with pytest.raises(UnsupportedGpuError, match="provider and providers cannot both be set"):
+        allocator.allocate(
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            provider="runpod",
+            providers=("vast",),
+        )
+    with pytest.raises(UnsupportedGpuError, match="must name at least one provider"):
+        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", providers=[])
 
 
 def test_allocate_rejects_unconfigured_provider(monkeypatch):

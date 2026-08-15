@@ -319,6 +319,27 @@ def _validate_structured_smoke(
         raise ServingError(f"configured structured-output regex is invalid: {exc}") from exc
 
 
+def _smoke_request_settings(spec: JobSpec) -> tuple[dict | None, int, list[str] | None]:
+    train = getattr(spec, "train", None)
+    constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
+    max_tokens = 256
+    # thinking spends tokens before content regardless of grammar, so 256 can truncate the think
+    # block and reject a healthy deployment. the resolver widens it to what the run reasons within,
+    # bounded by a smoke-specific ceiling. a grammar lifts that ceiling because the smoke generates
+    # under the adapter's serving default and its shortest legal answer may be longer.
+    if spec.thinking:
+        max_tokens = max(
+            256, resolve_smoke_completion_tokens(spec, constrained=constraint is not None)
+        )
+        serving_capacity = serving_completion_token_capacity(
+            spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
+        )
+        if serving_capacity is not None:
+            max_tokens = min(max_tokens, serving_capacity)
+    stop_sequences = [str(value) for value in (getattr(train, "stop_sequences", ()) or ())]
+    return constraint, max_tokens, stop_sequences or None
+
+
 def _run_deployment_smoke(
     run_id: str,
     spec: JobSpec,
@@ -329,23 +350,7 @@ def _run_deployment_smoke(
 ) -> dict:
     started = time.monotonic()
     deadline = started + budget_s
-    train = getattr(spec, "train", None)
-    constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
-    max_tokens = 256
-    # thinking spends tokens before content, so use the run's own completion budget regardless of
-    # grammar; 256 tokens can truncate the think block and reject a healthy deployment.
-    if spec.thinking:
-        max_tokens = max(256, resolve_smoke_completion_tokens(spec))
-        serving_capacity = serving_completion_token_capacity(
-            spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
-        )
-        if serving_capacity is not None:
-            max_tokens = min(max_tokens, serving_capacity)
-    # a run trained with stop_sequences terminates on its delimiter and need never emit EOS. without
-    # forwarding them the smoke generates past the answer to max_tokens, comes back
-    # finish_reason="length", and the truncation guard below rejects a checkpoint that answered
-    # correctly.
-    stop_sequences = [str(value) for value in (getattr(train, "stop_sequences", ()) or ())]
+    constraint, max_tokens, stop_sequences = _smoke_request_settings(spec)
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -362,7 +367,7 @@ def _run_deployment_smoke(
                     expected_checkpoint=expected_checkpoint,
                     timeout_s=timeout_s,
                     retry_unavailable=True,
-                    stop=stop_sequences or None,
+                    stop=stop_sequences,
                 )
 
             result = _bounded_call(
@@ -403,82 +408,77 @@ def _run_deployment_smoke(
     }
 
 
-_ALIAS_THINKING_BUDGET_SECONDS = 120.0
-
-
-def _reasoning_is_silent(result: object) -> bool:
-    """Whether a served response came back with no reasoning channel at all.
-
-    Serving splits reasoning onto `reasoning_content` and `flash.serve.thinking` folds it back into
-    a balanced `<think>...</think>`. That fold is what makes the distinction here decidable: a model
-    that merely thought briefly still arrives with a pair (an empty `reasoning_content` folds to
-    `<think></think>`), so an absent pair means the field itself never arrived and the reasoning
-    parser was not applied -- not that this particular generation had little to say.
-    """
-    choice = (result.get("choices") or [{}])[0] if isinstance(result, dict) else {}
-    content = str((choice.get("message") or {}).get("content") or "")
-    return "<think>" not in content and "</think>" not in content
+def _alias_reasoning_content(result: dict, run_id: str, adapter_revision: str) -> str:
+    choices = result.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    message = choice.get("message") if isinstance(choice, dict) else None
+    if not isinstance(message, dict):
+        raise ServingError("alias thinking verification returned a malformed chat message")
+    if "reasoning_content" not in message:
+        raise AliasThinkingSilent(
+            run_id,
+            adapter_revision,
+            detail=(
+                "the alias returned no direct reasoning_content field while the immutable revision "
+                "smoked with reasoning enabled"
+            ),
+        )
+    reasoning = message.get("reasoning_content")
+    if not isinstance(reasoning, str):
+        raise ServingError("alias thinking verification returned non-string reasoning_content")
+    return reasoning
 
 
 def _verify_alias_thinking(
     run_id: str,
     spec: JobSpec,
     adapter_revision: str,
+    expected_checkpoint: str,
     *,
-    budget_s: float = _ALIAS_THINKING_BUDGET_SECONDS,
+    budget_s: float = _SMOKE_BUDGET_SECONDS,
 ) -> dict:
-    """Confirm the freshly activated alias still serves the reasoning channel.
-
-    The deployment smoke pins the immutable revision and runs BEFORE the alias flip, so nothing in
-    the pipeline ever asks the mutable alias -- which is what a bare `model: <run-id>` request
-    actually resolves to. A redeploy that reconciles the alias without re-applying the reasoning
-    parser therefore commits `ready` while every real request comes back with its reasoning silent.
-    This is the one request that closes that gap, so it deliberately targets `run_id`.
-    """
+    """Confirm the freshly activated alias serves the activated revision with reasoning metadata."""
     started = time.monotonic()
     deadline = started + budget_s
-    # the same budget and stop sequences the revision smoke just used: this asks a different model
-    # id, so any other difference would make a failure here ambiguous between the alias and the
-    # request. reasoning spends tokens before content, and a run that terminates on a delimiter
-    # rather than EOS otherwise generates past its answer to max_tokens.
-    train = getattr(spec, "train", None)
-    stop_sequences = [str(value) for value in (getattr(train, "stop_sequences", ()) or ())]
-    max_tokens = max(256, resolve_smoke_completion_tokens(spec))
-    capacity = serving_completion_token_capacity(
-        spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
-    )
-    if capacity is not None:
-        max_tokens = min(max_tokens, capacity)
+    _, max_tokens, stop_sequences = _smoke_request_settings(spec)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _smoke_timeout_error(budget_s)
+        try:
 
-    def _alias_call(timeout_s: float = budget_s):
-        return _app.serve_chat(
-            run_id=run_id,
-            messages=[{"role": "user", "content": _SMOKE_PROMPT}],
-            temperature=0.0,
-            max_tokens=max_tokens,
-            thinking=True,
-            timeout_s=timeout_s,
-            stop=stop_sequences or None,
-        )
+            def _alias_call(timeout_s: float = remaining):
+                return _app.serve_chat(
+                    run_id=run_id,
+                    messages=[{"role": "user", "content": _SMOKE_PROMPT}],
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                    thinking=True,
+                    expected_checkpoint=expected_checkpoint,
+                    timeout_s=timeout_s,
+                    retry_unavailable=True,
+                    stop=stop_sequences,
+                )
 
-    try:
-        result = _bounded_call(_alias_call, deadline=deadline, budget_s=budget_s)
-    except ServingError:
-        raise
-    except Exception as exc:
-        # an alias that cannot answer at all is a different failure from one that answers without
-        # reasoning, and the smoke already proved the revision generates. report it as itself.
-        raise ServingError(f"alias thinking verification could not reach {run_id}: {exc}") from exc
-    if _reasoning_is_silent(result):
-        raise AliasThinkingSilent(
-            run_id,
-            adapter_revision,
-            detail=(
-                "the alias returns no reasoning while the immutable revision smoked with a "
-                "thinking block, so alias reconciliation did not re-apply the reasoning "
-                "configuration"
-            ),
-        )
+            result = _bounded_call(_alias_call, deadline=deadline, budget_s=budget_s)
+        except RetryableServingUnavailable as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _smoke_timeout_error(budget_s) from exc
+            time.sleep(min(exc.retry_after_seconds, remaining))
+            continue
+        except ServingError:
+            raise
+        except Exception as exc:
+            raise ServingError(
+                f"alias thinking verification could not reach {run_id}: {exc}"
+            ) from exc
+        break
+
+    _smoke_provenance(result, adapter_revision, expected_checkpoint)
+    _alias_reasoning_content(result, run_id, adapter_revision)
+    if time.monotonic() > deadline:
+        raise _smoke_timeout_error(budget_s)
     return {
         "alias_thinking_tag": True,
         "alias_thinking_verified_at": time.time(),

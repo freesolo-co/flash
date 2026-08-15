@@ -1,8 +1,8 @@
 __pycache__/
 *.pyc
-# no trailing slash: a developer whose disk is tight symlinks .venv onto another volume, and a
-# `.venv/` pattern matches only a real directory, so the symlink was committable and then broke
-# CI's own `uv sync` with "File exists".
+# no trailing slash: a checkout may point `.venv` at a venv stored elsewhere, and a `.venv/` rule
+# matches only a directory, so the symlink itself stays trackable and `git add -A` commits it.
+# committing it breaks CI on the next run, where `uv sync` aborts on an existing `.venv` path.
 .venv
 venv/
 *.egg-info/

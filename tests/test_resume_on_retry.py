@@ -1107,3 +1107,83 @@ def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
 
     assert calls == [0], "an unreconciled create must fail fast, not relaunch (no double-provision)"
     assert "not retrying" in log.getvalue()
+
+
+def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypatch):
+    """The run log is one append-only file, so a retry's output follows the dead attempt's traceback.
+
+    `flash runs log` tails that file. Without a boundary line, an operator checking a run that is
+    currently retrying healthily reads the OOM stack that ended the PREVIOUS attempt and concludes
+    the run is failing. Each new attempt must announce itself and disown what is above it.
+    """
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        if attempt == 0:
+            print("Traceback (most recent call last):\ntorch.OutOfMemoryError: CUDA OOM", file=log)
+            return PollResult(False, failure="stalled", detail="infra")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    orch._submit_seed_supervised(spec, 0, log)
+
+    text = log.getvalue()
+    marker = "---- attempt 1 starts here; everything above it is from earlier attempts ----"
+    assert marker in text, "a retry must say which attempt the following bytes belong to"
+    assert text.index("CUDA OOM") < text.index(marker), (
+        "the marker must sit after the failure it disowns, or it cannot separate the two attempts"
+    )
+
+
+def test_the_marker_does_not_claim_one_previous_attempt_after_two_failures(orch, monkeypatch):
+    """From the second retry on, "everything above is attempt N-1" is simply false.
+
+    Above attempt 2 sit attempts 0 AND 1. The marker's job is to tell the reader where the current
+    attempt begins, which stays true however many failed before it -- so it must not name a single
+    owner for the bytes above.
+    """
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        if attempt < 2:
+            print(f"attempt {attempt} output", file=log)
+            return PollResult(False, failure="stalled", detail="infra")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    orch._submit_seed_supervised(spec, 0, log)
+
+    text = log.getvalue()
+    assert "---- attempt 2 starts here" in text
+    assert "is attempt 1 ----" not in text, (
+        "attempt 0's output is also above attempt 2, so crediting attempt 1 alone is wrong"
+    )
+
+
+def test_a_single_attempt_run_gets_no_boundary_marker(orch, monkeypatch):
+    """Attempt 0 has nothing above it to disown. A header on the common path is pure noise."""
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    monkeypatch.setattr(
+        rp_jobs,
+        "submit_run",
+        lambda *a, **k: PollResult(True, metrics={"train_tokens": 4096}),
+    )
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    orch._submit_seed_supervised(spec, 0, log)
+
+    assert "starts here; everything above" not in log.getvalue()
