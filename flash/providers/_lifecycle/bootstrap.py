@@ -909,8 +909,6 @@ def main() -> int:
             return 0 if ok else 1
         deadline_watchdog = arm_deadline_watchdog(deadline, payload)
         install_extra_pip(payload)
-        # Pre-worker HF fetch of the run's own code (control plane uploaded it before submit), same
-        # infra-shaped class as fetch_spec_from_hf above: a transient HF blip must retry, not fail.
         try:
             fetch_code(payload)
         except Exception:
@@ -921,8 +919,6 @@ def main() -> int:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stale)
         rc = run_mode(payload, env, phase, deadline)
-        # run_mode enforces the absolute subprocess deadline. once it returns, required completion
-        # artifacts take precedence over bootstrap bookkeeping that happens to cross the boundary.
         if not os.path.exists("/tmp/metrics.json"):
             # Missing local metrics but the run is confirmed complete on HF (DONE+metrics uploaded) —
             # e.g. the idempotency replay hit a transient HF read. The run SUCCEEDED; retry so a fresh

@@ -576,15 +576,12 @@ def _train_body(input_data: dict) -> dict:
                 with open(console, "rb") as f:
                     f.seek(0, os.SEEK_END)
                     start = max(0, f.tell() - tail_bytes)
-                    # over-read one byte to distinguish a complete boundary from a partial line.
                     f.seek(max(0, start - 1))
                     raw = f.read()
                 if start == 0:
                     tail = raw.decode("utf-8", "replace")
                 else:
                     tail = raw[1:].decode("utf-8", "replace")
-                    # drop a truncated first line before sanitizing; the canonical twin is
-                    # bootstrap_secrets._read_console_tail.
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""
@@ -594,9 +591,10 @@ def _train_body(input_data: dict) -> dict:
                 if not final and console_teardown.is_set():
                     print(f"console upload dropped for {mode}; superseded by the terminal snapshot")
                     return False
+                console_name = f"console_{mode}.txt" if final else f"console_{mode}_live.txt"
                 HfApi(token=env.get("HF_TOKEN")).upload_file(
                     path_or_fileobj=tail_path,
-                    path_in_repo=f"{prefix}/console_{mode}.txt",
+                    path_in_repo=f"{prefix}/{console_name}",
                     repo_id=input_data["hf_repo"],
                     repo_type="dataset",
                 )
@@ -606,40 +604,43 @@ def _train_body(input_data: dict) -> dict:
                 return False
 
         def _console_progress(path: str, state: dict) -> tuple[int, int, int]:
-            offset = int(state.get("offset", 0))
-            partial, dropping = state.get("partial", b""), bool(state.get("dropping", False))
+            committed = beats = 0
             try:
                 with open(path, "rb") as handle:
                     handle.seek(0, os.SEEK_END)
-                    eof = handle.tell()
+                    eof, offset = handle.tell(), state["offset"]
                     if eof < offset:
-                        offset, partial, dropping = 0, b"", False
-                    handle.seek(offset)
-                    chunk = handle.read(1_048_576)
+                        state.update(offset=0, partial=b"", dropping=False)
+                        offset = 0
+                    while offset < eof:
+                        handle.seek(offset)
+                        chunk = handle.read(min(1_048_576, eof - offset))
+                        if not chunk:
+                            break
+                        offset += len(chunk)
+                        lines = (state["partial"] + chunk).split(b"\n")
+                        state["partial"] = lines.pop()
+                        if state["dropping"]:
+                            if not lines:
+                                state["partial"] = b""
+                                state["offset"] = offset
+                                continue
+                            state["dropping"], lines = False, lines[1:]
+                        if len(state["partial"]) > 64_000:
+                            state.update(partial=b"", dropping=True)
+                        for line in lines:
+                            if len(line) > 64_000 or not line.startswith(b"HEARTBEAT "):
+                                continue
+                            try:
+                                payload = json.loads(line[len(b"HEARTBEAT ") :])
+                            except (TypeError, ValueError):
+                                continue
+                            if isinstance(payload, dict) and not payload.get("liveness"):
+                                beats += 1
+                                committed += not {"pending", "throttled"} & set(payload)
+                        state["offset"] = offset
             except OSError:
                 return -1, 0, 0
-            state["offset"] = offset + len(chunk)
-            lines = (partial + chunk).split(b"\n")
-            partial = lines.pop()
-            if dropping:
-                if not lines:
-                    state.update(partial=b"", dropping=True)
-                    return eof, 0, 0
-                dropping, lines = False, lines[1:]
-            if len(partial) > 64_000:
-                partial, dropping = b"", True
-            committed = beats = 0
-            for line in lines:
-                if len(line) > 64_000 or not line.startswith(b"HEARTBEAT "):
-                    continue
-                try:
-                    payload = json.loads(line[len(b"HEARTBEAT ") :])
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(payload, dict) and not payload.get("liveness"):
-                    beats += 1
-                    committed += not {"pending", "throttled"} & set(payload)
-            state.update(partial=partial, dropping=dropping)
             return eof, committed, beats
 
         def run_mode(mode: str, check: bool) -> int:

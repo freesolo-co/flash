@@ -189,6 +189,7 @@ def _console_progress(path, state):
     unterminated line still makes a later snapshot eligible. complete heartbeat lines are decoded
     independently; malformed and overlong lines are inert without hiding later valid lines.
     """
+    committed = beats = 0
     try:
         with open(path, "rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -196,28 +197,35 @@ def _console_progress(path, state):
             if eof < offset:
                 state.update(offset=0, partial=b"", dropping=False)
                 offset = 0
-            handle.seek(offset)
-            chunk = handle.read(_CONSOLE_PROGRESS_READ_LIMIT)
+            while offset < eof:
+                handle.seek(offset)
+                chunk = handle.read(min(_CONSOLE_PROGRESS_READ_LIMIT, eof - offset))
+                if not chunk:
+                    break
+                offset += len(chunk)
+                lines = (state["partial"] + chunk).split(b"\n")
+                state["partial"] = lines.pop()
+                if state["dropping"]:
+                    if not lines:
+                        state["partial"] = b""
+                        state["offset"] = offset
+                        continue
+                    state["dropping"], lines = False, lines[1:]
+                if len(state["partial"]) > _CONSOLE_PROGRESS_LINE_LIMIT:
+                    state.update(partial=b"", dropping=True)
+                for line in lines:
+                    if len(line) > _CONSOLE_PROGRESS_LINE_LIMIT or not line.startswith(
+                        b"HEARTBEAT "
+                    ):
+                        continue
+                    try:
+                        payload = json.loads(line[len(b"HEARTBEAT ") :])
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(payload, dict) and not payload.get("liveness"):
+                        beats += 1
+                        committed += not {"pending", "throttled"} & set(payload)
+                state["offset"] = offset
     except OSError:
         return -1, 0, 0
-    state["offset"] = offset + len(chunk)
-    lines = (state["partial"] + chunk).split(b"\n")
-    state["partial"] = lines.pop()
-    if state["dropping"]:
-        if not lines:
-            state["partial"] = b""
-            return eof, 0, 0
-        state["dropping"], lines = False, lines[1:]
-    if len(state["partial"]) > _CONSOLE_PROGRESS_LINE_LIMIT:
-        state.update(partial=b"", dropping=True)
-    beats = []
-    for line in lines:
-        if len(line) <= _CONSOLE_PROGRESS_LINE_LIMIT and line.startswith(b"HEARTBEAT "):
-            try:
-                payload = json.loads(line[len(b"HEARTBEAT ") :])
-            except (TypeError, ValueError):
-                continue
-            if isinstance(payload, dict) and not payload.get("liveness"):
-                beats.append(payload)
-    committed = sum(not {"pending", "throttled"} & set(beat) for beat in beats)
-    return eof, committed, len(beats)
+    return eof, committed, beats

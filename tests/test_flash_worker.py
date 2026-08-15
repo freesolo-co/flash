@@ -1172,9 +1172,11 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # the shipped parser advances through bounded chunks, retains only a bounded partial line, and
     # drops overlong lines through their newline. eof stays separate from the parser offset so growth
     # in an unterminated line still makes a snapshot eligible.
-    assert "chunk = handle.read(1_048_576)" in body
-    assert 'state["offset"] = offset + len(chunk)' in body
-    assert "state.update(partial=partial, dropping=dropping)" in body
+    assert "while offset < eof:" in body
+    assert "chunk = handle.read(min(1_048_576, eof - offset))" in body
+    assert 'state["offset"] = offset' in body
+    assert 'state["partial"] = lines.pop()' in body
+    assert 'state.update(partial=b"", dropping=True)' in body
     assert "return eof, committed, beats" in body
     # each complete heartbeat is decoded independently and only top-level markers classify it.
     assert 'line.startswith(b"HEARTBEAT ")' in body
@@ -1933,7 +1935,29 @@ def test_console_progress_skips_malformed_lines_independently(tmp_path):
     assert state["offset"] == console.stat().st_size
 
 
-def test_console_progress_bounds_repeated_reads_of_an_unterminated_line(tmp_path):
+def test_console_progress_keeps_oversized_managed_heartbeat_progress(tmp_path):
+    from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers._lifecycle import bootstrap_secrets
+
+    snapshot = _console_heartbeat_snapshot(
+        {
+            "stage": "rl_step",
+            "step": 3,
+            "sampled_completions": [{"completion": "x" * 100_000}],
+        }
+    )
+    line = f"HEARTBEAT {snapshot}\n".encode()
+    assert len(line) <= bootstrap_secrets._CONSOLE_PROGRESS_LINE_LIMIT
+    assert "sampled_completions_count" in snapshot
+    console = tmp_path / "console_large_managed_heartbeat.txt"
+    console.write_bytes(line)
+    state = {"offset": 0, "partial": b"", "dropping": False}
+
+    assert _instance_bootstrap._console_progress(str(console), state)[1:] == (1, 1)
+
+
+def test_console_progress_bounds_reads_while_draining_each_poll(tmp_path, monkeypatch):
     from flash.providers._lifecycle import bootstrap as _instance_bootstrap
     from flash.providers._lifecycle import bootstrap_secrets
 
@@ -1941,20 +1965,42 @@ def test_console_progress_bounds_repeated_reads_of_an_unterminated_line(tmp_path
     console = tmp_path / "console_unterminated.txt"
     console.write_bytes(b"x" * (2 * read_limit + 123))
     state = {"offset": 0, "partial": b"", "dropping": False}
+    real_open = open
+    read_sizes: list[int] = []
 
-    first = _instance_bootstrap._console_progress(str(console), state)
-    assert first == (console.stat().st_size, 0, 0)
-    assert state == {"offset": read_limit, "partial": b"", "dropping": True}
+    class _TrackedFile:
+        def __init__(self, handle):
+            self.handle = handle
 
-    second = _instance_bootstrap._console_progress(str(console), state)
-    assert second == (console.stat().st_size, 0, 0)
-    assert state["offset"] == 2 * read_limit
-    assert state["partial"] == b""
-    assert state["dropping"] is True
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
 
-    _instance_bootstrap._console_progress(str(console), state)
-    assert state["offset"] == console.stat().st_size
-    assert state["partial"] == b""
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            return self.handle.read(size)
+
+    def _open(path, mode="r", *args, **kwargs):
+        handle = real_open(path, mode, *args, **kwargs)
+        return _TrackedFile(handle) if str(path) == str(console) and mode == "rb" else handle
+
+    monkeypatch.setattr(bootstrap_secrets, "open", _open, raising=False)
+    assert _instance_bootstrap._console_progress(str(console), state) == (
+        console.stat().st_size,
+        0,
+        0,
+    )
+    assert read_sizes == [read_limit, read_limit, 123]
+    assert state == {"offset": console.stat().st_size, "partial": b"", "dropping": True}
+
+    assert _instance_bootstrap._console_progress(str(console), state)[1:] == (0, 0)
+    assert read_sizes == [read_limit, read_limit, 123], "a caught-up poll must not reread old bytes"
 
 
 def test_console_progress_recovers_after_an_overlong_line_newline(tmp_path):
@@ -1990,7 +2036,7 @@ def test_console_progress_instance_and_source_shipped_parser_stay_in_parity(tmp_
     writes = [
         b"HEARTBEAT {not json}\n" + valid[:17],
         valid[17:] + b"HEARTBEAT {not json}\n" + pending,
-        b"x" * 64_001,
+        b"x" * 1_048_577,
         b"\n" + valid,
     ]
     instance_state = {"offset": 0, "partial": b"", "dropping": False}
@@ -2594,7 +2640,6 @@ def test_serverless_periodic_console_upload_drops_a_commit_started_before_teardo
     console.write_text("line one\nline two\n")
     commits: list[str] = []
     console_teardown = threading.Event()
-    console_teardown.set()  # teardown began while this snapshot was staging its tail
 
     class _Api:
         def __init__(self, token=None):
@@ -2627,9 +2672,13 @@ def test_serverless_periodic_console_upload_drops_a_commit_started_before_teardo
     upload_locked = namespace["_upload_console_locked"]
 
     tail = str(tmp_path / "console_train.txt.tail")
+    assert upload_locked("train", str(console), tail, False) is True
+    assert commits == ["opd/r1/console_train_live.txt"]
+    commits.clear()
+    console_teardown.set()  # teardown began while the next periodic snapshot was staging its tail
     assert upload_locked("train", str(console), tail, False) is False
     assert commits == [], "a periodic upload must not commit once teardown has begun"
-    # the terminal snapshot still commits: it IS the teardown upload.
+    # the terminal snapshot still commits to a path no in-flight periodic writer can overwrite.
     assert upload_locked("train", str(console), tail + ".final", True) is True
     assert commits == ["opd/r1/console_train.txt"]
     # a False from a swallowed error would satisfy the first assertion for the wrong reason.
