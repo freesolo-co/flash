@@ -386,7 +386,9 @@ def test_the_keyless_warning_redeploys_the_file_that_was_actually_deployed(
         )
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    monkeypatch.setattr(serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False))
+    monkeypatch.setattr(
+        serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False)
+    )
     app_file = tmp_path / "serving" / "my_app.py"
     assert serve_cmd._deploy(app_file) == 0
     err = capsys.readouterr().err
@@ -633,7 +635,9 @@ def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, ca
     only copy goes into Modal and is unrecoverable, so the app is authenticated against a secret
     nobody holds and every deploy 401s -- with a setup transcript that looked like it worked.
     """
-    monkeypatch.setattr(serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False))
+    monkeypatch.setattr(
+        serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False)
+    )
     serve_cmd._warn_if_unauthenticated("https://acme--flash-serve-api.modal.run")
     for text in (serve_cmd._setup_instructions(), capsys.readouterr().err):
         assert "export FREESOLO_INTERNAL_KEY=$(" in text
@@ -704,7 +708,9 @@ def test_deploy_instructions_quote_a_path_with_spaces(tmp_path, monkeypatch, cap
     spaced.parent.mkdir()
     spaced.write_text("# generated\n")
 
-    monkeypatch.setattr(serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False))
+    monkeypatch.setattr(
+        serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False)
+    )
     serve_cmd._warn_if_unauthenticated("https://acme.modal.run", spaced)
     warning = capsys.readouterr().err
     assert f"modal deploy {shlex.quote(str(spaced))}" in warning, (
@@ -728,7 +734,9 @@ def test_the_deploy_output_points_at_the_control_plane_process(tmp_path, monkeyp
         )
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    monkeypatch.setattr(serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=True))
+    monkeypatch.setattr(
+        serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=True)
+    )
     assert serve_cmd._deploy(tmp_path / "app.py") == 0
     out = capsys.readouterr().out
     assert serve_cmd.SERVER_NAME in out, "the output never names the control-plane process"

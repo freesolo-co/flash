@@ -349,7 +349,6 @@ def _deployed_url(output: str) -> str:
     return ""
 
 
-
 def cmd_serve_status(args) -> int:
     """Check the configured serving backend and report what it supports."""
     from flash.serve.errors import ServingError
@@ -365,23 +364,19 @@ def cmd_serve_status(args) -> int:
         result = request_json(base, headers)
     except Exception as exc:
         return _err(
-            f"serving backend at {shown} did not answer /healthz: "
-            f"{redacted_error(exc, base)}"
+            f"serving backend at {shown} did not answer /healthz: {redacted_error(exc, base)}"
         )
     if result.status_code != 200:
         detail = result.error or f"HTTP {result.status_code}"
         return _err(
-            f"serving backend at {shown} did not answer /healthz: "
-            f"{redacted_error(detail, base)}"
+            f"serving backend at {shown} did not answer /healthz: {redacted_error(detail, base)}"
         )
     try:
         health = parse_serving_health(result.payload)
     except ServingHealthError as exc:
         if exc.code == "non_object":
             return _err(f"serving backend at {shown} returned a non-object /healthz payload")
-        return _err(
-            f"serving backend at {shown} did not return capabilities as a list of strings"
-        )
+        return _err(f"serving backend at {shown} did not return capabilities as a list of strings")
 
     print(f"serving:      {shown}")
     print(f"base models:  {', '.join(health.base_models) or '-'}")
@@ -409,8 +404,7 @@ def _verify_serving_key(base: str, shown: str, headers: dict[str, str]) -> int:
         result = probe_serving_key(base, headers)
     except Exception as exc:
         print(
-            f"\ncould not verify the serving key against {shown}: "
-            f"{redacted_error(exc, base)}",
+            f"\ncould not verify the serving key against {shown}: {redacted_error(exc, base)}",
             file=sys.stderr,
         )
         return 1

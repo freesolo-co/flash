@@ -659,7 +659,9 @@ def test_a_registration_for_another_base_model_is_refused(client):
     assert client.post("/adapters", json=body).status_code == 409
 
 
-def test_unload_deletes_cache_without_a_resident_request(client, engine_class, monkeypatch, tmp_path):
+def test_unload_deletes_cache_without_a_resident_request(
+    client, engine_class, monkeypatch, tmp_path
+):
     module = client.app.state.generated_module
     adapter_dir = tmp_path / module._adapter_digest(REVISION)
     adapter_dir.mkdir()
