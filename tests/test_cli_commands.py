@@ -576,10 +576,10 @@ def test_env_setup_scaffolds_the_github_form_on_a_self_hosted_plane(monkeypatch,
     written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
 
     for name in ("sft.toml", "rl.toml", "opd.toml"):
-        assert 'id = "github:OWNER/REPO@main:environment.py"' in written[name], name
+        assert 'id = "github:OWNER/REPO@REF:environment.py"' in written[name], name
         assert "flash env push --project" not in written[name], name
         # the id must PARSE, or the scaffold just trades one unusable id for another:
-        # `github:OWNER/REPO@main:.` reads naturally and `_normalize_env_path` rejects it.
+        # `github:OWNER/REPO@REF:.` reads naturally and `_normalize_env_path` rejects it.
         env_id = tomllib.loads(written[name])["environment"]["id"]
         assert _parse_github_environment_ref(env_id) is not None, (
             f"{name} scaffolds {env_id!r}, which the environment loader cannot parse"
@@ -593,6 +593,23 @@ def test_env_setup_scaffolds_the_github_form_on_a_self_hosted_plane(monkeypatch,
         assert "flash env push" not in written[name], name
         for placeholder in placeholders | {"PROJECT_UUID"}:
             assert placeholder not in written[name], f"{name} still contains {placeholder}"
+
+
+def test_scaffolded_ref_is_a_placeholder_not_a_branch_name(monkeypatch, tmp_path) -> None:
+    """The scaffolded ref must not name a branch that half of all repos do not have.
+
+    Scaffolding `@main` next to OWNER/REPO makes the ref look like the one token already correct, so
+    it survives an edit that replaces the obvious placeholders around it. `gh repo create` still
+    publishes `master`, so following the CLI's default and GitHub's default together produces a ref
+    that does not exist -- which surfaces as a pinning error naming neither the ref nor the cause.
+    """
+    written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
+
+    for name in ("sft.toml", "rl.toml", "opd.toml", "TRAINING.md"):
+        assert "OWNER/REPO@main" not in written[name], (
+            f"{name} scaffolds a concrete branch where a placeholder belongs"
+        )
+        assert "OWNER/REPO@master" not in written[name], name
 
 
 def test_env_setup_keeps_the_push_workflow_on_the_managed_plane(monkeypatch, tmp_path) -> None:
@@ -669,7 +686,7 @@ def test_env_setup_names_the_self_hosted_id_form_in_both_next_step_renderings(
     assert "flash env push" not in plain
 
     styled = render.env_setup(["environment.py"], "UUID", can_publish=False)
-    assert "github:OWNER/REPO@main:environment.py" in styled
+    assert "github:OWNER/REPO@REF:environment.py" in styled
     assert "flash env push" not in styled
 
 
@@ -885,7 +902,7 @@ def test_training_guide_caveats_the_managed_hub_commands(monkeypatch, tmp_path) 
     """
     guide = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")["TRAINING.md"]
 
-    assert 'id = "github:OWNER/REPO@main:environment.py"' in guide
+    assert 'id = "github:OWNER/REPO@REF:environment.py"' in guide
     assert "**Self-hosted:** `env push` targets the managed hub" in guide
     assert "push/pull/delete act on Freesolo's managed hub" in guide
 
