@@ -214,8 +214,20 @@ def normalize_eval_result(
     )
 
 
+def _episode_grading_enabled(suite: EvaluationSuite) -> bool:
+    """Return the validated full-episode grading opt-in."""
+    value = getattr(suite, "grades_episodes", False)
+    if not isinstance(value, bool):
+        name = getattr(suite, "name", "evaluation")
+        raise TypeError(
+            f"suite {name!r} grades_episodes must be a bool, got {type(value).__name__}"
+        )
+    return value
+
+
 def validate_evaluation_cases(suite: EvaluationSuite, *, source: str | Path) -> list[EvalCase]:
     """Load and validate one suite's cases with source-aware errors."""
+    _episode_grading_enabled(suite)
     try:
         cases = suite.cases()
     except Exception as exc:

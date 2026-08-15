@@ -17,7 +17,7 @@ import sys
 
 from flash.cli.commands.env.test_evaluations import _evaluation_example
 from flash.cli.ui import render
-from flash.envs.evaluations import EvalCase, EvalResult
+from flash.envs.evaluations import EvalCase, EvalResult, _episode_grading_enabled
 
 
 def _eval_module():
@@ -36,13 +36,7 @@ def _grades_episodes(suite) -> bool:
     Keying off the environment scored the wrong turn there and turned a well-formed first action
     into an error, so the suite has to say so itself.
     """
-    value = getattr(suite, "grades_episodes", False)
-    if not isinstance(value, bool):
-        name = getattr(suite, "name", "evaluation")
-        raise TypeError(
-            f"suite {name!r} grades_episodes must be a bool, got {type(value).__name__}"
-        )
-    return value
+    return _episode_grading_enabled(suite)
 
 
 def _drive_episode(client, target: str, environment, case: EvalCase, args) -> dict | str:

@@ -2029,6 +2029,8 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
     assert "`score(self, case, response, state)`" in evaluations_text
     assert "passes the resulting transcript in `state`" in evaluations_text
     assert "step_episode" in evaluations_text
+    assert "`messages` already ends with this action" in env_py
+    assert "`messages[:-1]` and apply `assistant_response` once" in env_py
     # the docstring documents all three algorithms train off the multi-turn env (no opd carve-out)
     assert "distils EVERY assistant turn" in env_py
     assert "single-turn only" not in env_py

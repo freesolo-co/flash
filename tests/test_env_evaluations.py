@@ -2455,6 +2455,31 @@ def test_env_eval_uploads_a_suite_that_failed_to_load(monkeypatch, tmp_path, cap
     assert "suite broken failed to load cases" in capsys.readouterr().err
 
 
+def test_env_eval_reports_invalid_episode_flag_as_a_suite_failure(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
+    (env_dir / "evaluations.py").write_text(
+        "from flash.envs.evaluations import EvalCase\n"
+        "class Suite:\n"
+        "    name = 'invalid-episode-flag'\n"
+        "    grades_episodes = 'false'\n"
+        "    def cases(self): return [EvalCase(id='c', input='go')]\n"
+        "    def score(self, case, response): return True\n"
+        "def load_evaluations(environment=None): return [Suite()]\n"
+    )
+
+    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr("flash.client.client_from_config", _EvalClient)
+
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
+    captured = capsys.readouterr()
+    assert "suite invalid-episode-flag failed to load cases" in captured.err
+    assert "grades_episodes must be a bool, got str" in captured.err
+    assert "Traceback" not in captured.err
+    assert "overall: FAIL" in captured.err
+
+
 def test_env_eval_concurrent_results_stay_in_case_order(monkeypatch, tmp_path) -> None:
     # generation completes out of order under --concurrency. pairing results with case ids by
     # completion order rather than submission index would hand each result another case's id,
