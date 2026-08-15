@@ -3711,13 +3711,13 @@ def test_without_the_claim_the_orphan_reparents_past_this_process():
 
 
 @_needs_process_teardown
-def test_the_claim_is_made_before_the_trainer_is_spawned():
+def test_the_claim_is_made_before_each_verl_process_is_spawned():
     """Order matters: the kernel only reparents to a process that was ALREADY a subreaper.
 
     Claiming after the child exists leaves any grandchild it has already orphaned parented
     elsewhere, so the fix would work only for the second job onward on a reused worker.
     """
-    for fn in (vc.run_verl_training, rl_train._execute_rl_child):
+    for fn in (vc._run_streaming_verl_subprocess, rl_train._execute_rl_child):
         src = " ".join(inspect.getsource(fn).split())
         assert "adopt_orphaned_descendants()" in src, f"{fn.__name__} never claims its orphans"
         assert src.index("adopt_orphaned_descendants()") < src.index("subprocess.Popen("), (
