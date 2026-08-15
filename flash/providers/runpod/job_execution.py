@@ -310,7 +310,6 @@ class _PollContext:
     current_attempt: int
     launch_ts: float
     next_gpu_note: str
-    on_last_gpu: bool
     poll_errors: PollErrorTracker
 
 
@@ -446,44 +445,6 @@ def _probe_worker_coming_up_at(context: _PollContext, now: float) -> float | Non
     return now if (usable or workers.get("initializing")) else None
 
 
-def _queue_deadline_already_spent(
-    context: _PollContext, state: _PollState, status: Any, now: float
-) -> bool:
-    """True when a queue deadline is spent, so this poll returns a terminal verdict regardless.
-
-    Three timers can end the wait here and none of them can be changed by a heartbeat: the capacity
-    grace (`no_capacity`), and the unhealthy and throttled graces once a probe is due to check them
-    (`stalled` / `no_capacity`). The heartbeat reader is an HF artifact download on real runs, so
-    reading it first would put network I/O in front of a retry or a GPU-class escalation that is
-    already decided -- and in front of a line that is never printed on those paths.
-
-    Read-only and side-effect free, unlike `_classify_queue_state`: it must not consume the health
-    probe budget or arm anything. Deliberately conservative -- the classifier may still re-probe at
-    the boundary and find a worker coming up, or a fresh health read may clear a spent health timer,
-    in which case the run continues and `poll_job` reads the heartbeat right after. Being wrong here
-    only defers a heartbeat within the same iteration; being wrong the other way blocks a terminal
-    verdict behind a network read that cannot change it.
-    """
-    if status != "IN_QUEUE" or _worker_is_coming_up(state.worker_coming_up_at, now):
-        return False
-    if (
-        state.queued_timer.since is not None
-        and now - state.queued_timer.since > context.queue_grace_s
-    ):
-        return True
-    # a health grace is only actionable on a poll that will actually re-read health: the classifier
-    # returns early otherwise, leaving the timer untouched and the verdict unchanged.
-    if now - state.last_health_probe <= _jobs.HEALTH_PROBE_GATE_S:
-        return False
-    return any(
-        timer.since is not None and now - timer.since > grace
-        for timer, grace in (
-            (state.unhealthy_timer, context.unhealthy_grace_s),
-            (state.throttled_timer, context.throttled_grace_s),
-        )
-    )
-
-
 def _classify_queue_state(
     context: _PollContext,
     state: _PollState,
@@ -523,7 +484,7 @@ def _classify_queue_state(
         state.unhealthy_timer.since = None
         state.throttled_timer.since = None
         return None
-    if now - state.last_health_probe <= _jobs.HEALTH_PROBE_GATE_S:
+    if now - state.last_health_probe <= 90:
         return None
     state.last_health_probe = now
     try:
@@ -552,51 +513,11 @@ def _classify_queue_state(
             # between unhealthy and empty cannot make a broken box look like starvation.
             state.ever_saw_worker = True
         if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
-            # name the budget this wait is spending, so a queued line separates "still inside its
-            # grace" from "wedged". A worker that is coming up suppresses only the capacity and
-            # health candidates -- those timers really are not running for it -- but the run wall
-            # deadline and the setup/no-progress limit still apply and still end the wait, so the
-            # note is always asked for. Gate on `usable or recovering`, the same evidence that
-            # clears the timer above, rather than on the timers' `since`, which is still armed from
-            # the classify pass that ran BEFORE this health read.
-            coming_up = bool(usable or recovering)
-            # re-read the clock: `now` was taken before the heartbeat read and the health request,
-            # and the RunPod client allows multiple 30s attempts plus backoff, so on a slow or
-            # retried probe the figures printed here would be stale by tens of seconds -- claiming
-            # budget that is already spent, which is the exact false reassurance this note exists to
-            # remove. The timers below keep using `now`, the instant their evidence was classified.
-            note = _jobs.queue_wait_note(
-                _jobs.time.time(),
-                unhealthy=bool(workers.get("unhealthy")) and not coming_up,
-                unhealthy_since=state.unhealthy_timer.since,
-                unhealthy_grace_s=context.unhealthy_grace_s,
-                throttled=bool(workers.get("throttled")) and not coming_up,
-                throttled_since=state.throttled_timer.since,
-                throttled_grace_s=context.throttled_grace_s,
-                queued_since=state.queued_timer.since,
-                queue_grace_s=context.queue_grace_s,
-                capacity_applies=not coming_up,
-                on_last_gpu=context.on_last_gpu,
-                absolute_deadline=context.absolute_deadline,
-                stall_since=state.last_progress,
-                # the same choice _classify_stall makes one call later in this iteration.
-                stall_limit_s=(
-                    context.setup_grace_s
-                    if context.heartbeat_reader is not None and not state.seen_training_hb
-                    else context.stall_after_s
-                ),
-                # when THIS probe was stamped, so health-timer eligibility is measured from the
-                # real cadence rather than assumed from the post-request clock above.
-                probe_at=state.last_health_probe,
-                # the clock the expired() calls below are handed. A slow health request leaves it
-                # behind the stamp above, and only it decides whether they fire on THIS pass.
-                classifier_now=now,
-                # probes land on polling iterations, not on the gate constant, so the real cadence
-                # depends on the interval this run was launched with.
-                interval_s=context.interval_s,
-            )
-            budget = f"; {note}" if note else ""
-            context.say(f"queued; workers: {workers}{budget}")
+            message = f"queued; workers: {workers}"
+            if not usable and not recovering and state.queued_timer.since is not None:
+                elapsed_s = max(0, int(now - state.queued_timer.since))
+                message += f"; waited {elapsed_s}s of {int(context.queue_grace_s)}s capacity grace"
+            context.say(message)
         if state.unhealthy_timer.expired(
             workers.get("unhealthy") and not usable and not recovering,
             now,
@@ -773,7 +694,6 @@ def poll_job(
         current_attempt=attempt_id,
         launch_ts=launch_ts,
         next_gpu_note=_jobs.capacity_escalation_note(on_last_gpu),
-        on_last_gpu=on_last_gpu,
         poll_errors=PollErrorTracker(say, interval_s),
     )
     state = _PollState(
@@ -827,29 +747,10 @@ def poll_job(
         if terminal is not None:
             return terminal
         now = _jobs.time.time()
-        # before the queue classifier, not after: its queued line reports the no-progress deadline
-        # among the budgets it may quote, and a heartbeat that became visible this iteration would
-        # otherwise be charged against the previous last_progress -- reporting the budget as spent
-        # in the same iteration that resets it and keeps polling. Still one reader call, and `now`
-        # is read in the same position as before so the clock-read sequence per poll is unchanged.
-        #
-        # But NOT ahead of a capacity verdict that is already decided: the reader is an HF artifact
-        # download on real runs, and no heartbeat can change "RunPod never gave us a GPU". Blocking
-        # on network I/O there would delay the escalation to the next GPU class for a line that is
-        # never printed on this path -- _classify_queue_state returns no_capacity before it.
-        deferred_heartbeat = _queue_deadline_already_spent(context, state, status, now)
-        if not deferred_heartbeat:
-            _update_heartbeat(context, state)
         terminal = _classify_queue_state(context, state, status, now)
         if terminal is not None:
             return terminal
-        if deferred_heartbeat:
-            # the boundary probe found a worker coming up and overturned the presumed no_capacity
-            # verdict, so this job is alive and _classify_stall is the very next check. Deferring the
-            # read to the next poll would let a stall limit that is also spent fire on a job whose
-            # fresh heartbeat is already readable -- killing a live run to save a read we now have to
-            # do anyway. The skip above is only ever a shortcut past a verdict that stands.
-            _update_heartbeat(context, state)
+        _update_heartbeat(context, state)
         terminal = _classify_stall(context, state, status)
         if terminal is not None:
             return terminal
