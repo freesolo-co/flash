@@ -30,7 +30,8 @@ _USER_DATA_BUDGET = _USER_DATA_CAP - _USER_DATA_MARGIN
 
 # Fast path only: above this, the spec is spilled to HF without first rendering a payload that
 # cannot fit. What is left of the ~64,000-byte cap after the fixed framing -- this module's template
-# plus every source it heredocs in (bootstrap.py, bootstrap_secrets.py, bootstrap_pip.py) -- is
+# plus every source it heredocs in (bootstrap.py, bootstrap_console.py, bootstrap_secrets.py,
+# bootstrap_pip.py) -- is
 # ~5,800 bytes, and base64 + json escaping inflate the spec ~1.35x on the way in. shrink this again
 # whenever those sources grow; docstrings are stripped on the way in, so only code and comments
 # count, and prose belongs in a docstring rather than a comment for exactly that reason.

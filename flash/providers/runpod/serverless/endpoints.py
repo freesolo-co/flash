@@ -1,7 +1,7 @@
 """RunPod Flash endpoint lifecycle: provision, cache, teardown.
 
-The worker handler itself lives in ``handler``; this module only hands it to the SDK. They were one
-file until the handler's 662 lines left no room for either to grow.
+The worker handler lives in ``handler``; this module owns only endpoint lifecycle and hands the
+source-shipped function to the SDK.
 """
 
 from __future__ import annotations

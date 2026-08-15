@@ -9,7 +9,7 @@ job payload from job["input"] and runs the training via `_train_body`.
 the flash `code/**` from HF at runtime), so extracting just its source needs no flash import.
 Single source of truth: it's generated from the real `_train_body`, so it can't drift.
 
-Usage: python make_rp_handler.py <path-to-endpoints.py> <out-path>
+usage: python docker/make_rp_handler.py flash/providers/runpod/serverless/handler.py <out-path>
 """
 
 import ast
@@ -18,7 +18,7 @@ import sys
 
 def main() -> int:
     if len(sys.argv) != 3:
-        raise SystemExit(f"usage: {sys.argv[0]} <path-to-endpoints.py> <out-path>")
+        raise SystemExit(f"usage: {sys.argv[0]} <path-to-handler.py> <out-path>")
     src_path, out_path = sys.argv[1], sys.argv[2]
     with open(src_path, encoding="utf-8") as f:
         src = f.read()
