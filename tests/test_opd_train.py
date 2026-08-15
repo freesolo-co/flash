@@ -4725,6 +4725,58 @@ def test_child_failure_sanitizer_redacts_the_credential_not_the_auth_scheme(monk
     )
 
 
+def test_child_failure_sanitizer_redacts_presigned_url_signatures(monkeypatch):
+    """A presigned URL carries a complete capability in its QUERY PARAMETERS.
+
+    `?X-Amz-Credential=...&X-Amz-Signature=...` is immediately usable by anyone holding it, and none
+    of those parameter names resembles the credential words the shape rule matched -- so the whole
+    URL was written to the failure record verbatim. The value pass cannot help: a signature is
+    minted per request and appears in no environment variable, which is precisely the case the
+    shape rule exists to catch.
+
+    Each parameter is redacted on its own rather than swallowing the rest of the query string. An
+    unquoted value ending only at whitespace would take `X-Amz-Expires` with it, and that field is
+    often the whole diagnostic -- it says the capability EXPIRED rather than was malformed.
+    """
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    from flash.engine.worker.train.opd.child.bridge import _safe_child_failure_detail
+
+    for message, secrets in (
+        (
+            (
+                "upload failed: https://b.s3.amazonaws.com/k?X-Amz-Credential=AKIA123%2F20260815"
+                "&X-Amz-Signature=abc123deadbeef&X-Amz-Expires=3600"
+            ),
+            ("AKIA123", "abc123deadbeef"),
+        ),
+        ("GET https://s.blob.core.windows.net/c/b?sig=aBcD%2F123&se=2026-08-15", ("aBcD",)),
+        (
+            "https://storage.googleapis.com/b/o?X-Goog-Signature=deadbeef&X-Goog-Credential=svc",
+            ("deadbeef",),
+        ),
+        ("https://host/path?signature=abc123&other=1", ("abc123",)),
+        ("?X-Amz-Security-Token=FwoGZXIvYXdz&X-Amz-Expires=60", ("FwoGZXIvYXdz",)),
+    ):
+        redacted = _safe_child_failure_detail(ValueError(message))
+        assert "<redacted>" in redacted
+        for secret in secrets:
+            assert secret not in redacted, f"{message!r} leaked {secret!r}: {redacted!r}"
+
+    # the non-secret query fields survive: `&` ends an unquoted value, so one signed parameter does
+    # not swallow the rest of the string. losing X-Amz-Expires would hide WHY the capability failed.
+    kept = _safe_child_failure_detail(
+        ValueError("https://b/k?X-Amz-Signature=abc&X-Amz-Expires=3600&X-Amz-Date=20260815")
+    )
+    assert "X-Amz-Expires=3600" in kept
+    assert "X-Amz-Date=20260815" in kept
+
+    # `sig` is guarded on its LEFT edge. The case that matters is a key ENDING in those letters
+    # immediately before the separator: unguarded, `basig=7` matches and the value is redacted.
+    # A `sig` with a space before it passes either way, so asserting only that proves nothing.
+    for innocent in ("basig=7", "model_basig=qwen3", "config=big sig word"):
+        assert _safe_child_failure_detail(ValueError(innocent)) == innocent, innocent
+
+
 def test_child_failure_sanitizer_redacts_every_digest_parameter(monkeypatch):
     """A Digest value is a parameter LIST, so single-token capture leaves the secrets behind.
 

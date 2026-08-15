@@ -50,13 +50,25 @@ _FAILURE_FALLBACK_MAX_CHARS = 8192
 # digest is absent by design: its own branches below run first and consume the whole line, so
 # listing it here too would be dead alternation.
 _SECRET_SCHEME = r"(?:(?:bearer|basic|token)\s+)?"
+# a presigned url carries its capability in QUERY PARAMETERS whose names look nothing like the
+# credential words above: `?X-Amz-Credential=...&X-Amz-Signature=...` is a complete, immediately
+# usable capability and matched none of them. it is minted per-request, so it is in no environment
+# variable and the value pass cannot see it either -- exactly the case this shape rule exists for.
+# `sig` (azure) needs a left guard: unanchored it would fire on any word ending in those letters.
+_SECRET_URL_PARAM = (
+    r"x-(?:amz|goog)-(?:signature|credential|security-token)|signature|(?<![\w-])sig"
+)
 _SECRET_DETAIL = re.compile(
-    r"(?i)(?P<key>authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
+    r"(?i)(?P<key>authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password"
+    rf"|{_SECRET_URL_PARAM})"
     r"(?P<sep>['\"]?\s*[:=]\s*)"
     rf"(?:(?P<quote>['\"])(?:digest\s+(?P<qdigest>[^\r\n]+)"
     rf"|{_SECRET_SCHEME}(?P<quoted>(?:(?!(?P=quote))[^\r\n])*))"
     r"|digest\s+(?P<digest>[^\r\n]+)"
-    rf"|{_SECRET_SCHEME}(?P<bare>[^\s,;'\"}}]+))"
+    # `&` terminates an unquoted value: without it the first signed-url parameter swallows every
+    # later one, so a single <redacted> replaces the whole query string including the benign
+    # `X-Amz-Expires` that says WHY a capability failed. each parameter is redacted on its own.
+    rf"|{_SECRET_SCHEME}(?P<bare>[^\s,;&'\"}}]+))"
 )
 # component lines of a multiline credential shorter than this are punctuation such as ``}``, not
 # secrets; redacting them would erase innocent text. Matches `bootstrap_secrets._MIN_SECRET_COMPONENT`.
