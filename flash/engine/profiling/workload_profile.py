@@ -8,12 +8,32 @@ import math
 from dataclasses import dataclass, field, fields
 from typing import Any
 
+# re-exported: identifying reasoning in a render is its own problem and lives in a sibling module,
+# but the profile's callers import these from here.
+from flash.engine.profiling.reasoning_render import (  # noqa: F401
+    horizon_row_count,
+    marked_reasoning_end,
+    reasoned_assistant_turns,
+    reasoning_marker_prefix,
+    reasoning_markers,
+    reasoning_warning_rows,
+    rendered_reasoning_loss_warning,
+    strip_reasoning_markers,
+    with_marked_reasoning,
+)
+
 SFT_PROFILE_KIND = "sft"
 # 3 removes the deleted per-run worker environment map from the profile identity payload. 4 adds
 # the authored [environment] pip digest, which changes the installed worker stack and so cannot be
 # absent from identity. old cached profiles use a different identity shape, so reject them and
-# re-profile.
-WORKLOAD_PROFILE_SCHEMA_VERSION = 4
+# re-profile. 5 serializes the reasoning-loss counts so the submitting client can render that
+# warning; they are digest-free, but `from_dict` requires an exact field set, so a profile cached
+# under 4 cannot be rebuilt and has to re-profile. 6 adds truncated_reasoning_spans, splitting
+# cap-truncated reasoning out from template-stripped reasoning so the warning names the right
+# remedy; same exact-field-set reason a 5 profile cannot be rebuilt. 7 serializes reasoning_rows,
+# the denominator those counts were totalled over: under 6 the counts were whole-dataset, so a
+# reader had to infer the denominator and could pair bounded counts with the wrong row count.
+WORKLOAD_PROFILE_SCHEMA_VERSION = 7
 # 2 lets a gdn hybrid pack when the installed stack proves it can reset example boundaries, where 1
 # always answered exact-unpacked. the same config therefore resolves to a different packing_mode and
 # examples_per_update, so a profile cached under 1 quotes a step count this policy would not: it has
@@ -240,6 +260,25 @@ class SftWorkloadProfile:
     authoritative_steps: int
     packing_efficiency: float
     sample_policy: str
+    # reasoning authored by the retained rows' assistant turns, and how much of it the chat template
+    # actually renders into the supervised span. carried on the profile rather than only printed
+    # where it is measured: control-plane profiling runs inside the server, so its stderr is not the
+    # submitting client's. the CLI renders the warning from these two counts, like the packing
+    # override, and a user sees it before a training gpu is allocated.
+    #
+    # `compare=False` keeps them out of `_content()`, so they change neither the content digest nor
+    # worker parity. they are a property of the dataset's rendered text rather than of the token and
+    # step contract the quote freezes, and the worker legitimately measures different counts because
+    # it executes environment.py while the estimate reads raw records -- folding them into parity
+    # would fire the drift warning on a run whose billing contract never moved.
+    authored_reasoning_turns: int = field(default=0, compare=False)
+    rendered_reasoning_spans: int = field(default=0, compare=False)
+    truncated_reasoning_spans: int = field(default=0, compare=False)
+    # how many retained rows the three counts above were totalled over. serialized rather than
+    # re-derived because a reader cannot tell a bounded count from a whole-dataset one by looking:
+    # both shapes carry examples_per_update and authoritative_steps, so inferring the denominator
+    # from them would pair a binding horizon with counts that predate the bounding.
+    reasoning_rows: int = field(default=0, compare=False)
     schema_version: int = WORKLOAD_PROFILE_SCHEMA_VERSION
     kind: str = SFT_PROFILE_KIND
     # unix seconds stamped by the control-plane profile producer. 0.0 on worker recomputation.
@@ -280,6 +319,10 @@ class SftWorkloadProfile:
             "examples_per_update": self.examples_per_update,
             "derived_steps": self.derived_steps,
             "authoritative_steps": self.authoritative_steps,
+            "authored_reasoning_turns": self.authored_reasoning_turns,
+            "rendered_reasoning_spans": self.rendered_reasoning_spans,
+            "truncated_reasoning_spans": self.truncated_reasoning_spans,
+            "reasoning_rows": self.reasoning_rows,
         }
         for name, value in counts.items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -316,6 +359,10 @@ class SftWorkloadProfile:
             raise ValueError("untruncated max length cannot be smaller than realized max length")
         if self.truncated_examples > self.retained_examples:
             raise ValueError("truncated examples cannot exceed retained examples")
+        # the reasoning counts are totalled over a prefix of the retained rows, so their denominator
+        # cannot name more rows than were retained.
+        if self.reasoning_rows > self.retained_examples:
+            raise ValueError("reasoning rows cannot exceed retained examples")
         # a truncated row is exactly a row longer than the cap, so the two measurements must agree
         # on whether the cap bound at all.
         if bool(self.truncated_examples) != (self.untruncated_max_length > self.max_length):
@@ -357,6 +404,12 @@ class SftWorkloadProfile:
         return {
             **self._content(),
             "created_at": float(self.created_at),
+            # serialized but digest-free, so the client can render the reasoning-loss warning from
+            # the quote without the counts entering the frozen contract
+            "authored_reasoning_turns": int(self.authored_reasoning_turns),
+            "rendered_reasoning_spans": int(self.rendered_reasoning_spans),
+            "truncated_reasoning_spans": int(self.truncated_reasoning_spans),
+            "reasoning_rows": int(self.reasoning_rows),
             "content_digest": self.content_digest,
         }
 
