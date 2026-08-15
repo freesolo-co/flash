@@ -61,6 +61,10 @@ from flash.cli.ui import render
 from flash.client.config import shadowed_login_warning
 from flash.core.catalog import ALGORITHMS
 
+# argv flags whose VALUE is a credential, so it must never be echoed back to the user. both the
+# freesolo key (`flash login`) and the HuggingFace token (`flash models export`) use this name.
+_CREDENTIAL_FLAGS = frozenset({"--api-key"})
+
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
 # every subparser's own `help=` / `<cmd> --help`). test_cli_help.py asserts these rows stay in
@@ -296,8 +300,11 @@ def _add_auth_commands(sub: argparse._SubParsersAction) -> None:
     )
     login.add_argument(
         "--api-key",
-        help="your freesolo API key (default: FREESOLO_API_KEY); create it at "
-        "https://freesolo.co/sign-in",
+        help=(
+            "your freesolo API key (default: FREESOLO_API_KEY); prefer the environment variable "
+            "because argument values are visible in process listings; create a key at "
+            "https://freesolo.co/sign-in"
+        ),
     )
     login.add_argument(
         "--freesolo-url",
@@ -687,6 +694,11 @@ def _add_runs_commands(sub: argparse._SubParsersAction) -> None:
         action="store_true",
         help="poll status until the run ends without replaying logs",
     )
+    runs_status.add_argument(
+        "--json",
+        action="store_true",
+        help="print machine-readable run status",
+    )
     runs_status.set_defaults(func=cmd_status)
 
     runs_log = runs_sub.add_parser(
@@ -757,8 +769,10 @@ def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
     )
     export.add_argument(
         "--api-key",
-        help="HuggingFace token with write access to --repository "
-        "(default: HF_TOKEN from your shell or a local .env / .env.local)",
+        help=(
+            "HuggingFace token with write access to --repository; prefer HF_TOKEN or a local "
+            ".env / .env.local because argument values are visible in process listings"
+        ),
     )
     export.add_argument(
         "--public",
@@ -839,6 +853,52 @@ def _warn_if_login_shadowed(args) -> None:
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
+def _is_credential_flag(arg: str) -> bool:
+    """Whether `arg` is a credential flag, including the abbreviations argparse accepts.
+
+    argparse allows any unambiguous prefix of a long option, so `--api-k` and `--api-ke` both reach
+    `api_key`. Matching the full spelling exactly would leave those spellings unredacted and print
+    the key -- the redaction would look correct while missing every abbreviated invocation.
+
+    Ambiguity is deliberately NOT consulted. Whether `--api` is ambiguous depends on the SUBPARSER:
+    `flash login` also defines `--api-url` so argparse refuses it there, but `flash models export`
+    defines no such option, so `--ap`, `--api` and `--api-` are all unambiguous there and bind the
+    HuggingFace token. Judging ambiguity against a fixed rival list gets that case exactly backwards
+    and leaves the token printable. Erring the other way is free: if the parser does reject the
+    spelling, nothing was bound, and redacting an argument in an already-failing command loses
+    nothing.
+    """
+    if not arg.startswith("--") or len(arg) <= 2:
+        return False
+    return any(flag.startswith(arg) for flag in _CREDENTIAL_FLAGS)
+
+
+def _redacted_args(raw_args: list[str]) -> list[str]:
+    """`raw_args` with any credential value replaced, for echoing a command back to the user.
+
+    The unexpected-error handler suggests re-running the exact command with --debug, which would
+    otherwise reproduce a `--api-key <key>` the user typed -- printing the key into a terminal, a
+    CI log or a pasted bug report. That is the same exposure `--api-key` already carries in process
+    listings, and the fix costs nothing: the value is never what makes the traceback useful.
+    """
+    redacted: list[str] = []
+    drop_value = False
+    for arg in raw_args:
+        if drop_value:
+            redacted.append("<redacted>")
+            drop_value = False
+            continue
+        if _is_credential_flag(arg):
+            redacted.append(arg)
+            drop_value = True
+            continue
+        flag, sep, _ = arg.partition("=")
+        # `--api-key=secret` is one argv entry, so the split form has to be handled separately or
+        # the value rides along inside it.
+        redacted.append(f"{flag}=<redacted>" if sep and _is_credential_flag(flag) else arg)
+    return redacted
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     parser = _build_parser()
@@ -872,7 +932,7 @@ def main(argv: list[str] | None = None) -> int:
         # point at the exact command to re-run, copy-pasteable. --debug is a root-level flag, so it
         # must come BEFORE the subcommand (argparse rejects `flash runs --debug`); place it right
         # after the program name. raw_args never contains --debug here — that path re-raises above.
-        cmd = " ".join([CLI_NAME, "--debug", *(shlex.quote(a) for a in raw_args)])
+        cmd = " ".join([CLI_NAME, "--debug", *(shlex.quote(a) for a in _redacted_args(raw_args))])
         print(render.error(str(exc) or exc.__class__.__name__), file=sys.stderr)
         print(render.arrow(f"run `{cmd}` for the full traceback"), file=sys.stderr)
         return 1
