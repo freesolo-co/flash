@@ -319,19 +319,97 @@ def capacity_escalation_note(on_last_gpu: bool) -> str:
     )
 
 
-def _health_probe_cadence(interval_s: float) -> float:
-    """How far apart health probes ACTUALLY land, given the poll interval.
+def _health_probe_cadence(interval_s: float, observed_gap: float = 0.0) -> float:
+    """How far apart health probes land: the UPPER bound on the gap, never an exact prediction.
 
     `_classify_queue_state` can only probe on a polling iteration, and its gate rejects equality
-    (`now - last_health_probe <= 90` returns early), so the real cadence is the first whole number
-    of poll intervals STRICTLY past the threshold -- not the threshold itself. At the 10s default
-    that is 100s; at `interval_s=60` it is 120s, not 90s. Assuming the bare threshold predicts
-    health checks earlier than they can happen and so reports a health grace that does not fire
-    first. A non-positive interval degenerates to the threshold, the tightest honest bound.
+    (`now - last_health_probe <= HEALTH_PROBE_GATE_S` returns early), so a probe needs the first
+    whole number of poll intervals STRICTLY past the gate -- not the gate itself. At the 10s default
+    that is 100s; at `interval_s=60` it is 120s. Assuming the bare gate predicts health checks
+    earlier than they can happen and reports a health grace that does not fire first.
+
+    But `interval_s` alone OVERSTATES the gap, because the gate measures wall time while the
+    interval only counts sleeps: each iteration also spends a status read, a heartbeat read and
+    possibly a health request, so the real spacing can be shorter. At `interval_s=60` with a 40s
+    status read, probes land 100s apart, not 120s. `observed_gap` -- the actual distance between the
+    last two probes -- corrects for that when the caller has measured one; the smaller of the two is
+    the honest bound, since a gap already observed is proof the cadence can be at least that tight.
+
+    Erring long here is the safe direction anyway: it can only delay a health candidate behind a
+    deadline that is checked every poll, never promise a health timer that has not run.
     """
     if interval_s <= 0.0:
-        return HEALTH_PROBE_GATE_S
-    return (math.floor(HEALTH_PROBE_GATE_S / interval_s) + 1) * interval_s
+        bound = HEALTH_PROBE_GATE_S
+    else:
+        bound = (math.floor(HEALTH_PROBE_GATE_S / interval_s) + 1) * interval_s
+    # a measured gap can only be at or above the gate; below that the classifier returned early.
+    if observed_gap > HEALTH_PROBE_GATE_S:
+        bound = min(bound, observed_gap)
+    return bound
+
+
+def _health_candidates(
+    timers,
+    *,
+    now: float,
+    pass_now: float,
+    probe_at: float | None,
+    interval_s: float,
+    on_pass_order: int,
+    next_pass_order: int,
+) -> list:
+    """Rank the unhealthy/throttled timers as `queue_wait_note` candidates.
+
+    Each active timer contributes `(fires_in, order, waited, grace, label, clause)`. The order is
+    `on_pass_order` only when the `expired()` call below the note fires it on this pass; a probe
+    that is overdue but has not RUN yet happens on the next iteration and takes `next_pass_order`,
+    behind the stall and wall checks.
+    """
+    cadence = _health_probe_cadence(interval_s, 0.0 if probe_at is None else pass_now - probe_at)
+    out = []
+    for active, since, grace, label in timers:
+        if not active:
+            continue
+        # an unarmed timer is armed by the expired() call below AT `pass_now`, the pre-request
+        # clock -- so by the time the note prints, the request's own duration is already spent
+        # against its grace. Treating it as zero elapsed hides a first probe slow enough to consume
+        # most of the grace, letting the timer fire on the next probe while a later capacity
+        # deadline is reported instead.
+        arms_at = pass_now if since is None else since
+        waited = max(now - arms_at, 0.0)
+        fires_in, on_this_pass = _health_deadline_in(
+            grace - waited,
+            armed=since is not None,
+            now=now,
+            probe_at=probe_at,
+            cadence=cadence,
+            classifier_remaining=grace - (pass_now - arms_at),
+        )
+        out.append(
+            (fires_in, on_pass_order if on_this_pass else next_pass_order, waited, grace, label, "")
+        )
+    return out
+
+
+def _observed_at(remaining: float, *, this_pass: bool, interval_s: float) -> float:
+    """Round a deadline to the poll that actually OBSERVES it, not the instant it runs out.
+
+    Capacity, the no-progress limit and the wall deadline are checked every poll, but "every poll"
+    is not "continuously": a deadline that runs out mid-sleep is not acted on until the next
+    iteration wakes up. Two deadlines falling inside the same sleep are therefore observed on the
+    SAME poll, and which one ends the run is decided by check order within that iteration, not by
+    which ran out first. Ranking raw seconds there picks a deadline that is never observed first --
+    5s of capacity grace against 10s of wall time at `interval_s=10` reads as capacity, but the next
+    poll is at 10s and the wall check runs before the capacity timer, so the run ends `stalled`.
+
+    `this_pass` marks the checks still to run in the current iteration, which observe their deadline
+    immediately if it is already spent. An unknown interval leaves the value untouched.
+    """
+    if remaining <= 0.0:
+        return 0.0 if this_pass else max(interval_s, 0.0)
+    if interval_s <= 0.0:
+        return remaining
+    return math.ceil(remaining / interval_s) * interval_s
 
 
 def _health_deadline_in(
@@ -445,27 +523,18 @@ def queue_wait_note(
     # handed them, which a slow health request leaves behind the one this note is stamped with.
     # Defaults to `now` for callers that do not separate the two.
     pass_now = now if classifier_now is None else classifier_now
-    cadence = _health_probe_cadence(interval_s)
-    candidates = []
-    for active, since, grace, label in (
-        (unhealthy, unhealthy_since, unhealthy_grace_s, "unhealthy"),
-        (throttled, throttled_since, throttled_grace_s, "throttled"),
-    ):
-        if not active:
-            continue
-        waited = 0.0 if since is None else now - since
-        remaining, on_this_pass = _health_deadline_in(
-            grace - waited,
-            armed=since is not None,
-            now=now,
-            probe_at=probe_at,
-            cadence=cadence,
-            classifier_remaining=grace if since is None else grace - (pass_now - since),
-        )
-        # a probe that is overdue but has not run yet fires on the NEXT iteration, after
-        # _classify_stall and the wall check. Only a timer the call below fires keeps health_order.
-        order = health_order if on_this_pass else next_iteration_health_order
-        candidates.append((remaining, order, waited, grace, label, ""))
+    candidates = _health_candidates(
+        (
+            (unhealthy, unhealthy_since, unhealthy_grace_s, "unhealthy"),
+            (throttled, throttled_since, throttled_grace_s, "throttled"),
+        ),
+        now=now,
+        pass_now=pass_now,
+        probe_at=probe_at,
+        interval_s=interval_s,
+        on_pass_order=health_order,
+        next_pass_order=next_iteration_health_order,
+    )
     # the caller only asks for a note when it has just confirmed no usable or recovering worker, so
     # the capacity timer is either running or about to re-arm on the next poll. a cleared `since`
     # therefore means zero elapsed, not "not applicable": _classify_queue_state clears it via the
@@ -492,7 +561,7 @@ def queue_wait_note(
         # checks that have not run yet. `check_order` is what resolves that, not overdue-ness.
         candidates.append(
             (
-                max(queue_grace_s - waited, 0.0),
+                _observed_at(queue_grace_s - waited, this_pass=False, interval_s=interval_s),
                 capacity_order,
                 waited,
                 queue_grace_s,
@@ -506,7 +575,8 @@ def queue_wait_note(
     stall_waited = now - stall_since
     candidates.append(
         (
-            max(stall_limit_s - stall_waited, 0.0),
+            # still to run in THIS iteration, so a spent limit is observed immediately.
+            _observed_at(stall_limit_s - stall_waited, this_pass=True, interval_s=interval_s),
             stall_order,
             stall_waited,
             stall_limit_s,
@@ -519,7 +589,16 @@ def queue_wait_note(
         # retry or reattachment it can be shorter than any grace, and it is not a grace at all --
         # nothing "arms" it -- so it is reported as the remaining budget rather than time served.
         wall_left = absolute_deadline - now
-        candidates.append((max(wall_left, 0.0), wall_order, 0.0, wall_left, "run wall", ""))
+        candidates.append(
+            (
+                _observed_at(wall_left, this_pass=False, interval_s=interval_s),
+                wall_order,
+                0.0,
+                wall_left,
+                "run wall",
+                "",
+            )
+        )
     _, _, waited, budget, label, clause = min(candidates, key=lambda c: (c[0], c[1]))
     if label == "run wall":
         return f"{int(max(budget, 0.0))}s left of the run wall deadline"

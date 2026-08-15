@@ -1136,6 +1136,80 @@ def test_a_spent_health_grace_is_not_delayed_by_a_blocking_heartbeat_read(monkey
     )
 
 
+def test_a_slow_first_health_request_counts_against_the_grace_it_will_be_backdated_to():
+    # An unarmed timer is armed by the expired() call below the note, AT the pre-request clock. So
+    # by the time this line prints, the request's own duration has already been spent against the
+    # grace. Reporting 0s elapsed hid a first probe slow enough to consume most of it: the timer
+    # then fires on the next probe while the line advertises a later capacity deadline.
+    slow_first_probe = _note(
+        330.0,  # the first health request took 230s
+        classifier_now=100.0,  # expired() arms the timer here, not at 330
+        probe_at=100.0,
+        interval_s=10.0,
+        unhealthy=True,
+        unhealthy_since=None,
+        unhealthy_grace_s=240.0,  # only 10s of it actually remains
+        queued_since=0.0,
+        queue_grace_s=100_000.0,
+        stall_since=0.0,
+        stall_limit_s=100_000.0,
+    )
+    assert "unhealthy grace" in slow_first_probe, slow_first_probe
+    assert "waited 230s of 240s" in slow_first_probe, slow_first_probe
+
+
+def test_deadlines_inside_one_sleep_are_ranked_by_the_poll_that_observes_them():
+    # "Checked every poll" is not "checked continuously": a deadline that runs out mid-sleep waits
+    # for the next iteration. Two deadlines inside the same sleep are observed on the SAME poll, so
+    # check order decides between them -- not which ran out first. With 5s of capacity grace and 10s
+    # of wall time at interval_s=10, the next poll is at 10s and the wall check runs before the
+    # capacity timer, so the run ends on the wall deadline even though capacity expired earlier.
+    same_sleep = _note(
+        0.0,
+        interval_s=10.0,
+        queued_since=0.0,
+        queue_grace_s=5.0,
+        absolute_deadline=10.0,
+        stall_since=0.0,
+        stall_limit_s=100_000.0,
+        on_last_gpu=False,
+    )
+    assert "run wall deadline" in same_sleep, same_sleep
+    assert "capacity" not in same_sleep, same_sleep
+
+    # but a capacity grace a full poll earlier really is observed first, so rounding must not
+    # flatten every deadline into the same bucket.
+    earlier_poll = _note(
+        0.0,
+        interval_s=10.0,
+        queued_since=0.0,
+        queue_grace_s=5.0,
+        absolute_deadline=100.0,
+        stall_since=0.0,
+        stall_limit_s=100_000.0,
+        on_last_gpu=False,
+    )
+    assert "capacity grace" in earlier_poll, earlier_poll
+
+
+def test_the_probe_cadence_is_an_upper_bound_that_an_observed_gap_can_tighten():
+    # The gate measures WALL time while interval_s only counts sleeps, so each iteration's status,
+    # heartbeat and health reads make the real spacing shorter than interval arithmetic predicts:
+    # at interval_s=60 with a 40s status read, probes land 100s apart, not 120s. The interval bound
+    # is therefore an upper bound, and a gap actually observed between the last two probes proves
+    # the cadence can be at least that tight.
+    from flash.providers.runpod.jobs import HEALTH_PROBE_GATE_S, _health_probe_cadence
+
+    assert _health_probe_cadence(60.0) == 120.0  # no observation: the interval bound
+    assert _health_probe_cadence(60.0, 100.0) == 100.0  # measured tighter, so use it
+    assert _health_probe_cadence(60.0, 200.0) == 120.0  # measured looser: keep the bound
+
+    # a gap at or below the gate is not evidence of anything -- the classifier returned early
+    # without probing -- so it must not tighten the bound to something impossible.
+    assert _health_probe_cadence(60.0, HEALTH_PROBE_GATE_S) == 120.0
+    assert _health_probe_cadence(60.0, 10.0) == 120.0
+
+
 def test_a_deadline_already_declined_this_iteration_does_not_outrank_the_next_check():
     # A slow health request can push several deadlines past due at once. Capacity and the run wall
     # were checked BEFORE the request, with the older clock, and did not fire; _classify_stall is the
