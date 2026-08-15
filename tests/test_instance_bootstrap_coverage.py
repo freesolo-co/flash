@@ -341,7 +341,9 @@ def test_hf_upload_targets_prefixed_path_and_swallows_errors(monkeypatch):
 
     _install_fake_hf(monkeypatch, HfApi=_Api)
     payload = {"hf_repo": "org/repo", "hf_prefix": "sft/run", "env": {"HF_TOKEN": "hf-tok"}}
-    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is None
+    # True only when the artifact landed: the error is swallowed, so a caller tracking what is
+    # already stored would otherwise read a failed upload as success and skip its retry.
+    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is True
     assert recorded["token"] == "hf-tok"
     assert recorded["path_or_fileobj"] == "/tmp/x.txt"
     assert recorded["path_in_repo"] == "sft/run/console.txt"
@@ -357,7 +359,7 @@ def test_hf_upload_targets_prefixed_path_and_swallows_errors(monkeypatch):
             raise RuntimeError("hf 500")
 
     _install_fake_hf(monkeypatch, HfApi=_BoomApi)
-    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is None
+    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is False
 
 
 def test_hf_upload_starts_no_request_at_deadline(monkeypatch):
@@ -378,7 +380,7 @@ def test_hf_upload_starts_no_request_at_deadline(monkeypatch):
         "run_max_wall_seconds": 100.0,
     }
 
-    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is None
+    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is False
     assert calls == []
 
 
