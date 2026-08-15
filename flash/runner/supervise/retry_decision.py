@@ -65,10 +65,10 @@ def _capacity_exhausted(
 ) -> bool:
     """Whether a retry would re-ask a question the class it lands on has ALREADY refused twice.
 
-    A ``no_capacity`` verdict is about the CLASS, not the host: unlike a stall or a preemption, which
-    a fresh box can clear, re-submitting to a shape the provider refuses asks the identical question
-    at up to 900s of queue grace per attempt, which is what turned an unavailable pin into a
-    75-minute serial retry loop.
+    A ``no_capacity`` verdict settles the same question only when both class and provider are pinned.
+    Without a provider pin the next allocation rebuilds the live market and may discover that class
+    on Lambda or Vast even when RunPod refused it twice. A hard class-plus-provider pin has nowhere
+    new to ask, which is what turned an unavailable shape into a 75-minute serial retry loop.
 
     The bar is a SECOND refusal, since ``no_capacity`` also covers a transient search flake and a
     market that was dry a minute ago routinely frees a card. Counted PER SHAPE rather than as a set
@@ -84,7 +84,12 @@ def _capacity_exhausted(
     cache lifts the volume's datacenter restriction and reaches hosts the cached attempt could not.
     Every other infra failure keeps its full retry budget.
     """
-    if outcome.result.failure != "no_capacity" or first_cache_drop or not ctx.spec.gpu.type:
+    if (
+        outcome.result.failure != "no_capacity"
+        or first_cache_drop
+        or not ctx.spec.gpu.type
+        or not ctx.spec.gpu.provider
+    ):
         return False
     if outcome.chosen is None:
         return False

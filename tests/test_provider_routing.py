@@ -2477,11 +2477,10 @@ def test_generic_provider_exception_text_still_never_reaches_the_run_record():
 def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_class(
     orch, monkeypatch
 ):
-    """A pinned gpu.type gives the picker a ONE-ENTRY candidate list, so a no_capacity retry used to
-    re-select the same unavailable class and burn another full capacity grace on it -- five times,
-    at 900s each, for up to 75 minutes of wall clock with every attempt guaranteed to fail for the
-    reason the last one did. `no_capacity` is a verdict about the CLASS, not the host, so once the
-    shape the retry would land on has refused TWICE the market has answered: stop and name the fix.
+    """A hard gpu.type plus gpu.provider pin gives the picker one fixed market question, so a
+    no_capacity retry used to re-select the same unavailable shape and burn another full capacity
+    grace on it -- five times, at 900s each, for up to 75 minutes of wall clock. Once that exact
+    class-provider shape has refused twice, the market has answered: stop and name the fix.
 
     Two, not one: `no_capacity` also covers a transient search flake and an exhausted provider pool,
     and a dry market frees cards, so the second refusal is what separates a blip from a wall (see
@@ -2491,7 +2490,7 @@ def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_clas
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs as rp_jobs
 
-    # exactly what a pinned spec produces: the allocator only ever offers the pinned class.
+    # exactly what hard class and provider pins produce: one fixed class-provider shape.
     candidates = (Candidate("runpod", "H200", 4.0, 141),)
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
@@ -2509,7 +2508,7 @@ def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_clas
         )
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    spec = _spec(run_id="flash-pinned-gpu-nowalk", type="H200")
+    spec = _spec(run_id="flash-pinned-gpu-nowalk", type="H200", provider="runpod")
     _seed_status(orch, spec)
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="failed after retries"):
@@ -2554,7 +2553,7 @@ def test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up(orch, monkey
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    spec = _spec(run_id="flash-pinned-gpu-blip", type="H200")
+    spec = _spec(run_id="flash-pinned-gpu-blip", type="H200", provider="runpod")
     _seed_status(orch, spec)
     log = io.StringIO()
     metrics = orch._submit_seed_supervised(spec, spec.seed, log)
@@ -2564,9 +2563,9 @@ def test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up(orch, monkey
     assert "has already refused capacity twice" not in log.getvalue()
 
 
-def test_auto_gpu_capacity_refusals_do_not_short_circuit_the_retry_budget(orch, monkeypatch):
-    """Automatic placement rebuilds its market search on every attempt, so seeing the same class
-    twice does not prove the next search has nowhere else to go."""
+@pytest.mark.parametrize("gpu_type", ["", "H200"], ids=["auto-class", "pinned-class"])
+def test_dynamic_provider_search_keeps_the_full_capacity_retry_budget(orch, monkeypatch, gpu_type):
+    """Without a hard provider pin, each retry can discover a class on a returning provider."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -2586,7 +2585,7 @@ def test_auto_gpu_capacity_refusals_do_not_short_circuit_the_retry_budget(orch, 
         return PollResult(False, failure="no_capacity", detail="market search is dry")
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    spec = _spec(run_id="flash-auto-gpu-capacity", type="")
+    spec = _spec(run_id=f"flash-dynamic-provider-{gpu_type or 'auto'}", type=gpu_type)
     _seed_status(orch, spec)
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="failed after retries"):
@@ -2620,7 +2619,7 @@ def test_a_provisioned_attempt_resets_the_class_capacity_refusals(orch, monkeypa
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    spec = _spec(run_id="flash-capacity-recovers", type="H200", max_retries=3)
+    spec = _spec(run_id="flash-capacity-recovers", type="H200", provider="runpod", max_retries=3)
     _seed_status(orch, spec)
     log = io.StringIO()
     metrics = orch._submit_seed_supervised(spec, spec.seed, log)
@@ -2667,7 +2666,12 @@ def test_dropping_the_weight_cache_gives_the_widened_search_its_own_capacity_loo
         return PollResult(False, failure="no_capacity", detail="IN_QUEUE (no capacity)")
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
-    spec = _spec(max_retries=3, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
+    spec = _spec(
+        provider="runpod",
+        max_retries=3,
+        network_volume=WEIGHT_CACHE_VOLUME_NAME,
+        network_volume_gb=100,
+    )
     _seed_status(orch, spec)
     metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
 
