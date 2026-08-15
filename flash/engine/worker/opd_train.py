@@ -29,6 +29,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     parse_wandb_link,
     probe_verl_capabilities,
     render_gdn_varlen_shim,
+    render_shim_marker_prologue,
     render_wandb_link_shim,
     require_gdn_boundary_resets,
     resolve_blackwell_attention_backends,
@@ -37,9 +38,12 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     resolve_verl_python,
     rollout_sleep_unsupported,
     run_verl_training,
+    shim_marker_file,
     stall_tail_fields,
+    verify_applied_shim_markers,
     verl_device_capability,
     verl_step_number,
+    wrap_shim_fragment,
 )
 from flash.engine.worker.entry.opd import (  # noqa: F401
     _resolve_opd_knobs,
