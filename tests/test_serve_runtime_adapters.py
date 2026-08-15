@@ -1,0 +1,201 @@
+"""adapter concurrency, incarnation replacement, ids, pinning, eviction, and unload."""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+from flash.serve.runtime import (
+    AdapterConflictError,
+    AdapterSpec,
+    EngineConfig,
+    StaleIncarnationError,
+)
+from flash.serve.runtime import adapters as adapters_module
+from flash.serve.runtime.adapters import AdapterManager
+
+
+class _LoRARequest:
+    def __init__(self, name: str, lora_int_id: int, path: str) -> None:
+        self.lora_name = name
+        self.lora_int_id = lora_int_id
+        self.lora_path = path
+
+
+class _Engine:
+    def __init__(self) -> None:
+        self.added: list[_LoRARequest] = []
+        self.pinned: list[int] = []
+        self.removed: list[int] = []
+
+    async def add_lora(self, request: _LoRARequest) -> None:
+        await asyncio.sleep(0)
+        self.added.append(request)
+
+    async def pin_lora(self, int_id: int) -> None:
+        self.pinned.append(int_id)
+
+    async def remove_lora(self, int_id: int) -> None:
+        self.removed.append(int_id)
+
+
+@pytest.fixture(autouse=True)
+def _fake_vllm(monkeypatch):
+    vllm = types.ModuleType("vllm")
+    lora = types.ModuleType("vllm.lora")
+    request = types.ModuleType("vllm.lora.request")
+    request.LoRARequest = _LoRARequest
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.lora", lora)
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", request)
+
+
+@pytest.fixture
+def adapter_dir(tmp_path: Path) -> Path:
+    path = tmp_path / "adapter"
+    path.mkdir()
+    (path / "adapter_config.json").write_text("{}")
+    (path / "adapter_model.safetensors").write_bytes(b"weights")
+    return path
+
+
+def _spec(path: Path, incarnation: str = "one", *, adapter_id: str = "adapter") -> AdapterSpec:
+    return AdapterSpec(adapter_id=adapter_id, path=str(path), incarnation=incarnation)
+
+
+def test_concurrent_registration_is_idempotent(adapter_dir: Path) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    spec = _spec(adapter_dir)
+
+    async def exercise() -> list[bool]:
+        return await asyncio.gather(manager.register(spec), manager.register(spec))
+
+    assert sorted(asyncio.run(exercise())) == [False, True]
+    assert len(engine.added) == 1
+    assert engine.pinned == [engine.added[0].lora_int_id]
+    assert manager.registered_count == manager.loaded_count == 1
+
+
+def test_replacement_waits_for_inflight_incarnation(adapter_dir: Path) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    async def exercise() -> None:
+        await manager.register(_spec(adapter_dir, "one"))
+        acquired = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold_generation() -> None:
+            async with manager.acquire("adapter", "one"):
+                acquired.set()
+                await release.wait()
+
+        generation = asyncio.create_task(hold_generation())
+        await acquired.wait()
+        replacement = asyncio.create_task(manager.register(_spec(adapter_dir, "two")))
+        await asyncio.sleep(0)
+        assert replacement.done() is False
+        release.set()
+        await generation
+        assert await replacement is True
+
+    asyncio.run(exercise())
+    assert engine.removed == [engine.added[0].lora_int_id]
+    assert len(engine.added) == 2
+
+
+def test_same_incarnation_rejects_different_runtime_state(adapter_dir: Path) -> None:
+    other = adapter_dir.parent / "other"
+    other.mkdir()
+    (other / "adapter_config.json").write_text("{}")
+    (other / "adapter_model.bin").write_bytes(b"weights")
+    manager = AdapterManager(_Engine(), EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir)))
+
+    with pytest.raises(AdapterConflictError, match="incarnation token"):
+        asyncio.run(manager.register(_spec(other)))
+
+
+def test_replacement_reuses_id_and_stale_operations_fail(adapter_dir: Path) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    first = _spec(adapter_dir, "one")
+    second = _spec(adapter_dir, "two")
+    asyncio.run(manager.register(first))
+    first_id = engine.added[-1].lora_int_id
+    asyncio.run(manager.register(second))
+
+    assert engine.removed == [first_id]
+    assert engine.added[-1].lora_int_id == first_id
+
+    async def stale_acquire() -> None:
+        async with manager.acquire("adapter", "one"):
+            raise AssertionError("stale acquire must not enter")
+
+    with pytest.raises(StaleIncarnationError):
+        asyncio.run(stale_acquire())
+    with pytest.raises(StaleIncarnationError):
+        asyncio.run(manager.unload("adapter", "one"))
+    assert asyncio.run(manager.unload("adapter", "two")) is True
+
+
+def test_collision_safe_ids_probe_without_cross_wiring(
+    adapter_dir: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(adapters_module, "lora_int_id", lambda _adapter_id: 7)
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    async def exercise() -> None:
+        await asyncio.gather(
+            manager.register(_spec(adapter_dir, adapter_id="a")),
+            manager.register(_spec(adapter_dir, adapter_id="b")),
+        )
+
+    asyncio.run(exercise())
+    ids = {request.lora_name: request.lora_int_id for request in engine.added}
+    assert set(ids) == {"a", "b"}
+    assert set(ids.values()) == {7, 8}
+
+
+def test_evict_reloads_on_acquire_then_unloads(adapter_dir: Path) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model", pin_loras=True))
+    asyncio.run(manager.register(_spec(adapter_dir)))
+    int_id = engine.added[0].lora_int_id
+
+    assert asyncio.run(manager.evict("adapter", "one")) is True
+    assert asyncio.run(manager.evict("adapter", "one")) is False
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+
+    async def acquire() -> None:
+        async with manager.acquire("adapter", "one") as binding:
+            assert binding.spec.incarnation == "one"
+            assert binding.lora_request.lora_int_id == int_id
+
+    asyncio.run(acquire())
+    assert len(engine.added) == 2
+    assert engine.pinned == [int_id, int_id]
+    assert asyncio.run(manager.unload("adapter", "one")) is True
+    assert engine.removed == [int_id, int_id]
+    assert manager.registered_count == manager.loaded_count == 0
+
+
+def test_per_adapter_pin_false_skips_pinning(adapter_dir: Path) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model", pin_loras=True))
+    spec = AdapterSpec(
+        adapter_id="adapter",
+        path=str(adapter_dir),
+        incarnation="one",
+        pin=False,
+    )
+    asyncio.run(manager.register(spec))
+    assert engine.pinned == []

@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.2.34"
+version = "1.2.35"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -85,6 +85,14 @@ serve-modal = [
     "httpx>=0.27",
     "fastapi",
 ]
+# reusable gpu execution runtime. these are the model-path dependencies validated by the current
+# production freesolo serving image. vllm stays exact until a real-gpu base plus lora canary validates
+# a replacement; this extra intentionally remains independent from both `gpu` and `serve-modal`.
+serve-runtime = [
+    "pillow>=11.0.0",
+    "transformers>=5.0.0",
+    "vllm==0.23.0",
+]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
     "mypy>=1.13.0",
@@ -149,7 +157,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.2.34"
+version = "1.2.35"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -169,6 +177,14 @@ markers = [
 [tool.uv]
 # Heavy GPU extras are worker-side; keep the default sync light.
 package = true
+# training and serving intentionally validate different exact vllm builds and cannot be installed
+# into one environment. uv records both resolutions while rejecting only the incompatible combination.
+conflicts = [
+    [
+        { extra = "gpu" },
+        { extra = "serve-runtime" },
+    ],
+]
 
 [dependency-groups]
 dev = [
