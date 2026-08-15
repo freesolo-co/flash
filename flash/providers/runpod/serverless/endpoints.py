@@ -645,7 +645,11 @@ def _train_body(input_data: dict) -> dict:
                         continue
                     ok = _upload_console(mode)  # swallows its own errors; False if it did not land
                     uploaded_size = size if ok else uploaded_size
-                    quiet_used, since, due_s = quiet_used or (wedged and ok), 0.0, 3600.0
+                    quiet_used = quiet_used or (wedged and ok)
+                    # only a LANDED upload advances the deadline: resetting on a swallowed
+                    # failure puts the retry an interval out, past the stall teardown.
+                    if ok:
+                        since, due_s = 0.0, 3600.0
 
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()

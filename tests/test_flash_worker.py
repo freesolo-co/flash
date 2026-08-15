@@ -1141,7 +1141,11 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     body = inspect.getsource(endpoints._train_body)
     assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_POLL_S})" in body
     assert f"due_s, since, quiet_polls = {endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S}" in body
-    assert f"quiet_used or (wedged and ok), 0.0, {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
+    assert "quiet_used = quiet_used or (wedged and ok)" in body
+    # the deadline advances only on a LANDED upload: resetting on a swallowed failure books a
+    # snapshot that reached no repo and puts the retry an interval out, past the stall teardown.
+    assert f"since, due_s = 0.0, {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
+    assert "if ok:" in body
     # the latch is spent only on silence that bought an upload, not on an already-due snapshot.
     assert "and not quiet_used and not due" in body
     # the sustained-silence threshold and the success-gated watermark, which keep a sparsely
@@ -1361,6 +1365,37 @@ def test_instance_console_upload_loop_does_not_spend_the_latch_on_a_due_snapshot
     assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
 
 
+def test_instance_console_upload_loop_keeps_a_slow_starting_run_in_budget(monkeypatch):
+    """A silent setup must not buy the run a faster sustained cadence.
+
+    A tempting fix for "a setup that never emits a heartbeat is torn down at 3000s with only its
+    600s snapshot" is to hold the first-snapshot cadence until progress starts. It does close that
+    gap -- and it costs one extra commit that lands in the SUSTAINED rate, because a real run has a
+    silent setup and then trains for hours: 4h with a 600s setup measures 1.25/hr console + 4/hr
+    heartbeat = 5.25/hr against a hard 5.0. The gap is left to the stall classifier instead. This
+    pins the rate so that fix cannot be reintroduced without buying rate somewhere else.
+    """
+    import flash.engine.worker as worker
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    interval_s = _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    hours = 4
+    cycles = int(hours * 3600.0 / poll_s)
+    # the realistic shape: a silent setup, then a healthy run that logs for hours.
+    setup_polls = int(first_s / poll_s)
+    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
+    staged = [0] * setup_polls + [1] * (cycles + 2 - setup_polls)
+    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles, staged=staged)
+
+    per_hour = len(uploads) / hours
+    total = per_hour + 3600.0 / worker._HB_MIN_INTERVAL_S
+    assert total <= 5.0, f"console {per_hour}/hr + heartbeat = {total}/hr, budget is 5"
+    # and the cadence must actually converge to the interval, not merely squeak under the cap.
+    assert (uploads[-1] - uploads[-2]) * poll_s == interval_s
+
+
 def test_instance_console_upload_loop_keeps_its_wedge_credit_through_a_slow_startup(monkeypatch):
     """A cold image that imports for minutes before its first heartbeat must not spend the latch.
 
@@ -1511,6 +1546,42 @@ def test_instance_console_upload_loop_retries_when_an_upload_fails(monkeypatch):
     assert len(uploads) > 1, "a swallowed upload failure must not suppress every later attempt"
     # the retry must land inside the stall window, not at the next hourly boundary.
     assert (uploads[1] - uploads[0]) * poll_s < 1200.0
+
+
+def test_instance_console_upload_loop_retries_a_failed_snapshot_before_any_progress(monkeypatch):
+    """A failed upload must not advance the DEADLINE either, including before progress starts.
+
+    The uploaded-bytes watermark is only half of it. hf_upload swallows its exception and returns
+    falsy, so resetting ``since`` on that return books a snapshot that reached no repo AND pushes
+    the next attempt a full interval out -- 4200s, past the 1200s stall and the 3000s setup grace.
+
+    Before any staged heartbeat the wedge path is disarmed by design (a wedge is progress that
+    STOPPED), so it cannot supply the retry the way it incidentally did when quiet accounting ran
+    from process start. That makes the deadline the ONLY thing standing between a transient 500 at
+    the first snapshot and a run that dies with no console at all. The series here never emits a
+    heartbeat and never grows, so a retry can only come from the deadline staying due.
+    """
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    setup_grace_s = 3000.0  # poll.SETUP_GRACE_S: teardown for a run that never reaches a heartbeat
+    grow_polls = int(first_s / poll_s) + 1
+    # frozen console AND no heartbeat ever: neither the size change nor the wedge can buy the retry.
+    sizes = [1000] * (grow_polls + 20)
+    staged = [0] * len(sizes)
+    _waits, uploads = _drive_instance_upload_loop(
+        monkeypatch,
+        sizes,
+        cycles=len(sizes),
+        succeed=lambda attempt: attempt > 1,
+        staged=staged,
+    )
+
+    assert len(uploads) > 1, "a failed first snapshot was never retried before teardown"
+    assert uploads[1] * poll_s < setup_grace_s, "the retry landed after the setup teardown"
+    # one poll later, not one interval later -- the deadline must not have advanced on the failure.
+    assert (uploads[1] - uploads[0]) * poll_s <= poll_s
 
 
 def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots():

@@ -274,24 +274,24 @@ def _console_upload_loop(
     classifier kills a wedged run at 1200s/3000s -- long before an hourly snapshot would capture the
     hang. So commit only on un-uploaded bytes AND either the interval elapsing or
     _CONSOLE_UPLOAD_QUIET_POLLS samples with no STAGED heartbeat (_console_progress explains why
-    bytes cannot serve); spend that quiet snapshot once per run; and advance it and ``sent`` only on
-    reported success, since hf_upload swallows its exception. ``wedged`` excludes an already-due
-    poll, so the latch is spent only when a stall BOUGHT an upload -- charging it for a commit that
+    bytes cannot serve); and spend that quiet snapshot once per run. ``wedged`` excludes an
+    already-due poll, so the latch is spent only when a stall BOUGHT an upload -- charging it for a
     was happening anyway would disarm detection for a later hang. QUIET_POLLS is sized so that
     (it + 1) * poll stays under poll_job's 1200s training stall, or the box dies before the wedge
     snapshot commits.
 
-    A wedge is progress that STOPPED, so the latch arms only after a staged heartbeat has been seen.
-    Startup is quiet by nature -- importing the worker stack on a cold image outruns QUIET_POLLS
-    before the first snapshot is even due -- and counting that as a wedge spends the one-shot latch
-    on a console with nothing in it, then pushes the next commit a full interval out. A real hang
-    after that startup would find the latch gone and the run torn down at 1200s with no console:
-    strictly worse than not detecting wedges at all. The setup grace is 3000s, so a startup that
-    never reaches a heartbeat is the stall classifier's case, not this one.
-
-    An upload failure is printed with ``flush``: it is the only trace of a failed upload, and
-    teardown kills this process outright. Each rule is pinned by a
-    test_instance_console_upload_loop_* case."""
+    A wedge is progress that STOPPED, so the latch arms only after a staged heartbeat. Startup is
+    quiet by nature -- a cold image outruns QUIET_POLLS before the first snapshot is even due -- and
+    counting it spends the latch on an empty console AND pushes the next commit an interval out, so
+    a later hang dies at 1200s with nothing: worse than no wedge detection. A setup that NEVER
+    reaches a heartbeat stays uncovered on purpose; holding the first-snapshot cadence until
+    progress starts would fix it but costs a commit in the SUSTAINED rate (4h with a 600s setup
+    measures 1.25/hr + 4/hr heartbeat = 5.25/hr, over the hard 5.0), so it is left to the 3000s
+    setup grace. A FAILED upload advances neither ``sent`` nor the deadline: hf_upload swallows its
+    exception and returns falsy, so resetting ``since`` books a snapshot that reached no repo and
+    puts the retry an interval out, past both teardowns. Staying due retries until one lands. The
+    failure is printed with ``flush``: it is its only trace, and teardown kills this process
+    outright. Each rule is pinned by a test_instance_console_upload_loop_* case."""
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
     sent = size = -1
@@ -302,9 +302,9 @@ def _console_upload_loop(
         size, staged = _console_progress(console, max(size, 0))
         progressed = progressed or bool(staged)
         quiet_polls = 0.0 if staged else quiet_polls + 1
-        wedged = progressed and quiet_polls >= _CONSOLE_UPLOAD_QUIET_POLLS
         due = since >= due_s
-        wedged = wedged and not quiet_used and not due
+        stalled = quiet_polls >= _CONSOLE_UPLOAD_QUIET_POLLS and progressed
+        wedged = stalled and not quiet_used and not due
         if size == sent or not (due or wedged):
             continue
         try:
@@ -314,7 +314,8 @@ def _console_upload_loop(
             print(f"console upload warn: {detail}", flush=True)
             uploaded = False
         quiet_used = quiet_used or (wedged and uploaded)
-        sent, since, due_s = (size if uploaded else sent), 0.0, interval_s
+        if uploaded:
+            sent, since, due_s = size, 0.0, interval_s
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
