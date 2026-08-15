@@ -416,7 +416,7 @@ def test_heartbeat_success_keeps_console_and_uploaded_payload_unmarked(monkeypat
     console = _last_console_heartbeat(capsys)
     assert uploaded[0]["sampled_completions"] == samples
     assert "sampled_completions" not in console
-    assert console["sampled_completions_count"] == 1
+    assert console["sample_count"] == 1
     assert "pending" not in console
     assert "throttled" not in console
 

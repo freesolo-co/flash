@@ -1949,7 +1949,7 @@ def test_console_progress_keeps_oversized_managed_heartbeat_progress(tmp_path):
     )
     line = f"HEARTBEAT {snapshot}\n".encode()
     assert len(line) <= bootstrap_secrets._CONSOLE_PROGRESS_LINE_LIMIT
-    assert "sampled_completions_count" in snapshot
+    assert '"sample_count": 1' in snapshot
     console = tmp_path / "console_large_managed_heartbeat.txt"
     console.write_bytes(line)
     state = {"offset": 0, "partial": b"", "dropping": False}

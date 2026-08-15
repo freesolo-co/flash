@@ -137,7 +137,7 @@ def _console_heartbeat_snapshot(
         console_payload["metrics_last_count"] = len(metrics_last)
     samples = console_payload.pop("sampled_completions", None)
     if isinstance(samples, list):
-        console_payload["sampled_completions_count"] = len(samples)
+        console_payload["sample_count"] = len(samples)
     if upload_due and not payload_committed:
         console_payload["pending"] = True
     elif not upload_due:
